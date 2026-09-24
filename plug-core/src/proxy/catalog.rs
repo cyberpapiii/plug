@@ -334,16 +334,96 @@ pub(crate) fn normalize_search_text(text: &str) -> String {
         .join(" ")
 }
 
+/// A tool's searchable fields, already passed through
+/// [`normalize_search_text`].
+pub(crate) struct NormalizedToolText {
+    name: String,
+    title: String,
+    server: String,
+    description: String,
+}
+
+impl NormalizedToolText {
+    pub(crate) fn new(tool: &Tool, server_id: &str) -> Self {
+        Self {
+            name: normalize_search_text(tool.name.as_ref()),
+            title: normalize_search_text(tool.title.as_deref().unwrap_or("")),
+            server: normalize_search_text(server_id),
+            description: normalize_search_text(tool.description.as_deref().unwrap_or("")),
+        }
+    }
+}
+
+pub(crate) struct ToolSearchEntry {
+    pub(crate) server_id: String,
+    pub(crate) tool_name: String,
+    pub(crate) text: NormalizedToolText,
+}
+
+/// Normalized search text for every searchable tool in one
+/// [`RouterSnapshot`], in `tools_all` order. Built once per snapshot so a
+/// search does not re-normalize the whole catalog.
+pub(crate) struct ToolSearchIndex {
+    /// Identifies the snapshot this index was built from. The `Weak` keeps
+    /// the allocation (not the snapshot) alive, so a later snapshot cannot
+    /// reuse the address while this index exists.
+    snapshot: Weak<RouterSnapshot>,
+    pub(crate) entries: Vec<ToolSearchEntry>,
+}
+
+impl ToolSearchIndex {
+    pub(crate) fn build(snapshot: &Arc<RouterSnapshot>) -> Self {
+        let entries = snapshot
+            .tools_all
+            .iter()
+            .filter_map(|tool| {
+                let (server_id, _) = snapshot.routes.get(tool.name.as_ref())?;
+                if server_id == "__plug_internal__" {
+                    return None;
+                }
+                Some(ToolSearchEntry {
+                    server_id: server_id.clone(),
+                    tool_name: tool.name.to_string(),
+                    text: NormalizedToolText::new(tool, server_id),
+                })
+            })
+            .collect();
+        Self {
+            snapshot: Arc::downgrade(snapshot),
+            entries,
+        }
+    }
+
+    pub(crate) fn is_for(&self, snapshot: &Arc<RouterSnapshot>) -> bool {
+        std::ptr::eq(self.snapshot.as_ptr(), Arc::as_ptr(snapshot))
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn score_tool_match(
     tool: &Tool,
     server_id: &str,
     query_phrase: &str,
     tokens: &[String],
 ) -> Option<i64> {
-    let name = normalize_search_text(tool.name.as_ref());
-    let title = normalize_search_text(tool.title.as_deref().unwrap_or(""));
-    let server = normalize_search_text(server_id);
-    let description = normalize_search_text(tool.description.as_deref().unwrap_or(""));
+    score_normalized_match(
+        &NormalizedToolText::new(tool, server_id),
+        query_phrase,
+        tokens,
+    )
+}
+
+pub(crate) fn score_normalized_match(
+    text: &NormalizedToolText,
+    query_phrase: &str,
+    tokens: &[String],
+) -> Option<i64> {
+    let NormalizedToolText {
+        name,
+        title,
+        server,
+        description,
+    } = text;
     let mut score = 0i64;
     let mut all_tokens_matched = true;
 
@@ -544,22 +624,6 @@ impl super::ToolRouter {
             .map(|(server, _)| server.clone())
     }
 
-    /// List all tools with their source server IDs.
-    pub fn list_all_tools(&self) -> Vec<(String, Tool)> {
-        let snapshot = self.cache.load();
-        let mut result = Vec::new();
-        for tool in snapshot.tools_all.iter() {
-            let server_id = snapshot
-                .routes
-                .get(tool.name.as_ref())
-                .map(|(s, _)| s.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            result.push((server_id, tool.clone()));
-        }
-        result
-    }
-
     /// List all tools with their source server IDs and operator risk metadata.
     pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, crate::ipc::IpcToolRiskInfo)> {
         let snapshot = self.cache.load();
@@ -686,10 +750,13 @@ impl super::ToolRouter {
         ) {
             return Arc::new(self.filtered_legacy_meta_tools());
         }
-        if !self.config.tool_filter_enabled {
-            return self.list_tools();
-        }
         let snapshot = self.cache.load();
+        // This client's own surface is Standard or Native here, so with
+        // filtering disabled it gets the whole catalog. `list_tools()` would
+        // resolve the Unknown client's lazy policy instead.
+        if !self.config.tool_filter_enabled {
+            return Arc::clone(&snapshot.tools_all);
+        }
         match client_type {
             ClientType::Windsurf => Arc::clone(&snapshot.tools_windsurf),
             ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),

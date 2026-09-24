@@ -24,7 +24,7 @@ use crate::branding;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
-use crate::engine::{Engine, EngineEvent, next_call_id};
+use crate::engine::{Engine, next_call_id};
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
@@ -238,9 +238,10 @@ pub struct ToolRouter {
     /// without invalidating parked rounds; route targets and upstream
     /// instances may not.
     published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
+    /// Search index for the current snapshot, rebuilt lazily when the
+    /// snapshot changes. See [`ToolRouter::search_index_for`].
+    search_index: std::sync::Mutex<Option<Arc<ToolSearchIndex>>>,
     config: RouterConfig,
-    /// Optional event sender for tool call observability.
-    event_tx: Option<broadcast::Sender<EngineEvent>>,
     protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
     /// Separate channel for logging notifications to prevent log volume
     /// from causing Lagged errors that drop Progress/Cancelled delivery.
@@ -282,12 +283,6 @@ pub struct ToolRouter {
     /// Change feed for `modern_downstream_enabled`, so long-lived IPC
     /// connections can push gate changes without polling.
     modern_downstream_watch: tokio::sync::watch::Sender<bool>,
-    /// Serializes `refresh_tools`' decide-and-mutate phase (subscription
-    /// classify → prune → snapshot publish → rebind) across concurrent
-    /// refresh passes, so one pass cannot interleave reconciliation
-    /// decisions made against a pre-publish snapshot with another pass's
-    /// publish. Per-server listing/fetch work stays outside it.
-    refresh_reconcile_lock: Mutex<()>,
     /// Coalesces overlapping full-catalog refresh requests. One pass runs at
     /// a time and requests arriving during that pass share one trailing pass,
     /// preserving their expectation of observing work started after they
@@ -890,8 +885,8 @@ impl ToolRouter {
             activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
+            search_index: std::sync::Mutex::new(None),
             config,
-            event_tx: None,
             protocol_notification_tx,
             logging_tx,
             client_log_levels: DashMap::new(),
@@ -915,7 +910,6 @@ impl ToolRouter {
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
             modern_downstream_watch: tokio::sync::watch::Sender::new(false),
-            refresh_reconcile_lock: Mutex::new(()),
             refresh_coordinator: RefreshCoordinator::default(),
             #[cfg(test)]
             refresh_request_count: std::sync::atomic::AtomicUsize::new(0),
@@ -945,12 +939,6 @@ impl ToolRouter {
         admission_quotas: crate::protocol::AdmissionQuotas,
     ) -> Self {
         Self::new_with_quotas(server_manager, config, admission_quotas)
-    }
-
-    /// Set the event sender for tool call observability.
-    pub fn with_event_tx(mut self, tx: broadcast::Sender<EngineEvent>) -> Self {
-        self.event_tx = Some(tx);
-        self
     }
 
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<ProtocolNotification> {
@@ -2273,15 +2261,6 @@ impl ToolRouter {
                 tools = ?drifted_tools,
                 "detected material tool definition drift during refresh"
             );
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(EngineEvent::ToolDefinitionDriftDetected {
-                    tool_names: drifted_tools
-                        .iter()
-                        .cloned()
-                        .map(Arc::<str>::from)
-                        .collect(),
-                });
-            }
         }
 
         tracing::info!(
@@ -2296,9 +2275,9 @@ impl ToolRouter {
 
         // Build pre-cached filtered views — only when tool filtering is
         // enabled. `list_tools_for_client_session` (catalog.rs) is the only
-        // reader of these two fields, and it always returns early via
-        // `list_tools()` (which serves `tools_all`) when filtering is
-        // disabled, so these views are provably never read in that case.
+        // reader of these two fields, and it always returns `tools_all` early
+        // when filtering is disabled, so these views are provably never read
+        // in that case.
         let (tools_windsurf, tools_copilot) = if self.config.tool_filter_enabled {
             (
                 Arc::new(tools.iter().take(100).cloned().collect()),
@@ -2424,18 +2403,11 @@ impl ToolRouter {
         prompts_vec.sort_by(|a, b| a.name.cmp(&b.name));
         let prompts_all = Arc::new(prompts_vec);
 
-        let tool_count = tools_all.len();
-
-        // Serialize the decide-and-mutate phase across concurrent refresh
-        // passes: everything from here through the rebind loop (classify →
-        // prune execution → snapshot publish → rebind execution) runs under
-        // this guard, so a second pass cannot classify against a
-        // pre-publish snapshot and then apply those stale decisions around
-        // this pass's publish. The per-server listing above stays
-        // concurrent. If the notification loop's refresh backstop drops
-        // this future mid-phase, the guard is released on drop — tokio's
-        // Mutex does not poison.
-        let reconcile_guard = self.refresh_reconcile_lock.lock().await;
+        // The decide-and-mutate phase below (classify → prune execution →
+        // snapshot publish → rebind execution) never interleaves with another
+        // pass: `refresh_coordinator` runs one `refresh_tools_once` at a time,
+        // and a cancelled leader's future is dropped whole before a waiter
+        // can take over.
 
         // Classify every currently-tracked subscription URI against the
         // old/new route snapshots. Pure decision — no registry mutation, no
@@ -2451,8 +2423,8 @@ impl ToolRouter {
         // Execute prunes for URIs that lost their route entirely
         // (best-effort upstream unsubscribe) before publishing the new
         // snapshot — same ordering as the historical stale-unsubscribe pass.
-        // Distinct URIs use distinct transition locks, so parallelize under the
-        // reconcile guard (wall-clock = max RTT, not sum).
+        // Distinct URIs use distinct transition locks, so parallelize them
+        // (wall-clock = max RTT, not sum).
         {
             let prune_futs: Vec<_> = reconciliation
                 .iter()
@@ -2504,10 +2476,6 @@ impl ToolRouter {
         // instance remain unchanged.
         self.publish_route_snapshot(snapshot);
 
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
-        }
-
         // Rebind subscriptions whose URI still exists but ownership changed,
         // after publishing the new snapshot (same ordering as before).
         Self::rebind_reconciled_routes(
@@ -2517,11 +2485,6 @@ impl ToolRouter {
             "resource subscription rebind failed during route refresh",
         )
         .await;
-
-        // Release the reconcile guard before the post-publish sweep: the
-        // sweep classifies against the just-published snapshot only, and
-        // must not extend the serialized window it exists to double-check.
-        drop(reconcile_guard);
 
         // Post-publish sweep. Entries whose subscribe transition confirmed
         // inside this pass's classify→publish window were invisible to the
@@ -3098,8 +3061,6 @@ impl ToolRouter {
                     }
                 }
             }
-            let server_id_arc = Arc::<str>::from(server_id.as_str());
-            let tool_name_arc = Arc::<str>::from(original_name.as_str());
             let mut active_call_guard = None;
             if let Some(call_context) = downstream.clone() {
                 self.register_active_call(
@@ -3229,14 +3190,6 @@ impl ToolRouter {
                 retry = is_retry,
                 "proxy tool call started"
             );
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(EngineEvent::ToolCallStarted {
-                    call_id,
-                    trace_id: Arc::clone(&trace_id),
-                    server_id: Arc::clone(&server_id_arc),
-                    tool_name: Arc::clone(&tool_name_arc),
-                });
-            }
 
             let call_start = std::time::Instant::now();
 
@@ -3285,29 +3238,32 @@ impl ToolRouter {
                 .get(&server_id)
                 .map(|entry| Arc::clone(entry.value()));
 
+            // Close out this attempt's ledgers: record the circuit breaker
+            // outcome and call metrics when given, then drop the active-call
+            // registration. `None` leaves that ledger untouched.
+            let mut finish = |breaker_ok: Option<bool>, metrics_ok: Option<bool>| {
+                if let (Some(ok), Some(cb)) = (breaker_ok, &cb) {
+                    if ok {
+                        cb.on_success();
+                    } else {
+                        cb.on_failure();
+                    }
+                }
+                if let Some(ok) = metrics_ok {
+                    metrics_guard.settle(ok);
+                }
+                if let Some(guard) = active_call_guard.as_mut() {
+                    guard.disarm();
+                }
+                self.remove_active_call(call_id);
+            };
+
             match result {
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
                     admit_tool_result_meta(&mut response);
-                    if let Some(cb) = &cb {
-                        cb.on_success();
-                    }
-                    metrics_guard.settle(true);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: true,
-                        });
-                    }
+                    finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,
@@ -3325,24 +3281,7 @@ impl ToolRouter {
                     // A modern upstream completed this round and supplied its
                     // own continuation contract. Do not retain or replay the
                     // old request handle; the downstream retry is a new round.
-                    if let Some(cb) = &cb {
-                        cb.on_success();
-                    }
-                    metrics_guard.settle(true);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: true,
-                        });
-                    }
+                    finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,
@@ -3369,20 +3308,7 @@ impl ToolRouter {
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: false,
-                        });
-                    }
+                    finish(None, None);
 
                     match self.reconnect_server_now(&server_id).await {
                         Ok(()) => {
@@ -3432,22 +3358,7 @@ impl ToolRouter {
                         timeout_secs = timeout.as_secs(),
                         "upstream tool call timed out"
                     );
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: false,
-                        });
-                    }
-
-                    metrics_guard.settle(false);
+                    finish(None, Some(false));
 
                     if matches!(transport_type, crate::config::TransportType::Stdio) {
                         self.reconnect_server_in_background(server_id.clone());
@@ -3464,24 +3375,7 @@ impl ToolRouter {
                         error = %e,
                         "upstream tool call failed"
                     );
-                    if let Some(cb) = &cb {
-                        cb.on_failure();
-                    }
-                    metrics_guard.settle(false);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: false,
-                        });
-                    }
+                    finish(Some(false), Some(false));
                     match e {
                         rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
                         other => Err(McpError::internal_error(other.to_string(), None)),
@@ -3490,11 +3384,7 @@ impl ToolRouter {
                 Ok(other) => {
                     // An unexpected upstream response is a terminal failure —
                     // record it like the other terminal branches.
-                    metrics_guard.settle(false);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
+                    finish(None, Some(false));
                     Err(McpError::internal_error(
                         format!("unexpected response type from upstream tool call: {other:?}"),
                         None,
@@ -3623,6 +3513,26 @@ impl ToolRouter {
         )]))
     }
 
+    /// Return the search index for `snapshot`, building it on first use.
+    /// A racing search against an older snapshot builds its own index
+    /// without replacing the cached one for the newer snapshot.
+    fn search_index_for(&self, snapshot: &Arc<RouterSnapshot>) -> Arc<ToolSearchIndex> {
+        let mut cached = self
+            .search_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = cached.as_ref()
+            && index.is_for(snapshot)
+        {
+            return Arc::clone(index);
+        }
+        let index = Arc::new(ToolSearchIndex::build(snapshot));
+        if Arc::ptr_eq(snapshot, &*self.cache.load()) {
+            *cached = Some(Arc::clone(&index));
+        }
+        index
+    }
+
     /// Handle the `plug__search_tools` meta-tool call.
     fn handle_search_tools(
         &self,
@@ -3658,19 +3568,14 @@ impl ToolRouter {
             .and_then(|value| value.as_u64())
             .map(|value| value.min(BRIDGE_SEARCH_RESULT_MAX as u64) as usize)
             .unwrap_or(5);
-        let snapshot = self.cache.load();
+        let snapshot = self.cache.load_full();
+        let index = self.search_index_for(&snapshot);
         let mut ranked = Vec::new();
-        for tool in snapshot.tools_all.iter() {
-            let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
+        for entry in &index.entries {
+            let Some(score) = score_normalized_match(&entry.text, &query_phrase, &tokens) else {
                 continue;
             };
-            if server_id == "__plug_internal__" {
-                continue;
-            }
-            let Some(score) = score_tool_match(tool, server_id, &query_phrase, &tokens) else {
-                continue;
-            };
-            ranked.push((score, server_id.as_str(), tool.name.as_ref()));
+            ranked.push((score, entry.server_id.as_str(), entry.tool_name.as_str()));
         }
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(b.2)));
         ranked.truncate(limit);

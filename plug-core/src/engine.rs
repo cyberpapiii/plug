@@ -1,8 +1,7 @@
 //! Core Engine — unified runtime for plug MCP multiplexer.
 //!
 //! The Engine owns all shared state (servers, routing, config, health) and
-//! exposes it through a query API. TUI, daemon, and CLI are thin frontends
-//! that subscribe to [`EngineEvent`]s via `tokio::sync::broadcast`.
+//! exposes it through a query API. The daemon and CLI are thin frontends.
 //!
 //! All fields are private — consumers access state through methods that
 //! return value types, never through direct field access.
@@ -12,24 +11,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
-use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio::sync::broadcast;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
-use crate::circuit::CircuitState;
 use crate::config::{Config, ServerConfig};
 use crate::health::{spawn_health_check, spawn_health_checks};
 use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::server_config_changed;
 use crate::server::{ServerManager, UpstreamServer, retire_upstream_owned};
-use crate::types::{ClientType, ServerHealth, ServerStatus};
-
-/// Broadcast channel capacity. At peak burst (~130 events/sec with 20 servers),
-/// this provides ~1 second of buffer. Memory cost: ~25KB.
-const EVENT_CHANNEL_CAPACITY: usize = 128;
+use crate::types::{ServerHealth, ServerStatus};
 
 /// Minimum interval between restarts of the same server.
 const RESTART_COOLDOWN: Duration = Duration::from_secs(10);
@@ -55,63 +47,7 @@ impl Drop for UpstreamStartGuard {
     }
 }
 
-/// Events emitted by the Engine for observability consumers (TUI, daemon, CLI).
-///
-/// Uses `Arc<str>` for string fields — O(1) clone on broadcast fan-out
-/// instead of O(n) String clone. Create via `Arc::from("value")`.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub enum EngineEvent {
-    ServerHealthChanged {
-        server_id: Arc<str>,
-        old: ServerHealth,
-        new: ServerHealth,
-    },
-    CircuitBreakerTripped {
-        server_id: Arc<str>,
-        state: CircuitState,
-    },
-    ToolCacheRefreshed {
-        tool_count: usize,
-    },
-    ToolDefinitionDriftDetected {
-        tool_names: Vec<Arc<str>>,
-    },
-    ClientConnected {
-        session_id: Arc<str>,
-        client_type: ClientType,
-    },
-    ClientDisconnected {
-        session_id: Arc<str>,
-    },
-    ToolCallStarted {
-        call_id: u64,
-        trace_id: Arc<str>,
-        server_id: Arc<str>,
-        tool_name: Arc<str>,
-    },
-    ToolCallCompleted {
-        call_id: u64,
-        trace_id: Arc<str>,
-        server_id: Arc<str>,
-        tool_name: Arc<str>,
-        duration_ms: u64,
-        success: bool,
-    },
-    ServerStarted {
-        server_id: Arc<str>,
-    },
-    ServerStopped {
-        server_id: Arc<str>,
-    },
-    Error {
-        context: Arc<str>,
-        message: Arc<str>,
-    },
-    ConfigReloaded,
-}
-
-/// Read-only, Clone-able snapshot of Engine state for initial TUI population
-/// and Lagged recovery.
+/// Read-only, Clone-able snapshot of Engine state.
 #[derive(Clone, Debug)]
 pub struct EngineSnapshot {
     pub servers: Vec<ServerStatus>,
@@ -147,7 +83,6 @@ pub struct Engine {
     config: Arc<ArcSwap<Config>>,
     cancel: CancellationToken,
     tracker: TaskTracker,
-    event_tx: broadcast::Sender<EngineEvent>,
     started_at: Instant,
     /// Per-server last restart timestamp for rate limiting.
     restart_timestamps: dashmap::DashMap<String, Instant>,
@@ -166,6 +101,9 @@ pub struct Engine {
     /// above all, which a client performs exactly once and cannot repeat — have
     /// to wait for this rather than answer from a half-built catalog.
     ready: watch::Sender<bool>,
+    /// Completed config reloads, so tests can wait for one without a bus.
+    #[cfg(test)]
+    reloads_applied: AtomicU64,
 }
 
 impl Engine {
@@ -175,10 +113,7 @@ impl Engine {
     pub fn new(config: Config) -> Self {
         let server_manager = Arc::new(ServerManager::new());
         let router_config = RouterConfig::from(&config);
-        let (event_tx, _) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
-        let tool_router = Arc::new(
-            ToolRouter::new(server_manager.clone(), router_config).with_event_tx(event_tx.clone()),
-        );
+        let tool_router = Arc::new(ToolRouter::new(server_manager.clone(), router_config));
         tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
         server_manager.set_tool_router(Arc::downgrade(&tool_router));
 
@@ -188,7 +123,6 @@ impl Engine {
             config: Arc::new(ArcSwap::from_pointee(config)),
             cancel: CancellationToken::new(),
             tracker: TaskTracker::new(),
-            event_tx,
             started_at: Instant::now(),
             restart_timestamps: dashmap::DashMap::new(),
             health_task_generations: dashmap::DashMap::new(),
@@ -197,7 +131,19 @@ impl Engine {
             supervision_attempts: dashmap::DashMap::new(),
             reload_lock: Mutex::new(()),
             ready: watch::channel(false).0,
+            #[cfg(test)]
+            reloads_applied: AtomicU64::new(0),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn note_reload_applied(&self) {
+        self.reloads_applied.fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reloads_applied(&self) -> u64 {
+        self.reloads_applied.load(Ordering::SeqCst)
     }
 
     /// Whether `start` has finished.
@@ -239,7 +185,6 @@ impl Engine {
                         self.server_manager.clone(),
                         self.tool_router.clone(),
                         Arc::clone(self),
-                        self.event_tx.clone(),
                         self.cancel.clone(),
                         name.to_string(),
                         server_config.health_check_interval_secs,
@@ -271,17 +216,6 @@ impl Engine {
         self.tool_router.refresh_tools().await;
         self.tool_router.prune_artifacts();
 
-        let tool_count = self.tool_router.tool_count();
-        let _ = self
-            .event_tx
-            .send(EngineEvent::ToolCacheRefreshed { tool_count });
-
-        for status in self.server_manager.server_statuses() {
-            let _ = self.event_tx.send(EngineEvent::ServerStarted {
-                server_id: Arc::from(status.server_id.as_str()),
-            });
-        }
-
         // Safety net for any enabled server that `start_all` never reported as
         // settled (a panicked start task). Servers that already have a task keep
         // it; re-spawning would supersede a live task and reset its interval.
@@ -289,7 +223,6 @@ impl Engine {
             self.server_manager.clone(),
             self.tool_router.clone(),
             Arc::clone(self),
-            self.event_tx.clone(),
             self.cancel.clone(),
             &config,
             &self.tracker,
@@ -325,11 +258,6 @@ impl Engine {
         self.server_manager.shutdown_all().await;
     }
 
-    /// Subscribe to the Engine event bus.
-    pub fn subscribe(&self) -> broadcast::Receiver<EngineEvent> {
-        self.event_tx.subscribe()
-    }
-
     /// Get a read-only snapshot of the current Engine state.
     pub fn snapshot(&self) -> EngineSnapshot {
         EngineSnapshot {
@@ -342,11 +270,6 @@ impl Engine {
     /// Return status information for all upstream servers.
     pub fn server_statuses(&self) -> Vec<ServerStatus> {
         self.server_manager.server_statuses()
-    }
-
-    /// Return the full merged tool list (for clients with no limit).
-    pub fn tool_list(&self) -> Arc<Vec<rmcp::model::Tool>> {
-        self.tool_router.list_tools_for_client(ClientType::Unknown)
     }
 
     /// Get the Engine's cancellation token (for shutdown coordination).
@@ -362,11 +285,6 @@ impl Engine {
     /// Get a reference to the ServerManager.
     pub fn server_manager(&self) -> &Arc<ServerManager> {
         &self.server_manager
-    }
-
-    /// Get a clone of the event sender (for transport-layer event emission).
-    pub fn event_sender(&self) -> broadcast::Sender<EngineEvent> {
-        self.event_tx.clone()
     }
 
     /// Get the loaded config.
@@ -524,7 +442,6 @@ impl Engine {
             self.server_manager.clone(),
             self.tool_router.clone(),
             Arc::clone(self),
-            self.event_tx.clone(),
             self.cancel.clone(),
             server_name.to_string(),
             server_config.health_check_interval_secs,
@@ -668,10 +585,6 @@ impl Engine {
             return Ok(());
         };
 
-        let _ = self.event_tx.send(EngineEvent::ServerStopped {
-            server_id: Arc::from(server_id),
-        });
-
         // Restart the server
         match self
             .server_manager
@@ -687,30 +600,19 @@ impl Engine {
                         self.sync_refresh_loop_for_server(server_id, &server_config);
                         self.tool_router.refresh_tools().await;
 
-                        let _ = self.event_tx.send(EngineEvent::ServerStarted {
-                            server_id: Arc::from(server_id),
-                        });
-
                         tracing::info!(server = %server_id, "server restarted");
                         Ok(())
                     }
                     ReplaceOutcome::StaleDiscarded => {
-                        // The ServerStopped event above is accurate either way — the
-                        // old instance WAS stopped. This is a user-facing command, so
-                        // it should say why it didn't do what was asked.
+                        // This is a user-facing command, so it should say why it
+                        // did not do what was asked.
                         Err(anyhow::anyhow!(
                             "server '{server_id}' was removed or reconfigured by a concurrent config reload; restart abandoned"
                         ))
                     }
                 }
             }
-            Err(e) => {
-                let _ = self.event_tx.send(EngineEvent::Error {
-                    context: Arc::from("restart_server"),
-                    message: Arc::from(e.to_string().as_str()),
-                });
-                Err(e)
-            }
+            Err(e) => Err(e),
         }
     }
 
@@ -807,13 +709,7 @@ impl Engine {
                     attempt += 1;
                     delay = (delay * 2).min(RECONNECT_RETRY_MAX_DELAY);
                 }
-                Err(e) => {
-                    let _ = self.event_tx.send(EngineEvent::Error {
-                        context: Arc::from("reconnect_server"),
-                        message: Arc::from(e.to_string()),
-                    });
-                    return Err(e);
-                }
+                Err(e) => return Err(e),
             }
         };
 
@@ -823,10 +719,6 @@ impl Engine {
         {
             ReplaceOutcome::Committed => {
                 self.tool_router.refresh_tools().await;
-
-                let _ = self.event_tx.send(EngineEvent::ServerStarted {
-                    server_id: Arc::from(server_id),
-                });
 
                 tracing::info!(server = %server_id, "server reconnected");
                 Ok(())
@@ -1074,7 +966,7 @@ async fn run_refresh_loop(
                         }
                         oauth::RefreshResult::InjectedToken => {
                             // Injected tokens cannot be refreshed via OAuth.
-                            // They rely on external re-injection via InjectToken IPC.
+                            // They are replaced by running `plug auth inject` again.
                             tracing::info!(
                                 server = %server_name,
                                 "injected token — cannot refresh via OAuth, skipping"
@@ -1160,20 +1052,13 @@ fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {
     );
 }
 
-/// Mark a server as `AuthRequired` and broadcast the state change.
+/// Mark a server as `AuthRequired` and notify clients of the state change.
 ///
 /// Used by `run_refresh_loop` when the token cannot be refreshed (revoked,
 /// missing refresh_token, etc.).
 async fn mark_auth_required(engine: &Engine, server_name: &str) {
     engine.server_manager().mark_auth_required(server_name);
     engine.tool_router().refresh_tools().await;
-    let _ = engine
-        .event_sender()
-        .send(EngineEvent::ServerHealthChanged {
-            server_id: Arc::from(server_name),
-            old: ServerHealth::Healthy,
-            new: ServerHealth::AuthRequired,
-        });
     engine.tool_router().publish_protocol_notification(
         crate::notifications::ProtocolNotification::AuthStateChanged {
             server_id: Arc::from(server_name),
@@ -1698,39 +1583,6 @@ mod tests {
     }
 
     #[test]
-    fn engine_subscribe() {
-        let engine = Engine::new(test_config());
-        let mut rx = engine.subscribe();
-
-        // No events yet — try_recv should return empty
-        assert!(rx.try_recv().is_err());
-
-        // Send an event
-        let _ = engine.event_tx.send(EngineEvent::ConfigReloaded);
-        let event = rx.try_recv().unwrap();
-        assert!(matches!(event, EngineEvent::ConfigReloaded));
-    }
-
-    #[test]
-    fn engine_event_arc_str_clone() {
-        // Verify Arc<str> is O(1) clone
-        let event = EngineEvent::ServerStarted {
-            server_id: Arc::from("test-server"),
-        };
-        let cloned = event.clone();
-        if let (
-            EngineEvent::ServerStarted { server_id: a },
-            EngineEvent::ServerStarted { server_id: b },
-        ) = (&event, &cloned)
-        {
-            // Arc::ptr_eq confirms same underlying allocation
-            assert!(Arc::ptr_eq(a, b));
-        } else {
-            panic!("unexpected variant");
-        }
-    }
-
-    #[test]
     fn call_id_monotonic() {
         let a = next_call_id();
         let b = next_call_id();
@@ -1897,9 +1749,9 @@ mod tests {
         );
 
         let engine = Arc::new(Engine::new(config));
-        let mut rx = engine.subscribe();
+        let reloads_before = engine.reloads_applied();
 
-        // Disable the server — triggers reload which emits ConfigReloaded
+        // Disable the server — triggers a config reload
         let result = engine.set_server_enabled("test", false).await;
         assert!(result.is_ok());
 
@@ -1907,15 +1759,10 @@ mod tests {
         let cfg = engine.config();
         assert!(!cfg.servers["test"].enabled);
 
-        // Should have emitted ConfigReloaded (possibly after other events)
-        let mut found_reloaded = false;
-        while let Ok(event) = rx.try_recv() {
-            if matches!(event, EngineEvent::ConfigReloaded) {
-                found_reloaded = true;
-                break;
-            }
-        }
-        assert!(found_reloaded, "expected ConfigReloaded event");
+        assert!(
+            engine.reloads_applied() > reloads_before,
+            "expected a config reload"
+        );
     }
 
     #[tokio::test]
@@ -2307,7 +2154,7 @@ HOME_DIR = "$HOME"
         assert!(!engine.supervision_due("imessage"));
     }
 
-    /// Verify that concurrent reads (snapshot, server_statuses, tool_list) remain
+    /// Verify that concurrent reads (snapshot, server_statuses, tool list) remain
     /// safe while reload_config removes/adds servers. The ArcSwap-based design
     /// guarantees wait-free reads; this test documents that invariant.
     #[tokio::test]
@@ -2351,7 +2198,7 @@ HOME_DIR = "$HOME"
         let engine = Arc::new(Engine::new(config_a));
         let done = Arc::new(AtomicBool::new(false));
 
-        // Spawn reader tasks that continuously call snapshot/server_statuses/tool_list
+        // Spawn reader tasks that continuously call snapshot/server_statuses/tool list
         let mut readers = Vec::new();
         for _ in 0..4 {
             let eng = engine.clone();
@@ -2361,7 +2208,9 @@ HOME_DIR = "$HOME"
                 while !done_flag.load(Ordering::Relaxed) {
                     let _snap = eng.snapshot();
                     let _statuses = eng.server_statuses();
-                    let _tools = eng.tool_list();
+                    let _tools = eng
+                        .tool_router()
+                        .list_tools_for_client(crate::types::ClientType::Unknown);
                     iterations += 1;
                     // Yield to avoid starving the reload task
                     if iterations.is_multiple_of(100) {
@@ -2392,37 +2241,6 @@ HOME_DIR = "$HOME"
         // Config should reflect the last reload (empty)
         let snap = engine.snapshot();
         assert!(snap.servers.is_empty());
-    }
-
-    #[tokio::test]
-    async fn broadcast_lagged_recovery() {
-        let engine = Engine::new(test_config());
-
-        // Create a receiver with capacity 128
-        let mut rx = engine.subscribe();
-
-        // Fill the buffer beyond capacity to trigger Lagged
-        for i in 0..200 {
-            let _ = engine
-                .event_tx
-                .send(EngineEvent::ToolCacheRefreshed { tool_count: i });
-        }
-
-        // First recv should be Lagged
-        match rx.recv().await {
-            Err(broadcast::error::RecvError::Lagged(n)) => {
-                assert!(n > 0);
-                // Recovery: get snapshot
-                let snapshot = engine.snapshot();
-                assert!(snapshot.servers.is_empty());
-            }
-            Ok(_) => {
-                // Some events may still be receivable — that's fine
-            }
-            Err(broadcast::error::RecvError::Closed) => {
-                panic!("channel should not be closed");
-            }
-        }
     }
 
     #[test]
