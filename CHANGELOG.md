@@ -78,6 +78,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Plug.app no longer reloads the full tool list, about a megabyte, after
   every action. It reloads it when the daemon reports the list changed, or
   when you choose Refresh.
+- Plug.app no longer runs `brew` two or three times on every launch. It asks
+  Homebrew about the old formula only when a `plug` keg is on disk under
+  `/opt/homebrew` or `/usr/local`; each call took about a second, longer at
+  login.
 
 ## [0.8.11] - 2026-09-01
 
