@@ -136,6 +136,45 @@ final class DaemonServiceManager {
 
     func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
         let canonical = try await verifiedApp(expectedVersion: expectedVersion)
+        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
+    }
+
+    /// For a caller that verified the app and read launchd moments ago in the
+    /// same pass. Verifying the app signs and runs the bundled binary, and a
+    /// launchd read runs `launchctl` once per job, so repeating both right
+    /// after the caller did was most of what a healthy launch spent. When the
+    /// inspected job is ours, one fresh handshake proves the daemon; anything
+    /// short of exact proof falls through to the full path, which reads
+    /// launchd again before it changes anything.
+    func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        inspected: DaemonServiceSnapshot
+    ) async throws -> OperatorHandshake {
+        let expectedVersion = canonical.appVersion
+        guard canonical.embeddedVersion == expectedVersion else {
+            throw DaemonServiceError.invalidAppVersion(
+                expected: expectedVersion,
+                actual: canonical.embeddedVersion
+            )
+        }
+        if case let .appManagedCurrent(record) = inspected.ownership,
+           let handshake = try? await backend.handshake(),
+           exactProof(
+               record: record,
+               handshake: handshake,
+               canonical: canonical,
+               expectedVersion: expectedVersion
+           )
+        {
+            return handshake
+        }
+        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
+    }
+
+    private func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        expectedVersion: String
+    ) async throws -> OperatorHandshake {
         let inspection = try await inspectWithHandshake(
             canonical: canonical,
             legacyPaths: legacyPaths

@@ -28,6 +28,10 @@ protocol DaemonServiceManaging: AnyObject {
         expectedVersion: String
     ) async throws -> OperatorHandshake
     func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake
+    func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        inspected: DaemonServiceSnapshot
+    ) async throws -> OperatorHandshake
     func adopt() async throws
 }
 
@@ -152,6 +156,10 @@ final class InstallationCoordinator {
             var legacy = try await legacyMigrator.inspect(canonical: canonical)
 
             try rejectUnknownLegacyState(legacy)
+            // Whether this pass changed anything on the machine. A pass that
+            // only looked already holds the evidence a final inspection would
+            // gather again, so it skips that inspection.
+            var changedInstallation = false
 
             var inspectTimeLegacyPaths = Set<URL>()
             var leftoverAdoptSnapshot: DaemonServiceSnapshot?
@@ -171,6 +179,7 @@ final class InstallationCoordinator {
                 if !Self.requiresAdoption(preUninstallDaemon) || isAdoptionAuthorized(trigger) {
                     try await bootOutHomebrewLegacyIfNeeded(preUninstallDaemon)
                     publish(.removingLegacyFormula)
+                    changedInstallation = true
                     try await legacyMigrator.removeRecognizedFormula(legacy)
                     legacy = legacySnapshot(legacy, formulaInstalled: false)
                 }
@@ -189,6 +198,7 @@ final class InstallationCoordinator {
                 shellLink = legacy.shellLink
             case .absent, .repairable:
                 publish(.repairingCommand)
+                changedInstallation = true
                 shellLink = try await legacyMigrator.repairShellLink(to: canonical.executableURL)
                 legacy = legacySnapshot(legacy, shellLink: shellLink)
             case let .canonical(target):
@@ -202,6 +212,7 @@ final class InstallationCoordinator {
             )
             if clientsNeedRepair {
                 publish(.repairingClients)
+                changedInstallation = true
                 _ = try await clientRepairer.repairAll(
                     canonicalExecutable: canonical.executableURL
                 )
@@ -216,6 +227,11 @@ final class InstallationCoordinator {
                 live: liveDaemon,
                 leftover: leftoverAdoptSnapshot
             )
+            // Anything but this app's own current daemon gets replaced or
+            // adopted below.
+            if !isExactService(daemonSnapshot, canonical: canonical) {
+                changedInstallation = true
+            }
             let handshake = try await reconcileDaemon(
                 snapshot: daemonSnapshot,
                 canonical: canonical,
@@ -240,6 +256,7 @@ final class InstallationCoordinator {
             )
 
             if legacy.cargoBinary != nil {
+                changedInstallation = true
                 publish(.cleaningLegacyBinary)
                 try await legacyMigrator.removeVerifiedCargoBinary(legacy, proof: proof)
             }
@@ -247,7 +264,21 @@ final class InstallationCoordinator {
             if case let .reconcilingUpdate(phase) = state, phase != .inspecting {
                 publish(.verifying)
             }
-            let final = try await inspectFinalState(expected: canonical)
+            let final: InstallationState
+            if changedInstallation {
+                final = try await inspectFinalState(expected: canonical)
+            } else {
+                final = .healthy(makeSnapshot(
+                    app: canonical,
+                    legacy: legacy,
+                    service: DaemonServiceSnapshot(
+                        ownership: daemonSnapshot.ownership,
+                        daemonVersion: handshake.daemonVersion,
+                        daemonExecutable: handshake.daemonExecutable
+                    ),
+                    clientRepairNeeded: clientsNeedRepair
+                ))
+            }
             try requireHealthy(final, expected: canonical)
             state = final
             transientFailures = 0
@@ -356,7 +387,7 @@ final class InstallationCoordinator {
             if !isExactService(snapshot, canonical: canonical) {
                 publish(.replacingDaemon)
             }
-            return try await daemonManager.ensureRunning(expectedVersion: canonical.appVersion)
+            return try await daemonManager.ensureRunning(canonical: canonical, inspected: snapshot)
 
         case .unknown:
             throw CoordinatorError.unknownOwnership

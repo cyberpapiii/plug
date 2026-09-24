@@ -82,6 +82,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Homebrew about the old formula only when a `plug` keg is on disk under
   `/opt/homebrew` or `/usr/local`; each call took about a second, longer at
   login.
+- Plug.app launches with far fewer checks when nothing needs setting up: it
+  no longer inspects the app, the command, the clients and the daemon a
+  second time after a pass that changed nothing, and it trusts the launchd
+  inspection it just made, so the first refresh comes sooner.
 
 ## [0.8.11] - 2026-09-01
 
