@@ -57,10 +57,6 @@ pub struct DownstreamOauthConfig {
     pub public_base_url: String,
     pub oauth_scopes: Vec<String>,
     pub local_port: u16,
-    /// Mirrors `http.modern_downstream_enabled`. The modern `/mcp` path gates
-    /// method families on a token's stored scopes, so this decides whether a
-    /// stored pre-enforcement grant was ever really constrained by them.
-    pub modern_downstream_enabled: bool,
 }
 
 impl DownstreamOauthConfig {
@@ -77,7 +73,6 @@ impl DownstreamOauthConfig {
                     .collect()
             }),
             local_port: http.port,
-            modern_downstream_enabled: http.modern_downstream_enabled,
         })
     }
 }
@@ -469,15 +464,6 @@ struct PendingAuthorizationCode {
     expires_at: u64,
 }
 
-/// Grants at this scope model were issued and enforced against method-family
-/// scopes. Model 1 grants predate /mcp enforcement, when every OAuth
-/// principal had unlimited method access regardless of stored scopes.
-const SCOPE_MODEL_ENFORCED: u32 = 2;
-
-fn legacy_scope_model() -> u32 {
-    1
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct IssuedAccessToken {
     client_id: String,
@@ -485,11 +471,10 @@ struct IssuedAccessToken {
     resource: String,
     issued_at: u64,
     expires_at: u64,
-    #[serde(default = "legacy_scope_model")]
-    scope_model: u32,
     /// Rotation lineage. Every pair minted from the same authorization code
     /// shares one id, so a replayed refresh token can revoke the whole chain.
-    /// Empty on records written before families existed; backfilled at load.
+    /// Empty only on records written before families existed; an empty id
+    /// never matches in [`revoke_token_family`].
     #[serde(default)]
     family_id: String,
 }
@@ -500,8 +485,6 @@ struct IssuedRefreshToken {
     scopes: Vec<String>,
     resource: String,
     expires_at: u64,
-    #[serde(default = "legacy_scope_model")]
-    scope_model: u32,
     /// See [`IssuedAccessToken::family_id`].
     #[serde(default)]
     family_id: String,
@@ -652,48 +635,6 @@ impl DownstreamOauthState {
         self.refresh_tokens
             .retain(|_, item| item.client_id != client_id);
     }
-
-    fn replace_client_material_from(&mut self, source: &Self, client_id: &str) {
-        self.remove_client_material(client_id);
-        if let Some(client) = source.clients.get(client_id) {
-            self.clients.insert(client_id.to_string(), client.clone());
-        }
-        self.pending_consents.extend(
-            source
-                .pending_consents
-                .iter()
-                .filter(|(_, item)| item.client_id == client_id)
-                .map(|(id, item)| (id.clone(), item.clone())),
-        );
-        self.completed_consents.extend(
-            source
-                .completed_consents
-                .iter()
-                .filter(|(_, item)| item.client_id == client_id)
-                .map(|(id, item)| (id.clone(), item.clone())),
-        );
-        self.pending_codes.extend(
-            source
-                .pending_codes
-                .iter()
-                .filter(|(_, item)| item.client_id == client_id)
-                .map(|(id, item)| (id.clone(), item.clone())),
-        );
-        self.access_tokens.extend(
-            source
-                .access_tokens
-                .iter()
-                .filter(|(_, item)| item.client_id == client_id)
-                .map(|(id, item)| (id.clone(), item.clone())),
-        );
-        self.refresh_tokens.extend(
-            source
-                .refresh_tokens
-                .iter()
-                .filter(|(_, item)| item.client_id == client_id)
-                .map(|(id, item)| (id.clone(), item.clone())),
-        );
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -721,9 +662,7 @@ impl DownstreamOauthManager {
         state_dir: &std::path::Path,
     ) -> Result<Self, DownstreamOauthError> {
         let path = state_file_path_in_dir(&config, state_dir, STATE_VERSION);
-        let legacy_path = state_file_path_in_dir(&config, state_dir, 2);
         let state_lock = acquire_state_lock(&path)?;
-        reconcile_legacy_state(&config, state_dir, &path, &legacy_path)?;
         Self::new_with_state_path_and_lock(config, path, state_lock)
     }
 
@@ -752,12 +691,7 @@ impl DownstreamOauthManager {
         })?;
         let owner_security = Arc::new(OwnerSecurity::new(&config.public_base_url)?);
         let mut state = load_persisted_state(&state_path)?;
-        let mut migrated = mark_pre_enforcement_grants(&mut state, &config);
-        migrated += backfill_token_families(&mut state);
         prune_consumed_refresh_tokens(&mut state);
-        if migrated > 0 {
-            require_durable(persist_state(&state_path, &state)?, &state_path)?;
-        }
         let principal_lifecycles = state
             .clients
             .keys()
@@ -837,11 +771,6 @@ impl DownstreamOauthManager {
 
     pub fn registration_endpoint(&self) -> String {
         format!("{}/oauth/register", self.base_url())
-    }
-
-    #[cfg(test)]
-    async fn persisted_state_version_for_tests(&self) -> u8 {
-        self.state.lock().await.version
     }
 
     #[cfg(test)]
@@ -1015,15 +944,9 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
-            next.pending_consents.remove(consent_id);
-            next.owner_authentication_ceremonies
-                .retain(|_, ceremony| ceremony.consent_id != consent_id);
+            let expired = expire_consent(&mut next, consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         // One consent owns at most one live challenge. Repeated public calls
         // replace only that consent's challenge; another public caller can
@@ -1112,13 +1035,9 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidOwnerAssertion);
         };
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
-            next.pending_consents.remove(&ceremony.consent_id);
+            let expired = expire_consent(&mut next, &ceremony.consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         let consent_bytes = serde_json::to_vec(&consent)
             .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
@@ -1173,39 +1092,12 @@ impl DownstreamOauthManager {
         };
         owner_credential.passkey.counter = success.new_counter;
         owner_credential.last_used_at = Some(now);
-        next.pending_consents.remove(&ceremony.consent_id);
-        next.owner_authentication_ceremonies
-            .retain(|_, pending| pending.consent_id != ceremony.consent_id);
-        let code = opaque_value();
-        next.pending_codes.insert(
-            code.clone(),
-            PendingAuthorizationCode {
-                client_id: consent.client_id.clone(),
-                redirect_uri: consent.redirect_uri.clone(),
-                code_challenge: consent.code_challenge,
-                scopes: consent.scopes,
-                resource: consent.resource,
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-            },
-        );
-        if let Some(client) = next.clients.get_mut(&consent.client_id) {
-            client.last_used_at = Some(now);
-            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
-        }
-        let redirect = AuthorizationRedirect {
-            location: redirect_with_params(
-                &consent.redirect_uri,
-                &[("code", &code), ("state", &consent.state)],
-            ),
-        };
-        next.completed_consents.insert(
-            ceremony.consent_id,
-            CompletedConsent {
-                client_id: consent.client_id,
-                redirect: redirect.clone(),
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                approval_ceremony_ids,
-            },
+        let redirect = issue_code_for_consent(
+            &mut next,
+            &ceremony.consent_id,
+            consent,
+            approval_ceremony_ids,
+            now,
         );
         self.commit_state(&mut guard, next)?;
         Ok(redirect)
@@ -1232,14 +1124,10 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
             let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
+            let expired = expire_consent(&mut next, consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         if !crate::auth::verify_auth_token(csrf_token, &consent.csrf_token) {
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
@@ -1494,6 +1382,13 @@ impl DownstreamOauthManager {
         })
     }
 
+    /// Approve or deny a consent without the owner passkey ceremony.
+    ///
+    /// Test-only: production approval goes through
+    /// [`Self::finish_owner_approval`] and denial through
+    /// [`Self::deny_consent`]. Tests in other crates reach this through the
+    /// `test-helpers` feature, which only dev-dependencies enable.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub async fn decide_consent(
         &self,
         consent_id: &str,
@@ -1514,14 +1409,10 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
             let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
+            let expired = expire_consent(&mut next, consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         if !approved {
             let redirect = AuthorizationRedirect {
@@ -1546,38 +1437,7 @@ impl DownstreamOauthManager {
         }
 
         let mut next = guard.clone();
-        next.pending_consents.remove(consent_id);
-        let code = opaque_value();
-        next.pending_codes.insert(
-            code.clone(),
-            PendingAuthorizationCode {
-                client_id: consent.client_id.clone(),
-                redirect_uri: consent.redirect_uri.clone(),
-                code_challenge: consent.code_challenge,
-                scopes: consent.scopes,
-                resource: consent.resource,
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-            },
-        );
-        if let Some(client) = next.clients.get_mut(&consent.client_id) {
-            client.last_used_at = Some(now);
-            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
-        }
-        let redirect = AuthorizationRedirect {
-            location: redirect_with_params(
-                &consent.redirect_uri,
-                &[("code", &code), ("state", &consent.state)],
-            ),
-        };
-        next.completed_consents.insert(
-            consent_id.to_string(),
-            CompletedConsent {
-                client_id: consent.client_id,
-                redirect: redirect.clone(),
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                approval_ceremony_ids: Vec::new(),
-            },
-        );
+        let redirect = issue_code_for_consent(&mut next, consent_id, consent, Vec::new(), now);
         self.commit_state(&mut guard, next)?;
         Ok(redirect)
     }
@@ -2024,14 +1884,32 @@ async fn fetch_client_metadata_document(
     {
         return Err(DownstreamOauthError::MetadataFetch);
     }
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|_| DownstreamOauthError::MetadataFetch)?;
-    if bytes.len() > MAX_METADATA_DOCUMENT_BYTES {
-        return Err(DownstreamOauthError::MetadataFetch);
-    }
+    let bytes = read_capped_body(response, MAX_METADATA_DOCUMENT_BYTES).await?;
     serde_json::from_slice(&bytes).map_err(|_| DownstreamOauthError::InvalidClientMetadata)
+}
+
+/// Read a response body chunk by chunk and give up as soon as it passes `cap`.
+///
+/// `Content-Length` is only a hint: a chunked response carries none, so the
+/// cap has to be enforced while reading or an unauthenticated
+/// `/oauth/authorize?client_id=https://...` could make the daemon buffer an
+/// arbitrarily large body until the request timeout.
+async fn read_capped_body(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<Vec<u8>, DownstreamOauthError> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|_| DownstreamOauthError::MetadataFetch)?
+    {
+        if body.len() + chunk.len() > cap {
+            return Err(DownstreamOauthError::MetadataFetch);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// IPv6 forms that carry an IPv4 address inside them and that no legitimate
@@ -2092,6 +1970,68 @@ fn forbidden_metadata_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// Drop a consent that outlived its window, with any approval ceremony tied
+/// to it, and return the error that sends the user back to the client.
+fn expire_consent(
+    next: &mut DownstreamOauthState,
+    consent_id: &str,
+    consent: &PendingConsent,
+) -> DownstreamOauthError {
+    next.pending_consents.remove(consent_id);
+    next.owner_authentication_ceremonies
+        .retain(|_, ceremony| ceremony.consent_id != consent_id);
+    DownstreamOauthError::AuthorizationExpired(ValidatedAuthorizationCallback {
+        redirect_uri: consent.redirect_uri.clone(),
+        state: consent.state.clone(),
+    })
+}
+
+/// Turn an approved consent into a single-use authorization code, record the
+/// redirect for replay, and extend the client's registration.
+fn issue_code_for_consent(
+    next: &mut DownstreamOauthState,
+    consent_id: &str,
+    consent: PendingConsent,
+    approval_ceremony_ids: Vec<String>,
+    now: u64,
+) -> AuthorizationRedirect {
+    next.pending_consents.remove(consent_id);
+    next.owner_authentication_ceremonies
+        .retain(|_, pending| pending.consent_id != consent_id);
+    let code = opaque_value();
+    next.pending_codes.insert(
+        code.clone(),
+        PendingAuthorizationCode {
+            client_id: consent.client_id.clone(),
+            redirect_uri: consent.redirect_uri.clone(),
+            code_challenge: consent.code_challenge,
+            scopes: consent.scopes,
+            resource: consent.resource,
+            expires_at: now + AUTH_CODE_LIFETIME_SECS,
+        },
+    );
+    if let Some(client) = next.clients.get_mut(&consent.client_id) {
+        client.last_used_at = Some(now);
+        client.expires_at = now + REGISTRATION_LIFETIME_SECS;
+    }
+    let redirect = AuthorizationRedirect {
+        location: redirect_with_params(
+            &consent.redirect_uri,
+            &[("code", &code), ("state", &consent.state)],
+        ),
+    };
+    next.completed_consents.insert(
+        consent_id.to_string(),
+        CompletedConsent {
+            client_id: consent.client_id,
+            redirect: redirect.clone(),
+            expires_at: now + AUTH_CODE_LIFETIME_SECS,
+            approval_ceremony_ids,
+        },
+    );
+    redirect
+}
+
 fn issue_token_pair(
     state: &mut DownstreamOauthState,
     client_id: &str,
@@ -2123,7 +2063,6 @@ fn issue_token_pair(
             resource: resource.to_string(),
             issued_at: now,
             expires_at: now + ACCESS_TOKEN_LIFETIME_SECS,
-            scope_model: SCOPE_MODEL_ENFORCED,
             family_id: family_id.to_string(),
         },
     );
@@ -2134,7 +2073,6 @@ fn issue_token_pair(
             scopes: scopes.to_vec(),
             resource: resource.to_string(),
             expires_at: now + REFRESH_TOKEN_LIFETIME_SECS,
-            scope_model: SCOPE_MODEL_ENFORCED,
             family_id: family_id.to_string(),
         },
     );
@@ -2203,30 +2141,6 @@ fn prune_consumed_refresh_tokens(state: &mut DownstreamOauthState) {
         .retain(|_, token| now.saturating_sub(token.consumed_at) < REFRESH_TOKEN_LIFETIME_SECS);
 }
 
-/// Give every pre-family record its own lineage.
-///
-/// A shared placeholder would be worse than none: one replay would revoke every
-/// grant issued before this change. Distinct ids mean legacy tokens simply have
-/// no chain to revoke, which matches reality — nothing recorded their rotation.
-///
-/// Returns the number of records this pass changed.
-fn backfill_token_families(state: &mut DownstreamOauthState) -> usize {
-    let mut backfilled = 0;
-    for record in state.access_tokens.values_mut() {
-        if record.family_id.is_empty() {
-            record.family_id = opaque_value();
-            backfilled += 1;
-        }
-    }
-    for record in state.refresh_tokens.values_mut() {
-        if record.family_id.is_empty() {
-            record.family_id = opaque_value();
-            backfilled += 1;
-        }
-    }
-    backfilled
-}
-
 fn opaque_value() -> String {
     let mut bytes = [0_u8; 32];
     rand::rng().fill_bytes(&mut bytes);
@@ -2269,408 +2183,6 @@ pub fn owner_enrollment_state_path_in_dir(
     state_file_path_in_dir(config, state_dir, STATE_VERSION)
 }
 
-fn lineage_file_path_in_dir(
-    config: &DownstreamOauthConfig,
-    state_dir: &std::path::Path,
-) -> PathBuf {
-    state_file_path_in_dir(config, state_dir, STATE_VERSION).with_extension("lineage.json")
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum LineagePhase {
-    Pending,
-    Complete,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct LegacyV2Lineage {
-    version: u8,
-    phase: LineagePhase,
-    full_digest: String,
-    global_digest: String,
-    client_material_digests: HashMap<String, String>,
-    revoked_client_ids: Vec<String>,
-}
-
-struct LegacyV2Snapshot {
-    lineage: LegacyV2Lineage,
-}
-
-fn reconcile_legacy_state(
-    config: &DownstreamOauthConfig,
-    state_dir: &std::path::Path,
-    current_path: &std::path::Path,
-    legacy_path: &std::path::Path,
-) -> Result<(), DownstreamOauthError> {
-    let lineage_path = lineage_file_path_in_dir(config, state_dir);
-    let lineage = load_lineage(&lineage_path)?;
-    match lineage {
-        None if !legacy_path.exists() => Ok(()),
-        None if current_path.exists() => Err(DownstreamOauthError::Persistence(format!(
-            "version 2 and version {STATE_VERSION} state exist without durable lineage; reconcile {} and {} before starting",
-            legacy_path.display(),
-            current_path.display()
-        ))),
-        None => {
-            let snapshot = legacy_v2_snapshot(legacy_path)?;
-            let mut pending = snapshot.lineage.clone();
-            pending.phase = LineagePhase::Pending;
-            require_durable(persist_lineage(&lineage_path, &pending)?, &lineage_path)?;
-            let migrated = load_persisted_state(legacy_path)?;
-            require_durable(persist_state(current_path, &migrated)?, current_path)?;
-            let mut complete = snapshot.lineage;
-            complete.phase = LineagePhase::Complete;
-            require_durable(persist_lineage(&lineage_path, &complete)?, &lineage_path)
-        }
-        Some(lineage) if lineage.phase == LineagePhase::Pending => {
-            if !legacy_path.exists() {
-                return Err(DownstreamOauthError::Persistence(format!(
-                    "pending version 2 migration is missing its source file: {}",
-                    legacy_path.display()
-                )));
-            }
-            let snapshot = legacy_v2_snapshot(legacy_path)?;
-            if snapshot.lineage.full_digest != lineage.full_digest {
-                return Err(DownstreamOauthError::Persistence(
-                    "version 2 state changed during pending migration; explicit reconciliation is required"
-                        .to_string(),
-                ));
-            }
-            if !current_path.exists() {
-                let migrated = load_persisted_state(legacy_path)?;
-                require_durable(persist_state(current_path, &migrated)?, current_path)?;
-            }
-            let mut complete = lineage;
-            complete.phase = LineagePhase::Complete;
-            require_durable(persist_lineage(&lineage_path, &complete)?, &lineage_path)
-        }
-        Some(mut lineage) => {
-            if !current_path.exists() {
-                return Err(DownstreamOauthError::Persistence(format!(
-                    "version {STATE_VERSION} state is missing while completed migration lineage exists; restore or reconcile {} instead of reimporting stale {}",
-                    current_path.display(),
-                    legacy_path.display()
-                )));
-            }
-            if !legacy_path.exists() {
-                return Ok(());
-            }
-            let snapshot = legacy_v2_snapshot(legacy_path)?;
-            if snapshot.lineage.full_digest == lineage.full_digest {
-                return Ok(());
-            }
-            let baseline_revoked = lineage
-                .revoked_client_ids
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>();
-            let current_revoked = snapshot
-                .lineage
-                .revoked_client_ids
-                .iter()
-                .cloned()
-                .collect::<HashSet<_>>();
-            let added_revocations = current_revoked
-                .difference(&baseline_revoked)
-                .cloned()
-                .collect::<HashSet<_>>();
-            let mut baseline_material = lineage.client_material_digests.clone();
-            let mut current_material = snapshot.lineage.client_material_digests.clone();
-            for client_id in &added_revocations {
-                baseline_material.remove(client_id);
-                current_material.remove(client_id);
-            }
-            if snapshot.lineage.global_digest != lineage.global_digest
-                || !current_revoked.is_superset(&baseline_revoked)
-            {
-                return Err(DownstreamOauthError::Persistence(
-                    "ambiguous version 2 changes include more than added revocations; explicit non-destructive reconciliation is required"
-                        .to_string(),
-                ));
-            }
-
-            let changed_clients = baseline_material
-                .keys()
-                .chain(current_material.keys())
-                .filter(|client_id| {
-                    baseline_material.get(*client_id) != current_material.get(*client_id)
-                })
-                .cloned()
-                .collect::<HashSet<_>>();
-            if changed_clients.iter().any(|client_id| {
-                !baseline_material.contains_key(client_id)
-                    || !current_material.contains_key(client_id)
-            }) {
-                return Err(DownstreamOauthError::Persistence(
-                    "ambiguous version 2 changes add or remove client grants; explicit non-destructive reconciliation is required"
-                        .to_string(),
-                ));
-            }
-
-            let mut current = load_persisted_state(current_path)?;
-            let rollback = load_persisted_state(legacy_path)?;
-            for client_id in &changed_clients {
-                if current.revoked_client_ids.contains(client_id)
-                    || current_revoked.contains(client_id)
-                {
-                    current.remove_client_material(client_id);
-                } else {
-                    current.replace_client_material_from(&rollback, client_id);
-                }
-            }
-            for client_id in &added_revocations {
-                current.remove_client_material(client_id);
-                current.revoked_client_ids.insert(client_id.clone());
-            }
-            current
-                .revoked_client_ids
-                .extend(current_revoked.iter().cloned());
-            require_durable(persist_state(current_path, &current)?, current_path)?;
-            lineage.full_digest = snapshot.lineage.full_digest;
-            lineage.global_digest = snapshot.lineage.global_digest;
-            lineage.client_material_digests = snapshot.lineage.client_material_digests;
-            lineage.revoked_client_ids = snapshot.lineage.revoked_client_ids;
-            require_durable(persist_lineage(&lineage_path, &lineage)?, &lineage_path)
-        }
-    }
-}
-
-fn load_lineage(path: &std::path::Path) -> Result<Option<LegacyV2Lineage>, DownstreamOauthError> {
-    let data = match std::fs::read(path) {
-        Ok(data) => data,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(DownstreamOauthError::Persistence(error.to_string())),
-    };
-    let lineage: LegacyV2Lineage = serde_json::from_slice(&data)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    if lineage.version != 2 {
-        return Err(DownstreamOauthError::Persistence(
-            "unsupported downstream OAuth migration lineage version".to_string(),
-        ));
-    }
-    Ok(Some(lineage))
-}
-
-fn persist_lineage(
-    path: &std::path::Path,
-    lineage: &LegacyV2Lineage,
-) -> Result<PersistOutcome, DownstreamOauthError> {
-    let json = serde_json::to_vec_pretty(lineage)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    persist_bytes(path, &json)
-}
-
-fn legacy_v2_snapshot(path: &std::path::Path) -> Result<LegacyV2Snapshot, DownstreamOauthError> {
-    let data = std::fs::read(path)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    let value: serde_json::Value = serde_json::from_slice(&data)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    if value.get("version").and_then(serde_json::Value::as_u64) != Some(2) {
-        return Err(DownstreamOauthError::Persistence(
-            "legacy downstream OAuth state must have version 2".to_string(),
-        ));
-    }
-    let mut revoked_client_ids = value
-        .get("revoked_client_ids")
-        .and_then(serde_json::Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(serde_json::Value::as_str)
-        .map(ToString::to_string)
-        .collect::<Vec<_>>();
-    revoked_client_ids.sort();
-    revoked_client_ids.dedup();
-    let full_digest = canonical_json_digest(&value)?;
-    let (global_digest, client_material_digests) = legacy_v2_material_digests(&value)?;
-    Ok(LegacyV2Snapshot {
-        lineage: LegacyV2Lineage {
-            version: 2,
-            phase: LineagePhase::Complete,
-            full_digest,
-            global_digest,
-            client_material_digests,
-            revoked_client_ids,
-        },
-    })
-}
-
-fn legacy_v2_material_digests(
-    value: &serde_json::Value,
-) -> Result<(String, HashMap<String, String>), DownstreamOauthError> {
-    const MATERIAL_FIELDS: [&str; 6] = [
-        "clients",
-        "pending_consents",
-        "completed_consents",
-        "pending_codes",
-        "access_tokens",
-        "refresh_tokens",
-    ];
-
-    let mut client_ids = HashSet::new();
-    for field in MATERIAL_FIELDS {
-        let Some(records) = value.get(field).and_then(serde_json::Value::as_object) else {
-            continue;
-        };
-        if field == "clients" {
-            client_ids.extend(records.keys().cloned());
-        } else {
-            client_ids.extend(records.values().filter_map(|record| {
-                record
-                    .get("client_id")
-                    .and_then(serde_json::Value::as_str)
-                    .map(ToString::to_string)
-            }));
-        }
-    }
-
-    let mut global = value.clone();
-    global["revoked_client_ids"] = serde_json::json!([]);
-    for field in MATERIAL_FIELDS {
-        if global.get(field).is_some() {
-            global[field] = serde_json::json!({});
-        }
-    }
-
-    let mut client_material_digests = HashMap::new();
-    for client_id in client_ids {
-        let mut material = serde_json::Map::new();
-        for field in MATERIAL_FIELDS {
-            let Some(records) = value.get(field).and_then(serde_json::Value::as_object) else {
-                continue;
-            };
-            let records = records
-                .iter()
-                .filter(|(record_id, record)| {
-                    if field == "clients" {
-                        record_id.as_str() == client_id
-                    } else {
-                        record.get("client_id").and_then(serde_json::Value::as_str)
-                            == Some(client_id.as_str())
-                    }
-                })
-                .map(|(key, record)| (key.clone(), record.clone()))
-                .collect();
-            material.insert(field.to_string(), serde_json::Value::Object(records));
-        }
-        client_material_digests.insert(
-            client_id,
-            canonical_json_digest(&serde_json::Value::Object(material))?,
-        );
-    }
-
-    Ok((canonical_json_digest(&global)?, client_material_digests))
-}
-
-fn canonical_json_digest(value: &serde_json::Value) -> Result<String, DownstreamOauthError> {
-    use sha2::Digest as _;
-    let canonical = canonical_json_value(value);
-    let bytes = serde_json::to_vec(&canonical)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    Ok(hex::encode(sha2::Sha256::digest(bytes)))
-}
-
-fn canonical_json_value(value: &serde_json::Value) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut entries = map.iter().collect::<Vec<_>>();
-            entries.sort_by_key(|(key, _)| *key);
-            serde_json::Value::Object(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key.clone(), canonical_json_value(value)))
-                    .collect(),
-            )
-        }
-        serde_json::Value::Array(items) => {
-            serde_json::Value::Array(items.iter().map(canonical_json_value).collect())
-        }
-        _ => value.clone(),
-    }
-}
-
-fn require_durable(
-    outcome: PersistOutcome,
-    path: &std::path::Path,
-) -> Result<(), DownstreamOauthError> {
-    match outcome {
-        PersistOutcome::Durable => Ok(()),
-        PersistOutcome::CommittedDurabilityUncertain(error) => {
-            Err(DownstreamOauthError::Persistence(format!(
-                "{} was renamed but directory durability remains uncertain after {PARENT_DIR_SYNC_ATTEMPTS} attempts: {error}",
-                path.display()
-            )))
-        }
-    }
-}
-
-/// Startup treatment for grants stored before scope enforcement (scope model 1).
-///
-/// Replacing such a grant's stored scopes with the configured set is a
-/// no-privilege-change correction only for grants that were served under the
-/// legacy local-trust policy, where the stored scopes were decorative and every
-/// method family stayed reachable regardless of them. Under
-/// `modern_downstream_enabled` the modern `/mcp` path already gated method
-/// families on those same stored scopes, so the grant records real owner
-/// consent from the passkey ceremony and widening it would hand the client
-/// access the owner never approved. Widening is therefore gated on the flag.
-/// Modern-era records keep their consented scopes and are only stamped as
-/// enforced, so later startups stop re-evaluating them.
-///
-/// Returns the number of records this pass changed.
-fn mark_pre_enforcement_grants(
-    state: &mut DownstreamOauthState,
-    config: &DownstreamOauthConfig,
-) -> usize {
-    let widen_to = if config.modern_downstream_enabled {
-        None
-    } else if config.oauth_scopes.is_empty() {
-        return 0;
-    } else {
-        let mut widened = config.oauth_scopes.clone();
-        widened.sort();
-        widened.dedup();
-        Some(widened)
-    };
-
-    let mut marked = 0;
-    for record in state.access_tokens.values_mut() {
-        if record.scope_model >= SCOPE_MODEL_ENFORCED {
-            continue;
-        }
-        if let Some(widened) = &widen_to {
-            record.scopes = widened.clone();
-            tracing::info!(
-                client_id = %record.client_id,
-                "widened pre-enforcement access-token grant to the configured scope set"
-            );
-        }
-        record.scope_model = SCOPE_MODEL_ENFORCED;
-        marked += 1;
-    }
-    for record in state.refresh_tokens.values_mut() {
-        if record.scope_model >= SCOPE_MODEL_ENFORCED {
-            continue;
-        }
-        if let Some(widened) = &widen_to {
-            record.scopes = widened.clone();
-            tracing::info!(
-                client_id = %record.client_id,
-                "widened pre-enforcement refresh-token grant to the configured scope set"
-            );
-        }
-        record.scope_model = SCOPE_MODEL_ENFORCED;
-        marked += 1;
-    }
-    if widen_to.is_none() && marked > 0 {
-        tracing::info!(
-            marked,
-            "marked pre-enforcement grants as scope-enforced without widening because modern-era downstream enforcement was already active"
-        );
-    }
-    marked
-}
-
 fn load_persisted_state(
     path: &std::path::Path,
 ) -> Result<DownstreamOauthState, DownstreamOauthError> {
@@ -2683,9 +2195,7 @@ fn load_persisted_state(
     };
     let mut state: DownstreamOauthState = serde_json::from_str(&data)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    if state.version == 2 {
-        state.version = STATE_VERSION;
-    } else if state.version != STATE_VERSION {
+    if state.version != STATE_VERSION {
         return Err(DownstreamOauthError::Persistence(
             "unsupported downstream OAuth state version".to_string(),
         ));
@@ -2704,9 +2214,28 @@ fn persist_state(
     path: &std::path::Path,
     state: &DownstreamOauthState,
 ) -> Result<PersistOutcome, DownstreamOauthError> {
-    let json = serde_json::to_vec_pretty(state)
+    let json = serde_json::to_vec(state)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    persist_bytes(path, &json)
+    run_blocking_io(|| persist_bytes(path, &json))
+}
+
+/// Run a blocking state write without stalling the other tasks scheduled on
+/// this runtime worker.
+///
+/// Deliberately not `spawn_blocking`: that would add an await point between
+/// writing the file and publishing the same state in memory, and a caller
+/// cancelled there (a dropped HTTP request) would leave the disk ahead of
+/// memory, so a restart could resurrect an operation the client never saw
+/// complete. `block_in_place` keeps the commit synchronous with respect to
+/// the caller. A current-thread runtime cannot hand its other tasks to
+/// another worker, so there the write simply runs inline, as before.
+fn run_blocking_io<T>(write: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(write)
+        }
+        _ => write(),
+    }
 }
 
 fn persist_bytes(
@@ -2877,6 +2406,44 @@ mod tests {
         ))
     }
 
+    /// Serve one HTTP response with a chunked body that never ends, and
+    /// return the URL. Nothing in the response states a length.
+    async fn endless_chunked_server() -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let address = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("accept");
+            let mut request = [0_u8; 1024];
+            let _ = socket.read(&mut request).await;
+            let _ = socket
+                .write_all(
+                    b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\n\r\n",
+                )
+                .await;
+            let chunk = format!("{:x}\r\n{}\r\n", 4096, "a".repeat(4096));
+            while socket.write_all(chunk.as_bytes()).await.is_ok() {}
+        });
+        format!("http://{address}/client.json")
+    }
+
+    #[tokio::test]
+    async fn metadata_body_cap_applies_to_chunked_responses() {
+        crate::tls::ensure_rustls_provider_installed();
+        let url = endless_chunked_server().await;
+        let response = reqwest::Client::new().get(url).send().await.expect("send");
+        assert!(response.content_length().is_none(), "body must be chunked");
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            read_capped_body(response, MAX_METADATA_DOCUMENT_BYTES),
+        )
+        .await
+        .expect("an oversized chunked body must be refused, not buffered to the end");
+        assert!(matches!(result, Err(DownstreamOauthError::MetadataFetch)));
+    }
+
     #[test]
     fn ipv6_wrapped_internal_addresses_are_forbidden_metadata_targets() {
         // Each of these reaches an internal IPv4 address through an IPv6
@@ -2932,7 +2499,6 @@ mod tests {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
             local_port: 3282,
-            modern_downstream_enabled: false,
         }
     }
 
@@ -4291,153 +3857,22 @@ mod tests {
         );
     }
 
+    /// State files written before the v2 migration code was deleted carry a
+    /// `scope_model` field on every grant. It must keep loading, and the grant
+    /// must keep exactly the scopes it was stored with.
     #[tokio::test]
-    async fn v2_state_migrates_without_losing_grants() {
+    async fn v3_state_with_scope_model_still_loads_with_stored_scopes() {
         let now = epoch_secs();
-        let fixture = serde_json::json!({
-            "version": 2,
-            "clients": {
-                "plug_existing": {
-                    "client_id": "plug_existing",
-                    "client_name": "Existing client",
-                    "redirect_uris": ["https://client.example/callback"],
-                    "source": "dynamic_registration",
-                    "created_at": now,
-                    "last_used_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "access_tokens": {
-                "access-existing": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "issued_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "refresh_tokens": {
-                "refresh-existing": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "expires_at": now + 3600
-                }
-            },
-            "revoked_client_ids": []
-        });
-        let path = write_state_fixture(fixture);
-
-        let manager = DownstreamOauthManager::new_with_state_path(test_config(), path)
-            .expect("migrate version 2 state");
-        assert_eq!(manager.persisted_state_version_for_tests().await, 3);
-        let state = manager.state.lock().await;
-
-        assert!(state.clients.contains_key("plug_existing"));
-        assert!(state.access_tokens.contains_key("access-existing"));
-        assert!(state.refresh_tokens.contains_key("refresh-existing"));
-    }
-
-    #[tokio::test]
-    async fn try_new_migrates_into_v3_without_mutating_v2_source() {
-        let temp = tempfile::tempdir().expect("state tempdir");
-        let state_dir = temp.path().join("downstream_oauth");
-        std::fs::create_dir_all(&state_dir).expect("state directory");
-        let config = test_config();
-        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
-        let current_path = state_file_path_in_dir(&config, &state_dir, STATE_VERSION);
-        let now = epoch_secs();
-        let fixture = serde_json::json!({
-            "version": 2,
-            "clients": {
-                "plug_existing": {
-                    "client_id": "plug_existing",
-                    "client_name": "Existing client",
-                    "redirect_uris": ["https://client.example/callback"],
-                    "source": "dynamic_registration",
-                    "created_at": now,
-                    "last_used_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "access_tokens": {
-                "access-existing": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "issued_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "refresh_tokens": {
-                "refresh-existing": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "expires_at": now + 3600
-                }
-            },
-            "revoked_client_ids": ["plug_revoked"]
-        });
-        let legacy_bytes = serde_json::to_vec_pretty(&fixture).expect("serialize fixture");
-        std::fs::write(&legacy_path, &legacy_bytes).expect("write legacy fixture");
-
-        let manager = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
-            .expect("migrate production state paths");
-
-        assert_eq!(
-            std::fs::read(&legacy_path).expect("read legacy source"),
-            legacy_bytes,
-            "version 2 rollback source must remain byte-for-byte unchanged"
-        );
-        let current: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&current_path).expect("read version 3 target"))
-                .expect("parse version 3 target");
-        assert_eq!(current["version"], 3);
-        assert!(current["clients"].get("plug_existing").is_some());
-        assert!(current["access_tokens"].get("access-existing").is_some());
-        assert!(current["refresh_tokens"].get("refresh-existing").is_some());
-        assert_eq!(
-            current["revoked_client_ids"],
-            serde_json::json!(["plug_revoked"])
-        );
-
-        let state = manager.state.lock().await;
-        assert!(state.clients.contains_key("plug_existing"));
-        assert!(state.access_tokens.contains_key("access-existing"));
-        assert!(state.refresh_tokens.contains_key("refresh-existing"));
-        assert!(state.revoked_client_ids.contains("plug_revoked"));
-    }
-
-    fn scope_migration_fixture(
-        now: u64,
-        extra_token_fields: serde_json::Value,
-    ) -> serde_json::Value {
-        let mut access = serde_json::json!({
+        let token = serde_json::json!({
             "client_id": "plug_existing",
             "scopes": ["tools:read"],
             "resource": "https://plug.example.com/mcp",
             "issued_at": now,
-            "expires_at": now + 3600
+            "expires_at": now + 3600,
+            "scope_model": 2,
+            "family_id": "family-existing"
         });
-        let mut refresh = serde_json::json!({
-            "client_id": "plug_existing",
-            "scopes": ["tools:read"],
-            "resource": "https://plug.example.com/mcp",
-            "expires_at": now + 3600
-        });
-        for record in [&mut access, &mut refresh] {
-            record
-                .as_object_mut()
-                .expect("token fixture object")
-                .extend(
-                    extra_token_fields
-                        .as_object()
-                        .expect("extra fields object")
-                        .clone(),
-                );
-        }
-        serde_json::json!({
+        let fixture = serde_json::json!({
             "version": 3,
             "clients": {
                 "plug_existing": {
@@ -4450,487 +3885,58 @@ mod tests {
                     "expires_at": now + 3600
                 }
             },
-            "access_tokens": { "access-existing": access },
-            "refresh_tokens": { "refresh-existing": refresh }
-        })
-    }
+            "access_tokens": { "access-existing": token.clone() },
+            "refresh_tokens": { "refresh-existing": token }
+        });
+        let path = write_state_fixture(fixture);
+        let wider = DownstreamOauthConfig {
+            oauth_scopes: vec!["tools:read".to_string(), "tools:call".to_string()],
+            ..test_config()
+        };
 
-    fn two_scope_config() -> DownstreamOauthConfig {
-        DownstreamOauthConfig {
-            public_base_url: "https://plug.example.com".to_string(),
-            oauth_scopes: vec!["tools:read".to_string(), "resources:read".to_string()],
-            local_port: 3282,
-            modern_downstream_enabled: false,
-        }
-    }
-
-    fn two_scope_modern_config() -> DownstreamOauthConfig {
-        DownstreamOauthConfig {
-            modern_downstream_enabled: true,
-            ..two_scope_config()
-        }
-    }
-
-    #[tokio::test]
-    async fn pre_enforcement_grants_widen_to_configured_scopes_on_load() {
-        let now = epoch_secs();
-        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
-
-        let manager = DownstreamOauthManager::new_with_state_path(two_scope_config(), path.clone())
-            .expect("load pre-enforcement state");
-
-        let expected = vec!["resources:read".to_string(), "tools:read".to_string()];
-        let state = manager.state.lock().await;
-        let access = state.access_tokens.get("access-existing").unwrap();
-        assert_eq!(
-            access.scopes, expected,
-            "pre-enforcement access grant must widen to the sorted configured set"
-        );
-        assert_eq!(access.scope_model, SCOPE_MODEL_ENFORCED);
-        let refresh = state.refresh_tokens.get("refresh-existing").unwrap();
-        assert_eq!(
-            refresh.scopes, expected,
-            "pre-enforcement refresh grant must widen to the sorted configured set"
-        );
-        assert_eq!(refresh.scope_model, SCOPE_MODEL_ENFORCED);
-        drop(state);
-
-        let disk: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read migrated state"))
-                .expect("parse migrated state");
-        for kind in ["access_tokens", "refresh_tokens"] {
-            let record = &disk[kind][if kind == "access_tokens" {
-                "access-existing"
-            } else {
-                "refresh-existing"
-            }];
-            assert_eq!(
-                record["scopes"],
-                serde_json::json!(["resources:read", "tools:read"]),
-                "widened {kind} grant must be persisted"
-            );
-            assert_eq!(
-                record["scope_model"],
-                serde_json::json!(SCOPE_MODEL_ENFORCED)
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn enforced_grants_keep_their_scopes_under_a_wider_config() {
-        let now = epoch_secs();
-        let path = write_state_fixture(scope_migration_fixture(
-            now,
-            serde_json::json!({ "scope_model": SCOPE_MODEL_ENFORCED }),
+        let manager = DownstreamOauthManager::new_with_state_path(wider, path)
+            .expect("v3 state with scope_model loads");
+        let resource = manager.resource();
+        assert!(matches!(
+            manager
+                .validate_access_token_for(
+                    "access-existing",
+                    &["tools:read".to_string()],
+                    &resource
+                )
+                .await,
+            AccessTokenValidation::Valid(_)
         ));
-
-        let manager = DownstreamOauthManager::new_with_state_path(two_scope_config(), path)
-            .expect("load enforced state");
-
-        let state = manager.state.lock().await;
-        let expected = vec!["tools:read".to_string()];
-        assert_eq!(
-            state.access_tokens.get("access-existing").unwrap().scopes,
-            expected,
-            "already-enforced access grant must keep its consented scopes"
-        );
-        assert_eq!(
-            state.refresh_tokens.get("refresh-existing").unwrap().scopes,
-            expected,
-            "already-enforced refresh grant must keep its consented scopes"
-        );
-    }
-
-    #[tokio::test]
-    async fn grant_widening_is_idempotent_across_restarts() {
-        let now = epoch_secs();
-        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
-
-        let first = DownstreamOauthManager::new_with_state_path(two_scope_config(), path.clone())
-            .expect("first load migrates");
-        drop(first);
-        let after_migration = std::fs::read(&path).expect("read post-migration state");
-
-        let second = DownstreamOauthManager::new_with_state_path(two_scope_config(), path.clone())
-            .expect("second load is a no-op");
-        drop(second);
-        assert_eq!(
-            std::fs::read(&path).expect("read post-restart state"),
-            after_migration,
-            "a second startup must not rewrite already-migrated state"
-        );
-    }
-
-    #[tokio::test]
-    async fn modern_era_pre_enforcement_grants_keep_their_consented_scopes() {
-        let now = epoch_secs();
-        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
-
-        let manager =
-            DownstreamOauthManager::new_with_state_path(two_scope_modern_config(), path.clone())
-                .expect("load pre-enforcement state under modern enforcement");
-
-        let consented = vec!["tools:read".to_string()];
-        let state = manager.state.lock().await;
-        let access = state.access_tokens.get("access-existing").unwrap();
-        assert_eq!(
-            access.scopes, consented,
-            "a grant already gated by modern enforcement must keep the scopes the owner approved"
-        );
-        assert_eq!(access.scope_model, SCOPE_MODEL_ENFORCED);
-        let refresh = state.refresh_tokens.get("refresh-existing").unwrap();
-        assert_eq!(
-            refresh.scopes, consented,
-            "the refresh record must not re-mint a widened set on every rotation"
-        );
-        assert_eq!(refresh.scope_model, SCOPE_MODEL_ENFORCED);
-        drop(state);
-
-        let disk: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(&path).expect("read marked state"))
-                .expect("parse marked state");
-        for (kind, key) in [
-            ("access_tokens", "access-existing"),
-            ("refresh_tokens", "refresh-existing"),
-        ] {
-            let record = &disk[kind][key];
-            assert_eq!(
-                record["scopes"],
-                serde_json::json!(["tools:read"]),
-                "{kind} grant must persist with its consented scopes"
-            );
-            assert_eq!(
-                record["scope_model"],
-                serde_json::json!(SCOPE_MODEL_ENFORCED),
-                "{kind} grant must still be stamped so later startups skip it"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn modern_era_grant_marking_is_idempotent_across_restarts() {
-        let now = epoch_secs();
-        let path = write_state_fixture(scope_migration_fixture(now, serde_json::json!({})));
-        let before = std::fs::read(&path).expect("read fixture state");
-
-        let first =
-            DownstreamOauthManager::new_with_state_path(two_scope_modern_config(), path.clone())
-                .expect("first load marks");
-        drop(first);
-        let after_marking = std::fs::read(&path).expect("read post-marking state");
-        assert_ne!(
-            before, after_marking,
-            "the first startup must persist the enforced-scope stamp"
-        );
-
-        let second =
-            DownstreamOauthManager::new_with_state_path(two_scope_modern_config(), path.clone())
-                .expect("second load is a no-op");
-        drop(second);
-        assert_eq!(
-            std::fs::read(&path).expect("read post-restart state"),
-            after_marking,
-            "a second startup must not rewrite already-marked state"
-        );
-    }
-
-    #[tokio::test]
-    async fn roll_forward_merges_rollback_revocation_by_digest_and_preserves_owner_state() {
-        let temp = tempfile::tempdir().expect("state tempdir");
-        let state_dir = temp.path().join("downstream_oauth");
-        std::fs::create_dir_all(&state_dir).expect("state directory");
-        let config = test_config();
-        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
-        let current_path = state_file_path_in_dir(&config, &state_dir, STATE_VERSION);
-        let now = epoch_secs();
-        let mut rollback_state = serde_json::json!({
-            "version": 2,
-            "clients": {
-                "plug_existing": {
-                    "client_id": "plug_existing",
-                    "client_name": "Existing client",
-                    "redirect_uris": ["https://client.example/callback"],
-                    "source": "dynamic_registration",
-                    "created_at": now,
-                    "last_used_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "access_tokens": {
-                "access-existing": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "issued_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "refresh_tokens": {
-                "refresh-existing": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "expires_at": now + 3600
-                }
-            },
-            "revoked_client_ids": []
-        });
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).expect("serialize initial v2"),
-        )
-        .expect("write initial v2");
-
-        let initial = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
-            .expect("initial roll-forward migration");
-        {
-            let mut live = initial.state.lock().await;
-            let mut next = live.clone();
-            next.owner_bootstraps.insert(
-                "owner-only-v3".to_string(),
-                OwnerBootstrap {
-                    secret_hash: "owner-secret-hash".to_string(),
-                    expires_at: now + 3600,
-                },
-            );
-            assert!(matches!(
-                persist_state(&current_path, &next).expect("persist v3 owner state"),
-                PersistOutcome::Durable
-            ));
-            *live = next;
-        }
-        drop(initial);
-        let v3_modified = std::fs::metadata(&current_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("version 3 modification time");
-
-        rollback_state["clients"]
-            .as_object_mut()
-            .expect("version 2 clients")
-            .remove("plug_existing");
-        rollback_state["access_tokens"]
-            .as_object_mut()
-            .expect("version 2 access tokens")
-            .remove("access-existing");
-        rollback_state["refresh_tokens"]
-            .as_object_mut()
-            .expect("version 2 refresh tokens")
-            .remove("refresh-existing");
-        rollback_state["revoked_client_ids"] = serde_json::json!(["plug_existing"]);
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).expect("serialize rollback mutation"),
-        )
-        .expect("write rollback mutation");
-        filetime::set_file_mtime(
-            &legacy_path,
-            filetime::FileTime::from_system_time(
-                v3_modified
-                    .checked_sub(std::time::Duration::from_secs(60))
-                    .expect("clock-skewed timestamp"),
+        assert!(
+            matches!(
+                manager
+                    .validate_access_token_for(
+                        "access-existing",
+                        &["tools:call".to_string()],
+                        &resource
+                    )
+                    .await,
+                AccessTokenValidation::InsufficientScope
             ),
-        )
-        .expect("set rollback file time behind version 3");
-
-        let reconciled = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
-            .expect("digest lineage merges rollback revocation despite backward clock");
-        let state = reconciled.state.lock().await;
-        assert!(state.revoked_client_ids.contains("plug_existing"));
-        assert!(!state.clients.contains_key("plug_existing"));
-        assert!(state.owner_bootstraps.contains_key("owner-only-v3"));
-        drop(state);
-        drop(reconciled);
-
-        rollback_state["revoked_client_ids"] =
-            serde_json::json!(["plug_existing", "plug_equal_clock_revocation"]);
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).expect("serialize equal-clock rollback"),
-        )
-        .expect("write equal-clock rollback");
-        let current_mtime = std::fs::metadata(&current_path)
-            .and_then(|metadata| metadata.modified())
-            .expect("current v3 modification time");
-        filetime::set_file_mtime(
-            &legacy_path,
-            filetime::FileTime::from_system_time(current_mtime),
-        )
-        .expect("set equal version 2 and version 3 timestamps");
-        let equal_clock =
-            DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
-                .expect("digest lineage merges revocation with equal clocks");
-        let equal_clock_state = equal_clock.state.lock().await;
-        assert!(
-            equal_clock_state
-                .revoked_client_ids
-                .contains("plug_equal_clock_revocation")
+            "a stored grant must not widen to the configured scope set"
         );
-        assert!(
-            equal_clock_state
-                .owner_bootstraps
-                .contains_key("owner-only-v3")
+        let state = manager.state.lock().await;
+        assert_eq!(
+            state.refresh_tokens["refresh-existing"].scopes,
+            vec!["tools:read".to_string()]
         );
-        drop(equal_clock_state);
-        drop(equal_clock);
-
-        assert!(lineage_file_path_in_dir(&config, &state_dir).exists());
-        std::fs::remove_file(&current_path).expect("simulate lost version 3 file");
-        let error = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
-            .expect_err("completed lineage must block stale v2 reimport when v3 is missing");
-        assert!(error.to_string().contains("version 3 state is missing"));
-    }
-
-    #[tokio::test]
-    async fn roll_forward_reconciles_rollback_token_activity_and_preserves_v3_owner_state() {
-        let temp = tempfile::tempdir().expect("state tempdir");
-        let state_dir = temp.path().join("downstream_oauth");
-        std::fs::create_dir_all(&state_dir).expect("state directory");
-        let config = test_config();
-        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
-        let current_path = state_file_path_in_dir(&config, &state_dir, STATE_VERSION);
-        let now = epoch_secs();
-        let mut rollback_state = serde_json::json!({
-            "version": 2,
-            "clients": {
-                "plug_existing": {
-                    "client_id": "plug_existing",
-                    "client_name": "Existing client",
-                    "redirect_uris": ["https://client.example/callback"],
-                    "source": "dynamic_registration",
-                    "created_at": now,
-                    "last_used_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "access_tokens": {
-                "access-old": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "issued_at": now,
-                    "expires_at": now + 3600
-                }
-            },
-            "refresh_tokens": {
-                "refresh-old": {
-                    "client_id": "plug_existing",
-                    "scopes": ["tools:read"],
-                    "resource": "https://plug.example.com/mcp",
-                    "expires_at": now + 3600
-                }
-            },
-            "revoked_client_ids": ["plug_revoked_in_v2"]
-        });
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).unwrap(),
-        )
-        .expect("write initial v2");
-
-        let initial = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
-            .expect("initial migration");
-        {
-            let mut live = initial.state.lock().await;
-            let mut next = live.clone();
-            next.owner_bootstraps.insert(
-                "owner-only-v3".to_string(),
-                OwnerBootstrap {
-                    secret_hash: "owner-secret-hash".to_string(),
-                    expires_at: now + 3600,
-                },
-            );
-            next.revoked_client_ids
-                .insert("plug_revoked_in_v3".to_string());
-            assert!(matches!(
-                persist_state(&current_path, &next).unwrap(),
-                PersistOutcome::Durable
-            ));
-            *live = next;
-        }
-        drop(initial);
-
-        rollback_state["access_tokens"]
-            .as_object_mut()
-            .unwrap()
-            .remove("access-old");
-        rollback_state["refresh_tokens"]
-            .as_object_mut()
-            .unwrap()
-            .remove("refresh-old");
-        rollback_state["access_tokens"]["access-rotated"] = serde_json::json!({
-            "client_id": "plug_existing",
-            "scopes": ["tools:read"],
-            "resource": "https://plug.example.com/mcp",
-            "issued_at": now + 1,
-            "expires_at": now + 3600
-        });
-        rollback_state["refresh_tokens"]["refresh-rotated"] = serde_json::json!({
-            "client_id": "plug_existing",
-            "scopes": ["tools:read"],
-            "resource": "https://plug.example.com/mcp",
-            "expires_at": now + 3600
-        });
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).unwrap(),
-        )
-        .expect("write rollback token activity");
-
-        let reconciled = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
-            .expect("re-upgrade reconciles rollback token activity");
-        let state = reconciled.state.lock().await;
-        assert!(state.access_tokens.contains_key("access-rotated"));
-        assert!(state.refresh_tokens.contains_key("refresh-rotated"));
-        assert!(!state.access_tokens.contains_key("access-old"));
-        assert!(!state.refresh_tokens.contains_key("refresh-old"));
-        assert!(state.owner_bootstraps.contains_key("owner-only-v3"));
-        assert!(state.revoked_client_ids.contains("plug_revoked_in_v2"));
-        assert!(state.revoked_client_ids.contains("plug_revoked_in_v3"));
+        assert_eq!(
+            state.refresh_tokens["refresh-existing"].family_id,
+            "family-existing"
+        );
     }
 
     #[test]
-    fn roll_forward_blocks_ambiguous_rollback_grant_changes() {
-        let temp = tempfile::tempdir().expect("state tempdir");
-        let state_dir = temp.path().join("downstream_oauth");
-        std::fs::create_dir_all(&state_dir).expect("state directory");
-        let config = test_config();
-        let legacy_path = state_file_path_in_dir(&config, &state_dir, 2);
-        let now = epoch_secs();
-        let mut rollback_state = serde_json::json!({
-            "version": 2,
-            "clients": {},
-            "access_tokens": {},
-            "refresh_tokens": {},
-            "revoked_client_ids": []
-        });
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).expect("serialize initial v2"),
-        )
-        .expect("write initial v2");
-        drop(
-            DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
-                .expect("initial migration"),
-        );
-
-        rollback_state["clients"]["plug_rollback_grant"] = serde_json::json!({
-            "client_id": "plug_rollback_grant",
-            "client_name": "Rollback grant",
-            "redirect_uris": ["https://client.example/callback"],
-            "source": "dynamic_registration",
-            "created_at": now,
-            "last_used_at": now,
-            "expires_at": now + 3600
-        });
-        std::fs::write(
-            &legacy_path,
-            serde_json::to_vec_pretty(&rollback_state).expect("serialize ambiguous rollback"),
-        )
-        .expect("write ambiguous rollback");
-
-        let error = DownstreamOauthManager::try_new_with_state_dir(config, &state_dir)
-            .expect_err("rollback grants require explicit operator reconciliation");
-        assert!(error.to_string().contains("ambiguous version 2 changes"));
+    fn version_2_state_is_no_longer_loaded() {
+        let path = write_state_fixture(serde_json::json!({ "version": 2 }));
+        let error = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect_err("version 2 state is not migrated any more");
+        assert!(error.to_string().contains("unsupported"));
     }
 
     #[tokio::test]
@@ -4959,6 +3965,24 @@ mod tests {
             restarted
                 .pending_consent_exists_for_tests(&consent.consent_id)
                 .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_commits_persist_on_the_multi_thread_runtime() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        drop(manager);
+
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("restart manager");
+        assert!(
+            restarted
+                .state
+                .lock()
+                .await
+                .clients
+                .contains_key(&client.client_id)
         );
     }
 
@@ -5137,41 +4161,6 @@ mod tests {
     }
 
     #[test]
-    fn pre_family_records_are_backfilled_with_distinct_lineages() {
-        let mut state = DownstreamOauthState::default();
-        for token in ["legacy-a", "legacy-b"] {
-            state.access_tokens.insert(
-                token.to_string(),
-                IssuedAccessToken {
-                    client_id: "client".to_string(),
-                    scopes: vec!["tools:read".to_string()],
-                    resource: "https://plug.example.com/mcp".to_string(),
-                    issued_at: 0,
-                    expires_at: u64::MAX,
-                    scope_model: SCOPE_MODEL_ENFORCED,
-                    family_id: String::new(),
-                },
-            );
-        }
-
-        assert_eq!(backfill_token_families(&mut state), 2);
-        let families: HashSet<&str> = state
-            .access_tokens
-            .values()
-            .map(|token| token.family_id.as_str())
-            .collect();
-        assert_eq!(
-            families.len(),
-            2,
-            "legacy records must not be collapsed into one revocable family"
-        );
-        assert!(families.iter().all(|family| !family.is_empty()));
-
-        // Backfilling is idempotent: a second pass changes nothing.
-        assert_eq!(backfill_token_families(&mut state), 0);
-    }
-
-    #[test]
     fn an_empty_family_id_revokes_nothing() {
         let mut state = DownstreamOauthState::default();
         state.access_tokens.insert(
@@ -5182,7 +4171,6 @@ mod tests {
                 resource: "https://plug.example.com/mcp".to_string(),
                 issued_at: 0,
                 expires_at: u64::MAX,
-                scope_model: SCOPE_MODEL_ENFORCED,
                 family_id: String::new(),
             },
         );
@@ -5633,7 +4621,6 @@ mod tests {
                     .map(ToString::to_string)
                     .collect(),
                 local_port: 3282,
-                modern_downstream_enabled: false,
             },
             temp_state_path(),
         )

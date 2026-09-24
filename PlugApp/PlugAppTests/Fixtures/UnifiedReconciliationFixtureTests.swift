@@ -1491,7 +1491,6 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool
-    var serviceStatus: SMAppService.Status { enabled ? .enabled : .notRegistered }
     private let legacyVersion: String
     private let currentVersion: String
     private let legacyExecutable: URL

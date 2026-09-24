@@ -45,14 +45,6 @@ extension Verdict.Tone {
         case .blocked: .red.opacity(0.18)
         }
     }
-
-    /// Only trouble earns a filled, coloured badge. Calm states stay quiet.
-    var isLoud: Bool {
-        switch self {
-        case .good, .busy: false
-        case .attention, .blocked: true
-        }
-    }
 }
 
 extension ServerHealth {
@@ -152,21 +144,11 @@ struct SectionLabel: View {
 /// The headline. Rendered as a hero in the popover, compact in the window
 /// banner, but always the same words, so the app cannot contradict itself.
 struct VerdictView: View {
-    enum Style { case hero, regular, compact }
+    enum Style { case hero, compact }
 
     let verdict: Verdict
-    var style: Style = .regular
+    let style: Style
     let run: (PlugIntent) -> Void
-
-    init(verdict: Verdict, style: Style = .regular, run: @escaping (PlugIntent) -> Void) {
-        self.verdict = verdict
-        self.style = style
-        self.run = run
-    }
-
-    init(verdict: Verdict, compact: Bool, run: @escaping (PlugIntent) -> Void) {
-        self.init(verdict: verdict, style: compact ? .compact : .regular, run: run)
-    }
 
     private var compact: Bool { style == .compact }
 
@@ -197,7 +179,6 @@ struct VerdictView: View {
     private var titleFont: Font {
         switch style {
         case .hero: .title3.weight(.semibold)
-        case .regular: .headline
         case .compact: .callout.weight(.medium)
         }
     }
@@ -220,7 +201,7 @@ struct VerdictView: View {
             }
             .frame(width: 40, height: 40)
             .accessibilityHidden(true)
-        case .regular, .compact:
+        case .compact:
             if verdict.tone == .busy {
                 ProgressView()
                     .controlSize(.small)
@@ -248,66 +229,6 @@ struct VerdictView: View {
                     .controlSize(compact ? .small : .regular)
             }
         }
-    }
-}
-
-/// One server, read-only and quiet. The same row shape in the popover and the
-/// window so the two surfaces never feel like different apps.
-struct ServerRow: View {
-    let server: ServerFacts
-    var showsTrailingDetail = true
-
-    var body: some View {
-        HStack(spacing: Metric.snug) {
-            StatusGlyph(health: server.health)
-            Text(server.name)
-                .font(.callout)
-                .foregroundStyle(server.enabled ? .primary : .secondary)
-                .lineLimit(1)
-            Spacer(minLength: Metric.tight)
-            if showsTrailingDetail {
-                Text(trailingText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(server.name), \(server.health.label)")
-    }
-
-    private var trailingText: String {
-        switch server.health {
-        case .working: server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools"
-        default: server.health.label
-        }
-    }
-}
-
-/// A row that reads as one tappable line: label, value, chevron.
-struct DisclosureRow<Trailing: View>: View {
-    let symbol: String
-    let title: String
-    let detail: String?
-    @ViewBuilder var trailing: Trailing
-
-    var body: some View {
-        HStack(spacing: Metric.snug) {
-            Image(systemName: symbol)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .frame(width: 18)
-                .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 0) {
-                Text(title).font(.callout)
-                if let detail {
-                    Text(detail).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-            }
-            Spacer(minLength: Metric.tight)
-            trailing
-        }
-        .contentShape(Rectangle())
     }
 }
 

@@ -48,7 +48,7 @@ struct ConnectionsView: View {
             PageHeader("Connections", detail: connectionSummary)
 
             Group {
-                if model.isLoadingInitialData && !model.hasLoadedSnapshot {
+                if model.isLoadingInitialData {
                     LoadingPage(message: "Loading connections…")
                 } else if model.initialDataUnavailable {
                     UnavailablePage(item: "Connections") { run(.reconnect) }

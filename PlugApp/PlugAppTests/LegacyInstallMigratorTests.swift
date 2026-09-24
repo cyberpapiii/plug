@@ -59,7 +59,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
             }
             return ProcessResult(status: 0, stdout: Data(), stderr: Data())
         }
-        let fixture = try Fixture(runner: runner)
+        let fixture = try Fixture(runner: runner, formulaKeg: true)
         let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
 
         XCTAssertTrue(snapshot.formulaInstalled)
@@ -76,7 +76,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
             }
             return ProcessResult(status: 1, stdout: Data(), stderr: Data("busy".utf8))
         }
-        let fixture = try Fixture(runner: runner)
+        let fixture = try Fixture(runner: runner, formulaKeg: true)
         try Data("cargo".utf8).write(to: fixture.cargo)
         let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
 
@@ -89,6 +89,46 @@ final class LegacyInstallMigratorTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargo.path))
     }
 
+    /// Without a keg under brew's prefix there is no formula, so brew is not
+    /// run at all. Each call costs about a second, more at login.
+    func testBrewIsNotAskedWhenNoFormulaKegExists() async throws {
+        let runner = RecordingProcessRunner { _, _ in
+            ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
+        }
+        let fixture = try Fixture(runner: runner)
+
+        let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
+        _ = try await fixture.migrator.repairShellLink(to: fixture.canonical.executableURL)
+
+        XCTAssertFalse(snapshot.formulaInstalled)
+        let calls = await runner.calls
+        XCTAssertTrue(calls.isEmpty, "brew ran \(calls.count) times with no keg on disk")
+    }
+
+    /// A keg reached through `opt/plug` alone still sends the question to brew.
+    func testOptLinkAloneStillAsksBrew() async throws {
+        let runner = RecordingProcessRunner { _, arguments in
+            ProcessResult(
+                status: 0,
+                stdout: Data(arguments.first == "list" ? "plug 0.6.4\n".utf8 : "".utf8),
+                stderr: Data()
+            )
+        }
+        let fixture = try Fixture(runner: runner)
+        try FileManager.default.createDirectory(
+            at: fixture.root.appending(path: "opt"),
+            withIntermediateDirectories: true
+        )
+        try fixture.createSymlink(
+            at: fixture.root.appending(path: "opt/plug"),
+            target: fixture.root.appending(path: "missing-keg")
+        )
+
+        let snapshot = try await fixture.migrator.inspect(canonical: fixture.canonical)
+
+        XCTAssertTrue(snapshot.formulaInstalled)
+    }
+
     func testFormulaMustBeRemovedBeforeShellLinkRepair() async throws {
         let runner = RecordingProcessRunner { _, arguments in
             if arguments.first == "list" {
@@ -96,7 +136,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
             }
             return ProcessResult(status: 0, stdout: Data(), stderr: Data())
         }
-        let fixture = try Fixture(runner: runner)
+        let fixture = try Fixture(runner: runner, formulaKeg: true)
 
         do {
             _ = try await fixture.migrator.repairShellLink(to: fixture.canonical.executableURL)
@@ -298,7 +338,8 @@ private final class Fixture {
         runner: any ProcessRunning = RecordingProcessRunner { _, _ in
             ProcessResult(status: 1, stdout: Data(), stderr: Data())
         },
-        identityReader: @escaping @Sendable (URL) -> LegacyBinaryIdentity? = { _ in nil }
+        identityReader: @escaping @Sendable (URL) -> LegacyBinaryIdentity? = { _ in nil },
+        formulaKeg: Bool = false
     ) throws {
         root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
         home = root.appending(path: "home")
@@ -321,6 +362,13 @@ private final class Fixture {
         try FileManager.default.createDirectory(at: brew.deletingLastPathComponent(), withIntermediateDirectories: true)
         try Data("canonical".utf8).write(to: executable)
         try Data("brew".utf8).write(to: brew)
+        if formulaKeg {
+            // What an installed formula leaves under the prefix above brew's bin.
+            try FileManager.default.createDirectory(
+                at: root.appending(path: "Cellar/plug/0.6.4"),
+                withIntermediateDirectories: true
+            )
+        }
         migrator = LegacyInstallMigrator(
             homeURL: home,
             brewURLs: [brew],

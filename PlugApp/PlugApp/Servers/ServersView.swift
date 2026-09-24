@@ -167,11 +167,11 @@ private struct ServerListRow: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: Metric.tight)
-            if let fix {
+            if let fix = server.fix {
                 Button(fix.title) { run(fix.intent) }
                     .controlSize(.small)
             } else if server.health == .working {
-                Text(server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools")
+                Text(server.toolCountText)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
@@ -185,16 +185,8 @@ private struct ServerListRow: View {
         if server.health.needsAttention, let error = server.error, !error.isEmpty {
             return error.split(separator: "\n").first.map(String.init) ?? error
         }
-        if !server.enabled { return "Switched off" }
+        if !server.enabled { return server.health.label }
         return server.transportLabel
-    }
-
-    private var fix: Verdict.Button? {
-        switch server.health {
-        case .signInNeeded: server.isSigningIn ? nil : .init("Sign In", .signIn(server: server.name))
-        case .down, .unknown: .init("Restart", .restartServer(server.name))
-        default: nil
-        }
     }
 }
 

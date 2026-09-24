@@ -1188,9 +1188,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     plug_core::session::DownstreamTransport::Http => {
                         plug_core::ipc::LiveSessionTransport::Http
                     }
-                    plug_core::session::DownstreamTransport::Sse => {
-                        plug_core::ipc::LiveSessionTransport::Sse
-                    }
                 },
                 client_id: None,
                 session_id: snapshot.session_id,
@@ -3929,7 +3926,7 @@ mod tests {
         engine.start().await.expect("engine start");
         let state = Arc::new(plug_core::http::server::HttpState {
             router: engine.tool_router().clone(),
-            sessions: Arc::new(plug_core::http::session::SessionManager::new(1800, 100))
+            sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
                 as Arc<dyn SessionStore>,
             cancel: CancellationToken::new(),
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,

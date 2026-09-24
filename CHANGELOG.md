@@ -21,6 +21,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   made the call, and turn the latency orange when a call took five seconds or
   more.
 - The version in About can be selected and copied.
+- Downstream OAuth state from before 0.4.0 (`issuer-v2-*.json`) is no
+  longer migrated at startup, and the one-time grant scope and token-family
+  backfills are gone. State written by 0.4.0 or later loads unchanged.
+- Downstream OAuth state writes no longer stall other requests on the same
+  daemon worker thread, and the state file is written as compact JSON.
+- Servers use the same words everywhere: the detail header says "Running · N
+  tools" or "Off" like the rows do, a degraded server sorts with the working
+  ones instead of above them, and the notification setting now says what it
+  does: "Tell me when a server needs sign-in or a new app connects".
 - `plug codesign-setup` is gone. It only ran for a `PLUG_DEV=1 plug-dev`
   binary, a development path `dev-install.sh` already replaced.
 
@@ -72,6 +81,39 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- The OAuth client-metadata fetch now stops reading at its 64 KiB cap even
+  when the response has no `Content-Length`. A chunked body used to be
+  buffered in full for up to five seconds.
+- A remote client that cancels an elicitation or sampling request no longer
+  leaves the pending request behind. It used to stay registered, and replay
+  to the client on its next reconnect, until the session ended.
+- A remote HTTP session that sends a request just as the idle sweep runs no
+  longer loses its subscriptions, roots, and tasks while it stays open. The
+  sweep now rechecks expiry at the moment it removes a session.
+- Plug.app no longer leaks a socket each time it checks on the background
+  service. Setup and repair checked several times per pass, and up to 180
+  times while a new service started, without closing the connection.
+- The menu bar panel and main window update every two seconds from the moment
+  they open. The background poll used to finish its 30-second sleep first, so
+  after the first read an open panel could miss changes for up to half a
+  minute.
+- After you switch a tool or server, sign in or out, or connect an app,
+  Plug.app shows the result without waiting for the next poll. A refresh
+  asked for while another was running used to be dropped, so the view could
+  keep showing the state from before the change.
+- Plug.app no longer reloads the full tool list, about a megabyte, after
+  every action. It reloads it when the daemon reports the list changed, or
+  when you choose Refresh.
+- Plug.app no longer runs `brew` two or three times on every launch. It asks
+  Homebrew about the old formula only when a `plug` keg is on disk under
+  `/opt/homebrew` or `/usr/local`; each call took about a second, longer at
+  login.
+- Plug.app launches with far fewer checks when nothing needs setting up: it
+  no longer inspects the app, the command, the clients and the daemon a
+  second time after a pass that changed nothing, and it trusts the launchd
+  inspection it just made, so the first refresh comes sooner.
+- The "Show Plug in the menu bar at login" toggle starts from what macOS
+  reports instead of a value Plug remembered separately.
 - A tool result or schema with a key named `envelope` no longer fails the
   whole call through `plug connect` with "invalid envelope message".
 - Through `plug connect`, an upstream error from reading a resource, getting
