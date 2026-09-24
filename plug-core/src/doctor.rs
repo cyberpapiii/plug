@@ -206,35 +206,9 @@ async fn check_config_exists(config_path: &Path) -> CheckResult {
 
 /// Validate TOML syntax without depending on the full Config schema.
 fn toml_parse(contents: &str) -> Result<(), String> {
-    // Use serde_json roundtrip via figment's TOML parser indirectly —
-    // but simpler: just try to parse as a generic toml table via figment.
-    // Actually, we just try to deserialize as Config.
-    use figment::Figment;
-    use figment::providers::{Format, Toml};
-
-    Figment::new()
-        .merge(Toml::string(contents))
-        .extract::<toml_value::Value>()
+    toml::from_str::<toml::Table>(contents)
         .map(|_| ())
         .map_err(|e| e.to_string())
-}
-
-/// Minimal TOML value type for validation only.
-mod toml_value {
-    use serde::Deserialize;
-    use std::collections::HashMap;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    #[allow(dead_code)]
-    pub enum Value {
-        Table(HashMap<String, Value>),
-        Array(Vec<Value>),
-        String(String),
-        Integer(i64),
-        Float(f64),
-        Bool(bool),
-    }
 }
 
 /// Check 2: config file permissions (Unix only).
