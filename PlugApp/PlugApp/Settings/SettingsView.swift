@@ -46,7 +46,9 @@ struct SettingsView: View {
 // MARK: - General
 
 private struct GeneralSettings: View {
-    @AppStorage("launchAtLogin") private var launchAtLogin = true
+    // The login item lives in macOS, not in this app's defaults, so the toggle
+    // starts from what SMAppService reports and the task below re-reads it.
+    @State private var launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
     @AppStorage(NotificationService.preferenceKey) private var notify = false
     @State private var loginItemFailed = false
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
@@ -77,7 +79,7 @@ private struct GeneralSettings: View {
                     .listRowSeparator(.hidden)
                 }
                 Toggle(isOn: $notify) {
-                    Label("Tell me when a server needs attention", systemImage: "bell")
+                    Label("Tell me when a server needs sign-in or a new app connects", systemImage: "bell")
                 }
                 .listRowSeparator(.hidden)
                 .onChange(of: notify) { _, enabled in

@@ -1,5 +1,9 @@
 import Foundation
 
+/// The daemon IPC protocol versions this app speaks. The handshake offers
+/// them, and the app accepts a daemon only when the two ranges overlap.
+public let supportedIPCVersions: ClosedRange<UInt16> = 3...6
+
 public struct OperatorHandshake: Codable, Equatable, Sendable {
     public let daemonVersion: String
     public let daemonExecutable: URL?
@@ -26,6 +30,14 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
         ipcMax = try container.decode(UInt16.self, forKey: .ipcMax)
         ownership = try container.decode(String.self, forKey: .ownership)
         capabilities = try container.decode([String].self, forKey: .capabilities)
+    }
+
+    /// Whether the daemon's IPC range is well formed and shares at least one
+    /// version with `supportedIPCVersions`.
+    public var sharesSupportedIPCVersion: Bool {
+        ipcMin <= ipcMax
+            && ipcMin <= supportedIPCVersions.upperBound
+            && ipcMax >= supportedIPCVersions.lowerBound
     }
 }
 

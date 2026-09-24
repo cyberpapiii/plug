@@ -91,6 +91,51 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertFalse(snapshot.clientRepairNeeded)
     }
 
+    /// A launch that finds everything already in place changes nothing, so it
+    /// already holds the evidence a final inspection would gather again. Every
+    /// inspection runs subprocesses (the app's signature and version, one
+    /// `launchctl` per job), and doing each one two or three times on every
+    /// launch delayed the first refresh.
+    func testHealthyLaunchInspectsEachThingOnceAndTrustsItsOwnEvidence() async {
+        let events = EventLog()
+        let service = healthyService()
+        let coordinator = InstallationCoordinator(
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(
+                events: events,
+                values: [LegacyInstallSnapshot(
+                    formulaInstalled: false,
+                    cargoBinary: nil,
+                    shellLink: .canonical(canonical.executableURL),
+                    recognizedPaths: [],
+                    unknownPaths: []
+                )]
+            ),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(
+                events: events,
+                inspections: [service],
+                handshakes: [handshake(version: canonical.appVersion)]
+            ),
+            openURL: { _ in },
+            logWriter: { _, _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+
+        let eventValues = await events.values
+        XCTAssertEqual(
+            eventValues,
+            ["app.inspect", "legacy.inspect", "clients.inspect", "daemon.inspect", "daemon.ensureRunning"]
+        )
+        guard case let .healthy(snapshot) = coordinator.state else {
+            return XCTFail("Expected healthy state, got \(coordinator.state)")
+        }
+        XCTAssertEqual(snapshot.service, service)
+        XCTAssertEqual(snapshot.daemonVersion, canonical.appVersion)
+        XCTAssertTrue(snapshot.shadowInstalls.isEmpty)
+    }
+
     func testLegacyDaemonRequiresExplicitAdoptionAndDoesNotMutateDuringLaunch() async {
         let events = EventLog()
         let legacyRecord = LaunchdJobRecord(
@@ -454,8 +499,9 @@ final class InstallationCoordinatorTests: XCTestCase {
         await first.value
         await second.value
 
+        // One pass, and a pass with nothing to change inspects the app once.
         let callsAfterCoalescing = await app.calls
-        XCTAssertEqual(callsAfterCoalescing, 2)
+        XCTAssertEqual(callsAfterCoalescing, 1)
     }
 
     func testTimedOutCommandRetriesOnItsOwnAndConvergesHealthy() async {
@@ -503,7 +549,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected healthy state after retries, got \(coordinator.state)")
         }
         let calls = await app.calls
-        XCTAssertEqual(calls, 4, "two timeouts, then the initial and final inspections")
+        XCTAssertEqual(calls, 3, "two timeouts, then one pass with nothing to change")
     }
 
     func testTimeoutsBeyondTheBudgetBlockWithAReadableDetailAndALog() async throws {
@@ -633,6 +679,8 @@ final class InstallationCoordinatorTests: XCTestCase {
     }
 
     func testFinalDisagreementNeverReportsHealthy() async {
+        // A client repair makes this pass change something, so the final
+        // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let current = healthyService()
         let staleRecord = LaunchdJobRecord(
@@ -649,7 +697,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
         let app = RecordingAppInspector(events: events, values: [canonical, canonical])
         let legacy = RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()])
-        let clients = RecordingClientRepairer(events: events, values: [false, false])
+        let clients = RecordingClientRepairer(events: events, values: [true, false])
         let daemon = RecordingDaemonManager(
             events: events,
             inspections: [current, stale],
@@ -749,6 +797,8 @@ final class InstallationCoordinatorTests: XCTestCase {
     }
 
     func testFinalDisagreementDetailNamesTheFailedCheck() async {
+        // A client repair makes this pass change something, so the final
+        // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let current = healthyService()
         let staleRecord = LaunchdJobRecord(
@@ -765,7 +815,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
         let app = RecordingAppInspector(events: events, values: [canonical, canonical])
         let legacy = RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()])
-        let clients = RecordingClientRepairer(events: events, values: [false, false])
+        let clients = RecordingClientRepairer(events: events, values: [true, false])
         let daemon = RecordingDaemonManager(
             events: events,
             inspections: [current, stale],
@@ -791,6 +841,8 @@ final class InstallationCoordinatorTests: XCTestCase {
     }
 
     func testFinalHandshakeExecutableMismatchNeverReportsHealthy() async {
+        // A client repair makes this pass change something, so the final
+        // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let wrongExecutable = URL(fileURLWithPath: "/Applications/Other Plug.app/Contents/Resources/plug")
         let finalRecord = LaunchdJobRecord(
@@ -808,7 +860,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let coordinator = InstallationCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()]),
-            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [true, false]),
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [healthyService(), finalService]
@@ -825,6 +877,8 @@ final class InstallationCoordinatorTests: XCTestCase {
     }
 
     func testFinalUnknownDaemonOwnershipBlocksInsteadOfReportingRepairableDrift() async {
+        // A client repair makes this pass change something, so the final
+        // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let coordinator = InstallationCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
@@ -832,7 +886,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 events: events,
                 values: [emptyLegacy(), emptyLegacy()]
             ),
-            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [true, false]),
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [
@@ -1424,6 +1478,13 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
             : handshakes.removeFirst()
     }
 
+    func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        inspected: DaemonServiceSnapshot
+    ) async throws -> OperatorHandshake {
+        try await ensureRunning(expectedVersion: canonical.appVersion)
+    }
+
     func adopt() async throws {
         await events.append("daemon.adopt")
     }
@@ -1502,6 +1563,13 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
     func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
         await events.append("daemon.ensureRunning")
         return handshake
+    }
+
+    func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        inspected: DaemonServiceSnapshot
+    ) async throws -> OperatorHandshake {
+        try await ensureRunning(expectedVersion: canonical.appVersion)
     }
 
     func adopt() async throws {

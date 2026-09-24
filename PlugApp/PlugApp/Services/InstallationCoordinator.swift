@@ -28,18 +28,18 @@ protocol DaemonServiceManaging: AnyObject {
         expectedVersion: String
     ) async throws -> OperatorHandshake
     func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake
+    func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        inspected: DaemonServiceSnapshot
+    ) async throws -> OperatorHandshake
     func adopt() async throws
 }
-
-typealias InstallationDaemonManaging = DaemonServiceManaging
 
 @MainActor
 extension DaemonServiceManager: DaemonServiceManaging {}
 
 @MainActor @Observable
 final class InstallationCoordinator {
-    private static let supportedIPCMin: UInt16 = 3
-    private static let supportedIPCMax: UInt16 = 6
     private static let appManagedOwnership = "app_managed"
     private static let unknownOwnership = "unknown"
 
@@ -152,6 +152,10 @@ final class InstallationCoordinator {
             var legacy = try await legacyMigrator.inspect(canonical: canonical)
 
             try rejectUnknownLegacyState(legacy)
+            // Whether this pass changed anything on the machine. A pass that
+            // only looked already holds the evidence a final inspection would
+            // gather again, so it skips that inspection.
+            var changedInstallation = false
 
             var inspectTimeLegacyPaths = Set<URL>()
             var leftoverAdoptSnapshot: DaemonServiceSnapshot?
@@ -171,6 +175,7 @@ final class InstallationCoordinator {
                 if !Self.requiresAdoption(preUninstallDaemon) || isAdoptionAuthorized(trigger) {
                     try await bootOutHomebrewLegacyIfNeeded(preUninstallDaemon)
                     publish(.removingLegacyFormula)
+                    changedInstallation = true
                     try await legacyMigrator.removeRecognizedFormula(legacy)
                     legacy = legacySnapshot(legacy, formulaInstalled: false)
                 }
@@ -189,6 +194,7 @@ final class InstallationCoordinator {
                 shellLink = legacy.shellLink
             case .absent, .repairable:
                 publish(.repairingCommand)
+                changedInstallation = true
                 shellLink = try await legacyMigrator.repairShellLink(to: canonical.executableURL)
                 legacy = legacySnapshot(legacy, shellLink: shellLink)
             case let .canonical(target):
@@ -202,6 +208,7 @@ final class InstallationCoordinator {
             )
             if clientsNeedRepair {
                 publish(.repairingClients)
+                changedInstallation = true
                 _ = try await clientRepairer.repairAll(
                     canonicalExecutable: canonical.executableURL
                 )
@@ -216,6 +223,11 @@ final class InstallationCoordinator {
                 live: liveDaemon,
                 leftover: leftoverAdoptSnapshot
             )
+            // Anything but this app's own current daemon gets replaced or
+            // adopted below.
+            if !isExactService(daemonSnapshot, canonical: canonical) {
+                changedInstallation = true
+            }
             let handshake = try await reconcileDaemon(
                 snapshot: daemonSnapshot,
                 canonical: canonical,
@@ -240,6 +252,7 @@ final class InstallationCoordinator {
             )
 
             if legacy.cargoBinary != nil {
+                changedInstallation = true
                 publish(.cleaningLegacyBinary)
                 try await legacyMigrator.removeVerifiedCargoBinary(legacy, proof: proof)
             }
@@ -247,7 +260,21 @@ final class InstallationCoordinator {
             if case let .reconcilingUpdate(phase) = state, phase != .inspecting {
                 publish(.verifying)
             }
-            let final = try await inspectFinalState(expected: canonical)
+            let final: InstallationState
+            if changedInstallation {
+                final = try await inspectFinalState(expected: canonical)
+            } else {
+                final = .healthy(makeSnapshot(
+                    app: canonical,
+                    legacy: legacy,
+                    service: DaemonServiceSnapshot(
+                        ownership: daemonSnapshot.ownership,
+                        daemonVersion: handshake.daemonVersion,
+                        daemonExecutable: handshake.daemonExecutable
+                    ),
+                    clientRepairNeeded: clientsNeedRepair
+                ))
+            }
             try requireHealthy(final, expected: canonical)
             state = final
             transientFailures = 0
@@ -356,7 +383,7 @@ final class InstallationCoordinator {
             if !isExactService(snapshot, canonical: canonical) {
                 publish(.replacingDaemon)
             }
-            return try await daemonManager.ensureRunning(expectedVersion: canonical.appVersion)
+            return try await daemonManager.ensureRunning(canonical: canonical, inspected: snapshot)
 
         case .unknown:
             throw CoordinatorError.unknownOwnership
@@ -476,7 +503,7 @@ final class InstallationCoordinator {
         var shadows: [ShadowInstall] = []
         var knownPaths = Set<URL>()
         if let cargo = legacy.cargoBinary?.standardizedFileURL {
-            shadows.append(ShadowInstall(kind: .cargo, url: cargo))
+            shadows.append(ShadowInstall(url: cargo))
             knownPaths.insert(cargo)
         }
         // The shell link stays in `recognizedPaths` so legacy launchd jobs
@@ -491,30 +518,17 @@ final class InstallationCoordinator {
         for path in legacy.recognizedPaths.map(\.standardizedFileURL) {
             guard knownPaths.insert(path).inserted else { continue }
             if canonicalShellLink, path.path.hasSuffix("/.local/bin/plug") { continue }
-            let kind: ShadowInstall.Kind
-            if path.path.hasSuffix("/.cargo/bin/plug") {
-                kind = .cargo
-            } else if path.path.contains("/opt/plug/bin/plug") {
-                kind = .homebrewFormula
-            } else {
-                kind = .clientLink
-            }
-            shadows.append(ShadowInstall(kind: kind, url: path))
+            shadows.append(ShadowInstall(url: path))
         }
         if legacy.formulaInstalled,
-           !shadows.contains(where: { $0.kind == .homebrewFormula })
+           !shadows.contains(where: { $0.url.path.contains("/opt/plug/bin/plug") })
         {
-            shadows.append(
-                ShadowInstall(
-                    kind: .homebrewFormula,
-                    url: URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")
-                )
-            )
+            shadows.append(ShadowInstall(url: URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")))
         }
         if case let .recognizedLegacy(records) = service.ownership {
             for record in records {
                 if let program = record.programURL {
-                    shadows.append(ShadowInstall(kind: .launchdJob, url: program.standardizedFileURL))
+                    shadows.append(ShadowInstall(url: program.standardizedFileURL))
                 }
             }
         }
@@ -601,9 +615,7 @@ final class InstallationCoordinator {
     }
 
     private func isCompatible(_ handshake: OperatorHandshake) -> Bool {
-        guard handshake.ipcMin <= handshake.ipcMax else { return false }
-        return handshake.ipcMin <= Self.supportedIPCMax
-            && handshake.ipcMax >= Self.supportedIPCMin
+        handshake.sharesSupportedIPCVersion
     }
 
     private func isExactService(
