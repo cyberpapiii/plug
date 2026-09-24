@@ -1657,9 +1657,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .collect();
             IpcResponse::Tools { tools: ipc_tools }
         }
-        IpcRequest::ListClients => IpcResponse::Clients {
-            clients: ctx.client_registry.list(),
-        },
         IpcRequest::ListLiveSessions => IpcResponse::LiveSessions {
             sessions: {
                 let mut sessions = ctx.client_registry.list_live_sessions();
@@ -1968,14 +1965,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::AuthStatus => dispatch_auth_status(ctx).await,
-
-        IpcRequest::InjectToken {
-            server_name,
-            access_token,
-            refresh_token,
-            expires_in,
-            ..
-        } => dispatch_inject_token(ctx, server_name, access_token, refresh_token, expires_in).await,
     }
 }
 
@@ -2006,119 +1995,6 @@ fn reject_invalid_cancellation_identity(
         });
     }
     None
-}
-
-/// Handle `InjectToken` — save credentials and trigger server reconnect.
-async fn dispatch_inject_token(
-    ctx: &ConnectionContext,
-    server_name: &str,
-    access_token: &str,
-    refresh_token: &Option<String>,
-    expires_in: &Option<u64>,
-) -> IpcResponse {
-    use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
-    use plug_core::oauth;
-    use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Verify server exists and is OAuth-configured
-    let config = match plug_core::config::load_config(Some(&ctx.config_path)) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return IpcResponse::Error {
-                code: "CONFIG_LOAD_FAILED".to_string(),
-                message: e.to_string(),
-            };
-        }
-    };
-    match config.servers.get(server_name) {
-        Some(sc) if sc.auth.as_deref() == Some("oauth") => {}
-        Some(_) => {
-            return IpcResponse::Error {
-                code: "NOT_OAUTH_SERVER".to_string(),
-                message: format!("server '{server_name}' is not configured for OAuth"),
-            };
-        }
-        None => {
-            return IpcResponse::Error {
-                code: "UNKNOWN_SERVER".to_string(),
-                message: format!("server '{server_name}' not found in config"),
-            };
-        }
-    }
-
-    // Build and save credentials
-    let store = oauth::get_or_create_store(server_name);
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
-        AccessToken::new(access_token.to_string()),
-        BasicTokenType::Bearer,
-        VendorExtraTokenFields::default(),
-    );
-
-    if let Some(rt) = refresh_token {
-        token.set_refresh_token(Some(RefreshToken::new(rt.clone())));
-    }
-    if let Some(secs) = expires_in {
-        token.set_expires_in(Some(&std::time::Duration::from_secs(*secs)));
-    }
-
-    let snapshot = store.credential_snapshot();
-    let existing_client_id = snapshot
-        .credentials
-        .as_ref()
-        .map(|creds| creds.client_id.as_str());
-    let (client_id, _) = oauth::injected_client_identity(
-        config
-            .servers
-            .get(server_name)
-            .is_some_and(|sc| sc.auth.as_deref() == Some("oauth")),
-        config
-            .servers
-            .get(server_name)
-            .and_then(|sc| sc.oauth_client_id.as_deref()),
-        existing_client_id,
-        refresh_token.is_some(),
-    );
-
-    let stored = StoredCredentials::new(client_id, Some(token), vec![], Some(now));
-
-    if let Err(e) = store.save(stored).await {
-        return IpcResponse::Error {
-            code: "CREDENTIAL_SAVE_FAILED".to_string(),
-            message: e.to_string(),
-        };
-    }
-
-    // Trigger server reconnect to pick up new credentials
-    match ctx.engine.restart_server(server_name).await {
-        Ok(()) => {
-            tracing::info!(server = %server_name, "credentials injected and server restarted via IPC");
-            // Notify IPC clients of the auth state change (→ Healthy)
-            ctx.engine.tool_router().publish_protocol_notification(
-                plug_core::notifications::ProtocolNotification::AuthStateChanged {
-                    server_id: std::sync::Arc::from(server_name),
-                    new_state: plug_core::types::ServerHealth::Healthy,
-                },
-            );
-            IpcResponse::Ok
-        }
-        Err(e) => {
-            tracing::warn!(server = %server_name, error = %e, "credentials injected but server restart failed");
-            IpcResponse::Error {
-                code: "RESTART_FAILED".to_string(),
-                message: format!(
-                    "credentials saved but server restart failed: {e:#}. \
-                     The server may recover on next health check."
-                ),
-            }
-        }
-    }
 }
 
 fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
@@ -3006,51 +2882,6 @@ mod tests {
         clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
-    }
-
-    #[tokio::test]
-    async fn inject_token_reuses_existing_persisted_client_id() {
-        let config_path = temp_config_path("inject-token-client-id");
-        let server_name = format!("oauth-inject-{}", std::process::id());
-        write_oauth_config(&config_path, &[server_name.as_str()]);
-        let mut config = plug_core::config::load_config(Some(&config_path)).unwrap();
-        config
-            .servers
-            .get_mut(&server_name)
-            .expect("server config")
-            .oauth_client_id = None;
-        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
-
-        let store = plug_core::oauth::get_or_create_store(&server_name);
-        clear_store(&server_name).await;
-        let mut existing = seeded_credentials();
-        existing.client_id = "dynamic-client-123".to_string();
-        store.save(existing).await.unwrap();
-
-        let ctx = auth_status_test_context(config_path.clone());
-        let response = dispatch_inject_token(
-            &ctx,
-            &server_name,
-            "new-access-token",
-            &Some("new-refresh-token".to_string()),
-            &Some(3600),
-        )
-        .await;
-
-        match response {
-            IpcResponse::Ok | IpcResponse::Error { .. } => {}
-            other => panic!("unexpected inject response: {other:?}"),
-        }
-
-        let stored = store
-            .load()
-            .await
-            .expect("load injected credentials")
-            .expect("stored credentials");
-        assert_eq!(stored.client_id, "dynamic-client-123");
-
-        clear_store(&server_name).await;
-        cleanup_temp_config(&config_path);
     }
 
     #[test]

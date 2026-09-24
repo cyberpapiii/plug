@@ -935,30 +935,6 @@ pub(crate) async fn fetch_live_sessions(
                 scope,
                 LiveClientSupport::Supported,
             ),
-            Ok(plug_core::ipc::IpcResponse::Clients { clients }) => {
-                let sessions = clients
-                    .into_iter()
-                    .map(|client| plug_core::ipc::IpcLiveSessionInfo {
-                        transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
-                        client_id: Some(client.client_id),
-                        session_id: client.session_id,
-                        client_type: client
-                            .client_info
-                            .as_deref()
-                            .map(plug_core::client_detect::detect_client)
-                            .unwrap_or(plug_core::types::ClientType::Unknown),
-                        client_info: client.client_info,
-                        adapter_version: client.adapter_version,
-                        connected_secs: client.connected_secs,
-                        last_activity_secs: None,
-                    })
-                    .collect();
-                (
-                    LiveSessionSourceState::Available(sessions),
-                    plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-                    LiveClientSupport::Supported,
-                )
-            }
             Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => (
                 LiveSessionSourceState::Unavailable,
                 plug_core::ipc::LiveSessionInventoryScope::Unavailable,
