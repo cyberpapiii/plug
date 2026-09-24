@@ -54,7 +54,8 @@ final class AppModelTests: XCTestCase {
             tokenURL: try! makeFixtureTokenURL()
         )
         await model.start()
-        XCTAssertTrue(model.isHealthy)
+        XCTAssertEqual(model.situation.setup, .ready)
+        XCTAssertEqual(model.connectionState, .ready)
 
         let nonHealthyStates: [InstallationState] = [
             .adoptionRequired(makeInstallationSnapshot()),
@@ -65,7 +66,7 @@ final class AppModelTests: XCTestCase {
         for state in nonHealthyStates {
             coordinator.state = state
             await model.reconcile(trigger: .retry)
-            XCTAssertFalse(model.isHealthy, "\(state) must not report healthy")
+            XCTAssertNotEqual(model.situation.setup, .ready, "\(state) must not report healthy")
         }
     }
 
@@ -137,7 +138,7 @@ final class AppModelTests: XCTestCase {
         )
         await model.start()
 
-        XCTAssertNil(model.installationFailure)
+        XCTAssertEqual(model.situation.setup, .ready)
     }
 
     /// The handshake describes the daemon behind an open descriptor, so a poll
@@ -367,7 +368,7 @@ final class AppModelTests: XCTestCase {
             coordinator: coordinator
         )
 
-        XCTAssertEqual(model.installationFailure?.summary, "Plug needs attention")
+        XCTAssertEqual(model.situation.setup, .blocked(detail: "daemon skew", hasLog: true))
         await model.retry()
         model.openLog()
 
@@ -403,10 +404,7 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertEqual(
-            model.connectionRecoveryDetail,
-            "The app and its background service are running different versions."
-        )
+        XCTAssertEqual(model.verdict.title, "Restart required to finish update")
     }
 
     @MainActor
@@ -426,18 +424,14 @@ final class AppModelTests: XCTestCase {
         await model.start()
 
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertTrue(model.connectionRecoveryIsRequired)
-        XCTAssertFalse(model.isHealthy)
-        XCTAssertEqual(
-            model.connectionRecoveryDetail,
-            "The app and its background service are running different versions."
-        )
+        XCTAssertEqual(model.situation.runtime, .versionMismatch)
+        XCTAssertEqual(model.verdict.primary?.intent, .reconnect)
 
         await model.retryConnection()
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertTrue(model.connectionRecoveryIsRequired)
+        XCTAssertEqual(model.situation.runtime, .versionMismatch)
     }
 
     @MainActor

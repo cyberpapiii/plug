@@ -212,13 +212,6 @@ final class AppModel {
 
     var menuBarSymbol: String { PlugVerdict.menuBarSymbol(for: verdict) }
 
-    var isHealthy: Bool {
-        guard case .healthy = installationState, connectionState == .ready else { return false }
-        return visibleServers.allSatisfy {
-            !$0.configured.enabled || $0.health == "Healthy"
-        }
-    }
-
     var isLoadingInitialData: Bool {
         !hasLoadedSnapshot && connectionState == .connecting
     }
@@ -240,29 +233,6 @@ final class AppModel {
             .sorted { $0.sequence > $1.sequence }
             .prefix(limit)
             .map { $0 }
-    }
-
-    var connectionRecoveryIsRequired: Bool {
-        connectionState == .incompatible
-    }
-
-    var connectionRecoveryDetail: String {
-        "The app and its background service are running different versions."
-    }
-
-    var installationFailure: InstallationFailure? {
-        guard case let .blocked(failure) = installationState else { return nil }
-        return failure
-    }
-
-    var installationDrift: InstallationDrift? {
-        guard case let .repairableDrift(drift) = installationState else { return nil }
-        return drift
-    }
-
-    var adoptionIsRequired: Bool {
-        if case .adoptionRequired = installationState { return true }
-        return false
     }
 
     func start() async {

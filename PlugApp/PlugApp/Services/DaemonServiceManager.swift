@@ -17,7 +17,6 @@ enum DaemonServiceError: Error, Equatable {
 @MainActor
 protocol DaemonServiceBackend: AnyObject {
     var enabled: Bool { get }
-    var serviceStatus: SMAppService.Status { get }
     func pauseConnectors() async -> [Int32]
     func resumeConnectors(_ pids: [Int32])
     func bootOut(_ record: LaunchdJobRecord) async throws
@@ -53,13 +52,8 @@ final class DaemonServiceManager {
         self.retryLimit = max(1, retryLimit)
     }
 
-    var status: SMAppService.Status { backend.serviceStatus }
     var appServiceEnabled: Bool { backend.enabled }
     var mainAppAtLoginEnabled: Bool { SMAppService.mainApp.status == .enabled }
-
-    // Temporary bridge while AppModel moves to the asynchronous installation snapshot.
-    // It never authorizes replacement; every mutation below re-inspects evidence.
-    var needsAdoption: Bool { !backend.enabled }
 
     func inspect(
         canonical: VerifiedAppInstallation,
@@ -454,7 +448,6 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool { agent.status == .enabled }
-    var serviceStatus: SMAppService.Status { agent.status }
 
     func pauseConnectors() async -> [Int32] {
         DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()).compactMap { pid in

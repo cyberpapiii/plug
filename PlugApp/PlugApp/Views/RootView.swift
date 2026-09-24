@@ -25,7 +25,7 @@ struct RootView: View {
     var body: some View {
         VStack(spacing: 0) {
             if model.verdict.tone != .good {
-                VerdictView(verdict: model.verdict, compact: true, run: run)
+                VerdictView(verdict: model.verdict, style: .compact, run: run)
                     .padding(.horizontal, Metric.roomy)
                     .padding(.vertical, Metric.snug)
                     .background(.bar)

@@ -464,7 +464,6 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool
-    var serviceStatus: SMAppService.Status { enabled ? .enabled : .notRegistered }
     var events: [Event] = []
     var registerError: Error?
     private var handshakes: [OperatorHandshake]

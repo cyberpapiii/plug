@@ -35,8 +35,6 @@ protocol DaemonServiceManaging: AnyObject {
     func adopt() async throws
 }
 
-typealias InstallationDaemonManaging = DaemonServiceManaging
-
 @MainActor
 extension DaemonServiceManager: DaemonServiceManaging {}
 
@@ -507,7 +505,7 @@ final class InstallationCoordinator {
         var shadows: [ShadowInstall] = []
         var knownPaths = Set<URL>()
         if let cargo = legacy.cargoBinary?.standardizedFileURL {
-            shadows.append(ShadowInstall(kind: .cargo, url: cargo))
+            shadows.append(ShadowInstall(url: cargo))
             knownPaths.insert(cargo)
         }
         // The shell link stays in `recognizedPaths` so legacy launchd jobs
@@ -522,30 +520,17 @@ final class InstallationCoordinator {
         for path in legacy.recognizedPaths.map(\.standardizedFileURL) {
             guard knownPaths.insert(path).inserted else { continue }
             if canonicalShellLink, path.path.hasSuffix("/.local/bin/plug") { continue }
-            let kind: ShadowInstall.Kind
-            if path.path.hasSuffix("/.cargo/bin/plug") {
-                kind = .cargo
-            } else if path.path.contains("/opt/plug/bin/plug") {
-                kind = .homebrewFormula
-            } else {
-                kind = .clientLink
-            }
-            shadows.append(ShadowInstall(kind: kind, url: path))
+            shadows.append(ShadowInstall(url: path))
         }
         if legacy.formulaInstalled,
-           !shadows.contains(where: { $0.kind == .homebrewFormula })
+           !shadows.contains(where: { $0.url.path.contains("/opt/plug/bin/plug") })
         {
-            shadows.append(
-                ShadowInstall(
-                    kind: .homebrewFormula,
-                    url: URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")
-                )
-            )
+            shadows.append(ShadowInstall(url: URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")))
         }
         if case let .recognizedLegacy(records) = service.ownership {
             for record in records {
                 if let program = record.programURL {
-                    shadows.append(ShadowInstall(kind: .launchdJob, url: program.standardizedFileURL))
+                    shadows.append(ShadowInstall(url: program.standardizedFileURL))
                 }
             }
         }

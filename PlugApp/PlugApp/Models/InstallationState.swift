@@ -29,14 +29,6 @@ enum ShellLinkState: Equatable, Sendable {
 }
 
 struct ShadowInstall: Equatable, Sendable {
-    enum Kind: String, Sendable {
-        case cargo
-        case homebrewFormula
-        case clientLink
-        case launchdJob
-    }
-
-    let kind: Kind
     let url: URL
 }
 
