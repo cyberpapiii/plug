@@ -233,8 +233,6 @@ pub enum IpcRequest {
 
     /// List all available tools across all servers.
     ListTools,
-    /// List live proxy client sessions connected to the daemon.
-    ListClients,
     /// List live downstream sessions with explicit transport/scope.
     ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
@@ -296,15 +294,6 @@ pub enum IpcRequest {
 
     /// Query OAuth authentication status for all configured servers.
     AuthStatus,
-
-    /// Inject OAuth credentials into the running daemon and trigger reconnect.
-    InjectToken {
-        auth_token: String,
-        server_name: String,
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: Option<u64>,
-    },
 }
 
 /// Custom Debug that redacts auth_token fields to prevent log leakage.
@@ -422,7 +411,6 @@ impl fmt::Debug for IpcRequest {
                 .field("session_id", session_id)
                 .finish(),
             Self::ListTools => write!(f, "ListTools"),
-            Self::ListClients => write!(f, "ListClients"),
             Self::ListLiveSessions => write!(f, "ListLiveSessions"),
             Self::Capabilities { session_id } => f
                 .debug_struct("Capabilities")
@@ -478,26 +466,6 @@ impl fmt::Debug for IpcRequest {
                 .field("uris", uris)
                 .finish(),
             Self::AuthStatus => write!(f, "AuthStatus"),
-            Self::InjectToken {
-                server_name,
-                refresh_token,
-                expires_in,
-                ..
-            } => f
-                .debug_struct("InjectToken")
-                .field("auth_token", &"[REDACTED]")
-                .field("server_name", server_name)
-                .field("access_token", &"[REDACTED]")
-                .field(
-                    "refresh_token",
-                    if refresh_token.is_some() {
-                        &"[REDACTED]"
-                    } else {
-                        &"None"
-                    },
-                )
-                .field("expires_in", expires_in)
-                .finish(),
         }
     }
 }
@@ -691,16 +659,6 @@ impl IpcTrustInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpcClientInfo {
-    pub client_id: String,
-    pub session_id: String,
-    pub client_info: Option<String>,
-    #[serde(default)]
-    pub adapter_version: Option<String>,
-    pub connected_secs: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveSessionTransport {
@@ -789,10 +747,6 @@ pub enum IpcResponse {
     /// List of all tools available.
     Tools {
         tools: Vec<IpcToolInfo>,
-    },
-    /// List of live client sessions connected to the daemon.
-    Clients {
-        clients: Vec<IpcClientInfo>,
     },
     /// List of live downstream sessions with explicit transport/scope.
     LiveSessions {
@@ -967,7 +921,6 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
         IpcRequest::RestartServer { .. }
             | IpcRequest::Reload { .. }
             | IpcRequest::Shutdown { .. }
-            | IpcRequest::InjectToken { .. }
             | IpcRequest::ActivitySnapshot { .. }
             | IpcRequest::OperatorSnapshot { .. }
             | IpcRequest::GetServerConfig { .. }
@@ -986,8 +939,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     match request {
         IpcRequest::RestartServer { auth_token, .. }
         | IpcRequest::Reload { auth_token, .. }
-        | IpcRequest::Shutdown { auth_token, .. }
-        | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
         IpcRequest::ActivitySnapshot { auth_token, .. }
         | IpcRequest::OperatorSnapshot { auth_token, .. }
         | IpcRequest::GetServerConfig { auth_token, .. }
@@ -1197,20 +1149,6 @@ mod tests {
                 params: Some(serde_json::json!({"name": "test_tool", "arguments": {}})),
             },
             IpcRequest::AuthStatus,
-            IpcRequest::InjectToken {
-                auth_token: "token".to_string(),
-                server_name: "my-server".to_string(),
-                access_token: "at-123".to_string(),
-                refresh_token: Some("rt-456".to_string()),
-                expires_in: Some(3600),
-            },
-            IpcRequest::InjectToken {
-                auth_token: "token".to_string(),
-                server_name: "other".to_string(),
-                access_token: "at".to_string(),
-                refresh_token: None,
-                expires_in: None,
-            },
         ];
 
         for req in &requests {
@@ -1591,13 +1529,6 @@ mod tests {
             auth_token: "t".to_string(),
             client_id: "client".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::InjectToken {
-            auth_token: "t".to_string(),
-            server_name: "s".to_string(),
-            access_token: "a".to_string(),
-            refresh_token: None,
-            expires_in: None,
-        }));
         assert!(requires_auth(&IpcRequest::ActivitySnapshot {
             auth_token: "t".to_string(),
             after_sequence: 0,
@@ -1662,16 +1593,6 @@ mod tests {
                 auth_token: "my_token".to_string(),
             }),
             Some("my_token")
-        );
-        assert_eq!(
-            extract_auth_token(&IpcRequest::InjectToken {
-                auth_token: "inject_tok".to_string(),
-                server_name: "s".to_string(),
-                access_token: "a".to_string(),
-                refresh_token: None,
-                expires_in: None,
-            }),
-            Some("inject_tok")
         );
     }
 
@@ -1743,24 +1664,6 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(!debug_str.contains("super_secret"));
         assert!(debug_str.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn debug_redacts_inject_token_secrets() {
-        let req = IpcRequest::InjectToken {
-            auth_token: "daemon_secret".to_string(),
-            server_name: "my-server".to_string(),
-            access_token: "bearer_secret".to_string(),
-            refresh_token: Some("refresh_secret".to_string()),
-            expires_in: Some(3600),
-        };
-        let debug_str = format!("{:?}", req);
-        assert!(!debug_str.contains("daemon_secret"));
-        assert!(!debug_str.contains("bearer_secret"));
-        assert!(!debug_str.contains("refresh_secret"));
-        assert!(debug_str.contains("[REDACTED]"));
-        assert!(debug_str.contains("my-server"));
-        assert!(debug_str.contains("3600"));
     }
 
     #[test]

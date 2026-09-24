@@ -279,6 +279,9 @@ pub struct ToolRouter {
     /// Process-wide, reloadable gate for the modern downstream lifecycle.
     /// It defaults off and is captured into each downstream call context.
     modern_downstream_enabled: AtomicBool,
+    /// Change feed for `modern_downstream_enabled`, so long-lived IPC
+    /// connections can push gate changes without polling.
+    modern_downstream_watch: tokio::sync::watch::Sender<bool>,
     /// Serializes `refresh_tools`' decide-and-mutate phase (subscription
     /// classify → prune → snapshot publish → rebind) across concurrent
     /// refresh passes, so one pass cannot interleave reconciliation
@@ -911,6 +914,7 @@ impl ToolRouter {
             task_store: Mutex::new(TaskStore::new()),
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
+            modern_downstream_watch: tokio::sync::watch::Sender::new(false),
             refresh_reconcile_lock: Mutex::new(()),
             refresh_coordinator: RefreshCoordinator::default(),
             #[cfg(test)]
@@ -960,6 +964,11 @@ impl ToolRouter {
     pub fn set_modern_downstream_enabled(&self, enabled: bool) {
         self.modern_downstream_enabled
             .store(enabled, Ordering::Release);
+        self.modern_downstream_watch.send_if_modified(|current| {
+            let changed = *current != enabled;
+            *current = enabled;
+            changed
+        });
         if !enabled {
             self.continuation_registry.clear();
         }
@@ -967,6 +976,11 @@ impl ToolRouter {
 
     pub fn modern_downstream_enabled(&self) -> bool {
         self.modern_downstream_enabled.load(Ordering::Acquire)
+    }
+
+    /// Subscribe to changes of the modern downstream gate.
+    pub fn watch_modern_downstream(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.modern_downstream_watch.subscribe()
     }
 
     pub fn clear_continuations(&self) {

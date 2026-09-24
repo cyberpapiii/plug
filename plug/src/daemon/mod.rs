@@ -680,6 +680,47 @@ async fn handle_ipc_connection(
     result
 }
 
+/// Key a live session's lazy working set the way its transport stores it:
+/// bridge sessions under `ipc:`, HTTP and SSE sessions under `http:`.
+fn live_session_lazy_key(session: &plug_core::ipc::IpcLiveSessionInfo) -> String {
+    let transport = match session.transport {
+        plug_core::ipc::LiveSessionTransport::DaemonProxy => {
+            plug_core::proxy::DownstreamTransport::Ipc
+        }
+        plug_core::ipc::LiveSessionTransport::Http | plug_core::ipc::LiveSessionTransport::Sse => {
+            plug_core::proxy::DownstreamTransport::Http
+        }
+    };
+    plug_core::proxy::ToolRouter::lazy_session_key(transport, &session.session_id)
+}
+
+/// Resolves when the modern downstream gate may have changed. Never resolves
+/// once the sender is gone, so a closed channel cannot spin a select loop.
+async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
+    if gate_rx.changed().await.is_err() {
+        std::future::pending::<()>().await;
+    }
+}
+
+/// Push `ModernDownstreamGateChanged` when the gate differs from the value
+/// this connection last reported.
+async fn push_modern_gate_change(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    gate_rx: &mut tokio::sync::watch::Receiver<bool>,
+    last_modern_gate: &mut bool,
+) -> anyhow::Result<()> {
+    let enabled = *gate_rx.borrow_and_update();
+    if enabled != *last_modern_gate {
+        ipc::send_response(
+            writer,
+            &IpcResponse::ModernDownstreamGateChanged { enabled },
+        )
+        .await?;
+        *last_modern_gate = enabled;
+    }
+    Ok(())
+}
+
 /// Inner loop for IPC connection handling.
 async fn handle_ipc_loop(
     reader: &mut FrameReader,
@@ -694,9 +735,10 @@ async fn handle_ipc_loop(
     // Protocol notification subscription — activated after Register so the daemon
     // can push list_changed, progress, and cancelled notifications to this IPC client.
     let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    let mut gate_tick = tokio::time::interval(Duration::from_millis(100));
-    gate_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut last_modern_gate = ctx.engine.tool_router().modern_downstream_enabled();
+    // Modern downstream gate changes are pushed as they happen. The router
+    // outlives this connection, so the sender never closes under it.
+    let mut gate_rx = ctx.engine.tool_router().watch_modern_downstream();
+    let mut last_modern_gate = *gate_rx.borrow_and_update();
 
     loop {
         // Proxy connections (those that have Registered) are long-lived and should
@@ -724,16 +766,8 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                     }
-                    _ = gate_tick.tick() => {
-                        let enabled = ctx.engine.tool_router().modern_downstream_enabled();
-                        if enabled != last_modern_gate {
-                            ipc::send_response(
-                                writer,
-                                &IpcResponse::ModernDownstreamGateChanged { enabled },
-                            )
-                            .await?;
-                            last_modern_gate = enabled;
-                        }
+                    _ = modern_gate_changed(&mut gate_rx) => {
+                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
                     }
                     reverse = async {
                         if let Some(ref mut rx) = ctx.reverse_request_rx {
@@ -840,7 +874,6 @@ async fn handle_ipc_loop(
         // SESSION_REPLACED) early-returns without touching the bridge, and
         // the still-live channel must be restored as usual.
         let request_was_deregister = is_deregister_request(&request);
-        let gate_router = ctx.engine.tool_router().clone();
 
         let response = {
             use std::pin::pin;
@@ -893,16 +926,8 @@ async fn handle_ipc_loop(
                     } => {
                         send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
                     }
-                    _ = gate_tick.tick() => {
-                        let enabled = gate_router.modern_downstream_enabled();
-                        if enabled != last_modern_gate {
-                            ipc::send_response(
-                                writer,
-                                &IpcResponse::ModernDownstreamGateChanged { enabled },
-                            )
-                            .await?;
-                            last_modern_gate = enabled;
-                        }
+                    _ = modern_gate_changed(&mut gate_rx) => {
+                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
                     }
                 }
             }
@@ -1256,7 +1281,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                         .tool_router()
                         .list_tools_for_client_session(
                             session.client_type,
-                            Some(session.session_id.as_str()),
+                            Some(live_session_lazy_key(session).as_str()),
                         )
                         .len(),
                 })
@@ -1512,17 +1537,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 
         IpcRequest::Deregister { session_id } => {
             // Enforce session ownership — only deregister your own session
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             let removed_client_id = ctx.client_registry.client_id(session_id);
             ctx.client_registry.deregister(session_id);
@@ -1572,17 +1588,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             client_info,
         } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             if ctx
                 .client_registry
@@ -1603,17 +1610,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::Ping { session_id } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             IpcResponse::Pong
         }
@@ -1657,9 +1655,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .collect();
             IpcResponse::Tools { tools: ipc_tools }
         }
-        IpcRequest::ListClients => IpcResponse::Clients {
-            clients: ctx.client_registry.list(),
-        },
         IpcRequest::ListLiveSessions => IpcResponse::LiveSessions {
             sessions: {
                 let mut sessions = ctx.client_registry.list_live_sessions();
@@ -1687,17 +1682,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             },
         },
         IpcRequest::Capabilities { session_id } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             // Capabilities are negotiated once per session and never
             // revisited, so answering from a catalog that is still filling
@@ -1724,17 +1710,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::ModernDownstreamGate { session_id } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             IpcResponse::ModernDownstreamGate {
                 enabled: ctx.engine.tool_router().modern_downstream_enabled(),
@@ -1743,17 +1720,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 
         IpcRequest::UpdateRoots { session_id, roots } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             match serde_json::from_value::<Vec<rmcp::model::Root>>(roots.clone()) {
                 Ok(parsed_roots) => {
@@ -1784,17 +1752,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             capabilities,
         } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             if ctx
                 .client_registry
@@ -1814,17 +1773,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::RestoreResourceSubscriptions { session_id, uris } => {
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: Arc::from(session_id.as_str()),
@@ -1889,17 +1839,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             params,
         } => {
             // Enforce session ownership
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await
         }
@@ -1912,17 +1853,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         } => {
             // Context-bearing requests use the same connection ownership
             // rules as the legacy IPC request shape.
-            if ctx.session_id.as_deref() != Some(session_id.as_str()) {
-                return IpcResponse::Error {
-                    code: "SESSION_MISMATCH".to_string(),
-                    message: "session_id does not match this connection".to_string(),
-                };
-            }
-            if !ctx.client_registry.session_exists(session_id) {
-                return IpcResponse::Error {
-                    code: "SESSION_REPLACED".to_string(),
-                    message: "session is no longer active for this client".to_string(),
-                };
+            if let Some(response) = reject_unowned_session(ctx, session_id) {
+                return response;
             }
             dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await
         }
@@ -1968,15 +1900,26 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::AuthStatus => dispatch_auth_status(ctx).await,
-
-        IpcRequest::InjectToken {
-            server_name,
-            access_token,
-            refresh_token,
-            expires_in,
-            ..
-        } => dispatch_inject_token(ctx, server_name, access_token, refresh_token, expires_in).await,
     }
+}
+
+/// Reject a request naming a session this connection does not own
+/// (`SESSION_MISMATCH`) or one a newer registration has replaced
+/// (`SESSION_REPLACED`).
+fn reject_unowned_session(ctx: &ConnectionContext, session_id: &str) -> Option<IpcResponse> {
+    if ctx.session_id.as_deref() != Some(session_id) {
+        return Some(IpcResponse::Error {
+            code: "SESSION_MISMATCH".to_string(),
+            message: "session_id does not match this connection".to_string(),
+        });
+    }
+    if !ctx.client_registry.session_exists(session_id) {
+        return Some(IpcResponse::Error {
+            code: "SESSION_REPLACED".to_string(),
+            message: "session is no longer active for this client".to_string(),
+        });
+    }
+    None
 }
 
 fn reject_invalid_cancellation_identity(
@@ -2006,119 +1949,6 @@ fn reject_invalid_cancellation_identity(
         });
     }
     None
-}
-
-/// Handle `InjectToken` — save credentials and trigger server reconnect.
-async fn dispatch_inject_token(
-    ctx: &ConnectionContext,
-    server_name: &str,
-    access_token: &str,
-    refresh_token: &Option<String>,
-    expires_in: &Option<u64>,
-) -> IpcResponse {
-    use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
-    use plug_core::oauth;
-    use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
-    use std::time::{SystemTime, UNIX_EPOCH};
-
-    // Verify server exists and is OAuth-configured
-    let config = match plug_core::config::load_config(Some(&ctx.config_path)) {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return IpcResponse::Error {
-                code: "CONFIG_LOAD_FAILED".to_string(),
-                message: e.to_string(),
-            };
-        }
-    };
-    match config.servers.get(server_name) {
-        Some(sc) if sc.auth.as_deref() == Some("oauth") => {}
-        Some(_) => {
-            return IpcResponse::Error {
-                code: "NOT_OAUTH_SERVER".to_string(),
-                message: format!("server '{server_name}' is not configured for OAuth"),
-            };
-        }
-        None => {
-            return IpcResponse::Error {
-                code: "UNKNOWN_SERVER".to_string(),
-                message: format!("server '{server_name}' not found in config"),
-            };
-        }
-    }
-
-    // Build and save credentials
-    let store = oauth::get_or_create_store(server_name);
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-
-    let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
-        AccessToken::new(access_token.to_string()),
-        BasicTokenType::Bearer,
-        VendorExtraTokenFields::default(),
-    );
-
-    if let Some(rt) = refresh_token {
-        token.set_refresh_token(Some(RefreshToken::new(rt.clone())));
-    }
-    if let Some(secs) = expires_in {
-        token.set_expires_in(Some(&std::time::Duration::from_secs(*secs)));
-    }
-
-    let snapshot = store.credential_snapshot();
-    let existing_client_id = snapshot
-        .credentials
-        .as_ref()
-        .map(|creds| creds.client_id.as_str());
-    let (client_id, _) = oauth::injected_client_identity(
-        config
-            .servers
-            .get(server_name)
-            .is_some_and(|sc| sc.auth.as_deref() == Some("oauth")),
-        config
-            .servers
-            .get(server_name)
-            .and_then(|sc| sc.oauth_client_id.as_deref()),
-        existing_client_id,
-        refresh_token.is_some(),
-    );
-
-    let stored = StoredCredentials::new(client_id, Some(token), vec![], Some(now));
-
-    if let Err(e) = store.save(stored).await {
-        return IpcResponse::Error {
-            code: "CREDENTIAL_SAVE_FAILED".to_string(),
-            message: e.to_string(),
-        };
-    }
-
-    // Trigger server reconnect to pick up new credentials
-    match ctx.engine.restart_server(server_name).await {
-        Ok(()) => {
-            tracing::info!(server = %server_name, "credentials injected and server restarted via IPC");
-            // Notify IPC clients of the auth state change (→ Healthy)
-            ctx.engine.tool_router().publish_protocol_notification(
-                plug_core::notifications::ProtocolNotification::AuthStateChanged {
-                    server_id: std::sync::Arc::from(server_name),
-                    new_state: plug_core::types::ServerHealth::Healthy,
-                },
-            );
-            IpcResponse::Ok
-        }
-        Err(e) => {
-            tracing::warn!(server = %server_name, error = %e, "credentials injected but server restart failed");
-            IpcResponse::Error {
-                code: "RESTART_FAILED".to_string(),
-                message: format!(
-                    "credentials saved but server restart failed: {e:#}. \
-                     The server may recover on next health check."
-                ),
-            }
-        }
-    }
 }
 
 fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
@@ -3008,51 +2838,6 @@ mod tests {
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
-    #[tokio::test]
-    async fn inject_token_reuses_existing_persisted_client_id() {
-        let config_path = temp_config_path("inject-token-client-id");
-        let server_name = format!("oauth-inject-{}", std::process::id());
-        write_oauth_config(&config_path, &[server_name.as_str()]);
-        let mut config = plug_core::config::load_config(Some(&config_path)).unwrap();
-        config
-            .servers
-            .get_mut(&server_name)
-            .expect("server config")
-            .oauth_client_id = None;
-        std::fs::write(&config_path, toml::to_string(&config).unwrap()).unwrap();
-
-        let store = plug_core::oauth::get_or_create_store(&server_name);
-        clear_store(&server_name).await;
-        let mut existing = seeded_credentials();
-        existing.client_id = "dynamic-client-123".to_string();
-        store.save(existing).await.unwrap();
-
-        let ctx = auth_status_test_context(config_path.clone());
-        let response = dispatch_inject_token(
-            &ctx,
-            &server_name,
-            "new-access-token",
-            &Some("new-refresh-token".to_string()),
-            &Some(3600),
-        )
-        .await;
-
-        match response {
-            IpcResponse::Ok | IpcResponse::Error { .. } => {}
-            other => panic!("unexpected inject response: {other:?}"),
-        }
-
-        let stored = store
-            .load()
-            .await
-            .expect("load injected credentials")
-            .expect("stored credentials");
-        assert_eq!(stored.client_id, "dynamic-client-123");
-
-        clear_store(&server_name).await;
-        cleanup_temp_config(&config_path);
-    }
-
     #[test]
     fn parse_error_for_legacy_register_maps_to_protocol_error() {
         let frame = serde_json::to_vec(&serde_json::json!({
@@ -3661,6 +3446,110 @@ mod tests {
         plug_core::ipc::write_frame(&mut stream, &serde_json::to_vec(&reply).unwrap())
             .await
             .expect("write reverse-request reply");
+
+        cancel.cancel();
+        drop(stream);
+        let _ = server_task.await;
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The operator snapshot counts visible tools from the same working-set
+    /// key each transport writes, not the raw session id.
+    #[test]
+    fn live_session_lazy_key_matches_the_transport_key() {
+        let session = |transport| plug_core::ipc::IpcLiveSessionInfo {
+            transport,
+            client_id: None,
+            session_id: "sess-1".to_string(),
+            client_type: plug_core::types::ClientType::Unknown,
+            client_info: None,
+            adapter_version: None,
+            connected_secs: 0,
+            last_activity_secs: None,
+        };
+        let ipc = plug_core::proxy::ToolRouter::lazy_session_key(
+            plug_core::proxy::DownstreamTransport::Ipc,
+            "sess-1",
+        );
+        let http = plug_core::proxy::ToolRouter::lazy_session_key(
+            plug_core::proxy::DownstreamTransport::Http,
+            "sess-1",
+        );
+        assert_eq!(
+            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::DaemonProxy)),
+            ipc
+        );
+        assert_eq!(
+            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Http)),
+            http
+        );
+        assert_eq!(
+            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Sse)),
+            http
+        );
+    }
+
+    /// A registered connection hears about a modern downstream gate change
+    /// without sending another request.
+    #[tokio::test]
+    async fn registered_connection_is_pushed_modern_gate_changes() {
+        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        engine.start().await.expect("engine start");
+
+        let socket_path = std::path::PathBuf::from(format!(
+            "/tmp/plug-ipc-gate-push-{}.sock",
+            &uuid::Uuid::new_v4().simple().to_string()[..12]
+        ));
+        let _ = std::fs::remove_file(&socket_path);
+        let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
+        let cancel = CancellationToken::new();
+        let (client_registry, _count_rx) = ClientRegistry::new();
+        let ctx = ConnectionContext {
+            cancel: cancel.clone(),
+            auth_token: Arc::from("test-token"),
+            server_manager: Arc::clone(engine.server_manager()),
+            engine: Arc::clone(&engine),
+            config_path: std::path::PathBuf::from("/tmp/plug-ipc-gate-push-config.toml"),
+            started_at: Instant::now(),
+            client_registry: Arc::new(client_registry),
+            http_sessions: None,
+            downstream_oauth: None,
+            session_id: Some("gate-push-session".to_string()),
+            reverse_request_rx: None,
+        };
+        let server_task = tokio::spawn(async move {
+            if let Ok((stream, _addr)) = listener.accept().await {
+                let _ = handle_ipc_connection(stream, ctx).await;
+            }
+        });
+
+        let mut stream = tokio::net::UnixStream::connect(&socket_path)
+            .await
+            .expect("client connect");
+        // Enter the registered-idle loop.
+        write_ipc(&mut stream, &IpcRequest::Status).await;
+        let status = read_ipc_response(&mut stream).await;
+        assert!(matches!(status, IpcResponse::Status { .. }), "{status:?}");
+
+        for expected in [true, false] {
+            engine.tool_router().set_modern_downstream_enabled(expected);
+            let pushed = loop {
+                let frame = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    plug_core::ipc::read_frame(&mut stream),
+                )
+                .await
+                .expect("timed out waiting for the gate push")
+                .expect("read frame")
+                .expect("unexpected EOF");
+                let response: IpcResponse = serde_json::from_slice(&frame).expect("decode frame");
+                if let IpcResponse::ModernDownstreamGateChanged { enabled } = response {
+                    break enabled;
+                }
+            };
+            assert_eq!(pushed, expected);
+        }
 
         cancel.cancel();
         drop(stream);

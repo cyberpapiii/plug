@@ -177,27 +177,6 @@ impl ClientRegistry {
         self.sessions.contains_key(session_id)
     }
 
-    /// Snapshot all live sessions for CLI inspection.
-    pub(super) fn list(&self) -> Vec<plug_core::ipc::IpcClientInfo> {
-        let mut clients = self
-            .sessions
-            .iter()
-            .map(|entry| plug_core::ipc::IpcClientInfo {
-                client_id: entry.client_id.clone(),
-                session_id: entry.key().clone(),
-                client_info: entry.client_info.clone(),
-                adapter_version: entry.adapter_version.clone(),
-                connected_secs: entry.connected_at.elapsed().as_secs(),
-            })
-            .collect::<Vec<_>>();
-        clients.sort_by(|a, b| {
-            a.client_info
-                .cmp(&b.client_info)
-                .then(a.session_id.cmp(&b.session_id))
-        });
-        clients
-    }
-
     /// Snapshot all live sessions in the newer transport-aware shape.
     pub(super) fn list_live_sessions(&self) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
         let mut sessions = self
@@ -297,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn registration_preserves_adapter_version_in_client_and_live_inventories() {
+    fn registration_preserves_adapter_version_in_live_inventory() {
         let (registry, _count_rx) = ClientRegistry::new();
 
         registry.register(
@@ -306,7 +285,6 @@ mod tests {
             Some("0.6.5".to_string()),
         );
 
-        assert_eq!(registry.list()[0].adapter_version.as_deref(), Some("0.6.5"));
         assert_eq!(
             registry.list_live_sessions()[0].adapter_version.as_deref(),
             Some("0.6.5")

@@ -21,6 +21,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   made the call, and turn the latency orange when a call took five seconds or
   more.
 - The version in About can be selected and copied.
+- `plug codesign-setup` is gone. It only ran for a `PLUG_DEV=1 plug-dev`
+  binary, a development path `dev-install.sh` already replaced.
 
 ### Removed
 
@@ -70,6 +72,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- A tool result or schema with a key named `envelope` no longer fails the
+  whole call through `plug connect` with "invalid envelope message".
+- Through `plug connect`, an upstream error from reading a resource, getting
+  a prompt, completing, or listing now reaches the client as that error (for
+  example "resource not found") instead of "failed to parse".
+- Sending a client's roots to the daemon through `plug connect` no longer
+  leaves its reply behind for the next call to read when the daemon pushed a
+  notification first, and a wedged daemon during that send now trips the
+  read watchdog instead of hanging.
+- The daemon no longer wakes ten times a second for every connected
+  `plug connect` client to check whether the modern protocol gate changed.
+  Gate changes are now pushed the moment they happen.
+- The operator snapshot's visible tool count for a lazy-bridge session now
+  includes the tools that session loaded, instead of counting only the meta
+  tools.
 - A server that failed at startup and later recovered now gets its
   `max_concurrent` limit and circuit breaker. It used to run with neither
   for the rest of the daemon's life.
