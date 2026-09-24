@@ -1301,6 +1301,18 @@ impl StdioProtocolState {
 /// request/response vocabulary; a gated modern session passes through without
 /// those rewrites, beginning with `server/discover` as its first message.
 fn stdio_transport(modern_gate: Arc<dyn Fn() -> bool + Send + Sync>) -> tokio::io::DuplexStream {
+    bridge_transport(tokio::io::stdin(), tokio::io::stdout(), modern_gate)
+}
+
+fn bridge_transport<I, O>(
+    input: I,
+    mut output: O,
+    modern_gate: Arc<dyn Fn() -> bool + Send + Sync>,
+) -> tokio::io::DuplexStream
+where
+    I: tokio::io::AsyncRead + Unpin + Send + 'static,
+    O: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _, BufReader};
 
     let (service, bridge) = tokio::io::duplex(256 * 1024);
@@ -1313,7 +1325,7 @@ fn stdio_transport(modern_gate: Arc<dyn Fn() -> bool + Send + Sync>) -> tokio::i
     let inbound_tasks = std::sync::Arc::clone(&task_requests);
     let inbound_protocol = std::sync::Arc::clone(&protocol_state);
     tokio::spawn(async move {
-        let mut input = BufReader::new(tokio::io::stdin()).lines();
+        let mut input = BufReader::new(input).lines();
         while let Ok(Some(line)) = input.next_line().await {
             let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) else {
                 let _ = bridge_write.write_all(line.as_bytes()).await;
@@ -1344,11 +1356,14 @@ fn stdio_transport(modern_gate: Arc<dyn Fn() -> bool + Send + Sync>) -> tokio::i
                 }
             }
         }
+        // Dropping one half of a split duplex does not close it; without an
+        // explicit shutdown the service never sees EOF and the process stays
+        // up after the host closes stdin.
+        let _ = bridge_write.shutdown().await;
     });
 
     let outbound_protocol = protocol_state;
     tokio::spawn(async move {
-        let mut output = tokio::io::stdout();
         let mut lines = BufReader::new(bridge_read).lines();
         while let Ok(Some(line)) = lines.next_line().await {
             let Ok(mut value) = serde_json::from_str::<serde_json::Value>(&line) else {
@@ -1937,6 +1952,20 @@ mod tests {
             .connect(server_name, tcp)
             .await
             .expect("complete tls handshake")
+    }
+
+    #[tokio::test]
+    async fn bridge_closes_the_service_side_when_the_host_closes_stdin() {
+        use tokio::io::AsyncReadExt as _;
+
+        let mut service =
+            bridge_transport(tokio::io::empty(), tokio::io::sink(), Arc::new(|| false));
+        let mut buf = [0u8; 16];
+        let read = tokio::time::timeout(Duration::from_secs(5), service.read(&mut buf))
+            .await
+            .expect("service side sees EOF once stdin closes")
+            .expect("read succeeds");
+        assert_eq!(read, 0);
     }
 
     #[tokio::test]
