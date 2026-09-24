@@ -102,9 +102,21 @@ fn initialize_platform_keyring() -> Result<(), String> {
     .clone()
 }
 
+/// `keyring` installs its platform store on the first `Entry::new`, behind a
+/// flag it sets before the store exists. A second thread arriving in that
+/// window gets `NoDefaultStore`, which a read treats as a missing Keychain
+/// entry. Building the first entry under a `OnceLock` makes everyone else wait
+/// for the store. Constructing an entry does not touch the Keychain.
 #[cfg(not(target_os = "linux"))]
 fn initialize_platform_keyring() -> Result<(), String> {
-    Ok(())
+    static INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    INIT.get_or_init(|| {
+        platform_keyring::Entry::new("plug", "oauth:store-init")
+            .map(drop)
+            .map_err(|error| error.to_string())
+    })
+    .clone()
 }
 
 // ---------------------------------------------------------------------------
@@ -1882,6 +1894,31 @@ pub async fn refresh_access_token(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Two servers starting together used to race the keyring crate's lazy
+    /// store setup: the loser got `NoDefaultStore`, read as an empty Keychain.
+    /// Run alone, so this process has not touched the keyring yet.
+    #[test]
+    fn concurrent_first_keyring_entries_all_see_the_store() {
+        const THREADS: usize = 16;
+        let barrier = Arc::new(std::sync::Barrier::new(THREADS));
+        let stores: Vec<_> = (0..THREADS)
+            .map(|index| get_or_create_store(&format!("keyring-race-{index}")))
+            .collect();
+        let handles: Vec<_> = stores
+            .into_iter()
+            .map(|store| {
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    store.keyring_entry().is_some()
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert!(handle.join().expect("keyring thread panicked"));
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

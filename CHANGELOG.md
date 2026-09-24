@@ -61,6 +61,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   instead of "Unknown" with a Restart button.
 - The app reads responses the daemon splits into chunks, so a server list or
   tool list larger than 4 MiB no longer fails to load.
+- OAuth servers that start at the same moment no longer race the Keychain
+  store setup. The loser read its Keychain copy as missing, logged "incomplete
+  issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
 
 ## [0.8.11] - 2026-09-01
 
