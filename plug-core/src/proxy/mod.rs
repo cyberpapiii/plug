@@ -238,6 +238,9 @@ pub struct ToolRouter {
     /// without invalidating parked rounds; route targets and upstream
     /// instances may not.
     published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
+    /// Search index for the current snapshot, rebuilt lazily when the
+    /// snapshot changes. See [`ToolRouter::search_index_for`].
+    search_index: std::sync::Mutex<Option<Arc<ToolSearchIndex>>>,
     config: RouterConfig,
     protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
     /// Separate channel for logging notifications to prevent log volume
@@ -882,6 +885,7 @@ impl ToolRouter {
             activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
+            search_index: std::sync::Mutex::new(None),
             config,
             protocol_notification_tx,
             logging_tx,
@@ -3509,6 +3513,26 @@ impl ToolRouter {
         )]))
     }
 
+    /// Return the search index for `snapshot`, building it on first use.
+    /// A racing search against an older snapshot builds its own index
+    /// without replacing the cached one for the newer snapshot.
+    fn search_index_for(&self, snapshot: &Arc<RouterSnapshot>) -> Arc<ToolSearchIndex> {
+        let mut cached = self
+            .search_index
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(index) = cached.as_ref()
+            && index.is_for(snapshot)
+        {
+            return Arc::clone(index);
+        }
+        let index = Arc::new(ToolSearchIndex::build(snapshot));
+        if Arc::ptr_eq(snapshot, &*self.cache.load()) {
+            *cached = Some(Arc::clone(&index));
+        }
+        index
+    }
+
     /// Handle the `plug__search_tools` meta-tool call.
     fn handle_search_tools(
         &self,
@@ -3544,19 +3568,14 @@ impl ToolRouter {
             .and_then(|value| value.as_u64())
             .map(|value| value.min(BRIDGE_SEARCH_RESULT_MAX as u64) as usize)
             .unwrap_or(5);
-        let snapshot = self.cache.load();
+        let snapshot = self.cache.load_full();
+        let index = self.search_index_for(&snapshot);
         let mut ranked = Vec::new();
-        for tool in snapshot.tools_all.iter() {
-            let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
+        for entry in &index.entries {
+            let Some(score) = score_normalized_match(&entry.text, &query_phrase, &tokens) else {
                 continue;
             };
-            if server_id == "__plug_internal__" {
-                continue;
-            }
-            let Some(score) = score_tool_match(tool, server_id, &query_phrase, &tokens) else {
-                continue;
-            };
-            ranked.push((score, server_id.as_str(), tool.name.as_ref()));
+            ranked.push((score, entry.server_id.as_str(), entry.tool_name.as_str()));
         }
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(b.2)));
         ranked.truncate(limit);

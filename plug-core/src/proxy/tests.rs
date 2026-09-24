@@ -788,6 +788,80 @@ fn search_tools_returns_matches() {
 }
 
 #[test]
+fn search_index_scores_match_direct_scoring_and_follow_the_snapshot() {
+    let sm = Arc::new(ServerManager::new());
+    let router = ToolRouter::new(sm, test_router_config());
+    let mut titled = Tool::new(
+        Cow::Borrowed("Git_Hub__Create-PR"),
+        Cow::Borrowed("Open a Pull Request on GitHub"),
+        Arc::new(serde_json::Map::new()),
+    );
+    titled.title = Some("Create Pull Request".to_string());
+    let tools = vec![
+        titled,
+        Tool::new(
+            Cow::Borrowed("slack__send"),
+            Cow::Borrowed("Send a message on Slack"),
+            Arc::new(serde_json::Map::new()),
+        ),
+    ];
+    store_plain_tools_snapshot(&router, tools.clone());
+
+    let snapshot = router.cache.load_full();
+    let index = router.search_index_for(&snapshot);
+    assert!(
+        Arc::ptr_eq(&index, &router.search_index_for(&snapshot)),
+        "the same snapshot must reuse its index"
+    );
+    let indexed = index
+        .entries
+        .iter()
+        .map(|entry| entry.tool_name.as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(indexed, vec!["Git_Hub__Create-PR", "slack__send"]);
+
+    for query in [
+        "pull request",
+        "git hub",
+        "send slack message",
+        "create",
+        "x",
+    ] {
+        let tokens = tokenize_search_query(query);
+        let phrase = tokens.join(" ");
+        for (entry, tool) in index.entries.iter().zip(&tools) {
+            assert_eq!(
+                score_normalized_match(&entry.text, &phrase, &tokens),
+                score_tool_match(tool, &entry.server_id, &phrase, &tokens),
+                "query {query:?} tool {}",
+                entry.tool_name
+            );
+        }
+    }
+
+    store_plain_tools_snapshot(
+        &router,
+        vec![Tool::new(
+            Cow::Borrowed("jira__file"),
+            Cow::Borrowed("File a ticket"),
+            Arc::new(serde_json::Map::new()),
+        )],
+    );
+    let next = router.search_index_for(&router.cache.load_full());
+    assert!(
+        !Arc::ptr_eq(&index, &next),
+        "a new snapshot rebuilds the index"
+    );
+    let mut args = serde_json::Map::new();
+    args.insert("query".to_string(), serde_json::json!("ticket"));
+    let text = format!(
+        "{:?}",
+        router.handle_search_tools(Some(args), None).unwrap()
+    );
+    assert!(text.contains("jira__file"));
+}
+
+#[test]
 fn meta_tool_mode_lists_only_meta_tools() {
     let sm = Arc::new(ServerManager::new());
     let mut config = test_router_config();
