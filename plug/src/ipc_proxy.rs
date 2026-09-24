@@ -1627,7 +1627,7 @@ mod tests {
         }
         tokio::time::timeout(
             Duration::from_secs(5),
-            crate::runtime::wait_for_daemon_ready(None),
+            crate::runtime::wait_for_daemon_socket(),
         )
         .await
         .unwrap_or_else(|_| {
@@ -1636,8 +1636,7 @@ mod tests {
                 crate::daemon::socket_path().display(),
                 handle.is_finished()
             )
-        })
-        .expect("daemon ready");
+        });
         (engine, handle)
     }
 
@@ -2721,6 +2720,96 @@ mod tests {
         UnixListener::bind(&path).expect("bind fake daemon socket")
     }
 
+    /// Answer the `OperatorHandshake` every session setup opens with.
+    async fn answer_operator_handshake(reader: &mut OwnedReadHalf, writer: &mut OwnedWriteHalf) {
+        let frame = ipc::read_frame(reader)
+            .await
+            .expect("read operator handshake frame")
+            .expect("connection closed before operator handshake");
+        let req: IpcRequest =
+            serde_json::from_slice(&frame).expect("parse operator handshake request");
+        match req {
+            IpcRequest::OperatorHandshake {
+                client_version,
+                ipc_min,
+                ipc_max,
+            } => {
+                assert_eq!(client_version, env!("CARGO_PKG_VERSION"));
+                assert!(ipc_min <= ipc::OPERATOR_IPC_MAX);
+                assert!(ipc_max >= ipc::OPERATOR_IPC_MIN);
+                ipc::send_response(
+                    writer,
+                    &IpcResponse::OperatorHandshake {
+                        handshake: ipc::OperatorHandshake {
+                            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                            daemon_executable: Some(
+                                std::env::current_exe().expect("test executable path"),
+                            ),
+                            ipc_min: ipc::OPERATOR_IPC_MIN,
+                            ipc_max: ipc::OPERATOR_IPC_MAX,
+                            ownership: ipc::DaemonOwnershipMode::Unmanaged,
+                            capabilities: Vec::new(),
+                        },
+                    },
+                )
+                .await
+                .expect("send OperatorHandshake");
+            }
+            other => panic!("expected OperatorHandshake, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_setup_rejects_a_registration_for_another_client() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("register-mismatch");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            answer_operator_handshake(&mut reader, &mut writer).await;
+            ipc::read_frame(&mut reader)
+                .await
+                .expect("read register frame")
+                .expect("connection open");
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::Registered {
+                    protocol_version: ipc::IPC_PROTOCOL_VERSION,
+                    client_id: "someone-else".to_string(),
+                    session_id: "stolen-session".to_string(),
+                    modern_downstream_enabled: false,
+                    cancellation_capability: ipc::IpcCancellationCapability::new(
+                        "capability".to_string(),
+                    ),
+                },
+            )
+            .await
+            .expect("send Registered");
+        });
+
+        let error = match crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-register-mismatch".to_string(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a registration for another client must fail setup"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("registration mismatch"),
+            "unexpected error: {error}"
+        );
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     /// Perform the OperatorHandshake + Register + Capabilities handshake that
     /// `establish_daemon_proxy_session` sends on the initial connect AND on
     /// every reconnect, replying with `session_id` and default
@@ -2756,43 +2845,8 @@ mod tests {
     ) -> (OwnedReadHalf, OwnedWriteHalf, Vec<String>) {
         let (mut reader, mut writer) = stream.into_split();
         let mut seen = Vec::new();
-
-        let frame = ipc::read_frame(&mut reader)
-            .await
-            .expect("read operator handshake frame")
-            .expect("connection closed before operator handshake");
-        let req: IpcRequest =
-            serde_json::from_slice(&frame).expect("parse operator handshake request");
-        match req {
-            IpcRequest::OperatorHandshake {
-                client_version,
-                ipc_min,
-                ipc_max,
-            } => {
-                seen.push("OperatorHandshake".to_string());
-                assert_eq!(client_version, env!("CARGO_PKG_VERSION"));
-                assert!(ipc_min <= ipc::OPERATOR_IPC_MAX);
-                assert!(ipc_max >= ipc::OPERATOR_IPC_MIN);
-                ipc::send_response(
-                    &mut writer,
-                    &IpcResponse::OperatorHandshake {
-                        handshake: ipc::OperatorHandshake {
-                            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                            daemon_executable: Some(
-                                std::env::current_exe().expect("test executable path"),
-                            ),
-                            ipc_min: ipc::OPERATOR_IPC_MIN,
-                            ipc_max: ipc::OPERATOR_IPC_MAX,
-                            ownership: ipc::DaemonOwnershipMode::Unmanaged,
-                            capabilities: Vec::new(),
-                        },
-                    },
-                )
-                .await
-                .expect("send OperatorHandshake");
-            }
-            other => panic!("expected OperatorHandshake, got {other:?}"),
-        }
+        answer_operator_handshake(&mut reader, &mut writer).await;
+        seen.push("OperatorHandshake".to_string());
 
         let frame = ipc::read_frame(&mut reader)
             .await
