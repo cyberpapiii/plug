@@ -46,6 +46,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug connect` now exits when its host closes stdin. Before, it kept
+  running with a live daemon session after the app or agent that started it
+  was gone.
+
 - Toggling a tool or server from Plug.app or `plug servers` no longer
   restarts every server whose config uses `$VAR` env references. The reload
   compared the raw file against the expanded running config, saw every
