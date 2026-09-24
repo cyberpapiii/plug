@@ -36,10 +36,11 @@ jobs:
     if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
     # CI never debugs these binaries. Omitting DWARF materially reduces compile,
-    # link, cache, and upload time without changing the code under test. These
-    # live per job rather than at workflow level so warm-release-cache, which
-    # must hash the same rust-cache key as release.yml, inherits none of them.
-    env:
+    # link, cache, and upload time without changing the code under test. This
+    # block is a YAML anchor that the other lanes reuse, not workflow-level
+    # env, so warm-release-cache, which must hash the same rust-cache key as
+    # release.yml, inherits none of it.
+    env: &lane-env
       CARGO_TERM_COLOR: always
       CARGO_PROFILE_DEV_DEBUG: 0
       CARGO_PROFILE_TEST_DEBUG: 0
@@ -58,15 +59,7 @@ jobs:
     needs: classify
     if: needs.classify.outputs.rust == 'true'
     runs-on: ubuntu-latest
-    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
-    # link, cache, and upload time without changing the code under test. These
-    # live per job rather than at workflow level so warm-release-cache, which
-    # must hash the same rust-cache key as release.yml, inherits none of them.
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      RUSTFLAGS: -Dwarnings
+    env: *lane-env
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -81,15 +74,7 @@ jobs:
     needs: classify
     if: needs.classify.outputs.rust == 'true'
     runs-on: macos-15
-    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
-    # link, cache, and upload time without changing the code under test. These
-    # live per job rather than at workflow level so warm-release-cache, which
-    # must hash the same rust-cache key as release.yml, inherits none of them.
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      RUSTFLAGS: -Dwarnings
+    env: *lane-env
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -101,15 +86,7 @@ jobs:
     needs: classify
     if: needs.classify.outputs.e2e == 'true'
     runs-on: ubuntu-latest
-    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
-    # link, cache, and upload time without changing the code under test. These
-    # live per job rather than at workflow level so warm-release-cache, which
-    # must hash the same rust-cache key as release.yml, inherits none of them.
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      RUSTFLAGS: -Dwarnings
+    env: *lane-env
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -130,17 +107,9 @@ jobs:
   test-macos-app:
     name: Test (Plug.app)
     needs: classify
-    if: needs.classify.outputs.app == 'true' && (github.event_name == 'pull_request' || (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+    if: needs.classify.outputs.app == 'true'
     runs-on: macos-15
-    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
-    # link, cache, and upload time without changing the code under test. These
-    # live per job rather than at workflow level so warm-release-cache, which
-    # must hash the same rust-cache key as release.yml, inherits none of them.
-    env:
-      CARGO_TERM_COLOR: always
-      CARGO_PROFILE_DEV_DEBUG: 0
-      CARGO_PROFILE_TEST_DEBUG: 0
-      RUSTFLAGS: -Dwarnings
+    env: *lane-env
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
