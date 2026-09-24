@@ -85,6 +85,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A server that failed at startup is now retried the moment its health task
   starts. It used to sit out a random pause of up to ten seconds meant only
   to stagger pings to healthy servers.
+- `plug auth inject` for an OAuth server with no earlier login now works.
+  It saved the token without binding it to the server's authorization
+  server, the runtime refused it, and the server stayed "auth required". It
+  now discovers and binds the authority first, as `plug auth login` does.
 
 ## [0.8.11] - 2026-09-01
 

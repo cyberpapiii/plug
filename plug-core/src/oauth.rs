@@ -366,21 +366,31 @@ pub async fn verified_access_token_for_resource(
     resource_url: &str,
     start_budget: Duration,
 ) -> Result<Option<String>, AuthError> {
-    use rmcp::transport::auth::AuthorizationManager;
-
     let store = get_or_create_store(server_name);
     if let Some(token) = store.bound_access_token_for_resource(resource_url) {
         return Ok(Some(token));
     }
 
-    let manager = AuthorizationManager::new(resource_url).await?;
-    let resolution =
-        bounded_discovery(resource_url, start_budget, manager.resolve_metadata()).await?;
-    let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
-    store.bind_verified_authority(&authority)?;
+    bind_discovered_authority(&store, resource_url, start_budget).await?;
     Ok(store
         .verified_bound_credentials()
         .and_then(|credentials| stored_access_token(&credentials)))
+}
+
+/// Discover `resource_url`'s OAuth authority and bind `store` to it, so the
+/// next save writes an issuer/resource-bound pair the runtime will accept.
+/// Discovery is bounded by a share of `budget` like every start-path lookup.
+pub async fn bind_discovered_authority(
+    store: &CompositeCredentialStore,
+    resource_url: &str,
+    budget: Duration,
+) -> Result<(), AuthError> {
+    use rmcp::transport::auth::AuthorizationManager;
+
+    let manager = AuthorizationManager::new(resource_url).await?;
+    let resolution = bounded_discovery(resource_url, budget, manager.resolve_metadata()).await?;
+    let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
+    store.bind_verified_authority(&authority)
 }
 
 // ---------------------------------------------------------------------------
