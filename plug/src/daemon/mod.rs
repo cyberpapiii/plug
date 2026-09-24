@@ -655,9 +655,29 @@ struct InFlight {
     ids: std::collections::HashMap<tokio::task::Id, u64>,
 }
 
-/// Reverse requests written to the proxy and awaiting its `reverse_id` reply.
+/// Reverse requests written to the proxy and awaiting its reply, oldest first.
 type PendingReverse =
-    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
+    std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
+
+/// The reverse request `frame` answers, if it is a reverse-request reply.
+///
+/// A v4 proxy tags its reply with `reverse_id`. A v3 proxy sends a bare
+/// `IpcClientResponse` and answers reverse requests one at a time in the
+/// order it received them, so a bare reply belongs to the oldest one waiting.
+/// No `IpcRequest` variant shares a name with an `IpcClientResponse` variant,
+/// so a request never parses as a reply.
+fn reverse_reply_target(pending: &PendingReverse, frame: &[u8], ids: ipc::FrameIds) -> Option<u64> {
+    if ids.reverse_id.is_some() {
+        return ids.reverse_id;
+    }
+    if ids.ipc_id.is_some() {
+        return None;
+    }
+    let oldest = *pending.keys().next()?;
+    serde_json::from_slice::<IpcClientResponse>(frame)
+        .is_ok()
+        .then_some(oldest)
+}
 
 /// True for requests that change the connection's own session and so must
 /// run in order on the connection loop even when tagged.
@@ -898,7 +918,7 @@ async fn handle_ipc_loop(
         };
 
         let ids = ipc::FrameIds::peek(&frame);
-        if let Some(reverse_id) = ids.reverse_id {
+        if let Some(reverse_id) = reverse_reply_target(&pending_reverse, &frame, ids) {
             deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
             continue;
         }
@@ -1040,7 +1060,11 @@ async fn handle_ipc_loop(
                     }
                     next = reader.next(), if read_ahead => {
                         match next {
-                            Ok(Some(frame)) => match ipc::FrameIds::peek(&frame).reverse_id {
+                            Ok(Some(frame)) => match reverse_reply_target(
+                                &pending_reverse,
+                                &frame,
+                                ipc::FrameIds::peek(&frame),
+                            ) {
                                 Some(reverse_id) => {
                                     deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
                                 }
@@ -1230,8 +1254,9 @@ async fn send_reverse_request(
         request: Box::new(request),
     };
 
-    // Forget requests whose caller already gave up.
-    pending.retain(|_, tx| !tx.is_closed());
+    // Entries whose caller gave up stay until the proxy answers them: a v3
+    // proxy's bare reply is matched to the oldest entry, so dropping one
+    // early would hand the next reply to the wrong waiter.
     pending.insert(id, response_tx);
     tracing::debug!(
         reverse_request_id = id,
@@ -1593,11 +1618,14 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             client_info,
             adapter_version,
         } => {
-            if *protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+            if !(plug_core::ipc::IPC_PROTOCOL_VERSION_MIN..=plug_core::ipc::IPC_PROTOCOL_VERSION)
+                .contains(protocol_version)
+            {
                 return IpcResponse::Error {
                     code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
                     message: format!(
-                        "daemon supports IPC protocol v{}, got v{}",
+                        "daemon supports IPC protocol v{}..=v{}, got v{}",
+                        plug_core::ipc::IPC_PROTOCOL_VERSION_MIN,
                         plug_core::ipc::IPC_PROTOCOL_VERSION,
                         protocol_version
                     ),
@@ -1666,8 +1694,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             );
             ctx.reverse_request_rx = Some(reverse_rx);
 
+            // Echo the client's version: a v3 client checks for an exact match.
             IpcResponse::Registered {
-                protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+                protocol_version: *protocol_version,
                 client_id: client_id.clone(),
                 session_id,
                 modern_downstream_enabled: ctx.engine.tool_router().modern_downstream_enabled(),
@@ -3244,6 +3273,14 @@ mod tests {
         }
 
         async fn start_with_servers(servers: Vec<(&str, plug_core::config::ServerConfig)>) -> Self {
+            Self::start_registered(servers, plug_core::ipc::IPC_PROTOCOL_VERSION).await
+        }
+
+        /// Register at `protocol_version`, as a proxy of that version would.
+        async fn start_registered(
+            servers: Vec<(&str, plug_core::config::ServerConfig)>,
+            protocol_version: u16,
+        ) -> Self {
             let mut config = plug_core::config::Config::default();
             for (name, server) in servers {
                 config.servers.insert(name.to_string(), server);
@@ -3291,7 +3328,7 @@ mod tests {
             write_ipc(
                 &mut stream,
                 &IpcRequest::Register {
-                    protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
+                    protocol_version,
                     client_id: uuid::Uuid::new_v4().to_string(),
                     client_info: Some("plug-test".to_string()),
                     adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
@@ -3299,7 +3336,14 @@ mod tests {
             )
             .await;
             let session_id = match read_ipc_response(&mut stream).await {
-                IpcResponse::Registered { session_id, .. } => session_id,
+                IpcResponse::Registered {
+                    session_id,
+                    protocol_version: registered,
+                    ..
+                } => {
+                    assert_eq!(registered, protocol_version, "daemon echoes the version");
+                    session_id
+                }
                 other => panic!("expected Registered, got {other:?}"),
             };
 
@@ -4890,5 +4934,197 @@ mod tests {
             .expect("server task join");
 
         harness.shutdown().await;
+    }
+
+    /// Fail if a frame sent to a v3 proxy carries a field v3 never saw.
+    fn assert_v3_frame(bytes: &[u8]) {
+        let value: serde_json::Value = serde_json::from_slice(bytes).expect("frame is JSON");
+        for field in ["ipc_id", "reverse_id"] {
+            assert!(
+                value.get(field).is_none(),
+                "a v3 proxy got a frame with `{field}`"
+            );
+        }
+    }
+
+    /// Read the reply to an untagged request the way a v3 proxy does: one
+    /// frame at a time, reassembling chunks and answering each reverse request
+    /// with a bare `IpcClientResponse` before reading on. Returns the reply
+    /// and how many reverse requests were answered.
+    async fn read_v3_reply(stream: &mut tokio::net::UnixStream) -> (IpcResponse, usize) {
+        use base64::Engine as _;
+        let mut chunks: Vec<u8> = Vec::new();
+        let mut reverse_requests = 0;
+        loop {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                plug_core::ipc::read_frame(stream),
+            )
+            .await
+            .expect("timed out waiting for a reply")
+            .expect("read frame")
+            .expect("unexpected EOF before reply");
+            assert_v3_frame(&frame);
+            let body = if frame.starts_with(b"{\"envelope\":") {
+                match serde_json::from_slice(&frame).expect("decode envelope") {
+                    plug_core::ipc::DaemonToProxyMessage::ResponseChunk {
+                        chunk_index,
+                        chunk_count,
+                        payload_b64,
+                    } => {
+                        chunks.extend(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(payload_b64)
+                                .expect("chunk payload"),
+                        );
+                        if chunk_index + 1 < chunk_count {
+                            continue;
+                        }
+                        std::mem::take(&mut chunks)
+                    }
+                    plug_core::ipc::DaemonToProxyMessage::ReverseRequest { request, .. } => {
+                        assert!(
+                            matches!(*request, IpcClientRequest::CreateElicitation { .. }),
+                            "{request:?}"
+                        );
+                        reverse_requests += 1;
+                        let reply = IpcClientResponse::CreateElicitation {
+                            result: serde_json::from_value(
+                                serde_json::json!({ "action": "accept", "content": {} }),
+                            )
+                            .expect("elicit result"),
+                        };
+                        let payload = serde_json::to_vec(&reply).expect("encode reply");
+                        plug_core::ipc::write_frame(stream, &payload)
+                            .await
+                            .expect("write reverse reply");
+                        continue;
+                    }
+                    other => panic!("unexpected envelope {other:?}"),
+                }
+            } else {
+                frame
+            };
+            assert_v3_frame(&body);
+            let response: IpcResponse = serde_json::from_slice(&body).expect("decode reply");
+            if is_ipc_push_notification(&response) {
+                continue;
+            }
+            return (response, reverse_requests);
+        }
+    }
+
+    fn reply_text(response: &IpcResponse) -> String {
+        let IpcResponse::McpResponse { payload } = response else {
+            panic!("expected an MCP response, got {response:?}");
+        };
+        payload["content"][0]["text"]
+            .as_str()
+            .expect("text content")
+            .to_string()
+    }
+
+    /// A `plug connect` started before an upgrade speaks v3. It must keep
+    /// working against the new daemon until its host restarts it.
+    #[tokio::test]
+    async fn v3_proxy_keeps_working_against_this_daemon() {
+        let mut harness = IpcTestHarness::start_registered(
+            vec![(
+                "mock",
+                ipc_harness_mock_config_with(
+                    "echo,chunked_text",
+                    &["--reverse-request", "elicitation"],
+                ),
+            )],
+            3,
+        )
+        .await;
+        let session_id = harness.session_id.clone();
+
+        let capabilities: rmcp::model::ClientCapabilities =
+            serde_json::from_value(serde_json::json!({ "elicitation": {} }))
+                .expect("client capabilities");
+        write_ipc(
+            &mut harness.stream,
+            &IpcRequest::UpdateCapabilities {
+                session_id: session_id.clone(),
+                capabilities: Box::new(capabilities),
+            },
+        )
+        .await;
+        let (reply, _) = read_v3_reply(&mut harness.stream).await;
+        assert!(matches!(reply, IpcResponse::Ok), "{reply:?}");
+
+        // A call whose upstream asks the client for input mid-call.
+        write_ipc(
+            &mut harness.stream,
+            &tool_call_request(&session_id, "Mock__echo"),
+        )
+        .await;
+        let (reply, reverse_requests) = read_v3_reply(&mut harness.stream).await;
+        assert_eq!(reverse_requests, 1);
+        assert!(
+            reply_text(&reply).contains("reverse=elicitation:Accept"),
+            "{reply:?}"
+        );
+
+        // A reply over MAX_FRAME_SIZE arrives in chunks.
+        write_ipc(
+            &mut harness.stream,
+            &tool_call_request(&session_id, "Mock__chunked_text"),
+        )
+        .await;
+        let (reply, _) = read_v3_reply(&mut harness.stream).await;
+        assert_eq!(reply_text(&reply).len(), 6 * 1024 * 1024);
+
+        write_ipc(
+            &mut harness.stream,
+            &IpcRequest::Ping {
+                session_id: session_id.clone(),
+            },
+        )
+        .await;
+        let (reply, _) = read_v3_reply(&mut harness.stream).await;
+        assert!(matches!(reply, IpcResponse::Pong), "{reply:?}");
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn register_rejects_versions_outside_the_supported_range() {
+        for version in [
+            plug_core::ipc::IPC_PROTOCOL_VERSION_MIN - 1,
+            plug_core::ipc::IPC_PROTOCOL_VERSION + 1,
+        ] {
+            let (client_registry, _count_rx) = ClientRegistry::new();
+            let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+            let mut ctx = ConnectionContext {
+                cancel: CancellationToken::new(),
+                auth_token: Arc::from("test-token"),
+                server_manager: Arc::clone(engine.server_manager()),
+                engine: Arc::clone(&engine),
+                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
+                started_at: Instant::now(),
+                client_registry: Arc::new(client_registry),
+                http_sessions: None,
+                downstream_oauth: None,
+                session_id: None,
+                reverse_request_rx: None,
+            };
+            let response = dispatch_request(
+                &IpcRequest::Register {
+                    protocol_version: version,
+                    client_id: "client".to_string(),
+                    client_info: None,
+                    adapter_version: None,
+                },
+                &mut ctx,
+            )
+            .await;
+            assert!(
+                matches!(response, IpcResponse::Error { ref code, .. } if code == "PROTOCOL_VERSION_UNSUPPORTED"),
+                "v{version}: {response:?}"
+            );
+        }
     }
 }

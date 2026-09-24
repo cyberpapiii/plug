@@ -34,7 +34,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   binary, a development path `dev-install.sh` already replaced.
 - A `plug connect` client can now have many requests in flight at once, so
   one slow tool call no longer holds up that client's other requests. IPC
-  protocol version is now 4; the daemon and `plug connect` update together.
+  protocol version is now 4. The daemon still serves v3 clients one request
+  at a time, so running `plug connect` processes keep working after an
+  upgrade without a host restart.
 
 ### Removed
 

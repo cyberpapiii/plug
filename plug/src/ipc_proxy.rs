@@ -117,7 +117,12 @@ impl ProxyConnection {
             client_id: session.client_id,
             client_info: session.client_info,
             session_id: session.session_id,
-            mux: DaemonMux::start(session.reader, session.writer, shared),
+            mux: DaemonMux::start(
+                session.reader,
+                session.writer,
+                session.ipc_protocol_version >= 4,
+                shared,
+            ),
         }
     }
 }
@@ -143,8 +148,13 @@ struct MuxState {
 /// waiter registered under its id, forwards push notifications, and answers
 /// reverse requests on tasks of their own. A reply without an id goes to the
 /// oldest waiter, which is how the one-at-a-time protocol paired them.
+///
+/// A session registered at IPC v3 (an older daemon) gets no ids: `serial`
+/// holds each request until its reply arrives, as before v4.
 struct DaemonMux {
     outbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// `Some` when the daemon predates tagged requests.
+    serial: Option<Mutex<()>>,
     state: std::sync::Mutex<MuxState>,
     next_id: std::sync::atomic::AtomicU64,
     /// Last time the daemon sent a frame, or a request started on an idle
@@ -167,11 +177,13 @@ impl DaemonMux {
     fn start(
         reader: tokio::net::unix::OwnedReadHalf,
         writer: tokio::net::unix::OwnedWriteHalf,
+        tagged: bool,
         shared: std::sync::Weak<SharedConnection>,
     ) -> Arc<Self> {
         let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
         let mux = Arc::new(Self {
             outbound,
+            serial: (!tagged).then(|| Mutex::new(())),
             state: std::sync::Mutex::new(MuxState::default()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             last_activity: std::sync::Mutex::new(tokio::time::Instant::now()),
@@ -180,7 +192,12 @@ impl DaemonMux {
         // The tasks hold the mux weakly: dropping the last handle aborts them
         // and closes the socket.
         let writer_task = tokio::spawn(Self::write_loop(writer, outbound_rx, Arc::downgrade(&mux)));
-        let reader_task = tokio::spawn(Self::read_loop(reader, Arc::downgrade(&mux), shared));
+        let reader_task = tokio::spawn(Self::read_loop(
+            reader,
+            Arc::downgrade(&mux),
+            tagged,
+            shared,
+        ));
         if let Ok(mut tasks) = mux.tasks.lock() {
             tasks.push(writer_task);
             tasks.push(reader_task);
@@ -263,7 +280,12 @@ impl DaemonMux {
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let payload = ipc::encode_tagged(Some(id), request).map_err(|e| TransportFailure {
+        let _serial = match &self.serial {
+            Some(serial) => Some(serial.lock().await),
+            None => None,
+        };
+        let ipc_id = self.serial.is_none().then_some(id);
+        let payload = ipc::encode_tagged(ipc_id, request).map_err(|e| TransportFailure {
             message: format!("failed to encode IPC request: {e}"),
             reconnectable: false,
         })?;
@@ -361,6 +383,7 @@ impl DaemonMux {
     async fn read_loop(
         mut reader: tokio::net::unix::OwnedReadHalf,
         mux: std::sync::Weak<DaemonMux>,
+        tagged: bool,
         shared: std::sync::Weak<SharedConnection>,
     ) {
         let mut chunks = ChunkAssembler::default();
@@ -397,7 +420,12 @@ impl DaemonMux {
                             request,
                         )
                         .await;
-                        match ipc::encode_reverse_response(id, &response) {
+                        let encoded = if tagged {
+                            ipc::encode_reverse_response(id, &response)
+                        } else {
+                            serde_json::to_vec(&response)
+                        };
+                        match encoded {
                             Ok(payload) => {
                                 if let Some(mux) = mux.upgrade() {
                                     mux.send_frame(payload);
@@ -5228,6 +5256,141 @@ mod tests {
             );
         }
         assert_eq!(proxy.shared.conn.lock().await.session_id, "fake-session-2");
+
+        drop(proxy);
+        tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("daemon task timeout")
+            .expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A daemon that predates v4 rejects a v4 registration. The proxy falls
+    /// back to v3 and then sends untagged requests one at a time.
+    #[tokio::test]
+    async fn proxy_falls_back_to_serial_requests_on_a_v3_daemon() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("v3-daemon");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            answer_operator_handshake(&mut reader, &mut writer).await;
+
+            async fn read_request(reader: &mut OwnedReadHalf) -> IpcRequest {
+                let frame = ipc::read_frame(reader)
+                    .await
+                    .expect("read request")
+                    .expect("connection open");
+                assert_eq!(
+                    ipc::FrameIds::peek(&frame),
+                    ipc::FrameIds::default(),
+                    "a v3 session never tags requests"
+                );
+                serde_json::from_slice::<IpcRequest>(&frame).expect("parse request")
+            }
+
+            let mut versions = Vec::new();
+            loop {
+                let IpcRequest::Register {
+                    protocol_version,
+                    client_id,
+                    ..
+                } = read_request(&mut reader).await
+                else {
+                    panic!("expected Register");
+                };
+                versions.push(protocol_version);
+                if protocol_version != 3 {
+                    ipc::send_response(
+                        &mut writer,
+                        &IpcResponse::Error {
+                            code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
+                            message: "daemon supports IPC protocol v3".to_string(),
+                        },
+                    )
+                    .await
+                    .expect("reject v4");
+                    continue;
+                }
+                ipc::send_response(
+                    &mut writer,
+                    &IpcResponse::Registered {
+                        protocol_version,
+                        client_id,
+                        session_id: "v3-session".to_string(),
+                        modern_downstream_enabled: false,
+                        cancellation_capability: ipc::IpcCancellationCapability::new(
+                            "fake-cancellation-capability".to_string(),
+                        ),
+                    },
+                )
+                .await
+                .expect("send Registered");
+                break;
+            }
+            assert_eq!(versions, vec![ipc::IPC_PROTOCOL_VERSION, 3]);
+
+            assert!(matches!(
+                read_request(&mut reader).await,
+                IpcRequest::Capabilities { .. }
+            ));
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::Capabilities {
+                    capabilities: serde_json::to_value(ServerCapabilities::default())
+                        .expect("serialize capabilities"),
+                },
+            )
+            .await
+            .expect("send Capabilities");
+
+            // Two calls are pending, but only one is on the wire until its
+            // reply is written.
+            for _ in 0..2 {
+                let name = tool_call_name(&read_request(&mut reader).await);
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), ipc::read_frame(&mut reader))
+                        .await
+                        .is_err(),
+                    "a second request was written before the first reply"
+                );
+                ipc::send_response(&mut writer, &text_result(&name))
+                    .await
+                    .expect("send reply");
+            }
+            let _ = ipc::read_frame(&mut reader).await;
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-v3-daemon".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        assert_eq!(session.ipc_protocol_version, 3);
+        let proxy = Arc::new(IpcProxyHandler::new(session, None));
+        proxy.heartbeat.abort();
+
+        let first = spawn_tool_call(&proxy, "first");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = spawn_tool_call(&proxy, "second");
+        for (call, expected) in [(first, "first"), (second, "second")] {
+            let response = tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("call timeout")
+                .expect("join")
+                .expect("call succeeds");
+            let IpcResponse::McpResponse { payload } = response else {
+                panic!("unexpected response {response:?}");
+            };
+            let result: CallToolResult = serde_json::from_value(payload).expect("call result");
+            assert_eq!(call_text(&result), expected);
+        }
 
         drop(proxy);
         tokio::time::timeout(Duration::from_secs(5), daemon_task)

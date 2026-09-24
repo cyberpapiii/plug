@@ -51,6 +51,14 @@ impl fmt::Debug for IpcCancellationCapability {
 /// unaffected.
 pub const IPC_PROTOCOL_VERSION: u16 = 4;
 
+/// Oldest proxy protocol version the daemon still registers.
+///
+/// A v3 `plug connect` never tags its requests, so the daemon serves it one
+/// request at a time exactly as before and sends it nothing new. Keeping v3
+/// means proxies started before an upgrade keep working until their host
+/// restarts them. A v4 proxy registering with a v3 daemon falls back to v3.
+pub const IPC_PROTOCOL_VERSION_MIN: u16 = 3;
+
 /// Inclusive operator IPC compatibility band advertised by the daemon.
 ///
 /// Compatibility is range overlap, not a selected version. A client that

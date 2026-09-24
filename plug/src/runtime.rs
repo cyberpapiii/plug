@@ -938,6 +938,9 @@ pub(crate) struct DaemonProxySession {
     pub(crate) modern_downstream_enabled: bool,
     pub(crate) cancellation_capability: plug_core::ipc::IpcCancellationCapability,
     pub(crate) pending_notifications: Vec<plug_core::ipc::IpcResponse>,
+    /// IPC protocol version the daemon registered this session at. Requests
+    /// are tagged and run concurrently only at v4 or later.
+    pub(crate) ipc_protocol_version: u16,
 }
 
 fn paths_resolve_to_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -1148,16 +1151,39 @@ pub(crate) async fn establish_daemon_proxy_session(
     let (expected_executable, require_app_ownership) = expected_proxy_daemon_identity()?;
     validate_proxy_daemon_handshake(&handshake, &expected_executable, require_app_ownership)?;
 
-    let register_req = plug_core::ipc::IpcRequest::Register {
-        protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
-        client_id: client_id.clone(),
-        client_info: client_info.clone(),
-        adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-    };
-    let payload = serde_json::to_vec(&register_req)?;
-    plug_core::ipc::write_frame(&mut writer, &payload).await?;
-    let (session_id, modern_downstream_enabled, cancellation_capability) =
-        match read_setup_response(&mut reader, &mut pending_notifications, setup_deadline).await? {
+    // Register at the newest version; a daemon that predates it answers
+    // PROTOCOL_VERSION_UNSUPPORTED and gets the oldest one this client speaks,
+    // which it serves one request at a time.
+    let mut ipc_protocol_version = plug_core::ipc::IPC_PROTOCOL_VERSION;
+    let (session_id, modern_downstream_enabled, cancellation_capability) = loop {
+        let register_req = plug_core::ipc::IpcRequest::Register {
+            protocol_version: ipc_protocol_version,
+            client_id: client_id.clone(),
+            client_info: client_info.clone(),
+            adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        };
+        let payload = serde_json::to_vec(&register_req)?;
+        plug_core::ipc::write_frame(&mut writer, &payload).await?;
+        let response = match read_setup_response(
+            &mut reader,
+            &mut pending_notifications,
+            setup_deadline,
+        )
+        .await
+        {
+            // `read_setup_response` renders a daemon error as "CODE: message".
+            Err(error)
+                if ipc_protocol_version > plug_core::ipc::IPC_PROTOCOL_VERSION_MIN
+                    && error
+                        .to_string()
+                        .starts_with("PROTOCOL_VERSION_UNSUPPORTED:") =>
+            {
+                ipc_protocol_version = plug_core::ipc::IPC_PROTOCOL_VERSION_MIN;
+                continue;
+            }
+            result => result?,
+        };
+        match response {
             plug_core::ipc::IpcResponse::Registered {
                 protocol_version,
                 client_id: registered_client_id,
@@ -1165,10 +1191,9 @@ pub(crate) async fn establish_daemon_proxy_session(
                 modern_downstream_enabled,
                 cancellation_capability,
             } => {
-                if protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+                if protocol_version != ipc_protocol_version {
                     anyhow::bail!(
-                        "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{}",
-                        plug_core::ipc::IPC_PROTOCOL_VERSION
+                        "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{ipc_protocol_version}"
                     );
                 }
                 if registered_client_id != client_id {
@@ -1176,14 +1201,15 @@ pub(crate) async fn establish_daemon_proxy_session(
                         "daemon/client registration mismatch: expected client_id {client_id}, got {registered_client_id}"
                     );
                 }
-                (
+                break (
                     session_id,
                     modern_downstream_enabled,
                     cancellation_capability,
-                )
+                );
             }
             other => return Err(unexpected_setup_response(other)),
-        };
+        }
+    };
     let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
         session_id: session_id.clone(),
     };
@@ -1207,6 +1233,7 @@ pub(crate) async fn establish_daemon_proxy_session(
         modern_downstream_enabled,
         cancellation_capability,
         pending_notifications,
+        ipc_protocol_version,
     })
 }
 
