@@ -280,12 +280,6 @@ pub struct ToolRouter {
     /// Change feed for `modern_downstream_enabled`, so long-lived IPC
     /// connections can push gate changes without polling.
     modern_downstream_watch: tokio::sync::watch::Sender<bool>,
-    /// Serializes `refresh_tools`' decide-and-mutate phase (subscription
-    /// classify → prune → snapshot publish → rebind) across concurrent
-    /// refresh passes, so one pass cannot interleave reconciliation
-    /// decisions made against a pre-publish snapshot with another pass's
-    /// publish. Per-server listing/fetch work stays outside it.
-    refresh_reconcile_lock: Mutex<()>,
     /// Coalesces overlapping full-catalog refresh requests. One pass runs at
     /// a time and requests arriving during that pass share one trailing pass,
     /// preserving their expectation of observing work started after they
@@ -912,7 +906,6 @@ impl ToolRouter {
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
             modern_downstream_watch: tokio::sync::watch::Sender::new(false),
-            refresh_reconcile_lock: Mutex::new(()),
             refresh_coordinator: RefreshCoordinator::default(),
             #[cfg(test)]
             refresh_request_count: std::sync::atomic::AtomicUsize::new(0),
@@ -2406,16 +2399,11 @@ impl ToolRouter {
         prompts_vec.sort_by(|a, b| a.name.cmp(&b.name));
         let prompts_all = Arc::new(prompts_vec);
 
-        // Serialize the decide-and-mutate phase across concurrent refresh
-        // passes: everything from here through the rebind loop (classify →
-        // prune execution → snapshot publish → rebind execution) runs under
-        // this guard, so a second pass cannot classify against a
-        // pre-publish snapshot and then apply those stale decisions around
-        // this pass's publish. The per-server listing above stays
-        // concurrent. If the notification loop's refresh backstop drops
-        // this future mid-phase, the guard is released on drop — tokio's
-        // Mutex does not poison.
-        let reconcile_guard = self.refresh_reconcile_lock.lock().await;
+        // The decide-and-mutate phase below (classify → prune execution →
+        // snapshot publish → rebind execution) never interleaves with another
+        // pass: `refresh_coordinator` runs one `refresh_tools_once` at a time,
+        // and a cancelled leader's future is dropped whole before a waiter
+        // can take over.
 
         // Classify every currently-tracked subscription URI against the
         // old/new route snapshots. Pure decision — no registry mutation, no
@@ -2431,8 +2419,8 @@ impl ToolRouter {
         // Execute prunes for URIs that lost their route entirely
         // (best-effort upstream unsubscribe) before publishing the new
         // snapshot — same ordering as the historical stale-unsubscribe pass.
-        // Distinct URIs use distinct transition locks, so parallelize under the
-        // reconcile guard (wall-clock = max RTT, not sum).
+        // Distinct URIs use distinct transition locks, so parallelize them
+        // (wall-clock = max RTT, not sum).
         {
             let prune_futs: Vec<_> = reconciliation
                 .iter()
@@ -2493,11 +2481,6 @@ impl ToolRouter {
             "resource subscription rebind failed during route refresh",
         )
         .await;
-
-        // Release the reconcile guard before the post-publish sweep: the
-        // sweep classifies against the just-published snapshot only, and
-        // must not extend the serialized window it exists to double-check.
-        drop(reconcile_guard);
 
         // Post-publish sweep. Entries whose subscribe transition confirmed
         // inside this pass's classify→publish window were invisible to the
