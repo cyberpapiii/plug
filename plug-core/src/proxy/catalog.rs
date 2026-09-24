@@ -544,22 +544,6 @@ impl super::ToolRouter {
             .map(|(server, _)| server.clone())
     }
 
-    /// List all tools with their source server IDs.
-    pub fn list_all_tools(&self) -> Vec<(String, Tool)> {
-        let snapshot = self.cache.load();
-        let mut result = Vec::new();
-        for tool in snapshot.tools_all.iter() {
-            let server_id = snapshot
-                .routes
-                .get(tool.name.as_ref())
-                .map(|(s, _)| s.clone())
-                .unwrap_or_else(|| "unknown".to_string());
-
-            result.push((server_id, tool.clone()));
-        }
-        result
-    }
-
     /// List all tools with their source server IDs and operator risk metadata.
     pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, crate::ipc::IpcToolRiskInfo)> {
         let snapshot = self.cache.load();

@@ -24,7 +24,7 @@ use crate::branding;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
-use crate::engine::{Engine, EngineEvent, next_call_id};
+use crate::engine::{Engine, next_call_id};
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
@@ -239,8 +239,6 @@ pub struct ToolRouter {
     /// instances may not.
     published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
     config: RouterConfig,
-    /// Optional event sender for tool call observability.
-    event_tx: Option<broadcast::Sender<EngineEvent>>,
     protocol_notification_tx: broadcast::Sender<ProtocolNotification>,
     /// Separate channel for logging notifications to prevent log volume
     /// from causing Lagged errors that drop Progress/Cancelled delivery.
@@ -891,7 +889,6 @@ impl ToolRouter {
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
             config,
-            event_tx: None,
             protocol_notification_tx,
             logging_tx,
             client_log_levels: DashMap::new(),
@@ -945,12 +942,6 @@ impl ToolRouter {
         admission_quotas: crate::protocol::AdmissionQuotas,
     ) -> Self {
         Self::new_with_quotas(server_manager, config, admission_quotas)
-    }
-
-    /// Set the event sender for tool call observability.
-    pub fn with_event_tx(mut self, tx: broadcast::Sender<EngineEvent>) -> Self {
-        self.event_tx = Some(tx);
-        self
     }
 
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<ProtocolNotification> {
@@ -2273,15 +2264,6 @@ impl ToolRouter {
                 tools = ?drifted_tools,
                 "detected material tool definition drift during refresh"
             );
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(EngineEvent::ToolDefinitionDriftDetected {
-                    tool_names: drifted_tools
-                        .iter()
-                        .cloned()
-                        .map(Arc::<str>::from)
-                        .collect(),
-                });
-            }
         }
 
         tracing::info!(
@@ -2424,8 +2406,6 @@ impl ToolRouter {
         prompts_vec.sort_by(|a, b| a.name.cmp(&b.name));
         let prompts_all = Arc::new(prompts_vec);
 
-        let tool_count = tools_all.len();
-
         // Serialize the decide-and-mutate phase across concurrent refresh
         // passes: everything from here through the rebind loop (classify →
         // prune execution → snapshot publish → rebind execution) runs under
@@ -2503,10 +2483,6 @@ impl ToolRouter {
         // without breaking a continuation whose exact tool route and upstream
         // instance remain unchanged.
         self.publish_route_snapshot(snapshot);
-
-        if let Some(ref tx) = self.event_tx {
-            let _ = tx.send(EngineEvent::ToolCacheRefreshed { tool_count });
-        }
 
         // Rebind subscriptions whose URI still exists but ownership changed,
         // after publishing the new snapshot (same ordering as before).
@@ -3098,8 +3074,6 @@ impl ToolRouter {
                     }
                 }
             }
-            let server_id_arc = Arc::<str>::from(server_id.as_str());
-            let tool_name_arc = Arc::<str>::from(original_name.as_str());
             let mut active_call_guard = None;
             if let Some(call_context) = downstream.clone() {
                 self.register_active_call(
@@ -3229,14 +3203,6 @@ impl ToolRouter {
                 retry = is_retry,
                 "proxy tool call started"
             );
-            if let Some(ref tx) = self.event_tx {
-                let _ = tx.send(EngineEvent::ToolCallStarted {
-                    call_id,
-                    trace_id: Arc::clone(&trace_id),
-                    server_id: Arc::clone(&server_id_arc),
-                    tool_name: Arc::clone(&tool_name_arc),
-                });
-            }
 
             let call_start = std::time::Instant::now();
 
@@ -3298,16 +3264,6 @@ impl ToolRouter {
                         guard.disarm();
                     }
                     self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: true,
-                        });
-                    }
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,
@@ -3333,16 +3289,6 @@ impl ToolRouter {
                         guard.disarm();
                     }
                     self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: true,
-                        });
-                    }
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,
@@ -3373,16 +3319,6 @@ impl ToolRouter {
                         guard.disarm();
                     }
                     self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: false,
-                        });
-                    }
 
                     match self.reconnect_server_now(&server_id).await {
                         Ok(()) => {
@@ -3436,16 +3372,6 @@ impl ToolRouter {
                         guard.disarm();
                     }
                     self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: false,
-                        });
-                    }
 
                     metrics_guard.settle(false);
 
@@ -3472,16 +3398,6 @@ impl ToolRouter {
                         guard.disarm();
                     }
                     self.remove_active_call(call_id);
-                    if let Some(ref tx) = self.event_tx {
-                        let _ = tx.send(EngineEvent::ToolCallCompleted {
-                            call_id,
-                            trace_id: Arc::clone(&trace_id),
-                            server_id: Arc::clone(&server_id_arc),
-                            tool_name: Arc::clone(&tool_name_arc),
-                            duration_ms,
-                            success: false,
-                        });
-                    }
                     match e {
                         rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
                         other => Err(McpError::internal_error(other.to_string(), None)),

@@ -153,10 +153,8 @@ async fn run_watcher(
 mod tests {
     use super::*;
     use crate::config::{Config, ServerConfig, TransportType};
-    use crate::engine::EngineEvent;
     use std::collections::HashMap;
     use tempfile::TempDir;
-    use tokio::sync::broadcast::error::TryRecvError;
 
     fn write_config(path: &std::path::Path, config: &Config) {
         std::fs::write(path, toml::to_string(config).expect("serialize config"))
@@ -209,7 +207,8 @@ mod tests {
         _dir: TempDir,
         config_path: PathBuf,
         engine: Arc<Engine>,
-        events: tokio::sync::broadcast::Receiver<EngineEvent>,
+        /// Reloads already observed by `wait_for_reload`.
+        seen_reloads: u64,
     }
 
     impl WatcherFixture {
@@ -220,7 +219,7 @@ mod tests {
 
             let engine = Arc::new(Engine::new(Config::default()));
             engine.start().await.expect("engine start");
-            let events = engine.event_sender().subscribe();
+            let seen_reloads = engine.reloads_applied();
 
             let ready = spawn_config_watcher(
                 engine.clone(),
@@ -237,7 +236,7 @@ mod tests {
                 _dir: dir,
                 config_path,
                 engine,
-                events,
+                seen_reloads,
             };
 
             // FSEvents can report a file event that predates registration.
@@ -257,20 +256,15 @@ mod tests {
         }
 
         /// Poll (deadline-bounded, never a bare sleep-then-check) until a
-        /// `ConfigReloaded` event has arrived, or `timeout` elapses.
+        /// config reload has been applied since the last one seen, or
+        /// `timeout` elapses.
         async fn wait_for_reload(&mut self, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
-                loop {
-                    match self.events.try_recv() {
-                        Ok(EngineEvent::ConfigReloaded) => return true,
-                        Ok(_) => continue,
-                        // A lagged receiver may have dropped the event we care
-                        // about — keep draining rather than treating this as
-                        // "no more events right now".
-                        Err(TryRecvError::Lagged(_)) => continue,
-                        Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
-                    }
+                let applied = self.engine.reloads_applied();
+                if applied > self.seen_reloads {
+                    self.seen_reloads = applied;
+                    return true;
                 }
                 if tokio::time::Instant::now() >= deadline {
                     return false;
@@ -314,7 +308,7 @@ mod tests {
             .await;
         assert!(
             reloaded,
-            "expected a ConfigReloaded event after adding a server on disk"
+            "expected a config reload after adding a server on disk"
         );
 
         let statuses = fixture.engine.server_statuses();
@@ -334,10 +328,7 @@ mod tests {
             .expect("write invalid toml");
 
         let saw_reload = fixture.wait_for_reload(Duration::from_secs(2)).await;
-        assert!(
-            !saw_reload,
-            "watcher must not emit ConfigReloaded on a parse failure"
-        );
+        assert!(!saw_reload, "watcher must not reload on a parse failure");
         assert!(
             fixture.engine.server_statuses().is_empty(),
             "config must be unchanged after a parse failure"

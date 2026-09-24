@@ -9,9 +9,6 @@ use rmcp::model::{
 };
 
 /// Internal protocol notifications used for downstream transport fan-out.
-///
-/// This is intentionally separate from `EngineEvent`, which remains focused on
-/// observability and UI/daemon consumers rather than wire-level MCP messages.
 #[derive(Clone, Debug, PartialEq)]
 pub enum ProtocolNotification {
     ToolListChanged,

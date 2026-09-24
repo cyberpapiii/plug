@@ -9,7 +9,6 @@ use std::collections::HashSet;
 use futures::stream::{self, StreamExt};
 
 use crate::config::{Config, ServerConfig, UpstreamProtocolMode};
-use crate::engine::EngineEvent;
 use crate::server::ServerManager;
 
 /// Diff result between old and new configs.
@@ -334,7 +333,8 @@ pub async fn apply_reload(
         engine.tool_router().refresh_tools().await;
     }
 
-    let _ = engine.event_sender().send(EngineEvent::ConfigReloaded);
+    #[cfg(test)]
+    engine.note_reload_applied();
 
     for warning in &diff.restart_required {
         tracing::warn!("{warning}");

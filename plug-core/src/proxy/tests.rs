@@ -834,8 +834,9 @@ fn meta_tool_mode_lists_only_meta_tools() {
         .collect::<Vec<_>>();
     assert_eq!(names, expected_legacy_meta_tool_names());
 
-    let full_tools = router.list_all_tools();
+    let full_tools = router.list_all_tools_with_risk();
     assert_eq!(full_tools.len(), 1);
+    assert_eq!(full_tools[0].0, "git");
     assert_eq!(full_tools[0].1.name.as_ref(), "git__commit");
 }
 
