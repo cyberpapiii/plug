@@ -21,6 +21,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   made the call, and turn the latency orange when a call took five seconds or
   more.
 - The version in About can be selected and copied.
+- `plug codesign-setup` is gone. It only ran for a `PLUG_DEV=1 plug-dev`
+  binary, a development path `dev-install.sh` already replaced.
 
 ### Fixed
 
