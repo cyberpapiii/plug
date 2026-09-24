@@ -70,6 +70,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - The OAuth client-metadata fetch now stops reading at its 64 KiB cap even
   when the response has no `Content-Length`. A chunked body used to be
   buffered in full for up to five seconds.
+- A remote client that cancels an elicitation or sampling request no longer
+  leaves the pending request behind. It used to stay registered, and replay
+  to the client on its next reconnect, until the session ended.
 
 ## [0.8.11] - 2026-09-01
 

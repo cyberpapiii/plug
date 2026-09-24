@@ -419,7 +419,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::ElicitRequest(ElicitRequest::new(request)),
-                Some(Duration::from_secs(600)), // 10-minute upper bound prevents resource leaks
+                Duration::from_secs(600), // 10-minute upper bound prevents resource leaks
             )
             .await?;
             match result {
@@ -451,7 +451,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::CreateMessageRequest(CreateMessageRequest::new(request)),
-                Some(Duration::from_secs(60)), // sampling has bounded timeout
+                Duration::from_secs(60), // sampling has bounded timeout
             )
             .await?;
             match result {
@@ -1246,7 +1246,7 @@ async fn send_http_client_request(
     state: &HttpState,
     session_id: &str,
     request: ServerRequest,
-    timeout: Option<Duration>,
+    timeout: Duration,
 ) -> Result<ClientResult, McpError> {
     let id = i64::try_from(state.reverse_request_counter.fetch_add(1, Ordering::SeqCst))
         .map_err(|_| McpError::internal_error("reverse request id overflow".to_string(), None))?;
@@ -1279,55 +1279,53 @@ async fn send_http_client_request(
     state
         .pending_client_requests
         .insert((session_id.to_string(), id), tx);
+    // From here on every exit, including the caller dropping this future
+    // (a cancelled elicitation or sampling call), releases the pending entry
+    // and the replay copy of the request.
+    let _pending = PendingReverseRequest {
+        state,
+        session_id,
+        id,
+    };
     match state.sessions.send_to_live_session(session_id, message) {
         SessionSendOutcome::Delivered | SessionSendOutcome::Queued => {}
         SessionSendOutcome::SessionNotFound => {
-            state
-                .pending_client_requests
-                .remove(&(session_id.to_string(), id));
             return Err(McpError::internal_error(
                 "HTTP client SSE stream could not accept reverse request delivery".to_string(),
                 None,
             ));
         }
     }
-    match timeout {
-        Some(duration) => match tokio::time::timeout(duration, rx).await {
-            Ok(Ok(result)) => {
-                state
-                    .sessions
-                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
-                Ok(result)
-            }
-            Ok(Err(_)) => Err(McpError::internal_error(
-                "HTTP client response channel closed".to_string(),
-                None,
-            )),
-            Err(_) => {
-                state
-                    .pending_client_requests
-                    .remove(&(session_id.to_string(), id));
-                state
-                    .sessions
-                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
-                Err(McpError::internal_error(
-                    "HTTP client request timed out".to_string(),
-                    None,
-                ))
-            }
-        },
-        None => match rx.await {
-            Ok(result) => {
-                state
-                    .sessions
-                    .remove_replay_events_by_key(session_id, &SseReplayKey::ReverseRequest(id));
-                Ok(result)
-            }
-            Err(_) => Err(McpError::internal_error(
-                "HTTP client response channel closed".to_string(),
-                None,
-            )),
-        },
+    match tokio::time::timeout(timeout, rx).await {
+        Ok(Ok(result)) => Ok(result),
+        Ok(Err(_)) => Err(McpError::internal_error(
+            "HTTP client response channel closed".to_string(),
+            None,
+        )),
+        Err(_) => Err(McpError::internal_error(
+            "HTTP client request timed out".to_string(),
+            None,
+        )),
+    }
+}
+
+/// Releases a reverse request's bookkeeping when its caller stops waiting,
+/// for whatever reason. Both removals are no-ops once the response handler
+/// has already taken them.
+struct PendingReverseRequest<'a> {
+    state: &'a HttpState,
+    session_id: &'a str,
+    id: i64,
+}
+
+impl Drop for PendingReverseRequest<'_> {
+    fn drop(&mut self) {
+        self.state
+            .pending_client_requests
+            .remove(&(self.session_id.to_string(), self.id));
+        self.state
+            .sessions
+            .remove_replay_events_by_key(self.session_id, &SseReplayKey::ReverseRequest(self.id));
     }
 }
 
@@ -1370,7 +1368,7 @@ fn maybe_request_http_roots(state: Arc<HttpState>, session_id: String) {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
-            Some(Duration::from_secs(10)),
+            Duration::from_secs(10),
         )
         .await
         {
@@ -5716,12 +5714,58 @@ mod tests {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
-            Some(Duration::from_millis(50)),
+            Duration::from_millis(50),
         )
         .await;
 
         assert!(result.is_err());
         assert!(state.pending_client_requests.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_reverse_request_releases_pending_entry_and_replay_copy() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let (tx, mut rx) = mpsc::channel(4);
+        state
+            .sessions
+            .set_sse_sender(&session_id, tx, None)
+            .unwrap();
+
+        let state_for_request = Arc::clone(&state);
+        let session_id_for_request = session_id.clone();
+        let pending = tokio::spawn(async move {
+            send_http_client_request(
+                &state_for_request,
+                &session_id_for_request,
+                ServerRequest::ListRootsRequest(ListRootsRequest {
+                    method: Default::default(),
+                    extensions: Default::default(),
+                }),
+                Duration::from_secs(600),
+            )
+            .await
+        });
+        rx.recv().await.expect("reverse request delivered");
+        assert_eq!(state.pending_client_requests.len(), 1);
+
+        // The caller gives up, as a cancelled elicitation does.
+        pending.abort();
+        let _ = pending.await;
+
+        assert!(
+            state.pending_client_requests.is_empty(),
+            "an abandoned reverse request must not stay pending"
+        );
+        let (reconnect_tx, mut reconnect_rx) = mpsc::channel(4);
+        state
+            .sessions
+            .set_sse_sender(&session_id, reconnect_tx, Some(0))
+            .unwrap();
+        assert!(
+            reconnect_rx.try_recv().is_err(),
+            "an abandoned reverse request must not replay on reconnect"
+        );
     }
 
     #[tokio::test]
@@ -5765,7 +5809,7 @@ mod tests {
                 method: Default::default(),
                 extensions: Default::default(),
             }),
-            Some(Duration::from_secs(1)),
+            Duration::from_secs(1),
         )
         .await
         .expect("reverse request should succeed");
@@ -5809,7 +5853,7 @@ mod tests {
                     method: Default::default(),
                     extensions: Default::default(),
                 }),
-                Some(Duration::from_secs(1)),
+                Duration::from_secs(1),
             )
             .await
         });
