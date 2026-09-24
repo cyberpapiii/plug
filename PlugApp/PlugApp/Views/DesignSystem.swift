@@ -278,7 +278,7 @@ struct ServerRow: View {
 
     private var trailingText: String {
         switch server.health {
-        case .working: server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools"
+        case .working: server.toolCountText
         default: server.health.label
         }
     }

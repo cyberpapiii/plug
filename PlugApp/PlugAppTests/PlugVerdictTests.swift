@@ -125,7 +125,8 @@ final class PlugVerdictTests: XCTestCase {
         let verdict = PlugVerdict.verdict(for: situation)
         XCTAssertEqual(verdict.title, "2 servers need attention")
         XCTAssertNil(verdict.primary)
-        XCTAssertEqual(PlugVerdict.attention(for: situation).count, 2)
+        XCTAssertEqual(situation.troubledServers.map(\.name), ["a", "b"])
+        XCTAssertEqual(situation.troubledServers.compactMap(\.fix).count, 2)
     }
 
     func testDisabledServersAreNeverTrouble() {
@@ -155,20 +156,30 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(verdict.primary?.intent, .addServer)
     }
 
-    func testAttentionItemsPairEveryProblemWithItsOwnFix() {
-        let items = PlugVerdict.attention(
-            for: PlugSituation(
-                runtime: .running,
-                servers: [
-                    server("Notion", health: .signInNeeded),
-                    server("Linear", health: .down, error: "spawn failed\nsecond line")
-                ]
+    func testEveryProblemCarriesItsOwnFix() {
+        XCTAssertEqual(server("Notion", health: .signInNeeded).fix?.intent, .signIn(server: "Notion"))
+        XCTAssertEqual(server("Notion", health: .signInNeeded).fix?.title, "Sign In")
+        XCTAssertNil(server("Notion", health: .signInNeeded, signingIn: true).fix)
+        XCTAssertEqual(server("Linear", health: .down).fix?.intent, .restartServer("Linear"))
+        XCTAssertEqual(server("Odd", health: .unknown).fix?.intent, .restartServer("Odd"))
+        for health in [ServerHealth.working, .starting, .off] {
+            XCTAssertNil(server("fine", health: health).fix, "\(health) needs no fix")
+        }
+    }
+
+    func testTheVerdictOffersTheServersOwnFix() {
+        for troubled in [server("Notion", health: .signInNeeded), server("Linear", health: .down)] {
+            let verdict = PlugVerdict.verdict(
+                for: PlugSituation(runtime: .running, servers: [troubled, server("ok")])
             )
-        )
-        XCTAssertEqual(items.map(\.id), ["Notion", "Linear"])
-        XCTAssertEqual(items[0].button?.intent, .signIn(server: "Notion"))
-        XCTAssertEqual(items[1].button?.intent, .restartServer("Linear"))
-        XCTAssertEqual(items[1].detail, "spawn failed")
+            XCTAssertEqual(verdict.primary, troubled.fix)
+        }
+    }
+
+    func testToolCountReadsAsWords() {
+        XCTAssertEqual(server("a", tools: 1).toolCountText, "1 tool")
+        XCTAssertEqual(server("a", tools: 0).toolCountText, "0 tools")
+        XCTAssertEqual(server("a", tools: 12).toolCountText, "12 tools")
     }
 
     func testMenuBarIconChangesShapeNotJustColour() {

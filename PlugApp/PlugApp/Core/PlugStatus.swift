@@ -110,6 +110,21 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         return transportSymbol
     }
 
+    /// The one button that fixes this server, or nil when nothing needs
+    /// fixing or a sign-in is already open in the browser. Every surface that
+    /// offers a fix asks this, so the verb never differs between them.
+    var fix: Verdict.Button? {
+        switch health {
+        case .signInNeeded: isSigningIn ? nil : .init("Sign In", .signIn(server: name))
+        case .down, .unknown: .init("Restart", .restartServer(name))
+        case .working, .starting, .off: nil
+        }
+    }
+
+    var toolCountText: String {
+        toolCount == 1 ? "1 tool" : "\(toolCount) tools"
+    }
+
     var transportLabel: String {
         switch transport.lowercased() {
         case "stdio": "Runs on this Mac"
@@ -252,36 +267,9 @@ struct Verdict: Equatable, Sendable {
     }
 }
 
-/// One fixable problem, shown with the button that fixes it. The rule this
-/// encodes: you never see a problem in a place where you cannot act on it.
-struct AttentionItem: Identifiable, Equatable, Sendable {
-    let id: String
-    let symbol: String
-    let title: String
-    let detail: String
-    let button: Verdict.Button?
-    let isWorking: Bool
-
-    init(
-        id: String,
-        symbol: String,
-        title: String,
-        detail: String,
-        button: Verdict.Button? = nil,
-        isWorking: Bool = false
-    ) {
-        self.id = id
-        self.symbol = symbol
-        self.title = title
-        self.detail = detail
-        self.button = button
-        self.isWorking = isWorking
-    }
-}
-
 // MARK: - Builder
 
-/// Turns a situation into the single verdict and the list of fixable problems.
+/// Turns a situation into the single verdict.
 /// The order of the checks below is the product: the most blocking, most
 /// specific, most actionable thing wins, and only one thing ever speaks.
 enum PlugVerdict {
@@ -386,7 +374,7 @@ enum PlugVerdict {
                     detail: only.isSigningIn
                         ? "Sign-in is open in the browser."
                         : "All other servers are running.",
-                    primary: only.isSigningIn ? nil : .init("Sign In", .signIn(server: only.name))
+                    primary: only.fix
                 )
             default:
                 return Verdict(
@@ -394,7 +382,7 @@ enum PlugVerdict {
                     symbol: "bolt.trianglebadge.exclamationmark",
                     title: "\(only.name) is \(only.health.label.lowercased())",
                     detail: only.error ?? "All other servers are running.",
-                    primary: .init("Restart", .restartServer(only.name))
+                    primary: only.fix
                 )
             }
         }
@@ -436,36 +424,6 @@ enum PlugVerdict {
         guard tools > 0 else { return "\(servers) \(serverWord)" }
         let toolWord = tools == 1 ? "tool" : "tools"
         return "\(servers) \(serverWord) · \(tools) \(toolWord)"
-    }
-
-    /// Problems worth listing, each paired with the button that resolves it.
-    static func attention(for situation: PlugSituation) -> [AttentionItem] {
-        situation.troubledServers.map { server in
-            switch server.health {
-            case .signInNeeded:
-                return AttentionItem(
-                    id: server.name,
-                    symbol: "person.badge.key",
-                    title: server.name,
-                    detail: server.isSigningIn ? "Sign-in open in browser" : "Sign-in needed",
-                    button: server.isSigningIn ? nil : .init("Sign In", .signIn(server: server.name)),
-                    isWorking: server.isSigningIn
-                )
-            default:
-                return AttentionItem(
-                    id: server.name,
-                    symbol: "exclamationmark.triangle",
-                    title: server.name,
-                    detail: server.error.map(firstLine) ?? server.health.label,
-                    button: .init("Restart", .restartServer(server.name))
-                )
-            }
-        }
-    }
-
-    private static func firstLine(_ text: String) -> String {
-        let line = text.split(separator: "\n").first.map(String.init) ?? text
-        return line.count > 120 ? String(line.prefix(119)) + "…" : line
     }
 
     /// The menu bar icon. Shape carries the state, not colour, so it stays

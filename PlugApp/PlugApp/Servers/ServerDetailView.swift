@@ -17,8 +17,8 @@ struct ServerDetailView: View {
                 header
                 if server.health == .signInNeeded {
                     signInCard
-                } else if let problem {
-                    problemCard(problem)
+                } else if let fix = server.fix {
+                    problemCard(fix)
                 }
                 details
                 if !recentCalls.isEmpty { recent }
@@ -73,20 +73,13 @@ struct ServerDetailView: View {
 
     private var statusLine: String {
         switch server.health {
-        case .working: server.toolCount == 1 ? "Working · 1 tool" : "Working · \(server.toolCount) tools"
+        case .working: "Working · \(server.toolCountText)"
         case .off: "Switched off"
         default: server.health.label
         }
     }
 
     // MARK: - Problem
-
-    private var problem: Verdict.Button? {
-        switch server.health {
-        case .down, .unknown: .init("Restart", .restartServer(server.name))
-        default: nil
-        }
-    }
 
     private var signInCard: some View {
         VStack(alignment: .leading, spacing: Metric.snug) {

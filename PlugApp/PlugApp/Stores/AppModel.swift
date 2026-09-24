@@ -161,9 +161,6 @@ final class AppModel {
     /// The single sentence every surface renders.
     var verdict: Verdict { PlugVerdict.verdict(for: situation) }
 
-    /// Problems paired with the buttons that fix them.
-    var attentionItems: [AttentionItem] { PlugVerdict.attention(for: situation) }
-
     var serverFacts: [ServerFacts] {
         let auth = Dictionary(
             snapshot.upstreamAuth.map { ($0.name, $0) },
