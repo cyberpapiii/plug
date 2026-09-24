@@ -1,0 +1,112 @@
+{
+  "snapshot": {
+    "client_visibility": [
+      {
+        "client_type": "ClaudeCode",
+        "session_id": "session-1",
+        "visible_tool_count": 16
+      }
+    ],
+    "configured_servers": [
+      {
+        "enabled": true,
+        "name": "healthy",
+        "oauth": false,
+        "transport": "stdio"
+      },
+      {
+        "enabled": true,
+        "name": "degraded",
+        "oauth": false,
+        "transport": "stdio"
+      },
+      {
+        "enabled": true,
+        "name": "failed",
+        "oauth": false,
+        "transport": "stdio"
+      },
+      {
+        "enabled": true,
+        "name": "auth-required",
+        "oauth": true,
+        "transport": "stdio"
+      }
+    ],
+    "downstream_clients": [
+      {
+        "client_id": "remote-1",
+        "client_name": "Remote client",
+        "created_at": 1700000000,
+        "expires_at": 1800000000,
+        "last_used_at": null,
+        "redirect_uris": [
+          "https://example.com/callback"
+        ],
+        "source": "dynamic_registration"
+      }
+    ],
+    "live_sessions": [
+      {
+        "adapter_version": null,
+        "client_id": "client-1",
+        "client_info": "claude-code 2.0",
+        "client_type": "ClaudeCode",
+        "connected_secs": 30,
+        "last_activity_secs": 2,
+        "session_id": "session-1",
+        "transport": "daemon_proxy"
+      }
+    ],
+    "ownership": "app_managed",
+    "runtime_version": "0.7.0",
+    "servers": [
+      {
+        "auth_status": "none",
+        "availability": "healthy",
+        "health": "Healthy",
+        "metrics": null,
+        "server_id": "healthy",
+        "tool_count": 12
+      },
+      {
+        "auth_status": "none",
+        "availability": "healthy",
+        "health": "Degraded",
+        "metrics": null,
+        "server_id": "degraded",
+        "tool_count": 4
+      },
+      {
+        "auth_status": "none",
+        "availability": "healthy",
+        "health": "Failed",
+        "metrics": null,
+        "server_id": "failed",
+        "tool_count": 0
+      },
+      {
+        "auth_status": "none",
+        "availability": "healthy",
+        "health": "AuthRequired",
+        "metrics": null,
+        "server_id": "auth-required",
+        "tool_count": 0
+      }
+    ],
+    "tool_catalog_revision": 7,
+    "upstream_auth": [
+      {
+        "authenticated": false,
+        "health": "AuthRequired",
+        "name": "auth-required",
+        "scopes": null,
+        "token_expires_in_secs": null,
+        "url": "https://example.com/mcp",
+        "warnings": []
+      }
+    ],
+    "uptime_secs": 42
+  },
+  "type": "OperatorSnapshot"
+}
