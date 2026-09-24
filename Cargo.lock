@@ -2475,6 +2475,7 @@ dependencies = [
  "notify-debouncer-mini",
  "oauth2",
  "passkey-auth",
+ "plug-core",
  "plug-test-harness",
  "rand 0.10.2",
  "reqwest",

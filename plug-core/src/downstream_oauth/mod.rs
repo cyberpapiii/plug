@@ -944,15 +944,9 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
-            next.pending_consents.remove(consent_id);
-            next.owner_authentication_ceremonies
-                .retain(|_, ceremony| ceremony.consent_id != consent_id);
+            let expired = expire_consent(&mut next, consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         // One consent owns at most one live challenge. Repeated public calls
         // replace only that consent's challenge; another public caller can
@@ -1041,13 +1035,9 @@ impl DownstreamOauthManager {
             return Err(DownstreamOauthError::InvalidOwnerAssertion);
         };
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
-            next.pending_consents.remove(&ceremony.consent_id);
+            let expired = expire_consent(&mut next, &ceremony.consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         let consent_bytes = serde_json::to_vec(&consent)
             .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
@@ -1102,39 +1092,12 @@ impl DownstreamOauthManager {
         };
         owner_credential.passkey.counter = success.new_counter;
         owner_credential.last_used_at = Some(now);
-        next.pending_consents.remove(&ceremony.consent_id);
-        next.owner_authentication_ceremonies
-            .retain(|_, pending| pending.consent_id != ceremony.consent_id);
-        let code = opaque_value();
-        next.pending_codes.insert(
-            code.clone(),
-            PendingAuthorizationCode {
-                client_id: consent.client_id.clone(),
-                redirect_uri: consent.redirect_uri.clone(),
-                code_challenge: consent.code_challenge,
-                scopes: consent.scopes,
-                resource: consent.resource,
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-            },
-        );
-        if let Some(client) = next.clients.get_mut(&consent.client_id) {
-            client.last_used_at = Some(now);
-            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
-        }
-        let redirect = AuthorizationRedirect {
-            location: redirect_with_params(
-                &consent.redirect_uri,
-                &[("code", &code), ("state", &consent.state)],
-            ),
-        };
-        next.completed_consents.insert(
-            ceremony.consent_id,
-            CompletedConsent {
-                client_id: consent.client_id,
-                redirect: redirect.clone(),
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                approval_ceremony_ids,
-            },
+        let redirect = issue_code_for_consent(
+            &mut next,
+            &ceremony.consent_id,
+            consent,
+            approval_ceremony_ids,
+            now,
         );
         self.commit_state(&mut guard, next)?;
         Ok(redirect)
@@ -1161,14 +1124,10 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
             let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
+            let expired = expire_consent(&mut next, consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         if !crate::auth::verify_auth_token(csrf_token, &consent.csrf_token) {
             return Err(DownstreamOauthError::InvalidAuthorizationRequest);
@@ -1423,6 +1382,13 @@ impl DownstreamOauthManager {
         })
     }
 
+    /// Approve or deny a consent without the owner passkey ceremony.
+    ///
+    /// Test-only: production approval goes through
+    /// [`Self::finish_owner_approval`] and denial through
+    /// [`Self::deny_consent`]. Tests in other crates reach this through the
+    /// `test-helpers` feature, which only dev-dependencies enable.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub async fn decide_consent(
         &self,
         consent_id: &str,
@@ -1443,14 +1409,10 @@ impl DownstreamOauthManager {
             .cloned()
             .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
         if consent.expires_at <= now {
-            let callback = ValidatedAuthorizationCallback {
-                redirect_uri: consent.redirect_uri.clone(),
-                state: consent.state.clone(),
-            };
             let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
+            let expired = expire_consent(&mut next, consent_id, &consent);
             self.commit_state(&mut guard, next)?;
-            return Err(DownstreamOauthError::AuthorizationExpired(callback));
+            return Err(expired);
         }
         if !approved {
             let redirect = AuthorizationRedirect {
@@ -1475,38 +1437,7 @@ impl DownstreamOauthManager {
         }
 
         let mut next = guard.clone();
-        next.pending_consents.remove(consent_id);
-        let code = opaque_value();
-        next.pending_codes.insert(
-            code.clone(),
-            PendingAuthorizationCode {
-                client_id: consent.client_id.clone(),
-                redirect_uri: consent.redirect_uri.clone(),
-                code_challenge: consent.code_challenge,
-                scopes: consent.scopes,
-                resource: consent.resource,
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-            },
-        );
-        if let Some(client) = next.clients.get_mut(&consent.client_id) {
-            client.last_used_at = Some(now);
-            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
-        }
-        let redirect = AuthorizationRedirect {
-            location: redirect_with_params(
-                &consent.redirect_uri,
-                &[("code", &code), ("state", &consent.state)],
-            ),
-        };
-        next.completed_consents.insert(
-            consent_id.to_string(),
-            CompletedConsent {
-                client_id: consent.client_id,
-                redirect: redirect.clone(),
-                expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                approval_ceremony_ids: Vec::new(),
-            },
-        );
+        let redirect = issue_code_for_consent(&mut next, consent_id, consent, Vec::new(), now);
         self.commit_state(&mut guard, next)?;
         Ok(redirect)
     }
@@ -2037,6 +1968,68 @@ fn forbidden_metadata_ip(ip: IpAddr) -> bool {
                 || ip.is_multicast()
         }
     }
+}
+
+/// Drop a consent that outlived its window, with any approval ceremony tied
+/// to it, and return the error that sends the user back to the client.
+fn expire_consent(
+    next: &mut DownstreamOauthState,
+    consent_id: &str,
+    consent: &PendingConsent,
+) -> DownstreamOauthError {
+    next.pending_consents.remove(consent_id);
+    next.owner_authentication_ceremonies
+        .retain(|_, ceremony| ceremony.consent_id != consent_id);
+    DownstreamOauthError::AuthorizationExpired(ValidatedAuthorizationCallback {
+        redirect_uri: consent.redirect_uri.clone(),
+        state: consent.state.clone(),
+    })
+}
+
+/// Turn an approved consent into a single-use authorization code, record the
+/// redirect for replay, and extend the client's registration.
+fn issue_code_for_consent(
+    next: &mut DownstreamOauthState,
+    consent_id: &str,
+    consent: PendingConsent,
+    approval_ceremony_ids: Vec<String>,
+    now: u64,
+) -> AuthorizationRedirect {
+    next.pending_consents.remove(consent_id);
+    next.owner_authentication_ceremonies
+        .retain(|_, pending| pending.consent_id != consent_id);
+    let code = opaque_value();
+    next.pending_codes.insert(
+        code.clone(),
+        PendingAuthorizationCode {
+            client_id: consent.client_id.clone(),
+            redirect_uri: consent.redirect_uri.clone(),
+            code_challenge: consent.code_challenge,
+            scopes: consent.scopes,
+            resource: consent.resource,
+            expires_at: now + AUTH_CODE_LIFETIME_SECS,
+        },
+    );
+    if let Some(client) = next.clients.get_mut(&consent.client_id) {
+        client.last_used_at = Some(now);
+        client.expires_at = now + REGISTRATION_LIFETIME_SECS;
+    }
+    let redirect = AuthorizationRedirect {
+        location: redirect_with_params(
+            &consent.redirect_uri,
+            &[("code", &code), ("state", &consent.state)],
+        ),
+    };
+    next.completed_consents.insert(
+        consent_id.to_string(),
+        CompletedConsent {
+            client_id: consent.client_id,
+            redirect: redirect.clone(),
+            expires_at: now + AUTH_CODE_LIFETIME_SECS,
+            approval_ceremony_ids,
+        },
+    );
+    redirect
 }
 
 fn issue_token_pair(
