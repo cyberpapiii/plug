@@ -762,7 +762,7 @@ fn build_configured_http_runtime(
     let http_state_for_expiry = Arc::clone(&http_state);
     tokio::spawn(async move {
         while let Some(session_id) = expiry_rx.recv().await {
-            cleanup_expired_http_session(&http_state_for_expiry, &tool_router, &session_id).await;
+            http_state_for_expiry.teardown_session(&session_id).await;
         }
     });
 
@@ -778,37 +778,6 @@ fn build_configured_http_runtime(
         sessions,
         downstream_oauth,
     })
-}
-
-/// Clean up all per-session state for an HTTP session that expired via idle
-/// timeout. Mirrors the teardown `delete_mcp` performs for an explicit
-/// `DELETE /mcp`, including the session's task records.
-pub(crate) async fn cleanup_expired_http_session(
-    http_state: &Arc<plug_core::http::server::HttpState>,
-    tool_router: &Arc<plug_core::proxy::ToolRouter>,
-    session_id: &str,
-) {
-    let target = plug_core::notifications::NotificationTarget::Http {
-        session_id: Arc::from(session_id),
-    };
-    tool_router.cleanup_subscriptions_for_target(&target).await;
-    http_state.roots_capable_sessions.remove(session_id);
-    http_state.client_capabilities.remove(session_id);
-    http_state
-        .pending_client_requests
-        .retain(|(pending_session_id, _), _| pending_session_id != session_id);
-    if tool_router.clear_roots_for_target(&target) {
-        tool_router.forward_roots_list_changed_to_upstreams().await;
-    }
-    tool_router.remove_client_log_level(session_id);
-    let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-        plug_core::proxy::DownstreamTransport::Http,
-        session_id,
-    );
-    tool_router.clear_lazy_session(&lazy_session_key);
-    tool_router.unregister_downstream_bridge(&target);
-    let owner = plug_core::proxy::ToolRouter::task_owner_for_http_session(session_id);
-    tool_router.cleanup_tasks_for_owner(&owner).await;
 }
 
 fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
@@ -3658,7 +3627,7 @@ mod tests {
             .expect("enqueue task for expiring session");
         assert_eq!(tool_router.task_count_for_owner(&owner).await, 1);
 
-        cleanup_expired_http_session(&http_state, &tool_router, session_id).await;
+        http_state.teardown_session(session_id).await;
 
         assert_eq!(tool_router.task_count_for_owner(&owner).await, 0);
         assert_eq!(

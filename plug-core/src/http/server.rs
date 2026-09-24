@@ -478,6 +478,39 @@ impl DownstreamBridge for HttpBridge {
 }
 
 impl HttpState {
+    /// Release everything the daemon holds for an HTTP session that has left
+    /// the session store, whether by `DELETE /mcp` or by idle expiry.
+    ///
+    /// Session-owned legacy task records end with the wire session. Durable
+    /// principal-owned records intentionally survive and can be resumed by a
+    /// later session authenticated as the same principal.
+    pub async fn teardown_session(&self, session_id: &str) {
+        let target = NotificationTarget::Http {
+            session_id: Arc::from(session_id),
+        };
+        self.router.cleanup_subscriptions_for_target(&target).await;
+        self.roots_capable_sessions.remove(session_id);
+        self.client_capabilities.remove(session_id);
+        // Dropping pending reverse-request senders wakes their receivers with
+        // RecvError instead of leaving them to time out.
+        self.pending_client_requests
+            .retain(|(pending_session_id, _), _| pending_session_id != session_id);
+        self.router.unregister_downstream_bridge(&target);
+        if self.router.clear_roots_for_target(&target) {
+            self.router.forward_roots_list_changed_to_upstreams().await;
+        }
+        // A stale per-client log level would keep the effective level
+        // permanently at a permissive value.
+        self.router.remove_client_log_level(session_id);
+        let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
+            crate::proxy::DownstreamTransport::Http,
+            session_id,
+        );
+        self.router.clear_lazy_session(&lazy_session_key);
+        let owner = crate::proxy::ToolRouter::task_owner_for_http_session(session_id);
+        self.router.cleanup_tasks_for_owner(&owner).await;
+    }
+
     pub fn spawn_notification_fanout(self: &Arc<Self>) {
         if self
             .notification_task_started
@@ -1501,34 +1534,7 @@ async fn delete_mcp(
     let session_id = extract_session_id(&headers)?;
 
     if state.sessions.remove(&session_id) {
-        // Clean up resource subscriptions for this departing session
-        let target = NotificationTarget::Http {
-            session_id: Arc::from(session_id.as_str()),
-        };
-        state.router.cleanup_subscriptions_for_target(&target).await;
-        state.roots_capable_sessions.remove(&session_id);
-        state.client_capabilities.remove(&session_id);
-        // Drop pending reverse-request senders so receivers get RecvError
-        state
-            .pending_client_requests
-            .retain(|(pending_session_id, _), _| pending_session_id != &session_id);
-        state.router.unregister_downstream_bridge(&target);
-        if state.router.clear_roots_for_target(&target) {
-            state.router.forward_roots_list_changed_to_upstreams().await;
-        }
-        // Clean up per-client log level to prevent stale entries from
-        // keeping the effective level permanently at a permissive value.
-        state.router.remove_client_log_level(&session_id);
-        let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
-            crate::proxy::DownstreamTransport::Http,
-            &session_id,
-        );
-        state.router.clear_lazy_session(&lazy_session_key);
-        // Session-owned legacy records end with the wire session. Durable
-        // principal-owned records intentionally survive and can be resumed
-        // by a later session authenticated as the same principal.
-        let owner = crate::proxy::ToolRouter::task_owner_for_http_session(&session_id);
-        state.router.cleanup_tasks_for_owner(&owner).await;
+        state.teardown_session(&session_id).await;
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
