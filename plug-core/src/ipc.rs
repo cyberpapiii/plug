@@ -43,7 +43,21 @@ impl fmt::Debug for IpcCancellationCapability {
 }
 
 /// Current daemon/client IPC protocol version.
-pub const IPC_PROTOCOL_VERSION: u16 = 3;
+///
+/// v4: a registered proxy connection tags requests with `ipc_id` and the
+/// daemon answers them concurrently, echoing the id; replies to reverse
+/// requests carry `reverse_id`. Untagged requests keep the one-at-a-time
+/// behavior, so operator clients (the app, one-shot CLI commands) are
+/// unaffected.
+pub const IPC_PROTOCOL_VERSION: u16 = 4;
+
+/// Oldest proxy protocol version the daemon still registers.
+///
+/// A v3 `plug connect` never tags its requests, so the daemon serves it one
+/// request at a time exactly as before and sends it nothing new. Keeping v3
+/// means proxies started before an upgrade keep working until their host
+/// restarts them. A v4 proxy registering with a v3 daemon falls back to v3.
+pub const IPC_PROTOCOL_VERSION_MIN: u16 = 3;
 
 /// Inclusive operator IPC compatibility band advertised by the daemon.
 ///
@@ -1058,7 +1072,24 @@ pub async fn send_chunked_response<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
     response: &IpcResponse,
 ) -> anyhow::Result<()> {
-    let payload = encode_response_payload(response)?;
+    send_chunked_response_with_id(writer, None, response).await
+}
+
+/// `send_chunked_response` for a reply to a request that carried `ipc_id`.
+///
+/// The id travels inside the logical response, so a chunked response carries
+/// it once, in the reassembled payload. A connection has one writer, which
+/// writes all chunks of a response back to back; chunks of two responses never
+/// interleave.
+pub async fn send_chunked_response_with_id<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    ipc_id: Option<u64>,
+    response: &IpcResponse,
+) -> anyhow::Result<()> {
+    let payload = match ipc_id {
+        None => encode_response_payload(response)?,
+        Some(id) => Cow::Owned(encode_tagged(Some(id), response)?),
+    };
     if payload.len() <= MAX_FRAME_SIZE as usize {
         return write_frame(writer, payload.as_ref()).await;
     }
@@ -1076,9 +1107,126 @@ pub async fn send_chunked_response<W: tokio::io::AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+// ──────────────────────── Request correlation (v4) ────────────────────────────
+//
+// A registered proxy connection carries many requests at once. A request may
+// carry a top-level `ipc_id`; the daemon echoes it on the response so the proxy
+// can route replies that arrive out of order. The proxy's reply to a daemon
+// `ReverseRequest { id, .. }` carries that id as `reverse_id`. Both fields sit
+// beside the variant's own fields, so a peer that does not know them ignores
+// them, and a frame without them keeps the one-at-a-time meaning. Push
+// notifications never carry an id.
+
+/// Correlation ids read off the top level of a frame.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize)]
+pub struct FrameIds {
+    #[serde(default)]
+    pub ipc_id: Option<u64>,
+    #[serde(default)]
+    pub reverse_id: Option<u64>,
+}
+
+impl FrameIds {
+    /// Ids present at the top level of `frame`. A frame that is not a JSON
+    /// object reports none; its own parse reports the error.
+    pub fn peek(frame: &[u8]) -> Self {
+        serde_json::from_slice(frame).unwrap_or_default()
+    }
+}
+
+#[derive(Serialize)]
+struct Tagged<'a, T: Serialize> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ipc_id: Option<u64>,
+    #[serde(flatten)]
+    inner: &'a T,
+}
+
+#[derive(Serialize)]
+struct ReverseReply<'a> {
+    reverse_id: u64,
+    #[serde(flatten)]
+    inner: &'a IpcClientResponse,
+}
+
+/// Encode an `IpcRequest` or `IpcResponse` with an optional top-level `ipc_id`.
+pub fn encode_tagged<T: Serialize>(ipc_id: Option<u64>, inner: &T) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&Tagged { ipc_id, inner })
+}
+
+/// Encode the proxy's reply to the daemon's `ReverseRequest { id, .. }`.
+pub fn encode_reverse_response(
+    reverse_id: u64,
+    response: &IpcClientResponse,
+) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&ReverseReply {
+        reverse_id,
+        inner: response,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tagged_frames_round_trip_and_stay_readable_without_the_id() {
+        for request in [
+            IpcRequest::Status,
+            IpcRequest::Ping {
+                session_id: "s".to_string(),
+            },
+            IpcRequest::McpRequest {
+                session_id: "s".to_string(),
+                method: "tools/list".to_string(),
+                params: Some(serde_json::json!({ "ipc_id": 99 })),
+            },
+        ] {
+            let bytes = encode_tagged(Some(7), &request).expect("encode request");
+            assert_eq!(FrameIds::peek(&bytes).ipc_id, Some(7));
+            let decoded: IpcRequest = serde_json::from_slice(&bytes).expect("decode request");
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap(),
+                serde_json::to_value(&request).unwrap()
+            );
+            let untagged = encode_tagged(None, &request).expect("encode untagged");
+            assert_eq!(untagged, serde_json::to_vec(&request).unwrap());
+            assert_eq!(FrameIds::peek(&untagged), FrameIds::default());
+        }
+
+        for response in [
+            IpcResponse::Pong,
+            IpcResponse::Ok,
+            IpcResponse::McpResponse {
+                payload: serde_json::json!({ "ipc_id": 5, "content": [] }),
+            },
+        ] {
+            let bytes = encode_tagged(Some(u64::MAX), &response).expect("encode response");
+            assert_eq!(FrameIds::peek(&bytes).ipc_id, Some(u64::MAX));
+            let decoded: IpcResponse = serde_json::from_slice(&bytes).expect("decode response");
+            assert_eq!(
+                serde_json::to_value(&decoded).unwrap(),
+                serde_json::to_value(&response).unwrap()
+            );
+        }
+
+        let reply = IpcClientResponse::Error {
+            message: "declined".to_string(),
+        };
+        let bytes = encode_reverse_response(3, &reply).expect("encode reverse reply");
+        assert_eq!(
+            FrameIds::peek(&bytes),
+            FrameIds {
+                ipc_id: None,
+                reverse_id: Some(3)
+            }
+        );
+        assert!(matches!(
+            serde_json::from_slice::<IpcClientResponse>(&bytes).expect("decode reverse reply"),
+            IpcClientResponse::Error { message } if message == "declined"
+        ));
+        assert_eq!(FrameIds::peek(b"not json"), FrameIds::default());
+    }
 
     #[test]
     fn cancellation_capability_preserves_wire_value_and_redaction() {

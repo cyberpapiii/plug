@@ -21,12 +21,10 @@ use plug_core::ipc;
 ///   dropping it mid-frame silently discards those bytes and desyncs the
 ///   length-prefixed wire protocol on the next read).
 ///
-/// The reverse-request path (`handle_reverse_request`) also reads a frame off
-/// this same connection (the proxy's elicitation/sampling response). It goes
-/// through `next()` too, so once multiplexed mode is active both consumers
-/// pull frames from the same ordered channel — never the raw reader
-/// directly — which preserves frame ordering without the two racing for the
-/// same `OwnedReadHalf`.
+/// The proxy's replies to reverse requests (elicitation/sampling) arrive on
+/// this same connection, tagged with `reverse_id`. The connection loop reads
+/// them through `next()` like any other frame and routes them by id, so
+/// there is one consumer of the read half and frame order is preserved.
 pub(super) struct FrameReader {
     reader: Option<tokio::net::unix::OwnedReadHalf>,
     frame_rx: Option<tokio::sync::mpsc::Receiver<anyhow::Result<Option<Vec<u8>>>>>,
