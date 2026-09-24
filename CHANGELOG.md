@@ -21,6 +21,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   made the call, and turn the latency orange when a call took five seconds or
   more.
 - The version in About can be selected and copied.
+- Downstream OAuth state from before 0.4.0 (`issuer-v2-*.json`) is no
+  longer migrated at startup, and the one-time grant scope and token-family
+  backfills are gone. State written by 0.4.0 or later loads unchanged.
 
 ### Fixed
 
