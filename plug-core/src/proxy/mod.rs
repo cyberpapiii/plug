@@ -3114,9 +3114,14 @@ impl ToolRouter {
             // the first is queued or executing, rather than waiting for the
             // semaphore and becoming a second side effect after the first
             // call unregisters.
-            let permit = if let Some(sem) = self.server_manager.semaphores.get(&server_id) {
+            let semaphore = self
+                .server_manager
+                .semaphores
+                .get(&server_id)
+                .map(|entry| Arc::clone(entry.value()));
+            let permit = if let Some(sem) = semaphore {
                 Some(
-                    tokio::time::timeout(semaphore_timeout, sem.clone().acquire_owned())
+                    tokio::time::timeout(semaphore_timeout, sem.acquire_owned())
                         .await
                         .map_err(|_| {
                             McpError::from(ProtocolError::ServerBusy {
@@ -3260,7 +3265,11 @@ impl ToolRouter {
             let duration_ms = call_start.elapsed().as_millis() as u64;
 
             // Record circuit breaker outcome
-            let cb = self.server_manager.circuit_breakers.get(&server_id);
+            let cb = self
+                .server_manager
+                .circuit_breakers
+                .get(&server_id)
+                .map(|entry| Arc::clone(entry.value()));
 
             match result {
                 Ok(ServerResult::CallToolResult(mut response)) => {

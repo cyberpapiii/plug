@@ -77,19 +77,24 @@ pub fn spawn_health_check(
     let tracker_clone = tracker.clone();
 
     tracker.spawn(async move {
-        let jitter = Duration::from_millis(rand::random_range(0..10_000));
-        tokio::time::sleep(jitter).await;
+        // A server that is already missing an upstream is known-bad before the
+        // loop begins -- typically a local upstream still binding its port
+        // after a reboot -- so it skips both the stagger and the consumed first
+        // tick and goes straight to recovery. Only servers that started healthy
+        // were just contacted and need neither an immediate ping nor a herd.
+        let started_healthy = server_manager.get_upstream(&name).is_some();
+        if started_healthy {
+            let jitter = Duration::from_millis(rand::random_range(0..10_000));
+            tokio::time::sleep(jitter).await;
+        }
 
         let mut tick = tokio::time::interval(interval);
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
-        // `interval` yields its first tick immediately. A server that started
-        // healthy was just contacted, so that tick would be a redundant ping and
-        // is consumed here. A server that is already missing an upstream is
-        // known-bad before the loop begins -- typically a local upstream still
-        // binding its port after a reboot -- so its first tick is left to fire
-        // now. Consuming it unconditionally used to leave such a server down for
-        // a whole interval after login even once it was ready to answer.
-        if server_manager.get_upstream(&name).is_some() {
+        // `interval` yields its first tick immediately. For a server that
+        // started healthy that tick would be a redundant ping, so it is
+        // consumed here. Consuming it unconditionally used to leave a failed
+        // server down for a whole interval after login even once it was ready.
+        if started_healthy {
             tick.tick().await;
         }
 
@@ -400,6 +405,33 @@ mod tests {
             restarts >= 1,
             "a server that failed to start should be retried within the first \
              health interval, but no recovery episode ran in 60s of a {INTERVAL_SECS}s interval"
+        );
+
+        engine.shutdown().await;
+    }
+
+    /// The 0-10s start stagger exists to spread pings to servers that are up.
+    /// A server that failed at boot has nothing to ping and should go straight
+    /// to recovery, not sit out a random share of the stagger first.
+    #[tokio::test(start_paused = true)]
+    async fn startup_failure_skips_the_health_start_jitter() {
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("dead".to_string(), unstartable_server_config(600));
+
+        let engine = Arc::new(Engine::new(config));
+        engine.start().await.expect("a failed start is not fatal");
+
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let restarts = engine
+            .server_manager()
+            .metrics_snapshot_or_default("dead")
+            .restart_count;
+        assert!(
+            restarts >= 1,
+            "a server that failed to start should be retried at once, not after the start jitter"
         );
 
         engine.shutdown().await;

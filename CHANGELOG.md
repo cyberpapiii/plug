@@ -70,6 +70,30 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- A server that failed at startup and later recovered now gets its
+  `max_concurrent` limit and circuit breaker. It used to run with neither
+  for the rest of the daemon's life.
+- One upstream that never answers `logging/setLevel` no longer holds up
+  every server that finishes starting after it. The log level is now pushed
+  in the background with a five-second bound, and also after a reload or
+  reconnect, which used to skip it.
+- A legacy server that ignores `tasks/list` now starts. The task capability
+  probe waited up to the 300-second call timeout inside the 30-second start
+  timeout; it now gives up after three seconds and runs beside the tool list.
+- Re-listing tools after an upstream's `tools/list_changed` now times out
+  after the server's `call_timeout_secs` instead of waiting forever.
+- A server that failed at startup is now retried the moment its health task
+  starts. It used to sit out a random pause of up to ten seconds meant only
+  to stagger pings to healthy servers.
+- `plug auth inject` for an OAuth server with no earlier login now works.
+  It saved the token without binding it to the server's authorization
+  server, the runtime refused it, and the server stayed "auth required". It
+  now discovers and binds the authority first, as `plug auth login` does.
+- `plug doctor` no longer warns about the OAuth token file that every
+  signed-in server keeps. It now warns only when another user can read that
+  file, and suggests `chmod 600`.
+- `plug doctor` reports a missing stdio server program once, under server
+  programs, instead of also failing connectivity for the same server.
 
 ## [0.8.11] - 2026-09-01
 
