@@ -55,6 +55,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         port,
         env_vars,
         binaries,
+        connectivity,
         collisions,
         limits,
         pid,
@@ -70,6 +71,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_port_available(config),
         check_env_vars(config),
         check_server_binaries(config),
+        check_server_connectivity(config),
         check_tool_collisions(config),
         check_client_limits(config),
         check_pid_staleness(),
@@ -80,9 +82,6 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_oauth_tokens(config),
         check_codesign_identity(config),
     );
-
-    // Server connectivity is sequential-ish internally but we run it after the rest
-    let connectivity = check_server_connectivity(config).await;
 
     let checks = vec![
         config_exists,
@@ -207,35 +206,9 @@ async fn check_config_exists(config_path: &Path) -> CheckResult {
 
 /// Validate TOML syntax without depending on the full Config schema.
 fn toml_parse(contents: &str) -> Result<(), String> {
-    // Use serde_json roundtrip via figment's TOML parser indirectly —
-    // but simpler: just try to parse as a generic toml table via figment.
-    // Actually, we just try to deserialize as Config.
-    use figment::Figment;
-    use figment::providers::{Format, Toml};
-
-    Figment::new()
-        .merge(Toml::string(contents))
-        .extract::<toml_value::Value>()
+    toml::from_str::<toml::Table>(contents)
         .map(|_| ())
         .map_err(|e| e.to_string())
-}
-
-/// Minimal TOML value type for validation only.
-mod toml_value {
-    use serde::Deserialize;
-    use std::collections::HashMap;
-
-    #[derive(Deserialize)]
-    #[serde(untagged)]
-    #[allow(dead_code)]
-    pub enum Value {
-        Table(HashMap<String, Value>),
-        Array(Vec<Value>),
-        String(String),
-        Integer(i64),
-        Float(f64),
-        Bool(bool),
-    }
 }
 
 /// Check 2: config file permissions (Unix only).
@@ -744,75 +717,36 @@ fn running_daemon_pid() -> Option<u32> {
 /// Check 9: try to start and initialize each server (5s timeout).
 async fn check_server_connectivity(config: &Config) -> CheckResult {
     use futures::future::join_all;
-    use std::future::Future;
-    use std::pin::Pin;
 
     let name = "server_connectivity".to_string();
-    let enabled_servers: Vec<&str> = config
+    // Stdio servers are covered by `server_binaries`; reporting a missing
+    // binary here too made one problem show up as two.
+    let remote_servers: Vec<(&str, &str)> = config
         .servers
         .iter()
-        .filter(|(_, s)| s.enabled)
-        .map(|(name, _)| name.as_str())
+        .filter(|(_, s)| {
+            s.enabled && matches!(s.transport, TransportType::Http | TransportType::Sse)
+        })
+        .filter_map(|(name, s)| Some((name.as_str(), s.url.as_deref()?)))
         .collect();
 
-    if enabled_servers.is_empty() {
+    if remote_servers.is_empty() {
         return CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: "No servers configured to check".to_string(),
+            message: "No remote servers configured to check".to_string(),
             fix_suggestion: None,
         };
     }
 
     // We don't actually start servers in doctor mode — that would be disruptive.
-    // Instead, we check that the basic requirements are met (binary exists, URL reachable).
-    let connectivity_checks: Vec<Pin<Box<dyn Future<Output = Option<String>> + Send>>> = config
-        .servers
-        .iter()
-        .filter_map(|(server_name, server)| {
-            if !server.enabled {
-                return None;
-            }
-
-            let server_name = server_name.clone();
-            match server.transport {
-                TransportType::Stdio => {
-                    let command = server.command.clone();
-                    Some(Box::pin(async move {
-                        let login_path = crate::server::stdio_login_path().await;
-                        if let Some(cmd) = command {
-                            let binary = cmd.split_whitespace().next().unwrap_or(&cmd).to_string();
-                            if !binary.starts_with('$') {
-                                let found = if binary.starts_with('/') || binary.starts_with('.') {
-                                    Path::new(&binary).exists()
-                                } else {
-                                    which(&binary, login_path).is_some()
-                                };
-                                if !found {
-                                    return Some(format!("{server_name}: binary not found"));
-                                }
-                            }
-                        }
-                        None
-                    })
-                        as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
-                }
-                TransportType::Http | TransportType::Sse => {
-                    let url = server.url.clone();
-                    Some(Box::pin(async move {
-                        if let Some(url) = url {
-                            return check_http_reachable(&url)
-                                .await
-                                .err()
-                                .map(|e| format!("{server_name}: {e}"));
-                        }
-                        None
-                    })
-                        as Pin<Box<dyn Future<Output = Option<String>> + Send>>)
-                }
-            }
-        })
-        .collect();
+    // Instead, we check that each remote URL is reachable.
+    let connectivity_checks = remote_servers.iter().map(|(server_name, url)| async move {
+        check_http_reachable(url)
+            .await
+            .err()
+            .map(|e| format!("{server_name}: {e}"))
+    });
     let unreachable = join_all(connectivity_checks)
         .await
         .into_iter()
@@ -823,7 +757,7 @@ async fn check_server_connectivity(config: &Config) -> CheckResult {
         CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: format!("All {} servers are reachable", enabled_servers.len()),
+            message: format!("All {} remote servers are reachable", remote_servers.len()),
             fix_suggestion: None,
         }
     } else {
@@ -1183,36 +1117,55 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
         };
     }
 
+    // Each signed-in server keeps a token file next to its Keychain entry. The
+    // file is the runtime's required mirror, so its presence is expected and
+    // not worth a warning; the only problem worth flagging is one other users
+    // can read.
     let tokens_dir = crate::oauth::tokens_dir();
-    let mut plaintext_token_files = Vec::new();
-
+    let mut signed_in = 0usize;
+    let mut exposed = Vec::new();
     for (server_name, _) in &oauth_servers {
-        let token_file = tokens_dir.join(format!("{server_name}.json"));
-        if token_file.exists() {
-            plaintext_token_files.push(format!(
-                "server '{server_name}': plaintext token file present at {}",
-                token_file.display()
-            ));
+        let Ok(safe_name) = crate::config::sanitize_server_name_for_path(server_name) else {
+            continue;
+        };
+        let token_file = tokens_dir.join(format!("{safe_name}.json"));
+        let Ok(metadata) = std::fs::metadata(&token_file) else {
+            continue;
+        };
+        signed_in += 1;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                exposed.push(format!(
+                    "server '{server_name}': token file {} is readable by other users",
+                    token_file.display()
+                ));
+            }
         }
+        #[cfg(not(unix))]
+        let _ = metadata;
     }
 
-    if plaintext_token_files.is_empty() {
+    if exposed.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
-            message:
-                "No plaintext OAuth token files detected (doctor does not probe keychain-backed credentials)"
-                    .to_string(),
+            message: format!(
+                "{signed_in} of {} OAuth servers have stored sign-ins (doctor does not probe keychain-backed credentials)",
+                oauth_servers.len()
+            ),
             fix_suggestion: None,
         }
     } else {
         CheckResult {
             name,
             status: CheckStatus::Warn,
-            message: plaintext_token_files.join("; "),
-            fix_suggestion: Some(
-                "Use `plug auth status` for live credential state; these local token files back process restarts and should remain protected with filesystem permissions".to_string(),
-            ),
+            message: exposed.join("; "),
+            fix_suggestion: Some(format!(
+                "Restrict the token files to your user: chmod 600 {}/*.json",
+                tokens_dir.display()
+            )),
         }
     }
 }
@@ -1687,8 +1640,10 @@ command = "example-server"
         );
     }
 
+    /// The token file is the runtime's required mirror of every sign-in, so
+    /// a private one is the normal state, not a warning.
     #[tokio::test]
-    async fn oauth_tokens_warn_when_plaintext_token_file_exists() {
+    async fn oauth_tokens_pass_when_a_private_token_file_exists() {
         let server_name = format!("oauth-doctor-file-{}", std::process::id());
         let mut config = test_config();
         config.servers.insert(
@@ -1701,20 +1656,50 @@ command = "example-server"
             std::fs::create_dir_all(parent).unwrap();
         }
         std::fs::write(&token_file, "{}").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
 
         let result = check_oauth_tokens(&config).await;
+        let _ = std::fs::remove_file(&token_file);
 
+        assert_eq!(result.status, CheckStatus::Pass);
+        assert!(result.message.contains("1 of 1"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn oauth_tokens_warn_when_token_file_is_readable_by_others() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server_name = format!("oauth-doctor-exposed-{}", std::process::id());
+        let mut config = test_config();
+        config.servers.insert(
+            server_name.clone(),
+            oauth_http_server("https://example.com/mcp"),
+        );
+
+        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        if let Some(parent) = token_file.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&token_file, "{}").unwrap();
+        std::fs::set_permissions(&token_file, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        let result = check_oauth_tokens(&config).await;
         let _ = std::fs::remove_file(&token_file);
 
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains(&server_name));
-        assert!(result.message.contains("plaintext token file"));
+        assert!(result.message.contains("readable by other users"));
         assert!(
             result
                 .fix_suggestion
                 .as_deref()
                 .unwrap_or_default()
-                .contains("filesystem permissions")
+                .contains("chmod 600")
         );
     }
 
@@ -1865,13 +1850,15 @@ command = "example-server"
     }
 
     #[tokio::test]
-    async fn connectivity_stdio_binary_found() {
+    async fn connectivity_leaves_stdio_servers_to_server_binaries() {
         let mut config = test_config();
-        config
-            .servers
-            .insert("test".to_string(), stdio_server("echo"));
+        config.servers.insert(
+            "missing".to_string(),
+            stdio_server("/nonexistent/plug-doctor-test-binary"),
+        );
         let result = check_server_connectivity(&config).await;
         assert_eq!(result.status, CheckStatus::Pass);
+        assert!(!result.message.contains("missing"));
     }
 
     #[tokio::test]

@@ -901,30 +901,6 @@ pub(crate) async fn fetch_live_sessions(
                 scope,
                 LiveClientSupport::Supported,
             ),
-            Ok(plug_core::ipc::IpcResponse::Clients { clients }) => {
-                let sessions = clients
-                    .into_iter()
-                    .map(|client| plug_core::ipc::IpcLiveSessionInfo {
-                        transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
-                        client_id: Some(client.client_id),
-                        session_id: client.session_id,
-                        client_type: client
-                            .client_info
-                            .as_deref()
-                            .map(plug_core::client_detect::detect_client)
-                            .unwrap_or(plug_core::types::ClientType::Unknown),
-                        client_info: client.client_info,
-                        adapter_version: client.adapter_version,
-                        connected_secs: client.connected_secs,
-                        last_activity_secs: None,
-                    })
-                    .collect();
-                (
-                    LiveSessionSourceState::Available(sessions),
-                    plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-                    LiveClientSupport::Supported,
-                )
-            }
             Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => (
                 LiveSessionSourceState::Unavailable,
                 plug_core::ipc::LiveSessionInventoryScope::Unavailable,
@@ -962,16 +938,6 @@ pub(crate) struct DaemonProxySession {
     pub(crate) modern_downstream_enabled: bool,
     pub(crate) cancellation_capability: plug_core::ipc::IpcCancellationCapability,
     pub(crate) pending_notifications: Vec<plug_core::ipc::IpcResponse>,
-}
-
-enum PendingIpcResponse {
-    OperatorHandshake(plug_core::ipc::OperatorHandshake),
-    Registered {
-        session_id: String,
-        modern_downstream_enabled: bool,
-        cancellation_capability: plug_core::ipc::IpcCancellationCapability,
-    },
-    Capabilities(rmcp::model::ServerCapabilities),
 }
 
 fn paths_resolve_to_same_file(left: &std::path::Path, right: &std::path::Path) -> bool {
@@ -1101,13 +1067,13 @@ fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)
 /// host client shows a server that is neither ready nor failed.
 const SESSION_SETUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
-async fn read_pending_or_matching_response(
+/// Read the next reply during session setup, parking push notifications in
+/// `pending_notifications` for the proxy to forward once it has a peer.
+async fn read_setup_response(
     reader: &mut tokio::net::unix::OwnedReadHalf,
-    expected_client_id: &str,
     pending_notifications: &mut Vec<plug_core::ipc::IpcResponse>,
     deadline: tokio::time::Instant,
-    matcher: impl Fn(&plug_core::ipc::IpcResponse) -> Option<PendingIpcResponse>,
-) -> anyhow::Result<PendingIpcResponse> {
+) -> anyhow::Result<plug_core::ipc::IpcResponse> {
     loop {
         let frame = tokio::time::timeout_at(deadline, plug_core::ipc::read_frame(reader))
             .await
@@ -1123,37 +1089,9 @@ async fn read_pending_or_matching_response(
         let response: plug_core::ipc::IpcResponse = serde_json::from_slice(&frame)
             .map_err(|e| anyhow::anyhow!("invalid daemon response: {e}"))?;
 
-        if let Some(matched) = matcher(&response) {
-            return Ok(matched);
-        }
-
         match response {
             plug_core::ipc::IpcResponse::Error { code, message } => {
                 anyhow::bail!("{code}: {message}");
-            }
-            plug_core::ipc::IpcResponse::Registered {
-                protocol_version,
-                client_id,
-                session_id,
-                modern_downstream_enabled,
-                cancellation_capability,
-            } => {
-                if protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
-                    anyhow::bail!(
-                        "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{}",
-                        plug_core::ipc::IPC_PROTOCOL_VERSION
-                    );
-                }
-                if client_id != expected_client_id {
-                    anyhow::bail!(
-                        "daemon/client registration mismatch: expected client_id {expected_client_id}, got {client_id}"
-                    );
-                }
-                return Ok(PendingIpcResponse::Registered {
-                    session_id,
-                    modern_downstream_enabled,
-                    cancellation_capability,
-                });
             }
             resp @ (plug_core::ipc::IpcResponse::LoggingNotification { .. }
             | plug_core::ipc::IpcResponse::ToolListChangedNotification
@@ -1165,11 +1103,13 @@ async fn read_pending_or_matching_response(
             | plug_core::ipc::IpcResponse::ModernDownstreamGateChanged { .. }) => {
                 pending_notifications.push(resp);
             }
-            other => {
-                anyhow::bail!("unexpected daemon response while waiting for IPC setup: {other:?}");
-            }
+            other => return Ok(other),
         }
     }
+}
+
+fn unexpected_setup_response(response: plug_core::ipc::IpcResponse) -> anyhow::Error {
+    anyhow::anyhow!("unexpected daemon response while waiting for IPC setup: {response:?}")
 }
 
 pub(crate) async fn establish_daemon_proxy_session(
@@ -1200,25 +1140,11 @@ pub(crate) async fn establish_daemon_proxy_session(
     };
     let payload = serde_json::to_vec(&handshake_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
-    let handshake = match read_pending_or_matching_response(
-        &mut reader,
-        &client_id,
-        &mut pending_notifications,
-        setup_deadline,
-        |response| match response {
-            plug_core::ipc::IpcResponse::OperatorHandshake { handshake } => {
-                Some(PendingIpcResponse::OperatorHandshake(handshake.clone()))
-            }
-            _ => None,
-        },
-    )
-    .await?
-    {
-        PendingIpcResponse::OperatorHandshake(handshake) => handshake,
-        PendingIpcResponse::Registered { .. } | PendingIpcResponse::Capabilities(_) => {
-            unreachable!("operator handshake response expected")
-        }
-    };
+    let handshake =
+        match read_setup_response(&mut reader, &mut pending_notifications, setup_deadline).await? {
+            plug_core::ipc::IpcResponse::OperatorHandshake { handshake } => handshake,
+            other => return Err(unexpected_setup_response(other)),
+        };
     let (expected_executable, require_app_ownership) = expected_proxy_daemon_identity()?;
     validate_proxy_daemon_handshake(&handshake, &expected_executable, require_app_ownership)?;
 
@@ -1231,68 +1157,46 @@ pub(crate) async fn establish_daemon_proxy_session(
     let payload = serde_json::to_vec(&register_req)?;
     plug_core::ipc::write_frame(&mut writer, &payload).await?;
     let (session_id, modern_downstream_enabled, cancellation_capability) =
-        match read_pending_or_matching_response(
-            &mut reader,
-            &client_id,
-            &mut pending_notifications,
-            setup_deadline,
-            |response| match response {
-                plug_core::ipc::IpcResponse::Registered {
+        match read_setup_response(&mut reader, &mut pending_notifications, setup_deadline).await? {
+            plug_core::ipc::IpcResponse::Registered {
+                protocol_version,
+                client_id: registered_client_id,
+                session_id,
+                modern_downstream_enabled,
+                cancellation_capability,
+            } => {
+                if protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "daemon/client protocol mismatch: daemon=v{protocol_version}, client=v{}",
+                        plug_core::ipc::IPC_PROTOCOL_VERSION
+                    );
+                }
+                if registered_client_id != client_id {
+                    anyhow::bail!(
+                        "daemon/client registration mismatch: expected client_id {client_id}, got {registered_client_id}"
+                    );
+                }
+                (
                     session_id,
                     modern_downstream_enabled,
                     cancellation_capability,
-                    ..
-                } => Some(PendingIpcResponse::Registered {
-                    session_id: session_id.clone(),
-                    modern_downstream_enabled: *modern_downstream_enabled,
-                    cancellation_capability: cancellation_capability.clone(),
-                }),
-                _ => None,
-            },
-        )
-        .await?
-        {
-            PendingIpcResponse::Registered {
-                session_id,
-                modern_downstream_enabled,
-                cancellation_capability,
-            } => (
-                session_id,
-                modern_downstream_enabled,
-                cancellation_capability,
-            ),
-            PendingIpcResponse::Capabilities(_) => unreachable!("registration response expected"),
-            PendingIpcResponse::OperatorHandshake(_) => {
-                unreachable!("registration response expected")
+                )
             }
+            other => return Err(unexpected_setup_response(other)),
         };
     let capabilities_req = plug_core::ipc::IpcRequest::Capabilities {
         session_id: session_id.clone(),
     };
     let capabilities_payload = serde_json::to_vec(&capabilities_req)?;
     plug_core::ipc::write_frame(&mut writer, &capabilities_payload).await?;
-    let capabilities = match read_pending_or_matching_response(
-        &mut reader,
-        &client_id,
-        &mut pending_notifications,
-        setup_deadline,
-        |response| match response {
+    let capabilities =
+        match read_setup_response(&mut reader, &mut pending_notifications, setup_deadline).await? {
             plug_core::ipc::IpcResponse::Capabilities { capabilities } => {
-                serde_json::from_value(capabilities.clone())
-                    .ok()
-                    .map(PendingIpcResponse::Capabilities)
+                serde_json::from_value(capabilities)
+                    .map_err(|e| anyhow::anyhow!("invalid daemon capabilities: {e}"))?
             }
-            _ => None,
-        },
-    )
-    .await?
-    {
-        PendingIpcResponse::Capabilities(capabilities) => capabilities,
-        PendingIpcResponse::Registered { .. } => unreachable!("capabilities response expected"),
-        PendingIpcResponse::OperatorHandshake(_) => {
-            unreachable!("capabilities response expected")
-        }
-    };
+            other => return Err(unexpected_setup_response(other)),
+        };
     Ok(DaemonProxySession {
         reader,
         writer,
@@ -1467,83 +1371,16 @@ pub(crate) async fn connect_via_daemon(
     Ok(())
 }
 
+/// Test-only: poll until an in-process daemon binds its socket. Callers bound
+/// the wait with their own timeout.
 #[cfg(test)]
-pub(crate) async fn wait_for_daemon_ready(
-    child: Option<&mut std::process::Child>,
-) -> anyhow::Result<tokio::net::UnixStream> {
-    wait_for_daemon_ready_with_timeouts(
-        child,
-        std::time::Duration::from_secs(30),
-        std::time::Duration::from_secs(300),
-    )
-    .await
-}
-
-#[cfg(test)]
-#[derive(Debug)]
-struct DaemonStartupContention;
-
-#[cfg(test)]
-impl std::fmt::Display for DaemonStartupContention {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("another Plug daemon still owns startup but is not ready")
-    }
-}
-
-#[cfg(test)]
-impl std::error::Error for DaemonStartupContention {}
-
-#[derive(Debug, PartialEq, Eq)]
-enum DaemonProxyFailurePolicy {
-    RefuseStandalone,
-}
-
-fn daemon_proxy_failure_policy(_error: &anyhow::Error) -> DaemonProxyFailurePolicy {
-    DaemonProxyFailurePolicy::RefuseStandalone
-}
-
-#[cfg(test)]
-async fn wait_for_daemon_ready_with_timeouts(
-    mut child: Option<&mut std::process::Child>,
-    initial_timeout: std::time::Duration,
-    contention_timeout: std::time::Duration,
-) -> anyhow::Result<tokio::net::UnixStream> {
-    let mut delay = std::time::Duration::from_millis(10);
-    let started_at = std::time::Instant::now();
-    let mut deadline = started_at + initial_timeout;
-    let mut child_exit = None;
-    while std::time::Instant::now() < deadline {
+pub(crate) async fn wait_for_daemon_socket() -> tokio::net::UnixStream {
+    loop {
         if let Some(stream) = daemon::connect_to_daemon().await {
-            return Ok(stream);
+            return stream;
         }
-        if child_exit.is_none()
-            && let Some(child) = child.as_mut()
-            && let Some(status) = child.try_wait()?
-        {
-            if daemon::runtime_lock_is_held() {
-                // This child correctly lost a concurrent auto-start race. Keep
-                // waiting for the lock owner instead of falling back to a
-                // standalone Engine that would duplicate upstream startup.
-                child_exit = Some(status);
-                deadline = started_at + contention_timeout;
-            } else {
-                anyhow::bail!("daemon exited before becoming ready (status: {status})");
-            }
-        }
-        if let Some(status) = child_exit
-            && !daemon::runtime_lock_is_held()
-        {
-            anyhow::bail!(
-                "concurrent daemon exited before becoming ready (losing child status: {status})"
-            );
-        }
-        tokio::time::sleep(delay).await;
-        delay = (delay * 2).min(std::time::Duration::from_millis(500));
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    if child_exit.is_some() && daemon::runtime_lock_is_held() {
-        return Err(DaemonStartupContention.into());
-    }
-    anyhow::bail!("daemon failed to start")
 }
 
 pub(crate) async fn ensure_daemon_with_feedback(
@@ -1588,18 +1425,9 @@ pub(crate) async fn daemon_query<T>(
 }
 
 pub(crate) async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    if let Err(error) = connect_via_daemon(config_path).await {
-        match daemon_proxy_failure_policy(&error) {
-            DaemonProxyFailurePolicy::RefuseStandalone => {
-                tracing::error!(
-                    error = %error,
-                        "daemon proxy failed; refusing to start a private engine"
-                );
-                return Err(error);
-            }
-        }
-    }
-    Ok(())
+    connect_via_daemon(config_path).await.inspect_err(|error| {
+        tracing::error!(%error, "daemon proxy failed; refusing to start a private engine");
+    })
 }
 
 pub(crate) async fn cmd_start(
@@ -2476,165 +2304,6 @@ mod tests {
         assert!(metadata.http_sessions_included);
     }
 
-    #[tokio::test]
-    async fn wait_for_daemon_ready_fails_fast_when_spawned_process_exits() {
-        let _guard = runtime_path_test_lock().lock().await;
-        let runtime_root = unique_temp_dir("daemon-ready-runtime");
-        let state_root = unique_temp_dir("daemon-ready-state");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
-
-        let mut child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 0")
-            .spawn()
-            .expect("spawn short-lived child");
-
-        let error = wait_for_daemon_ready(Some(&mut child))
-            .await
-            .expect_err("expected readiness wait to fail");
-        assert!(
-            error
-                .to_string()
-                .contains("daemon exited before becoming ready"),
-            "unexpected readiness failure: {error}"
-        );
-
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
-    }
-
-    #[tokio::test]
-    async fn wait_for_daemon_ready_follows_the_concurrent_lock_winner() {
-        let _guard = runtime_path_test_lock().lock().await;
-        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let runtime_root = std::path::PathBuf::from(format!("/tmp/plug-dr-{suffix}"));
-        let state_root = std::path::PathBuf::from(format!("/tmp/plug-ds-{suffix}"));
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
-
-        let winning_lock = daemon::acquire_runtime_lock().expect("winning daemon lock");
-        let mut losing_child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("sleep 0.02; exit 1")
-            .spawn()
-            .expect("spawn losing daemon stand-in");
-
-        let listener_task = tokio::spawn(async {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let socket = daemon::socket_path();
-            let listener = tokio::net::UnixListener::bind(&socket).expect("bind winner socket");
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            listener
-        });
-
-        let stream = tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_daemon_ready(Some(&mut losing_child)),
-        )
-        .await
-        .expect("readiness wait timed out")
-        .expect("losing auto-start should wait for the lock winner");
-        drop(stream);
-
-        listener_task.abort();
-        drop(winning_lock);
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
-    }
-
-    #[tokio::test]
-    async fn daemon_failures_never_allow_standalone_fallback() {
-        let _guard = runtime_path_test_lock().lock().await;
-        let suffix = &uuid::Uuid::new_v4().simple().to_string()[..8];
-        let runtime_root = std::path::PathBuf::from(format!("/tmp/plug-cr-{suffix}"));
-        let state_root = std::path::PathBuf::from(format!("/tmp/plug-cs-{suffix}"));
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
-
-        let winning_lock = daemon::acquire_runtime_lock().expect("winning daemon lock");
-        let mut losing_child = std::process::Command::new("sh")
-            .arg("-c")
-            .arg("exit 1")
-            .spawn()
-            .expect("spawn losing daemon stand-in");
-
-        let error = wait_for_daemon_ready_with_timeouts(
-            Some(&mut losing_child),
-            Duration::from_millis(100),
-            Duration::from_millis(50),
-        )
-        .await
-        .expect_err("held winner without a socket must fail closed");
-        assert!(error.downcast_ref::<DaemonStartupContention>().is_some());
-        assert_eq!(
-            daemon_proxy_failure_policy(&error),
-            DaemonProxyFailurePolicy::RefuseStandalone,
-            "lock contention must refuse duplicate standalone startup"
-        );
-        assert_eq!(
-            daemon_proxy_failure_policy(&anyhow::anyhow!("ordinary daemon failure")),
-            DaemonProxyFailurePolicy::RefuseStandalone,
-            "ordinary daemon failures must not fork a private engine"
-        );
-
-        drop(winning_lock);
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
-    }
-
-    #[tokio::test]
-    async fn wait_for_daemon_ready_succeeds_when_daemon_is_running() {
-        let _guard = runtime_path_test_lock().lock().await;
-        let temp = std::env::temp_dir().join(format!(
-            "pr-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
-
-        let config_path = runtime_root.join("config.toml");
-        std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
-        engine.start().await.expect("engine start");
-
-        let daemon_engine = Arc::clone(&engine);
-        let daemon_handle =
-            tokio::spawn(async move { run_daemon(daemon_engine, config_path, 0, None).await });
-
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        if daemon_handle.is_finished() {
-            let daemon_result = daemon_handle.await.expect("daemon task join");
-            panic!("daemon exited before readiness: {daemon_result:?}");
-        }
-
-        let stream = tokio::time::timeout(Duration::from_secs(5), wait_for_daemon_ready(None))
-            .await
-            .expect("daemon readiness wait timed out")
-            .expect("daemon should become ready");
-        drop(stream);
-
-        engine.shutdown().await;
-        let daemon_result = tokio::time::timeout(Duration::from_secs(5), daemon_handle)
-            .await
-            .expect("daemon join timed out")
-            .expect("daemon task join");
-        assert!(daemon_result.is_ok(), "daemon should shut down cleanly");
-
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
-    }
-
     /// `plug connect` reaches this path after the daemon has already proven its
     /// socket, so a reply that never arrives means a wedged engine. Without a
     /// bound the host client shows a server that is neither ready nor failed,
@@ -2660,16 +2329,13 @@ mod tests {
         let (mut reader, _writer) = stream.into_split();
         let mut pending = Vec::new();
 
-        let error = read_pending_or_matching_response(
+        let error = read_setup_response(
             &mut reader,
-            "client",
             &mut pending,
             tokio::time::Instant::now() + Duration::from_millis(200),
-            |_| None,
         )
         .await
-        .err()
-        .expect("a silent daemon must not stall session setup forever");
+        .expect_err("a silent daemon must not stall session setup forever");
 
         accepting.abort();
         let _ = std::fs::remove_file(&socket);
@@ -2713,10 +2379,9 @@ mod tests {
             panic!("daemon exited before readiness: {daemon_result:?}");
         }
 
-        tokio::time::timeout(Duration::from_secs(5), wait_for_daemon_ready(None))
+        tokio::time::timeout(Duration::from_secs(5), wait_for_daemon_socket())
             .await
-            .expect("daemon readiness wait timed out")
-            .expect("daemon should become ready");
+            .expect("daemon readiness wait timed out");
 
         let started = ensure_daemon_with_feedback(Some(&config_path), false)
             .await

@@ -29,6 +29,8 @@ const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 /// (notifications, chunks, reverse requests) reset the clock, so slow tool
 /// calls that emit progress are unaffected. See plans/009.
 const READ_WATCHDOG: Duration = Duration::from_secs(120);
+/// Every `DaemonToProxyMessage` frame starts with its serde tag.
+const ENVELOPE_FRAME_PREFIX: &[u8] = b"{\"envelope\":";
 
 fn selected_protocol_for_log(protocol: &ProtocolVersion) -> &str {
     protocol.as_str()
@@ -78,7 +80,7 @@ struct SharedConnection {
     ///
     /// Lock ordering: `conn` is always acquired before `replay` whenever
     /// both are needed. The only sites that need both are
-    /// `refresh_session_locked`/`refresh_session` (the reconnect path),
+    /// `refresh_session` (the reconnect path),
     /// which already hold `conn` when they lock `replay` for the replay
     /// round trips. Every other mutation site (`initialize`, `subscribe`,
     /// `unsubscribe`, `set_level`) locks `replay` alone, strictly after its
@@ -314,8 +316,21 @@ impl IpcProxyHandler {
     where
         F: Fn(&str) -> IpcRequest,
     {
-        let mut conn = self.shared.conn.lock().await;
-        let peer = self.shared.peer.get();
+        Self::shared_round_trip(&self.shared, retry_policy, build_request).await
+    }
+
+    /// `session_round_trip` for callers that hold only the shared connection,
+    /// such as the spawned roots refresh.
+    async fn shared_round_trip<F>(
+        shared: &SharedConnection,
+        retry_policy: RetryPolicy,
+        build_request: F,
+    ) -> Result<IpcResponse, McpError>
+    where
+        F: Fn(&str) -> IpcRequest,
+    {
+        let mut conn = shared.conn.lock().await;
+        let peer = shared.peer.get();
         let request = build_request(&conn.session_id);
         let payload = serde_json::to_vec(&request)
             .map_err(|e| McpError::internal_error(e.to_string(), None))?;
@@ -324,14 +339,14 @@ impl IpcProxyHandler {
             &mut conn,
             &payload,
             peer,
-            &self.shared.modern_downstream_enabled,
+            &shared.modern_downstream_enabled,
         )
         .await
         {
             Ok(response) => Ok(response),
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon IPC connection lost; reconnecting");
-                self.reconnect_locked(&mut conn).await?;
+                Self::refresh_session(shared, &mut conn).await?;
                 match retry_policy {
                     RetryPolicy::SafeToRetry => {
                         let rebound = build_request(&conn.session_id);
@@ -341,7 +356,7 @@ impl IpcProxyHandler {
                             &mut conn,
                             &retry_payload,
                             peer,
-                            &self.shared.modern_downstream_enabled,
+                            &shared.modern_downstream_enabled,
                         )
                         .await
                         .map_err(|e| {
@@ -407,46 +422,20 @@ impl IpcProxyHandler {
                 }
             };
 
-            // Peek the discriminant key so plain `IpcResponse` frames (hot path)
-            // deserialize once. Envelope frames carry `"envelope"`.
-            let looks_like_envelope = frame
-                .windows(b"\"envelope\"".len())
-                .any(|window| window == b"\"envelope\"");
-            if looks_like_envelope {
+            // Envelope frames are serialized by `ipc::send_daemon_message` with
+            // `serde_json::to_vec`, which writes an internally tagged enum's tag
+            // first. Matching the prefix keeps plain `IpcResponse` frames (the
+            // hot path) to one parse, and a payload that merely contains an
+            // `"envelope"` key somewhere is never mistaken for one.
+            let response = if frame.starts_with(ENVELOPE_FRAME_PREFIX) {
                 let daemon_msg: DaemonToProxyMessage =
                     serde_json::from_slice(&frame).map_err(|e| TransportFailure {
                         message: format!("invalid envelope message: {e}"),
                         reconnectable: false,
                     })?;
                 match daemon_msg {
-                    DaemonToProxyMessage::Response { inner } => match inner {
-                        IpcResponse::LoggingNotification { params } => {
-                            if let Some(peer) = peer
-                                && let Ok(notif_params) = serde_json::from_value::<
-                                    LoggingMessageNotificationParam,
-                                >(params)
-                            {
-                                let _ = peer.notify_logging_message(notif_params).await;
-                            }
-                            continue;
-                        }
-                        resp @ (IpcResponse::ToolListChangedNotification
-                        | IpcResponse::ResourceListChangedNotification
-                        | IpcResponse::ResourceUpdatedNotification { .. }
-                        | IpcResponse::PromptListChangedNotification
-                        | IpcResponse::ProgressNotification { .. }
-                        | IpcResponse::CancelledNotification { .. }
-                        | IpcResponse::AuthStateChanged { .. }) => {
-                            forward_control_notification(peer, resp).await;
-                            continue;
-                        }
-                        IpcResponse::ModernDownstreamGateChanged { enabled } => {
-                            modern_downstream_enabled
-                                .store(enabled, std::sync::atomic::Ordering::Release);
-                            continue;
-                        }
-                        other => return Ok(other),
-                    },
+                    // Never sent by the current daemon; decoded for tolerance.
+                    DaemonToProxyMessage::Response { inner } => inner,
                     DaemonToProxyMessage::ResponseChunk {
                         chunk_index,
                         chunk_count,
@@ -467,7 +456,6 @@ impl IpcProxyHandler {
                                 reconnectable: false,
                             });
                         }
-
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(payload_b64)
                             .map_err(|e| TransportFailure {
@@ -476,17 +464,16 @@ impl IpcProxyHandler {
                             })?;
                         chunked_response.extend_from_slice(&decoded);
 
-                        if chunk_index + 1 == chunk_count {
-                            let response: IpcResponse = serde_json::from_slice(&chunked_response)
-                                .map_err(|e| TransportFailure {
+                        if chunk_index + 1 != chunk_count {
+                            continue;
+                        }
+                        let response: IpcResponse = serde_json::from_slice(&chunked_response)
+                            .map_err(|e| TransportFailure {
                                 message: format!("invalid chunked IPC response: {e}"),
                                 reconnectable: false,
                             })?;
-                            chunked_response.clear();
-                            return Ok(response);
-                        }
-
-                        continue;
+                        chunked_response.clear();
+                        response
                     }
                     DaemonToProxyMessage::ReverseRequest { id, request } => {
                         // Handle reverse request from daemon (elicitation / sampling)
@@ -508,38 +495,37 @@ impl IpcProxyHandler {
                     }
                 }
             } else {
-                let response: IpcResponse =
-                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
-                        message: format!("invalid IPC response: {e}"),
-                        reconnectable: false,
-                    })?;
-                match response {
-                    IpcResponse::LoggingNotification { params } => {
-                        if let Some(peer) = peer
-                            && let Ok(notif_params) =
-                                serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                        {
-                            let _ = peer.notify_logging_message(notif_params).await;
-                        }
-                        continue; // keep reading for the actual response
+                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                    message: format!("invalid IPC response: {e}"),
+                    reconnectable: false,
+                })?
+            };
+
+            match response {
+                IpcResponse::LoggingNotification { params } => {
+                    if let Some(peer) = peer
+                        && let Ok(notif_params) =
+                            serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                    {
+                        let _ = peer.notify_logging_message(notif_params).await;
                     }
-                    resp @ (IpcResponse::ToolListChangedNotification
-                    | IpcResponse::ResourceListChangedNotification
-                    | IpcResponse::ResourceUpdatedNotification { .. }
-                    | IpcResponse::PromptListChangedNotification
-                    | IpcResponse::ProgressNotification { .. }
-                    | IpcResponse::CancelledNotification { .. }
-                    | IpcResponse::AuthStateChanged { .. }) => {
-                        forward_control_notification(peer, resp).await;
-                        continue;
-                    }
-                    IpcResponse::ModernDownstreamGateChanged { enabled } => {
-                        modern_downstream_enabled
-                            .store(enabled, std::sync::atomic::Ordering::Release);
-                        continue;
-                    }
-                    other => return Ok(other),
+                    continue; // keep reading for the actual response
                 }
+                resp @ (IpcResponse::ToolListChangedNotification
+                | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::ResourceUpdatedNotification { .. }
+                | IpcResponse::PromptListChangedNotification
+                | IpcResponse::ProgressNotification { .. }
+                | IpcResponse::CancelledNotification { .. }
+                | IpcResponse::AuthStateChanged { .. }) => {
+                    forward_control_notification(peer, resp).await;
+                    continue;
+                }
+                IpcResponse::ModernDownstreamGateChanged { enabled } => {
+                    modern_downstream_enabled.store(enabled, std::sync::atomic::Ordering::Release);
+                    continue;
+                }
+                other => return Ok(other),
             }
         }
     }
@@ -581,14 +567,6 @@ impl IpcProxyHandler {
                 },
             },
         }
-    }
-
-    async fn reconnect_locked(
-        &self,
-        conn: &mut crate::runtime::DaemonProxySession,
-    ) -> Result<(), McpError> {
-        self.refresh_session_locked(self.shared.config_path.as_ref(), conn)
-            .await
     }
 
     async fn heartbeat_loop(shared: Arc<SharedConnection>) {
@@ -642,39 +620,8 @@ impl IpcProxyHandler {
         }
     }
 
-    async fn refresh_session_locked(
-        &self,
-        config_path: Option<&PathBuf>,
-        conn: &mut crate::runtime::DaemonProxySession,
-    ) -> Result<(), McpError> {
-        let session = crate::runtime::establish_daemon_proxy_session(
-            config_path,
-            conn.client_id.clone(),
-            conn.client_info.clone(),
-        )
-        .await
-        .map_err(reconnect_error)?;
-        if let Ok(mut caps) = self.shared.capabilities.write() {
-            *caps = session.capabilities.clone();
-        }
-        self.shared.modern_downstream_enabled.store(
-            session.modern_downstream_enabled,
-            std::sync::atomic::Ordering::Release,
-        );
-        if let Ok(mut identity) = self.shared.cancellation_identity.write() {
-            *identity = CancellationIdentity {
-                session_id: session.session_id.clone(),
-                client_id: session.client_id.clone(),
-                cancellation_capability: session.cancellation_capability.clone(),
-            };
-        }
-        *conn = session;
-        Self::replay_session_state_locked(&self.shared, conn).await;
-        Ok(())
-    }
-
     async fn refresh_session(
-        shared: &Arc<SharedConnection>,
+        shared: &SharedConnection,
         conn: &mut crate::runtime::DaemonProxySession,
     ) -> Result<(), McpError> {
         let session = crate::runtime::establish_daemon_proxy_session(
@@ -707,7 +654,7 @@ impl IpcProxyHandler {
     /// `shared.conn`; use locked round trips only (see `SharedConnection::replay`).
     /// Replay failures are logged and do not fail reconnect.
     async fn replay_session_state_locked(
-        shared: &Arc<SharedConnection>,
+        shared: &SharedConnection,
         conn: &mut crate::runtime::DaemonProxySession,
     ) {
         let replay = shared.replay.lock().await;
@@ -757,7 +704,7 @@ impl IpcProxyHandler {
 
     /// Send a single replay request over the already-locked `conn` and
     /// classify the result as success/failure, without ever calling
-    /// `reconnect_locked`/`session_round_trip` (see
+    /// `refresh_session`/`session_round_trip` (see
     /// `replay_session_state_locked`).
     async fn send_replay_request(
         conn: &mut crate::runtime::DaemonProxySession,
@@ -1116,23 +1063,10 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, "tools/list", params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse tools/list: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "tools/list")
         }
     }
 
@@ -1163,64 +1097,41 @@ impl ServerHandler for IpcProxyHandler {
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                 );
             }
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::UnsafeToRetry,
                     "tools/call",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    // Check if this is an error response before attempting CallToolResult parse
-                    if payload.get("code").is_some()
-                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
-                    {
-                        return Err(err);
-                    }
-                    if legacy_task_requested {
-                        let task: LegacyCreateTaskResult = serde_json::from_value(payload)
-                            .map_err(|e| {
-                                McpError::internal_error(
-                                    format!("unexpected task response: {e}"),
-                                    None,
-                                )
-                            })?;
-                        Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
-                            (&task.task).into(),
-                        )))
-                    } else {
-                        if payload.get("resultType").and_then(|v| v.as_str())
-                            == Some("input_required")
-                        {
-                            serde_json::from_value::<rmcp::model::InputRequiredResult>(payload)
-                                .map(Into::into)
-                                .map_err(|e| {
-                                    McpError::internal_error(
-                                        format!("unexpected input-required response: {e}"),
-                                        None,
-                                    )
-                                })
-                        } else {
-                            serde_json::from_value::<CallToolResult>(payload)
-                                .map(Into::into)
-                                .map_err(|e| {
-                                    McpError::internal_error(
-                                        format!("unexpected tool call response: {e}"),
-                                        None,
-                                    )
-                                })
-                        }
-                    }
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
+                .await?;
+            let payload: serde_json::Value = decode_mcp(response, "tools/call")?;
+            if legacy_task_requested {
+                let task: LegacyCreateTaskResult =
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("unexpected task response: {e}"), None)
+                    })?;
+                Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
+                    (&task.task).into(),
+                )))
+            } else if payload.get("resultType").and_then(|v| v.as_str()) == Some("input_required") {
+                serde_json::from_value::<rmcp::model::InputRequiredResult>(payload)
+                    .map(Into::into)
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("unexpected input-required response: {e}"),
+                            None,
+                        )
+                    })
+            } else {
+                serde_json::from_value::<CallToolResult>(payload)
+                    .map(Into::into)
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("unexpected tool call response: {e}"),
+                            None,
+                        )
+                    })
             }
         }
     }
@@ -1239,19 +1150,10 @@ impl ServerHandler for IpcProxyHandler {
                 })?
                 .to_string();
             let params = request.params.clone();
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, &method, params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => Ok(CustomResult::new(payload)),
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, &method).map(CustomResult::new)
         }
     }
 
@@ -1262,29 +1164,19 @@ impl ServerHandler for IpcProxyHandler {
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
             let params = serde_json::json!({ "level": request.level });
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "logging/setLevel",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { .. } => {
-                    // Record for replay after a future daemon reconnect —
-                    // see `ReplayState`. `conn` is not held here.
-                    self.shared.replay.lock().await.log_level = Some(request.level);
-                    Ok(())
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<serde_json::Value>(response, "logging/setLevel")?;
+            // Record for replay after a future daemon reconnect — see
+            // `ReplayState`. `conn` is not held here.
+            self.shared.replay.lock().await.log_level = Some(request.level);
+            Ok(())
         }
     }
 
@@ -1298,26 +1190,10 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, "resources/list", params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse resources/list: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "resources/list")
         }
     }
 
@@ -1331,31 +1207,15 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/templates/list",
                     params,
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse resources/templates/list: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "resources/templates/list")
         }
     }
 
@@ -1367,33 +1227,15 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/read",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value::<ReadResourceResult>(payload)
-                        .map(Into::into)
-                        .map_err(|e| {
-                            McpError::internal_error(
-                                format!("failed to parse resources/read: {e}"),
-                                None,
-                            )
-                        })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<ReadResourceResult>(response, "resources/read").map(Into::into)
         }
     }
 
@@ -1405,40 +1247,25 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/subscribe",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    if payload.get("code").is_some()
-                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
-                    {
-                        return Err(err);
-                    }
-                    // Record for replay after a future daemon reconnect —
-                    // see `ReplayState`. `conn` is not held here. Only a
-                    // successful subscribe is replayed.
-                    self.shared
-                        .replay
-                        .lock()
-                        .await
-                        .subscriptions
-                        .insert(request.uri.clone());
-                    Ok(())
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<serde_json::Value>(response, "resources/subscribe")?;
+            // Record for replay after a future daemon reconnect — see
+            // `ReplayState`. `conn` is not held here. Only a successful
+            // subscribe is replayed.
+            self.shared
+                .replay
+                .lock()
+                .await
+                .subscriptions
+                .insert(request.uri.clone());
+            Ok(())
         }
     }
 
@@ -1450,40 +1277,25 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/unsubscribe",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    if payload.get("code").is_some()
-                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
-                    {
-                        return Err(err);
-                    }
-                    // Remove from the replay set on success — a failed
-                    // unsubscribe must not stop the subscription from being
-                    // replayed after a future reconnect.
-                    self.shared
-                        .replay
-                        .lock()
-                        .await
-                        .subscriptions
-                        .remove(&request.uri);
-                    Ok(())
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<serde_json::Value>(response, "resources/unsubscribe")?;
+            // Remove from the replay set on success — a failed unsubscribe
+            // must not stop the subscription from being replayed after a
+            // future reconnect.
+            self.shared
+                .replay
+                .lock()
+                .await
+                .subscriptions
+                .remove(&request.uri);
+            Ok(())
         }
     }
 
@@ -1497,23 +1309,10 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, "prompts/list", params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse prompts/list: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "prompts/list")
         }
     }
 
@@ -1525,33 +1324,15 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "prompts/get",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value::<GetPromptResult>(payload)
-                        .map(Into::into)
-                        .map_err(|e| {
-                            McpError::internal_error(
-                                format!("failed to parse prompts/get: {e}"),
-                                None,
-                            )
-                        })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<GetPromptResult>(response, "prompts/get").map(Into::into)
         }
     }
 
@@ -1563,32 +1344,44 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "completion/complete",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse completion/complete: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "completion/complete")
         }
+    }
+}
+
+/// Decode a daemon reply to an MCP request. Upstream errors ride back as an
+/// `McpResponse` whose payload is a serialized `McpError`; surface those as
+/// the error they are instead of failing to parse them as a result.
+fn decode_mcp<T: serde::de::DeserializeOwned>(
+    response: IpcResponse,
+    method: &str,
+) -> Result<T, McpError> {
+    match response {
+        IpcResponse::McpResponse { payload } => {
+            if payload.get("code").is_some()
+                && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
+            {
+                return Err(err);
+            }
+            serde_json::from_value(payload).map_err(|e| {
+                McpError::internal_error(format!("failed to parse {method}: {e}"), None)
+            })
+        }
+        IpcResponse::Error { code, message } => {
+            Err(McpError::internal_error(format!("{code}: {message}"), None))
+        }
+        other => Err(McpError::internal_error(
+            format!("unexpected IPC response: {other:?}"),
+            None,
+        )),
     }
 }
 
@@ -1612,71 +1405,35 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
                     return;
                 }
             };
-            let mut conn = shared.conn.lock().await;
-            let request = IpcRequest::UpdateRoots {
-                session_id: conn.session_id.clone(),
-                roots: roots_json,
-            };
-            let payload = match serde_json::to_vec(&request) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(error = %e, "failed to serialize UpdateRoots");
-                    return;
-                }
-            };
-            if let Err(e) = ipc::write_frame(&mut conn.writer, &payload).await {
-                tracing::debug!(error = %e, "failed to send UpdateRoots to daemon");
-                return;
-            }
-            // Read response while forwarding any interleaved daemon push traffic.
-            loop {
-                match ipc::read_frame(&mut conn.reader).await {
-                    Ok(Some(frame)) => match serde_json::from_slice::<IpcResponse>(&frame) {
-                        Ok(IpcResponse::LoggingNotification { params }) => {
-                            if let Ok(notif_params) =
-                                serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                            {
-                                let _ = peer.notify_logging_message(notif_params).await;
-                            }
-                            continue;
-                        }
-                        Ok(
-                            resp @ (IpcResponse::ToolListChangedNotification
-                            | IpcResponse::ResourceListChangedNotification
-                            | IpcResponse::ResourceUpdatedNotification { .. }
-                            | IpcResponse::PromptListChangedNotification
-                            | IpcResponse::ProgressNotification { .. }
-                            | IpcResponse::CancelledNotification { .. }
-                            | IpcResponse::AuthStateChanged { .. }),
-                        ) => {
-                            forward_control_notification(Some(peer), resp).await;
-                            continue;
-                        }
-                        Ok(IpcResponse::Ok) => break,
-                        Ok(IpcResponse::Error { code, message }) => {
-                            tracing::debug!(
-                                code = %code,
-                                message = %message,
-                                "daemon rejected UpdateRoots"
-                            );
-                            break;
-                        }
-                        Ok(_) => break,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "invalid UpdateRoots response");
-                            break;
-                        }
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "failed to read UpdateRoots response");
-                        break;
-                    }
-                }
-            }
+            push_roots_to_daemon(shared, roots_json).await;
         }
         Err(error) => {
             tracing::debug!(error = %error, "failed to fetch roots from downstream peer");
+        }
+    }
+}
+
+/// Send `IpcRequest::UpdateRoots` through the shared round trip, so the reply
+/// is read under the watchdog with push frames handled like any other call.
+async fn push_roots_to_daemon(shared: &SharedConnection, roots_json: serde_json::Value) {
+    let result =
+        IpcProxyHandler::shared_round_trip(shared, RetryPolicy::SafeToRetry, |session_id| {
+            IpcRequest::UpdateRoots {
+                session_id: session_id.to_string(),
+                roots: roots_json.clone(),
+            }
+        })
+        .await;
+    match result {
+        Ok(IpcResponse::Ok) => {}
+        Ok(IpcResponse::Error { code, message }) => {
+            tracing::debug!(code = %code, message = %message, "daemon rejected UpdateRoots");
+        }
+        Ok(other) => {
+            tracing::debug!(response = ?other, "unexpected UpdateRoots response");
+        }
+        Err(error) => {
+            tracing::debug!(error = %error, "failed to send UpdateRoots to daemon");
         }
     }
 }
@@ -1870,7 +1627,7 @@ mod tests {
         }
         tokio::time::timeout(
             Duration::from_secs(5),
-            crate::runtime::wait_for_daemon_ready(None),
+            crate::runtime::wait_for_daemon_socket(),
         )
         .await
         .unwrap_or_else(|_| {
@@ -1879,8 +1636,7 @@ mod tests {
                 crate::daemon::socket_path().display(),
                 handle.is_finished()
             )
-        })
-        .expect("daemon ready");
+        });
         (engine, handle)
     }
 
@@ -2964,6 +2720,96 @@ mod tests {
         UnixListener::bind(&path).expect("bind fake daemon socket")
     }
 
+    /// Answer the `OperatorHandshake` every session setup opens with.
+    async fn answer_operator_handshake(reader: &mut OwnedReadHalf, writer: &mut OwnedWriteHalf) {
+        let frame = ipc::read_frame(reader)
+            .await
+            .expect("read operator handshake frame")
+            .expect("connection closed before operator handshake");
+        let req: IpcRequest =
+            serde_json::from_slice(&frame).expect("parse operator handshake request");
+        match req {
+            IpcRequest::OperatorHandshake {
+                client_version,
+                ipc_min,
+                ipc_max,
+            } => {
+                assert_eq!(client_version, env!("CARGO_PKG_VERSION"));
+                assert!(ipc_min <= ipc::OPERATOR_IPC_MAX);
+                assert!(ipc_max >= ipc::OPERATOR_IPC_MIN);
+                ipc::send_response(
+                    writer,
+                    &IpcResponse::OperatorHandshake {
+                        handshake: ipc::OperatorHandshake {
+                            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
+                            daemon_executable: Some(
+                                std::env::current_exe().expect("test executable path"),
+                            ),
+                            ipc_min: ipc::OPERATOR_IPC_MIN,
+                            ipc_max: ipc::OPERATOR_IPC_MAX,
+                            ownership: ipc::DaemonOwnershipMode::Unmanaged,
+                            capabilities: Vec::new(),
+                        },
+                    },
+                )
+                .await
+                .expect("send OperatorHandshake");
+            }
+            other => panic!("expected OperatorHandshake, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_setup_rejects_a_registration_for_another_client() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("register-mismatch");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) = stream.into_split();
+            answer_operator_handshake(&mut reader, &mut writer).await;
+            ipc::read_frame(&mut reader)
+                .await
+                .expect("read register frame")
+                .expect("connection open");
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::Registered {
+                    protocol_version: ipc::IPC_PROTOCOL_VERSION,
+                    client_id: "someone-else".to_string(),
+                    session_id: "stolen-session".to_string(),
+                    modern_downstream_enabled: false,
+                    cancellation_capability: ipc::IpcCancellationCapability::new(
+                        "capability".to_string(),
+                    ),
+                },
+            )
+            .await
+            .expect("send Registered");
+        });
+
+        let error = match crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-register-mismatch".to_string(),
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a registration for another client must fail setup"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("registration mismatch"),
+            "unexpected error: {error}"
+        );
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     /// Perform the OperatorHandshake + Register + Capabilities handshake that
     /// `establish_daemon_proxy_session` sends on the initial connect AND on
     /// every reconnect, replying with `session_id` and default
@@ -2999,43 +2845,8 @@ mod tests {
     ) -> (OwnedReadHalf, OwnedWriteHalf, Vec<String>) {
         let (mut reader, mut writer) = stream.into_split();
         let mut seen = Vec::new();
-
-        let frame = ipc::read_frame(&mut reader)
-            .await
-            .expect("read operator handshake frame")
-            .expect("connection closed before operator handshake");
-        let req: IpcRequest =
-            serde_json::from_slice(&frame).expect("parse operator handshake request");
-        match req {
-            IpcRequest::OperatorHandshake {
-                client_version,
-                ipc_min,
-                ipc_max,
-            } => {
-                seen.push("OperatorHandshake".to_string());
-                assert_eq!(client_version, env!("CARGO_PKG_VERSION"));
-                assert!(ipc_min <= ipc::OPERATOR_IPC_MAX);
-                assert!(ipc_max >= ipc::OPERATOR_IPC_MIN);
-                ipc::send_response(
-                    &mut writer,
-                    &IpcResponse::OperatorHandshake {
-                        handshake: ipc::OperatorHandshake {
-                            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                            daemon_executable: Some(
-                                std::env::current_exe().expect("test executable path"),
-                            ),
-                            ipc_min: ipc::OPERATOR_IPC_MIN,
-                            ipc_max: ipc::OPERATOR_IPC_MAX,
-                            ownership: ipc::DaemonOwnershipMode::Unmanaged,
-                            capabilities: Vec::new(),
-                        },
-                    },
-                )
-                .await
-                .expect("send OperatorHandshake");
-            }
-            other => panic!("expected OperatorHandshake, got {other:?}"),
-        }
+        answer_operator_handshake(&mut reader, &mut writer).await;
+        seen.push("OperatorHandshake".to_string());
 
         let frame = ipc::read_frame(&mut reader)
             .await
@@ -3428,8 +3239,7 @@ mod tests {
 
         {
             let mut connection = proxy.shared.conn.lock().await;
-            proxy
-                .refresh_session_locked(None, &mut connection)
+            IpcProxyHandler::refresh_session(&proxy.shared, &mut connection)
                 .await
                 .expect("reconnect with disabled gate");
         }
@@ -4622,6 +4432,195 @@ mod tests {
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
+
+    /// Start a proxy against a fake daemon that answers one `expected_method`
+    /// request with `payload`, and connect a downstream client to it. Callers
+    /// hold `daemon_test_lock` and own the temp dir.
+    async fn proxy_with_one_scripted_reply(
+        client_id: &str,
+        expected_method: &'static str,
+        payload: serde_json::Value,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, TestClient>,
+        JoinHandle<()>,
+    ) {
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) =
+                drive_fake_daemon_initialize(stream, "fake-session-1").await;
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read request frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse request");
+            assert!(
+                is_mcp_request(&req, expected_method),
+                "expected {expected_method}, got {req:?}"
+            );
+            ipc::send_response(&mut writer, &IpcResponse::McpResponse { payload })
+                .await
+                .expect("send scripted reply");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, client_id.to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+        (client, daemon_task)
+    }
+
+    #[tokio::test]
+    async fn tool_result_with_an_envelope_key_is_not_mistaken_for_an_envelope() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("envelope-key");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let payload = serde_json::to_value(CallToolResult::structured(
+            serde_json::json!({ "envelope": "sealed" }),
+        ))
+        .expect("serialize call result");
+        let (client, daemon_task) =
+            proxy_with_one_scripted_reply("client-envelope-key", "tools/call", payload).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("call timeout")
+        .expect("a result carrying an `envelope` key must reach the client intact");
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({ "envelope": "sealed" }))
+        );
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_for_resources_read_reaches_the_client_as_that_error() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("read-error");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let payload = serde_json::to_value(McpError::resource_not_found(
+            "no such resource: file:///missing",
+            None,
+        ))
+        .expect("serialize error");
+        let (client, daemon_task) =
+            proxy_with_one_scripted_reply("client-read-error", "resources/read", payload).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_resource(ReadResourceRequestParams::new("file:///missing")),
+        )
+        .await
+        .expect("read timeout")
+        .expect_err("the upstream error must surface as an error");
+        let rmcp::ServiceError::McpError(error) = error else {
+            panic!("expected an MCP error, got {error:?}");
+        };
+        assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(error.message.contains("no such resource"), "{error:?}");
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn update_roots_consumes_its_reply_past_a_gate_push() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("roots-gate");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer, _seen) =
+                fake_daemon_handshake(stream, "fake-session-1").await;
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read UpdateRoots")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse UpdateRoots");
+            assert!(
+                matches!(req, IpcRequest::UpdateRoots { .. }),
+                "expected UpdateRoots, got {req:?}"
+            );
+            // The daemon may push a gate change while a request is in flight.
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::ModernDownstreamGateChanged { enabled: true },
+            )
+            .await
+            .expect("send gate push");
+            ipc::send_response(&mut writer, &IpcResponse::Ok)
+                .await
+                .expect("send UpdateRoots ack");
+
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read Ping")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse Ping");
+            assert!(matches!(req, IpcRequest::Ping { .. }), "got {req:?}");
+            ipc::send_response(&mut writer, &IpcResponse::Pong)
+                .await
+                .expect("send pong");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, "client-roots".to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        push_roots_to_daemon(&proxy.shared, serde_json::json!([])).await;
+        assert!(
+            proxy
+                .shared
+                .modern_downstream_enabled
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the gate push must be applied, not treated as the UpdateRoots reply"
+        );
+        let response = proxy
+            .session_round_trip(RetryPolicy::SafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("ping after UpdateRoots");
+        assert!(
+            matches!(response, IpcResponse::Pong),
+            "the next call must read its own reply, got {response:?}"
+        );
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     #[test]
     fn a_reconnect_exits_only_when_a_respawn_would_land_on_the_new_binary() {
         let upgraded = anyhow::Error::new(crate::runtime::DaemonVersionMismatch {

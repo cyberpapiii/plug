@@ -17,7 +17,6 @@ enum DaemonServiceError: Error, Equatable {
 @MainActor
 protocol DaemonServiceBackend: AnyObject {
     var enabled: Bool { get }
-    var serviceStatus: SMAppService.Status { get }
     func pauseConnectors() async -> [Int32]
     func resumeConnectors(_ pids: [Int32])
     func bootOut(_ record: LaunchdJobRecord) async throws
@@ -53,13 +52,8 @@ final class DaemonServiceManager {
         self.retryLimit = max(1, retryLimit)
     }
 
-    var status: SMAppService.Status { backend.serviceStatus }
     var appServiceEnabled: Bool { backend.enabled }
     var mainAppAtLoginEnabled: Bool { SMAppService.mainApp.status == .enabled }
-
-    // Temporary bridge while AppModel moves to the asynchronous installation snapshot.
-    // It never authorizes replacement; every mutation below re-inspects evidence.
-    var needsAdoption: Bool { !backend.enabled }
 
     func inspect(
         canonical: VerifiedAppInstallation,
@@ -136,6 +130,45 @@ final class DaemonServiceManager {
 
     func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
         let canonical = try await verifiedApp(expectedVersion: expectedVersion)
+        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
+    }
+
+    /// For a caller that verified the app and read launchd moments ago in the
+    /// same pass. Verifying the app signs and runs the bundled binary, and a
+    /// launchd read runs `launchctl` once per job, so repeating both right
+    /// after the caller did was most of what a healthy launch spent. When the
+    /// inspected job is ours, one fresh handshake proves the daemon; anything
+    /// short of exact proof falls through to the full path, which reads
+    /// launchd again before it changes anything.
+    func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        inspected: DaemonServiceSnapshot
+    ) async throws -> OperatorHandshake {
+        let expectedVersion = canonical.appVersion
+        guard canonical.embeddedVersion == expectedVersion else {
+            throw DaemonServiceError.invalidAppVersion(
+                expected: expectedVersion,
+                actual: canonical.embeddedVersion
+            )
+        }
+        if case let .appManagedCurrent(record) = inspected.ownership,
+           let handshake = try? await backend.handshake(),
+           exactProof(
+               record: record,
+               handshake: handshake,
+               canonical: canonical,
+               expectedVersion: expectedVersion
+           )
+        {
+            return handshake
+        }
+        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
+    }
+
+    private func ensureRunning(
+        canonical: VerifiedAppInstallation,
+        expectedVersion: String
+    ) async throws -> OperatorHandshake {
         let inspection = try await inspectWithHandshake(
             canonical: canonical,
             legacyPaths: legacyPaths
@@ -415,7 +448,6 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool { agent.status == .enabled }
-    var serviceStatus: SMAppService.Status { agent.status }
 
     func pauseConnectors() async -> [Int32] {
         DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()).compactMap { pid in
@@ -474,7 +506,9 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func handshake() async throws -> OperatorHandshake {
-        try await PlugIPCClient().connect()
+        // Called several times a reconcile and up to `retryLimit` times while
+        // a replacement proves itself, so each probe closes its own socket.
+        try await PlugIPCClient().handshakeAndDisconnect()
     }
 
     func waitBeforeRetry() async {

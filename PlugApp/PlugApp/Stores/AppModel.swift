@@ -26,7 +26,12 @@ final class AppModel {
         let configured: ConfiguredServer
         let runtime: ServerStatus?
         var id: String { configured.name }
-        var health: String { configured.enabled ? (runtime?.health ?? "Starting") : "Disabled" }
+        var health: ServerHealth {
+            ServerHealth(
+                daemonValue: configured.enabled ? runtime?.health : "Disabled",
+                enabled: configured.enabled
+            )
+        }
         var toolCount: Int { runtime?.toolCount ?? 0 }
     }
 
@@ -37,6 +42,8 @@ final class AppModel {
     private let clientVersion: String
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    private var refreshRequestedAgain = false
+    private var refreshAgainForcesCatalog = false
     private var reconciliationTask: Task<Void, Never>?
     private var hasStarted = false
     private var reconciliationInFlight = false
@@ -84,15 +91,23 @@ final class AppModel {
 
     static let foregroundPollInterval = Duration.seconds(2)
     static let backgroundPollInterval = Duration.seconds(30)
+    private let foregroundPollInterval: Duration
+    private let backgroundPollInterval: Duration
 
     private var pollInterval: Duration {
-        watcherCount > 0 ? Self.foregroundPollInterval : Self.backgroundPollInterval
+        watcherCount > 0 ? foregroundPollInterval : backgroundPollInterval
     }
 
     /// Called when a surface appears or disappears. Balanced pairs only.
     func setWatching(_ watching: Bool) {
+        let wasWatched = watcherCount > 0
         watcherCount = max(0, watcherCount + (watching ? 1 : -1))
-        if watching { Task { await refresh() } }
+        guard watching else { return }
+        // The poll loop may be halfway through a background sleep. Left alone,
+        // a panel opened now would show state up to that long out of date
+        // until the sleep ran out, so start the loop over at the new pace.
+        if !wasWatched, monitoringTask != nil { startMonitoring() }
+        Task { await refresh() }
     }
 
     init(
@@ -100,13 +115,17 @@ final class AppModel {
         coordinator: any InstallationCoordinating = InstallationCoordinator(),
         clientVersion: String = AppModel.defaultClientVersion,
         tokenURL: URL = PlugIPCClient.defaultTokenURL,
-        appLinker: any AppLinking = AppLinkService()
+        appLinker: any AppLinking = AppLinkService(),
+        foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
+        backgroundPollInterval: Duration = AppModel.backgroundPollInterval
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
         self.coordinator = coordinator
         self.tokenURL = tokenURL
         self.appLinker = appLinker
+        self.foregroundPollInterval = foregroundPollInterval
+        self.backgroundPollInterval = backgroundPollInterval
     }
 
     /// Read live rather than mirrored. A copy refreshed only when a
@@ -117,11 +136,18 @@ final class AppModel {
 
     var visibleServers: [ServerPresentation] {
         let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
-        return snapshot.configuredServers.map {
+        return Self.displayOrder(snapshot.configuredServers.map {
             ServerPresentation(configured: $0, runtime: runtimeByName[$0.name])
-        }.enumerated().sorted {
-            let lhsBad = $0.element.health != "Healthy"
-            let rhsBad = $1.element.health != "Healthy"
+        })
+    }
+
+    /// Servers that are not working come first; each group keeps config order.
+    /// It reads the same health the rows show, so a degraded server, which
+    /// still routes calls, sorts with the working ones.
+    static func displayOrder(_ servers: [ServerPresentation]) -> [ServerPresentation] {
+        servers.enumerated().sorted {
+            let lhsBad = $0.element.health != .working
+            let rhsBad = $1.element.health != .working
             return lhsBad == rhsBad ? $0.offset < $1.offset : lhsBad && !rhsBad
         }.map(\.element)
     }
@@ -147,9 +173,6 @@ final class AppModel {
     /// The single sentence every surface renders.
     var verdict: Verdict { PlugVerdict.verdict(for: situation) }
 
-    /// Problems paired with the buttons that fix them.
-    var attentionItems: [AttentionItem] { PlugVerdict.attention(for: situation) }
-
     var serverFacts: [ServerFacts] {
         let auth = Dictionary(
             snapshot.upstreamAuth.map { ($0.name, $0) },
@@ -162,10 +185,7 @@ final class AppModel {
                 enabled: server.configured.enabled,
                 transport: server.configured.transport,
                 usesOAuth: server.configured.oauth,
-                health: ServerHealth(
-                    daemonValue: server.configured.enabled ? server.runtime?.health : "Disabled",
-                    enabled: server.configured.enabled
-                ),
+                health: server.health,
                 toolCount: server.toolCount,
                 error: server.runtime?.error,
                 isSigningIn: signingInServers.contains(server.configured.name),
@@ -201,13 +221,6 @@ final class AppModel {
 
     var menuBarSymbol: String { PlugVerdict.menuBarSymbol(for: verdict) }
 
-    var isHealthy: Bool {
-        guard case .healthy = installationState, connectionState == .ready else { return false }
-        return visibleServers.allSatisfy {
-            !$0.configured.enabled || $0.health == "Healthy"
-        }
-    }
-
     var isLoadingInitialData: Bool {
         !hasLoadedSnapshot && connectionState == .connecting
     }
@@ -231,29 +244,6 @@ final class AppModel {
             .map { $0 }
     }
 
-    var connectionRecoveryIsRequired: Bool {
-        connectionState == .incompatible
-    }
-
-    var connectionRecoveryDetail: String {
-        "The app and its background service are running different versions."
-    }
-
-    var installationFailure: InstallationFailure? {
-        guard case let .blocked(failure) = installationState else { return nil }
-        return failure
-    }
-
-    var installationDrift: InstallationDrift? {
-        guard case let .repairableDrift(drift) = installationState else { return nil }
-        return drift
-    }
-
-    var adoptionIsRequired: Bool {
-        if case .adoptionRequired = installationState { return true }
-        return false
-    }
-
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
@@ -261,10 +251,14 @@ final class AppModel {
         guard !Task.isCancelled else { return }
         await refresh()
         guard !Task.isCancelled else { return }
+        startMonitoring()
+    }
 
+    private func startMonitoring() {
+        monitoringTask?.cancel()
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
-                let interval = self?.pollInterval ?? Self.backgroundPollInterval
+                guard let interval = self?.pollInterval else { return }
                 try? await Task.sleep(for: interval)
                 guard !Task.isCancelled else { return }
                 await self?.refresh()
@@ -301,80 +295,103 @@ final class AppModel {
         coordinator.openLog()
     }
 
+    /// Reads the daemon's state. A call that arrives while a read is already
+    /// running waits for one more read that starts after it, because the caller
+    /// usually just changed something and the read in flight may predate it.
     func refresh(forceCatalog: Bool = false) async {
-        guard refreshTask == nil, !reconciliationInFlight else { return }
+        guard !reconciliationInFlight else { return }
+        if let refreshTask {
+            refreshRequestedAgain = true
+            refreshAgainForcesCatalog = refreshAgainForcesCatalog || forceCatalog
+            await refreshTask.value
+            return
+        }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            if connectionState != .ready { connectionState = .connecting }
-            do {
-                let handshake = try await ipc.connect()
-                capabilities = Set(handshake.capabilities)
-                guard handshake.ipcMin <= 6, handshake.ipcMax >= 3 else {
-                    connectionState = .incompatible
-                    lastError = nil
-                    return
-                }
-                guard handshake.daemonVersion == clientVersion else {
-                    connectionState = .incompatible
-                    lastError = nil
-                    if !attemptedSkewRecovery {
-                        attemptedSkewRecovery = true
-                        await retry()
-                    }
-                    return
-                }
-                attemptedSkewRecovery = false
-                let token = try String(contentsOf: tokenURL, encoding: .utf8)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
-                    throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
-                }
-                let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
-                let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
-                snapshot = value
-                hasLoadedSnapshot = true
-                NotificationService.shared.observe(value)
-                if case let .activity(events) = try await ipc.request(
-                    .activity(
-                        authToken: token,
-                        afterSequence: activityCursor,
-                        limit: Self.activityLimit + 1,
-                        failuresOnly: false
-                    )
-                ) {
-                    if activityCursor == 0 {
-                        activityWasTruncated = events.count > Self.activityLimit
-                        activities = Array(events.suffix(Self.activityLimit))
-                    } else if !events.isEmpty {
-                        let merged = activities + events
-                        activityWasTruncated = activityWasTruncated
-                            || merged.count > Self.activityLimit
-                        activities = Array(merged.suffix(Self.activityLimit))
-                    }
-                }
-                // The tool list is nearly a megabyte and the snapshot above
-                // already reports when it would answer differently, so ask for
-                // it only then. This used to refetch on a timer as well,
-                // because the fingerprint was assembled here from server
-                // fields and could not see a tool disabled from the CLI. The
-                // daemon reports that now.
-                let revision = value.toolCatalogRevision
-                if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
-                   case let .tools(tools) = try await ipc.request(.listTools)
-                {
-                    toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
-                    toolCatalogRevision = revision
-                }
-                connectionState = .ready
-                lastError = nil
-            } catch {
-                connectionState = .disconnected
-                lastError = error.localizedDescription
-            }
+            var force = forceCatalog
+            repeat {
+                refreshRequestedAgain = false
+                await readDaemonState(forceCatalog: force)
+                force = refreshAgainForcesCatalog
+                refreshAgainForcesCatalog = false
+            } while refreshRequestedAgain && !reconciliationInFlight
+            refreshRequestedAgain = false
+            // Cleared here rather than by the caller, in the same turn that
+            // ends the loop, so no request can land between the last read and
+            // the task being forgotten.
+            refreshTask = nil
         }
         refreshTask = task
         await task.value
-        refreshTask = nil
+    }
+
+    private func readDaemonState(forceCatalog: Bool) async {
+        if connectionState != .ready { connectionState = .connecting }
+        do {
+            let handshake = try await ipc.connect()
+            capabilities = Set(handshake.capabilities)
+            guard handshake.sharesSupportedIPCVersion else {
+                connectionState = .incompatible
+                lastError = nil
+                return
+            }
+            guard handshake.daemonVersion == clientVersion else {
+                connectionState = .incompatible
+                lastError = nil
+                if !attemptedSkewRecovery {
+                    attemptedSkewRecovery = true
+                    await retry()
+                }
+                return
+            }
+            attemptedSkewRecovery = false
+            let token = try String(contentsOf: tokenURL, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
+                throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
+            }
+            let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
+            let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
+            snapshot = value
+            hasLoadedSnapshot = true
+            NotificationService.shared.observe(value)
+            if case let .activity(events) = try await ipc.request(
+                .activity(
+                    authToken: token,
+                    afterSequence: activityCursor,
+                    limit: Self.activityLimit + 1,
+                    failuresOnly: false
+                )
+            ) {
+                if activityCursor == 0 {
+                    activityWasTruncated = events.count > Self.activityLimit
+                    activities = Array(events.suffix(Self.activityLimit))
+                } else if !events.isEmpty {
+                    let merged = activities + events
+                    activityWasTruncated = activityWasTruncated
+                        || merged.count > Self.activityLimit
+                    activities = Array(merged.suffix(Self.activityLimit))
+                }
+            }
+            // The tool list is nearly a megabyte and the snapshot above
+            // already reports when it would answer differently, so ask for
+            // it only then. This used to refetch on a timer as well,
+            // because the fingerprint was assembled here from server
+            // fields and could not see a tool disabled from the CLI. The
+            // daemon reports that now.
+            let revision = value.toolCatalogRevision
+            if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
+               case let .tools(tools) = try await ipc.request(.listTools)
+            {
+                toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
+                toolCatalogRevision = revision
+            }
+            connectionState = .ready
+            lastError = nil
+        } catch {
+            connectionState = .disconnected
+            lastError = error.localizedDescription
+        }
     }
 
     func performOperation(_ request: (String) -> IPCRequest) async throws {
@@ -383,7 +400,10 @@ final class AppModel {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try await ipc.request(request(token))
         lastError = nil
-        await refresh(forceCatalog: true)
+        // No forced tool list. Every change an operation can make to it, a
+        // switched tool or a rebuilt catalog, moves the snapshot's
+        // `tool_catalog_revision`, and the refresh refetches on that alone.
+        await refresh()
     }
 
     func perform(_ request: (String) -> IPCRequest) async {

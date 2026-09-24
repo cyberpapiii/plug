@@ -26,6 +26,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   backfills are gone. State written by 0.4.0 or later loads unchanged.
 - Downstream OAuth state writes no longer stall other requests on the same
   daemon worker thread, and the state file is written as compact JSON.
+- Servers use the same words everywhere: the detail header says "Running · N
+  tools" or "Off" like the rows do, a degraded server sorts with the working
+  ones instead of above them, and the notification setting now says what it
+  does: "Tell me when a server needs sign-in or a new app connects".
+- `plug codesign-setup` is gone. It only ran for a `PLUG_DEV=1 plug-dev`
+  binary, a development path `dev-install.sh` already replaced.
+
+### Removed
+
+- `install.sh` is gone. It exited on macOS and the Linux tarballs it
+  downloaded stopped at 0.8.10. Install Plug.app from the DMG or the
+  `plug-app` Homebrew cask.
 
 ### Fixed
 
@@ -78,6 +90,69 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A remote HTTP session that sends a request just as the idle sweep runs no
   longer loses its subscriptions, roots, and tasks while it stays open. The
   sweep now rechecks expiry at the moment it removes a session.
+- Plug.app no longer leaks a socket each time it checks on the background
+  service. Setup and repair checked several times per pass, and up to 180
+  times while a new service started, without closing the connection.
+- The menu bar panel and main window update every two seconds from the moment
+  they open. The background poll used to finish its 30-second sleep first, so
+  after the first read an open panel could miss changes for up to half a
+  minute.
+- After you switch a tool or server, sign in or out, or connect an app,
+  Plug.app shows the result without waiting for the next poll. A refresh
+  asked for while another was running used to be dropped, so the view could
+  keep showing the state from before the change.
+- Plug.app no longer reloads the full tool list, about a megabyte, after
+  every action. It reloads it when the daemon reports the list changed, or
+  when you choose Refresh.
+- Plug.app no longer runs `brew` two or three times on every launch. It asks
+  Homebrew about the old formula only when a `plug` keg is on disk under
+  `/opt/homebrew` or `/usr/local`; each call took about a second, longer at
+  login.
+- Plug.app launches with far fewer checks when nothing needs setting up: it
+  no longer inspects the app, the command, the clients and the daemon a
+  second time after a pass that changed nothing, and it trusts the launchd
+  inspection it just made, so the first refresh comes sooner.
+- The "Show Plug in the menu bar at login" toggle starts from what macOS
+  reports instead of a value Plug remembered separately.
+- A tool result or schema with a key named `envelope` no longer fails the
+  whole call through `plug connect` with "invalid envelope message".
+- Through `plug connect`, an upstream error from reading a resource, getting
+  a prompt, completing, or listing now reaches the client as that error (for
+  example "resource not found") instead of "failed to parse".
+- Sending a client's roots to the daemon through `plug connect` no longer
+  leaves its reply behind for the next call to read when the daemon pushed a
+  notification first, and a wedged daemon during that send now trips the
+  read watchdog instead of hanging.
+- The daemon no longer wakes ten times a second for every connected
+  `plug connect` client to check whether the modern protocol gate changed.
+  Gate changes are now pushed the moment they happen.
+- The operator snapshot's visible tool count for a lazy-bridge session now
+  includes the tools that session loaded, instead of counting only the meta
+  tools.
+- A server that failed at startup and later recovered now gets its
+  `max_concurrent` limit and circuit breaker. It used to run with neither
+  for the rest of the daemon's life.
+- One upstream that never answers `logging/setLevel` no longer holds up
+  every server that finishes starting after it. The log level is now pushed
+  in the background with a five-second bound, and also after a reload or
+  reconnect, which used to skip it.
+- A legacy server that ignores `tasks/list` now starts. The task capability
+  probe waited up to the 300-second call timeout inside the 30-second start
+  timeout; it now gives up after three seconds and runs beside the tool list.
+- Re-listing tools after an upstream's `tools/list_changed` now times out
+  after the server's `call_timeout_secs` instead of waiting forever.
+- A server that failed at startup is now retried the moment its health task
+  starts. It used to sit out a random pause of up to ten seconds meant only
+  to stagger pings to healthy servers.
+- `plug auth inject` for an OAuth server with no earlier login now works.
+  It saved the token without binding it to the server's authorization
+  server, the runtime refused it, and the server stayed "auth required". It
+  now discovers and binds the authority first, as `plug auth login` does.
+- `plug doctor` no longer warns about the OAuth token file that every
+  signed-in server keeps. It now warns only when another user can read that
+  file, and suggests `chmod 600`.
+- `plug doctor` reports a missing stdio server program once, under server
+  programs, instead of also failing connectivity for the same server.
 
 ## [0.8.11] - 2026-09-01
 

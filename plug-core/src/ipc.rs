@@ -233,8 +233,6 @@ pub enum IpcRequest {
 
     /// List all available tools across all servers.
     ListTools,
-    /// List live proxy client sessions connected to the daemon.
-    ListClients,
     /// List live downstream sessions with explicit transport/scope.
     ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
@@ -296,15 +294,6 @@ pub enum IpcRequest {
 
     /// Query OAuth authentication status for all configured servers.
     AuthStatus,
-
-    /// Inject OAuth credentials into the running daemon and trigger reconnect.
-    InjectToken {
-        auth_token: String,
-        server_name: String,
-        access_token: String,
-        refresh_token: Option<String>,
-        expires_in: Option<u64>,
-    },
 }
 
 /// Custom Debug that redacts auth_token fields to prevent log leakage.
@@ -422,7 +411,6 @@ impl fmt::Debug for IpcRequest {
                 .field("session_id", session_id)
                 .finish(),
             Self::ListTools => write!(f, "ListTools"),
-            Self::ListClients => write!(f, "ListClients"),
             Self::ListLiveSessions => write!(f, "ListLiveSessions"),
             Self::Capabilities { session_id } => f
                 .debug_struct("Capabilities")
@@ -478,26 +466,6 @@ impl fmt::Debug for IpcRequest {
                 .field("uris", uris)
                 .finish(),
             Self::AuthStatus => write!(f, "AuthStatus"),
-            Self::InjectToken {
-                server_name,
-                refresh_token,
-                expires_in,
-                ..
-            } => f
-                .debug_struct("InjectToken")
-                .field("auth_token", &"[REDACTED]")
-                .field("server_name", server_name)
-                .field("access_token", &"[REDACTED]")
-                .field(
-                    "refresh_token",
-                    if refresh_token.is_some() {
-                        &"[REDACTED]"
-                    } else {
-                        &"None"
-                    },
-                )
-                .field("expires_in", expires_in)
-                .finish(),
         }
     }
 }
@@ -691,16 +659,6 @@ impl IpcTrustInfo {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct IpcClientInfo {
-    pub client_id: String,
-    pub session_id: String,
-    pub client_info: Option<String>,
-    #[serde(default)]
-    pub adapter_version: Option<String>,
-    pub connected_secs: u64,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveSessionTransport {
@@ -789,10 +747,6 @@ pub enum IpcResponse {
     /// List of all tools available.
     Tools {
         tools: Vec<IpcToolInfo>,
-    },
-    /// List of live client sessions connected to the daemon.
-    Clients {
-        clients: Vec<IpcClientInfo>,
     },
     /// List of live downstream sessions with explicit transport/scope.
     LiveSessions {
@@ -967,7 +921,6 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
         IpcRequest::RestartServer { .. }
             | IpcRequest::Reload { .. }
             | IpcRequest::Shutdown { .. }
-            | IpcRequest::InjectToken { .. }
             | IpcRequest::ActivitySnapshot { .. }
             | IpcRequest::OperatorSnapshot { .. }
             | IpcRequest::GetServerConfig { .. }
@@ -986,8 +939,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
     match request {
         IpcRequest::RestartServer { auth_token, .. }
         | IpcRequest::Reload { auth_token, .. }
-        | IpcRequest::Shutdown { auth_token, .. }
-        | IpcRequest::InjectToken { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
         IpcRequest::ActivitySnapshot { auth_token, .. }
         | IpcRequest::OperatorSnapshot { auth_token, .. }
         | IpcRequest::GetServerConfig { auth_token, .. }
@@ -1197,20 +1149,6 @@ mod tests {
                 params: Some(serde_json::json!({"name": "test_tool", "arguments": {}})),
             },
             IpcRequest::AuthStatus,
-            IpcRequest::InjectToken {
-                auth_token: "token".to_string(),
-                server_name: "my-server".to_string(),
-                access_token: "at-123".to_string(),
-                refresh_token: Some("rt-456".to_string()),
-                expires_in: Some(3600),
-            },
-            IpcRequest::InjectToken {
-                auth_token: "token".to_string(),
-                server_name: "other".to_string(),
-                access_token: "at".to_string(),
-                refresh_token: None,
-                expires_in: None,
-            },
         ];
 
         for req in &requests {
@@ -1591,13 +1529,6 @@ mod tests {
             auth_token: "t".to_string(),
             client_id: "client".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::InjectToken {
-            auth_token: "t".to_string(),
-            server_name: "s".to_string(),
-            access_token: "a".to_string(),
-            refresh_token: None,
-            expires_in: None,
-        }));
         assert!(requires_auth(&IpcRequest::ActivitySnapshot {
             auth_token: "t".to_string(),
             after_sequence: 0,
@@ -1662,16 +1593,6 @@ mod tests {
                 auth_token: "my_token".to_string(),
             }),
             Some("my_token")
-        );
-        assert_eq!(
-            extract_auth_token(&IpcRequest::InjectToken {
-                auth_token: "inject_tok".to_string(),
-                server_name: "s".to_string(),
-                access_token: "a".to_string(),
-                refresh_token: None,
-                expires_in: None,
-            }),
-            Some("inject_tok")
         );
     }
 
@@ -1743,24 +1664,6 @@ mod tests {
         let debug_str = format!("{:?}", req);
         assert!(!debug_str.contains("super_secret"));
         assert!(debug_str.contains("[REDACTED]"));
-    }
-
-    #[test]
-    fn debug_redacts_inject_token_secrets() {
-        let req = IpcRequest::InjectToken {
-            auth_token: "daemon_secret".to_string(),
-            server_name: "my-server".to_string(),
-            access_token: "bearer_secret".to_string(),
-            refresh_token: Some("refresh_secret".to_string()),
-            expires_in: Some(3600),
-        };
-        let debug_str = format!("{:?}", req);
-        assert!(!debug_str.contains("daemon_secret"));
-        assert!(!debug_str.contains("bearer_secret"));
-        assert!(!debug_str.contains("refresh_secret"));
-        assert!(debug_str.contains("[REDACTED]"));
-        assert!(debug_str.contains("my-server"));
-        assert!(debug_str.contains("3600"));
     }
 
     #[test]
@@ -2046,6 +1949,149 @@ mod tests {
             };
             assert_eq!(name, "workspace");
             assert_eq!(server.command.as_deref(), Some("uvx"));
+        }
+    }
+
+    /// The snapshot the app polls, with one server in every `ServerHealth`, so
+    /// the Swift decoder is pinned to the words the daemon really sends.
+    mod golden_operator_snapshot_fixture {
+        use super::*;
+        use std::path::PathBuf;
+
+        const NAME: &str = "operator_snapshot_response.json";
+
+        fn path() -> PathBuf {
+            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                .join("..")
+                .join("testdata")
+                .join("ipc")
+                .join(NAME)
+        }
+
+        fn server(name: &str, health: ServerHealth, tool_count: usize) -> ServerStatus {
+            // Built from JSON so fields added to ServerStatus later take their
+            // serde defaults instead of breaking this fixture.
+            serde_json::from_value(serde_json::json!({
+                "server_id": name,
+                "health": health,
+                "tool_count": tool_count,
+            }))
+            .expect("server status")
+        }
+
+        fn canonical_snapshot_response() -> IpcResponse {
+            let every_health = [
+                ("healthy", ServerHealth::Healthy, 12),
+                ("degraded", ServerHealth::Degraded, 4),
+                ("failed", ServerHealth::Failed, 0),
+                ("auth-required", ServerHealth::AuthRequired, 0),
+            ];
+            // A new ServerHealth variant fails to compile here until the
+            // fixture covers it too.
+            for (_, health, _) in &every_health {
+                match health {
+                    ServerHealth::Healthy
+                    | ServerHealth::Degraded
+                    | ServerHealth::Failed
+                    | ServerHealth::AuthRequired => {}
+                }
+            }
+            IpcResponse::OperatorSnapshot {
+                snapshot: Box::new(OperatorSnapshot {
+                    runtime_version: "0.7.0".to_string(),
+                    uptime_secs: 42,
+                    tool_catalog_revision: 7,
+                    ownership: DaemonOwnershipMode::AppManaged,
+                    configured_servers: every_health
+                        .iter()
+                        .map(|(name, health, _)| crate::operator::OperatorServerSummary {
+                            name: (*name).to_string(),
+                            enabled: true,
+                            transport: crate::config::TransportType::Stdio,
+                            oauth: matches!(health, ServerHealth::AuthRequired),
+                        })
+                        .collect(),
+                    servers: every_health
+                        .iter()
+                        .map(|(name, health, tools)| server(name, *health, *tools))
+                        .collect(),
+                    live_sessions: vec![IpcLiveSessionInfo {
+                        transport: LiveSessionTransport::DaemonProxy,
+                        client_id: Some("client-1".to_string()),
+                        session_id: "session-1".to_string(),
+                        client_type: crate::types::ClientType::ClaudeCode,
+                        client_info: Some("claude-code 2.0".to_string()),
+                        adapter_version: None,
+                        connected_secs: 30,
+                        last_activity_secs: Some(2),
+                    }],
+                    client_visibility: vec![OperatorClientVisibility {
+                        session_id: "session-1".to_string(),
+                        client_type: crate::types::ClientType::ClaudeCode,
+                        visible_tool_count: 16,
+                    }],
+                    upstream_auth: vec![IpcAuthServerInfo {
+                        name: "auth-required".to_string(),
+                        url: Some("https://example.com/mcp".to_string()),
+                        authenticated: false,
+                        health: ServerHealth::AuthRequired,
+                        scopes: None,
+                        token_expires_in_secs: None,
+                        warnings: Vec::new(),
+                    }],
+                    downstream_clients: vec![crate::downstream_oauth::RegisteredClientSummary {
+                        client_id: "remote-1".to_string(),
+                        client_name: "Remote client".to_string(),
+                        redirect_uris: vec!["https://example.com/callback".to_string()],
+                        source: crate::downstream_oauth::ClientSource::DynamicRegistration,
+                        created_at: 1_700_000_000,
+                        last_used_at: None,
+                        expires_at: 1_800_000_000,
+                    }],
+                }),
+            }
+        }
+
+        fn canonical_json() -> String {
+            let value = serde_json::to_value(canonical_snapshot_response()).unwrap();
+            format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
+        }
+
+        #[test]
+        #[ignore = "run manually to regenerate the shared operator snapshot fixture"]
+        fn write_golden_operator_snapshot_fixture() {
+            std::fs::write(path(), canonical_json())
+                .unwrap_or_else(|e| panic!("write golden {NAME}: {e}"));
+        }
+
+        #[test]
+        fn golden_operator_snapshot_matches_rust_types() {
+            let golden = std::fs::read_to_string(path())
+                .unwrap_or_else(|e| panic!("read golden {NAME}: {e}"));
+            let golden_value: serde_json::Value =
+                serde_json::from_str(&golden).expect("golden must be valid JSON");
+            let canonical_value = serde_json::to_value(canonical_snapshot_response()).unwrap();
+            assert_eq!(
+                canonical_value, golden_value,
+                "golden {NAME} drifted from current Rust IPC types; rerun \
+                 write_golden_operator_snapshot_fixture"
+            );
+
+            let decoded: IpcResponse =
+                serde_json::from_value(golden_value).expect("golden must decode");
+            let IpcResponse::OperatorSnapshot { snapshot } = decoded else {
+                panic!("expected OperatorSnapshot response");
+            };
+            let healths: Vec<ServerHealth> = snapshot.servers.iter().map(|s| s.health).collect();
+            assert_eq!(
+                healths,
+                vec![
+                    ServerHealth::Healthy,
+                    ServerHealth::Degraded,
+                    ServerHealth::Failed,
+                    ServerHealth::AuthRequired,
+                ]
+            );
         }
     }
 }

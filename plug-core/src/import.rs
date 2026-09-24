@@ -149,14 +149,6 @@ pub fn scan_client(source: ClientSource) -> ScanResult {
     }
 }
 
-/// Scan all clients and return results.
-pub fn scan_all() -> Vec<ScanResult> {
-    ClientSource::all()
-        .iter()
-        .map(|s| scan_client(*s))
-        .collect()
-}
-
 /// Run the full import: scan, deduplicate, and compute what's new.
 pub fn import(existing: &HashMap<String, ServerConfig>, sources: &[ClientSource]) -> ImportReport {
     let scanned: Vec<ScanResult> = sources.iter().map(|s| scan_client(*s)).collect();
@@ -836,14 +828,6 @@ fn is_existing_server(
 }
 
 /// Resolve name collisions: if name already exists, append source suffix.
-pub fn resolve_name(name: &str, source: ClientSource, existing_names: &[String]) -> String {
-    if !existing_names.iter().any(|existing| existing == name) {
-        return name.to_string();
-    }
-    let existing: std::collections::HashSet<String> = existing_names.iter().cloned().collect();
-    resolve_name_against_set(name, source, &existing)
-}
-
 fn resolve_name_against_set(
     name: &str,
     source: ClientSource,
@@ -1155,13 +1139,13 @@ extensions:
 
     #[test]
     fn resolve_name_handles_collisions() {
-        let existing = vec!["github".to_string()];
+        let existing: std::collections::HashSet<String> = ["github".to_string()].into();
         assert_eq!(
-            resolve_name("github", ClientSource::Cursor, &existing),
+            resolve_name_against_set("github", ClientSource::Cursor, &existing),
             "github-cursor"
         );
         assert_eq!(
-            resolve_name("slack", ClientSource::Cursor, &existing),
+            resolve_name_against_set("slack", ClientSource::Cursor, &existing),
             "slack"
         );
     }

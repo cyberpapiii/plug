@@ -54,7 +54,8 @@ final class AppModelTests: XCTestCase {
             tokenURL: try! makeFixtureTokenURL()
         )
         await model.start()
-        XCTAssertTrue(model.isHealthy)
+        XCTAssertEqual(model.situation.setup, .ready)
+        XCTAssertEqual(model.connectionState, .ready)
 
         let nonHealthyStates: [InstallationState] = [
             .adoptionRequired(makeInstallationSnapshot()),
@@ -65,7 +66,7 @@ final class AppModelTests: XCTestCase {
         for state in nonHealthyStates {
             coordinator.state = state
             await model.reconcile(trigger: .retry)
-            XCTAssertFalse(model.isHealthy, "\(state) must not report healthy")
+            XCTAssertNotEqual(model.situation.setup, .ready, "\(state) must not report healthy")
         }
     }
 
@@ -137,7 +138,7 @@ final class AppModelTests: XCTestCase {
         )
         await model.start()
 
-        XCTAssertNil(model.installationFailure)
+        XCTAssertEqual(model.situation.setup, .ready)
     }
 
     /// The handshake describes the daemon behind an open descriptor, so a poll
@@ -167,6 +168,77 @@ final class AppModelTests: XCTestCase {
         XCTAssertGreaterThan(snapshots.count, 1, "the polls themselves must still have happened")
     }
 
+    /// Opening a panel switches polling to the brisk pace at once. The loop
+    /// used to finish its background sleep first, so a panel opened just after
+    /// a poll showed state that stayed stale for the whole background interval.
+    @MainActor
+    func testOpeningASurfaceDropsTheBackgroundSleep() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL(),
+            foregroundPollInterval: .milliseconds(20),
+            backgroundPollInterval: .seconds(3600)
+        )
+        await model.start()
+        model.setWatching(true)
+        defer { model.setWatching(false) }
+        try await Task.sleep(for: .milliseconds(500))
+
+        let snapshots = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
+        // One at start, one from setWatching, and more from the brisk loop.
+        XCTAssertGreaterThan(snapshots, 3)
+    }
+
+    /// A refresh asked for while another is running usually follows a change
+    /// the running one may have missed. It used to be dropped, so the view kept
+    /// showing the state from before the change until the next poll.
+    @MainActor
+    func testRefreshRequestedDuringARefreshRunsAgainAfterIt() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        let before = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
+
+        let gate = DispatchSemaphore(value: 0)
+        server.snapshotGate = gate
+        let first = Task { await model.refresh() }
+        // The first read is now under way and waiting for its snapshot.
+        while coordinator.events.values.filter({ $0 == "ipc.snapshot" }).count == before {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        server.snapshotGate = nil
+        let second = Task { await model.refresh() }
+        let third = Task { await model.refresh() }
+        try await Task.sleep(for: .milliseconds(50))
+        gate.signal()
+        await second.value
+        let afterSecond = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
+        await first.value
+        await third.value
+
+        XCTAssertEqual(afterSecond, before + 2, "a request made mid-read waits for a read that starts after it")
+        let after = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
+        XCTAssertEqual(after, before + 2, "requests made during one read share one extra read")
+    }
+
     /// The tool list is by far the largest thing the daemon can be asked for.
     /// It used to be refetched on a timer; the snapshot now reports when it
     /// would answer differently, so a poll that sees the same revision must not
@@ -193,6 +265,39 @@ final class AppModelTests: XCTestCase {
         server.catalogRevision = 2
         await model.refresh()
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
+    }
+
+    /// An operation that leaves the catalog revision alone must not pull the
+    /// whole tool list again. Operations that do change it move the revision.
+    @MainActor
+    func testOperationRefetchesToolsOnlyWhenTheRevisionMoves() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
+
+        try await model.performOperation { .restartServer(authToken: $0, serverID: "demo") }
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
+
+        server.catalogRevision = 2
+        try await model.performOperation { .setToolEnabled(authToken: $0, tool: "demo__echo", enabled: false) }
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
+
+        await model.refresh(forceCatalog: true)
+        XCTAssertEqual(
+            coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 3,
+            "an explicit Refresh still pulls the list"
+        )
     }
 
     @MainActor
@@ -263,7 +368,7 @@ final class AppModelTests: XCTestCase {
             coordinator: coordinator
         )
 
-        XCTAssertEqual(model.installationFailure?.summary, "Plug needs attention")
+        XCTAssertEqual(model.situation.setup, .blocked(detail: "daemon skew", hasLog: true))
         await model.retry()
         model.openLog()
 
@@ -299,10 +404,7 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertEqual(
-            model.connectionRecoveryDetail,
-            "The app and its background service are running different versions."
-        )
+        XCTAssertEqual(model.verdict.title, "Restart required to finish update")
     }
 
     @MainActor
@@ -322,18 +424,14 @@ final class AppModelTests: XCTestCase {
         await model.start()
 
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertTrue(model.connectionRecoveryIsRequired)
-        XCTAssertFalse(model.isHealthy)
-        XCTAssertEqual(
-            model.connectionRecoveryDetail,
-            "The app and its background service are running different versions."
-        )
+        XCTAssertEqual(model.situation.runtime, .versionMismatch)
+        XCTAssertEqual(model.verdict.primary?.intent, .reconnect)
 
         await model.retryConnection()
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertTrue(model.connectionRecoveryIsRequired)
+        XCTAssertEqual(model.situation.runtime, .versionMismatch)
     }
 
     @MainActor
@@ -604,6 +702,33 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
+    func testDegradedServerSortsWithTheWorkingOnes() throws {
+        func presentation(_ name: String, health: String?, enabled: Bool = true) throws -> AppModel.ServerPresentation {
+            let configured = try JSONDecoder().decode(
+                ConfiguredServer.self,
+                from: Data(#"{"name":"\#(name)","enabled":\#(enabled),"transport":"stdio","oauth":false}"#.utf8)
+            )
+            let runtime = try health.map {
+                try JSONDecoder().decode(
+                    ServerStatus.self,
+                    from: Data(#"{"serverId":"\#(name)","health":"\#($0)","toolCount":1,"error":null}"#.utf8)
+                )
+            }
+            return AppModel.ServerPresentation(configured: configured, runtime: runtime)
+        }
+
+        let ordered = AppModel.displayOrder([
+            try presentation("healthy", health: "Healthy"),
+            try presentation("degraded", health: "Degraded"),
+            try presentation("failed", health: "Failed"),
+            try presentation("auth", health: "AuthRequired"),
+        ])
+
+        XCTAssertEqual(ordered.map(\.id), ["failed", "auth", "healthy", "degraded"])
+        XCTAssertEqual(ordered.map(\.health), [.down, .signInNeeded, .working, .working])
+    }
+
+    @MainActor
     private func makeNotificationSnapshot(
         authenticated: Bool = true,
         includeClient: Bool = false
@@ -732,6 +857,13 @@ private final class OperatorFixtureServer: @unchecked Sendable {
         set { lock.lock(); storedCatalogRevision = newValue; lock.unlock() }
     }
     private var storedCatalogRevision: UInt64 = 1
+    /// When set, the next snapshot request is recorded and then held until the
+    /// test signals, so a test can act while a read is in flight.
+    var snapshotGate: DispatchSemaphore? {
+        get { lock.lock(); defer { lock.unlock() }; return storedSnapshotGate }
+        set { lock.lock(); storedSnapshotGate = newValue; lock.unlock() }
+    }
+    private var storedSnapshotGate: DispatchSemaphore?
     private var connection: Int32 = -1
     private var didStop = false
 
@@ -837,6 +969,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                     ], to: accepted)
                 case "OperatorSnapshot":
                     events.append("ipc.snapshot")
+                    _ = snapshotGate?.wait(timeout: .now() + 5)
                     send(response: [
                         "type": "OperatorSnapshot",
                         "snapshot": [

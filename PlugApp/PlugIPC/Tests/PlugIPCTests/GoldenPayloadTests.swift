@@ -91,6 +91,33 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(server.transport, "stdio")
     }
 
+    /// The snapshot the app polls every two seconds, as Rust writes it, with
+    /// one server in every daemon health. The app maps these health strings
+    /// to what a person reads, so a renamed variant must fail here first.
+    func testGoldenOperatorSnapshotDecodesEveryServerHealthInSwift() throws {
+        let (payload, object) = try goldenJSON("operator_snapshot_response.json")
+        try assertExactKeys(object, expected: ["type", "snapshot"], context: "OperatorSnapshot response")
+
+        guard case let .snapshot(snapshot) = try decoder.decode(IPCResponse.self, from: payload) else {
+            return XCTFail("expected OperatorSnapshot IPCResponse variant")
+        }
+
+        XCTAssertEqual(snapshot.runtimeVersion, "0.7.0")
+        XCTAssertEqual(snapshot.toolCatalogRevision, 7)
+        XCTAssertEqual(snapshot.ownership, "app_managed")
+        XCTAssertEqual(snapshot.configuredServers.map(\.name), ["healthy", "degraded", "failed", "auth-required"])
+        XCTAssertEqual(snapshot.configuredServers.map(\.transport), ["stdio", "stdio", "stdio", "stdio"])
+        XCTAssertEqual(snapshot.servers.map(\.serverId), ["healthy", "degraded", "failed", "auth-required"])
+        XCTAssertEqual(snapshot.servers.map(\.health), ["Healthy", "Degraded", "Failed", "AuthRequired"])
+        XCTAssertEqual(snapshot.servers.map(\.toolCount), [12, 4, 0, 0])
+        XCTAssertEqual(snapshot.liveSessions.first?.transport, "daemon_proxy")
+        XCTAssertEqual(snapshot.liveSessions.first?.clientType, "ClaudeCode")
+        XCTAssertEqual(snapshot.clientVisibility.first?.visibleToolCount, 16)
+        XCTAssertEqual(snapshot.upstreamAuth.first?.health, "AuthRequired")
+        XCTAssertEqual(snapshot.upstreamAuth.first?.authenticated, false)
+        XCTAssertEqual(snapshot.downstreamClients.first?.source, "dynamic_registration")
+    }
+
     func testRenamedHandshakeFieldFailsExactKeyContract() throws {
         let (_, object) = try goldenJSON("operator_handshake_response.json")
         guard var handshake = object["handshake"] as? [String: Any] else {

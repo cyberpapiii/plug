@@ -24,9 +24,8 @@ the ServiceManagement and Keychain consent that needs a logged-in macOS GUI
 session. Plug.app owns the GUI, `plug` command, daemon, client links, and
 Sparkle updates. Headless macOS is unsupported.
 
-Linux users build from source with `cargo install`; prebuilt Linux archives
-and the `plug` Formula stopped at 0.8.10. Source development runs `./scripts/dev-install.sh`, which builds a Developer
-ID signed `Plug.app` from the working tree and installs it in place; releases
+Prebuilt Linux archives and the `plug` Formula stopped at 0.8.10; the
+[operator guide](OPERATOR-GUIDE.md) covers Linux and source builds. Releases
 are only for sharing a build with other people.
 
 ## Before running it

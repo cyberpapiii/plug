@@ -246,8 +246,8 @@ private struct PanelServerRow: View {
         if server.health.needsAttention {
             if server.isSigningIn {
                 ProgressView().controlSize(.mini)
-            } else if let action {
-                Button(action.title) { run(action.intent) }
+            } else if let fix = server.fix {
+                Button(fix.title) { run(fix.intent) }
                     .buttonStyle(.bordered)
                     .controlSize(.mini)
                     .tint(server.health.color)
@@ -267,17 +267,9 @@ private struct PanelServerRow: View {
         }
     }
 
-    private var action: Verdict.Button? {
-        switch server.health {
-        case .signInNeeded: .init("Sign In", .signIn(server: server.name))
-        case .down, .unknown: .init("Restart", .restartServer(server.name))
-        case .working, .starting, .off: nil
-        }
-    }
-
     private var trailingText: String {
         switch server.health {
-        case .working: server.toolCount == 1 ? "1 tool" : "\(server.toolCount) tools"
+        case .working: server.toolCountText
         default: server.health.label
         }
     }

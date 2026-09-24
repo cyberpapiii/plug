@@ -190,6 +190,51 @@ final class DaemonServiceManagerTests: XCTestCase {
         }
     }
 
+    /// Reconcile already inspected launchd and verified the app a moment ago.
+    /// One exact handshake is enough to prove the service is ours and current.
+    func testEnsureRunningTrustsAFreshInspectionWhenTheHandshakeIsExact() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector([.appManagedCurrent(current)])
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: [handshake("0.7.0", executable: canonical.executableURL)]
+        )
+        let manager = makeManager(inspector: inspector, backend: backend)
+
+        let proven = try await manager.ensureRunning(
+            canonical: canonical,
+            inspected: snapshot(.appManagedCurrent(current), version: "0.7.0", executable: canonical.executableURL)
+        )
+
+        XCTAssertEqual(proven.daemonVersion, "0.7.0")
+        XCTAssertEqual(backend.events, [.handshake])
+        let pathSets = await inspector.recognizedPathSets
+        XCTAssertTrue(pathSets.isEmpty, "a fresh inspection needs no second launchd scan")
+    }
+
+    func testEnsureRunningFallsBackToTheFullCheckWhenTheHandshakeDisagrees() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let otherAppExecutable = URL(fileURLWithPath: "/Users/me/Applications/Other Plug.app/Contents/Resources/plug")
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 3))
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: Array(repeating: handshake("0.7.0", executable: otherAppExecutable), count: 3)
+        )
+        let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 1)
+
+        do {
+            _ = try await manager.ensureRunning(
+                canonical: canonical,
+                inspected: snapshot(.appManagedCurrent(current), version: "0.7.0", executable: canonical.executableURL)
+            )
+            XCTFail("Expected other app copy proof to fail closed")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .verificationFailed(expectedVersion: "0.7.0", actualVersion: "0.7.0"))
+        }
+        let pathSets = await inspector.recognizedPathSets
+        XCTAssertFalse(pathSets.isEmpty, "a disagreeing handshake re-inspects launchd")
+    }
+
     func testSameBuildOtherAppCopyInHandshakeFailsClosed() async throws {
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
         let otherAppExecutable = URL(fileURLWithPath: "/Users/me/Applications/Other Plug.app/Contents/Resources/plug")
@@ -419,7 +464,6 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool
-    var serviceStatus: SMAppService.Status { enabled ? .enabled : .notRegistered }
     var events: [Event] = []
     var registerError: Error?
     private var handshakes: [OperatorHandshake]

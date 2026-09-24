@@ -75,7 +75,7 @@ while IFS= read -r path; do
       rust=true
       app=true
       ;;
-    package.json | package-lock.json | playwright.config.* | e2e/* | tests/e2e/*)
+    package.json | package-lock.json | playwright.config.* | tests/e2e/*)
       e2e=true
       ;;
     plug-core/src/downstream_oauth/* | plug-core/src/http/* | plug-core/src/oauth.rs)

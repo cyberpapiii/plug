@@ -198,7 +198,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     }
 
     private func installedBrew() async throws -> URL? {
-        for brew in brewURLs where pathExists(brew) {
+        for brew in brewURLs where pathExists(brew) && formulaMayBeInstalled(beside: brew) {
             let result = try await runner.run(
                 executable: brew,
                 arguments: ["list", "--versions", "cyberpapiii/tap/plug"],
@@ -207,6 +207,18 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
             if result.status == 0, !result.stdout.isEmpty { return brew }
         }
         return nil
+    }
+
+    /// Asking brew costs about a second a call, more at login, and a launch
+    /// used to ask two or three times. An installed formula always leaves
+    /// `opt/plug` or `Cellar/plug` under its prefix (`/opt/homebrew` or
+    /// `/usr/local`, the directory above brew's `bin`), so with neither there
+    /// is no formula to ask about. With either, brew still has the final word.
+    private func formulaMayBeInstalled(beside brew: URL) -> Bool {
+        let prefix = brew.deletingLastPathComponent().deletingLastPathComponent()
+        return ["opt/plug", "Cellar/plug"].contains {
+            pathExistsWithoutFollowing(prefix.appending(path: $0))
+        }
     }
 
     private func inspectShellLink(at link: URL, canonical: URL) -> ShellLinkState {
