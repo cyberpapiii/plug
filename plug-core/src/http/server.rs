@@ -518,130 +518,59 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                // classify -> resolve -> per-notification-kind delivery below.
                                 // Unlike stdio/daemon (one fan-out task per client, comparing
                                 // target to "self"), this task is shared by every HTTP session,
-                                // so a `Targeted` resolution is used to look up which session to
-                                // route to rather than to answer "is this me?". See
+                                // so a targeted resolution names which session to route to
+                                // rather than answering "is this me?". See
                                 // plug-core/src/notifications.rs::fanout.
-                                let resolved_target: Option<NotificationTarget> = match crate::notifications::fanout::resolve(
-                                    crate::notifications::fanout::classify(&notification),
-                                ) {
-                                    crate::notifications::fanout::ResolvedDelivery::Broadcast => None,
-                                    crate::notifications::fanout::ResolvedDelivery::ToTarget(target) => {
-                                        Some(target.clone())
-                                    }
+                                use crate::notifications::fanout::{
+                                    NotificationClass, ResolvedDelivery, classify, resolve,
                                 };
-                                match notification {
-                                    ProtocolNotification::ToolListChanged => {
-                                        if let Some(message) = notification_to_sse_message(
-                                            ProtocolNotification::ToolListChanged,
-                                        ) {
-                                            state.sessions.broadcast(
-                                                message,
-                                                crate::session::BroadcastKind::ToolList,
-                                            );
+                                let class = classify(&notification);
+                                // Targeted classes carry no broadcast audience; the gate that
+                                // admitted the originating request already authorized the reply.
+                                let kind = match class {
+                                    NotificationClass::ToolListChanged => {
+                                        Some(crate::session::BroadcastKind::ToolList)
+                                    }
+                                    NotificationClass::ResourceListChanged => {
+                                        Some(crate::session::BroadcastKind::ResourceList)
+                                    }
+                                    NotificationClass::PromptListChanged => {
+                                        Some(crate::session::BroadcastKind::PromptList)
+                                    }
+                                    NotificationClass::Logging | NotificationClass::AuthState => {
+                                        Some(crate::session::BroadcastKind::Logging)
+                                    }
+                                    NotificationClass::ToolListChangedFor(_)
+                                    | NotificationClass::Progress(_)
+                                    | NotificationClass::Cancelled(_)
+                                    | NotificationClass::ResourceUpdated(_) => None,
+                                };
+                                match resolve(class) {
+                                    ResolvedDelivery::ToTarget(NotificationTarget::Http {
+                                        session_id,
+                                    }) => {
+                                        if let Some(message) =
+                                            notification_to_sse_message(&notification)
+                                        {
+                                            state.sessions.send_to_session(session_id, message);
                                         }
                                     }
-                                    ProtocolNotification::ToolListChangedFor { .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::ToolListChangedFor {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
+                                    ResolvedDelivery::ToTarget(_) => {}
+                                    ResolvedDelivery::Broadcast => {
+                                        if let Some(kind) = kind
+                                            && let Some(message) =
+                                                notification_to_sse_message(&notification)
+                                        {
+                                            state.sessions.broadcast(message, kind);
                                         }
-                                    }
-                                    ProtocolNotification::ResourceListChanged => {
-                                        if let Some(message) = notification_to_sse_message(
-                                            ProtocolNotification::ResourceListChanged,
-                                        ) {
-                                            state.sessions.broadcast(
-                                                message,
-                                                crate::session::BroadcastKind::ResourceList,
-                                            );
-                                        }
-                                    }
-                                    ProtocolNotification::PromptListChanged => {
-                                        if let Some(message) = notification_to_sse_message(
-                                            ProtocolNotification::PromptListChanged,
-                                        ) {
-                                            state.sessions.broadcast(
-                                                message,
-                                                crate::session::BroadcastKind::PromptList,
-                                            );
-                                        }
-                                    }
-                                    ProtocolNotification::Progress { params, .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::Progress {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                    params,
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
-                                        }
-                                    }
-                                    ProtocolNotification::Cancelled { params, .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::Cancelled {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                    params,
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
-                                        }
-                                    }
-                                    ProtocolNotification::ResourceUpdated { params, .. } => {
-                                        if let Some(NotificationTarget::Http { session_id }) = resolved_target {
-                                            let session_key = session_id.to_string();
-                                            if let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::ResourceUpdated {
-                                                    target: NotificationTarget::Http {
-                                                        session_id,
-                                                    },
-                                                    params,
-                                                },
-                                            ) {
-                                                state.sessions.send_to_session(&session_key, message);
-                                            }
-                                        }
-                                    }
-                                    ref notification @ (
-                                        ProtocolNotification::LoggingMessage { .. }
-                                        | ProtocolNotification::TokenRefreshExchanged { .. }
-                                        | ProtocolNotification::AuthStateChanged { .. }
-                                    ) => {
-                                        if let Some(params) = notification.as_logging_message_params()
-                                            && let Some(message) = notification_to_sse_message(
-                                                ProtocolNotification::LoggingMessage { params },
-                                            ) {
-                                                state.sessions.broadcast(
-                                                    message,
-                                                    crate::session::BroadcastKind::Logging,
-                                                );
-                                            }
                                     }
                                 }
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP notification fan-out lagged");
-                                if let Some(message) = notification_to_sse_message(
+                                if let Some(message) = notification_to_sse_message(&
                                     ProtocolNotification::LoggingMessage {
                                         params: ProtocolNotification::control_lagged_logging_params(
                                             skipped,
@@ -673,7 +602,7 @@ impl HttpState {
                     recv = log_rx.recv() => {
                         match recv {
                             Ok(notif @ ProtocolNotification::LoggingMessage { .. }) => {
-                                if let Some(message) = notification_to_sse_message(notif) {
+                                if let Some(message) = notification_to_sse_message(&notif) {
                                     log_state.sessions.broadcast(
                                         message,
                                         crate::session::BroadcastKind::Logging,
@@ -693,7 +622,7 @@ impl HttpState {
                                     )
                                     .with_logger("plug"),
                                 };
-                                if let Some(message) = notification_to_sse_message(synthetic) {
+                                if let Some(message) = notification_to_sse_message(&synthetic) {
                                     log_state.sessions.broadcast(
                                         message,
                                         crate::session::BroadcastKind::Logging,
@@ -709,7 +638,7 @@ impl HttpState {
     }
 }
 
-fn notification_to_sse_message(notification: ProtocolNotification) -> Option<SseMessage> {
+fn notification_to_sse_message(notification: &ProtocolNotification) -> Option<SseMessage> {
     SseMessage::from_json_value(notification.to_json_value())
         .map_err(|error| {
             tracing::error!(%error, "failed to serialize SSE notification payload");
