@@ -702,6 +702,33 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
+    func testDegradedServerSortsWithTheWorkingOnes() throws {
+        func presentation(_ name: String, health: String?, enabled: Bool = true) throws -> AppModel.ServerPresentation {
+            let configured = try JSONDecoder().decode(
+                ConfiguredServer.self,
+                from: Data(#"{"name":"\#(name)","enabled":\#(enabled),"transport":"stdio","oauth":false}"#.utf8)
+            )
+            let runtime = try health.map {
+                try JSONDecoder().decode(
+                    ServerStatus.self,
+                    from: Data(#"{"serverId":"\#(name)","health":"\#($0)","toolCount":1,"error":null}"#.utf8)
+                )
+            }
+            return AppModel.ServerPresentation(configured: configured, runtime: runtime)
+        }
+
+        let ordered = AppModel.displayOrder([
+            try presentation("healthy", health: "Healthy"),
+            try presentation("degraded", health: "Degraded"),
+            try presentation("failed", health: "Failed"),
+            try presentation("auth", health: "AuthRequired"),
+        ])
+
+        XCTAssertEqual(ordered.map(\.id), ["failed", "auth", "healthy", "degraded"])
+        XCTAssertEqual(ordered.map(\.health), [.down, .signInNeeded, .working, .working])
+    }
+
+    @MainActor
     private func makeNotificationSnapshot(
         authenticated: Bool = true,
         includeClient: Bool = false

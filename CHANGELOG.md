@@ -21,6 +21,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   made the call, and turn the latency orange when a call took five seconds or
   more.
 - The version in About can be selected and copied.
+- Servers use the same words everywhere: the detail header says "Running · N
+  tools" or "Off" like the rows do, a degraded server sorts with the working
+  ones instead of above them, and the notification setting now says what it
+  does: "Tell me when a server needs sign-in or a new app connects".
 
 ### Fixed
 

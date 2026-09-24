@@ -77,7 +77,7 @@ private struct GeneralSettings: View {
                     .listRowSeparator(.hidden)
                 }
                 Toggle(isOn: $notify) {
-                    Label("Tell me when a server needs attention", systemImage: "bell")
+                    Label("Tell me when a server needs sign-in or a new app connects", systemImage: "bell")
                 }
                 .listRowSeparator(.hidden)
                 .onChange(of: notify) { _, enabled in

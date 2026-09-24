@@ -185,7 +185,7 @@ private struct ServerListRow: View {
         if server.health.needsAttention, let error = server.error, !error.isEmpty {
             return error.split(separator: "\n").first.map(String.init) ?? error
         }
-        if !server.enabled { return "Switched off" }
+        if !server.enabled { return server.health.label }
         return server.transportLabel
     }
 }

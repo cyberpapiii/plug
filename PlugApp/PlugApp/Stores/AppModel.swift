@@ -26,7 +26,12 @@ final class AppModel {
         let configured: ConfiguredServer
         let runtime: ServerStatus?
         var id: String { configured.name }
-        var health: String { configured.enabled ? (runtime?.health ?? "Starting") : "Disabled" }
+        var health: ServerHealth {
+            ServerHealth(
+                daemonValue: configured.enabled ? runtime?.health : "Disabled",
+                enabled: configured.enabled
+            )
+        }
         var toolCount: Int { runtime?.toolCount ?? 0 }
     }
 
@@ -131,11 +136,18 @@ final class AppModel {
 
     var visibleServers: [ServerPresentation] {
         let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
-        return snapshot.configuredServers.map {
+        return Self.displayOrder(snapshot.configuredServers.map {
             ServerPresentation(configured: $0, runtime: runtimeByName[$0.name])
-        }.enumerated().sorted {
-            let lhsBad = $0.element.health != "Healthy"
-            let rhsBad = $1.element.health != "Healthy"
+        })
+    }
+
+    /// Servers that are not working come first; each group keeps config order.
+    /// It reads the same health the rows show, so a degraded server, which
+    /// still routes calls, sorts with the working ones.
+    static func displayOrder(_ servers: [ServerPresentation]) -> [ServerPresentation] {
+        servers.enumerated().sorted {
+            let lhsBad = $0.element.health != .working
+            let rhsBad = $1.element.health != .working
             return lhsBad == rhsBad ? $0.offset < $1.offset : lhsBad && !rhsBad
         }.map(\.element)
     }
@@ -173,10 +185,7 @@ final class AppModel {
                 enabled: server.configured.enabled,
                 transport: server.configured.transport,
                 usesOAuth: server.configured.oauth,
-                health: ServerHealth(
-                    daemonValue: server.configured.enabled ? server.runtime?.health : "Disabled",
-                    enabled: server.configured.enabled
-                ),
+                health: server.health,
                 toolCount: server.toolCount,
                 error: server.runtime?.error,
                 isSigningIn: signingInServers.contains(server.configured.name),

@@ -73,8 +73,7 @@ struct ServerDetailView: View {
 
     private var statusLine: String {
         switch server.health {
-        case .working: "Working · \(server.toolCountText)"
-        case .off: "Switched off"
+        case .working: "\(server.health.label) · \(server.toolCountText)"
         default: server.health.label
         }
     }
@@ -104,8 +103,8 @@ struct ServerDetailView: View {
 
     private func problemCard(_ button: Verdict.Button) -> some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
-            Text(problemHeadline).font(.callout.weight(.medium))
-            if let error = server.error, !error.isEmpty, server.health != .signInNeeded {
+            Text("Plug couldn't reach this server.").font(.callout.weight(.medium))
+            if let error = server.error, !error.isEmpty {
                 Text(error)
                     .font(.caption.monospaced())
                     .foregroundStyle(.secondary)
@@ -119,13 +118,6 @@ struct ServerDetailView: View {
         .frame(maxWidth: .infinity, alignment: .leading)
         .padding(Metric.regular)
         .nativeInsetSurface(AnyShapeStyle(.orange.opacity(0.1)))
-    }
-
-    private var problemHeadline: String {
-        switch server.health {
-        case .signInNeeded: "This server needs you to sign in to your account."
-        default: "Plug couldn't reach this server."
-        }
     }
 
     // MARK: - Details
