@@ -643,9 +643,12 @@ impl ConnectionContext {
     }
 }
 
-/// Requests one registered connection may have dispatching at once. More
-/// wait for a slot without holding up the connection's reads.
-const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
+/// Requests one registered connection may have dispatching at once. The
+/// proxy keeps to the same limit, so a request over it is answered at once
+/// with a retryable `BUSY` error rather than queued: the loop never waits for
+/// a slot, and so never stops reading the reverse-request replies the
+/// running requests may be waiting on.
+pub(crate) const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
 
 /// Requests tagged with `ipc_id` on a registered connection, dispatching on
 /// their own tasks. Each task returns the response for the loop to write.
@@ -679,12 +682,18 @@ fn reverse_reply_target(pending: &PendingReverse, frame: &[u8], ids: ipc::FrameI
         .then_some(oldest)
 }
 
-/// True for requests that change the connection's own session and so must
-/// run in order on the connection loop even when tagged.
+/// True for requests that run on the connection loop even when tagged: those
+/// that change the connection's own session and so must run in order, and
+/// cheap control requests that must answer even when every request slot is
+/// taken by a long call (the proxy's heartbeat is a `Ping`).
 fn must_run_inline(request: &IpcRequest) -> bool {
     matches!(
         request,
-        IpcRequest::Register { .. } | IpcRequest::Deregister { .. } | IpcRequest::Shutdown { .. }
+        IpcRequest::Register { .. }
+            | IpcRequest::Deregister { .. }
+            | IpcRequest::Shutdown { .. }
+            | IpcRequest::Ping { .. }
+            | IpcRequest::ModernDownstreamGate { .. }
     )
 }
 
@@ -708,10 +717,21 @@ async fn handle_ipc_connection(
     // or sampling they start fail at once instead of waiting on a proxy that
     // is gone. On daemon shutdown they are aborted instead.
     ctx.reverse_request_rx = None;
-    if ctx.cancel.is_cancelled() {
-        in_flight.tasks.abort_all();
+    loop {
+        tokio::select! {
+            biased;
+            _ = ctx.cancel.cancelled() => {
+                in_flight.tasks.abort_all();
+                while in_flight.tasks.join_next().await.is_some() {}
+                break;
+            }
+            joined = in_flight.tasks.join_next() => {
+                if joined.is_none() {
+                    break;
+                }
+            }
+        }
     }
-    while in_flight.tasks.join_next().await.is_some() {}
 
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
@@ -967,11 +987,19 @@ async fn handle_ipc_loop(
             && ctx.session_id.is_some()
             && !must_run_inline(&request)
         {
+            let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
+                let busy = IpcResponse::Error {
+                    code: "BUSY".to_string(),
+                    message: format!(
+                        "this connection already has {MAX_CONCURRENT_REQUESTS_PER_CONNECTION} requests running; retry"
+                    ),
+                };
+                ipc::send_chunked_response_with_id(writer, Some(ipc_id), &busy).await?;
+                continue;
+            };
             let mut task_ctx = ctx.fork();
-            let permits = Arc::clone(&permits);
             let handle = in_flight.tasks.spawn(async move {
-                // The semaphore is never closed, so this only waits.
-                let _permit = permits.acquire_owned().await;
+                let _permit = permit;
                 dispatch_request(&request, &mut task_ctx).await
             });
             in_flight.ids.insert(handle.id(), ipc_id);
@@ -5126,5 +5154,55 @@ mod tests {
                 "v{version}: {response:?}"
             );
         }
+    }
+
+    /// With every request slot taken by long calls, one more call is refused
+    /// at once and a heartbeat still answers. Shutdown then aborts the calls
+    /// instead of waiting them out.
+    #[tokio::test]
+    async fn full_connection_refuses_more_calls_but_still_answers_pings() {
+        let mut harness = IpcTestHarness::start_with_servers(vec![(
+            "slow",
+            ipc_harness_mock_config_with("echo", &["--delay-ms", "3000"]),
+        )])
+        .await;
+        let session_id = harness.session_id.clone();
+
+        let limit = MAX_CONCURRENT_REQUESTS_PER_CONNECTION as u64;
+        for ipc_id in 1..=limit + 1 {
+            write_tagged_ipc(
+                &mut harness.stream,
+                ipc_id,
+                &tool_call_request(&session_id, "Slow__echo"),
+            )
+            .await;
+        }
+        write_tagged_ipc(
+            &mut harness.stream,
+            limit + 2,
+            &IpcRequest::Ping {
+                session_id: session_id.clone(),
+            },
+        )
+        .await;
+
+        let (ipc_id, busy) = read_tagged_reply(&mut harness.stream).await;
+        assert_eq!(ipc_id, limit + 1);
+        assert!(
+            matches!(busy, IpcResponse::Error { ref code, .. } if code == "BUSY"),
+            "{busy:?}"
+        );
+        let (ipc_id, pong) = read_tagged_reply(&mut harness.stream).await;
+        assert_eq!(ipc_id, limit + 2);
+        assert!(matches!(pong, IpcResponse::Pong), "{pong:?}");
+
+        // The calls are still running; shutdown must not wait for them.
+        harness.cancel.cancel();
+        let server_task = harness.server_task.take().expect("server task");
+        tokio::time::timeout(std::time::Duration::from_secs(2), server_task)
+            .await
+            .expect("shutdown waited on in-flight calls")
+            .expect("server task join");
+        harness.shutdown().await;
     }
 }

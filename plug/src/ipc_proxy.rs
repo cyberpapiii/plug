@@ -111,6 +111,7 @@ struct ProxyConnection {
 impl ProxyConnection {
     fn start(
         session: crate::runtime::DaemonProxySession,
+        config_path: Option<&PathBuf>,
         shared: std::sync::Weak<SharedConnection>,
     ) -> Self {
         Self {
@@ -121,6 +122,7 @@ impl ProxyConnection {
                 session.reader,
                 session.writer,
                 session.ipc_protocol_version >= 4,
+                request_ceiling(config_path),
                 shared,
             ),
         }
@@ -128,6 +130,41 @@ impl ProxyConnection {
 }
 
 // ──────────────────────── Multiplexed daemon connection ─────────────────────────
+
+#[cfg(test)]
+static REQUEST_CEILING_TEST_OVERRIDE_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Longest one request waits for its reply before the proxy gives up on it.
+///
+/// The daemon bounds every upstream call by that server's
+/// `call_timeout_secs`, elicitation or sampling inside the call included, so
+/// twice the longest configured timeout plus a minute only trips on a request
+/// the daemon has lost. Never below the default call timeout, and read at
+/// each connect, so a config the proxy cannot load still gets a bound.
+fn request_ceiling(config_path: Option<&PathBuf>) -> Duration {
+    #[cfg(test)]
+    {
+        let override_ms =
+            REQUEST_CEILING_TEST_OVERRIDE_MS.load(std::sync::atomic::Ordering::SeqCst);
+        if override_ms != 0 {
+            return Duration::from_millis(override_ms);
+        }
+    }
+    const DEFAULT_CALL_TIMEOUT_SECS: u64 = 300;
+    let longest = plug_core::config::load_config(config_path)
+        .ok()
+        .and_then(|config| {
+            config
+                .servers
+                .values()
+                .map(|server| server.call_timeout_secs.max(server.timeout_secs))
+                .max()
+        })
+        .unwrap_or(DEFAULT_CALL_TIMEOUT_SECS)
+        .max(DEFAULT_CALL_TIMEOUT_SECS);
+    Duration::from_secs(longest.saturating_mul(2).saturating_add(60))
+}
 
 type ReplyWaiter = tokio::sync::oneshot::Sender<Result<IpcResponse, TransportFailure>>;
 
@@ -149,12 +186,16 @@ struct MuxState {
 /// reverse requests on tasks of their own. A reply without an id goes to the
 /// oldest waiter, which is how the one-at-a-time protocol paired them.
 ///
-/// A session registered at IPC v3 (an older daemon) gets no ids: `serial`
-/// holds each request until its reply arrives, as before v4.
+/// A session registered at IPC v3 (an older daemon) gets no ids and one
+/// request slot, so each request waits for the one before it, as before v4.
 struct DaemonMux {
     outbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-    /// `Some` when the daemon predates tagged requests.
-    serial: Option<Mutex<()>>,
+    /// False when the daemon predates tagged requests.
+    tagged: bool,
+    /// Requests allowed on the wire at once; the daemon's own limit at v4.
+    slots: tokio::sync::Semaphore,
+    /// Longest one request waits for its reply; see `request_ceiling`.
+    ceiling: Duration,
     state: std::sync::Mutex<MuxState>,
     next_id: std::sync::atomic::AtomicU64,
     /// Last time the daemon sent a frame, or a request started on an idle
@@ -178,12 +219,20 @@ impl DaemonMux {
         reader: tokio::net::unix::OwnedReadHalf,
         writer: tokio::net::unix::OwnedWriteHalf,
         tagged: bool,
+        ceiling: Duration,
         shared: std::sync::Weak<SharedConnection>,
     ) -> Arc<Self> {
         let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let slots = if tagged {
+            crate::daemon::MAX_CONCURRENT_REQUESTS_PER_CONNECTION
+        } else {
+            1
+        };
         let mux = Arc::new(Self {
             outbound,
-            serial: (!tagged).then(|| Mutex::new(())),
+            tagged,
+            slots: tokio::sync::Semaphore::new(slots),
+            ceiling,
             state: std::sync::Mutex::new(MuxState::default()),
             next_id: std::sync::atomic::AtomicU64::new(1),
             last_activity: std::sync::Mutex::new(tokio::time::Instant::now()),
@@ -273,18 +322,33 @@ impl DaemonMux {
 
     /// Send `request` and wait for its reply.
     ///
-    /// The read watchdog fails the whole connection, reconnectably, once the
-    /// daemon has sent nothing at all for `read_watchdog()` while this request
-    /// waits. Any frame resets it, including replies to other requests.
+    /// Two limits apply while it waits:
+    /// - The read watchdog fails the whole connection, reconnectably, once the
+    ///   daemon has sent nothing at all for `read_watchdog()`. Any frame resets
+    ///   it, including replies to other requests and heartbeat pongs.
+    /// - `ceiling` fails this request alone once it has waited that long, so a
+    ///   request the daemon lost cannot hang its caller while the heartbeat
+    ///   keeps the connection alive.
     async fn round_trip(&self, request: &IpcRequest) -> Result<IpcResponse, TransportFailure> {
+        // A v3 daemon has one slot, taken by every request. A v4 daemon runs
+        // up to its per-connection limit, and control requests it answers
+        // inline skip the queue so the heartbeat is never stuck behind calls.
+        let bypass = self.tagged
+            && matches!(
+                request,
+                IpcRequest::Ping { .. } | IpcRequest::ModernDownstreamGate { .. }
+            );
+        let _slot = if bypass {
+            None
+        } else {
+            // The semaphore is never closed.
+            self.slots.acquire().await.ok()
+        };
+        // Allocated after the slot, so on a v3 daemon ids follow wire order.
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let _serial = match &self.serial {
-            Some(serial) => Some(serial.lock().await),
-            None => None,
-        };
-        let ipc_id = self.serial.is_none().then_some(id);
+        let ipc_id = self.tagged.then_some(id);
         let payload = ipc::encode_tagged(ipc_id, request).map_err(|e| TransportFailure {
             message: format!("failed to encode IPC request: {e}"),
             reconnectable: false,
@@ -323,8 +387,9 @@ impl DaemonMux {
         }
 
         let watchdog = read_watchdog();
+        let ceiling = started + self.ceiling;
         loop {
-            let deadline = self.last_activity().max(started) + watchdog;
+            let deadline = (self.last_activity().max(started) + watchdog).min(ceiling);
             match tokio::time::timeout_at(deadline, &mut reply).await {
                 Ok(Ok(result)) => return result,
                 Ok(Err(_)) => {
@@ -334,7 +399,22 @@ impl DaemonMux {
                     });
                 }
                 Err(_elapsed) => {
-                    if tokio::time::Instant::now() < self.last_activity().max(started) + watchdog {
+                    let now = tokio::time::Instant::now();
+                    if now >= ceiling {
+                        self.lock_state().pending.remove(&id);
+                        tracing::warn!(
+                            secs = self.ceiling.as_secs(),
+                            "daemon never answered an IPC request; giving up on it"
+                        );
+                        return Err(TransportFailure {
+                            message: format!(
+                                "daemon did not answer within {}s",
+                                self.ceiling.as_secs()
+                            ),
+                            reconnectable: false,
+                        });
+                    }
+                    if now < self.last_activity().max(started) + watchdog {
                         continue;
                     }
                     tracing::warn!(
@@ -671,7 +751,11 @@ impl IpcProxyHandler {
         };
         let shared = Arc::new_cyclic(|self_ref| SharedConnection {
             capabilities: std::sync::RwLock::new(session.capabilities.clone()),
-            conn: Mutex::new(ProxyConnection::start(session, self_ref.clone())),
+            conn: Mutex::new(ProxyConnection::start(
+                session,
+                config_path.as_ref(),
+                self_ref.clone(),
+            )),
             self_ref: self_ref.clone(),
             cancellation_identity: std::sync::RwLock::new(cancellation_identity),
             config_path,
@@ -968,7 +1052,11 @@ impl IpcProxyHandler {
         }
         let replaced = std::mem::replace(
             conn,
-            ProxyConnection::start(session, shared.self_ref.clone()),
+            ProxyConnection::start(
+                session,
+                shared.config_path.as_ref(),
+                shared.self_ref.clone(),
+            ),
         );
         // Requests still waiting on the old connection fail over to the new
         // one through their own retry policy.
@@ -5397,6 +5485,87 @@ mod tests {
             .await
             .expect("daemon task timeout")
             .expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// Sets the per-request ceiling for one test, cleared on drop.
+    struct RequestCeilingTestOverride;
+
+    impl RequestCeilingTestOverride {
+        fn install(duration: Duration) -> Self {
+            REQUEST_CEILING_TEST_OVERRIDE_MS.store(
+                duration.as_millis() as u64,
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            Self
+        }
+    }
+
+    impl Drop for RequestCeilingTestOverride {
+        fn drop(&mut self) {
+            REQUEST_CEILING_TEST_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// The daemon keeps answering heartbeats but never answers one call. The
+    /// call fails at the ceiling and the connection stays up.
+    #[tokio::test]
+    async fn a_request_the_daemon_never_answers_fails_at_the_ceiling() {
+        let _guard = daemon_test_lock().lock().await;
+        let _ceiling = RequestCeilingTestOverride::install(Duration::from_millis(500));
+        let temp = unique_temp_dir("request-ceiling");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer, _seen) =
+                fake_daemon_handshake(stream, "fake-session-1").await;
+            // Answer every Ping; swallow everything else.
+            while let Ok(Some(frame)) = ipc::read_frame(&mut reader).await {
+                let request: IpcRequest = serde_json::from_slice(&frame).expect("parse request");
+                if matches!(request, IpcRequest::Ping { .. }) {
+                    let ipc_id = ipc::FrameIds::peek(&frame).ipc_id.expect("tagged");
+                    send_tagged(&mut writer, ipc_id, &IpcResponse::Pong).await;
+                }
+            }
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-request-ceiling".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        // The heartbeat stays on: its pongs are what used to keep the
+        // watchdog from ever firing on the lost call.
+        let proxy = Arc::new(IpcProxyHandler::new(session, None));
+
+        let error = tokio::time::timeout(Duration::from_secs(5), spawn_tool_call(&proxy, "lost"))
+            .await
+            .expect("the lost call hung past its ceiling")
+            .expect("join")
+            .expect_err("the daemon never answered");
+        assert!(
+            error.message.contains("did not answer"),
+            "unexpected error: {}",
+            error.message
+        );
+
+        // Only that request failed; the connection still works.
+        let pong = proxy
+            .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("ping after the lost call");
+        assert!(matches!(pong, IpcResponse::Pong), "{pong:?}");
+        assert_eq!(proxy.shared.conn.lock().await.session_id, "fake-session-1");
+
+        drop(proxy);
+        let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
