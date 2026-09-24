@@ -210,9 +210,6 @@ async fn operator_live_sessions(
                 plug_core::session::DownstreamTransport::Http => {
                     plug_core::ipc::LiveSessionTransport::Http
                 }
-                plug_core::session::DownstreamTransport::Sse => {
-                    plug_core::ipc::LiveSessionTransport::Sse
-                }
             },
             client_id: None,
             session_id: snapshot.session_id,

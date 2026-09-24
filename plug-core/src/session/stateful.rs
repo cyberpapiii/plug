@@ -82,24 +82,19 @@ impl StatefulSessionStore {
         self
     }
 
-    fn notify_expired(&self, session_id: &str) {
-        if let Some(tx) = &self.expiry_tx {
-            let _ = tx.send(session_id.to_owned());
-        }
+    /// Remove `session_id` if it is still expired at the moment of removal,
+    /// and report it to the expiry listener. See [`remove_if_expired`].
+    fn remove_if_expired(&self, session_id: &str) -> bool {
+        remove_if_expired(
+            &self.sessions,
+            self.timeout,
+            self.expiry_tx.as_ref(),
+            session_id,
+        )
     }
 
-    fn prune_expired_sessions(&self) {
-        let expired_ids: Vec<String> = self
-            .sessions
-            .iter()
-            .filter(|entry| entry.last_activity.elapsed() > self.timeout)
-            .map(|entry| entry.key().clone())
-            .collect();
-        for session_id in expired_ids {
-            if self.sessions.remove(&session_id).is_some() {
-                self.notify_expired(&session_id);
-            }
-        }
+    fn prune_expired_sessions(&self) -> usize {
+        prune_expired_sessions(&self.sessions, self.timeout, self.expiry_tx.as_ref())
     }
 
     fn enqueue_pending(entry: &mut SessionState, event: SseEvent) {
@@ -157,8 +152,7 @@ impl StatefulSessionStore {
 
         if entry.last_activity.elapsed() > self.timeout {
             drop(entry);
-            self.sessions.remove(session_id);
-            self.notify_expired(session_id);
+            self.remove_if_expired(session_id);
             return Err(HttpError::SessionNotFound);
         }
 
@@ -214,8 +208,7 @@ impl StatefulSessionStore {
         }
 
         if remove_session {
-            self.sessions.remove(session_id);
-            self.notify_expired(session_id);
+            self.remove_if_expired(session_id);
             return SessionSendOutcome::SessionNotFound;
         }
 
@@ -414,12 +407,6 @@ impl SessionStore for StatefulSessionStore {
         })
     }
 
-    fn touch(&self, session_id: &str) -> Result<(), HttpError> {
-        self.with_live_session_mut(session_id, |entry| {
-            entry.last_activity = Instant::now();
-        })
-    }
-
     fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
         self.with_live_session_mut(session_id, |entry| entry.sse_sender.is_some())
     }
@@ -521,14 +508,8 @@ impl SessionStore for StatefulSessionStore {
             }
         }
         for session_id in expired {
-            if self.sessions.remove(&session_id).is_some() {
-                self.notify_expired(&session_id);
-            }
+            self.remove_if_expired(&session_id);
         }
-    }
-
-    fn send_to_session(&self, session_id: &str, message: SseMessage) {
-        let _ = self.try_send_to_session(session_id, message, true);
     }
 
     fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome {
@@ -563,27 +544,8 @@ impl SessionStore for StatefulSessionStore {
                         break;
                     }
                     _ = interval.tick() => {
-                        // Collect expired session IDs before retain removes them,
-                        // so we can notify the subscription cleanup listener.
-                        let expired_ids: Vec<String> = if expiry_tx.is_some() {
-                            sessions.iter()
-                                .filter(|entry| entry.last_activity.elapsed() > timeout)
-                                .map(|entry| entry.key().clone())
-                                .collect()
-                        } else {
-                            Vec::new()
-                        };
-
-                        let before = sessions.len();
-                        sessions.retain(|_, state| state.last_activity.elapsed() <= timeout);
-                        let expired = before.saturating_sub(sessions.len());
-
-                        if let Some(tx) = &expiry_tx {
-                            for session_id in expired_ids {
-                                let _ = tx.send(session_id);
-                            }
-                        }
-
+                        let expired =
+                            prune_expired_sessions(&sessions, timeout, expiry_tx.as_ref());
                         if expired > 0 {
                             tracing::info!(expired, remaining = sessions.len(), "cleaned up expired sessions");
                         }
@@ -602,9 +564,95 @@ impl SessionStore for StatefulSessionStore {
     }
 }
 
+/// Remove `session_id` only if it is still expired under the map's shard
+/// lock, and tell the expiry listener about it.
+///
+/// Checking expiry and removing in two steps let a request that touched the
+/// session in between lose its session anyway: the listener tore down its
+/// bridge, subscriptions, and tasks while the client was still using it.
+fn remove_if_expired(
+    sessions: &DashMap<String, SessionState>,
+    timeout: Duration,
+    expiry_tx: Option<&mpsc::UnboundedSender<String>>,
+    session_id: &str,
+) -> bool {
+    let removed = sessions
+        .remove_if(session_id, |_, state| {
+            state.last_activity.elapsed() > timeout
+        })
+        .is_some();
+    if removed && let Some(tx) = expiry_tx {
+        let _ = tx.send(session_id.to_owned());
+    }
+    removed
+}
+
+/// Remove every expired session, rechecking each at removal time. Returns how
+/// many were removed.
+fn prune_expired_sessions(
+    sessions: &DashMap<String, SessionState>,
+    timeout: Duration,
+    expiry_tx: Option<&mpsc::UnboundedSender<String>>,
+) -> usize {
+    let candidates: Vec<String> = sessions
+        .iter()
+        .filter(|entry| entry.last_activity.elapsed() > timeout)
+        .map(|entry| entry.key().clone())
+        .collect();
+    candidates
+        .iter()
+        .filter(|session_id| remove_if_expired(sessions, timeout, expiry_tx, session_id))
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn backdate(store: &StatefulSessionStore, session_id: &str) {
+        store
+            .sessions
+            .get_mut(session_id)
+            .expect("session")
+            .last_activity = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("backdate instant");
+    }
+
+    #[test]
+    fn expiry_rechecks_at_removal_so_a_refreshed_session_survives() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let id = store.create_session().unwrap();
+        backdate(&store, &id);
+
+        // The sweep saw it expired, then a request refreshed it before the
+        // removal ran.
+        store.sessions.get_mut(&id).unwrap().last_activity = Instant::now();
+        assert!(!store.remove_if_expired(&id));
+
+        assert!(store.validate(&id).is_ok(), "a live session must survive");
+        assert!(
+            rx.try_recv().is_err(),
+            "a live session must not be reported expired"
+        );
+    }
+
+    #[test]
+    fn prune_removes_and_reports_each_expired_session_once() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let expired = store.create_session().unwrap();
+        let live = store.create_session().unwrap();
+        backdate(&store, &expired);
+
+        assert_eq!(store.prune_expired_sessions(), 1);
+        assert_eq!(store.prune_expired_sessions(), 0);
+        assert_eq!(rx.try_recv().unwrap(), expired);
+        assert!(rx.try_recv().is_err());
+        assert!(store.validate(&live).is_ok());
+        assert!(store.validate(&expired).is_err());
+    }
 
     #[test]
     fn create_session_returns_uuid() {
@@ -619,13 +667,6 @@ mod tests {
         let store = StatefulSessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         assert!(store.validate(&id).is_ok());
-    }
-
-    #[test]
-    fn touch_existing_session() {
-        let store = StatefulSessionStore::new(1800, 100);
-        let id = store.create_session().unwrap();
-        assert!(store.touch(&id).is_ok());
     }
 
     #[test]
@@ -941,7 +982,7 @@ mod tests {
         })
         .unwrap();
 
-        store.send_to_session(
+        store.send_to_live_session(
             &id,
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "requeued"}))
                 .unwrap(),
@@ -968,7 +1009,7 @@ mod tests {
         store.set_sse_sender(&id, tx_a.clone(), None).unwrap();
         drop(rx_a);
 
-        store.send_to_session(
+        store.send_to_live_session(
             &id,
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "closed"}))
                 .unwrap(),
@@ -1028,11 +1069,11 @@ mod tests {
 
         let (first_tx, mut first_rx) = mpsc::channel(8);
         store.set_sse_sender(&id, first_tx, None).unwrap();
-        store.send_to_session(
+        store.send_to_live_session(
             &id,
             crate::session::SseMessage::from_json_value(serde_json::json!({"seq": 1})).unwrap(),
         );
-        store.send_to_session(
+        store.send_to_live_session(
             &id,
             crate::session::SseMessage::from_json_value(serde_json::json!({"seq": 2})).unwrap(),
         );
@@ -1058,7 +1099,7 @@ mod tests {
         let store = StatefulSessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
-        store.send_to_session(
+        store.send_to_live_session(
             &id,
             crate::session::SseMessage::from_json_value(serde_json::json!({"seq": 1})).unwrap(),
         );
@@ -1076,7 +1117,7 @@ mod tests {
         let store = StatefulSessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
-        store.send_to_session(
+        store.send_to_live_session(
             &id,
             crate::session::SseMessage::from_json_value_with_replay_key(
                 serde_json::json!({"jsonrpc": "2.0", "id": 7, "method": "roots/list"}),
@@ -1103,7 +1144,7 @@ mod tests {
         let id = store.create_session().unwrap();
 
         for seq in 1..=5u64 {
-            store.send_to_session(
+            store.send_to_live_session(
                 &id,
                 crate::session::SseMessage::from_json_value(serde_json::json!({"seq": seq}))
                     .unwrap(),

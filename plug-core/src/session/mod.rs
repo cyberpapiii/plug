@@ -39,13 +39,6 @@ impl SseMessage {
         })
     }
 
-    pub fn from_serialized(serialized: Arc<str>) -> Self {
-        Self {
-            serialized,
-            replay_key: None,
-        }
-    }
-
     pub fn from_json_value_with_replay_key(
         value: serde_json::Value,
         replay_key: SseReplayKey,
@@ -143,14 +136,12 @@ impl BroadcastAudience {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownstreamTransport {
     Http,
-    Sse,
 }
 
 impl std::fmt::Display for DownstreamTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Http => write!(f, "http"),
-            Self::Sse => write!(f, "sse"),
         }
     }
 }
@@ -176,7 +167,6 @@ pub struct DownstreamSessionSnapshot {
 pub trait SessionStore: Send + Sync {
     fn create_session(&self) -> Result<String, HttpError>;
     fn validate(&self, session_id: &str) -> Result<(), HttpError>;
-    fn touch(&self, session_id: &str) -> Result<(), HttpError>;
     fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError>;
     fn set_sse_sender(
         &self,
@@ -197,7 +187,6 @@ pub trait SessionStore: Send + Sync {
     ) -> Result<(), HttpError>;
     fn remove(&self, session_id: &str) -> bool;
     fn broadcast(&self, message: SseMessage, kind: BroadcastKind);
-    fn send_to_session(&self, session_id: &str, message: SseMessage);
     fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome;
     fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey);
     fn spawn_cleanup_task(&self, cancel: CancellationToken);

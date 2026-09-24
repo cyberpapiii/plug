@@ -73,6 +73,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A remote client that cancels an elicitation or sampling request no longer
   leaves the pending request behind. It used to stay registered, and replay
   to the client on its next reconnect, until the session ended.
+- A remote HTTP session that sends a request just as the idle sweep runs no
+  longer loses its subscriptions, roots, and tasks while it stays open. The
+  sweep now rechecks expiry at the moment it removes a session.
 
 ## [0.8.11] - 2026-09-01
 

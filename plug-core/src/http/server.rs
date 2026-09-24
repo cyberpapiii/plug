@@ -554,7 +554,7 @@ impl HttpState {
                                         if let Some(message) =
                                             notification_to_sse_message(&notification)
                                         {
-                                            state.sessions.send_to_session(session_id, message);
+                                            state.sessions.send_to_live_session(session_id, message);
                                         }
                                     }
                                     ResolvedDelivery::ToTarget(_) => {}
@@ -1424,7 +1424,7 @@ async fn get_mcp(
     let session_store = Arc::clone(&state.sessions);
     let keepalive_session_id = session_id.clone();
     let sse = sse_stream_with_heartbeat(rx, state.cancel.clone(), move || {
-        let _ = session_store.touch(&keepalive_session_id);
+        let _ = session_store.validate(&keepalive_session_id);
     });
     let mut response = sse.into_response();
     response
@@ -4512,10 +4512,6 @@ mod tests {
             self.inner.validate(session_id)
         }
 
-        fn touch(&self, session_id: &str) -> Result<(), HttpError> {
-            self.inner.touch(session_id)
-        }
-
         fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
             self.inner.has_live_sse_sender(session_id)
         }
@@ -4555,10 +4551,6 @@ mod tests {
 
         fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
             self.inner.broadcast(message, kind);
-        }
-
-        fn send_to_session(&self, session_id: &str, message: SseMessage) {
-            self.inner.send_to_session(session_id, message);
         }
 
         fn send_to_live_session(

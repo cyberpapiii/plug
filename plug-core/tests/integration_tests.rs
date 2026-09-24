@@ -28,7 +28,6 @@ use plug_core::config::{
 };
 use plug_core::engine::Engine;
 use plug_core::http::server::{HttpState, build_router};
-use plug_core::http::session::SessionManager;
 use plug_core::oauth;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
@@ -2686,7 +2685,8 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Auto,
         downstream_oauth: None,
@@ -3085,7 +3085,8 @@ async fn test_http_structured_content_passes_through_end_to_end() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Auto,
         downstream_oauth: None,
@@ -3170,7 +3171,8 @@ async fn test_http_resource_link_passes_through_end_to_end() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Auto,
         downstream_oauth: None,
@@ -3256,7 +3258,8 @@ async fn test_http_oversized_tool_result_spills_to_artifact_link() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Auto,
         downstream_oauth: None,
@@ -4578,7 +4581,8 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     let approval_manager = manager.clone();
     let app = build_router(Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
         downstream_oauth: Some(manager),
@@ -4963,7 +4967,8 @@ async fn test_http_elicitation_reverse_request_round_trip() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Auto,
         downstream_oauth: None,
@@ -5147,7 +5152,8 @@ async fn test_http_sampling_reverse_request_round_trip() {
 
     let state = Arc::new(HttpState {
         router: engine.tool_router().clone(),
-        sessions: Arc::new(SessionManager::new(1800, 100)) as Arc<dyn SessionStore>,
+        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+            as Arc<dyn SessionStore>,
         cancel: CancellationToken::new(),
         auth_mode: plug_core::config::DownstreamAuthMode::Auto,
         downstream_oauth: None,

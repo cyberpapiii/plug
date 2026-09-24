@@ -9,14 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::SseEvent;
 
-/// SSE stream from an mpsc receiver with priming event, keepalive comments, and cancel.
-pub fn sse_stream(
-    rx: mpsc::Receiver<SseEvent>,
-    cancel: CancellationToken,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), || {})
-}
-
+/// SSE stream from an mpsc receiver with priming event, keepalive comments
+/// (each one calling `on_keepalive`), and cancel.
 pub fn sse_stream_with_heartbeat<F>(
     rx: mpsc::Receiver<SseEvent>,
     cancel: CancellationToken,
@@ -110,7 +104,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
-        let sse = sse_stream(rx, cancel.clone());
+        let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
         let response = sse.into_response();
         let body = response.into_body();
 
@@ -132,7 +126,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
-        let sse = sse_stream(rx, cancel.clone());
+        let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
         let response = sse.into_response();
         let body = response.into_body();
 
@@ -173,7 +167,7 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<SseEvent>(8);
         let cancel = CancellationToken::new();
 
-        let sse = sse_stream(rx, cancel.clone());
+        let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
         let response = sse.into_response();
         let body = response.into_body();
 
