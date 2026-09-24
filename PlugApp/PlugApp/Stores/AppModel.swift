@@ -37,6 +37,8 @@ final class AppModel {
     private let clientVersion: String
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
+    private var refreshRequestedAgain = false
+    private var refreshAgainForcesCatalog = false
     private var reconciliationTask: Task<Void, Never>?
     private var hasStarted = false
     private var reconciliationInFlight = false
@@ -317,80 +319,103 @@ final class AppModel {
         coordinator.openLog()
     }
 
+    /// Reads the daemon's state. A call that arrives while a read is already
+    /// running waits for one more read that starts after it, because the caller
+    /// usually just changed something and the read in flight may predate it.
     func refresh(forceCatalog: Bool = false) async {
-        guard refreshTask == nil, !reconciliationInFlight else { return }
+        guard !reconciliationInFlight else { return }
+        if let refreshTask {
+            refreshRequestedAgain = true
+            refreshAgainForcesCatalog = refreshAgainForcesCatalog || forceCatalog
+            await refreshTask.value
+            return
+        }
         let task = Task { @MainActor [weak self] in
             guard let self else { return }
-            if connectionState != .ready { connectionState = .connecting }
-            do {
-                let handshake = try await ipc.connect()
-                capabilities = Set(handshake.capabilities)
-                guard handshake.ipcMin <= 6, handshake.ipcMax >= 3 else {
-                    connectionState = .incompatible
-                    lastError = nil
-                    return
-                }
-                guard handshake.daemonVersion == clientVersion else {
-                    connectionState = .incompatible
-                    lastError = nil
-                    if !attemptedSkewRecovery {
-                        attemptedSkewRecovery = true
-                        await retry()
-                    }
-                    return
-                }
-                attemptedSkewRecovery = false
-                let token = try String(contentsOf: tokenURL, encoding: .utf8)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
-                    throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
-                }
-                let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
-                let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
-                snapshot = value
-                hasLoadedSnapshot = true
-                NotificationService.shared.observe(value)
-                if case let .activity(events) = try await ipc.request(
-                    .activity(
-                        authToken: token,
-                        afterSequence: activityCursor,
-                        limit: Self.activityLimit + 1,
-                        failuresOnly: false
-                    )
-                ) {
-                    if activityCursor == 0 {
-                        activityWasTruncated = events.count > Self.activityLimit
-                        activities = Array(events.suffix(Self.activityLimit))
-                    } else if !events.isEmpty {
-                        let merged = activities + events
-                        activityWasTruncated = activityWasTruncated
-                            || merged.count > Self.activityLimit
-                        activities = Array(merged.suffix(Self.activityLimit))
-                    }
-                }
-                // The tool list is nearly a megabyte and the snapshot above
-                // already reports when it would answer differently, so ask for
-                // it only then. This used to refetch on a timer as well,
-                // because the fingerprint was assembled here from server
-                // fields and could not see a tool disabled from the CLI. The
-                // daemon reports that now.
-                let revision = value.toolCatalogRevision
-                if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
-                   case let .tools(tools) = try await ipc.request(.listTools)
-                {
-                    toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
-                    toolCatalogRevision = revision
-                }
-                connectionState = .ready
-                lastError = nil
-            } catch {
-                connectionState = .disconnected
-                lastError = error.localizedDescription
-            }
+            var force = forceCatalog
+            repeat {
+                refreshRequestedAgain = false
+                await readDaemonState(forceCatalog: force)
+                force = refreshAgainForcesCatalog
+                refreshAgainForcesCatalog = false
+            } while refreshRequestedAgain && !reconciliationInFlight
+            refreshRequestedAgain = false
+            // Cleared here rather than by the caller, in the same turn that
+            // ends the loop, so no request can land between the last read and
+            // the task being forgotten.
+            refreshTask = nil
         }
         refreshTask = task
         await task.value
-        refreshTask = nil
+    }
+
+    private func readDaemonState(forceCatalog: Bool) async {
+        if connectionState != .ready { connectionState = .connecting }
+        do {
+            let handshake = try await ipc.connect()
+            capabilities = Set(handshake.capabilities)
+            guard handshake.ipcMin <= 6, handshake.ipcMax >= 3 else {
+                connectionState = .incompatible
+                lastError = nil
+                return
+            }
+            guard handshake.daemonVersion == clientVersion else {
+                connectionState = .incompatible
+                lastError = nil
+                if !attemptedSkewRecovery {
+                    attemptedSkewRecovery = true
+                    await retry()
+                }
+                return
+            }
+            attemptedSkewRecovery = false
+            let token = try String(contentsOf: tokenURL, encoding: .utf8)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
+                throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
+            }
+            let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
+            let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
+            snapshot = value
+            hasLoadedSnapshot = true
+            NotificationService.shared.observe(value)
+            if case let .activity(events) = try await ipc.request(
+                .activity(
+                    authToken: token,
+                    afterSequence: activityCursor,
+                    limit: Self.activityLimit + 1,
+                    failuresOnly: false
+                )
+            ) {
+                if activityCursor == 0 {
+                    activityWasTruncated = events.count > Self.activityLimit
+                    activities = Array(events.suffix(Self.activityLimit))
+                } else if !events.isEmpty {
+                    let merged = activities + events
+                    activityWasTruncated = activityWasTruncated
+                        || merged.count > Self.activityLimit
+                    activities = Array(merged.suffix(Self.activityLimit))
+                }
+            }
+            // The tool list is nearly a megabyte and the snapshot above
+            // already reports when it would answer differently, so ask for
+            // it only then. This used to refetch on a timer as well,
+            // because the fingerprint was assembled here from server
+            // fields and could not see a tool disabled from the CLI. The
+            // daemon reports that now.
+            let revision = value.toolCatalogRevision
+            if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
+               case let .tools(tools) = try await ipc.request(.listTools)
+            {
+                toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
+                toolCatalogRevision = revision
+            }
+            connectionState = .ready
+            lastError = nil
+        } catch {
+            connectionState = .disconnected
+            lastError = error.localizedDescription
+        }
     }
 
     func performOperation(_ request: (String) -> IPCRequest) async throws {

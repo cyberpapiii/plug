@@ -71,6 +71,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   they open. The background poll used to finish its 30-second sleep first, so
   after the first read an open panel could miss changes for up to half a
   minute.
+- After you switch a tool or server, sign in or out, or connect an app,
+  Plug.app shows the result without waiting for the next poll. A refresh
+  asked for while another was running used to be dropped, so the view could
+  keep showing the state from before the change.
 
 ## [0.8.11] - 2026-09-01
 
