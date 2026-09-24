@@ -111,6 +111,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   file, and suggests `chmod 600`.
 - `plug doctor` reports a missing stdio server program once, under server
   programs, instead of also failing connectivity for the same server.
+- With `tool_filter_enabled = false`, a client whose lazy-tools setting is
+  `standard` or `native` now gets every tool even when the global setting
+  (or `meta_tool_mode`) hides tools behind search. It used to get the
+  global setting's search-only list.
 
 ## [0.8.11] - 2026-09-01
 

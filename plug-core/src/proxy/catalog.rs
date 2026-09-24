@@ -686,10 +686,13 @@ impl super::ToolRouter {
         ) {
             return Arc::new(self.filtered_legacy_meta_tools());
         }
-        if !self.config.tool_filter_enabled {
-            return self.list_tools();
-        }
         let snapshot = self.cache.load();
+        // This client's own surface is Standard or Native here, so with
+        // filtering disabled it gets the whole catalog. `list_tools()` would
+        // resolve the Unknown client's lazy policy instead.
+        if !self.config.tool_filter_enabled {
+            return Arc::clone(&snapshot.tools_all);
+        }
         match client_type {
             ClientType::Windsurf => Arc::clone(&snapshot.tools_windsurf),
             ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),

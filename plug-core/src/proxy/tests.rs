@@ -566,8 +566,8 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
     // when `tool_filter_enabled` is false, `refresh_tools()` no longer
     // populates `tools_windsurf` / `tools_copilot` (they're left empty).
     // `list_tools_for_client_session` must still return the FULL catalog for
-    // Windsurf/Copilot in that case — it has to take the early-return path
-    // via `list_tools()` before ever reading those two fields.
+    // Windsurf/Copilot in that case — it has to return `tools_all` early
+    // before ever reading those two fields.
     let sm = Arc::new(ServerManager::new());
     let config = RouterConfig {
         tool_filter_enabled: false,
@@ -622,6 +622,86 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
         150,
         "Copilot must still see the full catalog, not the empty pre-cached view"
     );
+}
+
+fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
+    let routes = tools
+        .iter()
+        .map(|tool| {
+            let name = tool.name.to_string();
+            let (server, original) = name.split_once("__").unwrap_or(("fixture", &name));
+            (name.clone(), (server.to_string(), original.to_string()))
+        })
+        .collect();
+    router.cache.store(Arc::new(
+        RouterSnapshot {
+            routes,
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+            tools_all: Arc::new(tools),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            tools_windsurf: Arc::new(Vec::new()),
+            tools_copilot: Arc::new(Vec::new()),
+            resources_all: Arc::new(Vec::new()),
+            resource_templates_all: Arc::new(Vec::new()),
+            prompts_all: Arc::new(Vec::new()),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        }
+        .with_indexes(),
+    ));
+}
+
+#[test]
+fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy() {
+    // A client whose own lazy policy is Standard must get the full catalog
+    // when filtering is disabled, even if the global policy (which the
+    // Unknown client resolves to) hides tools behind the search bridge.
+    let sm = Arc::new(ServerManager::new());
+    let mut lazy_tools = LazyToolsConfig {
+        mode: crate::types::LazyToolSetting::Bridge,
+        ..LazyToolsConfig::default()
+    };
+    lazy_tools.clients.insert(
+        "claude-code".to_string(),
+        crate::types::LazyToolSetting::Standard,
+    );
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        lazy_tools,
+        ..test_router_config()
+    };
+    let router = ToolRouter::new(sm, config);
+    let tools: Vec<Tool> = (0..3)
+        .map(|i| {
+            Tool::new(
+                Cow::Owned(format!("fixture__tool_{i}")),
+                Cow::Owned(format!("Tool {i}")),
+                Arc::new(serde_json::Map::new()),
+            )
+        })
+        .collect();
+    store_plain_tools_snapshot(&router, tools);
+
+    let names = router
+        .list_tools_for_client_session(ClientType::ClaudeCode, None)
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["fixture__tool_0", "fixture__tool_1", "fixture__tool_2"]
+    );
+    // The bridge client itself still gets the bridge surface.
+    let bridge_names = router
+        .list_tools_for_client_session(ClientType::Unknown, None)
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(bridge_names, expected_meta_tool_names());
 }
 
 #[test]
