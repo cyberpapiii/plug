@@ -70,6 +70,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- A server that failed at startup and later recovered now gets its
+  `max_concurrent` limit and circuit breaker. It used to run with neither
+  for the rest of the daemon's life.
+- One upstream that never answers `logging/setLevel` no longer holds up
+  every server that finishes starting after it. The log level is now pushed
+  in the background with a five-second bound, and also after a reload or
+  reconnect, which used to skip it.
+- A legacy server that ignores `tasks/list` now starts. The task capability
+  probe waited up to the 300-second call timeout inside the 30-second start
+  timeout; it now gives up after three seconds and runs beside the tool list.
+- Re-listing tools after an upstream's `tools/list_changed` now times out
+  after the server's `call_timeout_secs` instead of waiting forever.
 
 ## [0.8.11] - 2026-09-01
 

@@ -153,6 +153,17 @@ struct InitializedNotificationCompatHttpClient {
 /// the same bound on the path that carries every upstream call.
 pub(crate) const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// Bound on the legacy `tasks/list` capability probe. A legacy server that
+/// implements the old task surface answers a read-only list at once; one that
+/// ignores the method would otherwise hold the start open for its whole
+/// `call_timeout_secs`, which is longer than the start timeout itself.
+const LEGACY_TASKS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Bound on pushing the effective log level to a newly registered upstream.
+/// It runs in the background, so this only caps how long a server that never
+/// answers `logging/setLevel` keeps the request open.
+const INITIAL_LOG_LEVEL_TIMEOUT: Duration = Duration::from_secs(5);
+
 fn upstream_http_client() -> reqwest::Client {
     // Building a TLS-capable client panics without a crypto provider, and the
     // callers that used to guarantee one are elsewhere in the start path.
@@ -543,6 +554,9 @@ pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
     tools: Arc<ArcSwap<Vec<Tool>>>,
     router: std::sync::Weak<ToolRouter>,
+    /// Bound on the re-list a `tools/list_changed` notification triggers: the
+    /// server's `call_timeout_secs`, the same bound every other listing uses.
+    list_timeout: Duration,
     #[cfg(test)]
     protocol_version_override: Option<rmcp::model::ProtocolVersion>,
 }
@@ -562,6 +576,7 @@ impl UpstreamClientHandler {
             server_id,
             tools,
             router,
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         }
     }
@@ -576,6 +591,7 @@ impl UpstreamClientHandler {
             server_id,
             tools,
             router,
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: Some(protocol_version),
         }
     }
@@ -677,21 +693,29 @@ impl ClientHandler for UpstreamClientHandler {
         let router = self.router.clone();
         let peer = context.peer.clone();
         let server_id = Arc::clone(&self.server_id);
+        let list_timeout = self.list_timeout;
 
         async move {
-            match peer.list_all_tools().await {
-                Ok(fresh_tools) => {
+            match tokio::time::timeout(list_timeout, peer.list_all_tools()).await {
+                Ok(Ok(fresh_tools)) => {
                     tools.store(Arc::new(fresh_tools));
 
                     if let Some(router) = router.upgrade() {
                         router.schedule_tool_list_changed_refresh();
                     }
                 }
-                Err(error) => {
+                Ok(Err(error)) => {
                     tracing::warn!(
                         server = %server_id,
                         error = %error,
                         "failed to refresh tools after tools/list_changed"
+                    );
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        server = %server_id,
+                        timeout_secs = list_timeout.as_secs(),
+                        "timed out refreshing tools after tools/list_changed"
                     );
                 }
             }
@@ -1365,41 +1389,7 @@ impl ServerManager {
                         "server started"
                     );
 
-                    // Apply current effective log level to new server so all
-                    // upstreams converge to the same level regardless of start order.
-                    if upstream.capabilities.logging.is_some()
-                        && let Some(router) = self.tool_router().upgrade()
-                    {
-                        let level = router.log_level();
-                        let params = SetLevelRequestParams::new(level);
-                        if let Err(e) = upstream.client.peer().set_level(params).await {
-                            tracing::debug!(
-                                server = %name,
-                                error = %e,
-                                "failed to apply initial log level"
-                            );
-                        }
-                    }
-
-                    let max_concurrent = upstream.config.max_concurrent;
-                    let cb_enabled = upstream.config.circuit_breaker_enabled;
-                    self.configured_auth.insert(
-                        name.clone(),
-                        Self::configured_auth_for_server(&upstream.config),
-                    );
-                    self.insert_upstream(name.clone(), Arc::new(upstream));
-
-                    self.health.insert(name.clone(), HealthState::new());
-                    self.semaphores.insert(
-                        name.clone(),
-                        Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-                    );
-                    if cb_enabled {
-                        self.circuit_breakers.insert(
-                            name.clone(),
-                            Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
-                        );
-                    }
+                    self.register_started(&name, upstream);
                     on_settled(&name);
                 }
                 Ok((name, Err(e))) => {
@@ -1483,15 +1473,15 @@ impl ServerManager {
                         "spawning server process"
                     );
 
-                    let transport =
-                        rmcp::transport::child_process::TokioChildProcess::new(cmd)
-                            .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
+                    let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)
+                        .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
                     let handler = Arc::new(UpstreamClientHandler {
                         server_id: Arc::from(name),
                         tools: Arc::clone(&tools),
                         router: tool_router.clone(),
+                        list_timeout: Duration::from_secs(config.call_timeout_secs),
                         #[cfg(test)]
                         protocol_version_override: None,
                     });
@@ -1504,77 +1494,17 @@ impl ServerManager {
                         .await
                         .map_err(|e| anyhow::anyhow!("failed to initialize client: {e}"))?;
 
-                    let tools_result = client
-                        .peer()
-                        .list_all_tools()
-                        .await
-                        .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
-                    tools.store(Arc::new(tools_result));
-
-                    let server_info = client.peer().peer_info();
-                    let selected_protocol_version = server_info
-                        .as_ref()
-                        .map(|info| info.protocol_version.to_string())
-                        .unwrap_or_else(|| crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string());
-                    let protocol_era = crate::protocol::ProtocolEra::from_version(
-                        &server_info
-                            .as_ref()
-                            .map(|info| info.protocol_version.clone())
-                            .unwrap_or(rmcp::model::ProtocolVersion::V_2025_11_25),
-                    );
-                    let upstream = server_info.as_ref().and_then(|info| {
-                        info.server_info
-                            .as_ref()
-                            .and_then(|implementation| {
-                                upstream_metadata_from_implementation(
-                                    implementation,
-                                    &selected_protocol_version,
-                                )
-                            })
-                    });
-                    if let Some(info) = server_info {
-                        let implementation = info.server_info.as_ref();
-                        tracing::info!(
-                            server = %name,
-                            server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
-                            server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
-                            configured_protocol = ?config.protocol_mode,
-                            effective_protocol = ?effective_protocol_mode,
-                            selected_protocol = %info.protocol_version,
-                            "connected to server"
-                        );
-                    }
-
-                    let mut capabilities = client
-                        .peer()
-                        .peer_info()
-                        .map(|info| info.capabilities.clone())
-                        .unwrap_or_default();
-                    if protocol_era == crate::protocol::ProtocolEra::Legacy {
-                        restore_legacy_task_capability(
-                            client.peer(),
-                            &mut capabilities,
-                            Duration::from_secs(config.call_timeout_secs),
-                        )
-                        .await;
-                    } else {
-                        capabilities.extensions = None;
-                        capabilities.experimental = None;
-                    }
-
-                    Ok(UpstreamServer {
-                        name: name.to_string(),
-                        config: config.clone(),
+                    Self::finish_upstream_connection(
+                        name,
+                        config,
                         client,
                         tools,
-                        capabilities,
-                        upstream,
-                        protocol_era,
-                        selected_protocol_version,
-                        protocol_gate_state: modern_upstream_gate_state,
-                        connection: ConnectionGeneration::new(),
-                        health: ServerHealth::Healthy,
-                    })
+                        "stdio upstream",
+                        effective_protocol_mode,
+                        modern_upstream_gate_state,
+                        ConnectionGeneration::new(),
+                    )
+                    .await
                 }
                 TransportType::Http => {
                     crate::tls::ensure_rustls_provider_installed();
@@ -1584,44 +1514,10 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("HTTP transport requires a URL"))?;
 
-                    // SSRF protection: reject private/loopback/link-local URLs.
-                    // Note: DNS-based bypasses (hostname resolving to private IP) are
-                    // not covered here — would require async DNS resolution at connect time.
-                    let parsed = url
-                        .parse::<http::Uri>()
-                        .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-                    if let Some(host) = parsed.host()
-                        && is_blocked_host(host) {
-                            anyhow::bail!(
-                                "URL host '{host}' is blocked — private, loopback, or metadata endpoint"
-                            );
-                        }
-
-                    let mut transport_config =
-                        StreamableHttpClientTransportConfig::with_uri(url);
+                    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
 
                     // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
-                    let auth_token = if config.auth.as_deref() == Some("oauth") {
-                        match crate::oauth::verified_access_token_for_resource(name, url, Duration::from_secs(config.timeout_secs)).await {
-                            Ok(Some(token)) => Some(token),
-                            Err(error) => {
-                                return Err(anyhow::anyhow!(
-                                    "OAuth authority verification failed for server '{name}': {error}"
-                                ));
-                            }
-                            Ok(None) => {
-                                tracing::info!(
-                                    server = %name,
-                                    "OAuth server has no available token, marking AuthRequired"
-                                );
-                                return Err(anyhow::anyhow!("OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."));
-                            }
-                        }
-                    } else {
-                        config.auth_token.as_ref().map(|t| t.as_str().to_string())
-                    };
-
-                    if let Some(token) = auth_token {
+                    if let Some(token) = resolve_upstream_auth(name, url, config).await? {
                         transport_config = transport_config.auth_header(token);
                     }
 
@@ -1650,6 +1546,7 @@ impl ServerManager {
                         server_id: Arc::from(name),
                         tools: Arc::clone(&tools),
                         router: tool_router.clone(),
+                        list_timeout: Duration::from_secs(config.call_timeout_secs),
                         #[cfg(test)]
                         protocol_version_override: None,
                     });
@@ -1668,13 +1565,15 @@ impl ServerManager {
                                 client,
                                 tools,
                                 "HTTP upstream",
+                                effective_protocol_mode,
                                 modern_upstream_gate_state,
                                 connection,
-                            ).await
+                            )
+                            .await
                         }
                         Err(e) => {
-                            let error = anyhow::Error::new(e)
-                                .context("failed to connect to HTTP upstream");
+                            let error =
+                                anyhow::Error::new(e).context("failed to connect to HTTP upstream");
                             if should_fallback_to_legacy_sse(effective_protocol_mode, &error) {
                                 tracing::info!(
                                     server = %name,
@@ -1686,7 +1585,8 @@ impl ServerManager {
                                     config,
                                     tool_router,
                                     modern_upstream_gate_state,
-                                ).await
+                                )
+                                .await
                             } else {
                                 Err(error)
                             }
@@ -1705,7 +1605,8 @@ impl ServerManager {
                         config,
                         tool_router,
                         modern_upstream_gate_state,
-                    ).await
+                    )
+                    .await
                 }
             }
         })
@@ -1742,45 +1643,10 @@ impl ServerManager {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("SSE transport requires a URL"))?;
 
-        // SSRF protection: same rules as HTTP upstream
-        let parsed = url
-            .parse::<http::Uri>()
-            .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-        if let Some(host) = parsed.host()
-            && is_blocked_host(host)
-        {
-            anyhow::bail!("URL host '{host}' is blocked — private, loopback, or metadata endpoint");
-        }
-
+        let auth_token = resolve_upstream_auth(name, url, config).await?;
         let mut transport_config = LegacySseTransportConfig::with_uri(url)
             .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs));
-
-        // Resolve auth token: OAuth token from cache, or static bearer token
-        let auth_token_value = if config.auth.as_deref() == Some("oauth") {
-            match crate::oauth::verified_access_token_for_resource(
-                name,
-                url,
-                Duration::from_secs(config.timeout_secs),
-            )
-            .await
-            {
-                Ok(Some(token)) => Some(token),
-                Err(error) => {
-                    return Err(anyhow::anyhow!(
-                        "OAuth authority verification failed for server '{name}': {error}"
-                    ));
-                }
-                Ok(None) => {
-                    return Err(anyhow::anyhow!(
-                        "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
-                    ));
-                }
-            }
-        } else {
-            config.auth_token.as_ref().map(|t| t.as_str().to_string())
-        };
-
-        if let Some(token) = auth_token_value {
+        if let Some(token) = auth_token {
             transport_config = transport_config.auth_token(token.as_str());
         }
 
@@ -1808,6 +1674,7 @@ impl ServerManager {
             server_id: Arc::from(name),
             tools: Arc::clone(&tools),
             router: tool_router,
+            list_timeout: Duration::from_secs(config.call_timeout_secs),
             #[cfg(test)]
             protocol_version_override: None,
         });
@@ -1823,6 +1690,7 @@ impl ServerManager {
             client,
             tools,
             "legacy SSE upstream",
+            UpstreamProtocolMode::Legacy,
             modern_upstream_gate_state,
             connection,
         )
@@ -1830,22 +1698,19 @@ impl ServerManager {
     }
 
     /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
+    ///
+    /// Every transport ends here, so the three start paths cannot drift apart.
+    #[allow(clippy::too_many_arguments)]
     async fn finish_upstream_connection(
         name: &str,
         config: &ServerConfig,
         client: McpClient,
         tools: Arc<ArcSwap<Vec<Tool>>>,
         transport_label: &str,
+        effective_protocol_mode: UpstreamProtocolMode,
         modern_upstream_gate_state: u64,
         connection: ConnectionGeneration,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        let tools_result = client
-            .peer()
-            .list_all_tools()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
-        tools.store(Arc::new(tools_result));
-
         let server_info = client.peer().peer_info();
         let selected_protocol_version = server_info
             .as_ref()
@@ -1862,34 +1727,43 @@ impl ServerManager {
                 upstream_metadata_from_implementation(implementation, &selected_protocol_version)
             })
         });
-        if let Some(info) = server_info {
+        if let Some(info) = server_info.as_ref() {
             let implementation = info.server_info.as_ref();
             tracing::info!(
                 server = %name,
                 server_name = implementation.map(|value| value.name.as_ref()).unwrap_or("unknown"),
                 server_version = implementation.map(|value| value.version.as_ref()).unwrap_or("unknown"),
                 configured_protocol = ?config.protocol_mode,
+                effective_protocol = ?effective_protocol_mode,
                 selected_protocol = %info.protocol_version,
                 "connected to {transport_label}"
             );
         }
 
-        let mut capabilities = client
-            .peer()
-            .peer_info()
+        let mut capabilities = server_info
             .map(|info| info.capabilities.clone())
             .unwrap_or_default();
-        if protocol_era == crate::protocol::ProtocolEra::Legacy {
-            restore_legacy_task_capability(
-                client.peer(),
-                &mut capabilities,
-                Duration::from_secs(config.call_timeout_secs),
-            )
-            .await;
-        } else {
+        let legacy = protocol_era == crate::protocol::ProtocolEra::Legacy;
+        if !legacy {
             capabilities.extensions = None;
             capabilities.experimental = None;
         }
+
+        // The legacy task probe runs beside the tool listing rather than after
+        // it, and on its own short bound, so a legacy server that ignores
+        // `tasks/list` costs at most the probe bound instead of its whole
+        // start timeout.
+        let probe_timeout =
+            LEGACY_TASKS_PROBE_TIMEOUT.min(Duration::from_secs(config.call_timeout_secs));
+        let (tools_result, ()) = tokio::join!(client.peer().list_all_tools(), async {
+            if legacy {
+                restore_legacy_task_capability(client.peer(), &mut capabilities, probe_timeout)
+                    .await;
+            }
+        });
+        let tools_result =
+            tools_result.map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+        tools.store(Arc::new(tools_result));
 
         Ok(UpstreamServer {
             name: name.to_string(),
@@ -2357,22 +2231,82 @@ impl ServerManager {
         config: &ServerConfig,
     ) -> Result<(), anyhow::Error> {
         let upstream = self.start_server(name, config).await?;
-        let max_concurrent = upstream.config.max_concurrent;
-        let cb_enabled = upstream.config.circuit_breaker_enabled;
-        self.insert_upstream(name.to_string(), Arc::new(upstream));
-
-        self.health.insert(name.to_string(), HealthState::new());
-        self.semaphores.insert(
-            name.to_string(),
-            Arc::new(tokio::sync::Semaphore::new(max_concurrent)),
-        );
-        if cb_enabled {
-            self.circuit_breakers.insert(
-                name.to_string(),
-                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
-            );
-        }
+        self.register_started(name, upstream);
         Ok(())
+    }
+
+    /// Register a freshly started upstream: a clean health entry, fresh call
+    /// guards, and the effective log level.
+    fn register_started(&self, name: &str, upstream: UpstreamServer) {
+        let upstream = Arc::new(upstream);
+        self.install_call_guards(name, &upstream.config, true);
+        self.insert_upstream(name.to_string(), Arc::clone(&upstream));
+        self.health.insert(name.to_string(), HealthState::new());
+        self.spawn_initial_log_level(name, &upstream);
+    }
+
+    /// Give `name` the per-server concurrency limit and circuit breaker every
+    /// call path expects, plus its configured auth kind.
+    ///
+    /// `fresh` (a new start) installs new guards. Otherwise (a reconnect) an
+    /// existing semaphore is kept so in-flight permits stay accounted for, an
+    /// existing breaker is reset, and whichever is missing is created: a
+    /// server that failed at boot has neither until it first recovers.
+    fn install_call_guards(&self, name: &str, config: &ServerConfig, fresh: bool) {
+        self.configured_auth
+            .insert(name.to_string(), Self::configured_auth_for_server(config));
+        let new_semaphore = || Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
+        let new_breaker = || Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
+        if fresh {
+            self.semaphores.insert(name.to_string(), new_semaphore());
+            if config.circuit_breaker_enabled {
+                self.circuit_breakers
+                    .insert(name.to_string(), new_breaker());
+            }
+            return;
+        }
+        // Read-only check first: a queued call holds a read guard on this
+        // map while it waits for a permit, and `entry()` would block on the
+        // shard write lock until that call finishes.
+        if !self.semaphores.contains_key(name) {
+            self.semaphores.insert(name.to_string(), new_semaphore());
+        }
+        if let Some(cb) = self.circuit_breakers.get(name) {
+            cb.reset();
+        } else if config.circuit_breaker_enabled {
+            self.circuit_breakers
+                .insert(name.to_string(), new_breaker());
+        }
+    }
+
+    /// Push the router's effective log level to a newly registered upstream so
+    /// every upstream converges on the same level whichever way it came up:
+    /// boot, reload, or reconnect. Runs in the background on a short bound so
+    /// a server that never answers `logging/setLevel` holds up nothing.
+    fn spawn_initial_log_level(&self, name: &str, upstream: &UpstreamServer) {
+        if upstream.capabilities.logging.is_none() {
+            return;
+        }
+        let Some(router) = self.tool_router().upgrade() else {
+            return;
+        };
+        let params = SetLevelRequestParams::new(router.log_level());
+        let peer = upstream.client.peer().clone();
+        let name = name.to_string();
+        tokio::spawn(async move {
+            match tokio::time::timeout(INITIAL_LOG_LEVEL_TIMEOUT, peer.set_level(params)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => tracing::debug!(
+                    server = %name,
+                    error = %error,
+                    "failed to apply initial log level"
+                ),
+                Err(_) => tracing::debug!(
+                    server = %name,
+                    "timed out applying initial log level"
+                ),
+            }
+        });
     }
 
     /// Stop and remove a single upstream server.
@@ -2401,11 +2335,9 @@ impl ServerManager {
     /// listing and reclaimed by `stop_server`/`update_availability` if the server is
     /// removed from config.
     pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
+        self.install_call_guards(name, &upstream.config, false);
+        self.spawn_initial_log_level(name, &upstream);
         let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
-
-        if let Some(cb) = self.circuit_breakers.get(name) {
-            cb.reset();
-        }
 
         if let Some(mut entry) = self.health.get_mut(name) {
             *entry = HealthState::new();
@@ -2503,6 +2435,52 @@ impl Default for ServerManager {
 /// Only blocks cloud metadata endpoints (169.254.169.254, metadata.google.internal).
 /// Loopback and private IPs are allowed because all servers in config.toml are
 /// explicitly user-configured — blocking them prevents legitimate local servers.
+/// Check a remote upstream URL against the SSRF block list and resolve the
+/// bearer token to send: the verified OAuth token for `auth = "oauth"`, the
+/// static `auth_token` otherwise. Shared by the HTTP and legacy SSE paths.
+///
+/// DNS-based bypasses (a hostname resolving to a private IP) are not covered;
+/// that would need async resolution at connect time.
+async fn resolve_upstream_auth(
+    name: &str,
+    url: &str,
+    config: &ServerConfig,
+) -> Result<Option<String>, anyhow::Error> {
+    let parsed = url
+        .parse::<http::Uri>()
+        .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+    if let Some(host) = parsed.host()
+        && is_blocked_host(host)
+    {
+        anyhow::bail!("URL host '{host}' is blocked — private, loopback, or metadata endpoint");
+    }
+
+    if config.auth.as_deref() != Some("oauth") {
+        return Ok(config.auth_token.as_ref().map(|t| t.as_str().to_string()));
+    }
+    match crate::oauth::verified_access_token_for_resource(
+        name,
+        url,
+        Duration::from_secs(config.timeout_secs),
+    )
+    .await
+    {
+        Ok(Some(token)) => Ok(Some(token)),
+        Err(error) => Err(anyhow::anyhow!(
+            "OAuth authority verification failed for server '{name}': {error}"
+        )),
+        Ok(None) => {
+            tracing::info!(
+                server = %name,
+                "OAuth server has no available token, marking AuthRequired"
+            );
+            Err(anyhow::anyhow!(
+                "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
+            ))
+        }
+    }
+}
+
 fn is_blocked_host(host: &str) -> bool {
     // Known metadata hostnames
     if host == "metadata.google.internal" {
@@ -3452,6 +3430,7 @@ mod tests {
             server_id: Arc::from(name.to_string()),
             tools: Arc::clone(&tools),
             router: std::sync::Weak::new(),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -3492,6 +3471,7 @@ mod tests {
             server_id: Arc::from(name.to_string()),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(router),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -3831,6 +3811,7 @@ mod tests {
             server_id: Arc::from("replace-test"),
             tools: Arc::clone(&tools_a),
             router: std::sync::Weak::new(),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client_a: McpClient = upstream_handler_a
@@ -3888,6 +3869,7 @@ mod tests {
             server_id: Arc::from("replace-test"),
             tools: Arc::clone(&tools_b),
             router: std::sync::Weak::new(),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client_b: McpClient = upstream_handler_b
@@ -4194,6 +4176,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -4301,6 +4284,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -4633,6 +4617,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -4755,6 +4740,7 @@ mod tests {
             server_id: Arc::from("upstream"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -4894,6 +4880,7 @@ mod tests {
             server_id: Arc::from("catalog"),
             tools: Arc::clone(&tools),
             router: Arc::downgrade(&router),
+            list_timeout: Duration::from_secs(300),
             protocol_version_override: None,
         });
         let client: McpClient = upstream_handler
@@ -5332,5 +5319,221 @@ mod tests {
             "connect took {:?}, which is not bounded by the connect timeout",
             started.elapsed()
         );
+    }
+
+    /// A server that failed at boot has no semaphore and no breaker. When it
+    /// recovers through a reconnect it must get both, or it runs with no
+    /// concurrency limit and no circuit breaker for the rest of the process.
+    #[tokio::test]
+    async fn replace_server_installs_call_guards_for_a_server_that_failed_at_boot() {
+        let mgr = ServerManager::new();
+        mgr.mark_start_failure("recovered");
+        assert!(mgr.semaphores.get("recovered").is_none());
+        assert!(mgr.circuit_breakers.get("recovered").is_none());
+
+        let mut upstream = make_connected_test_upstream("recovered").await;
+        upstream.config.max_concurrent = 3;
+        upstream.config.circuit_breaker_enabled = true;
+        mgr.replace_server("recovered", upstream).await;
+
+        let semaphore = mgr
+            .semaphores
+            .get("recovered")
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("a recovered server has a concurrency limit");
+        assert_eq!(semaphore.available_permits(), 3);
+        assert!(
+            mgr.circuit_breakers.get("recovered").is_some(),
+            "a recovered server has a circuit breaker"
+        );
+
+        // A later reconnect keeps the same semaphore so permits held by
+        // in-flight calls stay accounted for.
+        let mut again = make_connected_test_upstream("recovered").await;
+        again.config.max_concurrent = 3;
+        again.config.circuit_breaker_enabled = true;
+        mgr.replace_server("recovered", again).await;
+        let after = mgr
+            .semaphores
+            .get("recovered")
+            .map(|entry| Arc::clone(entry.value()))
+            .expect("semaphore survives reconnect");
+        assert!(Arc::ptr_eq(&semaphore, &after));
+    }
+
+    struct LogLevelServer {
+        seen: Arc<Mutex<Option<rmcp::model::LoggingLevel>>>,
+        signal: Arc<Notify>,
+    }
+
+    impl ServerHandler for LogLevelServer {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(
+                ServerCapabilities::builder()
+                    .enable_tools()
+                    .enable_logging()
+                    .build(),
+            )
+        }
+
+        async fn set_level(
+            &self,
+            request: SetLevelRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<(), rmcp::ErrorData> {
+            *self.seen.lock().unwrap() = Some(request.level);
+            self.signal.notify_one();
+            Ok(())
+        }
+    }
+
+    /// Reconnect used to skip the initial log-level push, so an upstream that
+    /// came back after a failure logged at its own default forever.
+    #[tokio::test]
+    async fn replace_server_applies_the_effective_log_level() {
+        let server_manager = Arc::new(ServerManager::new());
+        let router = Arc::new(crate::proxy::ToolRouter::new(
+            server_manager.clone(),
+            test_router_config(),
+        ));
+        server_manager.set_tool_router(Arc::downgrade(&router));
+        router.set_client_log_level("client", rmcp::model::LoggingLevel::Debug);
+
+        let seen = Arc::new(Mutex::new(None));
+        let signal = Arc::new(Notify::new());
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handler = LogLevelServer {
+            seen: Arc::clone(&seen),
+            signal: Arc::clone(&signal),
+        };
+        tokio::spawn(async move {
+            let server = server_handler
+                .serve(server_transport)
+                .await
+                .expect("start upstream test server");
+            let _ = server.waiting().await;
+        });
+        let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("logging"),
+            Arc::new(ArcSwap::from_pointee(Vec::new())),
+            Arc::downgrade(&router),
+        ))
+        .serve(client_transport)
+        .await
+        .expect("connect upstream test client");
+        let capabilities = client
+            .peer()
+            .peer_info()
+            .map(|info| info.capabilities.clone())
+            .unwrap_or_default();
+        assert!(capabilities.logging.is_some());
+
+        let notified = signal.notified();
+        server_manager
+            .replace_server(
+                "logging",
+                UpstreamServer {
+                    name: "logging".to_string(),
+                    config: test_server_config(),
+                    client,
+                    tools: Arc::new(ArcSwap::from_pointee(Vec::new())),
+                    capabilities,
+                    upstream: None,
+                    protocol_era: crate::protocol::ProtocolEra::Legacy,
+                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
+                        .to_string(),
+                    protocol_gate_state: 0,
+                    connection: ConnectionGeneration::new(),
+                    health: ServerHealth::Healthy,
+                },
+            )
+            .await;
+
+        tokio::time::timeout(Duration::from_secs(5), notified)
+            .await
+            .expect("the reconnected upstream receives logging/setLevel");
+        assert_eq!(
+            *seen.lock().unwrap(),
+            Some(rmcp::model::LoggingLevel::Debug)
+        );
+    }
+
+    /// A legacy server that simply never answers `tasks/list`.
+    async fn serve_raw_legacy_upstream_ignoring_tasks_list(stream: tokio::io::DuplexStream) {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        let (read, mut write) = tokio::io::split(stream);
+        let mut lines = BufReader::new(read).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let request: serde_json::Value = serde_json::from_str(&line).expect("valid JSON-RPC");
+            let Some(id) = request.get("id").cloned() else {
+                continue;
+            };
+            let response = match request["method"].as_str().unwrap_or_default() {
+                "initialize" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result": {
+                        "protocolVersion": crate::protocol::SUPPORTED_PROTOCOL_VERSION,
+                        "capabilities": {"tools":{"listChanged":false}},
+                        "serverInfo":{"name":"silent-legacy","version":"1.0.0"}
+                    }
+                }),
+                "tools/list" => serde_json::json!({
+                    "jsonrpc":"2.0", "id":id,
+                    "result":{"tools":[{"name":"echo","description":"echo","inputSchema":{"type":"object"}}]}
+                }),
+                _ => continue,
+            };
+            let mut encoded = serde_json::to_vec(&response).expect("encode response");
+            encoded.push(b'\n');
+            write.write_all(&encoded).await.expect("write response");
+            write.flush().await.expect("flush response");
+        }
+    }
+
+    /// The legacy task probe used to wait out the whole `call_timeout_secs`
+    /// (300s by default) inside a 30s start timeout, so a legacy server that
+    /// ignores `tasks/list` failed to start at all.
+    #[tokio::test]
+    async fn legacy_server_ignoring_tasks_list_still_starts_promptly() {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(serve_raw_legacy_upstream_ignoring_tasks_list(
+            server_transport,
+        ));
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("silent"),
+            Arc::clone(&tools),
+            std::sync::Weak::new(),
+        ))
+        .serve(client_transport)
+        .await
+        .expect("connect upstream test client");
+
+        let mut config = test_server_config();
+        config.call_timeout_secs = 300;
+        let started = std::time::Instant::now();
+        let upstream = ServerManager::finish_upstream_connection(
+            "silent",
+            &config,
+            client,
+            tools,
+            "test upstream",
+            UpstreamProtocolMode::Legacy,
+            0,
+            ConnectionGeneration::new(),
+        )
+        .await
+        .expect("a silent tasks/list probe is not a start failure");
+
+        assert!(
+            started.elapsed() < LEGACY_TASKS_PROBE_TIMEOUT + Duration::from_secs(2),
+            "start took {:?}",
+            started.elapsed()
+        );
+        assert_eq!(upstream.tools.load().len(), 1);
+        assert!(!crate::protocol::legacy_tasks_capability(
+            &upstream.capabilities
+        ));
     }
 }
