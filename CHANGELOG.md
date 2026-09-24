@@ -64,6 +64,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - OAuth servers that start at the same moment no longer race the Keychain
   store setup. The loser read its Keychain copy as missing, logged "incomplete
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
+- A tool result or schema with a key named `envelope` no longer fails the
+  whole call through `plug connect` with "invalid envelope message".
 
 ## [0.8.11] - 2026-09-01
 

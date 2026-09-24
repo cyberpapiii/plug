@@ -29,6 +29,8 @@ const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 /// (notifications, chunks, reverse requests) reset the clock, so slow tool
 /// calls that emit progress are unaffected. See plans/009.
 const READ_WATCHDOG: Duration = Duration::from_secs(120);
+/// Every `DaemonToProxyMessage` frame starts with its serde tag.
+const ENVELOPE_FRAME_PREFIX: &[u8] = b"{\"envelope\":";
 
 fn selected_protocol_for_log(protocol: &ProtocolVersion) -> &str {
     protocol.as_str()
@@ -407,46 +409,20 @@ impl IpcProxyHandler {
                 }
             };
 
-            // Peek the discriminant key so plain `IpcResponse` frames (hot path)
-            // deserialize once. Envelope frames carry `"envelope"`.
-            let looks_like_envelope = frame
-                .windows(b"\"envelope\"".len())
-                .any(|window| window == b"\"envelope\"");
-            if looks_like_envelope {
+            // Envelope frames are serialized by `ipc::send_daemon_message` with
+            // `serde_json::to_vec`, which writes an internally tagged enum's tag
+            // first. Matching the prefix keeps plain `IpcResponse` frames (the
+            // hot path) to one parse, and a payload that merely contains an
+            // `"envelope"` key somewhere is never mistaken for one.
+            let response = if frame.starts_with(ENVELOPE_FRAME_PREFIX) {
                 let daemon_msg: DaemonToProxyMessage =
                     serde_json::from_slice(&frame).map_err(|e| TransportFailure {
                         message: format!("invalid envelope message: {e}"),
                         reconnectable: false,
                     })?;
                 match daemon_msg {
-                    DaemonToProxyMessage::Response { inner } => match inner {
-                        IpcResponse::LoggingNotification { params } => {
-                            if let Some(peer) = peer
-                                && let Ok(notif_params) = serde_json::from_value::<
-                                    LoggingMessageNotificationParam,
-                                >(params)
-                            {
-                                let _ = peer.notify_logging_message(notif_params).await;
-                            }
-                            continue;
-                        }
-                        resp @ (IpcResponse::ToolListChangedNotification
-                        | IpcResponse::ResourceListChangedNotification
-                        | IpcResponse::ResourceUpdatedNotification { .. }
-                        | IpcResponse::PromptListChangedNotification
-                        | IpcResponse::ProgressNotification { .. }
-                        | IpcResponse::CancelledNotification { .. }
-                        | IpcResponse::AuthStateChanged { .. }) => {
-                            forward_control_notification(peer, resp).await;
-                            continue;
-                        }
-                        IpcResponse::ModernDownstreamGateChanged { enabled } => {
-                            modern_downstream_enabled
-                                .store(enabled, std::sync::atomic::Ordering::Release);
-                            continue;
-                        }
-                        other => return Ok(other),
-                    },
+                    // Never sent by the current daemon; decoded for tolerance.
+                    DaemonToProxyMessage::Response { inner } => inner,
                     DaemonToProxyMessage::ResponseChunk {
                         chunk_index,
                         chunk_count,
@@ -467,7 +443,6 @@ impl IpcProxyHandler {
                                 reconnectable: false,
                             });
                         }
-
                         let decoded = base64::engine::general_purpose::STANDARD
                             .decode(payload_b64)
                             .map_err(|e| TransportFailure {
@@ -476,17 +451,16 @@ impl IpcProxyHandler {
                             })?;
                         chunked_response.extend_from_slice(&decoded);
 
-                        if chunk_index + 1 == chunk_count {
-                            let response: IpcResponse = serde_json::from_slice(&chunked_response)
-                                .map_err(|e| TransportFailure {
+                        if chunk_index + 1 != chunk_count {
+                            continue;
+                        }
+                        let response: IpcResponse = serde_json::from_slice(&chunked_response)
+                            .map_err(|e| TransportFailure {
                                 message: format!("invalid chunked IPC response: {e}"),
                                 reconnectable: false,
                             })?;
-                            chunked_response.clear();
-                            return Ok(response);
-                        }
-
-                        continue;
+                        chunked_response.clear();
+                        response
                     }
                     DaemonToProxyMessage::ReverseRequest { id, request } => {
                         // Handle reverse request from daemon (elicitation / sampling)
@@ -508,38 +482,37 @@ impl IpcProxyHandler {
                     }
                 }
             } else {
-                let response: IpcResponse =
-                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
-                        message: format!("invalid IPC response: {e}"),
-                        reconnectable: false,
-                    })?;
-                match response {
-                    IpcResponse::LoggingNotification { params } => {
-                        if let Some(peer) = peer
-                            && let Ok(notif_params) =
-                                serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                        {
-                            let _ = peer.notify_logging_message(notif_params).await;
-                        }
-                        continue; // keep reading for the actual response
+                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
+                    message: format!("invalid IPC response: {e}"),
+                    reconnectable: false,
+                })?
+            };
+
+            match response {
+                IpcResponse::LoggingNotification { params } => {
+                    if let Some(peer) = peer
+                        && let Ok(notif_params) =
+                            serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                    {
+                        let _ = peer.notify_logging_message(notif_params).await;
                     }
-                    resp @ (IpcResponse::ToolListChangedNotification
-                    | IpcResponse::ResourceListChangedNotification
-                    | IpcResponse::ResourceUpdatedNotification { .. }
-                    | IpcResponse::PromptListChangedNotification
-                    | IpcResponse::ProgressNotification { .. }
-                    | IpcResponse::CancelledNotification { .. }
-                    | IpcResponse::AuthStateChanged { .. }) => {
-                        forward_control_notification(peer, resp).await;
-                        continue;
-                    }
-                    IpcResponse::ModernDownstreamGateChanged { enabled } => {
-                        modern_downstream_enabled
-                            .store(enabled, std::sync::atomic::Ordering::Release);
-                        continue;
-                    }
-                    other => return Ok(other),
+                    continue; // keep reading for the actual response
                 }
+                resp @ (IpcResponse::ToolListChangedNotification
+                | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::ResourceUpdatedNotification { .. }
+                | IpcResponse::PromptListChangedNotification
+                | IpcResponse::ProgressNotification { .. }
+                | IpcResponse::CancelledNotification { .. }
+                | IpcResponse::AuthStateChanged { .. }) => {
+                    forward_control_notification(peer, resp).await;
+                    continue;
+                }
+                IpcResponse::ModernDownstreamGateChanged { enabled } => {
+                    modern_downstream_enabled.store(enabled, std::sync::atomic::Ordering::Release);
+                    continue;
+                }
+                other => return Ok(other),
             }
         }
     }
@@ -1612,71 +1585,79 @@ async fn refresh_roots_via_daemon(shared: &SharedConnection, peer: &Peer<RoleSer
                     return;
                 }
             };
-            let mut conn = shared.conn.lock().await;
-            let request = IpcRequest::UpdateRoots {
-                session_id: conn.session_id.clone(),
-                roots: roots_json,
-            };
-            let payload = match serde_json::to_vec(&request) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::debug!(error = %e, "failed to serialize UpdateRoots");
-                    return;
-                }
-            };
-            if let Err(e) = ipc::write_frame(&mut conn.writer, &payload).await {
-                tracing::debug!(error = %e, "failed to send UpdateRoots to daemon");
-                return;
-            }
-            // Read response while forwarding any interleaved daemon push traffic.
-            loop {
-                match ipc::read_frame(&mut conn.reader).await {
-                    Ok(Some(frame)) => match serde_json::from_slice::<IpcResponse>(&frame) {
-                        Ok(IpcResponse::LoggingNotification { params }) => {
-                            if let Ok(notif_params) =
-                                serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                            {
-                                let _ = peer.notify_logging_message(notif_params).await;
-                            }
-                            continue;
-                        }
-                        Ok(
-                            resp @ (IpcResponse::ToolListChangedNotification
-                            | IpcResponse::ResourceListChangedNotification
-                            | IpcResponse::ResourceUpdatedNotification { .. }
-                            | IpcResponse::PromptListChangedNotification
-                            | IpcResponse::ProgressNotification { .. }
-                            | IpcResponse::CancelledNotification { .. }
-                            | IpcResponse::AuthStateChanged { .. }),
-                        ) => {
-                            forward_control_notification(Some(peer), resp).await;
-                            continue;
-                        }
-                        Ok(IpcResponse::Ok) => break,
-                        Ok(IpcResponse::Error { code, message }) => {
-                            tracing::debug!(
-                                code = %code,
-                                message = %message,
-                                "daemon rejected UpdateRoots"
-                            );
-                            break;
-                        }
-                        Ok(_) => break,
-                        Err(e) => {
-                            tracing::debug!(error = %e, "invalid UpdateRoots response");
-                            break;
-                        }
-                    },
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::debug!(error = %e, "failed to read UpdateRoots response");
-                        break;
-                    }
-                }
-            }
+            push_roots_to_daemon(shared, roots_json).await;
         }
         Err(error) => {
             tracing::debug!(error = %error, "failed to fetch roots from downstream peer");
+        }
+    }
+}
+
+/// Send `IpcRequest::UpdateRoots` and consume its reply.
+async fn push_roots_to_daemon(shared: &SharedConnection, roots_json: serde_json::Value) {
+    let Some(peer) = shared.peer.get() else {
+        return;
+    };
+    let mut conn = shared.conn.lock().await;
+    let request = IpcRequest::UpdateRoots {
+        session_id: conn.session_id.clone(),
+        roots: roots_json,
+    };
+    let payload = match serde_json::to_vec(&request) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to serialize UpdateRoots");
+            return;
+        }
+    };
+    if let Err(e) = ipc::write_frame(&mut conn.writer, &payload).await {
+        tracing::debug!(error = %e, "failed to send UpdateRoots to daemon");
+        return;
+    }
+    // Read response while forwarding any interleaved daemon push traffic.
+    loop {
+        match ipc::read_frame(&mut conn.reader).await {
+            Ok(Some(frame)) => match serde_json::from_slice::<IpcResponse>(&frame) {
+                Ok(IpcResponse::LoggingNotification { params }) => {
+                    if let Ok(notif_params) =
+                        serde_json::from_value::<LoggingMessageNotificationParam>(params)
+                    {
+                        let _ = peer.notify_logging_message(notif_params).await;
+                    }
+                    continue;
+                }
+                Ok(
+                    resp @ (IpcResponse::ToolListChangedNotification
+                    | IpcResponse::ResourceListChangedNotification
+                    | IpcResponse::ResourceUpdatedNotification { .. }
+                    | IpcResponse::PromptListChangedNotification
+                    | IpcResponse::ProgressNotification { .. }
+                    | IpcResponse::CancelledNotification { .. }
+                    | IpcResponse::AuthStateChanged { .. }),
+                ) => {
+                    forward_control_notification(Some(peer), resp).await;
+                    continue;
+                }
+                Ok(IpcResponse::Ok) => break,
+                Ok(IpcResponse::Error { code, message }) => {
+                    tracing::debug!(
+                        code = %code,
+                        message = %message,
+                        "daemon rejected UpdateRoots"
+                    );
+                    break;
+                }
+                Ok(_) => break,
+                Err(e) => {
+                    tracing::debug!(error = %e, "invalid UpdateRoots response");
+                    break;
+                }
+            },
+            Ok(None) => break,
+            Err(e) => {
+                tracing::debug!(error = %e, "failed to read UpdateRoots response");
+                break;
+            }
         }
     }
 }
@@ -4622,6 +4603,89 @@ mod tests {
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
+
+    /// Start a proxy against a fake daemon that answers one `expected_method`
+    /// request with `payload`, and connect a downstream client to it. Callers
+    /// hold `daemon_test_lock` and own the temp dir.
+    async fn proxy_with_one_scripted_reply(
+        client_id: &str,
+        expected_method: &'static str,
+        payload: serde_json::Value,
+    ) -> (
+        rmcp::service::RunningService<rmcp::RoleClient, TestClient>,
+        JoinHandle<()>,
+    ) {
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) =
+                drive_fake_daemon_initialize(stream, "fake-session-1").await;
+            let frame = ipc::read_frame(&mut reader)
+                .await
+                .expect("read request frame")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse request");
+            assert!(
+                is_mcp_request(&req, expected_method),
+                "expected {expected_method}, got {req:?}"
+            );
+            ipc::send_response(&mut writer, &IpcResponse::McpResponse { payload })
+                .await
+                .expect("send scripted reply");
+        });
+
+        let session =
+            crate::runtime::establish_daemon_proxy_session(None, client_id.to_string(), None)
+                .await
+                .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+        let client = TestClient
+            .serve(client_transport)
+            .await
+            .expect("connect downstream client");
+        (client, daemon_task)
+    }
+
+    #[tokio::test]
+    async fn tool_result_with_an_envelope_key_is_not_mistaken_for_an_envelope() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("envelope-key");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let payload = serde_json::to_value(CallToolResult::structured(
+            serde_json::json!({ "envelope": "sealed" }),
+        ))
+        .expect("serialize call result");
+        let (client, daemon_task) =
+            proxy_with_one_scripted_reply("client-envelope-key", "tools/call", payload).await;
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("whatever")),
+        )
+        .await
+        .expect("call timeout")
+        .expect("a result carrying an `envelope` key must reach the client intact");
+        assert_eq!(
+            result.structured_content,
+            Some(serde_json::json!({ "envelope": "sealed" }))
+        );
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
     #[test]
     fn a_reconnect_exits_only_when_a_respawn_would_land_on_the_new_binary() {
         let upgraded = anyhow::Error::new(crate::runtime::DaemonVersionMismatch {
