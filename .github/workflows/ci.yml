@@ -73,6 +73,29 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
 
+  test-macos:
+    # macOS is the only shipped platform, and its cfg(target_os = "macos")
+    # code paths never compile into the ubuntu test binary. OAuth tests use
+    # the isolated test credential environment, never the runner's Keychain.
+    name: Test (macOS)
+    needs: classify
+    if: needs.classify.outputs.rust == 'true'
+    runs-on: macos-15
+    # CI never debugs these binaries. Omitting DWARF materially reduces compile,
+    # link, cache, and upload time without changing the code under test. These
+    # live per job rather than at workflow level so warm-release-cache, which
+    # must hash the same rust-cache key as release.yml, inherits none of them.
+    env:
+      CARGO_TERM_COLOR: always
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      RUSTFLAGS: -Dwarnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace
+
   browser-oauth:
     name: Browser OAuth
     needs: classify
@@ -173,6 +196,7 @@ jobs:
       - classify
       - check
       - test-linux
+      - test-macos
       - browser-oauth
       - test-macos-app
     runs-on: ubuntu-latest
