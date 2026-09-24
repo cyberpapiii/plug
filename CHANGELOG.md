@@ -75,6 +75,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Plug.app shows the result without waiting for the next poll. A refresh
   asked for while another was running used to be dropped, so the view could
   keep showing the state from before the change.
+- Plug.app no longer reloads the full tool list, about a megabyte, after
+  every action. It reloads it when the daemon reports the list changed, or
+  when you choose Refresh.
 
 ## [0.8.11] - 2026-09-01
 

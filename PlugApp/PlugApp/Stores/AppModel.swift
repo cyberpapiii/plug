@@ -424,7 +424,10 @@ final class AppModel {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try await ipc.request(request(token))
         lastError = nil
-        await refresh(forceCatalog: true)
+        // No forced tool list. Every change an operation can make to it, a
+        // switched tool or a rebuilt catalog, moves the snapshot's
+        // `tool_catalog_revision`, and the refresh refetches on that alone.
+        await refresh()
     }
 
     func perform(_ request: (String) -> IPCRequest) async {

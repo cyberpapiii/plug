@@ -266,6 +266,39 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
     }
 
+    /// An operation that leaves the catalog revision alone must not pull the
+    /// whole tool list again. Operations that do change it move the revision.
+    @MainActor
+    func testOperationRefetchesToolsOnlyWhenTheRevisionMoves() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
+
+        try await model.performOperation { .restartServer(authToken: $0, serverID: "demo") }
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
+
+        server.catalogRevision = 2
+        try await model.performOperation { .setToolEnabled(authToken: $0, tool: "demo__echo", enabled: false) }
+        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
+
+        await model.refresh(forceCatalog: true)
+        XCTAssertEqual(
+            coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 3,
+            "an explicit Refresh still pulls the list"
+        )
+    }
+
     @MainActor
     func testUsePlugIsExplicitCoordinatorAction() async {
         let coordinator = RecordingInstallationCoordinator(
