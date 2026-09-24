@@ -78,6 +78,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - The daemon no longer wakes ten times a second for every connected
   `plug connect` client to check whether the modern protocol gate changed.
   Gate changes are now pushed the moment they happen.
+- The operator snapshot's visible tool count for a lazy-bridge session now
+  includes the tools that session loaded, instead of counting only the meta
+  tools.
 
 ## [0.8.11] - 2026-09-01
 

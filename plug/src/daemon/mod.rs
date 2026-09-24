@@ -680,6 +680,20 @@ async fn handle_ipc_connection(
     result
 }
 
+/// Key a live session's lazy working set the way its transport stores it:
+/// bridge sessions under `ipc:`, HTTP and SSE sessions under `http:`.
+fn live_session_lazy_key(session: &plug_core::ipc::IpcLiveSessionInfo) -> String {
+    let transport = match session.transport {
+        plug_core::ipc::LiveSessionTransport::DaemonProxy => {
+            plug_core::proxy::DownstreamTransport::Ipc
+        }
+        plug_core::ipc::LiveSessionTransport::Http | plug_core::ipc::LiveSessionTransport::Sse => {
+            plug_core::proxy::DownstreamTransport::Http
+        }
+    };
+    plug_core::proxy::ToolRouter::lazy_session_key(transport, &session.session_id)
+}
+
 /// Resolves when the modern downstream gate may have changed. Never resolves
 /// once the sender is gone, so a closed channel cannot spin a select loop.
 async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -1267,7 +1281,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                         .tool_router()
                         .list_tools_for_client_session(
                             session.client_type,
-                            Some(session.session_id.as_str()),
+                            Some(live_session_lazy_key(session).as_str()),
                         )
                         .len(),
                 })
@@ -3438,6 +3452,42 @@ mod tests {
         let _ = server_task.await;
         engine.shutdown().await;
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// The operator snapshot counts visible tools from the same working-set
+    /// key each transport writes, not the raw session id.
+    #[test]
+    fn live_session_lazy_key_matches_the_transport_key() {
+        let session = |transport| plug_core::ipc::IpcLiveSessionInfo {
+            transport,
+            client_id: None,
+            session_id: "sess-1".to_string(),
+            client_type: plug_core::types::ClientType::Unknown,
+            client_info: None,
+            adapter_version: None,
+            connected_secs: 0,
+            last_activity_secs: None,
+        };
+        let ipc = plug_core::proxy::ToolRouter::lazy_session_key(
+            plug_core::proxy::DownstreamTransport::Ipc,
+            "sess-1",
+        );
+        let http = plug_core::proxy::ToolRouter::lazy_session_key(
+            plug_core::proxy::DownstreamTransport::Http,
+            "sess-1",
+        );
+        assert_eq!(
+            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::DaemonProxy)),
+            ipc
+        );
+        assert_eq!(
+            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Http)),
+            http
+        );
+        assert_eq!(
+            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Sse)),
+            http
+        );
     }
 
     /// A registered connection hears about a modern downstream gate change
