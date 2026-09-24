@@ -160,7 +160,7 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 - Does NOT open SSE stream (GET /mcp), so never receives `tools/list_changed` notifications
 - Workaround: set PAGE_SIZE large enough (500+) so all tools fit in a single page
 - After config changes (enabling/disabling upstream servers), remote clients must disconnect and reconnect to see updated tool lists
-- See: `docs/bug-reports/pagination-cursor-forwarding-and-remote-client-blanking.md`
+- See: `docs/archive/bug-reports/pagination-cursor-forwarding-and-remote-client-blanking.md`
 
 **plug implications**:
 - Standard stdio connection via `plug connect`
