@@ -3251,19 +3251,32 @@ impl ToolRouter {
                 .get(&server_id)
                 .map(|entry| Arc::clone(entry.value()));
 
+            // Close out this attempt's ledgers: record the circuit breaker
+            // outcome and call metrics when given, then drop the active-call
+            // registration. `None` leaves that ledger untouched.
+            let mut finish = |breaker_ok: Option<bool>, metrics_ok: Option<bool>| {
+                if let (Some(ok), Some(cb)) = (breaker_ok, &cb) {
+                    if ok {
+                        cb.on_success();
+                    } else {
+                        cb.on_failure();
+                    }
+                }
+                if let Some(ok) = metrics_ok {
+                    metrics_guard.settle(ok);
+                }
+                if let Some(guard) = active_call_guard.as_mut() {
+                    guard.disarm();
+                }
+                self.remove_active_call(call_id);
+            };
+
             match result {
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
                     admit_tool_result_meta(&mut response);
-                    if let Some(cb) = &cb {
-                        cb.on_success();
-                    }
-                    metrics_guard.settle(true);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
+                    finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,
@@ -3281,14 +3294,7 @@ impl ToolRouter {
                     // A modern upstream completed this round and supplied its
                     // own continuation contract. Do not retain or replay the
                     // old request handle; the downstream retry is a new round.
-                    if let Some(cb) = &cb {
-                        cb.on_success();
-                    }
-                    metrics_guard.settle(true);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
+                    finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
                         trace_id = %trace_id,
@@ -3315,10 +3321,7 @@ impl ToolRouter {
                         error = %e,
                         "session error detected, attempting reconnect"
                     );
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
+                    finish(None, None);
 
                     match self.reconnect_server_now(&server_id).await {
                         Ok(()) => {
@@ -3368,12 +3371,7 @@ impl ToolRouter {
                         timeout_secs = timeout.as_secs(),
                         "upstream tool call timed out"
                     );
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-
-                    metrics_guard.settle(false);
+                    finish(None, Some(false));
 
                     if matches!(transport_type, crate::config::TransportType::Stdio) {
                         self.reconnect_server_in_background(server_id.clone());
@@ -3390,14 +3388,7 @@ impl ToolRouter {
                         error = %e,
                         "upstream tool call failed"
                     );
-                    if let Some(cb) = &cb {
-                        cb.on_failure();
-                    }
-                    metrics_guard.settle(false);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
+                    finish(Some(false), Some(false));
                     match e {
                         rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
                         other => Err(McpError::internal_error(other.to_string(), None)),
@@ -3406,11 +3397,7 @@ impl ToolRouter {
                 Ok(other) => {
                     // An unexpected upstream response is a terminal failure —
                     // record it like the other terminal branches.
-                    metrics_guard.settle(false);
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
+                    finish(None, Some(false));
                     Err(McpError::internal_error(
                         format!("unexpected response type from upstream tool call: {other:?}"),
                         None,
