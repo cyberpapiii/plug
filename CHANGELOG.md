@@ -24,6 +24,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Downstream OAuth state from before 0.4.0 (`issuer-v2-*.json`) is no
   longer migrated at startup, and the one-time grant scope and token-family
   backfills are gone. State written by 0.4.0 or later loads unchanged.
+- Downstream OAuth state writes no longer stall other requests on the same
+  daemon worker thread, and the state file is written as compact JSON.
 
 ### Fixed
 

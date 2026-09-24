@@ -2214,9 +2214,28 @@ fn persist_state(
     path: &std::path::Path,
     state: &DownstreamOauthState,
 ) -> Result<PersistOutcome, DownstreamOauthError> {
-    let json = serde_json::to_vec_pretty(state)
+    let json = serde_json::to_vec(state)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    persist_bytes(path, &json)
+    run_blocking_io(|| persist_bytes(path, &json))
+}
+
+/// Run a blocking state write without stalling the other tasks scheduled on
+/// this runtime worker.
+///
+/// Deliberately not `spawn_blocking`: that would add an await point between
+/// writing the file and publishing the same state in memory, and a caller
+/// cancelled there (a dropped HTTP request) would leave the disk ahead of
+/// memory, so a restart could resurrect an operation the client never saw
+/// complete. `block_in_place` keeps the commit synchronous with respect to
+/// the caller. A current-thread runtime cannot hand its other tasks to
+/// another worker, so there the write simply runs inline, as before.
+fn run_blocking_io<T>(write: impl FnOnce() -> T) -> T {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(write)
+        }
+        _ => write(),
+    }
 }
 
 fn persist_bytes(
@@ -3946,6 +3965,24 @@ mod tests {
             restarted
                 .pending_consent_exists_for_tests(&consent.consent_id)
                 .await
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn state_commits_persist_on_the_multi_thread_runtime() {
+        let (manager, path) = test_manager();
+        let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        drop(manager);
+
+        let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)
+            .expect("restart manager");
+        assert!(
+            restarted
+                .state
+                .lock()
+                .await
+                .clients
+                .contains_key(&client.client_id)
         );
     }
 
