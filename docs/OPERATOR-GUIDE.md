@@ -16,7 +16,7 @@ Open Plug.app once. First launch needs a logged-in GUI session for
 ServiceManagement and Keychain consent. Plug.app owns the GUI, `plug` command,
 background daemon, client links, and updates. Headless macOS is unsupported.
 
-Linux builds from source. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
+Linux builds from source with `cargo install`. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
 
 ## Runtime Model
 

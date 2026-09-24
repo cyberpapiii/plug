@@ -39,7 +39,7 @@ invoke `plug connect`; they should not point at a separately installed binary.
 Headless macOS is unsupported because first-use ServiceManagement and Keychain
 consent need a logged-in GUI session.
 
-Linux builds from source. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
+For Linux and source builds, see the [operator guide](OPERATOR-GUIDE.md).
 
 ---
 
