@@ -622,6 +622,52 @@ struct ConnectionContext {
     >,
 }
 
+impl ConnectionContext {
+    /// A copy for one concurrently dispatched request. It sees the session as
+    /// it stood when the request arrived and owns no reverse-request receiver;
+    /// the connection loop keeps that.
+    fn fork(&self) -> Self {
+        Self {
+            cancel: self.cancel.clone(),
+            auth_token: Arc::clone(&self.auth_token),
+            server_manager: Arc::clone(&self.server_manager),
+            engine: Arc::clone(&self.engine),
+            config_path: self.config_path.clone(),
+            started_at: self.started_at,
+            client_registry: Arc::clone(&self.client_registry),
+            http_sessions: self.http_sessions.clone(),
+            downstream_oauth: self.downstream_oauth.clone(),
+            session_id: self.session_id.clone(),
+            reverse_request_rx: None,
+        }
+    }
+}
+
+/// Requests one registered connection may have dispatching at once. More
+/// wait for a slot without holding up the connection's reads.
+const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
+
+/// Requests tagged with `ipc_id` on a registered connection, dispatching on
+/// their own tasks. Each task returns the response for the loop to write.
+#[derive(Default)]
+struct InFlight {
+    tasks: tokio::task::JoinSet<IpcResponse>,
+    ids: std::collections::HashMap<tokio::task::Id, u64>,
+}
+
+/// Reverse requests written to the proxy and awaiting its `reverse_id` reply.
+type PendingReverse =
+    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
+
+/// True for requests that change the connection's own session and so must
+/// run in order on the connection loop even when tagged.
+fn must_run_inline(request: &IpcRequest) -> bool {
+    matches!(
+        request,
+        IpcRequest::Register { .. } | IpcRequest::Deregister { .. } | IpcRequest::Shutdown { .. }
+    )
+}
+
 /// Handle a single IPC connection: read requests, dispatch, send responses.
 ///
 /// Auto-deregisters any session created via `Register` when the connection closes
@@ -632,8 +678,20 @@ async fn handle_ipc_connection(
 ) -> anyhow::Result<()> {
     let (reader, mut writer) = stream.into_split();
     let mut reader = FrameReader::new(reader);
+    let mut in_flight = InFlight::default();
 
-    let result = handle_ipc_loop(&mut reader, &mut writer, &mut ctx).await;
+    let result = handle_ipc_loop(&mut reader, &mut writer, &mut ctx, &mut in_flight).await;
+
+    // Requests still dispatching have nowhere to send a reply. Let them
+    // finish before the cleanup below, which is the order serial dispatch
+    // gave. Dropping the reverse-request receiver first makes any elicitation
+    // or sampling they start fail at once instead of waiting on a proxy that
+    // is gone. On daemon shutdown they are aborted instead.
+    ctx.reverse_request_rx = None;
+    if ctx.cancel.is_cancelled() {
+        in_flight.tasks.abort_all();
+    }
+    while in_flight.tasks.join_next().await.is_some() {}
 
     // Auto-deregister on disconnect (clean or crash)
     if let Some(ref session_id) = ctx.session_id {
@@ -722,10 +780,18 @@ async fn push_modern_gate_change(
 }
 
 /// Inner loop for IPC connection handling.
+///
+/// Untagged requests run one at a time, as they always have: the loop
+/// dispatches each inline and writes its reply before taking the next. On a
+/// registered connection, a request tagged with `ipc_id` dispatches on its own
+/// task (see `InFlight`) and the loop keeps reading, so one slow call does not
+/// hold up the proxy's other requests. Every frame is still written by this
+/// loop, so a chunked reply goes out whole and never interleaves.
 async fn handle_ipc_loop(
     reader: &mut FrameReader,
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ctx: &mut ConnectionContext,
+    in_flight: &mut InFlight,
 ) -> anyhow::Result<()> {
     use plug_core::notifications::ProtocolNotification;
 
@@ -739,21 +805,38 @@ async fn handle_ipc_loop(
     // outlives this connection, so the sender never closes under it.
     let mut gate_rx = ctx.engine.tool_router().watch_modern_downstream();
     let mut last_modern_gate = *gate_rx.borrow_and_update();
+    let mut pending_reverse = PendingReverse::new();
+    // Frames read while an inline request was dispatching, in arrival order.
+    let mut deferred: std::collections::VecDeque<anyhow::Result<Option<Vec<u8>>>> =
+        std::collections::VecDeque::new();
+    let permits = Arc::new(tokio::sync::Semaphore::new(
+        MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+    ));
 
     loop {
+        // After registration, subscribe to notification channels for push
+        // delivery and move frame reads onto the cancellation-safe reader.
+        if ctx.session_id.is_some() && log_rx.is_none() {
+            log_rx = Some(ctx.engine.tool_router().subscribe_logging());
+            ctrl_rx = Some(ctx.engine.tool_router().subscribe_notifications());
+            reader.ensure_multiplexed();
+        }
+
         // Proxy connections (those that have Registered) are long-lived and should
         // not be subject to the idle timeout. Short-lived admin/query connections use
         // the timeout to reclaim resources.
-        let frame = if let Some(ref mut rx) = log_rx {
-            // Registered with notifications — multiplex request reads and push
-            // notifications. Notifications are sent immediately when idle. During
-            // a request dispatch, they queue in the broadcast channel and get
-            // drained after the response.
-            reader.ensure_multiplexed();
+        let frame = if let Some(deferred_frame) = deferred.pop_front() {
+            deferred_frame
+        } else if let Some(ref mut rx) = log_rx {
+            // Registered with notifications — multiplex request reads, push
+            // notifications, and replies from requests dispatching on tasks.
             'select: loop {
                 tokio::select! {
                     biased;
                     _ = ctx.cancel.cancelled() => return Ok(()),
+                    Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
+                        write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
+                    }
                     recv = rx.recv() => {
                         send_ipc_logging_notification(writer, recv).await?;
                     }
@@ -777,18 +860,13 @@ async fn handle_ipc_loop(
                         }
                     } => {
                         if let Some((reverse_req, resp_tx)) = reverse {
-                            handle_reverse_request(reader, writer, reverse_req, resp_tx).await?;
+                            send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
                         } else {
                             ctx.reverse_request_rx = None;
                         }
                     }
                     result = reader.next() => break 'select result,
                 }
-            }
-        } else if ctx.session_id.is_some() {
-            tokio::select! {
-                _ = ctx.cancel.cancelled() => break,
-                result = reader.next() => result,
             }
         } else {
             tokio::select! {
@@ -819,6 +897,12 @@ async fn handle_ipc_loop(
             }
         };
 
+        let ids = ipc::FrameIds::peek(&frame);
+        if let Some(reverse_id) = ids.reverse_id {
+            deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
+            continue;
+        }
+
         // Parse request
         let request: IpcRequest = match serde_json::from_slice(&frame) {
             Ok(req) => req,
@@ -828,7 +912,9 @@ async fn handle_ipc_loop(
                     code: "PARSE_ERROR".to_string(),
                     message: "invalid request format".to_string(),
                 });
-                ipc::send_response(writer, &resp).await.ok();
+                ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp)
+                    .await
+                    .ok();
                 break;
             }
         };
@@ -842,7 +928,7 @@ async fn handle_ipc_loop(
                             code: "AUTH_FAILED".to_string(),
                             message: "invalid auth token".to_string(),
                         };
-                        ipc::send_response(writer, &resp).await?;
+                        ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
                         continue;
                     }
                 }
@@ -851,10 +937,25 @@ async fn handle_ipc_loop(
                         code: "AUTH_REQUIRED".to_string(),
                         message: "auth_token required for this command".to_string(),
                     };
-                    ipc::send_response(writer, &resp).await?;
+                    ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
                     continue;
                 }
             }
+        }
+
+        if let Some(ipc_id) = ids.ipc_id
+            && ctx.session_id.is_some()
+            && !must_run_inline(&request)
+        {
+            let mut task_ctx = ctx.fork();
+            let permits = Arc::clone(&permits);
+            let handle = in_flight.tasks.spawn(async move {
+                // The semaphore is never closed, so this only waits.
+                let _permit = permits.acquire_owned().await;
+                dispatch_request(&request, &mut task_ctx).await
+            });
+            in_flight.ids.insert(handle.id(), ipc_id);
+            continue;
         }
 
         // Dispatch request. During a tools/call, the upstream MCP server may
@@ -874,6 +975,11 @@ async fn handle_ipc_loop(
         // SESSION_REPLACED) early-returns without touching the bridge, and
         // the still-live channel must be restored as usual.
         let request_was_deregister = is_deregister_request(&request);
+        // Keep reading while this request dispatches, once reads are
+        // cancellation-safe: replies to reverse requests are routed at once,
+        // everything else waits in `deferred` for its turn. Without this an
+        // inline request that triggers elicitation could never read its reply.
+        let mut read_ahead = log_rx.is_some();
 
         let response = {
             use std::pin::pin;
@@ -900,11 +1006,14 @@ async fn handle_ipc_loop(
                         }
                     } => {
                         if let Some((reverse_req, resp_tx)) = reverse {
-                            handle_reverse_request(reader, writer, reverse_req, resp_tx).await?;
+                            send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
                         } else {
                             // Channel closed (e.g. bridge deregistered) — stop polling it.
                             reverse_rx = None;
                         }
+                    }
+                    Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
+                        write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
                     }
                     // Also forward logging notifications while waiting
                     recv = async {
@@ -929,6 +1038,20 @@ async fn handle_ipc_loop(
                     _ = modern_gate_changed(&mut gate_rx) => {
                         push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
                     }
+                    next = reader.next(), if read_ahead => {
+                        match next {
+                            Ok(Some(frame)) => match ipc::FrameIds::peek(&frame).reverse_id {
+                                Some(reverse_id) => {
+                                    deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
+                                }
+                                None => deferred.push_back(Ok(Some(frame))),
+                            },
+                            end => {
+                                read_ahead = false;
+                                deferred.push_back(end);
+                            }
+                        }
+                    }
                 }
             }
             result.unwrap()
@@ -949,18 +1072,12 @@ async fn handle_ipc_loop(
             ctx.reverse_request_rx = reverse_rx;
         }
 
-        ipc::send_chunked_response(writer, &response).await?;
+        ipc::send_chunked_response_with_id(writer, ids.ipc_id, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
         if matches!(request, IpcRequest::Shutdown { .. }) {
             ctx.cancel.cancel();
             break;
-        }
-
-        // After registration, subscribe to notification channels for push delivery
-        if ctx.session_id.is_some() && log_rx.is_none() {
-            log_rx = Some(ctx.engine.tool_router().subscribe_logging());
-            ctrl_rx = Some(ctx.engine.tool_router().subscribe_notifications());
         }
 
         // Drain any notifications that queued during request dispatch
@@ -1016,6 +1133,33 @@ async fn handle_ipc_loop(
     Ok(())
 }
 
+/// Write the reply of a request that dispatched on its own task, tagged with
+/// the `ipc_id` it arrived with. A task that panicked answers with an error,
+/// so the proxy's waiter never hangs on it.
+async fn write_in_flight_reply(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    ids: &mut std::collections::HashMap<tokio::task::Id, u64>,
+    joined: Result<(tokio::task::Id, IpcResponse), tokio::task::JoinError>,
+) -> anyhow::Result<()> {
+    let (task_id, response) = match joined {
+        Ok((task_id, response)) => (task_id, response),
+        Err(error) => {
+            tracing::error!(error = %error, "IPC request task failed");
+            (
+                error.id(),
+                IpcResponse::Error {
+                    code: "INTERNAL_ERROR".to_string(),
+                    message: "request handler failed".to_string(),
+                },
+            )
+        }
+    };
+    let Some(ipc_id) = ids.remove(&task_id) else {
+        return Ok(());
+    };
+    ipc::send_chunked_response_with_id(writer, Some(ipc_id), &response).await
+}
+
 /// True when `request` is an `IpcRequest::Deregister`. On SUCCESS, the
 /// Deregister handler in `dispatch_request` clears `ctx.reverse_request_rx`
 /// and drops the bridge channel's sender (closing it), so `handle_ipc_loop`'s
@@ -1064,16 +1208,16 @@ async fn send_ipc_logging_notification(
     Ok(())
 }
 
-/// Handle a reverse request from the `DaemonBridge` during an active tool call.
+/// Forward a reverse request from the `DaemonBridge` to the proxy.
 ///
-/// Writes an `IpcClientRequest` to the IPC socket as a `DaemonToProxyMessage::ReverseRequest`,
-/// reads the `IpcClientResponse` back from the proxy, and sends it via the oneshot channel.
-///
-/// The proxy client's read loop must be prepared to receive `DaemonToProxyMessage::ReverseRequest`
-/// frames interleaved with normal `IpcResponse` frames during a `tools/call`.
-async fn handle_reverse_request(
-    reader: &mut FrameReader,
+/// Writes it as a `DaemonToProxyMessage::ReverseRequest` and parks the
+/// bridge's reply channel under the request id. The proxy answers with an
+/// `IpcClientResponse` carrying that id as `reverse_id`, which the connection
+/// loop hands to `deliver_reverse_reply`; other requests keep flowing while
+/// the proxy works on it.
+async fn send_reverse_request(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
+    pending: &mut PendingReverse,
     request: IpcClientRequest,
     response_tx: tokio::sync::oneshot::Sender<IpcClientResponse>,
 ) -> anyhow::Result<()> {
@@ -1086,35 +1230,36 @@ async fn handle_reverse_request(
         request: Box::new(request),
     };
 
+    // Forget requests whose caller already gave up.
+    pending.retain(|_, tx| !tx.is_closed());
+    pending.insert(id, response_tx);
     tracing::debug!(
         reverse_request_id = id,
         "sending reverse request to IPC proxy"
     );
-    ipc::send_daemon_message(writer, &msg).await?;
+    ipc::send_daemon_message(writer, &msg).await
+}
 
-    // Read the proxy's response. The proxy sends an IpcClientResponse frame
-    // after handling the reverse request.
-    let response = match reader.next().await? {
-        Some(frame) => match serde_json::from_slice::<IpcClientResponse>(&frame) {
-            Ok(resp) => resp,
-            Err(e) => {
-                tracing::warn!(error = %e, "invalid IPC reverse-request response");
-                IpcClientResponse::Error {
-                    message: format!("invalid reverse-request response: {e}"),
-                }
-            }
-        },
-        None => {
-            // Connection closed during reverse request
+/// Hand the proxy's reply for reverse request `reverse_id` to its waiter.
+fn deliver_reverse_reply(pending: &mut PendingReverse, reverse_id: u64, frame: &[u8]) {
+    let response = match serde_json::from_slice::<IpcClientResponse>(frame) {
+        Ok(resp) => resp,
+        Err(e) => {
+            tracing::warn!(error = %e, "invalid IPC reverse-request response");
             IpcClientResponse::Error {
-                message: "IPC connection closed during reverse request".to_string(),
+                message: format!("invalid reverse-request response: {e}"),
             }
         }
     };
-
-    // Send response back to DaemonBridge
-    let _ = response_tx.send(response);
-    Ok(())
+    match pending.remove(&reverse_id) {
+        Some(tx) => {
+            let _ = tx.send(response);
+        }
+        None => tracing::debug!(
+            reverse_request_id = reverse_id,
+            "late reverse-request reply"
+        ),
+    }
 }
 
 async fn dispatch_operator_mutation(
@@ -3095,8 +3240,14 @@ mod tests {
         }
 
         async fn start_with_config(mock: plug_core::config::ServerConfig) -> Self {
+            Self::start_with_servers(vec![("mock", mock)]).await
+        }
+
+        async fn start_with_servers(servers: Vec<(&str, plug_core::config::ServerConfig)>) -> Self {
             let mut config = plug_core::config::Config::default();
-            config.servers.insert("mock".to_string(), mock);
+            for (name, server) in servers {
+                config.servers.insert(name.to_string(), server);
+            }
             let engine = Arc::new(Engine::new(config));
             engine.start().await.expect("engine start");
 
@@ -3398,7 +3549,7 @@ mod tests {
         // Inject a reverse request directly into the connection's channel.
         // No further client frame is sent before reading the pushed frame
         // below — that's the crux of the regression.
-        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
+        let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
         let request = plug_core::ipc::IpcClientRequest::CreateElicitation {
             params: serde_json::from_value(serde_json::json!({
                 "message": "idle test",
@@ -3422,8 +3573,8 @@ mod tests {
 
         let msg: plug_core::ipc::DaemonToProxyMessage =
             serde_json::from_slice(&frame).expect("decode DaemonToProxyMessage");
-        match msg {
-            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { request, .. } => {
+        let reverse_id = match msg {
+            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { id, request } => {
                 assert!(
                     matches!(
                         *request,
@@ -3431,18 +3582,29 @@ mod tests {
                     ),
                     "expected CreateElicitation, got {request:?}"
                 );
+                id
             }
             other => panic!("expected ReverseRequest envelope, got {other:?}"),
-        }
+        };
 
-        // Unblock `handle_reverse_request`'s wait for a client reply so the
-        // connection loop and server task can wind down cleanly.
+        // The reply carries the request's id and reaches the bridge waiter.
         let reply = IpcClientResponse::Error {
             message: "test reply".to_string(),
         };
-        plug_core::ipc::write_frame(&mut stream, &serde_json::to_vec(&reply).unwrap())
+        plug_core::ipc::write_frame(
+            &mut stream,
+            &plug_core::ipc::encode_reverse_response(reverse_id, &reply).unwrap(),
+        )
+        .await
+        .expect("write reverse-request reply");
+        let delivered = tokio::time::timeout(std::time::Duration::from_secs(10), resp_rx)
             .await
-            .expect("write reverse-request reply");
+            .expect("reverse reply routed in time")
+            .expect("reverse reply delivered");
+        assert!(
+            matches!(delivered, IpcClientResponse::Error { ref message } if message == "test reply"),
+            "got {delivered:?}"
+        );
 
         cancel.cancel();
         drop(stream);
@@ -3660,8 +3822,8 @@ mod tests {
 
         let msg: plug_core::ipc::DaemonToProxyMessage =
             serde_json::from_slice(&frame).expect("decode DaemonToProxyMessage");
-        match msg {
-            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { request, .. } => {
+        let reverse_id = match msg {
+            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { id, request } => {
                 assert!(
                     matches!(
                         *request,
@@ -3669,17 +3831,21 @@ mod tests {
                     ),
                     "expected CreateElicitation, got {request:?}"
                 );
+                id
             }
             other => panic!("expected ReverseRequest envelope, got {other:?}"),
-        }
+        };
 
-        // Unblock `handle_reverse_request` so everything winds down cleanly.
+        // Answer the reverse request so everything winds down cleanly.
         let reply = IpcClientResponse::Error {
             message: "test reply".to_string(),
         };
-        plug_core::ipc::write_frame(&mut stream, &serde_json::to_vec(&reply).unwrap())
-            .await
-            .expect("write reverse-request reply");
+        plug_core::ipc::write_frame(
+            &mut stream,
+            &plug_core::ipc::encode_reverse_response(reverse_id, &reply).unwrap(),
+        )
+        .await
+        .expect("write reverse-request reply");
 
         cancel.cancel();
         drop(stream);
@@ -4558,5 +4724,171 @@ mod tests {
         let params = serde_json::json!({ "uri": "file:///tmp/mock-resource.txt" });
         let outcome = assert_parity("resources/unsubscribe", params).await;
         assert_empty_ok(outcome, "unsubscribe");
+    }
+
+    /// Send `request` tagged with `ipc_id`, as a v4 proxy does.
+    async fn write_tagged_ipc(stream: &mut tokio::net::UnixStream, ipc_id: u64, req: &IpcRequest) {
+        let payload = plug_core::ipc::encode_tagged(Some(ipc_id), req).expect("encode request");
+        plug_core::ipc::write_frame(stream, &payload)
+            .await
+            .expect("write frame");
+    }
+
+    /// Read the next reply that carries an `ipc_id`, reassembling a chunked
+    /// one. Fails if another frame lands between the chunks of a response.
+    async fn read_tagged_reply(stream: &mut tokio::net::UnixStream) -> (u64, IpcResponse) {
+        use base64::Engine as _;
+        let mut chunks: Vec<u8> = Vec::new();
+        let mut in_chunked = false;
+        loop {
+            let frame = tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                plug_core::ipc::read_frame(stream),
+            )
+            .await
+            .expect("timed out waiting for a tagged reply")
+            .expect("read frame")
+            .expect("unexpected EOF before reply");
+            let body = if frame.starts_with(b"{\"envelope\":") {
+                match serde_json::from_slice(&frame).expect("decode envelope") {
+                    plug_core::ipc::DaemonToProxyMessage::ResponseChunk {
+                        chunk_index,
+                        chunk_count,
+                        payload_b64,
+                    } => {
+                        assert_eq!(chunk_index == 0, !in_chunked, "chunks out of sequence");
+                        in_chunked = true;
+                        chunks.extend(
+                            base64::engine::general_purpose::STANDARD
+                                .decode(payload_b64)
+                                .expect("chunk payload"),
+                        );
+                        if chunk_index + 1 < chunk_count {
+                            continue;
+                        }
+                        in_chunked = false;
+                        std::mem::take(&mut chunks)
+                    }
+                    other => panic!("unexpected envelope {other:?}"),
+                }
+            } else {
+                assert!(!in_chunked, "a frame interleaved with a chunked response");
+                frame
+            };
+            let response: IpcResponse = serde_json::from_slice(&body).expect("decode reply");
+            if is_ipc_push_notification(&response) {
+                continue;
+            }
+            let ipc_id = plug_core::ipc::FrameIds::peek(&body)
+                .ipc_id
+                .expect("a tagged request gets a tagged reply");
+            return (ipc_id, response);
+        }
+    }
+
+    fn slow_and_fast_servers() -> Vec<(&'static str, plug_core::config::ServerConfig)> {
+        vec![
+            (
+                "slow",
+                ipc_harness_mock_config_with("echo", &["--delay-ms", "1500"]),
+            ),
+            ("fast", ipc_harness_mock_config("echo,chunked_text")),
+        ]
+    }
+
+    fn tool_call_request(session_id: &str, name: &str) -> IpcRequest {
+        IpcRequest::McpRequest {
+            session_id: session_id.to_string(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({ "name": name, "arguments": { "input": name } })),
+        }
+    }
+
+    #[tokio::test]
+    async fn tagged_requests_on_one_connection_run_concurrently() {
+        let mut harness = IpcTestHarness::start_with_servers(slow_and_fast_servers()).await;
+        let session_id = harness.session_id.clone();
+
+        // The slow call goes first; the big (chunked) and small calls behind
+        // it must not wait for it.
+        write_tagged_ipc(
+            &mut harness.stream,
+            1,
+            &tool_call_request(&session_id, "Slow__echo"),
+        )
+        .await;
+        write_tagged_ipc(
+            &mut harness.stream,
+            2,
+            &tool_call_request(&session_id, "Fast__chunked_text"),
+        )
+        .await;
+        write_tagged_ipc(
+            &mut harness.stream,
+            3,
+            &tool_call_request(&session_id, "Fast__echo"),
+        )
+        .await;
+
+        let mut order = Vec::new();
+        for _ in 0..3 {
+            let (ipc_id, response) = read_tagged_reply(&mut harness.stream).await;
+            let IpcResponse::McpResponse { payload } = response else {
+                panic!("request {ipc_id} failed: {response:?}");
+            };
+            let text = payload["content"][0]["text"]
+                .as_str()
+                .expect("text content")
+                .to_string();
+            match ipc_id {
+                1 => assert!(text.contains("\"Slow__echo\""), "{text}"),
+                2 => assert_eq!(text.len(), 6 * 1024 * 1024),
+                3 => assert!(text.contains("\"Fast__echo\""), "{text}"),
+                other => panic!("unknown ipc_id {other}"),
+            }
+            order.push(ipc_id);
+        }
+        assert_eq!(
+            order.last(),
+            Some(&1),
+            "the slow call finishes last: {order:?}"
+        );
+
+        // An untagged request on the same connection still gets a plain reply.
+        let reply = harness
+            .call_tool("Fast__echo", serde_json::json!({ "input": "untagged" }))
+            .await;
+        assert!(
+            matches!(reply, IpcResponse::McpResponse { .. }),
+            "{reply:?}"
+        );
+
+        harness.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_with_requests_in_flight_ends_the_connection() {
+        let mut harness = IpcTestHarness::start_with_servers(slow_and_fast_servers()).await;
+        let session_id = harness.session_id.clone();
+
+        for (ipc_id, tool) in [(1, "Slow__echo"), (2, "Slow__echo"), (3, "Fast__echo")] {
+            write_tagged_ipc(
+                &mut harness.stream,
+                ipc_id,
+                &tool_call_request(&session_id, tool),
+            )
+            .await;
+        }
+        tokio::io::AsyncWriteExt::shutdown(&mut harness.stream)
+            .await
+            .expect("close client side");
+
+        let server_task = harness.server_task.take().expect("server task");
+        tokio::time::timeout(std::time::Duration::from_secs(10), server_task)
+            .await
+            .expect("the connection handler hung on its in-flight requests")
+            .expect("server task join");
+
+        harness.shutdown().await;
     }
 }

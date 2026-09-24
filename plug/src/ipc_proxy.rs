@@ -60,9 +60,12 @@ fn read_watchdog() -> Duration {
 }
 
 struct SharedConnection {
-    conn: Mutex<crate::runtime::DaemonProxySession>,
+    conn: Mutex<ProxyConnection>,
+    /// Handed to each new `DaemonMux` so its reader can reach the peer and the
+    /// gate without keeping this struct alive.
+    self_ref: std::sync::Weak<SharedConnection>,
     /// Stable cancellation routing identity, duplicated outside `conn` so a
-    /// cancellation never waits behind the in-flight request it targets.
+    /// cancellation never waits behind a reconnect.
     cancellation_identity: std::sync::RwLock<CancellationIdentity>,
     config_path: Option<PathBuf>,
     capabilities: std::sync::RwLock<ServerCapabilities>,
@@ -90,6 +93,464 @@ struct SharedConnection {
     /// against the reconnect path above.
     replay: Mutex<ReplayState>,
     modern_downstream_enabled: std::sync::atomic::AtomicBool,
+}
+
+/// The registered daemon session every request currently goes through.
+///
+/// `conn` is held only to read or replace this: requests clone `mux` and
+/// release the lock before they write, so they run concurrently. A reconnect
+/// holds it for the whole re-registration and replay, so no request reaches
+/// the new session before its state is restored.
+struct ProxyConnection {
+    client_id: String,
+    client_info: Option<String>,
+    session_id: String,
+    mux: Arc<DaemonMux>,
+}
+
+impl ProxyConnection {
+    fn start(
+        session: crate::runtime::DaemonProxySession,
+        shared: std::sync::Weak<SharedConnection>,
+    ) -> Self {
+        Self {
+            client_id: session.client_id,
+            client_info: session.client_info,
+            session_id: session.session_id,
+            mux: DaemonMux::start(session.reader, session.writer, shared),
+        }
+    }
+}
+
+// ──────────────────────── Multiplexed daemon connection ─────────────────────────
+
+type ReplyWaiter = tokio::sync::oneshot::Sender<Result<IpcResponse, TransportFailure>>;
+
+#[derive(Default)]
+struct MuxState {
+    /// Waiters by `ipc_id`. Ordered so an untagged reply can go to the oldest.
+    pending: std::collections::BTreeMap<u64, ReplyWaiter>,
+    /// Set once the connection is unusable. Every later request fails fast
+    /// with a reconnectable error, which sends its caller to `refresh_session`.
+    closed: Option<String>,
+}
+
+/// One daemon connection shared by all of this proxy's in-flight requests.
+///
+/// Each request is written with a fresh `ipc_id` by a single writer task, so
+/// frames never interleave and a caller that gives up mid-request cannot
+/// leave half a frame on the wire. A reader task routes each reply to the
+/// waiter registered under its id, forwards push notifications, and answers
+/// reverse requests on tasks of their own. A reply without an id goes to the
+/// oldest waiter, which is how the one-at-a-time protocol paired them.
+struct DaemonMux {
+    outbound: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    state: std::sync::Mutex<MuxState>,
+    next_id: std::sync::atomic::AtomicU64,
+    /// Last time the daemon sent a frame, or a request started on an idle
+    /// connection; the read watchdog measures silence from here.
+    last_activity: std::sync::Mutex<tokio::time::Instant>,
+    tasks: std::sync::Mutex<Vec<JoinHandle<()>>>,
+}
+
+impl Drop for DaemonMux {
+    fn drop(&mut self) {
+        if let Ok(tasks) = self.tasks.get_mut() {
+            for task in tasks.drain(..) {
+                task.abort();
+            }
+        }
+    }
+}
+
+impl DaemonMux {
+    fn start(
+        reader: tokio::net::unix::OwnedReadHalf,
+        writer: tokio::net::unix::OwnedWriteHalf,
+        shared: std::sync::Weak<SharedConnection>,
+    ) -> Arc<Self> {
+        let (outbound, outbound_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mux = Arc::new(Self {
+            outbound,
+            state: std::sync::Mutex::new(MuxState::default()),
+            next_id: std::sync::atomic::AtomicU64::new(1),
+            last_activity: std::sync::Mutex::new(tokio::time::Instant::now()),
+            tasks: std::sync::Mutex::new(Vec::new()),
+        });
+        // The tasks hold the mux weakly: dropping the last handle aborts them
+        // and closes the socket.
+        let writer_task = tokio::spawn(Self::write_loop(writer, outbound_rx, Arc::downgrade(&mux)));
+        let reader_task = tokio::spawn(Self::read_loop(reader, Arc::downgrade(&mux), shared));
+        if let Ok(mut tasks) = mux.tasks.lock() {
+            tasks.push(writer_task);
+            tasks.push(reader_task);
+        }
+        mux
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, MuxState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn last_activity(&self) -> tokio::time::Instant {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn touch(&self) {
+        *self
+            .last_activity
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = tokio::time::Instant::now();
+    }
+
+    /// Fail every waiter with `failure` and refuse new requests. Idempotent;
+    /// the first failure is the one waiters see.
+    fn close(&self, failure: TransportFailure) {
+        let pending = {
+            let mut state = self.lock_state();
+            if state.closed.is_some() {
+                return;
+            }
+            state.closed = Some(failure.message.clone());
+            std::mem::take(&mut state.pending)
+        };
+        for waiter in pending.into_values() {
+            let _ = waiter.send(Err(failure.clone()));
+        }
+        if let Ok(tasks) = self.tasks.lock() {
+            for task in tasks.iter() {
+                task.abort();
+            }
+        }
+    }
+
+    /// Fail the requests currently waiting without closing the connection:
+    /// a frame arrived that cannot be matched to any of them.
+    fn fail_pending(&self, failure: TransportFailure) {
+        let pending = std::mem::take(&mut self.lock_state().pending);
+        for waiter in pending.into_values() {
+            let _ = waiter.send(Err(failure.clone()));
+        }
+    }
+
+    fn deliver(&self, ipc_id: Option<u64>, response: IpcResponse) {
+        let waiter = {
+            let mut state = self.lock_state();
+            match ipc_id {
+                Some(id) => state.pending.remove(&id),
+                None => state.pending.pop_first().map(|(_, waiter)| waiter),
+            }
+        };
+        match waiter {
+            Some(waiter) => {
+                let _ = waiter.send(Ok(response));
+            }
+            None => tracing::debug!(?ipc_id, "daemon reply has no waiting request"),
+        }
+    }
+
+    /// Send `request` and wait for its reply.
+    ///
+    /// The read watchdog fails the whole connection, reconnectably, once the
+    /// daemon has sent nothing at all for `read_watchdog()` while this request
+    /// waits. Any frame resets it, including replies to other requests.
+    async fn round_trip(&self, request: &IpcRequest) -> Result<IpcResponse, TransportFailure> {
+        let id = self
+            .next_id
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let payload = ipc::encode_tagged(Some(id), request).map_err(|e| TransportFailure {
+            message: format!("failed to encode IPC request: {e}"),
+            reconnectable: false,
+        })?;
+        if payload.len() > ipc::MAX_FRAME_SIZE as usize {
+            return Err(TransportFailure {
+                message: format!(
+                    "IPC write failed: payload too large: {} bytes (max {})",
+                    payload.len(),
+                    ipc::MAX_FRAME_SIZE
+                ),
+                reconnectable: false,
+            });
+        }
+
+        let (waiter, mut reply) = tokio::sync::oneshot::channel();
+        {
+            let mut state = self.lock_state();
+            if let Some(reason) = &state.closed {
+                return Err(TransportFailure {
+                    message: reason.clone(),
+                    reconnectable: true,
+                });
+            }
+            if state.pending.is_empty() {
+                self.touch();
+            }
+            state.pending.insert(id, waiter);
+        }
+        let started = tokio::time::Instant::now();
+        if self.outbound.send(payload).is_err() {
+            self.close(TransportFailure {
+                message: "IPC write failed: connection writer stopped".to_string(),
+                reconnectable: true,
+            });
+        }
+
+        let watchdog = read_watchdog();
+        loop {
+            let deadline = self.last_activity().max(started) + watchdog;
+            match tokio::time::timeout_at(deadline, &mut reply).await {
+                Ok(Ok(result)) => return result,
+                Ok(Err(_)) => {
+                    return Err(TransportFailure {
+                        message: "daemon connection closed".to_string(),
+                        reconnectable: true,
+                    });
+                }
+                Err(_elapsed) => {
+                    if tokio::time::Instant::now() < self.last_activity().max(started) + watchdog {
+                        continue;
+                    }
+                    tracing::warn!(
+                        secs = watchdog.as_secs(),
+                        "daemon read watchdog expired; forcing reconnect"
+                    );
+                    let failure = TransportFailure {
+                        message: format!(
+                            "daemon read watchdog expired after {}s",
+                            watchdog.as_secs()
+                        ),
+                        reconnectable: true,
+                    };
+                    self.close(failure.clone());
+                    return Err(failure);
+                }
+            }
+        }
+    }
+
+    /// Send a frame that expects no reply (a reverse-request answer).
+    fn send_frame(&self, payload: Vec<u8>) {
+        if self.outbound.send(payload).is_err() {
+            tracing::debug!("reverse-request reply dropped: connection writer stopped");
+        }
+    }
+
+    async fn write_loop(
+        mut writer: tokio::net::unix::OwnedWriteHalf,
+        mut outbound: tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+        mux: std::sync::Weak<DaemonMux>,
+    ) {
+        while let Some(payload) = outbound.recv().await {
+            if let Err(error) = ipc::write_frame(&mut writer, &payload).await {
+                if let Some(mux) = mux.upgrade() {
+                    mux.close(IpcProxyHandler::transport_failure(
+                        "IPC write failed",
+                        error,
+                    ));
+                }
+                return;
+            }
+        }
+    }
+
+    async fn read_loop(
+        mut reader: tokio::net::unix::OwnedReadHalf,
+        mux: std::sync::Weak<DaemonMux>,
+        shared: std::sync::Weak<SharedConnection>,
+    ) {
+        let mut chunks = ChunkAssembler::default();
+        let failure = loop {
+            let frame = match ipc::read_frame(&mut reader).await {
+                Ok(Some(frame)) => frame,
+                Ok(None) => {
+                    break TransportFailure {
+                        message: "daemon closed connection".to_string(),
+                        reconnectable: true,
+                    };
+                }
+                Err(error) => break IpcProxyHandler::transport_failure("IPC read failed", error),
+            };
+            let Some(mux_ref) = mux.upgrade() else {
+                return;
+            };
+            mux_ref.touch();
+            match decode_daemon_frame(&frame, &mut chunks) {
+                Ok(None) => {}
+                Ok(Some(DaemonFrame::Reply { ipc_id, response })) => {
+                    handle_daemon_reply(&mux_ref, &shared, ipc_id, response).await;
+                }
+                Ok(Some(DaemonFrame::Reverse { id, request })) => {
+                    let mux = mux.clone();
+                    let shared = shared.clone();
+                    tokio::spawn(async move {
+                        let peer = shared
+                            .upgrade()
+                            .and_then(|shared| shared.peer.get().cloned());
+                        let response = IpcProxyHandler::handle_daemon_reverse_request(
+                            peer.as_ref(),
+                            id,
+                            request,
+                        )
+                        .await;
+                        match ipc::encode_reverse_response(id, &response) {
+                            Ok(payload) => {
+                                if let Some(mux) = mux.upgrade() {
+                                    mux.send_frame(payload);
+                                }
+                            }
+                            Err(error) => {
+                                tracing::warn!(%error, "failed to serialize reverse response");
+                            }
+                        }
+                    });
+                }
+                Err(failure) => mux_ref.fail_pending(failure),
+            }
+        };
+        if let Some(mux) = mux.upgrade() {
+            mux.close(failure);
+        }
+    }
+}
+
+/// Reassembles one chunked response. The daemon writes all chunks of a
+/// response back to back, so there is only ever one in progress.
+#[derive(Default)]
+struct ChunkAssembler {
+    buffer: Vec<u8>,
+    expected: Option<u32>,
+}
+
+enum DaemonFrame {
+    Reply {
+        ipc_id: Option<u64>,
+        response: IpcResponse,
+    },
+    Reverse {
+        id: u64,
+        request: IpcClientRequest,
+    },
+}
+
+/// Decode one frame from the daemon. `Ok(None)` means a chunk was consumed
+/// and the response is not complete yet. An error concerns this frame only.
+fn decode_daemon_frame(
+    frame: &[u8],
+    chunks: &mut ChunkAssembler,
+) -> Result<Option<DaemonFrame>, TransportFailure> {
+    // Envelope frames are serialized by `ipc::send_daemon_message` with
+    // `serde_json::to_vec`, which writes an internally tagged enum's tag
+    // first. Matching the prefix keeps plain `IpcResponse` frames (the hot
+    // path) to one parse, and a payload that merely contains an `"envelope"`
+    // key somewhere is never mistaken for one.
+    if !frame.starts_with(ENVELOPE_FRAME_PREFIX) {
+        return decode_reply(frame, "invalid IPC response").map(Some);
+    }
+    let daemon_msg: DaemonToProxyMessage =
+        serde_json::from_slice(frame).map_err(|e| TransportFailure {
+            message: format!("invalid envelope message: {e}"),
+            reconnectable: false,
+        })?;
+    match daemon_msg {
+        // Never sent by the current daemon; decoded for tolerance.
+        DaemonToProxyMessage::Response { inner } => Ok(Some(DaemonFrame::Reply {
+            ipc_id: None,
+            response: inner,
+        })),
+        DaemonToProxyMessage::ResponseChunk {
+            chunk_index,
+            chunk_count,
+            payload_b64,
+        } => {
+            let invalid = |message: String| TransportFailure {
+                message,
+                reconnectable: false,
+            };
+            if chunk_count == 0 {
+                *chunks = ChunkAssembler::default();
+                return Err(invalid("invalid response chunk count 0".to_string()));
+            }
+            if chunk_index == 0 {
+                chunks.buffer.clear();
+                chunks.expected = Some(chunk_count);
+            } else if chunks.expected != Some(chunk_count) {
+                *chunks = ChunkAssembler::default();
+                return Err(invalid(
+                    "response chunk count changed mid-stream".to_string(),
+                ));
+            }
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(payload_b64)
+                .map_err(|e| {
+                    *chunks = ChunkAssembler::default();
+                    invalid(format!("invalid chunk payload: {e}"))
+                })?;
+            chunks.buffer.extend_from_slice(&decoded);
+            if chunk_index + 1 != chunk_count {
+                return Ok(None);
+            }
+            let whole = std::mem::take(chunks);
+            decode_reply(&whole.buffer, "invalid chunked IPC response").map(Some)
+        }
+        DaemonToProxyMessage::ReverseRequest { id, request } => Ok(Some(DaemonFrame::Reverse {
+            id,
+            request: *request,
+        })),
+    }
+}
+
+fn decode_reply(bytes: &[u8], context: &str) -> Result<DaemonFrame, TransportFailure> {
+    let response = serde_json::from_slice(bytes).map_err(|e| TransportFailure {
+        message: format!("{context}: {e}"),
+        reconnectable: false,
+    })?;
+    Ok(DaemonFrame::Reply {
+        ipc_id: ipc::FrameIds::peek(bytes).ipc_id,
+        response,
+    })
+}
+
+/// Apply a push notification, or hand a reply to its waiter.
+async fn handle_daemon_reply(
+    mux: &DaemonMux,
+    shared: &std::sync::Weak<SharedConnection>,
+    ipc_id: Option<u64>,
+    response: IpcResponse,
+) {
+    match response {
+        IpcResponse::LoggingNotification { params } => {
+            if let Some(shared) = shared.upgrade()
+                && let Some(peer) = shared.peer.get()
+                && let Ok(notif_params) =
+                    serde_json::from_value::<LoggingMessageNotificationParam>(params)
+            {
+                let _ = peer.notify_logging_message(notif_params).await;
+            }
+        }
+        resp @ (IpcResponse::ToolListChangedNotification
+        | IpcResponse::ResourceListChangedNotification
+        | IpcResponse::ResourceUpdatedNotification { .. }
+        | IpcResponse::PromptListChangedNotification
+        | IpcResponse::ProgressNotification { .. }
+        | IpcResponse::CancelledNotification { .. }
+        | IpcResponse::AuthStateChanged { .. }) => {
+            let shared = shared.upgrade();
+            forward_control_notification(shared.as_ref().and_then(|s| s.peer.get()), resp).await;
+        }
+        IpcResponse::ModernDownstreamGateChanged { enabled } => {
+            if let Some(shared) = shared.upgrade() {
+                shared
+                    .modern_downstream_enabled
+                    .store(enabled, std::sync::atomic::Ordering::Release);
+            }
+        }
+        other => mux.deliver(ipc_id, other),
+    }
 }
 
 /// What a failed reconnect can actually do about itself.
@@ -150,10 +611,8 @@ struct ReplayState {
 /// MCP server handler that proxies all requests through the daemon via IPC.
 ///
 /// Holds a persistent IPC connection to the daemon. The connection is
-/// established during `cmd_connect` and reused for all MCP traffic.
-///
-/// A single mutex guards the entire round-trip (write + read) to prevent
-/// concurrent requests from reading each other's responses.
+/// established during `cmd_connect` and reused for all MCP traffic. Requests
+/// share it concurrently; see `DaemonMux`.
 pub struct IpcProxyHandler {
     shared: Arc<SharedConnection>,
     heartbeat: JoinHandle<()>,
@@ -165,6 +624,7 @@ enum RetryPolicy {
     UnsafeToRetry,
 }
 
+#[derive(Clone, Debug)]
 struct TransportFailure {
     message: String,
     reconnectable: bool,
@@ -181,9 +641,10 @@ impl IpcProxyHandler {
             client_id: session.client_id.clone(),
             cancellation_capability: session.cancellation_capability.clone(),
         };
-        let shared = Arc::new(SharedConnection {
+        let shared = Arc::new_cyclic(|self_ref| SharedConnection {
             capabilities: std::sync::RwLock::new(session.capabilities.clone()),
-            conn: Mutex::new(session),
+            conn: Mutex::new(ProxyConnection::start(session, self_ref.clone())),
+            self_ref: self_ref.clone(),
             cancellation_identity: std::sync::RwLock::new(cancellation_identity),
             config_path,
             peer: std::sync::OnceLock::new(),
@@ -306,8 +767,8 @@ impl IpcProxyHandler {
 
     /// Send an IPC request and read the response.
     ///
-    /// Holds the connection lock for the entire round-trip to ensure
-    /// request-response pairing under concurrent MCP calls.
+    /// Requests run concurrently over the shared connection; replies are
+    /// paired by `ipc_id` (see `DaemonMux`).
     async fn session_round_trip<F>(
         &self,
         retry_policy: RetryPolicy,
@@ -317,6 +778,26 @@ impl IpcProxyHandler {
         F: Fn(&str) -> IpcRequest,
     {
         Self::shared_round_trip(&self.shared, retry_policy, build_request).await
+    }
+
+    /// The current session id and connection. Waits out a reconnect in
+    /// progress, so a request never reaches a session before its replay.
+    async fn current_connection(shared: &SharedConnection) -> (String, Arc<DaemonMux>) {
+        let conn = shared.conn.lock().await;
+        (conn.session_id.clone(), Arc::clone(&conn.mux))
+    }
+
+    /// Reconnect after `failed` broke, unless a concurrent request already
+    /// did. Returns the connection to retry on.
+    async fn reconnect_after(
+        shared: &SharedConnection,
+        failed: &Arc<DaemonMux>,
+    ) -> Result<(String, Arc<DaemonMux>), McpError> {
+        let mut conn = shared.conn.lock().await;
+        if Arc::ptr_eq(&conn.mux, failed) {
+            Self::refresh_session(shared, &mut conn).await?;
+        }
+        Ok((conn.session_id.clone(), Arc::clone(&conn.mux)))
     }
 
     /// `session_round_trip` for callers that hold only the shared connection,
@@ -329,43 +810,22 @@ impl IpcProxyHandler {
     where
         F: Fn(&str) -> IpcRequest,
     {
-        let mut conn = shared.conn.lock().await;
-        let peer = shared.peer.get();
-        let request = build_request(&conn.session_id);
-        let payload = serde_json::to_vec(&request)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        match Self::try_round_trip_locked(
-            &mut conn,
-            &payload,
-            peer,
-            &shared.modern_downstream_enabled,
-        )
-        .await
-        {
+        let (session_id, mux) = Self::current_connection(shared).await;
+        match mux.round_trip(&build_request(&session_id)).await {
             Ok(response) => Ok(response),
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon IPC connection lost; reconnecting");
-                Self::refresh_session(shared, &mut conn).await?;
+                let (session_id, mux) = Self::reconnect_after(shared, &mux).await?;
                 match retry_policy {
-                    RetryPolicy::SafeToRetry => {
-                        let rebound = build_request(&conn.session_id);
-                        let retry_payload = serde_json::to_vec(&rebound)
-                            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                        Self::try_round_trip_locked(
-                            &mut conn,
-                            &retry_payload,
-                            peer,
-                            &shared.modern_downstream_enabled,
-                        )
+                    RetryPolicy::SafeToRetry => mux
+                        .round_trip(&build_request(&session_id))
                         .await
                         .map_err(|e| {
                             McpError::internal_error(
                                 format!("IPC retry failed after reconnect: {}", e.message),
                                 None,
                             )
-                        })
-                    }
+                        }),
                     RetryPolicy::UnsafeToRetry => Err(McpError::internal_error(
                         "REQUEST_RETRY_UNSAFE: daemon connection recovered; retry the tool call",
                         None,
@@ -373,160 +833,6 @@ impl IpcProxyHandler {
                 }
             }
             Err(failure) => Err(McpError::internal_error(failure.message, None)),
-        }
-    }
-
-    async fn try_round_trip_locked(
-        conn: &mut crate::runtime::DaemonProxySession,
-        payload: &[u8],
-        peer: Option<&Peer<RoleServer>>,
-        modern_downstream_enabled: &std::sync::atomic::AtomicBool,
-    ) -> Result<IpcResponse, TransportFailure> {
-        ipc::write_frame(&mut conn.writer, payload)
-            .await
-            .map_err(|e| Self::transport_failure("IPC write failed", e))?;
-
-        // Read frames in a loop — the daemon may interleave push notifications
-        // (logging) and reverse requests (elicitation, sampling) with the actual
-        // response. Forward notifications to the downstream peer and handle
-        // reverse requests inline, then keep reading until we get the final
-        // response frame.
-        let mut chunked_response = Vec::new();
-        let mut expected_chunks: Option<u32> = None;
-        loop {
-            let frame = match tokio::time::timeout(
-                read_watchdog(),
-                ipc::read_frame(&mut conn.reader),
-            )
-            .await
-            {
-                Ok(result) => result
-                    .map_err(|e| Self::transport_failure("IPC read failed", e))?
-                    .ok_or_else(|| TransportFailure {
-                        message: "daemon closed connection".to_string(),
-                        reconnectable: true,
-                    })?,
-                Err(_elapsed) => {
-                    let watchdog = read_watchdog();
-                    tracing::warn!(
-                        secs = watchdog.as_secs(),
-                        "daemon read watchdog expired; forcing reconnect"
-                    );
-                    return Err(TransportFailure {
-                        message: format!(
-                            "daemon read watchdog expired after {}s",
-                            watchdog.as_secs()
-                        ),
-                        reconnectable: true,
-                    });
-                }
-            };
-
-            // Envelope frames are serialized by `ipc::send_daemon_message` with
-            // `serde_json::to_vec`, which writes an internally tagged enum's tag
-            // first. Matching the prefix keeps plain `IpcResponse` frames (the
-            // hot path) to one parse, and a payload that merely contains an
-            // `"envelope"` key somewhere is never mistaken for one.
-            let response = if frame.starts_with(ENVELOPE_FRAME_PREFIX) {
-                let daemon_msg: DaemonToProxyMessage =
-                    serde_json::from_slice(&frame).map_err(|e| TransportFailure {
-                        message: format!("invalid envelope message: {e}"),
-                        reconnectable: false,
-                    })?;
-                match daemon_msg {
-                    // Never sent by the current daemon; decoded for tolerance.
-                    DaemonToProxyMessage::Response { inner } => inner,
-                    DaemonToProxyMessage::ResponseChunk {
-                        chunk_index,
-                        chunk_count,
-                        payload_b64,
-                    } => {
-                        if chunk_count == 0 {
-                            return Err(TransportFailure {
-                                message: "invalid response chunk count 0".to_string(),
-                                reconnectable: false,
-                            });
-                        }
-                        if chunk_index == 0 {
-                            chunked_response.clear();
-                            expected_chunks = Some(chunk_count);
-                        } else if expected_chunks != Some(chunk_count) {
-                            return Err(TransportFailure {
-                                message: "response chunk count changed mid-stream".to_string(),
-                                reconnectable: false,
-                            });
-                        }
-                        let decoded = base64::engine::general_purpose::STANDARD
-                            .decode(payload_b64)
-                            .map_err(|e| TransportFailure {
-                                message: format!("invalid chunk payload: {e}"),
-                                reconnectable: false,
-                            })?;
-                        chunked_response.extend_from_slice(&decoded);
-
-                        if chunk_index + 1 != chunk_count {
-                            continue;
-                        }
-                        let response: IpcResponse = serde_json::from_slice(&chunked_response)
-                            .map_err(|e| TransportFailure {
-                                message: format!("invalid chunked IPC response: {e}"),
-                                reconnectable: false,
-                            })?;
-                        chunked_response.clear();
-                        response
-                    }
-                    DaemonToProxyMessage::ReverseRequest { id, request } => {
-                        // Handle reverse request from daemon (elicitation / sampling)
-                        let response =
-                            Self::handle_daemon_reverse_request(peer, id, *request).await;
-
-                        // Send the response back to the daemon
-                        let resp_payload =
-                            serde_json::to_vec(&response).map_err(|e| TransportFailure {
-                                message: format!("failed to serialize reverse response: {e}"),
-                                reconnectable: false,
-                            })?;
-                        ipc::write_frame(&mut conn.writer, &resp_payload)
-                            .await
-                            .map_err(|e| {
-                                Self::transport_failure("IPC reverse response write failed", e)
-                            })?;
-                        continue; // keep reading for the actual tool call response
-                    }
-                }
-            } else {
-                serde_json::from_slice(&frame).map_err(|e| TransportFailure {
-                    message: format!("invalid IPC response: {e}"),
-                    reconnectable: false,
-                })?
-            };
-
-            match response {
-                IpcResponse::LoggingNotification { params } => {
-                    if let Some(peer) = peer
-                        && let Ok(notif_params) =
-                            serde_json::from_value::<LoggingMessageNotificationParam>(params)
-                    {
-                        let _ = peer.notify_logging_message(notif_params).await;
-                    }
-                    continue; // keep reading for the actual response
-                }
-                resp @ (IpcResponse::ToolListChangedNotification
-                | IpcResponse::ResourceListChangedNotification
-                | IpcResponse::ResourceUpdatedNotification { .. }
-                | IpcResponse::PromptListChangedNotification
-                | IpcResponse::ProgressNotification { .. }
-                | IpcResponse::CancelledNotification { .. }
-                | IpcResponse::AuthStateChanged { .. }) => {
-                    forward_control_notification(peer, resp).await;
-                    continue;
-                }
-                IpcResponse::ModernDownstreamGateChanged { enabled } => {
-                    modern_downstream_enabled.store(enabled, std::sync::atomic::Ordering::Release);
-                    continue;
-                }
-                other => return Ok(other),
-            }
         }
     }
 
@@ -583,26 +889,13 @@ impl IpcProxyHandler {
     }
 
     async fn ping_once(shared: &Arc<SharedConnection>) -> Result<(), McpError> {
-        let mut conn = shared.conn.lock().await;
-        let peer = shared.peer.get();
-        let payload = serde_json::to_vec(&IpcRequest::Ping {
-            session_id: conn.session_id.clone(),
-        })
-        .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-        match Self::try_round_trip_locked(
-            &mut conn,
-            &payload,
-            peer,
-            &shared.modern_downstream_enabled,
-        )
-        .await
-        {
+        let (session_id, mux) = Self::current_connection(shared).await;
+        match mux.round_trip(&IpcRequest::Ping { session_id }).await {
             Ok(IpcResponse::Pong) => Ok(()),
             Ok(IpcResponse::Error { code, message }) => {
                 if matches!(code.as_str(), "SESSION_REPLACED" | "SESSION_MISMATCH") {
                     tracing::warn!(code = %code, message = %message, "daemon heartbeat detected stale session; reconnecting");
-                    Self::refresh_session(shared, &mut conn).await?;
+                    Self::reconnect_after(shared, &mux).await?;
                     return Ok(());
                 }
                 Err(McpError::internal_error(format!("{code}: {message}"), None))
@@ -613,7 +906,7 @@ impl IpcProxyHandler {
             )),
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon heartbeat lost connection; reconnecting");
-                Self::refresh_session(shared, &mut conn).await?;
+                Self::reconnect_after(shared, &mux).await?;
                 Ok(())
             }
             Err(failure) => Err(McpError::internal_error(failure.message, None)),
@@ -622,7 +915,7 @@ impl IpcProxyHandler {
 
     async fn refresh_session(
         shared: &SharedConnection,
-        conn: &mut crate::runtime::DaemonProxySession,
+        conn: &mut ProxyConnection,
     ) -> Result<(), McpError> {
         let session = crate::runtime::establish_daemon_proxy_session(
             shared.config_path.as_ref(),
@@ -645,30 +938,32 @@ impl IpcProxyHandler {
                 cancellation_capability: session.cancellation_capability.clone(),
             };
         }
-        *conn = session;
+        let replaced = std::mem::replace(
+            conn,
+            ProxyConnection::start(session, shared.self_ref.clone()),
+        );
+        // Requests still waiting on the old connection fail over to the new
+        // one through their own retry policy.
+        replaced.mux.close(TransportFailure {
+            message: "daemon session replaced by reconnect".to_string(),
+            reconnectable: true,
+        });
         Self::replay_session_state_locked(shared, conn).await;
         Ok(())
     }
 
     /// Replay `ReplayState` onto a fresh session. Caller already holds
-    /// `shared.conn`; use locked round trips only (see `SharedConnection::replay`).
+    /// `shared.conn`, so no other request reaches the session first.
     /// Replay failures are logged and do not fail reconnect.
-    async fn replay_session_state_locked(
-        shared: &SharedConnection,
-        conn: &mut crate::runtime::DaemonProxySession,
-    ) {
+    async fn replay_session_state_locked(shared: &SharedConnection, conn: &ProxyConnection) {
         let replay = shared.replay.lock().await;
-        let peer = shared.peer.get();
 
         if let Some(caps) = replay.client_capabilities.clone() {
             let request = IpcRequest::UpdateCapabilities {
                 session_id: conn.session_id.clone(),
                 capabilities: Box::new(caps),
             };
-            if let Err(e) =
-                Self::send_replay_request(conn, peer, &request, &shared.modern_downstream_enabled)
-                    .await
-            {
+            if let Err(e) = Self::send_replay_request(&conn.mux, &request).await {
                 tracing::warn!(error = %e, "reconnect: failed to replay client capabilities");
             }
         }
@@ -678,10 +973,7 @@ impl IpcProxyHandler {
                 session_id: conn.session_id.clone(),
                 uris: replay.subscriptions.iter().cloned().collect(),
             };
-            if let Err(e) =
-                Self::send_replay_request(conn, peer, &request, &shared.modern_downstream_enabled)
-                    .await
-            {
+            if let Err(e) = Self::send_replay_request(&conn.mux, &request).await {
                 tracing::warn!(error = %e, "reconnect: failed to replay subscriptions");
             }
         }
@@ -693,27 +985,18 @@ impl IpcProxyHandler {
                 method: "logging/setLevel".to_string(),
                 params: Some(params),
             };
-            if let Err(e) =
-                Self::send_replay_request(conn, peer, &request, &shared.modern_downstream_enabled)
-                    .await
-            {
+            if let Err(e) = Self::send_replay_request(&conn.mux, &request).await {
                 tracing::warn!(error = %e, "reconnect: failed to replay log level");
             }
         }
     }
 
-    /// Send a single replay request over the already-locked `conn` and
-    /// classify the result as success/failure, without ever calling
+    /// Send a single replay request on the fresh connection and classify the
+    /// result as success/failure, without ever calling
     /// `refresh_session`/`session_round_trip` (see
     /// `replay_session_state_locked`).
-    async fn send_replay_request(
-        conn: &mut crate::runtime::DaemonProxySession,
-        peer: Option<&Peer<RoleServer>>,
-        request: &IpcRequest,
-        modern_downstream_enabled: &std::sync::atomic::AtomicBool,
-    ) -> Result<(), String> {
-        let payload = serde_json::to_vec(request).map_err(|e| e.to_string())?;
-        match Self::try_round_trip_locked(conn, &payload, peer, modern_downstream_enabled).await {
+    async fn send_replay_request(mux: &DaemonMux, request: &IpcRequest) -> Result<(), String> {
+        match mux.round_trip(request).await {
             Ok(IpcResponse::Ok) => Ok(()),
             Ok(IpcResponse::McpResponse { payload }) => {
                 if payload.get("code").is_some()
@@ -3862,7 +4145,7 @@ mod tests {
             // exactly as the real daemon does when an upstream server logs
             // mid-call (plug/src/daemon.rs sends LoggingNotification via
             // plain ipc::send_response, never enveloped — see the "Plain
-            // IpcResponse" branch of try_round_trip_locked).
+            // IpcResponse" branch of decode_daemon_frame).
             let notif_params = serde_json::to_value(LoggingMessageNotificationParam::new(
                 LoggingLevel::Info,
                 serde_json::json!("hello from daemon"),
@@ -3965,7 +4248,7 @@ mod tests {
 
             // > MAX_FRAME_SIZE (4 MiB) so plug_core::ipc::send_chunked_response
             // — the SAME helper the real daemon uses — must split it into
-            // multiple ResponseChunk envelopes for try_round_trip_locked to
+            // multiple ResponseChunk envelopes for decode_daemon_frame to
             // reassemble.
             let big_text = "x".repeat(6 * 1024 * 1024);
             let call_result =
@@ -4056,7 +4339,7 @@ mod tests {
             // length prefix over MAX_FRAME_SIZE, are BOTH classified
             // reconnectable=false today (a parse error / anyhow::bail, not
             // a std::io::Error) and do NOT auto-recover — see
-            // try_round_trip_locked's parse-error arms, which always set
+            // decode_daemon_frame's parse-error arms, which always set
             // `reconnectable: false`.
             writer1
                 .write_u32(64)
@@ -4647,5 +4930,311 @@ mod tests {
             reconnect_recovery(&unrelated),
             ReconnectRecovery::ReportError
         );
+    }
+
+    fn tool_call_name(request: &IpcRequest) -> String {
+        match request {
+            IpcRequest::McpRequestWithContext {
+                params: Some(params),
+                ..
+            } => params["name"].as_str().unwrap_or_default().to_string(),
+            other => panic!("expected a tools/call request, got {other:?}"),
+        }
+    }
+
+    fn text_result(text: &str) -> IpcResponse {
+        IpcResponse::McpResponse {
+            payload: serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+                text.to_string(),
+            )]))
+            .expect("serialize call result"),
+        }
+    }
+
+    async fn send_tagged(writer: &mut OwnedWriteHalf, ipc_id: u64, response: &IpcResponse) {
+        let payload = ipc::encode_tagged(Some(ipc_id), response).expect("encode tagged reply");
+        ipc::write_frame(writer, &payload)
+            .await
+            .expect("send tagged reply");
+    }
+
+    /// Read `count` tools/call requests and return their ipc ids by tool name.
+    async fn read_tagged_calls(reader: &mut OwnedReadHalf, count: usize) -> HashMap<String, u64> {
+        let mut ids = HashMap::new();
+        while ids.len() < count {
+            let frame = ipc::read_frame(reader)
+                .await
+                .expect("read request")
+                .expect("connection open");
+            let request: IpcRequest = serde_json::from_slice(&frame).expect("parse request");
+            let ipc_id = ipc::FrameIds::peek(&frame)
+                .ipc_id
+                .expect("every proxy request carries an ipc_id");
+            ids.insert(tool_call_name(&request), ipc_id);
+        }
+        ids
+    }
+
+    fn call_text(result: &CallToolResult) -> String {
+        result
+            .content
+            .first()
+            .and_then(ContentBlock::as_text)
+            .expect("text content")
+            .text
+            .clone()
+    }
+
+    fn spawn_tool_call(
+        proxy: &Arc<IpcProxyHandler>,
+        name: &'static str,
+    ) -> JoinHandle<Result<IpcResponse, McpError>> {
+        let proxy = Arc::clone(proxy);
+        tokio::spawn(async move {
+            proxy
+                .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| {
+                    IpcRequest::McpRequestWithContext {
+                        session_id: session_id.to_string(),
+                        method: "tools/call".to_string(),
+                        params: Some(serde_json::json!({ "name": name })),
+                        context: ipc::IpcMcpRequestContext {
+                            request_id: RequestId::Number(1),
+                            protocol_version: plug_core::protocol::supported_protocol_version()
+                                .to_string(),
+                            client_name: None,
+                            client_version: None,
+                        },
+                    }
+                })
+                .await
+        })
+    }
+
+    #[tokio::test]
+    async fn concurrent_calls_complete_out_of_order_and_notifications_still_arrive() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("concurrent-calls");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let (release_slow, slow_released) = tokio::sync::oneshot::channel::<()>();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer) =
+                drive_fake_daemon_initialize(stream, "fake-session-1").await;
+
+            // Both calls are in flight at once; the slow one arrived first.
+            let ids = read_tagged_calls(&mut reader, 2).await;
+            send_tagged(&mut writer, ids["fast"], &text_result("fast")).await;
+            let notification = serde_json::to_value(LoggingMessageNotificationParam::new(
+                LoggingLevel::Info,
+                serde_json::json!("between replies"),
+            ))
+            .expect("serialize logging params");
+            ipc::send_response(
+                &mut writer,
+                &IpcResponse::LoggingNotification {
+                    params: notification,
+                },
+            )
+            .await
+            .expect("send notification");
+            slow_released.await.expect("release slow reply");
+            send_tagged(&mut writer, ids["slow"], &text_result("slow")).await;
+            // Keep the connection open until the proxy is done with it.
+            let _ = ipc::read_frame(&mut reader).await;
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-concurrent".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(async move {
+            let server = proxy
+                .serve(server_transport)
+                .await
+                .expect("start IPC proxy server");
+            let _ = server.waiting().await;
+        });
+
+        let notify = Arc::new(tokio::sync::Notify::new());
+        let messages = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let client = LoggingCaptureClient {
+            notify: notify.clone(),
+            messages: messages.clone(),
+        }
+        .serve(client_transport)
+        .await
+        .expect("connect downstream client");
+
+        let slow_peer = client.peer().clone();
+        let slow = tokio::spawn(async move {
+            slow_peer
+                .call_tool(CallToolRequestParams::new("slow"))
+                .await
+        });
+        // Make sure the slow call is written first.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let fast = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.call_tool(CallToolRequestParams::new("fast")),
+        )
+        .await
+        .expect("the fast call must not wait behind the slow one")
+        .expect("fast call succeeds");
+        assert_eq!(call_text(&fast), "fast");
+        assert!(!slow.is_finished(), "the slow call has no reply yet");
+
+        tokio::time::timeout(Duration::from_secs(5), notify.notified())
+            .await
+            .expect("a notification between replies reaches the downstream peer");
+        assert!(messages.lock().await[0].contains("between replies"));
+
+        release_slow.send(()).expect("daemon waiting");
+        let slow = tokio::time::timeout(Duration::from_secs(5), slow)
+            .await
+            .expect("slow call timeout")
+            .expect("slow task join")
+            .expect("slow call succeeds");
+        assert_eq!(call_text(&slow), "slow");
+
+        drop(client);
+        let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn chunked_reply_and_small_reply_route_to_their_own_requests() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("concurrent-chunked");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (mut reader, mut writer, _seen) =
+                fake_daemon_handshake(stream, "fake-session-1").await;
+
+            let ids = read_tagged_calls(&mut reader, 2).await;
+            // The big reply goes out first, over MAX_FRAME_SIZE, so it is
+            // chunked; the small reply follows it.
+            let big = "x".repeat(6 * 1024 * 1024);
+            ipc::send_chunked_response_with_id(&mut writer, Some(ids["big"]), &text_result(&big))
+                .await
+                .expect("send chunked reply");
+            send_tagged(&mut writer, ids["small"], &text_result("small")).await;
+            let _ = ipc::read_frame(&mut reader).await;
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-concurrent-chunked".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = Arc::new(IpcProxyHandler::new(session, None));
+        proxy.heartbeat.abort();
+
+        let small = spawn_tool_call(&proxy, "small");
+        let big = spawn_tool_call(&proxy, "big");
+
+        let text = |response: IpcResponse| match response {
+            IpcResponse::McpResponse { payload } => {
+                call_text(&serde_json::from_value::<CallToolResult>(payload).expect("call result"))
+            }
+            other => panic!("unexpected response {other:?}"),
+        };
+        let small = tokio::time::timeout(Duration::from_secs(10), small)
+            .await
+            .expect("small timeout")
+            .expect("join")
+            .expect("small call");
+        let big = tokio::time::timeout(Duration::from_secs(10), big)
+            .await
+            .expect("big timeout")
+            .expect("join")
+            .expect("big call");
+        assert_eq!(text(small), "small");
+        assert_eq!(text(big).len(), 6 * 1024 * 1024);
+
+        drop(proxy);
+        let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn connection_drop_resolves_every_in_flight_request_with_one_reconnect() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("concurrent-drop");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept 1");
+            let (mut reader, writer, _seen) = fake_daemon_handshake(stream, "fake-session-1").await;
+            // Three requests in flight, then the connection dies.
+            read_tagged_calls(&mut reader, 3).await;
+            drop(reader);
+            drop(writer);
+
+            let (stream, _) = listener.accept().await.expect("accept 2");
+            let (mut reader, _writer, _seen) =
+                fake_daemon_handshake(stream, "fake-session-2").await;
+            // One reconnect serves all three waiters: no third connection.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(500), listener.accept())
+                    .await
+                    .is_err(),
+                "each failed request reconnected on its own"
+            );
+            let _ = ipc::read_frame(&mut reader).await;
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-concurrent-drop".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = Arc::new(IpcProxyHandler::new(session, None));
+        proxy.heartbeat.abort();
+
+        let calls = [
+            spawn_tool_call(&proxy, "a"),
+            spawn_tool_call(&proxy, "b"),
+            spawn_tool_call(&proxy, "c"),
+        ];
+        for call in calls {
+            let error = tokio::time::timeout(Duration::from_secs(10), call)
+                .await
+                .expect("an in-flight request hung after the connection dropped")
+                .expect("join")
+                .expect_err("the connection died under the request");
+            assert!(
+                error.message.contains("REQUEST_RETRY_UNSAFE"),
+                "unexpected error: {}",
+                error.message
+            );
+        }
+        assert_eq!(proxy.shared.conn.lock().await.session_id, "fake-session-2");
+
+        drop(proxy);
+        tokio::time::timeout(Duration::from_secs(5), daemon_task)
+            .await
+            .expect("daemon task timeout")
+            .expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
     }
 }

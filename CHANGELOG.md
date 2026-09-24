@@ -32,6 +32,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   does: "Tell me when a server needs sign-in or a new app connects".
 - `plug codesign-setup` is gone. It only ran for a `PLUG_DEV=1 plug-dev`
   binary, a development path `dev-install.sh` already replaced.
+- A `plug connect` client can now have many requests in flight at once, so
+  one slow tool call no longer holds up that client's other requests. IPC
+  protocol version is now 4; the daemon and `plug connect` update together.
 
 ### Removed
 
