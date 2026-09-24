@@ -66,6 +66,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   issuer-bound credential mirror rejected", and rediscovered OAuth metadata.
 - A tool result or schema with a key named `envelope` no longer fails the
   whole call through `plug connect` with "invalid envelope message".
+- Through `plug connect`, an upstream error from reading a resource, getting
+  a prompt, completing, or listing now reaches the client as that error (for
+  example "resource not found") instead of "failed to parse".
 
 ## [0.8.11] - 2026-09-01
 

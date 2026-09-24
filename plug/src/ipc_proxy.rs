@@ -1089,23 +1089,10 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, "tools/list", params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse tools/list: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "tools/list")
         }
     }
 
@@ -1136,64 +1123,41 @@ impl ServerHandler for IpcProxyHandler {
                         .map_err(|e| McpError::internal_error(e.to_string(), None))?,
                 );
             }
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::UnsafeToRetry,
                     "tools/call",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    // Check if this is an error response before attempting CallToolResult parse
-                    if payload.get("code").is_some()
-                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
-                    {
-                        return Err(err);
-                    }
-                    if legacy_task_requested {
-                        let task: LegacyCreateTaskResult = serde_json::from_value(payload)
-                            .map_err(|e| {
-                                McpError::internal_error(
-                                    format!("unexpected task response: {e}"),
-                                    None,
-                                )
-                            })?;
-                        Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
-                            (&task.task).into(),
-                        )))
-                    } else {
-                        if payload.get("resultType").and_then(|v| v.as_str())
-                            == Some("input_required")
-                        {
-                            serde_json::from_value::<rmcp::model::InputRequiredResult>(payload)
-                                .map(Into::into)
-                                .map_err(|e| {
-                                    McpError::internal_error(
-                                        format!("unexpected input-required response: {e}"),
-                                        None,
-                                    )
-                                })
-                        } else {
-                            serde_json::from_value::<CallToolResult>(payload)
-                                .map(Into::into)
-                                .map_err(|e| {
-                                    McpError::internal_error(
-                                        format!("unexpected tool call response: {e}"),
-                                        None,
-                                    )
-                                })
-                        }
-                    }
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
+                .await?;
+            let payload: serde_json::Value = decode_mcp(response, "tools/call")?;
+            if legacy_task_requested {
+                let task: LegacyCreateTaskResult =
+                    serde_json::from_value(payload).map_err(|e| {
+                        McpError::internal_error(format!("unexpected task response: {e}"), None)
+                    })?;
+                Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
+                    (&task.task).into(),
+                )))
+            } else if payload.get("resultType").and_then(|v| v.as_str()) == Some("input_required") {
+                serde_json::from_value::<rmcp::model::InputRequiredResult>(payload)
+                    .map(Into::into)
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("unexpected input-required response: {e}"),
+                            None,
+                        )
+                    })
+            } else {
+                serde_json::from_value::<CallToolResult>(payload)
+                    .map(Into::into)
+                    .map_err(|e| {
+                        McpError::internal_error(
+                            format!("unexpected tool call response: {e}"),
+                            None,
+                        )
+                    })
             }
         }
     }
@@ -1212,19 +1176,10 @@ impl ServerHandler for IpcProxyHandler {
                 })?
                 .to_string();
             let params = request.params.clone();
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, &method, params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => Ok(CustomResult::new(payload)),
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, &method).map(CustomResult::new)
         }
     }
 
@@ -1235,29 +1190,19 @@ impl ServerHandler for IpcProxyHandler {
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
             let params = serde_json::json!({ "level": request.level });
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "logging/setLevel",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { .. } => {
-                    // Record for replay after a future daemon reconnect —
-                    // see `ReplayState`. `conn` is not held here.
-                    self.shared.replay.lock().await.log_level = Some(request.level);
-                    Ok(())
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<serde_json::Value>(response, "logging/setLevel")?;
+            // Record for replay after a future daemon reconnect — see
+            // `ReplayState`. `conn` is not held here.
+            self.shared.replay.lock().await.log_level = Some(request.level);
+            Ok(())
         }
     }
 
@@ -1271,26 +1216,10 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, "resources/list", params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse resources/list: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "resources/list")
         }
     }
 
@@ -1304,31 +1233,15 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/templates/list",
                     params,
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse resources/templates/list: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "resources/templates/list")
         }
     }
 
@@ -1340,33 +1253,15 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/read",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value::<ReadResourceResult>(payload)
-                        .map(Into::into)
-                        .map_err(|e| {
-                            McpError::internal_error(
-                                format!("failed to parse resources/read: {e}"),
-                                None,
-                            )
-                        })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<ReadResourceResult>(response, "resources/read").map(Into::into)
         }
     }
 
@@ -1378,40 +1273,25 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/subscribe",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    if payload.get("code").is_some()
-                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
-                    {
-                        return Err(err);
-                    }
-                    // Record for replay after a future daemon reconnect —
-                    // see `ReplayState`. `conn` is not held here. Only a
-                    // successful subscribe is replayed.
-                    self.shared
-                        .replay
-                        .lock()
-                        .await
-                        .subscriptions
-                        .insert(request.uri.clone());
-                    Ok(())
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<serde_json::Value>(response, "resources/subscribe")?;
+            // Record for replay after a future daemon reconnect — see
+            // `ReplayState`. `conn` is not held here. Only a successful
+            // subscribe is replayed.
+            self.shared
+                .replay
+                .lock()
+                .await
+                .subscriptions
+                .insert(request.uri.clone());
+            Ok(())
         }
     }
 
@@ -1423,40 +1303,25 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "resources/unsubscribe",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    if payload.get("code").is_some()
-                        && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
-                    {
-                        return Err(err);
-                    }
-                    // Remove from the replay set on success — a failed
-                    // unsubscribe must not stop the subscription from being
-                    // replayed after a future reconnect.
-                    self.shared
-                        .replay
-                        .lock()
-                        .await
-                        .subscriptions
-                        .remove(&request.uri);
-                    Ok(())
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<serde_json::Value>(response, "resources/unsubscribe")?;
+            // Remove from the replay set on success — a failed unsubscribe
+            // must not stop the subscription from being replayed after a
+            // future reconnect.
+            self.shared
+                .replay
+                .lock()
+                .await
+                .subscriptions
+                .remove(&request.uri);
+            Ok(())
         }
     }
 
@@ -1470,23 +1335,10 @@ impl ServerHandler for IpcProxyHandler {
                 .map(serde_json::to_value)
                 .transpose()
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(RetryPolicy::SafeToRetry, "prompts/list", params, &context)
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(format!("failed to parse prompts/list: {e}"), None)
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "prompts/list")
         }
     }
 
@@ -1498,33 +1350,15 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "prompts/get",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value::<GetPromptResult>(payload)
-                        .map(Into::into)
-                        .map_err(|e| {
-                            McpError::internal_error(
-                                format!("failed to parse prompts/get: {e}"),
-                                None,
-                            )
-                        })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp::<GetPromptResult>(response, "prompts/get").map(Into::into)
         }
     }
 
@@ -1536,32 +1370,44 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let params = serde_json::to_value(&request)
                 .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-            match self
+            let response = self
                 .mcp_round_trip(
                     RetryPolicy::SafeToRetry,
                     "completion/complete",
                     Some(params),
                     &context,
                 )
-                .await?
-            {
-                IpcResponse::McpResponse { payload } => {
-                    serde_json::from_value(payload).map_err(|e| {
-                        McpError::internal_error(
-                            format!("failed to parse completion/complete: {e}"),
-                            None,
-                        )
-                    })
-                }
-                IpcResponse::Error { code, message } => {
-                    Err(McpError::internal_error(format!("{code}: {message}"), None))
-                }
-                other => Err(McpError::internal_error(
-                    format!("unexpected IPC response: {other:?}"),
-                    None,
-                )),
-            }
+                .await?;
+            decode_mcp(response, "completion/complete")
         }
+    }
+}
+
+/// Decode a daemon reply to an MCP request. Upstream errors ride back as an
+/// `McpResponse` whose payload is a serialized `McpError`; surface those as
+/// the error they are instead of failing to parse them as a result.
+fn decode_mcp<T: serde::de::DeserializeOwned>(
+    response: IpcResponse,
+    method: &str,
+) -> Result<T, McpError> {
+    match response {
+        IpcResponse::McpResponse { payload } => {
+            if payload.get("code").is_some()
+                && let Ok(err) = serde_json::from_value::<McpError>(payload.clone())
+            {
+                return Err(err);
+            }
+            serde_json::from_value(payload).map_err(|e| {
+                McpError::internal_error(format!("failed to parse {method}: {e}"), None)
+            })
+        }
+        IpcResponse::Error { code, message } => {
+            Err(McpError::internal_error(format!("{code}: {message}"), None))
+        }
+        other => Err(McpError::internal_error(
+            format!("unexpected IPC response: {other:?}"),
+            None,
+        )),
     }
 }
 
@@ -4680,6 +4526,38 @@ mod tests {
             result.structured_content,
             Some(serde_json::json!({ "envelope": "sealed" }))
         );
+
+        daemon_task.await.expect("daemon task join");
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
+    async fn upstream_error_for_resources_read_reaches_the_client_as_that_error() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("read-error");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let payload = serde_json::to_value(McpError::resource_not_found(
+            "no such resource: file:///missing",
+            None,
+        ))
+        .expect("serialize error");
+        let (client, daemon_task) =
+            proxy_with_one_scripted_reply("client-read-error", "resources/read", payload).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.read_resource(ReadResourceRequestParams::new("file:///missing")),
+        )
+        .await
+        .expect("read timeout")
+        .expect_err("the upstream error must surface as an error");
+        let rmcp::ServiceError::McpError(error) = error else {
+            panic!("expected an MCP error, got {error:?}");
+        };
+        assert_eq!(error.code, ErrorCode::RESOURCE_NOT_FOUND);
+        assert!(error.message.contains("no such resource"), "{error:?}");
 
         daemon_task.await.expect("daemon task join");
         clear_test_runtime_paths();
