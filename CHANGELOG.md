@@ -22,6 +22,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   more.
 - The version in About can be selected and copied.
 
+### Removed
+
+- `install.sh` is gone. It exited on macOS and the Linux tarballs it
+  downloaded stopped at 0.8.10. Install Plug.app from the DMG or the
+  `plug-app` Homebrew cask.
+
 ### Fixed
 
 - Toggling a tool or server from Plug.app or `plug servers` no longer

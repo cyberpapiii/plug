@@ -292,9 +292,6 @@ Notes:
 | [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | AI client quirks, limits, and configuration |
 | [OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md) | Production operation: TLS, auth, observability, sandboxing |
 | [RELEASING.md](docs/RELEASING.md) | How a release is built, signed, and published |
-| [UX-DESIGN.md](docs/UX-DESIGN.md) | Guided CLI + agent UX patterns |
-| [CRATE-STACK.md](docs/CRATE-STACK.md) | Dependency decisions with rationale |
-| [MCP-SPEC.md](docs/MCP-SPEC.md) | MCP protocol reference relevant to implementation |
 | [archive/](docs/archive/) | Plans, research, audits, and release notes from before September 2026 |
 
 ## Design Principles
