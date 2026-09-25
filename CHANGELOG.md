@@ -12,6 +12,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `scripts/perf.sh` measures the journeys Plug owns against the installed
   app: connector startup, tools/list, ping and call overhead, and from the
   logs, per-server call latency, daemon startup, and the daemon swap gap.
+- A new `plug connect` is ready about 100ms sooner. When it runs from inside
+  Plug.app it no longer re-verifies the app it is running from, which cost a
+  codesign check and two subprocesses per connector.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

@@ -236,10 +236,10 @@ pub fn maybe_delegate_to_app() -> Result<()> {
 /// canonical install is one of them, and answering from a path comparison
 /// alone keeps the common case free of any system call beyond `canonicalize`.
 #[cfg(target_os = "macos")]
-fn running_as_bundle_executable(current: &Path) -> bool {
+pub(crate) fn running_as_bundle_executable(current: &Path) -> bool {
     fallback_bundle_paths()
         .into_iter()
-        .chain(registered_bundle_paths())
+        .chain(std::iter::once_with(registered_bundle_paths).flatten())
         .any(|bundle| paths_match(current, &bundle.join(BUNDLE_EXECUTABLE)))
 }
 
