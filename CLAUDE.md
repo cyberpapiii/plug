@@ -22,6 +22,7 @@ clients over HTTP. One person maintains it; keep it small and reliable.
 ./scripts/dev-install.sh           build Plug.app from the tree and install it; the app swaps its daemon. 1-2 min
 ./scripts/dev.sh --quick           fmt + clippy, 15s. pre-push runs this
 ./scripts/dev.sh                   the lanes your change touches, with tests, about 2 min
+./scripts/perf.sh                  latency of the journeys Plug owns, live and from logs. Read-only
 ./scripts/ship.sh "type: message"  commit, push, PR, auto-merge. Add new files with git add first
 ./scripts/release.sh [version]     only when asked to release. Write the CHANGELOG entry first
 ```

@@ -502,7 +502,11 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func kickstartAgent() async throws {
-        try await launchctl(["kickstart", "-k", "gui/\(getuid())/com.plug.daemon"])
+        // No `-k`: registration already started the job through RunAtLoad,
+        // and killing that fresh instance runs into launchd's ten-second
+        // respawn throttle, leaving no daemon for about eleven seconds. A plain
+        // kickstart starts the job only when it is not already running.
+        try await launchctl(["kickstart", "gui/\(getuid())/com.plug.daemon"])
     }
 
     func handshake() async throws -> OperatorHandshake {
