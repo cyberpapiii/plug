@@ -351,6 +351,9 @@ pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String
        `plug stop` exit 0 and stay stopped; a panic or a kill self-heals. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
+  <!-- Shutdown lets running tool calls finish for up to eight seconds, and
+       launchd's own default kills an agent about five seconds after SIGTERM. -->
+  <key>ExitTimeOut</key><integer>20</integer>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
@@ -834,11 +837,18 @@ arguments = {
     fn cli_and_app_plists_agree_on_crash_only_restart() {
         const CRASH_ONLY: &str =
             "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>";
+        // Room for the shutdown drain; without it launchd kills the daemon
+        // while running calls are still finishing.
+        const EXIT_TIMEOUT: &str = "<key>ExitTimeOut</key><integer>20</integer>";
 
         let cli = render_cli_plist(Path::new("/tmp/plug"), None);
         assert!(
             cli.contains(CRASH_ONLY),
             "CLI plist lost its crash-only restart policy"
+        );
+        assert!(
+            cli.contains(EXIT_TIMEOUT),
+            "CLI plist lost its exit timeout"
         );
 
         let app_plist = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -848,6 +858,10 @@ arguments = {
         assert!(
             app.contains(CRASH_ONLY),
             "app plist lost its crash-only restart policy"
+        );
+        assert!(
+            app.contains(EXIT_TIMEOUT),
+            "app plist lost its exit timeout"
         );
     }
 

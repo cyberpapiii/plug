@@ -2195,8 +2195,8 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
 // ──────────────────────── Unix signal handling ───────────────────────────────
 
 /// How long a signalled daemon lets running tool calls finish before it tears
-/// down. launchd sends SIGKILL twenty seconds after SIGTERM, and upstream
-/// shutdown needs a few of those.
+/// down. The launchd plists set `ExitTimeOut` to twenty seconds, which leaves
+/// room for upstream shutdown after the drain.
 const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
 /// Wait for SIGTERM or SIGINT (for daemon mode), then let running tool calls
