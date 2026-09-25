@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `scripts/perf.sh` measures the journeys Plug owns against the installed
+  app: connector startup, tools/list, ping and call overhead, and from the
+  logs, per-server call latency, daemon startup, and the daemon swap gap.
+
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling
   after launch, every enabled server stays in the list with its tool count,
@@ -45,6 +49,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `plug-app` Homebrew cask.
 
 ### Fixed
+
+- Updating Plug.app no longer leaves about twelve seconds without a daemon.
+  The replacement killed the daemon registration had just started, and
+  launchd's respawn throttle held the restart back; the gap is now under two
+  seconds.
 
 - `plug connect` now exits when its host closes stdin. Before, it kept
   running with a live daemon session after the app or agent that started it
