@@ -3,7 +3,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::future::Future;
 use std::hash::{Hash, Hasher};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 
@@ -252,6 +252,10 @@ pub struct ToolRouter {
     effective_log_level: ArcSwap<LoggingLevel>,
     active_calls: DashMap<u64, ActiveCallRecord>,
     active_call_lookup: DashMap<DownstreamCallKey, u64>,
+    /// Tool calls running right now, from any transport. Shutdown waits on
+    /// this so a daemon swap lets running calls finish instead of failing them.
+    calls_in_flight: AtomicUsize,
+    calls_settled: tokio::sync::Notify,
     upstream_request_lookup: DashMap<UpstreamRequestKey, u64>,
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
@@ -893,6 +897,8 @@ impl ToolRouter {
             effective_log_level: ArcSwap::from_pointee(LoggingLevel::Warning),
             active_calls: DashMap::new(),
             active_call_lookup: DashMap::new(),
+            calls_in_flight: AtomicUsize::new(0),
+            calls_settled: tokio::sync::Notify::new(),
             upstream_request_lookup: DashMap::new(),
             upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
@@ -1580,6 +1586,31 @@ impl ToolRouter {
 
     pub fn schedule_prompt_list_changed_refresh(self: &Arc<Self>) {
         self.schedule_list_changed_refresh(ProtocolNotification::PromptListChanged);
+    }
+
+    fn track_call(&self) -> InFlightCall<'_> {
+        self.calls_in_flight.fetch_add(1, Ordering::AcqRel);
+        InFlightCall { router: self }
+    }
+
+    /// Wait until no tool call is running, or until `timeout` passes. Returns
+    /// how many calls were still running when it gave up.
+    pub async fn drain_calls(&self, timeout: Duration) -> usize {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let settled = self.calls_settled.notified();
+            tokio::pin!(settled);
+            // Register before reading the count, so a call that ends between
+            // the read and the wait still wakes this loop.
+            settled.as_mut().enable();
+            let running = self.calls_in_flight.load(Ordering::Acquire);
+            if running == 0 {
+                return 0;
+            }
+            if tokio::time::timeout_at(deadline, settled).await.is_err() {
+                return self.calls_in_flight.load(Ordering::Acquire);
+            }
+        }
     }
 
     #[cfg(test)]
@@ -2933,6 +2964,7 @@ impl ToolRouter {
         Box<dyn std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + 'a>,
     > {
         Box::pin(async move {
+            let _in_flight = self.track_call();
             // Intercept plug meta-tools (case-insensitive for LLM casing drift).
             if let Some(meta_tool_name) = canonical_plug_meta_tool_name(tool_name) {
                 if !self.meta_tool_visible_for_call(meta_tool_name, downstream.as_ref()) {
@@ -3845,9 +3877,43 @@ fn health_gate_outcome(health: ServerHealth) -> Option<crate::protocol::Protocol
     }
 }
 
+struct InFlightCall<'a> {
+    router: &'a ToolRouter,
+}
+
+impl Drop for InFlightCall<'_> {
+    fn drop(&mut self) {
+        if self.router.calls_in_flight.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.router.calls_settled.notify_waiters();
+        }
+    }
+}
+
 #[cfg(test)]
 mod lifecycle_regression_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn drain_calls_waits_for_running_calls_and_gives_up_at_the_deadline() {
+        let router = Arc::new(ToolRouter::new(
+            Arc::new(ServerManager::new()),
+            test_router_config(),
+        ));
+        assert_eq!(router.drain_calls(Duration::from_secs(5)).await, 0);
+
+        let first = router.track_call();
+        let second = router.track_call();
+        assert_eq!(router.drain_calls(Duration::from_millis(20)).await, 2);
+
+        drop(first);
+        let started = std::time::Instant::now();
+        let (remaining, ()) = tokio::join!(router.drain_calls(Duration::from_secs(5)), async {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            drop(second);
+        });
+        assert_eq!(remaining, 0);
+        assert!(started.elapsed() < Duration::from_secs(2));
+    }
 
     fn test_router_config() -> RouterConfig {
         RouterConfig {
