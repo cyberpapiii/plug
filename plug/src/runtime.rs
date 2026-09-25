@@ -1052,6 +1052,14 @@ fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)
         let development =
             std::env::var_os("PLUG_DEV").as_deref() == Some(std::ffi::OsStr::new("1"));
         if !development {
+            // Running from inside Plug.app already means running the bundle the
+            // verifier would check, so verifying would re-prove the code on
+            // this line at the cost of a codesign walk and two subprocesses
+            // per connector. The handshake still has to name this executable.
+            let current = std::env::current_exe()?;
+            if crate::install::running_as_bundle_executable(&current) {
+                return Ok((current, true));
+            }
             let app = crate::install::resolve_verified_app()?.ok_or_else(|| {
                 anyhow::anyhow!(
                     "no verified Plug.app is available; open Plug.app to finish installation"
