@@ -18,6 +18,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Updating Plug no longer fails a tool call that is running. On shutdown the
   daemon waits up to eight seconds for running calls to finish before it
   disconnects clients and stops servers.
+- A daemon swap takes about a second less. A stdio server that stays up after
+  its stdin closes, like Figma's, now gets SIGTERM after a quarter second
+  instead of holding shutdown for the full timeout, and the "upstream
+  shutdown timed out" warnings it caused are gone.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

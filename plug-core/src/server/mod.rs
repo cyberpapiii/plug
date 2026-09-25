@@ -835,6 +835,9 @@ pub struct UpstreamServer {
     /// underneath us. See [`ConnectionGeneration`].
     pub(crate) connection: ConnectionGeneration,
     pub health: ServerHealth,
+    /// Process id of a stdio server, so retirement can send SIGTERM to a
+    /// server that does not exit when its stdin closes.
+    pub(crate) child_pid: Option<u32>,
 }
 
 impl UpstreamServer {
@@ -1471,6 +1474,7 @@ impl ServerManager {
 
                     let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)
                         .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
+                    let child_pid = transport.id();
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
                     let handler = Arc::new(UpstreamClientHandler {
@@ -1501,6 +1505,10 @@ impl ServerManager {
                         ConnectionGeneration::new(),
                     )
                     .await
+                    .map(|upstream| UpstreamServer {
+                        child_pid,
+                        ..upstream
+                    })
                 }
                 TransportType::Http => {
                     crate::tls::ensure_rustls_provider_installed();
@@ -1773,6 +1781,7 @@ impl ServerManager {
             protocol_gate_state: modern_upstream_gate_state,
             connection,
             health: ServerHealth::Healthy,
+            child_pid: None,
         })
     }
 
@@ -2383,11 +2392,25 @@ pub(crate) async fn retire_upstream_owned(
 
     match Arc::try_unwrap(upstream_arc) {
         Ok(mut upstream) => {
-            match upstream
+            let child_pid = upstream.child_pid;
+            let close = upstream
                 .client
-                .close_with_timeout(UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT)
-                .await
-            {
+                .close_with_timeout(UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT);
+            tokio::pin!(close);
+            // Closing stdin is the polite stop. A server that keeps running
+            // after it (Figma holds a WebSocket server open) gets SIGTERM, as
+            // the MCP stdio lifecycle prescribes, instead of waiting out the
+            // timeout and rmcp's SIGKILL after it.
+            let closed = match tokio::time::timeout(STDIO_EOF_GRACE, &mut close).await {
+                Ok(closed) => closed,
+                Err(_) => {
+                    if let Some(pid) = child_pid {
+                        terminate_process(pid).await;
+                    }
+                    close.await
+                }
+            };
+            match closed {
                 Ok(Some(_)) => {
                     tracing::info!(server = %name, reason, "retired upstream cleanly");
                 }
@@ -2417,6 +2440,24 @@ pub(crate) async fn retire_upstream_owned(
             );
             drop(arc);
         }
+    }
+}
+
+/// How long a stdio server gets to exit on its own after stdin closes before
+/// it is sent SIGTERM.
+const STDIO_EOF_GRACE: Duration = Duration::from_millis(250);
+
+async fn terminate_process(pid: u32) {
+    // No `unsafe` in this codebase, so no direct kill(2).
+    let status = tokio::process::Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .await;
+    if let Err(error) = status {
+        tracing::debug!(pid, %error, "could not send SIGTERM to upstream process");
     }
 }
 
@@ -3448,7 +3489,73 @@ mod tests {
             protocol_gate_state: 0,
             connection: ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
+            child_pid: None,
         }
+    }
+
+    /// A stdio server that ignores stdin EOF (Figma keeps a WebSocket server
+    /// open) is stopped with SIGTERM shortly after stdin closes, rather than
+    /// holding retirement for the whole shutdown timeout.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn retirement_terminates_a_stdio_server_that_ignores_stdin_eof() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let marker = dir.path().join("terminated");
+        let mut command = tokio::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "trap 'echo term > \"$0\"; exit 0' TERM; while :; do sleep 0.05; done",
+            marker.to_str().expect("utf-8 path"),
+        ]);
+        // The shell must not hold the test's output pipe if it outlives a failure.
+        command.stderr(std::process::Stdio::null());
+        let transport =
+            rmcp::transport::child_process::TokioChildProcess::new(command).expect("spawn");
+        let child_pid = transport.id();
+        struct KillOnExit(Option<u32>);
+        impl Drop for KillOnExit {
+            fn drop(&mut self) {
+                if let Some(pid) = self.0 {
+                    let _ = std::process::Command::new("/bin/kill")
+                        .args(["-KILL", &pid.to_string()])
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+        }
+        let _cleanup = KillOnExit(child_pid);
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let handler = Arc::new(UpstreamClientHandler {
+            server_id: Arc::from("eof-ignorer"),
+            tools: Arc::clone(&tools),
+            router: std::sync::Weak::new(),
+            list_timeout: Duration::from_secs(300),
+            protocol_version_override: None,
+        });
+        let client: McpClient = rmcp::service::serve_directly(handler, transport, None);
+        let upstream = UpstreamServer {
+            name: "eof-ignorer".to_string(),
+            config: test_server_config(),
+            client,
+            tools,
+            capabilities: ServerCapabilities::default(),
+            upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate_state: 0,
+            connection: ConnectionGeneration::new(),
+            health: ServerHealth::Healthy,
+            child_pid,
+        };
+
+        let started = std::time::Instant::now();
+        retire_upstream_owned("eof-ignorer".to_string(), Arc::new(upstream), "test").await;
+        assert!(
+            started.elapsed() < UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT,
+            "retirement waited out the timeout: {:?}",
+            started.elapsed()
+        );
+        assert!(marker.exists(), "the server never received SIGTERM");
     }
 
     async fn make_connected_task_native_upstream(
@@ -3499,6 +3606,7 @@ mod tests {
                 protocol_gate_state: 0,
                 connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
+                child_pid: None,
             },
             result_request_count,
         )
@@ -3835,6 +3943,7 @@ mod tests {
                 protocol_gate_state: 0,
                 connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
+                child_pid: None,
             },
         )
         .await;
@@ -3893,6 +4002,7 @@ mod tests {
                 protocol_gate_state: 0,
                 connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
+                child_pid: None,
             },
         )
         .await;
@@ -4198,6 +4308,7 @@ mod tests {
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
+                    child_pid: None,
                 },
             )
             .await;
@@ -4306,6 +4417,7 @@ mod tests {
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
+                    child_pid: None,
                 },
             )
             .await;
@@ -4639,6 +4751,7 @@ mod tests {
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
+                    child_pid: None,
                 },
             )
             .await;
@@ -4762,6 +4875,7 @@ mod tests {
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
+                    child_pid: None,
                 },
             )
             .await;
@@ -4907,6 +5021,7 @@ mod tests {
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
+                    child_pid: None,
                 },
             )
             .await;
@@ -5441,6 +5556,7 @@ mod tests {
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
+                    child_pid: None,
                 },
             )
             .await;
