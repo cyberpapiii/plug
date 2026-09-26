@@ -32,8 +32,17 @@ const READ_WATCHDOG: Duration = Duration::from_secs(120);
 /// Every `DaemonToProxyMessage` frame starts with its serde tag.
 const ENVELOPE_FRAME_PREFIX: &[u8] = b"{\"envelope\":";
 
-fn selected_protocol_for_log(protocol: &ProtocolVersion) -> &str {
-    protocol.as_str()
+/// The version `initialize` answers with: the requested one when Plug
+/// supports it, otherwise Plug's default, which is what RMCP negotiates.
+fn selected_protocol_for_log(
+    requested: &ProtocolVersion,
+    supported: &[ProtocolVersion],
+) -> ProtocolVersion {
+    if supported.contains(requested) {
+        requested.clone()
+    } else {
+        plug_core::protocol::supported_protocol_version()
+    }
 }
 
 /// Test-only override for `READ_WATCHDOG` so the suite can exercise watchdog
@@ -1276,7 +1285,10 @@ impl ServerHandler for IpcProxyHandler {
             tracing::info!(
                 client = %client_name,
                 requested_protocol = %request.protocol_version,
-                selected_protocol = selected_protocol_for_log(&request.protocol_version),
+                selected_protocol = %selected_protocol_for_log(
+                    &request.protocol_version,
+                    &self.supported_protocol_versions(),
+                ),
                 "client connected via IPC proxy"
             );
             self.shared.conn.lock().await.client_info = Some(client_name.clone());
@@ -1859,14 +1871,21 @@ mod tests {
     use tokio::task::JoinHandle;
 
     #[test]
-    fn selected_protocol_log_uses_requested_protocol_version() {
+    fn selected_protocol_log_reports_the_negotiated_version() {
+        let legacy_only = plug_core::protocol::supported_downstream_protocol_versions(false);
+        let with_modern = plug_core::protocol::supported_downstream_protocol_versions(true);
         assert_eq!(
-            selected_protocol_for_log(&ProtocolVersion::V_2026_07_28),
-            plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+            selected_protocol_for_log(&ProtocolVersion::V_2025_06_18, &legacy_only).as_str(),
+            plug_core::protocol::SUPPORTED_PROTOCOL_VERSION,
+            "an older client gets Plug's version, not the one it asked for"
         );
         assert_eq!(
-            selected_protocol_for_log(&ProtocolVersion::V_2025_11_25),
+            selected_protocol_for_log(&ProtocolVersion::V_2025_11_25, &legacy_only).as_str(),
             plug_core::protocol::SUPPORTED_PROTOCOL_VERSION
+        );
+        assert_eq!(
+            selected_protocol_for_log(&ProtocolVersion::V_2026_07_28, &with_modern).as_str(),
+            plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
         );
     }
 

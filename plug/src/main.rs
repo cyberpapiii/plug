@@ -582,8 +582,17 @@ fn init_stderr_tracing(level: &str) {
         return;
     }
 
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(level));
+    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG").unwrap_or_else(|_| {
+        // RMCP warns whenever a client asks for a protocol version Plug does
+        // not speak, which is ordinary version negotiation, and hosts show a
+        // connector's stderr warnings to the user. That warning is the only one
+        // in this module.
+        tracing_subscriber::EnvFilter::new(level).add_directive(
+            "rmcp::service::server=error"
+                .parse()
+                .expect("static tracing directive"),
+        )
+    });
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

@@ -1180,6 +1180,18 @@ async fn cmd_auth_status(
             println!();
 
             for (name, sc) in &oauth_servers {
+                // A disabled server never runs, so its stored credentials
+                // age out and the store's warnings are noise, not a fault.
+                if !sc.enabled {
+                    println!(
+                        "  {} {} ({})",
+                        style("○").dim(),
+                        style(name).bold(),
+                        style("disabled").dim()
+                    );
+                    println!();
+                    continue;
+                }
                 let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
                 let snapshot = if live.is_none() {
                     Some(oauth::get_or_create_store(name).fallback_auth_snapshot())
@@ -1261,6 +1273,15 @@ async fn cmd_auth_status(
         OutputFormat::Json => {
             let mut servers = Vec::new();
             for (name, sc) in &oauth_servers {
+                if !sc.enabled {
+                    servers.push(serde_json::json!({
+                        "name": name,
+                        "url": sc.url.clone(),
+                        "enabled": false,
+                        "warnings": [],
+                    }));
+                    continue;
+                }
                 let live = live_auth_status.as_ref().and_then(|m| m.get(*name));
                 let snapshot = if live.is_none() {
                     Some(oauth::get_or_create_store(name).fallback_auth_snapshot())
