@@ -705,6 +705,12 @@ async fn handle_ipc_connection(
     stream: tokio::net::UnixStream,
     mut ctx: ConnectionContext,
 ) -> anyhow::Result<()> {
+    // Plug.app stops connectors with SIGSTOP while it swaps the daemon, so
+    // a reply that finishes during the shutdown drain has to fit in the
+    // kernel buffer; the macOS default of 8 KB is smaller than most replies.
+    if let Err(error) = socket2::SockRef::from(&stream).set_send_buffer_size(IPC_SEND_BUFFER) {
+        tracing::debug!(%error, "could not enlarge the IPC send buffer");
+    }
     let (reader, mut writer) = stream.into_split();
     let mut reader = FrameReader::new(reader);
     let mut in_flight = InFlight::default();
@@ -1187,6 +1193,10 @@ async fn handle_ipc_loop(
 
     Ok(())
 }
+
+/// Send buffer for an IPC connection. Memory is only committed as data
+/// queues, and macOS caps socket buffers at 8 MB.
+const IPC_SEND_BUFFER: usize = 4 * 1024 * 1024;
 
 /// Write the reply of a request that dispatched on its own task, tagged with
 /// the `ipc_id` it arrived with. A task that panicked answers with an error,
@@ -4948,6 +4958,49 @@ mod tests {
         assert!(
             matches!(response, IpcResponse::McpResponse { .. }),
             "{response:?}"
+        );
+        harness.shutdown().await;
+    }
+
+    /// Plug.app stops every connector with SIGSTOP while it swaps the
+    /// daemon, so a proxy reads nothing during the drain. A reply larger
+    /// than the 8 KB macOS default socket buffer must still be written in
+    /// full before the connection closes, for the proxy to read on resume.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_drained_reply_reaches_a_proxy_that_is_not_reading() {
+        let mut harness = IpcTestHarness::start_with_servers(slow_and_fast_servers()).await;
+        let session_id = harness.session_id.clone();
+        let input = "x".repeat(256 * 1024);
+        let request = IpcRequest::McpRequest {
+            session_id: session_id.clone(),
+            method: "tools/call".to_string(),
+            params: Some(serde_json::json!({
+                "name": "Slow__echo",
+                "arguments": { "input": input },
+            })),
+        };
+        write_tagged_ipc(&mut harness.stream, 1, &request).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let remaining = harness
+            .engine
+            .tool_router()
+            .drain_calls(Duration::from_secs(5))
+            .await;
+        assert_eq!(remaining, 0);
+        harness.cancel.cancel();
+        // The proxy stays stopped well past the daemon's flush window.
+        tokio::time::sleep(REPLY_FLUSH_WINDOW * 4).await;
+
+        let (ipc_id, response) = read_tagged_reply(&mut harness.stream).await;
+        assert_eq!(ipc_id, 1);
+        let IpcResponse::McpResponse { payload } = response else {
+            panic!("{response:?}");
+        };
+        let text = payload["content"][0]["text"].as_str().expect("text");
+        assert!(
+            text.contains(&input),
+            "reply truncated to {} bytes",
+            text.len()
         );
         harness.shutdown().await;
     }

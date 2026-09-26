@@ -40,6 +40,7 @@ rustls = { version = "0.23", default-features = false, features = ["std", "ring"
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "process", "io-util", "net", "sync", "time", "signal"] }
+socket2 = "0.6"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
