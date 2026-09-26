@@ -1573,7 +1573,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         result = &mut daemon_future => {
             result?;
         }
-        _ = daemon::shutdown_signal(cancel) => {}
+        _ = daemon::shutdown_signal(cancel, engine.tool_router().clone()) => {}
     }
     // A cold start still in flight owns upstreams that shutdown has to retire,
     // so give it a bounded chance to finish before anything is torn down.

@@ -15,6 +15,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A new `plug connect` is ready about 100ms sooner. When it runs from inside
   Plug.app it no longer re-verifies the app it is running from, which cost a
   codesign check and two subprocesses per connector.
+- Updating Plug no longer fails a tool call that is running. On shutdown the
+  daemon waits up to eight seconds for running calls to finish before it
+  disconnects clients and stops servers.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

@@ -19,7 +19,7 @@ use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
 use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse};
-use plug_core::proxy::DownstreamBridge;
+use plug_core::proxy::{DownstreamBridge, ToolRouter};
 use plug_core::session::SessionStore;
 
 mod framing;
@@ -873,7 +873,10 @@ async fn handle_ipc_loop(
             'select: loop {
                 tokio::select! {
                     biased;
-                    _ = ctx.cancel.cancelled() => return Ok(()),
+                    _ = ctx.cancel.cancelled() => {
+                        flush_finished_replies(writer, in_flight).await;
+                        return Ok(());
+                    }
                     Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
                         write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
                     }
@@ -1188,6 +1191,27 @@ async fn handle_ipc_loop(
 /// Write the reply of a request that dispatched on its own task, tagged with
 /// the `ipc_id` it arrived with. A task that panicked answers with an error,
 /// so the proxy's waiter never hangs on it.
+/// How long a cancelled connection waits for request tasks to finish and
+/// their replies to be written.
+const REPLY_FLUSH_WINDOW: Duration = Duration::from_millis(250);
+
+/// Shutdown cancels only after running tool calls drain, so a request task can
+/// hold a finished reply, or be a moment from one, when the connection is
+/// cancelled. Write those replies before the connection closes. Tasks still
+/// running after the window are aborted by the caller.
+async fn flush_finished_replies(
+    writer: &mut tokio::net::unix::OwnedWriteHalf,
+    in_flight: &mut InFlight,
+) {
+    let _ = tokio::time::timeout(REPLY_FLUSH_WINDOW, async {
+        while let Some(joined) = in_flight.tasks.join_next_with_id().await {
+            write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    })
+    .await;
+}
+
 async fn write_in_flight_reply(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ids: &mut std::collections::HashMap<tokio::task::Id, u64>,
@@ -2170,29 +2194,49 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
 
 // ──────────────────────── Unix signal handling ───────────────────────────────
 
-/// Wait for SIGTERM or SIGINT (for daemon mode).
+/// How long a signalled daemon lets running tool calls finish before it tears
+/// down. The launchd plists set `ExitTimeOut` to twenty seconds, which leaves
+/// room for upstream shutdown after the drain.
+const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+
+/// Wait for SIGTERM or SIGINT (for daemon mode), then let running tool calls
+/// finish before cancelling. Clients and transports stay up while the calls
+/// drain, so an update or a stop does not fail a call an agent is waiting on.
 ///
 /// Systemd sends SIGTERM for graceful shutdown, not SIGINT.
 #[cfg(unix)]
-pub async fn shutdown_signal(cancel: CancellationToken) {
+pub async fn shutdown_signal(cancel: CancellationToken, router: Arc<ToolRouter>) {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     tokio::select! {
         _ = sigterm.recv() => {
             tracing::info!("received SIGTERM");
+            drain_calls(&router).await;
         }
         _ = sigint.recv() => {
             tracing::info!("received SIGINT");
+            drain_calls(&router).await;
         }
         _ = cancel.cancelled() => {}
     }
     cancel.cancel();
 }
 
+async fn drain_calls(router: &ToolRouter) {
+    let started = Instant::now();
+    let remaining = router.drain_calls(CALL_DRAIN_TIMEOUT).await;
+    let waited_ms = started.elapsed().as_millis() as u64;
+    if remaining == 0 {
+        tracing::info!(waited_ms, "tool calls drained");
+    } else {
+        tracing::warn!(waited_ms, remaining, "tool calls still running at shutdown");
+    }
+}
+
 /// Fallback for non-Unix platforms.
 #[cfg(not(unix))]
-pub async fn shutdown_signal(cancel: CancellationToken) {
+pub async fn shutdown_signal(cancel: CancellationToken, _router: Arc<ToolRouter>) {
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             tracing::info!("received Ctrl+C");
@@ -4874,6 +4918,38 @@ mod tests {
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({ "name": name, "arguments": { "input": name } })),
         }
+    }
+
+    /// Shutdown waits for running tool calls, then cancels. A call that
+    /// finished in that wait must still get its reply to the proxy before the
+    /// connection closes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_call_that_finishes_during_the_shutdown_drain_still_gets_its_reply() {
+        let mut harness = IpcTestHarness::start_with_servers(slow_and_fast_servers()).await;
+        let session_id = harness.session_id.clone();
+        write_tagged_ipc(
+            &mut harness.stream,
+            1,
+            &tool_call_request(&session_id, "Slow__echo"),
+        )
+        .await;
+        // Let the call reach the upstream, then shut down as the daemon does.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let remaining = harness
+            .engine
+            .tool_router()
+            .drain_calls(Duration::from_secs(5))
+            .await;
+        assert_eq!(remaining, 0);
+        harness.cancel.cancel();
+
+        let (ipc_id, response) = read_tagged_reply(&mut harness.stream).await;
+        assert_eq!(ipc_id, 1);
+        assert!(
+            matches!(response, IpcResponse::McpResponse { .. }),
+            "{response:?}"
+        );
+        harness.shutdown().await;
     }
 
     #[tokio::test]

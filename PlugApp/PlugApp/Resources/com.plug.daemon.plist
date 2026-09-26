@@ -11,4 +11,7 @@
        `plug stop` exit 0 and stay stopped; a panic or a kill self-heals. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
+  <!-- Shutdown lets running tool calls finish for up to eight seconds, and
+       launchd's own default kills an agent about five seconds after SIGTERM. -->
+  <key>ExitTimeOut</key><integer>20</integer>
 </dict></plist>
