@@ -2531,6 +2531,7 @@ dependencies = [
  "serde_json",
  "serde_norway",
  "sha2 0.10.9",
+ "socket2",
  "subtle",
  "tokio",
  "tokio-rustls",
