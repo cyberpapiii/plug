@@ -3094,6 +3094,7 @@ async fn connect_subscribable_upstream(
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
         health: ServerHealth::Healthy,
+        child_pid: None,
     }
 }
 
@@ -3132,6 +3133,7 @@ async fn connect_modern_tool_upstream(
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
         health: ServerHealth::Healthy,
+        child_pid: None,
     }
 }
 

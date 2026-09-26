@@ -1705,6 +1705,7 @@ mod tests {
             protocol_gate_state: 0,
             connection: crate::server::ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
+            child_pid: None,
         }
     }
 
@@ -2667,6 +2668,7 @@ mod tests {
             protocol_gate_state: 0,
             connection: crate::server::ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
+            child_pid: None,
         }
     }
 
