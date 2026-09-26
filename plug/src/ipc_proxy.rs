@@ -29,6 +29,9 @@ const DAEMON_PING_INTERVAL: Duration = Duration::from_secs(1);
 /// (notifications, chunks, reverse requests) reset the clock, so slow tool
 /// calls that emit progress are unaffected. See plans/009.
 const READ_WATCHDOG: Duration = Duration::from_secs(120);
+/// How long requests already sent wait for their replies after a write to
+/// the daemon fails, before the connection is closed under them.
+const WRITE_FAILURE_GRACE: Duration = Duration::from_secs(1);
 /// Every `DaemonToProxyMessage` frame starts with its serde tag.
 const ENVELOPE_FRAME_PREFIX: &[u8] = b"{\"envelope\":";
 
@@ -284,14 +287,11 @@ impl DaemonMux {
     }
 
     /// Fail every waiter with `failure` and refuse new requests. Idempotent;
-    /// the first failure is the one waiters see.
+    /// the first failure is the one later requests see.
     fn close(&self, failure: TransportFailure) {
         let pending = {
             let mut state = self.lock_state();
-            if state.closed.is_some() {
-                return;
-            }
-            state.closed = Some(failure.message.clone());
+            state.closed.get_or_insert_with(|| failure.message.clone());
             std::mem::take(&mut state.pending)
         };
         for waiter in pending.into_values() {
@@ -302,6 +302,17 @@ impl DaemonMux {
                 task.abort();
             }
         }
+    }
+
+    /// The socket refused a write: refuse new requests, but leave waiters to
+    /// the reader. A daemon that shuts down writes its last replies before it
+    /// closes, and a connector paused across a daemon swap resumes with those
+    /// replies unread and a heartbeat due at once. Failing the waiters here
+    /// would lose replies that are already in the socket buffer.
+    fn writes_failed(&self, failure: &TransportFailure) {
+        self.lock_state()
+            .closed
+            .get_or_insert_with(|| failure.message.clone());
     }
 
     /// Fail the requests currently waiting without closing the connection:
@@ -458,11 +469,15 @@ impl DaemonMux {
     ) {
         while let Some(payload) = outbound.recv().await {
             if let Err(error) = ipc::write_frame(&mut writer, &payload).await {
+                let failure = IpcProxyHandler::transport_failure("IPC write failed", error);
                 if let Some(mux) = mux.upgrade() {
-                    mux.close(IpcProxyHandler::transport_failure(
-                        "IPC write failed",
-                        error,
-                    ));
+                    mux.writes_failed(&failure);
+                }
+                // The reader normally sees end of file right after the last
+                // reply. Close anyway if it does not.
+                tokio::time::sleep(WRITE_FAILURE_GRACE).await;
+                if let Some(mux) = mux.upgrade() {
+                    mux.close(failure);
                 }
                 return;
             }
@@ -4595,6 +4610,59 @@ mod tests {
 
         clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A connector paused across a daemon swap resumes with the old daemon's
+    /// last reply unread and a heartbeat due at once. The heartbeat's write
+    /// fails first; the reply already in the socket must still reach its
+    /// caller.
+    #[tokio::test]
+    async fn a_failed_write_still_delivers_replies_already_sent() {
+        let (client, daemon) = UnixStream::pair().expect("socket pair");
+        let (reader, writer) = client.into_split();
+        let mux = DaemonMux::start(
+            reader,
+            writer,
+            true,
+            Duration::from_secs(10),
+            std::sync::Weak::new(),
+        );
+        let call = tokio::spawn({
+            let mux = Arc::clone(&mux);
+            async move { mux.round_trip(&IpcRequest::Status).await }
+        });
+
+        let (mut daemon_reader, mut daemon_writer) = daemon.into_split();
+        let frame = ipc::read_frame(&mut daemon_reader)
+            .await
+            .expect("read request")
+            .expect("connection open");
+        let ipc_id = ipc::FrameIds::peek(&frame).ipc_id;
+        mux.writes_failed(&TransportFailure {
+            message: "IPC write failed: broken pipe".to_string(),
+            reconnectable: true,
+        });
+        ipc::send_chunked_response_with_id(&mut daemon_writer, ipc_id, &IpcResponse::Pong)
+            .await
+            .expect("send reply");
+        drop((daemon_reader, daemon_writer));
+
+        let reply = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("call finished")
+            .expect("call task");
+        assert!(matches!(reply, Ok(IpcResponse::Pong)), "{reply:?}");
+        let later = mux.round_trip(&IpcRequest::Status).await;
+        assert!(
+            matches!(
+                later,
+                Err(TransportFailure {
+                    reconnectable: true,
+                    ..
+                })
+            ),
+            "a request after the failed write must reconnect"
+        );
     }
 
     #[tokio::test]
