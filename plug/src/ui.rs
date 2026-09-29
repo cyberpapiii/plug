@@ -143,6 +143,25 @@ pub(crate) fn print_wrapped_rows(
     }
 }
 
+/// A duration the way a person reads it: `45s`, `24m`, `3h 5m`, `2d 4h`, `60d`.
+pub(crate) fn format_duration(secs: u64) -> String {
+    const MINUTE: u64 = 60;
+    const HOUR: u64 = 60 * MINUTE;
+    const DAY: u64 = 24 * HOUR;
+    let (major, major_unit, minor, minor_unit) = match secs {
+        s if s < MINUTE => return format!("{s}s"),
+        s if s < HOUR => return format!("{}m", s / MINUTE),
+        s if s < DAY => (s / HOUR, "h", (s % HOUR) / MINUTE, "m"),
+        s if s < 7 * DAY => (s / DAY, "d", (s % DAY) / HOUR, "h"),
+        s => return format!("{}d", s / DAY),
+    };
+    if minor == 0 {
+        format!("{major}{major_unit}")
+    } else {
+        format!("{major}{major_unit} {minor}{minor_unit}")
+    }
+}
+
 pub(crate) fn print_label_value(label: &str, value: impl std::fmt::Display) {
     let prefix_text = format!("  {:<8} ", label);
     print_wrapped_rows(
@@ -293,7 +312,9 @@ fn truncate_tail(value: &str, max_width: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{summarize_server_auth, summarize_server_target, summarize_server_transport};
+    use super::{
+        format_duration, summarize_server_auth, summarize_server_target, summarize_server_transport,
+    };
     use plug_core::config::{ServerConfig, TransportType};
 
     fn server_config() -> ServerConfig {
@@ -362,5 +383,16 @@ mod tests {
         server.auth = Some("oauth".to_string());
         assert_eq!(summarize_server_transport(Some(&server)), "sse");
         assert_eq!(summarize_server_auth(Some(&server)), "oauth");
+    }
+
+    #[test]
+    fn format_duration_reads_like_a_person_would_say_it() {
+        assert_eq!(format_duration(0), "0s");
+        assert_eq!(format_duration(45), "45s");
+        assert_eq!(format_duration(1446), "24m");
+        assert_eq!(format_duration(3 * 3600), "3h");
+        assert_eq!(format_duration(3 * 3600 + 5 * 60 + 9), "3h 5m");
+        assert_eq!(format_duration(2 * 86400 + 4 * 3600), "2d 4h");
+        assert_eq!(format_duration(5_174_062), "59d");
     }
 }

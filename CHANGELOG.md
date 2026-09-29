@@ -9,6 +9,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `plug doctor` can come back clean. With downstream OAuth it now fetches the
+  OAuth metadata from the public URL, passing when the tunnel serves it and
+  warning with the error when it does not, instead of always warning that it
+  did not check. The daemon line reads as a sentence, and the port and PID
+  checks that only repeated "daemon running" fold into it. A new check warns
+  when a remote app has registered more than once, and `plug auth clients
+  list` shows when each registration was made, last used, and expires. Every
+  "restart Plug" hint now points to Plug.app's Restart button when the app is
+  installed, and `plug stop` answers with a sentence.
 - Node-based stdio servers such as Figma no longer stay down after a reboot.
   When the login shell was too slow to report its PATH at boot, Plug kept that
   failure until the daemon restarted, so `node` and `npx` could not be found.

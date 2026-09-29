@@ -161,6 +161,7 @@ pub(crate) async fn cmd_doctor(
     let config = plug_core::config::load_config(config_path)?;
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
     report.checks.extend(runtime_doctor_checks().await);
+    fold_daemon_liveness_checks(&mut report.checks);
     #[cfg(target_os = "macos")]
     let unified_snapshot = unified_install_snapshot().await;
     #[cfg(target_os = "macos")]
@@ -750,9 +751,15 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         checks.push(plug_core::doctor::CheckResult {
             name: "runtime_health".to_string(),
             status: runtime_status,
-            message: format!(
-                "Daemon running: uptime={}s, daemon_proxy_clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
-                uptime_secs, clients, healthy, degraded, auth_required, failed
+            message: runtime_health_message(
+                uptime_secs,
+                clients,
+                RuntimeServerCounts {
+                    healthy,
+                    degraded,
+                    auth_required,
+                    failed,
+                },
             ),
             fix_suggestion: if failed > 0 || degraded > 0 || auth_required > 0 {
                 Some(
@@ -790,7 +797,104 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         checks.extend(runtime_auth_checks(&servers));
     }
 
+    if daemon_reachable && let Ok(auth_token) = crate::daemon::read_auth_token() {
+        let snapshot = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot {
+            auth_token,
+        })
+        .await;
+        if let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) = snapshot {
+            checks.extend(duplicate_downstream_client_check(
+                &snapshot.downstream_clients,
+            ));
+        }
+    }
+
     checks
+}
+
+/// Remote apps that sign in through dynamic registration make a new client
+/// each time, and every old one keeps its grants until it expires 90 days
+/// after its last use. Several registrations under one name are usually
+/// leftovers worth revoking.
+fn duplicate_downstream_client_check(
+    clients: &[plug_core::downstream_oauth::RegisteredClientSummary],
+) -> Option<plug_core::doctor::CheckResult> {
+    let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+    for client in clients {
+        *counts.entry(client.client_name.as_str()).or_default() += 1;
+    }
+    let duplicates = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(name, count)| format!("{name} ×{count}"))
+        .collect::<Vec<_>>();
+    if duplicates.is_empty() {
+        return None;
+    }
+    Some(plug_core::doctor::CheckResult {
+        name: "downstream_oauth_clients".to_string(),
+        status: plug_core::doctor::CheckStatus::Warn,
+        message: format!(
+            "Remote apps registered more than once: {}. Each old registration keeps its access until 90 days after its last use",
+            duplicates.join(", ")
+        ),
+        fix_suggestion: Some(
+            "Run `plug auth clients list`, then `plug auth clients revoke <client_id>` for registrations you no longer use; an app whose registration you revoke just signs in again".to_string(),
+        ),
+    })
+}
+
+/// With the daemon answering, `runtime_health` already says it is running.
+/// The cold port and PID checks only repeat that when they pass, so they are
+/// dropped then and kept whenever they found something wrong.
+fn fold_daemon_liveness_checks(checks: &mut Vec<plug_core::doctor::CheckResult>) {
+    if !checks.iter().any(|check| check.name == "runtime_health") {
+        return;
+    }
+    checks.retain(|check| {
+        !(matches!(check.name.as_str(), "port_available" | "pid_staleness")
+            && matches!(check.status, plug_core::doctor::CheckStatus::Pass))
+    });
+}
+
+struct RuntimeServerCounts {
+    healthy: usize,
+    degraded: usize,
+    auth_required: usize,
+    failed: usize,
+}
+
+/// One readable line for the live daemon: how long it has run, who is
+/// connected, and how many servers are healthy, naming only the problems.
+fn runtime_health_message(uptime_secs: u64, clients: usize, counts: RuntimeServerCounts) -> String {
+    let total = counts.healthy + counts.degraded + counts.auth_required + counts.failed;
+    let clients = match clients {
+        1 => "1 local client".to_string(),
+        n => format!("{n} local clients"),
+    };
+    let servers = if total == counts.healthy {
+        match total {
+            0 => "no servers configured".to_string(),
+            1 => "its server is healthy".to_string(),
+            n => format!("all {n} servers healthy"),
+        }
+    } else {
+        let problems = [
+            (counts.degraded, "degraded"),
+            (counts.auth_required, "need sign-in"),
+            (counts.failed, "failed"),
+        ]
+        .into_iter()
+        .filter(|(count, _)| *count > 0)
+        .map(|(count, label)| format!("{count} {label}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+        format!("{} of {total} servers healthy ({problems})", counts.healthy)
+    };
+    format!(
+        "Daemon running for {}, {clients}, {servers}",
+        crate::ui::format_duration(uptime_secs)
+    )
 }
 
 #[cfg(test)]
@@ -831,9 +935,15 @@ fn runtime_health_checks_for_tests(
         } else {
             plug_core::doctor::CheckStatus::Pass
         },
-        message: format!(
-            "Daemon running: uptime={}s, daemon_proxy_clients={}, healthy={}, degraded={}, auth_required={}, failed={}",
-            uptime_secs, clients, healthy, degraded, auth_required, failed
+        message: runtime_health_message(
+            uptime_secs,
+            clients,
+            RuntimeServerCounts {
+                healthy,
+                degraded,
+                auth_required,
+                failed,
+            },
         ),
         fix_suggestion: None,
     }];
@@ -1041,9 +1151,10 @@ pub(crate) async fn cmd_reload(output: &OutputFormat) -> anyhow::Result<()> {
                 for warning in report.restart_required {
                     print_info_line(format!("Restart required: {warning}"));
                 }
-                print_info_line(
-                    "Run `plug stop` then `plug start` before relying on those changes in live sessions.",
-                );
+                print_info_line(format!(
+                    "{} before relying on those changes in live sessions.",
+                    crate::runtime::restart_advice()
+                ));
             }
         }
         plug_core::ipc::IpcResponse::Ok => {}
@@ -1213,11 +1324,12 @@ fn repair_canonical_command(dry_run: bool) -> anyhow::Result<std::path::PathBuf>
 #[cfg(test)]
 mod tests {
     use super::{
-        ClientRepairItem, ClientRepairReport, PlugLinkDisposition, doctor_check_details,
-        doctor_next_steps, persist_client_repair, repair_attention_messages,
+        ClientRepairItem, ClientRepairReport, PlugLinkDisposition, RuntimeServerCounts,
+        doctor_check_details, doctor_next_steps, duplicate_downstream_client_check,
+        fold_daemon_liveness_checks, persist_client_repair, repair_attention_messages,
         repair_canonical_command, repair_client_content, repair_export_endpoint, repair_targets,
         repair_text_summary, runtime_auth_checks, runtime_health_checks_for_tests,
-        synthesize_doctor_interpretation,
+        runtime_health_message, synthesize_doctor_interpretation,
     };
     use plug_core::doctor::{CheckResult, CheckStatus};
     use plug_core::ipc::IpcAuthServerInfo;
@@ -1841,6 +1953,121 @@ mod tests {
     }
 
     #[test]
+    fn runtime_health_reads_as_a_sentence_when_everything_is_healthy() {
+        assert_eq!(
+            runtime_health_message(
+                2117,
+                18,
+                RuntimeServerCounts {
+                    healthy: 14,
+                    degraded: 0,
+                    auth_required: 0,
+                    failed: 0,
+                },
+            ),
+            "Daemon running for 35m, 18 local clients, all 14 servers healthy"
+        );
+    }
+
+    #[test]
+    fn passing_port_and_pid_checks_fold_into_runtime_health() {
+        let mut checks = vec![
+            check(
+                "port_available",
+                CheckStatus::Pass,
+                "Port 3282 is bound by the daemon",
+            ),
+            check(
+                "pid_staleness",
+                CheckStatus::Pass,
+                "Daemon is running (PID 1)",
+            ),
+            check("runtime_health", CheckStatus::Pass, "Daemon running for 1m"),
+        ];
+        fold_daemon_liveness_checks(&mut checks);
+        let names = checks.iter().map(|c| c.name.as_str()).collect::<Vec<_>>();
+        assert_eq!(names, ["runtime_health"]);
+    }
+
+    #[test]
+    fn failing_port_or_pid_checks_survive_the_fold() {
+        let mut checks = vec![
+            check(
+                "port_available",
+                CheckStatus::Fail,
+                "Port 3282 is not available",
+            ),
+            check("pid_staleness", CheckStatus::Warn, "Stale PID file"),
+            check("runtime_health", CheckStatus::Pass, "Daemon running for 1m"),
+        ];
+        fold_daemon_liveness_checks(&mut checks);
+        assert_eq!(checks.len(), 3);
+    }
+
+    #[test]
+    fn liveness_checks_stay_when_the_daemon_did_not_answer() {
+        let mut checks = vec![
+            check(
+                "port_available",
+                CheckStatus::Pass,
+                "Port 3282 is available",
+            ),
+            check("pid_staleness", CheckStatus::Pass, "No PID file found"),
+        ];
+        fold_daemon_liveness_checks(&mut checks);
+        assert_eq!(checks.len(), 2);
+    }
+
+    fn registered(name: &str, id: &str) -> plug_core::downstream_oauth::RegisteredClientSummary {
+        plug_core::downstream_oauth::RegisteredClientSummary {
+            client_id: id.to_string(),
+            client_name: name.to_string(),
+            redirect_uris: vec!["http://127.0.0.1/callback".to_string()],
+            source: plug_core::downstream_oauth::ClientSource::DynamicRegistration,
+            created_at: 1,
+            last_used_at: Some(1),
+            expires_at: 2,
+        }
+    }
+
+    #[test]
+    fn duplicate_client_registrations_warn_by_name() {
+        let check = duplicate_downstream_client_check(&[
+            registered("Claude", "a"),
+            registered("Cursor", "b"),
+            registered("Cursor", "c"),
+            registered("Windsurf", "d"),
+            registered("Windsurf", "e"),
+            registered("Windsurf", "f"),
+        ])
+        .expect("duplicates warn");
+        assert_eq!(check.status, CheckStatus::Warn);
+        assert!(
+            check.message.contains("Cursor ×2, Windsurf ×3"),
+            "{}",
+            check.message
+        );
+        assert!(!check.message.contains("Claude"));
+        assert!(
+            check
+                .fix_suggestion
+                .as_deref()
+                .is_some_and(|fix| fix.contains("plug auth clients revoke"))
+        );
+    }
+
+    #[test]
+    fn unique_client_registrations_add_no_check() {
+        assert!(
+            duplicate_downstream_client_check(&[
+                registered("Claude", "a"),
+                registered("Cursor", "b")
+            ])
+            .is_none()
+        );
+    }
+
+    #[test]
     fn runtime_checks_split_summary_from_named_failures() {
         let checks = runtime_health_checks_for_tests(
             &[
@@ -1888,10 +2115,10 @@ mod tests {
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].name, "runtime_health");
         assert_eq!(checks[0].status, CheckStatus::Warn);
-        assert!(checks[0].message.contains("healthy=1"));
-        assert!(checks[0].message.contains("daemon_proxy_clients=4"));
-        assert!(checks[0].message.contains("auth_required=1"));
-        assert!(checks[0].message.contains("failed=1"));
+        assert_eq!(
+            checks[0].message,
+            "Daemon running for 2m, 4 local clients, 1 of 3 servers healthy (1 need sign-in, 1 failed)"
+        );
 
         assert_eq!(checks[1].name, "runtime_failures");
         assert_eq!(checks[1].status, CheckStatus::Fail);
@@ -1934,7 +2161,10 @@ mod tests {
         assert_eq!(checks.len(), 2);
         assert_eq!(checks[0].name, "runtime_health");
         assert_eq!(checks[0].status, CheckStatus::Warn);
-        assert!(checks[0].message.contains("degraded=1"));
+        assert_eq!(
+            checks[0].message,
+            "Daemon running for 45s, 2 local clients, 1 of 2 servers healthy (1 degraded)"
+        );
 
         assert_eq!(checks[1].name, "runtime_degraded");
         assert_eq!(checks[1].status, CheckStatus::Warn);

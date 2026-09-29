@@ -307,20 +307,7 @@ async fn cmd_downstream_oauth_clients(
             match output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
                 OutputFormat::Text => {
-                    if clients.is_empty() {
-                        ui::print_info_line("No downstream OAuth clients are registered");
-                    } else {
-                        println!("{}", style("Registered downstream OAuth clients").bold());
-                        for registered in clients {
-                            println!(
-                                "  {} ({})",
-                                style(&registered.client_name).bold(),
-                                registered.client_id
-                            );
-                            println!("    Redirects: {}", registered.redirect_uris.join(", "));
-                            println!("    Source: {:?}", registered.source);
-                        }
-                    }
+                    print_registered_clients(&clients);
                 }
             }
         }
@@ -351,6 +338,50 @@ async fn cmd_downstream_oauth_clients(
     Ok(())
 }
 
+fn print_registered_clients(clients: &[plug_core::downstream_oauth::RegisteredClientSummary]) {
+    if clients.is_empty() {
+        ui::print_info_line("No downstream OAuth clients are registered");
+        return;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_secs());
+    println!("{}", style("Registered downstream OAuth clients").bold());
+    for registered in clients {
+        println!(
+            "  {} ({})",
+            style(&registered.client_name).bold(),
+            registered.client_id
+        );
+        println!("    Redirects: {}", registered.redirect_uris.join(", "));
+        println!("    {}", registered_client_timeline(registered, now));
+    }
+}
+
+/// When a registration was made and last used, and when it lapses, so the
+/// stale one among several of the same name is the obvious one to revoke.
+fn registered_client_timeline(
+    registered: &plug_core::downstream_oauth::RegisteredClientSummary,
+    now: u64,
+) -> String {
+    let ago = |at: u64| format!("{} ago", ui::format_duration(now.saturating_sub(at)));
+    let last_used = registered
+        .last_used_at
+        .map_or_else(|| "never".to_string(), ago);
+    let expiry = if registered.expires_at > now {
+        format!(
+            "expires in {}",
+            ui::format_duration(registered.expires_at - now)
+        )
+    } else {
+        "expired".to_string()
+    };
+    format!(
+        "Registered {}, last used {last_used}, {expiry}",
+        ago(registered.created_at)
+    )
+}
+
 async fn cmd_downstream_oauth_clients_via_daemon(
     command: crate::DownstreamOauthClientCommands,
     output: &OutputFormat,
@@ -375,21 +406,7 @@ async fn cmd_downstream_oauth_clients_via_daemon(
             };
             match output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
-                OutputFormat::Text if clients.is_empty() => {
-                    ui::print_info_line("No downstream OAuth clients are registered")
-                }
-                OutputFormat::Text => {
-                    println!("{}", style("Registered downstream OAuth clients").bold());
-                    for registered in clients {
-                        println!(
-                            "  {} ({})",
-                            style(&registered.client_name).bold(),
-                            registered.client_id
-                        );
-                        println!("    Redirects: {}", registered.redirect_uris.join(", "));
-                        println!("    Source: {:?}", registered.source);
-                    }
-                }
+                OutputFormat::Text => print_registered_clients(&clients),
             }
         }
         crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
@@ -876,7 +893,8 @@ async fn cmd_auth_login(
         Ok(false) => {}
         Err(err) => {
             ui::print_warning_line(format!(
-                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: run `plug stop && plug start`."
+                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: {}.",
+                crate::runtime::restart_advice()
             ));
         }
     }
@@ -989,7 +1007,8 @@ async fn cmd_auth_complete(
         Ok(false) => {}
         Err(err) => {
             ui::print_warning_line(format!(
-                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: run `plug stop && plug start`."
+                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: {}.",
+                crate::runtime::restart_advice()
             ));
         }
     }
@@ -1479,7 +1498,8 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
         Ok(false) => {}
         Err(err) => {
             ui::print_warning_line(format!(
-                "Stored credentials were cleared, but the running service did not reload them automatically: {err}. Next: run `plug stop && plug start`."
+                "Stored credentials were cleared, but the running service did not reload them automatically: {err}. Next: {}.",
+                crate::runtime::restart_advice()
             ));
         }
     }
@@ -1491,6 +1511,30 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn registered_client_timeline_shows_age_use_and_expiry() {
+        let day = 86_400;
+        let mut registered = plug_core::downstream_oauth::RegisteredClientSummary {
+            client_id: "client".to_string(),
+            client_name: "Cursor".to_string(),
+            redirect_uris: Vec::new(),
+            source: plug_core::downstream_oauth::ClientSource::DynamicRegistration,
+            created_at: 100 * day - 19 * day,
+            last_used_at: Some(100 * day - 19 * day),
+            expires_at: 100 * day + 71 * day,
+        };
+        assert_eq!(
+            registered_client_timeline(&registered, 100 * day),
+            "Registered 19d ago, last used 19d ago, expires in 71d"
+        );
+        registered.last_used_at = None;
+        registered.expires_at = 99 * day;
+        assert_eq!(
+            registered_client_timeline(&registered, 100 * day),
+            "Registered 19d ago, last used never, expired"
+        );
+    }
 
     #[test]
     fn default_dynamic_oauth_redirect_uri_uses_real_loopback_port() {

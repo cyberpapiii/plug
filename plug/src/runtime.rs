@@ -1631,13 +1631,33 @@ pub(crate) async fn cmd_daemon_stop() -> anyhow::Result<()> {
     let auth_token = daemon::read_auth_token()?;
     let req = plug_core::ipc::IpcRequest::Shutdown { auth_token };
     match daemon::ipc_request(&req).await? {
-        plug_core::ipc::IpcResponse::Ok => println!("stopped"),
+        plug_core::ipc::IpcResponse::Ok => {
+            print_success_line("Stopped the shared background service.")
+        }
         plug_core::ipc::IpcResponse::Error { code, message } => {
             anyhow::bail!("{code}: {message}");
         }
         other => anyhow::bail!("unexpected daemon response: {other:?}"),
     }
     Ok(())
+}
+
+/// The one restart instruction every message gives, worded for whoever owns
+/// the daemon. With Plug.app installed its Restart button pauses connected
+/// clients across the swap; `plug stop` would drop them instead.
+pub(crate) fn restart_advice() -> &'static str {
+    restart_advice_for(matches!(
+        crate::install::resolve_verified_app(),
+        Ok(Some(_))
+    ))
+}
+
+fn restart_advice_for(app_installed: bool) -> &'static str {
+    if app_installed {
+        "Restart Plug from Plug.app (Settings → Service → Restart)"
+    } else {
+        "Run `plug stop`, then `plug start`"
+    }
 }
 
 pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
@@ -1741,6 +1761,13 @@ mod tests {
         assert!(!daemon_invocation_is_canonical(true, false, true, false));
         assert!(daemon_invocation_is_canonical(true, false, false, true));
         assert!(daemon_invocation_is_canonical(false, false, false, false));
+    }
+
+    #[test]
+    fn restart_advice_sends_app_users_to_the_app() {
+        assert!(restart_advice_for(true).contains("Plug.app"));
+        assert!(!restart_advice_for(true).contains("plug stop"));
+        assert!(restart_advice_for(false).contains("`plug stop`, then `plug start`"));
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
