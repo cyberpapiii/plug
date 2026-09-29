@@ -89,7 +89,6 @@ futures = "0.3"
 tower = { version = "0.5", features = ["util"] }
 
 # Resilience (Phase 3)
-backon = "1.6"
 rand = "0.10.2"
 base64 = "0.22"
 

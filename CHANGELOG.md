@@ -87,6 +87,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Cancel, and both stop the waiting `plug auth login`. Clicking a "needs
   sign-in" notification opens that server, and its Sign In button starts the
   sign-in.
+- A server that stays down is retried with growing backoff, up to once a
+  minute, and quietly. Recovery used to restart at a one-second delay on every
+  health check and retry inside each attempt, logging a warning or error each
+  time. In an hour of a missing command, start attempts drop from 312 to about
+  60 and log lines from 312 to 3, and recovery logs one line saying how many
+  attempts it took.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

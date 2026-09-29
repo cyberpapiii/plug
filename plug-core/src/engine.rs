@@ -628,12 +628,28 @@ impl Engine {
     /// Uses an AtomicBool per-server to prevent concurrent reconnects —
     /// if another caller is already reconnecting, returns Ok immediately.
     pub async fn reconnect_server(&self, server_id: &str) -> Result<(), anyhow::Error> {
+        self.reconnect_server_with_attempts(server_id, RECONNECT_RETRY_MAX_ATTEMPTS)
+            .await
+    }
+
+    /// Reconnect with one start attempt and no readiness retries. Proactive
+    /// recovery paces its own attempts, and retrying inside each of them
+    /// multiplied every failure it logged and every process it spawned.
+    pub(crate) async fn reconnect_server_once(&self, server_id: &str) -> Result<(), anyhow::Error> {
+        self.reconnect_server_with_attempts(server_id, 1).await
+    }
+
+    async fn reconnect_server_with_attempts(
+        &self,
+        server_id: &str,
+        max_attempts: u32,
+    ) -> Result<(), anyhow::Error> {
         let Some(_start_guard) = self.try_claim_upstream_start(server_id) else {
             tracing::debug!(server = %server_id, "reconnect already in progress, skipping");
             return Ok(());
         };
 
-        self.do_reconnect(server_id).await
+        self.do_reconnect(server_id, max_attempts).await
     }
 
     /// Claim the single in-flight start slot for `server_id` (restart and
@@ -650,7 +666,7 @@ impl Engine {
     }
 
     /// Internal reconnection logic shared by `reconnect_server`.
-    async fn do_reconnect(&self, server_id: &str) -> Result<(), anyhow::Error> {
+    async fn do_reconnect(&self, server_id: &str, max_attempts: u32) -> Result<(), anyhow::Error> {
         let config = self.config.load();
         let server_config = config
             .servers
@@ -696,14 +712,12 @@ impl Engine {
                 .await
             {
                 Ok(upstream) => break upstream,
-                Err(e)
-                    if attempt < RECONNECT_RETRY_MAX_ATTEMPTS
-                        && is_retryable_reconnect_error(&e) =>
-                {
-                    tracing::warn!(
+                Err(e) if attempt < max_attempts && is_retryable_reconnect_error(&e) => {
+                    // Debug: the caller logs the outcome once.
+                    tracing::debug!(
                         server = %server_id,
                         attempt,
-                        max_attempts = RECONNECT_RETRY_MAX_ATTEMPTS,
+                        max_attempts,
                         retry_in_ms = delay.as_millis(),
                         error = %e,
                         "reconnect attempt failed during upstream readiness window"
