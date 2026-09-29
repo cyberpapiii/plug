@@ -31,8 +31,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   the unlinked ones into one line. Durations read as `3h 5m` or `59d` instead
   of raw seconds, labels line up, `plug servers` shows just the protocol
   version (prefixed `modern` when it is), the always-zero `sse=0` count is
-  gone, and every subcommand and flag in `--help` has a description. JSON
-  output is unchanged.
+  gone, and every subcommand and flag in `--help` has a description. The
+  count of `disabled_tools` rules shows only in the full `plug tools` list,
+  since it applies to every server. JSON output is unchanged.
 - Node-based stdio servers such as Figma no longer stay down after a reboot.
   When the login shell was too slow to report its PATH at boot, Plug kept that
   failure until the daemon restarted, so `node` and `npx` could not be found.

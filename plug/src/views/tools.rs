@@ -97,11 +97,17 @@ fn server_tool_summaries(
 
 fn print_server_summaries(summaries: &[ServerToolSummary<'_>], width: usize) {
     print_heading("Servers");
+    // Groups come from `tool_groups` in the config; most setups have none.
+    let any_groups = summaries.iter().any(|summary| !summary.groups.is_empty());
     println!(
         "  {:<24} {:>5}  {}",
         style("SERVER").dim(),
         style("TOOLS").dim(),
-        style("GROUPS").dim()
+        if any_groups {
+            style("GROUPS").dim()
+        } else {
+            style("")
+        }
     );
     for summary in summaries {
         let prefix_text = format!("  {:<24} {:>5}  ", summary.server, summary.tools);
@@ -323,7 +329,11 @@ pub(crate) async fn cmd_tool_list(
                 print_heading("Summary");
                 print_label_value("Tools", style(tool_count).bold());
                 print_label_value("Servers", style(server_count).bold());
-                print_label_value("Disabled", style(disabled_count).yellow().bold());
+                // `disabled_tools` applies to every server, so it only belongs
+                // in the whole inventory.
+                if server.is_none() && disabled_count > 0 {
+                    print_label_value("Disabled", style(disabled_count).yellow().bold());
+                }
                 println!();
                 if server.is_none() && verbose == 0 {
                     print_server_summaries(&server_tool_summaries(&tools_by_prefix), term_width);
