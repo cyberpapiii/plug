@@ -73,6 +73,22 @@ pub(crate) struct LiveSessionTransportCounts {
     pub(crate) sse: usize,
 }
 
+impl LiveSessionTransportCounts {
+    /// `19 local, 1 HTTP`. No downstream session reports itself as SSE today
+    /// (a legacy GET SSE stream belongs to its HTTP session), so the SSE count
+    /// shows only when it is non-zero.
+    pub(crate) fn summary(&self) -> String {
+        let mut parts = vec![
+            format!("{} local", self.daemon_proxy),
+            format!("{} HTTP", self.http),
+        ];
+        if self.sse > 0 {
+            parts.push(format!("{} SSE", self.sse));
+        }
+        parts.join(", ")
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct LiveInventoryMetadata {
     pub(crate) session_count: usize,
@@ -1761,6 +1777,18 @@ mod tests {
         assert!(!daemon_invocation_is_canonical(true, false, true, false));
         assert!(daemon_invocation_is_canonical(true, false, false, true));
         assert!(daemon_invocation_is_canonical(false, false, false, false));
+    }
+
+    #[test]
+    fn transport_summary_shows_sse_only_when_something_reports_it() {
+        let mut counts = LiveSessionTransportCounts {
+            daemon_proxy: 19,
+            http: 1,
+            sse: 0,
+        };
+        assert_eq!(counts.summary(), "19 local, 1 HTTP");
+        counts.sse = 2;
+        assert_eq!(counts.summary(), "19 local, 1 HTTP, 2 SSE");
     }
 
     #[test]

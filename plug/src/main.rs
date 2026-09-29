@@ -70,7 +70,7 @@ Workflow:
   Maintain
     plug repair             Refresh linked client configs
     plug config check       Validate config syntax and rules
-    plug config --path      Print config file path
+    plug config path        Print config file path
     plug link               Link plug to your AI clients
     plug unlink             Remove plug from your AI client configs
 
@@ -93,7 +93,7 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
 
-    /// Increase verbosity (-v for debug, -vv for trace)
+    /// Increase verbosity (-v for debug, -vv for trace; `clients` and `tools` spend the first -v on listing every row)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
@@ -125,8 +125,10 @@ enum Commands {
     #[command(display_order = 2)]
     /// Discover servers, import config, and link your AI clients
     Setup {
+        /// Import every server found and accept the defaults without asking
         #[arg(long)]
         yes: bool,
+        /// How linked clients reach plug: stdio (`plug connect`) or http
         #[arg(long, value_enum)]
         transport: Option<ClientLinkTransport>,
     },
@@ -143,7 +145,9 @@ enum Commands {
     #[command(display_order = 5)]
     /// Refresh linked AI client configuration files
     Repair {
+        /// Client targets to repair, such as `cursor` or `codex-cli` (default: all)
         targets: Vec<String>,
+        /// Repair every client plug knows about
         #[arg(long)]
         all: bool,
         /// Inspect repair needs without changing client configuration files
@@ -154,34 +158,43 @@ enum Commands {
     /// Internal: reload service config from disk
     Reload,
     #[command(display_order = 7)]
-    /// View and manage linked, detected, and live AI clients
+    /// View and manage linked, detected, and live AI clients (-v lists each session)
     Clients,
     #[command(display_order = 8)]
     /// View and manage configured servers
     Servers,
     #[command(display_order = 9)]
-    /// View and manage available tools from your servers
+    /// Tool counts per server; `plug tools <server>` lists that server's tools, -v lists all
     Tools {
         #[command(subcommand)]
         command: Option<ToolCommands>,
+        /// Server name or tool group whose tools to list
+        server: Option<String>,
     },
     #[command(display_order = 10)]
     /// Link plug to your AI clients
     Link {
+        /// Client targets to link, such as `cursor` or `claude-code`
         targets: Vec<String>,
+        /// Link every detected client
         #[arg(long)]
         all: bool,
+        /// Accept the defaults (stdio transport) without asking
         #[arg(long)]
         yes: bool,
+        /// How linked clients reach plug: stdio (`plug connect`) or http
         #[arg(long, value_enum)]
         transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 11)]
     /// Remove plug from your AI client configs
     Unlink {
+        /// Client targets to unlink, such as `cursor` or `claude-code`
         targets: Vec<String>,
+        /// Unlink every linked client
         #[arg(long)]
         all: bool,
+        /// Unlink every linked client without asking
         #[arg(long)]
         yes: bool,
     },
@@ -197,6 +210,7 @@ enum Commands {
     #[command(display_order = 14)]
     /// Internal: run plug as the shared foreground or background service
     Serve {
+        /// Run as the shared background service (IPC + HTTP) that launchd manages
         #[arg(long)]
         daemon: bool,
     },
@@ -206,7 +220,8 @@ enum Commands {
     #[command(display_order = 16)]
     /// Open the plug config file in your default editor
     Config {
-        #[arg(long)]
+        /// Same as `plug config path`
+        #[arg(long, hide = true)]
         path: bool,
         #[command(subcommand)]
         command: Option<ConfigCommands>,
@@ -214,12 +229,16 @@ enum Commands {
     #[command(display_order = 17)]
     /// Advanced: import MCP servers from existing AI client configs
     Import {
+        /// Comma-separated clients to scan, such as `cursor,claude-code` (default: all)
         #[arg(long, value_delimiter = ',')]
         clients: Option<Vec<String>>,
+        /// Scan every supported client (the default)
         #[arg(long)]
         all: bool,
+        /// Show what would be imported without changing the config
         #[arg(long)]
         dry_run: bool,
+        /// Import every server found without asking
         #[arg(long)]
         yes: bool,
     },
@@ -247,7 +266,9 @@ enum Commands {
 
 #[derive(Subcommand)]
 pub(crate) enum ConfigCommands {
+    /// Print the config file path
     Path,
+    /// Validate config syntax and rules
     Check,
     /// Print the resolved downstream configuration without secrets
     Resolved,
@@ -255,77 +276,109 @@ pub(crate) enum ConfigCommands {
 
 #[derive(Subcommand)]
 pub(crate) enum ServerCommands {
+    /// Add a server (prompts for anything not given)
     Add {
+        /// Server name
         name: Option<String>,
+        /// Command that starts a stdio server
         #[arg(long)]
         command: Option<String>,
+        /// URL of an HTTP or SSE server
         #[arg(long)]
         url: Option<String>,
+        /// Comma-separated arguments for the command
         #[arg(long, value_delimiter = ',')]
         args: Vec<String>,
+        /// Environment variable as KEY=VALUE; repeat for more
         #[arg(long = "env")]
         env: Vec<String>,
+        /// Upstream transport: stdio, http, or sse
         #[arg(long)]
         transport: Option<String>,
+        /// Upstream auth for HTTP or SSE servers: none, bearer, or oauth
         #[arg(long)]
         auth: Option<String>,
+        /// Token sent as a bearer token (with --auth bearer)
         #[arg(long)]
         bearer_token: Option<String>,
+        /// Pre-registered OAuth client ID (with --auth oauth)
         #[arg(long)]
         oauth_client_id: Option<String>,
+        /// Comma-separated OAuth scopes to request
         #[arg(long, value_delimiter = ',')]
         oauth_scopes: Option<Vec<String>>,
+        /// Add the server switched off
         #[arg(long)]
         disabled: bool,
     },
+    /// Remove a server from the config
     Remove {
+        /// Server name
         name: Option<String>,
+        /// Remove without asking
         #[arg(long)]
         yes: bool,
     },
+    /// Change a server's command, URL, env, or auth
     Edit {
+        /// Server name
         name: Option<String>,
+        /// Command that starts a stdio server
         #[arg(long)]
         command: Option<String>,
+        /// URL of an HTTP or SSE server
         #[arg(long)]
         url: Option<String>,
+        /// Comma-separated arguments for the command
         #[arg(long, value_delimiter = ',')]
         args: Option<Vec<String>>,
+        /// Environment variable as KEY=VALUE; repeat for more
         #[arg(long = "env")]
         env: Vec<String>,
+        /// Comma-separated environment variable names to remove
         #[arg(long = "unset-env", value_delimiter = ',')]
         unset_env: Vec<String>,
+        /// Upstream transport: stdio, http, or sse
         #[arg(long)]
         transport: Option<String>,
+        /// Upstream auth for HTTP or SSE servers: none, bearer, or oauth
         #[arg(long)]
         auth: Option<String>,
+        /// Token sent as a bearer token (with --auth bearer)
         #[arg(long)]
         bearer_token: Option<String>,
+        /// Pre-registered OAuth client ID (with --auth oauth)
         #[arg(long)]
         oauth_client_id: Option<String>,
+        /// Comma-separated OAuth scopes to request
         #[arg(long, value_delimiter = ',')]
         oauth_scopes: Option<Vec<String>>,
     },
-    Enable {
-        name: Option<String>,
-    },
-    Disable {
-        name: Option<String>,
-    },
+    /// Turn a disabled server back on
+    Enable { name: Option<String> },
+    /// Keep a server in the config but stop starting it
+    Disable { name: Option<String> },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum ToolCommands {
+    /// Hide tools from every client
     Disable {
+        /// Hide every tool from this server
         #[arg(long)]
         server: Option<String>,
+        /// Tool names or glob patterns, such as `github__delete_*`
         patterns: Vec<String>,
     },
+    /// Re-enable tools you disabled
     Enable {
+        /// Show every tool from this server again
         #[arg(long)]
         server: Option<String>,
+        /// Tool names or glob patterns, such as `github__delete_*`
         patterns: Vec<String>,
     },
+    /// List disabled tool patterns
     Disabled,
 }
 
@@ -432,7 +485,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let log_level = match cli.verbose {
+    // `plug clients -v` and `plug tools -v` spend the first -v on listing
+    // more rows, so their debug logs start at -vv.
+    let log_verbosity = match &cli.command {
+        Some(Commands::Clients) | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
+        _ => cli.verbose,
+    };
+    let log_level = match log_verbosity {
         0 => default_log_level(cli.command.as_ref()),
         1 => "debug",
         _ => "trace",
@@ -473,12 +532,14 @@ async fn main() -> anyhow::Result<()> {
             views::servers::cmd_server_list(cli.config.as_ref(), &cli.output).await?
         }
         Some(Commands::Clients) => {
-            views::clients::cmd_client_list(cli.config.as_ref(), &cli.output).await?
+            views::clients::cmd_client_list(cli.config.as_ref(), &cli.output, cli.verbose > 0)
+                .await?
         }
-        Some(Commands::Tools { command }) => {
+        Some(Commands::Tools { command, server }) => {
             commands::tools::cmd_tool_command(
                 cli.config.as_ref(),
                 command,
+                server,
                 &cli.output,
                 cli.verbose,
             )
@@ -575,9 +636,10 @@ impl From<ClientLinkTransport> for plug_core::export::ExportTransport {
 fn default_log_level(command: Option<&Commands>) -> &'static str {
     match command {
         Some(Commands::Serve { .. }) | Some(Commands::Connect) => "info",
-        Some(Commands::Status { .. }) | Some(Commands::Servers) | Some(Commands::Tools { .. }) => {
-            "none"
-        }
+        Some(Commands::Status { .. })
+        | Some(Commands::Servers)
+        | Some(Commands::Clients)
+        | Some(Commands::Tools { .. }) => "none",
         _ => "error",
     }
 }
@@ -699,10 +761,36 @@ mod tests {
         assert_eq!(level(&["plug", "connect"]), "info");
         assert_eq!(level(&["plug", "status"]), "none");
         assert_eq!(level(&["plug", "doctor"]), "error");
-        assert_eq!(level(&["plug", "clients"]), "error");
+        assert_eq!(level(&["plug", "clients"]), "none");
         assert_eq!(level(&["plug", "auth", "status"]), "error");
         assert_eq!(level(&["plug", "config", "check"]), "error");
         assert_eq!(level(&["plug"]), "error");
+    }
+
+    #[test]
+    fn tools_command_takes_a_server_or_a_subcommand() {
+        let cli = Cli::try_parse_from(["plug", "tools", "workspace"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tools { command: None, server: Some(ref server) }) if server == "workspace"
+        ));
+        let cli = Cli::try_parse_from(["plug", "tools", "disabled"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Tools {
+                command: Some(ToolCommands::Disabled),
+                server: None
+            })
+        ));
+    }
+
+    #[test]
+    fn config_path_flag_still_works() {
+        let cli = Cli::try_parse_from(["plug", "config", "--path"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Config { path: true, .. })
+        ));
     }
 
     #[test]

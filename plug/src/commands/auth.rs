@@ -1135,7 +1135,7 @@ async fn cmd_auth_inject(
     }
 
     if let Some(secs) = expires_in {
-        ui::print_info_line(format!("Token expires in {secs}s"));
+        ui::print_info_line(format!("Token expires in {}", ui::format_duration(secs)));
     }
 
     Ok(())
@@ -1262,12 +1262,12 @@ async fn cmd_auth_status(
                 }
 
                 if let Some(remaining) = live.and_then(|s| s.token_expires_in_secs) {
-                    println!("    Token expires in: {remaining}s");
+                    println!("    Token expires in: {}", ui::format_duration(remaining));
                 } else if let Some(remaining) = snapshot
                     .as_ref()
                     .and_then(|snapshot| snapshot.token_expires_in_secs)
                 {
-                    println!("    Token expires in: {remaining}s");
+                    println!("    Token expires in: {}", ui::format_duration(remaining));
                 } else if has_creds {
                     println!("    Token: expired (refresh pending)");
                 }

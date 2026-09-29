@@ -11,11 +11,21 @@ use crate::{OutputFormat, ToolCommands};
 pub(crate) async fn cmd_tool_command(
     config_path: Option<&std::path::PathBuf>,
     command: Option<ToolCommands>,
+    server: Option<String>,
     output: &OutputFormat,
     verbose: u8,
 ) -> anyhow::Result<()> {
     match command {
-        None => crate::views::tools::cmd_tool_list(config_path, output, verbose, None).await,
+        None => {
+            crate::views::tools::cmd_tool_list(
+                config_path,
+                output,
+                verbose,
+                server.as_deref(),
+                None,
+            )
+            .await
+        }
         Some(ToolCommands::Disabled) => cmd_tool_disabled(config_path, output),
         Some(ToolCommands::Disable { server, patterns }) => {
             cmd_tool_disable(config_path, tool_patterns_for_server(server, patterns)?).await
