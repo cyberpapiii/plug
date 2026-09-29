@@ -2294,7 +2294,7 @@ pub fn setup_file_logging(
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| crate::default_log_filter("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

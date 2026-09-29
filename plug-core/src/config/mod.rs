@@ -828,13 +828,6 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             ));
         }
 
-        if server.max_concurrent > 1 && matches!(server.transport, TransportType::Stdio) {
-            tracing::warn!(
-                server = %name,
-                max_concurrent = server.max_concurrent,
-                "max_concurrent > 1 for stdio transport — stdio is serial, this may not behave as expected"
-            );
-        }
         if server
             .sandbox
             .as_ref()

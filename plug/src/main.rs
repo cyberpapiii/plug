@@ -432,18 +432,10 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let log_level = if cli.verbose > 0 {
-        match cli.verbose {
-            1 => "debug",
-            _ => "trace",
-        }
-    } else {
-        match &cli.command {
-            Some(Commands::Status { .. })
-            | Some(Commands::Servers)
-            | Some(Commands::Tools { .. }) => "none",
-            _ => "info",
-        }
+    let log_level = match cli.verbose {
+        0 => default_log_level(cli.command.as_ref()),
+        1 => "debug",
+        _ => "trace",
     };
 
     let daemon_mode = matches!(&cli.command, Some(Commands::Serve { daemon: true, .. }));
@@ -577,22 +569,44 @@ impl From<ClientLinkTransport> for plug_core::export::ExportTransport {
     }
 }
 
+/// The stderr log level when `-v` is not given. The long-running processes
+/// treat stderr as a log. For every other command stderr sits next to the
+/// output the user is reading, so only errors belong there.
+fn default_log_level(command: Option<&Commands>) -> &'static str {
+    match command {
+        Some(Commands::Serve { .. }) | Some(Commands::Connect) => "info",
+        Some(Commands::Status { .. }) | Some(Commands::Servers) | Some(Commands::Tools { .. }) => {
+            "none"
+        }
+        _ => "error",
+    }
+}
+
+/// The filter used when `PLUG_LOG` is not set, for stderr and the daemon log
+/// alike. Each directive quiets an RMCP module whose lines are not faults, or
+/// restate a failure Plug already reports in its own words.
+pub(crate) fn default_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    // Version negotiation: RMCP warns whenever a client asks for a protocol
+    // version Plug does not speak and falls back, which is ordinary.
+    // Transport worker: RMCP logs every failed upstream connection as a fatal
+    // worker error, beside Plug's own line naming the server and the cause.
+    ["rmcp::service::server=error", "rmcp::transport::worker=off"]
+        .into_iter()
+        .fold(
+            tracing_subscriber::EnvFilter::new(level),
+            |filter, directive| {
+                filter.add_directive(directive.parse().expect("static tracing directive"))
+            },
+        )
+}
+
 fn init_stderr_tracing(level: &str) {
     if level == "none" {
         return;
     }
 
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG").unwrap_or_else(|_| {
-        // RMCP warns whenever a client asks for a protocol version Plug does
-        // not speak, which is ordinary version negotiation, and hosts show a
-        // connector's stderr warnings to the user. That warning is the only one
-        // in this module.
-        tracing_subscriber::EnvFilter::new(level).add_directive(
-            "rmcp::service::server=error"
-                .parse()
-                .expect("static tracing directive"),
-        )
-    });
+    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
+        .unwrap_or_else(|_| default_log_filter(level));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -604,6 +618,92 @@ fn init_stderr_tracing(level: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt as _;
+
+    /// Records the level and target of every event that passes the filter.
+    #[derive(Clone, Default)]
+    struct Recorded(Arc<Mutex<Vec<(tracing::Level, String)>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Recorded {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            let metadata = event.metadata();
+            self.0
+                .lock()
+                .expect("recorded events")
+                .push((*metadata.level(), metadata.target().to_string()));
+        }
+    }
+
+    fn record_events(filter: tracing_subscriber::EnvFilter, emit: impl FnOnce()) -> Recorded {
+        let recorded = Recorded::default();
+        let subscriber = tracing_subscriber::registry()
+            .with(filter)
+            .with(recorded.clone());
+        tracing::subscriber::with_default(subscriber, emit);
+        recorded
+    }
+
+    #[test]
+    fn default_filter_drops_rmcp_worker_errors_but_keeps_plug_errors() {
+        let recorded = record_events(default_log_filter("info"), || {
+            tracing::error!(target: "rmcp::transport::worker", "worker quit with fatal");
+            tracing::warn!(target: "rmcp::service::server", "unsupported protocol version");
+            tracing::error!(target: "plug_core::server", "failed to start server");
+            tracing::info!(target: "plug_core::engine", "server reconnected");
+        });
+        let targets: Vec<String> = recorded
+            .0
+            .lock()
+            .expect("recorded events")
+            .iter()
+            .map(|(_, target)| target.clone())
+            .collect();
+        assert_eq!(targets, ["plug_core::server", "plug_core::engine"]);
+    }
+
+    /// RMCP matches concurrent stdio requests to replies by id, so a stdio
+    /// server with `max_concurrent > 1` is valid and must not warn. The warning
+    /// used to fire on every config load, which the app does every poll.
+    #[test]
+    fn validating_a_concurrent_stdio_server_logs_nothing() {
+        let server: plug_core::config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "npx",
+            "max_concurrent": 4,
+        }))
+        .expect("stdio server config");
+        let mut config = plug_core::config::Config::default();
+        config.servers.insert("slack".to_string(), server);
+
+        let recorded = record_events(default_log_filter("info"), || {
+            assert!(plug_core::config::validate_config(&config).is_empty());
+        });
+        assert!(
+            recorded.0.lock().expect("recorded events").is_empty(),
+            "validation logged: {:?}",
+            recorded.0.lock().expect("recorded events")
+        );
+    }
+
+    #[test]
+    fn only_long_running_commands_log_below_error_by_default() {
+        let level = |args: &[&str]| {
+            let cli = Cli::try_parse_from(args).expect("command parses");
+            default_log_level(cli.command.as_ref())
+        };
+        assert_eq!(level(&["plug", "serve"]), "info");
+        assert_eq!(level(&["plug", "connect"]), "info");
+        assert_eq!(level(&["plug", "status"]), "none");
+        assert_eq!(level(&["plug", "doctor"]), "error");
+        assert_eq!(level(&["plug", "clients"]), "error");
+        assert_eq!(level(&["plug", "auth", "status"]), "error");
+        assert_eq!(level(&["plug", "config", "check"]), "error");
+        assert_eq!(level(&["plug"]), "error");
+    }
 
     #[test]
     fn serve_command_rejects_stdio_flag() {
