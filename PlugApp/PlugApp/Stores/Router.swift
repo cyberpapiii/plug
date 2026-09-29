@@ -87,17 +87,7 @@ struct PlugIntentRunner {
         case .checkForUpdates:
             UpdateService.shared.checkForUpdates()
         case .restartService:
-            guard model.beginServiceRestart() else { return }
-            Task {
-                do {
-                    try await DaemonServiceManager.shared.restart()
-                    model.finishServiceRestart()
-                    await model.refresh()
-                } catch {
-                    model.finishServiceRestart(error: error)
-                    await model.retryConnection()
-                }
-            }
+            Task { await model.restartService() }
         case .reloadConfiguration:
             perform { .reload(authToken: $0) }
         case .openLogs:

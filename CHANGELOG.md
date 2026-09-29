@@ -40,6 +40,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   blanks Plug.app's status. The daemon keeps serving its last good config, the
   status reports the parse error, and each status poll reads the file once
   instead of twice.
+- Plug.app no longer says "Plug is not running" after an update or restart.
+  It reconnects to the new background service on the same read, shows
+  "Reconnecting…" while a dropped connection comes back, and only calls Plug
+  stopped after ten seconds. Settings → Restart shows "Restarting…" and a
+  Start Plug pressed meanwhile waits for it instead of starting a second
+  swap. A stopped Plug no longer flickers to "Starting…" on every poll.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling
