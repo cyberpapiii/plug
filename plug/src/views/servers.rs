@@ -8,8 +8,8 @@ use crate::commands::servers::{
 use crate::runtime::daemon_query;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
-    print_label_value, status_label, status_marker, summarize_server_auth, summarize_server_target,
-    summarize_server_transport,
+    print_label_value, print_reason, status_label, status_marker, summarize_server_auth,
+    summarize_server_target, summarize_server_transport,
 };
 
 async fn prompt_server_actions(
@@ -118,6 +118,7 @@ pub(crate) async fn cmd_server_list(
                                 "upstream": server.upstream,
                                 "selected_protocol_era": server.selected_protocol_era,
                                 "selected_protocol_version": server.selected_protocol_version,
+                                "error": server.error,
                                 "source": server_cfg.map(plug_core::ipc::IpcServerSourceInfo::from_config),
                                 "trust": plug_core::ipc::IpcTrustInfo::for_server(&server.server_id, server_cfg),
                             })
@@ -203,6 +204,7 @@ pub(crate) async fn cmd_server_list(
                                 s.tool_count,
                                 protocol.to_ascii_lowercase()
                             );
+                            print_reason(s);
                         }
                         let auth_required_servers = servers
                             .iter()
@@ -245,7 +247,7 @@ pub(crate) async fn cmd_server_list(
                                 print_label_value(
                                     "Failed",
                                     format!(
-                                        "{} failed — run `plug doctor` to inspect connectivity and runtime context",
+                                        "{} failed — the reason is under each server; Plug keeps retrying",
                                         failed_servers.join(", ")
                                     ),
                                 );

@@ -885,6 +885,7 @@ mod tests {
             availability: Availability::Degraded,
             selected_protocol_era: None,
             selected_protocol_version: None,
+            error: None,
             last_seen: None,
         };
         let value = serde_json::to_value(&status).unwrap();
@@ -1212,6 +1213,10 @@ pub struct ServerStatus {
     pub selected_protocol_era: Option<crate::protocol::ProtocolEra>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_protocol_version: Option<String>,
+    /// Why the server is not healthy: the error from its last failed start
+    /// or reconnect, on one line with secrets redacted. Absent while healthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
     #[serde(skip)]
     pub last_seen: Option<std::time::Instant>,
 }

@@ -732,11 +732,11 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
                 plug_core::types::ServerHealth::Healthy => healthy += 1,
                 plug_core::types::ServerHealth::Degraded => {
                     degraded += 1;
-                    degraded_servers.push(server.server_id.clone());
+                    degraded_servers.push(server_with_reason(server));
                 }
                 plug_core::types::ServerHealth::Failed => {
                     failed += 1;
-                    failed_servers.push(server.server_id.clone());
+                    failed_servers.push(server_with_reason(server));
                 }
                 plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
             }
@@ -774,9 +774,9 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
             checks.push(plug_core::doctor::CheckResult {
                 name: "runtime_failures".to_string(),
                 status: plug_core::doctor::CheckStatus::Fail,
-                message: format!("failing servers: {}", failed_servers.join(", ")),
+                message: format!("failing servers: {}", failed_servers.join("; ")),
                 fix_suggestion: Some(
-                    "Run `plug status` for the failing servers, then compare with `plug doctor` cold checks before restarting or editing config".to_string(),
+                    "Fix the cause named for each server. Plug keeps retrying and picks the server back up without a restart".to_string(),
                 ),
             });
         }
@@ -785,7 +785,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
             checks.push(plug_core::doctor::CheckResult {
                 name: "runtime_degraded".to_string(),
                 status: plug_core::doctor::CheckStatus::Warn,
-                message: format!("degraded servers: {}", degraded_servers.join(", ")),
+                message: format!("degraded servers: {}", degraded_servers.join("; ")),
                 fix_suggestion: Some(
                     "Compare `plug status` and `plug doctor` to separate transient runtime degradation from cold connectivity or auth issues".to_string(),
                 ),
@@ -897,6 +897,14 @@ fn runtime_health_message(uptime_secs: u64, clients: usize, counts: RuntimeServe
     )
 }
 
+/// `name (why it failed)`, or just the name when the daemon gave no reason.
+fn server_with_reason(server: &plug_core::types::ServerStatus) -> String {
+    match &server.error {
+        Some(error) => format!("{} ({error})", server.server_id),
+        None => server.server_id.clone(),
+    }
+}
+
 #[cfg(test)]
 fn runtime_health_checks_for_tests(
     servers: &[plug_core::types::ServerStatus],
@@ -918,11 +926,11 @@ fn runtime_health_checks_for_tests(
             plug_core::types::ServerHealth::Healthy => healthy += 1,
             plug_core::types::ServerHealth::Degraded => {
                 degraded += 1;
-                degraded_servers.push(server.server_id.clone());
+                degraded_servers.push(server_with_reason(server));
             }
             plug_core::types::ServerHealth::Failed => {
                 failed += 1;
-                failed_servers.push(server.server_id.clone());
+                failed_servers.push(server_with_reason(server));
             }
             plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
         }
@@ -952,7 +960,7 @@ fn runtime_health_checks_for_tests(
         checks.push(plug_core::doctor::CheckResult {
             name: "runtime_failures".to_string(),
             status: plug_core::doctor::CheckStatus::Fail,
-            message: format!("failing servers: {}", failed_servers.join(", ")),
+            message: format!("failing servers: {}", failed_servers.join("; ")),
             fix_suggestion: None,
         });
     }
@@ -961,7 +969,7 @@ fn runtime_health_checks_for_tests(
         checks.push(plug_core::doctor::CheckResult {
             name: "runtime_degraded".to_string(),
             status: plug_core::doctor::CheckStatus::Warn,
-            message: format!("degraded servers: {}", degraded_servers.join(", ")),
+            message: format!("degraded servers: {}", degraded_servers.join("; ")),
             fix_suggestion: None,
         });
     }
@@ -1011,7 +1019,7 @@ fn synthesize_doctor_interpretation(
             Fail,
             "Basic reachability looks fine, but the running daemon is currently failing one or more servers.".to_string(),
             Some(
-                "Use `plug status` for the failing servers, then compare with `plug doctor` to separate runtime failures from cold connectivity.".to_string(),
+                "Fix the cause named for each server under runtime_failures. Plug keeps retrying and picks the server back up without a restart.".to_string(),
             ),
         ),
         (Pass, _, Some(Warn), _) => (
@@ -2081,6 +2089,7 @@ mod tests {
                     availability: Default::default(),
                     selected_protocol_era: None,
                     selected_protocol_version: None,
+                    error: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -2093,6 +2102,7 @@ mod tests {
                     availability: Default::default(),
                     selected_protocol_era: None,
                     selected_protocol_version: None,
+                    error: Some("failed to spawn `node`: not found on PATH".to_string()),
                     last_seen: None,
                 },
                 ServerStatus {
@@ -2105,6 +2115,7 @@ mod tests {
                     availability: Default::default(),
                     selected_protocol_era: None,
                     selected_protocol_version: None,
+                    error: None,
                     last_seen: None,
                 },
             ],
@@ -2122,7 +2133,10 @@ mod tests {
 
         assert_eq!(checks[1].name, "runtime_failures");
         assert_eq!(checks[1].status, CheckStatus::Fail);
-        assert_eq!(checks[1].message, "failing servers: oura");
+        assert_eq!(
+            checks[1].message,
+            "failing servers: oura (failed to spawn `node`: not found on PATH)"
+        );
     }
 
     #[test]
@@ -2139,6 +2153,7 @@ mod tests {
                     availability: Default::default(),
                     selected_protocol_era: None,
                     selected_protocol_version: None,
+                    error: None,
                     last_seen: None,
                 },
                 ServerStatus {
@@ -2151,6 +2166,7 @@ mod tests {
                     availability: Default::default(),
                     selected_protocol_era: None,
                     selected_protocol_version: None,
+                    error: None,
                     last_seen: None,
                 },
             ],

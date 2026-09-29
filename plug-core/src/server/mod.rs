@@ -5,7 +5,6 @@ use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
 use std::ffi::OsString;
 use std::future::Future;
-#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -39,6 +38,9 @@ use crate::config::{Config, ServerConfig, TransportType, UpstreamProtocolMode};
 use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
+
+mod failure;
+use failure::StderrTail;
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -329,6 +331,34 @@ pub(crate) fn resolve_stdio_command(command: &str, login_path: Option<&OsStr>) -
 /// saved, so a boot does not wait on the shell, or else the inherited PATH
 /// plus the standard Homebrew directories.
 pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
+    stdio_path().await.0
+}
+
+/// Where the PATH handed to stdio servers came from, for error messages.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StdioPathSource {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    LoginShell,
+    /// The login-shell probe failed; see [`fallback_stdio_path`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    Fallback,
+    /// Not macOS: the daemon's own PATH.
+    #[cfg_attr(target_os = "macos", allow(dead_code))]
+    Inherited,
+}
+
+impl StdioPathSource {
+    fn describe(self) -> &'static str {
+        match self {
+            Self::LoginShell => "the login shell PATH",
+            Self::Fallback => "the fallback PATH (the login shell PATH probe failed)",
+            Self::Inherited => "PATH",
+        }
+    }
+}
+
+/// [`stdio_login_path`] and where it came from.
+async fn stdio_path() -> (Option<&'static OsStr>, StdioPathSource) {
     #[cfg(target_os = "macos")]
     {
         static CACHE: LoginPathCache = LoginPathCache::new();
@@ -346,14 +376,57 @@ pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
             ),
         )
         .await;
-        Some(probed.unwrap_or_else(|| {
-            FALLBACK
-                .get_or_init(|| fallback_stdio_path(std::env::var_os("PATH")))
-                .as_os_str()
-        }))
+        match probed {
+            Some(path) => (Some(path), StdioPathSource::LoginShell),
+            None => (
+                Some(
+                    FALLBACK
+                        .get_or_init(|| fallback_stdio_path(std::env::var_os("PATH")))
+                        .as_os_str(),
+                ),
+                StdioPathSource::Fallback,
+            ),
+        }
     }
     #[cfg(not(target_os = "macos"))]
-    None
+    (None, StdioPathSource::Inherited)
+}
+
+/// The PATH launchd gives an agent. The daemon runs with this when Plug.app
+/// starts it.
+#[cfg(target_os = "macos")]
+const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
+
+/// Resolve a bare `command` the way the daemon does when its login-shell
+/// probe fails: launchd's PATH plus Homebrew. `None` if it is not found there,
+/// and always `None` off macOS, where there is no such fallback.
+pub(crate) fn resolve_without_login_shell(command: &str) -> Option<PathBuf> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = fallback_stdio_path(Some(OsString::from(LAUNCHD_PATH)));
+        std::env::split_paths(&path)
+            .map(|dir| dir.join(command))
+            .find(|path| path.is_file())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = command;
+        None
+    }
+}
+
+/// A spawn failure that names the command and, when it was not found, the
+/// PATH that was searched. Never includes args or env, which can hold secrets.
+fn spawn_error(command: &str, error: &std::io::Error, source: StdioPathSource) -> anyhow::Error {
+    let bare = Path::new(command).components().count() == 1;
+    if error.kind() == std::io::ErrorKind::NotFound && bare {
+        anyhow::anyhow!(
+            "failed to spawn `{command}`: not found on {}",
+            source.describe()
+        )
+    } else {
+        anyhow::anyhow!("failed to spawn `{command}`: {error}")
+    }
 }
 
 #[cfg(target_os = "macos")]
@@ -964,6 +1037,8 @@ pub struct UpstreamServer {
     /// Process id of a stdio server, so retirement can send SIGTERM to a
     /// server that does not exit when its stdin closes.
     pub(crate) child_pid: Option<u32>,
+    /// What a stdio server has written to stderr recently.
+    pub(crate) stderr_tail: Option<Arc<StderrTail>>,
 }
 
 impl UpstreamServer {
@@ -1163,6 +1238,9 @@ pub struct ServerManager {
     last_prompts: DashMap<String, Arc<Vec<Prompt>>>,
     /// Current per-server catalog availability, recomputed each refresh cycle.
     availability: DashMap<String, Availability>,
+    /// Why each server last failed to start or reconnect, already redacted.
+    /// Cleared when it starts; shown in status while it is unhealthy.
+    last_errors: DashMap<String, String>,
     pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
     /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
     /// all trying to reconnect the same server simultaneously).
@@ -1241,6 +1319,7 @@ impl ServerManager {
             last_resource_templates: DashMap::new(),
             last_prompts: DashMap::new(),
             availability: DashMap::new(),
+            last_errors: DashMap::new(),
             semaphores: DashMap::new(),
             reconnecting: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
@@ -1520,6 +1599,7 @@ impl ServerManager {
                 Ok((name, Err(e))) => {
                     tracing::error!(server = %name, error = %e, "failed to start server");
                     if let Some(server_config) = config.servers.get(&name) {
+                        self.record_error(&name, server_config, &e);
                         self.record_start_failure(&name, server_config, &e);
                     }
                     on_settled(&name);
@@ -1552,8 +1632,24 @@ impl ServerManager {
         config: &ServerConfig,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        Self::start_server_with_router(name, config, self.tool_router(), modern_upstream_gate_state)
-            .await
+        let result = Self::start_server_with_router(
+            name,
+            config,
+            self.tool_router(),
+            modern_upstream_gate_state,
+        )
+        .await;
+        if let Err(error) = &result {
+            self.record_error(name, config, error);
+        }
+        result
+    }
+
+    /// Remember why `name` failed, for status output.
+    fn record_error(&self, name: &str, config: &ServerConfig, error: &anyhow::Error) {
+        let secrets = failure::config_secrets(config);
+        self.last_errors
+            .insert(name.to_string(), failure::summarize_error(error, &secrets));
     }
 
     async fn start_server_with_router(
@@ -1573,6 +1669,10 @@ impl ServerManager {
             modern_upstream_gate_state & 1 == 1,
         );
 
+        // Set once a stdio server is spawned, so a start that fails or times
+        // out afterwards can say what the server wrote to stderr.
+        let stderr_slot: std::sync::OnceLock<Arc<StderrTail>> = std::sync::OnceLock::new();
+
         let result = tokio::time::timeout(timeout_duration, async {
             match config.transport {
                 TransportType::Stdio => {
@@ -1581,26 +1681,35 @@ impl ServerManager {
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("stdio transport requires a command"))?;
 
-                    let login_path = stdio_login_path().await;
+                    let (login_path, path_source) = stdio_path().await;
                     let mut cmd = build_stdio_command(command, &config.args, config, login_path)?;
-                    // Suppress stderr at the OS level to prevent noisy server logs
-                    cmd.stderr(std::process::Stdio::null());
 
                     for (key, value) in &config.env {
                         cmd.env(key, value);
                     }
 
+                    // Args are not logged: some servers take their API token
+                    // as a command-line argument.
                     tracing::info!(
                         server = %name,
                         command = %command,
-                        args = ?config.args,
+                        arg_count = config.args.len(),
                         sandbox = config.sandbox.as_ref().is_some_and(|sandbox| sandbox.enabled),
                         "spawning server process"
                     );
 
-                    let transport = rmcp::transport::child_process::TokioChildProcess::new(cmd)
-                        .map_err(|e| anyhow::anyhow!("failed to spawn process: {e}"))?;
+                    let (transport, stderr) =
+                        rmcp::transport::child_process::TokioChildProcess::builder(cmd)
+                            .stderr(std::process::Stdio::piped())
+                            .spawn()
+                            .map_err(|e| spawn_error(command, &e, path_source))?;
                     let child_pid = transport.id();
+                    let stderr_tail = stderr.map(|stderr| {
+                        StderrTail::capture(name, stderr, failure::config_secrets(config))
+                    });
+                    if let Some(tail) = &stderr_tail {
+                        let _ = stderr_slot.set(Arc::clone(tail));
+                    }
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
                     let handler = Arc::new(UpstreamClientHandler {
@@ -1633,6 +1742,7 @@ impl ServerManager {
                     .await
                     .map(|upstream| UpstreamServer {
                         child_pid,
+                        stderr_tail,
                         ..upstream
                     })
                 }
@@ -1744,12 +1854,28 @@ impl ServerManager {
 
         // Not logged here: every caller logs a failure once, with the server
         // name and what it will do next, or returns it to the operator.
-        result.unwrap_or_else(|_| {
-            Err(anyhow::anyhow!(
-                "server '{name}' timed out after {}s during startup",
-                config.timeout_secs
-            ))
-        })
+        match result {
+            Ok(Ok(server)) => {
+                if let Some(tail) = &server.stderr_tail {
+                    tail.mark_running();
+                }
+                Ok(server)
+            }
+            Ok(Err(e)) => Err(match stderr_slot.get() {
+                Some(tail) => tail.explain(name, e).await,
+                None => e,
+            }),
+            Err(_) => {
+                let e = anyhow::anyhow!(
+                    "server '{name}' timed out after {}s during startup",
+                    config.timeout_secs
+                );
+                Err(match stderr_slot.get() {
+                    Some(tail) => tail.explain(name, e).await,
+                    None => e,
+                })
+            }
+        }
     }
 
     /// Connect to a legacy SSE upstream server.
@@ -1901,6 +2027,7 @@ impl ServerManager {
             connection,
             health: ServerHealth::Healthy,
             child_pid: None,
+            stderr_tail: None,
         })
     }
 
@@ -2270,6 +2397,7 @@ impl ServerManager {
         self.last_resource_templates.clear();
         self.last_prompts.clear();
         self.availability.clear();
+        self.last_errors.clear();
         self.semaphores.clear();
         self.reconnecting.clear();
     }
@@ -2299,6 +2427,7 @@ impl ServerManager {
                     availability: self.availability_for(&upstream.name, health),
                     selected_protocol_era: Some(upstream.protocol_era),
                     selected_protocol_version: Some(upstream.selected_protocol_version.clone()),
+                    error: self.error_for(&upstream.name, health),
                     last_seen: None,
                 }
             })
@@ -2324,12 +2453,22 @@ impl ServerManager {
                 availability: self.availability_for(entry.key(), entry.health),
                 selected_protocol_era: None,
                 selected_protocol_version: None,
+                error: self.error_for(entry.key(), entry.health),
                 last_seen: None,
             });
         }
 
         statuses.sort_by(|a, b| a.server_id.cmp(&b.server_id));
         statuses
+    }
+
+    /// The last failure reason for `name`, only while it is unhealthy: a
+    /// server that recovered on its own has nothing to explain.
+    fn error_for(&self, name: &str, health: ServerHealth) -> Option<String> {
+        if health == ServerHealth::Healthy {
+            return None;
+        }
+        self.last_errors.get(name).map(|error| error.clone())
     }
 
     /// Record that a configured server failed during startup so it appears in
@@ -2376,6 +2515,7 @@ impl ServerManager {
         self.install_call_guards(name, &upstream.config, true);
         self.insert_upstream(name.to_string(), Arc::clone(&upstream));
         self.health.insert(name.to_string(), HealthState::new());
+        self.last_errors.remove(name);
         self.spawn_initial_log_level(name, &upstream);
     }
 
@@ -2445,6 +2585,7 @@ impl ServerManager {
 
     /// Stop and remove a single upstream server.
     pub async fn stop_server(&self, name: &str) {
+        self.last_errors.remove(name);
         if let Some(upstream_arc) = self.remove_upstream(name) {
             self.health.remove(name);
             self.circuit_breakers.remove(name);
@@ -2476,6 +2617,7 @@ impl ServerManager {
         if let Some(mut entry) = self.health.get_mut(name) {
             *entry = HealthState::new();
         }
+        self.last_errors.remove(name);
 
         tracing::info!(server = %name, "server replaced after reconnection");
 
@@ -2517,6 +2659,9 @@ pub(crate) async fn retire_upstream_owned(
     upstream_arc: Arc<UpstreamServer>,
     reason: &str,
 ) {
+    if let Some(tail) = &upstream_arc.stderr_tail {
+        tail.mark_retiring();
+    }
     upstream_arc.client.cancellation_token().cancel();
 
     match Arc::try_unwrap(upstream_arc) {
@@ -3758,6 +3903,7 @@ mod tests {
             connection: ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
             child_pid: None,
+            stderr_tail: None,
         }
     }
 
@@ -3814,6 +3960,7 @@ mod tests {
             connection: ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
             child_pid,
+            stderr_tail: None,
         };
 
         let started = std::time::Instant::now();
@@ -3875,6 +4022,7 @@ mod tests {
                 connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
                 child_pid: None,
+                stderr_tail: None,
             },
             result_request_count,
         )
@@ -4212,6 +4360,7 @@ mod tests {
                 connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
                 child_pid: None,
+                stderr_tail: None,
             },
         )
         .await;
@@ -4271,6 +4420,7 @@ mod tests {
                 connection: ConnectionGeneration::new(),
                 health: ServerHealth::Healthy,
                 child_pid: None,
+                stderr_tail: None,
             },
         )
         .await;
@@ -4577,6 +4727,7 @@ mod tests {
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                     child_pid: None,
+                    stderr_tail: None,
                 },
             )
             .await;
@@ -4686,6 +4837,7 @@ mod tests {
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                     child_pid: None,
+                    stderr_tail: None,
                 },
             )
             .await;
@@ -5020,6 +5172,7 @@ mod tests {
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                     child_pid: None,
+                    stderr_tail: None,
                 },
             )
             .await;
@@ -5144,6 +5297,7 @@ mod tests {
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                     child_pid: None,
+                    stderr_tail: None,
                 },
             )
             .await;
@@ -5290,6 +5444,7 @@ mod tests {
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                     child_pid: None,
+                    stderr_tail: None,
                 },
             )
             .await;
@@ -5825,6 +5980,7 @@ mod tests {
                     connection: ConnectionGeneration::new(),
                     health: ServerHealth::Healthy,
                     child_pid: None,
+                    stderr_tail: None,
                 },
             )
             .await;
@@ -5903,6 +6059,7 @@ mod tests {
             connection: ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
             child_pid: None,
+            stderr_tail: None,
         });
 
         // The server never answers ping, so this request holds the upstream
@@ -5975,5 +6132,117 @@ mod tests {
         assert!(!crate::protocol::legacy_tasks_capability(
             &upstream.capabilities
         ));
+    }
+
+    fn sh_server(script: &str, env: &[(&str, &str)]) -> ServerConfig {
+        ServerConfig {
+            command: Some("/bin/sh".to_string()),
+            args: vec!["-c".to_string(), script.to_string()],
+            env: env
+                .iter()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect(),
+            enabled: true,
+            transport: TransportType::Stdio,
+            protocol_mode: Default::default(),
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 10,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+
+            sandbox: None,
+        }
+    }
+
+    /// A local server that exits during startup used to show only "Failed":
+    /// its stderr went nowhere and status carried no reason. Status now says
+    /// why, including the last line the server printed, with its own env
+    /// values redacted.
+    #[tokio::test]
+    async fn failed_start_reports_why_in_status() {
+        let mgr = ServerManager::new();
+        let mut config = Config::default();
+        config.servers.insert(
+            "broken".to_string(),
+            sh_server(
+                "echo \"missing module, key was $SECRET_KEY\" >&2; exit 3",
+                &[("SECRET_KEY", "hunter2hunter2")],
+            ),
+        );
+
+        mgr.start_all(&config, |_| {}).await.expect("start_all");
+
+        let statuses = mgr.server_statuses();
+        assert_eq!(statuses.len(), 1);
+        assert_eq!(statuses[0].health, ServerHealth::Failed);
+        let error = statuses[0]
+            .error
+            .as_deref()
+            .expect("a failed server says why");
+        assert!(
+            error.contains("stderr: missing module, key was <redacted>"),
+            "{error}"
+        );
+        assert!(!error.contains("hunter2hunter2"), "{error}");
+        assert!(!error.contains('\n'), "{error}");
+    }
+
+    #[tokio::test]
+    async fn successful_reconnect_clears_the_reason() {
+        let mgr = ServerManager::new();
+        let config = sh_server("exit 3", &[]);
+        let error = mgr
+            .start_server("flaky", &config)
+            .await
+            .err()
+            .expect("the server exits before initializing");
+        mgr.record_start_failure("flaky", &config, &error);
+        assert!(mgr.server_statuses()[0].error.is_some());
+
+        mgr.replace_server("flaky", make_connected_test_upstream("flaky").await)
+            .await;
+
+        let statuses = mgr.server_statuses();
+        assert_eq!(statuses[0].health, ServerHealth::Healthy);
+        assert_eq!(statuses[0].error, None);
+    }
+
+    #[test]
+    fn status_hides_a_stale_reason_while_healthy() {
+        let mgr = ServerManager::new();
+        mgr.mark_start_failure("recovering");
+        mgr.last_errors
+            .insert("recovering".to_string(), "old failure".to_string());
+        assert_eq!(
+            mgr.server_statuses()[0].error.as_deref(),
+            Some("old failure")
+        );
+
+        if let Some(mut entry) = mgr.health.get_mut("recovering") {
+            *entry = HealthState::new();
+        }
+        assert_eq!(mgr.server_statuses()[0].error, None);
+    }
+
+    #[test]
+    fn spawn_error_names_the_command_and_the_path_searched() {
+        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert_eq!(
+            spawn_error("npx", &not_found, StdioPathSource::Fallback).to_string(),
+            "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)"
+        );
+        assert_eq!(
+            spawn_error("/opt/tool", &not_found, StdioPathSource::LoginShell).to_string(),
+            format!("failed to spawn `/opt/tool`: {not_found}")
+        );
     }
 }

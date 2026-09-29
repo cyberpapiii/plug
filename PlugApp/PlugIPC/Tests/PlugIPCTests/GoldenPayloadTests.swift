@@ -110,6 +110,10 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(snapshot.servers.map(\.serverId), ["healthy", "degraded", "failed", "auth-required"])
         XCTAssertEqual(snapshot.servers.map(\.health), ["Healthy", "Degraded", "Failed", "AuthRequired"])
         XCTAssertEqual(snapshot.servers.map(\.toolCount), [12, 4, 0, 0])
+        XCTAssertEqual(
+            snapshot.servers.map(\.error),
+            [nil, nil, "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)", nil]
+        )
         XCTAssertEqual(snapshot.liveSessions.first?.transport, "daemon_proxy")
         XCTAssertEqual(snapshot.liveSessions.first?.clientType, "ClaudeCode")
         XCTAssertEqual(snapshot.clientVisibility.first?.visibleToolCount, 16)

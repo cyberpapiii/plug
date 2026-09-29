@@ -2413,6 +2413,7 @@ mod tests {
             availability: plug_core::types::Availability::Healthy,
             selected_protocol_era: None,
             selected_protocol_version: None,
+            error: None,
             last_seen: None,
         }];
 

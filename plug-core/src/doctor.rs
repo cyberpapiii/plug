@@ -380,11 +380,31 @@ fn extract_env_refs(input: &str) -> Vec<String> {
 
 /// Check 5: each stdio server's command binary is found in PATH.
 async fn check_server_binaries(config: &Config) -> CheckResult {
+    let login_path = crate::server::stdio_login_path().await;
+    server_binaries_result(
+        config,
+        |binary| which(binary, login_path),
+        crate::server::resolve_without_login_shell,
+    )
+}
+
+/// `resolve` finds a binary the way this shell does. `resolve_fallback` finds
+/// it the way the daemon does when its login-shell PATH probe fails, which
+/// happens after a reboot on a slow login. A binary only the first finds is a
+/// server that will not start after some reboots, so it earns a warning.
+fn server_binaries_result(
+    config: &Config,
+    resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
+    resolve_fallback: impl Fn(&str) -> Option<std::path::PathBuf>,
+) -> CheckResult {
     let name = "server_binaries".to_string();
     let mut missing: Vec<String> = Vec::new();
-    let login_path = crate::server::stdio_login_path().await;
+    let mut login_shell_only: Vec<String> = Vec::new();
+    let check_fallback = cfg!(target_os = "macos");
 
-    for (server_name, server) in &config.servers {
+    let mut servers: Vec<_> = config.servers.iter().collect();
+    servers.sort_by(|a, b| a.0.cmp(b.0));
+    for (server_name, server) in servers {
         if !server.enabled {
             continue;
         }
@@ -403,22 +423,19 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
                     missing.push(format!("{server_name}: {binary}"));
                 }
             } else {
-                // Check PATH
-                if which(binary, login_path).is_none() {
-                    missing.push(format!("{server_name}: {binary}"));
+                match resolve(binary) {
+                    None => missing.push(format!("{server_name}: {binary}")),
+                    Some(found) if check_fallback && resolve_fallback(binary).is_none() => {
+                        login_shell_only
+                            .push(format!("{server_name}: {binary} ({})", found.display()));
+                    }
+                    Some(_) => {}
                 }
             }
         }
     }
 
-    if missing.is_empty() {
-        CheckResult {
-            name,
-            status: CheckStatus::Pass,
-            message: "All server binaries found".to_string(),
-            fix_suggestion: None,
-        }
-    } else {
+    if !missing.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Fail,
@@ -426,6 +443,23 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
             fix_suggestion: Some(
                 "Install the missing binaries or fix the command path".to_string(),
             ),
+        }
+    } else if !login_shell_only.is_empty() {
+        CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: format!(
+                "Found only through your login shell PATH: {}. If the daemon cannot read that PATH at boot, these servers fail to start",
+                login_shell_only.join(", ")
+            ),
+            fix_suggestion: Some("Use the absolute path shown as the server's command".to_string()),
+        }
+    } else {
+        CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "All server binaries found".to_string(),
+            fix_suggestion: None,
         }
     }
 }
@@ -1843,6 +1877,40 @@ command = "example-server"
         let result = check_server_binaries(&config).await;
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("plug_nonexistent_binary_xyz"));
+    }
+
+    /// `node` from a version manager resolves in a shell but not on the PATH
+    /// the daemon falls back to when its login-shell probe fails. Doctor used
+    /// to pass that; the server then failed after a slow reboot.
+    #[test]
+    fn server_binaries_warn_when_only_the_login_shell_finds_one() {
+        let mut config = test_config();
+        config
+            .servers
+            .insert("oura".to_string(), stdio_server("node"));
+        config.servers.insert("sys".to_string(), stdio_server("sh"));
+        let result = server_binaries_result(
+            &config,
+            |binary| {
+                Some(std::path::PathBuf::from(format!(
+                    "/Users/me/.nvm/bin/{binary}"
+                )))
+            },
+            |binary| (binary == "sh").then(|| std::path::PathBuf::from("/bin/sh")),
+        );
+        if cfg!(target_os = "macos") {
+            assert_eq!(result.status, CheckStatus::Warn);
+            assert!(
+                result
+                    .message
+                    .contains("oura: node (/Users/me/.nvm/bin/node)"),
+                "{}",
+                result.message
+            );
+            assert!(!result.message.contains("sys"), "{}", result.message);
+        } else {
+            assert_eq!(result.status, CheckStatus::Pass);
+        }
     }
 
     // -- check_tool_collisions --
