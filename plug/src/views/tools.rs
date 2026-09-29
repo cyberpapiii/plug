@@ -7,7 +7,8 @@ use crate::commands::config::load_editable_config;
 use crate::commands::tools::prompt_tool_actions;
 use crate::runtime::daemon_query;
 use crate::ui::{
-    can_prompt_interactively, print_banner, print_heading, print_label_value, terminal_width,
+    can_prompt_interactively, print_banner, print_heading, print_info_line, print_label_value,
+    print_wrapped_rows, terminal_width,
 };
 
 type ToolInventoryGroup = Vec<(
@@ -56,10 +57,74 @@ fn classify_empty_tool_inventory(
     ToolInventoryEmptyState::EmptyMergedSet
 }
 
+/// `plug tools workspace` matches the server id; `plug tools gmail` matches
+/// one of the tool groups a server exposes under its own prefix.
+fn group_matches(prefix: &str, server_id: &str, filter: &str) -> bool {
+    server_id.eq_ignore_ascii_case(filter) || prefix.eq_ignore_ascii_case(filter)
+}
+
+/// One row per server for the default `plug tools` view.
+#[derive(Debug, PartialEq, Eq)]
+struct ServerToolSummary<'a> {
+    server: &'a str,
+    tools: usize,
+    /// Tool groups the server exposes under a prefix other than its own id.
+    groups: Vec<&'a str>,
+}
+
+fn server_tool_summaries(
+    tools_by_prefix: &BTreeMap<String, ToolInventoryGroup>,
+) -> Vec<ServerToolSummary<'_>> {
+    let mut summaries: BTreeMap<&str, ServerToolSummary<'_>> = BTreeMap::new();
+    for (prefix, tools) in tools_by_prefix {
+        for tool in tools {
+            let server = tool.1.as_str();
+            let summary = summaries
+                .entry(server)
+                .or_insert_with(|| ServerToolSummary {
+                    server,
+                    tools: 0,
+                    groups: Vec::new(),
+                });
+            summary.tools += 1;
+            if !prefix.eq_ignore_ascii_case(server) && !summary.groups.contains(&prefix.as_str()) {
+                summary.groups.push(prefix);
+            }
+        }
+    }
+    summaries.into_values().collect()
+}
+
+fn print_server_summaries(summaries: &[ServerToolSummary<'_>], width: usize) {
+    print_heading("Servers");
+    println!(
+        "  {:<24} {:>5}  {}",
+        style("SERVER").dim(),
+        style("TOOLS").dim(),
+        style("GROUPS").dim()
+    );
+    for summary in summaries {
+        let prefix_text = format!("  {:<24} {:>5}  ", summary.server, summary.tools);
+        let prefix_display = format!(
+            "  {:<24} {:>5}  ",
+            style(summary.server).cyan(),
+            summary.tools
+        );
+        print_wrapped_rows(
+            &prefix_text,
+            prefix_display,
+            &summary.groups.join(", "),
+            width,
+            |line| style(line).dim(),
+        );
+    }
+}
+
 pub(crate) async fn cmd_tool_list(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
-    _verbose: u8,
+    verbose: u8,
+    server: Option<&str>,
     started: Option<bool>,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
@@ -132,8 +197,20 @@ pub(crate) async fn cmd_tool_list(
             ));
         }
 
-        let unique_servers: BTreeSet<&str> =
-            all_tools.iter().map(|t| t.server_id.as_str()).collect();
+        if let Some(filter) = server {
+            tools_by_prefix.retain(|prefix, tools| group_matches(prefix, &tools[0].1, filter));
+            if tools_by_prefix.is_empty() && inventory_available {
+                anyhow::bail!(
+                    "no server or tool group named `{filter}`; run `plug tools` to see them"
+                );
+            }
+        }
+        let tool_count: usize = tools_by_prefix.values().map(Vec::len).sum();
+        let server_count = tools_by_prefix
+            .values()
+            .flat_map(|tools| tools.iter().map(|tool| tool.1.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len();
 
         match output {
             OutputFormat::Json => {
@@ -176,8 +253,8 @@ pub(crate) async fn cmd_tool_list(
                     serde_json::to_string_pretty(&serde_json::json!({
                         "runtime_available": inventory_available,
                         "status_source": inventory_availability.status_source(),
-                        "tool_count": all_tools.len(),
-                        "server_count": unique_servers.len(),
+                        "tool_count": tool_count,
+                        "server_count": server_count,
                         "groups": json_groups,
                     }))?
                 );
@@ -238,63 +315,67 @@ pub(crate) async fn cmd_tool_list(
                 print_banner(
                     "◆",
                     "Tools",
-                    &format!(
-                        "{} tools across {} server(s)",
-                        all_tools.len(),
-                        unique_servers.len()
-                    ),
+                    &format!("{tool_count} tools across {server_count} server(s)"),
                 );
                 if started {
                     println!();
                 }
                 print_heading("Summary");
-                print_label_value("Tools", style(all_tools.len()).bold());
-                print_label_value("Servers", style(unique_servers.len()).bold());
+                print_label_value("Tools", style(tool_count).bold());
+                print_label_value("Servers", style(server_count).bold());
                 print_label_value("Disabled", style(disabled_count).yellow().bold());
                 println!();
-                print_heading("Inventory");
-                for (prefix, mut tools) in tools_by_prefix {
-                    tools.sort_by(|a, b| a.0.cmp(&b.0));
-                    let server_id = &tools[0].1;
-                    let annotation = if server_id != &prefix {
-                        format!(" {}", style(format!("[{}]", server_id)).dim())
-                    } else {
-                        String::new()
-                    };
-                    println!(
-                        "{} {} {}{}",
-                        style("▸").cyan().bold(),
-                        style(&prefix).bold(),
-                        style(format!("{} tools", tools.len())).dim(),
-                        annotation
-                    );
-                    for (
-                        name,
-                        _server_id,
-                        title,
-                        desc,
-                        _icons,
-                        _risk,
-                        _source,
-                        _upstream,
-                        _trust,
-                    ) in &tools
-                    {
-                        let name_styled = style(format!("  │ {:<28}", name)).cyan();
-                        let display_text = title.as_deref().or(desc.as_deref());
-                        if let Some(text) = display_text {
-                            let cleaned = text.replace('\n', " ").replace('\r', "");
-                            let short = if cleaned.len() > available_width {
-                                format!("{}...", &cleaned[..available_width.max(0)])
-                            } else {
-                                cleaned
-                            };
-                            println!("{}  {}", name_styled, style(short).dim());
-                        } else {
-                            println!("{}", name_styled);
-                        }
-                    }
+                if server.is_none() && verbose == 0 {
+                    print_server_summaries(&server_tool_summaries(&tools_by_prefix), term_width);
                     println!();
+                    print_info_line(
+                        "Run `plug tools <server>` to list one server's tools, or `plug tools -v` to list them all.",
+                    );
+                } else {
+                    print_heading("Inventory");
+                    for (prefix, mut tools) in tools_by_prefix {
+                        tools.sort_by(|a, b| a.0.cmp(&b.0));
+                        let server_id = &tools[0].1;
+                        let annotation = if !server_id.eq_ignore_ascii_case(&prefix) {
+                            format!(" {}", style(format!("[{}]", server_id)).dim())
+                        } else {
+                            String::new()
+                        };
+                        println!(
+                            "{} {} {}{}",
+                            style("▸").cyan().bold(),
+                            style(&prefix).bold(),
+                            style(format!("{} tools", tools.len())).dim(),
+                            annotation
+                        );
+                        for (
+                            name,
+                            _server_id,
+                            title,
+                            desc,
+                            _icons,
+                            _risk,
+                            _source,
+                            _upstream,
+                            _trust,
+                        ) in &tools
+                        {
+                            let name_styled = style(format!("  │ {:<28}", name)).cyan();
+                            let display_text = title.as_deref().or(desc.as_deref());
+                            if let Some(text) = display_text {
+                                let cleaned = text.replace('\n', " ").replace('\r', "");
+                                let short = if cleaned.len() > available_width {
+                                    format!("{}...", &cleaned[..available_width.max(0)])
+                                } else {
+                                    cleaned
+                                };
+                                println!("{}  {}", name_styled, style(short).dim());
+                            } else {
+                                println!("{}", name_styled);
+                            }
+                        }
+                        println!();
+                    }
                 }
             }
         }
@@ -370,5 +451,62 @@ mod tests {
             classify_empty_tool_inventory(false, true, 1, &[]),
             ToolInventoryEmptyState::RuntimeInspectionFailed
         );
+    }
+
+    fn inventory(entries: &[(&str, &str)]) -> BTreeMap<String, ToolInventoryGroup> {
+        let mut groups: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
+        for (index, (prefix, server)) in entries.iter().enumerate() {
+            groups.entry(prefix.to_string()).or_default().push((
+                format!("tool{index}"),
+                server.to_string(),
+                None,
+                None,
+                None,
+                Default::default(),
+                None,
+                None,
+                Default::default(),
+            ));
+        }
+        groups
+    }
+
+    #[test]
+    fn server_summaries_count_tools_per_server_and_name_foreign_groups() {
+        let groups = inventory(&[
+            ("Gmail", "workspace"),
+            ("Gmail", "workspace"),
+            ("GoogleDocs", "workspace"),
+            ("Workspace", "workspace"),
+            ("Agent-admin", "agent-admin"),
+            ("exa", "exa"),
+        ]);
+        assert_eq!(
+            server_tool_summaries(&groups),
+            vec![
+                ServerToolSummary {
+                    server: "agent-admin",
+                    tools: 1,
+                    groups: vec![],
+                },
+                ServerToolSummary {
+                    server: "exa",
+                    tools: 1,
+                    groups: vec![],
+                },
+                ServerToolSummary {
+                    server: "workspace",
+                    tools: 4,
+                    groups: vec!["Gmail", "GoogleDocs"],
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn tool_filter_matches_server_or_group_ignoring_case() {
+        assert!(group_matches("Gmail", "workspace", "workspace"));
+        assert!(group_matches("Gmail", "workspace", "gmail"));
+        assert!(!group_matches("Gmail", "workspace", "slack"));
     }
 }

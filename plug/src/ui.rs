@@ -162,8 +162,12 @@ pub(crate) fn format_duration(secs: u64) -> String {
     }
 }
 
+/// Wide enough for the longest label in use (`Downstream Auth`), so every
+/// value in a block starts in the same column.
+const LABEL_WIDTH: usize = 15;
+
 pub(crate) fn print_label_value(label: &str, value: impl std::fmt::Display) {
-    let prefix_text = format!("  {:<8} ", label);
+    let prefix_text = format!("  {label:<LABEL_WIDTH$} ");
     print_wrapped_rows(
         &prefix_text,
         format!("{}", style(&prefix_text).dim().bold()),

@@ -24,6 +24,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   redacted. `plug doctor` also warns when a server's command is found only
   through your login shell PATH, which the daemon cannot always read at boot.
   The daemon no longer logs a stdio server's arguments, which can hold tokens.
+- `plug tools` opens with one row per server and its tool count; `plug tools
+  <server>` (or a group such as `gmail`) lists that server's tools, and `plug
+  tools -v` lists them all. `plug clients` groups live sessions by client with
+  a count (each session behind `-v`), lists linked clients first, and folds
+  the unlinked ones into one line. Durations read as `3h 5m` or `59d` instead
+  of raw seconds, labels line up, `plug servers` shows just the protocol
+  version (prefixed `modern` when it is), the always-zero `sse=0` count is
+  gone, and every subcommand and flag in `--help` has a description. JSON
+  output is unchanged.
 - Node-based stdio servers such as Figma no longer stay down after a reboot.
   When the login shell was too slow to report its PATH at boot, Plug kept that
   failure until the daemon restarted, so `node` and `npx` could not be found.

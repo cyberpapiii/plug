@@ -315,15 +315,7 @@ pub(crate) async fn cmd_overview(
             print_label_value("Live", style(live_client_count).bold());
             print_label_value("Live Inventory", live_inventory_summary(&inventory));
             print_info_line(live_client_count_scope_text(live_inventory_scope));
-            print_label_value(
-                "Live Transports",
-                format!(
-                    "daemon_proxy={} http={} sse={}",
-                    inventory.session_transports.daemon_proxy,
-                    inventory.session_transports.http,
-                    inventory.session_transports.sse
-                ),
-            );
+            print_label_value("Live Transports", inventory.session_transports.summary());
         }
         LiveClientSupport::DaemonRestartRequired => {
             print_label_value("Live", style("restart required").yellow().bold());
@@ -553,22 +545,17 @@ pub(crate) async fn cmd_status(
             }
             print_heading("Service");
             print_label_value("Status", style("running").green().bold());
-            print_label_value("Uptime", style(format!("{uptime_secs}s")).bold());
+            print_label_value(
+                "Uptime",
+                style(crate::ui::format_duration(uptime_secs)).bold(),
+            );
             match live_client_support {
                 LiveClientSupport::Supported => {
                     print_label_value(
                         "Live Sessions",
                         style(inventory.session_count.to_string()).bold(),
                     );
-                    print_label_value(
-                        "Live Transports",
-                        format!(
-                            "daemon_proxy={} http={} sse={}",
-                            inventory.session_transports.daemon_proxy,
-                            inventory.session_transports.http,
-                            inventory.session_transports.sse
-                        ),
-                    );
+                    print_label_value("Live Transports", inventory.session_transports.summary());
                     print_label_value("Live Inventory", live_inventory_summary(&inventory));
                     print_info_line(live_client_count_scope_text(live_inventory_scope));
                 }
@@ -578,7 +565,7 @@ pub(crate) async fn cmd_status(
                         "Inventory Scope",
                         "Restart the background daemon to enable transport-aware live session inventory.",
                     );
-                    print_label_value("Daemon Proxy Clients", style(clients.to_string()).bold());
+                    print_label_value("Local Clients", style(clients.to_string()).bold());
                 }
             }
             // Resource subscriptions are held by the runtime on behalf of
@@ -586,7 +573,7 @@ pub(crate) async fn cmd_status(
             // there is no way to tell a client that subscribed and went quiet
             // from one that never subscribed at all.
             print_label_value(
-                "Resource Subscriptions",
+                "Subscriptions",
                 style(resource_subscriptions.to_string()).bold(),
             );
             if !linked_clients.is_empty() {

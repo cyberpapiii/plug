@@ -60,12 +60,21 @@ fn configured_client_state_text(client: &crate::commands::clients::ClientView) -
         let transport_summary = if client.live_transports.is_empty() {
             "unknown".to_string()
         } else {
-            client.live_transports.join("+")
+            client
+                .live_transports
+                .iter()
+                .map(|transport| match transport.as_str() {
+                    "daemon_proxy" => "local",
+                    other => other,
+                })
+                .collect::<Vec<_>>()
+                .join("+")
         };
-        states.push(format!(
-            "live via {transport_summary} ({})",
-            client.live_sessions
-        ));
+        let sessions = match client.live_sessions {
+            1 => "1 live session".to_string(),
+            count => format!("{count} live sessions"),
+        };
+        states.push(format!("{sessions} ({transport_summary})"));
     }
 
     if states.is_empty() {
@@ -237,9 +246,102 @@ fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
     }
 }
 
+/// Live sessions for one client, so `plug clients` shows `Claude Code  12`
+/// instead of twelve near-identical rows.
+#[derive(Debug, PartialEq, Eq)]
+struct LiveSessionGroup<'a> {
+    client: &'a str,
+    sessions: usize,
+    transports: Vec<&'a str>,
+    longest_connected_secs: u64,
+}
+
+/// Busiest client first, then by name.
+fn live_session_groups(
+    sessions: &[crate::commands::clients::LiveSessionView],
+) -> Vec<LiveSessionGroup<'_>> {
+    let mut groups: Vec<LiveSessionGroup<'_>> = Vec::new();
+    for session in sessions {
+        let transport = match session.transport.as_str() {
+            "daemon_proxy" => "local",
+            other => other,
+        };
+        match groups
+            .iter_mut()
+            .find(|group| group.client == session.client_type)
+        {
+            Some(group) => {
+                group.sessions += 1;
+                if !group.transports.contains(&transport) {
+                    group.transports.push(transport);
+                }
+                group.longest_connected_secs =
+                    group.longest_connected_secs.max(session.connected_secs);
+            }
+            None => groups.push(LiveSessionGroup {
+                client: &session.client_type,
+                sessions: 1,
+                transports: vec![transport],
+                longest_connected_secs: session.connected_secs,
+            }),
+        }
+    }
+    groups.sort_by(|a, b| b.sessions.cmp(&a.sessions).then(a.client.cmp(b.client)));
+    groups
+}
+
+fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView]) {
+    println!(
+        "  {:<18} {:<14} {:<12} {:<10} {:<10}",
+        style("SESSION").dim(),
+        style("CLIENT").dim(),
+        style("TRANSPORT").dim(),
+        style("CONNECTED").dim(),
+        style("IDLE").dim()
+    );
+    println!(
+        "  {}",
+        style("--------------------------------------------------------------------------").dim()
+    );
+    for session in sessions {
+        let idle = session
+            .last_activity_secs
+            .map(crate::ui::format_duration)
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "  {:<18} {:<14} {:<12} {:<10} {:<10}",
+            &session.session_id[..session.session_id.len().min(18)],
+            session.client_type,
+            session.transport,
+            crate::ui::format_duration(session.connected_secs),
+            idle,
+        );
+    }
+}
+
+/// One line for every client Plug knows about but has not linked, noting the
+/// ones that are installed or connected anyway.
+fn unlinked_clients_text(clients: &[crate::commands::clients::ClientView]) -> Option<String> {
+    let names = clients
+        .iter()
+        .filter(|client| !client.linked)
+        .map(|client| {
+            if client.live {
+                format!("{} (live)", client.name)
+            } else if client.detected {
+                format!("{} (detected)", client.name)
+            } else {
+                client.name.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    (!names.is_empty()).then(|| names.join(", "))
+}
+
 pub(crate) async fn cmd_client_list(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
+    verbose: bool,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
     let mut started = false;
@@ -320,15 +422,7 @@ pub(crate) async fn cmd_client_list(
         if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
             print_label_value("Live Inventory", live_inventory_summary(&inventory));
             print_info_line(live_inventory_scope_text(live_inventory_scope));
-            print_label_value(
-                "Live Transports",
-                format!(
-                    "daemon_proxy={} http={} sse={}",
-                    inventory.session_transports.daemon_proxy,
-                    inventory.session_transports.http,
-                    inventory.session_transports.sse
-                ),
-            );
+            print_label_value("Live Transports", inventory.session_transports.summary());
             if inventory.session_count > 0 {
                 print_info_line(
                     "Lazy tool modes below are configured values; live sessions keep their daemon-start policy until restart after lazy_tools edits.",
@@ -341,62 +435,59 @@ pub(crate) async fn cmd_client_list(
             print_info_line("No live downstream sessions observed.");
         } else {
             println!(
-                "  {:<18} {:<14} {:<12} {:<10} {:<10}",
-                style("SESSION").dim(),
+                "  {:<24} {:<10} {:<14} {}",
                 style("CLIENT").dim(),
+                style("SESSIONS").dim(),
                 style("TRANSPORT").dim(),
-                style("CONNECTED").dim(),
-                style("IDLE").dim()
+                style("LONGEST").dim()
             );
             println!(
                 "  {}",
-                style("--------------------------------------------------------------------------")
-                    .dim()
+                style("----------------------------------------------------------------").dim()
             );
-            for session in &live_sessions {
-                let idle = session
-                    .last_activity_secs
-                    .map(|seconds| format!("{seconds}s"))
-                    .unwrap_or_else(|| "-".to_string());
+            for group in live_session_groups(&live_sessions) {
                 println!(
-                    "  {:<18} {:<14} {:<12} {:<10} {:<10}",
-                    &session.session_id[..session.session_id.len().min(18)],
-                    session.client_type,
-                    session.transport,
-                    format!("{}s", session.connected_secs),
-                    idle,
+                    "  {:<24} {:<10} {:<14} {}",
+                    group.client,
+                    group.sessions,
+                    group.transports.join("+"),
+                    crate::ui::format_duration(group.longest_connected_secs),
                 );
+            }
+            if verbose {
+                println!();
+                print_live_session_rows(&live_sessions);
+            } else {
+                print_info_line(style("Run `plug clients -v` to list each session.").dim());
             }
         }
 
         println!();
         print_heading("Configured Clients");
-        println!(
-            "  {:<24} {:<10} {}",
-            style("CLIENT").dim(),
-            style("LINKED").dim(),
-            style("STATE").dim()
-        );
-        println!(
-            "  {}",
-            style("----------------------------------------------------------------").dim()
-        );
-        for client in &clients {
-            let linked = if client.linked {
-                style("yes").green().bold()
-            } else {
-                style("no").dim()
-            };
+        let linked_clients = clients.iter().filter(|client| client.linked);
+        if linked_count == 0 {
+            print_info_line("No clients linked yet. Run `plug link` to add one.");
+        } else {
+            println!("  {:<24} {}", style("CLIENT").dim(), style("STATE").dim());
             println!(
-                "  {:<24} {:<10} {}",
+                "  {}",
+                style("----------------------------------------------------------------").dim()
+            );
+        }
+        for client in linked_clients {
+            println!(
+                "  {:<24} {}",
                 client.name,
-                linked,
                 style(configured_client_state_text(client)).dim()
             );
             if let Some(link_text) = configured_client_link_text(client) {
                 print_info_line(style(link_text).dim());
             }
             print_info_line(style(configured_client_lazy_tool_text(client)).dim());
+        }
+        if let Some(unlinked) = unlinked_clients_text(&clients) {
+            println!();
+            print_label_value("Not linked", style(unlinked).dim());
         }
 
         if !interactive {
@@ -415,9 +506,10 @@ pub(crate) async fn cmd_client_list(
 #[cfg(test)]
 mod tests {
     use super::{
-        client_list_json, configured_client_lazy_tool_text, configured_client_link_text,
-        configured_client_state_text, live_inventory_scope_label, live_inventory_scope_text,
-        live_inventory_summary,
+        LiveSessionGroup, client_list_json, configured_client_lazy_tool_text,
+        configured_client_link_text, configured_client_state_text, live_inventory_scope_label,
+        live_inventory_scope_text, live_inventory_summary, live_session_groups,
+        unlinked_clients_text,
     };
     use crate::commands::clients::{ClientView, LiveSessionView};
     use crate::runtime::{
@@ -547,7 +639,7 @@ mod tests {
         };
         assert_eq!(
             configured_client_state_text(&client),
-            "detected, live via daemon_proxy (2)"
+            "detected, 2 live sessions (local)"
         );
     }
 
@@ -614,5 +706,83 @@ mod tests {
             live_inventory_summary(&inventory),
             "daemon-proxy-only (missing: http)"
         );
+    }
+
+    fn session(client_type: &str, transport: &str, connected_secs: u64) -> LiveSessionView {
+        LiveSessionView {
+            session_id: format!("{client_type}-{connected_secs}"),
+            client_type: client_type.to_string(),
+            transport: transport.to_string(),
+            client_id: None,
+            client_info: None,
+            connected_secs,
+            last_activity_secs: None,
+        }
+    }
+
+    fn client(name: &str, linked: bool, detected: bool, live: bool) -> ClientView {
+        ClientView {
+            name: name.to_string(),
+            target: name.to_lowercase(),
+            linked,
+            linked_transport: None,
+            linked_endpoint: None,
+            detected,
+            live,
+            live_sessions: usize::from(live),
+            live_transports: Vec::new(),
+            lazy_tool_mode: "native".to_string(),
+            lazy_tool_mode_origin: "auto_default".to_string(),
+            lazy_tool_mode_reason: String::new(),
+        }
+    }
+
+    #[test]
+    fn live_sessions_group_by_client_busiest_first() {
+        let sessions = vec![
+            session("Claude Code", "daemon_proxy", 60),
+            session("Codex CLI", "daemon_proxy", 30),
+            session("Codex CLI", "daemon_proxy", 7_200),
+            session("Codex CLI", "http", 10),
+            session("Cursor", "http", 5),
+        ];
+        assert_eq!(
+            live_session_groups(&sessions),
+            vec![
+                LiveSessionGroup {
+                    client: "Codex CLI",
+                    sessions: 3,
+                    transports: vec!["local", "http"],
+                    longest_connected_secs: 7_200,
+                },
+                LiveSessionGroup {
+                    client: "Claude Code",
+                    sessions: 1,
+                    transports: vec!["local"],
+                    longest_connected_secs: 60,
+                },
+                LiveSessionGroup {
+                    client: "Cursor",
+                    sessions: 1,
+                    transports: vec!["http"],
+                    longest_connected_secs: 5,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn unlinked_clients_collapse_into_one_line() {
+        let clients = vec![
+            client("Claude Code", true, true, true),
+            client("Claude Desktop", false, true, false),
+            client("Goose", false, false, true),
+            client("Zed", false, false, false),
+        ];
+        assert_eq!(
+            unlinked_clients_text(&clients).as_deref(),
+            Some("Claude Desktop (detected), Goose (live), Zed")
+        );
+        assert_eq!(unlinked_clients_text(&clients[..1]), None);
     }
 }

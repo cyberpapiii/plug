@@ -186,13 +186,10 @@ pub(crate) async fn cmd_server_list(
                             let transport = summarize_server_transport(server_cfg);
                             let auth = summarize_server_auth(server_cfg);
                             let target = summarize_server_target(server_cfg, 28);
-                            let protocol = match (
+                            let protocol = protocol_label(
                                 s.selected_protocol_era,
                                 s.selected_protocol_version.as_deref(),
-                            ) {
-                                (Some(era), Some(version)) => format!("{era:?} {version}"),
-                                _ => "not connected".to_string(),
-                            };
+                            );
                             println!(
                                 "  {} {:<18} {:<12} {:<8} {:<6} {:<28} ({} tools; {})",
                                 status_marker(&s.health),
@@ -202,7 +199,7 @@ pub(crate) async fn cmd_server_list(
                                 auth,
                                 target,
                                 s.tool_count,
-                                protocol.to_ascii_lowercase()
+                                protocol
                             );
                             print_reason(s);
                         }
@@ -362,4 +359,35 @@ pub(crate) async fn cmd_server_list(
         started = false;
     }
     Ok(())
+}
+
+/// The MCP version a server negotiated. The 2025 era is the normal state, so
+/// only the newer stateless era earns a word in front of the version.
+fn protocol_label(era: Option<plug_core::protocol::ProtocolEra>, version: Option<&str>) -> String {
+    match (era, version) {
+        (Some(plug_core::protocol::ProtocolEra::Modern), Some(version)) => {
+            format!("modern {version}")
+        }
+        (Some(plug_core::protocol::ProtocolEra::Legacy), Some(version)) => version.to_string(),
+        _ => "not connected".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::protocol_label;
+    use plug_core::protocol::ProtocolEra;
+
+    #[test]
+    fn protocol_label_names_only_the_modern_era() {
+        assert_eq!(
+            protocol_label(Some(ProtocolEra::Legacy), Some("2025-11-25")),
+            "2025-11-25"
+        );
+        assert_eq!(
+            protocol_label(Some(ProtocolEra::Modern), Some("2026-07-28")),
+            "modern 2026-07-28"
+        );
+        assert_eq!(protocol_label(None, None), "not connected");
+    }
 }
