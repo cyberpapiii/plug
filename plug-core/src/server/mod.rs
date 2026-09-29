@@ -337,8 +337,10 @@ pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
 /// Where the PATH handed to stdio servers came from, for error messages.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StdioPathSource {
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     LoginShell,
     /// The login-shell probe failed; see [`fallback_stdio_path`].
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Fallback,
     /// Not macOS: the daemon's own PATH.
     #[cfg_attr(target_os = "macos", allow(dead_code))]
