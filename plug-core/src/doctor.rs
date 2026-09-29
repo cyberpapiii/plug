@@ -308,7 +308,7 @@ async fn check_port_available(config: &Config) -> CheckResult {
                     status: CheckStatus::Fail,
                     message: format!("Port {} is not available: {e}", config.http.port),
                     fix_suggestion: Some(format!(
-                        "Stop the process using port {} (for example a standalone `plug serve`) or change http.port in config",
+                        "Stop the other program using port {} or change http.port in config",
                         config.http.port
                     )),
                 }
@@ -962,18 +962,43 @@ async fn check_http_auth(config: &Config) -> CheckResult {
             },
             fix_suggestion: None,
         },
-        crate::config::DownstreamAuthMode::Oauth => CheckResult {
-            name,
-            status: CheckStatus::Warn,
-            message: "HTTP auth mode is oauth (metadata and token routes are configured, but doctor does not verify external endpoint reachability or public URL correctness)".to_string(),
-            fix_suggestion: Some(
-                "Verify the configured public URL externally, including /.well-known/mcp.json and OAuth endpoints"
-                    .to_string(),
-            ),
-        },
+        crate::config::DownstreamAuthMode::Oauth => {
+            let Some(base_url) = config.http.public_base_url.as_deref() else {
+                return CheckResult {
+                    name,
+                    status: CheckStatus::Warn,
+                    message: "HTTP auth mode is oauth but http.public_base_url is not set, so remote clients cannot discover the OAuth endpoints".to_string(),
+                    fix_suggestion: Some(
+                        "Set http.public_base_url to the HTTPS address remote clients use".to_string(),
+                    ),
+                };
+            };
+            match check_oauth_metadata_reachable(base_url).await {
+                Ok(()) => CheckResult {
+                    name,
+                    status: CheckStatus::Pass,
+                    message: format!("HTTP auth mode is oauth; {base_url} serves OAuth metadata"),
+                    fix_suggestion: None,
+                },
+                Err(error) => CheckResult {
+                    name,
+                    status: CheckStatus::Warn,
+                    message: format!(
+                        "HTTP auth mode is oauth, but {base_url} did not serve OAuth metadata: {error}"
+                    ),
+                    fix_suggestion: Some(format!(
+                        "Check that the tunnel or proxy in front of {base_url} is running and forwards to port {}",
+                        config.http.port
+                    )),
+                },
+            }
+        }
         crate::config::DownstreamAuthMode::Auto | crate::config::DownstreamAuthMode::Bearer => {
-            let requires_token = matches!(config.http.auth_mode, crate::config::DownstreamAuthMode::Bearer)
-                || !crate::config::http_bind_is_loopback(&config.http.bind_address);
+            let requires_token =
+                matches!(
+                    config.http.auth_mode,
+                    crate::config::DownstreamAuthMode::Bearer
+                ) || !crate::config::http_bind_is_loopback(&config.http.bind_address);
 
             if !requires_token {
                 return CheckResult {
@@ -992,17 +1017,17 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                     status: CheckStatus::Warn,
                     message: match config.http.auth_mode {
                         crate::config::DownstreamAuthMode::Bearer => format!(
-                            "HTTP auth mode is bearer but auth token is not yet generated — run `plug serve` to initialize ({})",
+                            "HTTP auth mode is bearer but the auth token has not been generated yet ({})",
                             token_path.display()
                         ),
                         crate::config::DownstreamAuthMode::Auto => format!(
-                            "HTTP auth in auto mode resolves to bearer for bind {} but auth token is not yet generated — run `plug serve` to initialize",
+                            "HTTP auth in auto mode resolves to bearer for bind {} but the auth token has not been generated yet",
                             config.http.bind_address
                         ),
                         _ => unreachable!("requires_token only applies to auto/bearer"),
                     },
                     fix_suggestion: Some(
-                        "Run `plug serve` to auto-generate an auth token, or change http.auth_mode for your deployment".to_string(),
+                        "Start Plug (open Plug.app, or run `plug start`) and it generates the token, or change http.auth_mode for your deployment".to_string(),
                     ),
                 };
             }
@@ -1021,7 +1046,10 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                                 mode,
                                 token_path.display()
                             ),
-                            fix_suggestion: Some(format!("Run: chmod 600 {}", token_path.display())),
+                            fix_suggestion: Some(format!(
+                                "Run: chmod 600 {}",
+                                token_path.display()
+                            )),
                         };
                     }
                 }
@@ -1045,6 +1073,45 @@ async fn check_http_auth(config: &Config) -> CheckResult {
             }
         }
     }
+}
+
+/// Fetch the public OAuth authorization-server metadata the way a remote
+/// client discovers it, so a stopped tunnel or a wrong public URL shows up
+/// here instead of as a failed sign-in in some other app.
+async fn check_oauth_metadata_reachable(base_url: &str) -> Result<(), String> {
+    let url = format!(
+        "{}/.well-known/oauth-authorization-server",
+        base_url.trim_end_matches('/')
+    );
+    crate::tls::ensure_rustls_provider_installed();
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .map_err(|error| error.to_string())?;
+    let response = client.get(&url).send().await.map_err(|error| {
+        if error.is_timeout() {
+            "request timed out (5s)".to_string()
+        } else {
+            // reqwest's Display repeats the URL, which the message already names.
+            error.without_url().to_string()
+        }
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        return Err(format!("HTTP {status}"));
+    }
+    let metadata = response
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|_| "the response was not OAuth metadata JSON".to_string())?;
+    if metadata
+        .get("issuer")
+        .and_then(|issuer| issuer.as_str())
+        .is_none()
+    {
+        return Err("the response has no issuer".to_string());
+    }
+    Ok(())
 }
 
 /// Check OAuth config fields are coherent.
@@ -1484,21 +1551,71 @@ command = "example-server"
         assert!(result.message.contains("auth mode is bearer"));
     }
 
-    #[tokio::test]
-    async fn http_auth_oauth_warns_for_unverified_external_surface() {
+    async fn serve_oauth_metadata(body: &'static str) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind metadata listener");
+        let address = listener.local_addr().expect("metadata listener address");
+        let router = axum::Router::new().route(
+            "/.well-known/oauth-authorization-server",
+            axum::routing::get(move || async move {
+                (
+                    [(axum::http::header::CONTENT_TYPE, "application/json")],
+                    body,
+                )
+            }),
+        );
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, router).await;
+        });
+        format!("http://{address}")
+    }
+
+    fn oauth_config(public_base_url: Option<String>) -> Config {
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
-        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.public_base_url = public_base_url;
         config.http.oauth_scopes = Some(vec!["tools:read".to_string()]);
         config.http.port = 62003;
+        config
+    }
 
-        let result = check_http_auth(&config).await;
+    #[tokio::test]
+    async fn http_auth_oauth_passes_when_the_public_url_serves_metadata() {
+        let base_url = serve_oauth_metadata(r#"{"issuer":"https://plug.example.com"}"#).await;
+        let result = check_http_auth(&oauth_config(Some(base_url))).await;
+        assert_eq!(result.status, CheckStatus::Pass, "{}", result.message);
+        assert!(result.fix_suggestion.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_auth_oauth_warns_when_the_public_url_serves_something_else() {
+        let base_url = serve_oauth_metadata(r#"{"hello":"world"}"#).await;
+        let result = check_http_auth(&oauth_config(Some(base_url))).await;
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("no issuer"), "{}", result.message);
+    }
+
+    #[tokio::test]
+    async fn http_auth_oauth_warns_when_the_public_url_is_unreachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("reserve port");
+        let address = listener.local_addr().expect("reserved address");
+        drop(listener);
+        let result = check_http_auth(&oauth_config(Some(format!("http://{address}")))).await;
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(
-            result
-                .message
-                .contains("does not verify external endpoint reachability")
+            result.message.contains("did not serve OAuth metadata"),
+            "{}",
+            result.message
         );
+        assert!(result.fix_suggestion.is_some());
+    }
+
+    #[tokio::test]
+    async fn http_auth_oauth_warns_without_a_public_url() {
+        let result = check_http_auth(&oauth_config(None)).await;
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert!(result.message.contains("public_base_url"));
     }
 
     #[tokio::test]
