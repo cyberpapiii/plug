@@ -111,14 +111,21 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     }
 
     /// The one button that fixes this server, or nil when nothing needs
-    /// fixing or a sign-in is already open in the browser. Every surface that
-    /// offers a fix asks this, so the verb never differs between them.
+    /// fixing. Every surface that offers a fix asks this, so the verb never
+    /// differs between them. A sign-in already open offers Try Again, because
+    /// a closed browser tab otherwise leaves nothing to press until the
+    /// command gives up minutes later.
     var fix: Verdict.Button? {
         switch health {
-        case .signInNeeded: isSigningIn ? nil : .init("Sign In", .signIn(server: name))
+        case .signInNeeded: .init(isSigningIn ? "Try Again" : "Sign In", .signIn(server: name))
         case .down, .unknown: .init("Restart", .restartServer(name))
         case .working, .starting, .off: nil
         }
+    }
+
+    /// Stops a sign-in that is open in the browser.
+    var cancelSignIn: Verdict.Button? {
+        isSigningIn ? .init("Cancel", .cancelSignIn(server: name)) : nil
     }
 
     var toolCountText: String {
@@ -200,6 +207,7 @@ enum PlugIntent: Equatable, Sendable {
     case showRepairLog
     case reconnect
     case signIn(server: String)
+    case cancelSignIn(server: String)
     case restartServer(String)
     case setServerEnabled(String, Bool)
     case editServer(String)
@@ -222,6 +230,8 @@ enum PlugIntent: Equatable, Sendable {
     /// Forget a server's stored account.
     case signOut(server: String)
     case openLogs
+    /// Hide the message about a press that failed.
+    case dismissActionError
     case quit
 }
 
@@ -393,7 +403,8 @@ enum PlugVerdict {
                     detail: only.isSigningIn
                         ? "Sign-in is open in the browser."
                         : "All other servers are running.",
-                    primary: only.fix
+                    primary: only.fix,
+                    secondary: only.cancelSignIn
                 )
             default:
                 return Verdict(

@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        NotificationService.shared.install()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
@@ -42,6 +43,7 @@ struct PlugApplication: App {
                 .accessibilityLabel("Plug: \(model.verdict.title)")
                 .task {
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
+                    NotificationService.shared.perform = { runner.run($0) }
                     await model.start()
                 }
         }

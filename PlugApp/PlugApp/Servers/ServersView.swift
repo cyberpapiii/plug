@@ -168,6 +168,10 @@ private struct ServerListRow: View {
             }
             Spacer(minLength: Metric.tight)
             if let fix = server.fix {
+                if let cancel = server.cancelSignIn {
+                    Button(cancel.title) { run(cancel.intent) }
+                        .controlSize(.small)
+                }
                 Button(fix.title) { run(fix.intent) }
                     .controlSize(.small)
             } else if server.health == .working {

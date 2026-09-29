@@ -48,6 +48,19 @@ struct PlugPopover: View {
     private var header: some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
             VerdictView(verdict: model.verdict, style: .hero, run: send)
+            if let error = model.actionError {
+                HStack(alignment: .firstTextBaseline, spacing: Metric.tight) {
+                    Label(error.message, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.red)
+                        .lineLimit(3)
+                    Spacer(minLength: 0)
+                    Button("Dismiss") { send(.dismissActionError) }
+                        .buttonStyle(.link)
+                        .font(.caption)
+                }
+                .accessibilityElement(children: .contain)
+            }
             if let progress = settlingProgress {
                 ProgressView(value: progress)
                     .progressViewStyle(.linear)
@@ -244,8 +257,13 @@ private struct PanelServerRow: View {
 
     @ViewBuilder private var trailing: some View {
         if server.health.needsAttention {
-            if server.isSigningIn {
-                ProgressView().controlSize(.mini)
+            if let cancel = server.cancelSignIn {
+                HStack(spacing: Metric.tight) {
+                    ProgressView().controlSize(.mini)
+                    Button(cancel.title) { run(cancel.intent) }
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                }
             } else if let fix = server.fix {
                 Button(fix.title) { run(fix.intent) }
                     .buttonStyle(.bordered)
