@@ -2267,7 +2267,7 @@ pub fn setup_file_logging(
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     ensure_dir(log_directory)?;
 
-    let file_appender = tracing_appender::rolling::daily(log_directory, "plug.log");
+    let file_appender = daily_log_appender(log_directory)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
@@ -2280,6 +2280,22 @@ pub fn setup_file_logging(
         .init();
 
     Ok(guard)
+}
+
+/// Daily log files kept, today's included. At about a megabyte a day this is
+/// two weeks of history for `scripts/perf.sh` and post-mortems.
+const LOG_FILES_KEPT: usize = 14;
+
+/// `plug.log.YYYY-MM-DD`, one file a day, pruning past [`LOG_FILES_KEPT`] when
+/// the daemon starts and at each rollover.
+fn daily_log_appender(
+    log_directory: &std::path::Path,
+) -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
+    Ok(tracing_appender::rolling::RollingFileAppender::builder()
+        .rotation(tracing_appender::rolling::Rotation::DAILY)
+        .filename_prefix("plug.log")
+        .max_log_files(LOG_FILES_KEPT)
+        .build(log_directory)?)
 }
 
 // ──────────────────────── Client helpers ──────────────────────────────────────
@@ -2458,6 +2474,46 @@ mod tests {
         if let Some(dir) = config_path.parent() {
             let _ = std::fs::remove_dir_all(dir);
         }
+    }
+
+    /// Daily logs used to be kept forever. Pruning must keep the file names
+    /// `scripts/perf.sh` globs and leave other files in the directory alone.
+    #[test]
+    fn daily_log_appender_prunes_old_logs_and_keeps_names() {
+        let dir = std::env::temp_dir().join(format!(
+            "plug-log-retention-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old: Vec<String> = (1..=20)
+            .map(|day| format!("plug.log.2000-01-{day:02}"))
+            .collect();
+        for name in &old {
+            std::fs::write(dir.join(name), "").unwrap();
+        }
+        std::fs::write(dir.join("installation-reconciliation.log"), "").unwrap();
+
+        drop(daily_log_appender(&dir).unwrap());
+
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        let _ = std::fs::remove_dir_all(&dir);
+        let logs: Vec<&String> = names
+            .iter()
+            .filter(|name| name.starts_with("plug.log."))
+            .collect();
+        assert_eq!(logs.len(), LOG_FILES_KEPT, "{names:?}");
+        let today: Vec<&&String> = logs.iter().filter(|name| !old.contains(name)).collect();
+        assert_eq!(today.len(), 1, "{names:?}");
+        let date = today[0].strip_prefix("plug.log.").unwrap();
+        assert!(
+            date.len() == 10 && date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-',
+            "today's log must be plug.log.YYYY-MM-DD, got {}",
+            today[0]
+        );
+        assert!(names.contains(&"installation-reconciliation.log".to_string()));
     }
 
     #[test]
