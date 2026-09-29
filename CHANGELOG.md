@@ -50,6 +50,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   stopped after ten seconds. Settings → Restart shows "Restarting…" and a
   Start Plug pressed meanwhile waits for it instead of starting a second
   swap. A stopped Plug no longer flickers to "Starting…" on every poll.
+- A failed upstream connection is logged once instead of three times. The
+  daemon log no longer repeats RMCP's "worker quit with fatal" line or a
+  second "server initialization failed" line beside Plug's own. The warning
+  that `max_concurrent > 1` is unsafe for stdio servers is gone, since it was
+  wrong and fired on every config load. Commands like `plug doctor` and
+  `plug config check` no longer print log warnings above their output.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

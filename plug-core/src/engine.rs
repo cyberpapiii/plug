@@ -612,7 +612,10 @@ impl Engine {
                     }
                 }
             }
-            Err(e) => Err(e),
+            Err(e) => {
+                tracing::warn!(server = %server_id, error = %e, "restart failed");
+                Err(e)
+            }
         }
     }
 

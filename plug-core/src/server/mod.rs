@@ -1742,21 +1742,14 @@ impl ServerManager {
         })
         .await;
 
-        match result {
-            Ok(Ok(server)) => Ok(server),
-            Ok(Err(e)) => {
-                tracing::error!(server = %name, error = %e, "server initialization failed");
-                Err(e)
-            }
-            Err(_) => {
-                let msg = format!(
-                    "server '{}' timed out after {}s during startup",
-                    name, config.timeout_secs
-                );
-                tracing::error!("{}", msg);
-                Err(anyhow::anyhow!(msg))
-            }
-        }
+        // Not logged here: every caller logs a failure once, with the server
+        // name and what it will do next, or returns it to the operator.
+        result.unwrap_or_else(|_| {
+            Err(anyhow::anyhow!(
+                "server '{name}' timed out after {}s during startup",
+                config.timeout_secs
+            ))
+        })
     }
 
     /// Connect to a legacy SSE upstream server.
