@@ -29,11 +29,13 @@ final class AppModel {
     struct ServerPresentation: Identifiable, Equatable {
         let configured: ConfiguredServer
         let runtime: ServerStatus?
+        var daemonUptimeSecs: UInt64 = 0
         var id: String { configured.name }
         var health: ServerHealth {
             ServerHealth(
                 daemonValue: configured.enabled ? runtime?.health : "Disabled",
-                enabled: configured.enabled
+                enabled: configured.enabled,
+                daemonUptimeSecs: daemonUptimeSecs
             )
         }
         var toolCount: Int { runtime?.toolCount ?? 0 }
@@ -163,10 +165,23 @@ final class AppModel {
     /// the pre-repair situation.
     private var installationState: InstallationState { coordinator.state }
 
+    /// The installation is being looked at, not changed, so reading the
+    /// daemon alongside is safe.
+    private var isOnlyInspecting: Bool {
+        if case .reconcilingUpdate(.inspecting) = installationState { return true }
+        return false
+    }
+
+    private var readsAllowed: Bool { !reconciliationInFlight || isOnlyInspecting }
+
     var visibleServers: [ServerPresentation] {
         let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
         return Self.displayOrder(snapshot.configuredServers.map {
-            ServerPresentation(configured: $0, runtime: runtimeByName[$0.name])
+            ServerPresentation(
+                configured: $0,
+                runtime: runtimeByName[$0.name],
+                daemonUptimeSecs: snapshot.uptimeSecs
+            )
         })
     }
 
@@ -252,6 +267,12 @@ final class AppModel {
 
     var menuBarSymbol: String { PlugVerdict.menuBarSymbol(for: verdict) }
 
+    /// The version About shows: the daemon's once it has answered, the app's
+    /// own before that. The two match except in the middle of an update.
+    var displayVersion: String {
+        snapshot.runtimeVersion.isEmpty ? clientVersion : snapshot.runtimeVersion
+    }
+
     var isLoadingInitialData: Bool {
         !hasLoadedSnapshot && connectionState == .connecting
     }
@@ -278,7 +299,14 @@ final class AppModel {
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
-        await reconcile(trigger: .applicationLaunch)
+        // Every launch opens with a pass that only reads the installation,
+        // and the daemon is nearly always already running. Waiting for the
+        // pass before asking the daemon anything kept a healthy Plug on
+        // "Starting…" for seconds.
+        let readsDuringLaunch = isOnlyInspecting
+        let launch = Task { await reconcile(trigger: .applicationLaunch) }
+        if readsDuringLaunch { await refresh() }
+        await launch.value
         guard !Task.isCancelled else { return }
         await refresh()
         guard !Task.isCancelled else { return }
@@ -356,7 +384,7 @@ final class AppModel {
     /// running waits for one more read that starts after it, because the caller
     /// usually just changed something and the read in flight may predate it.
     func refresh(forceCatalog: Bool = false) async {
-        guard !reconciliationInFlight else { return }
+        guard readsAllowed else { return }
         if let refreshTask {
             refreshRequestedAgain = true
             refreshAgainForcesCatalog = refreshAgainForcesCatalog || forceCatalog
@@ -371,7 +399,7 @@ final class AppModel {
                 await readDaemonState(forceCatalog: force)
                 force = refreshAgainForcesCatalog
                 refreshAgainForcesCatalog = false
-            } while refreshRequestedAgain && !reconciliationInFlight
+            } while refreshRequestedAgain && readsAllowed
             refreshRequestedAgain = false
             // Cleared here rather than by the caller, in the same turn that
             // ends the loop, so no request can land between the last read and
@@ -436,7 +464,9 @@ final class AppModel {
         guard handshake.daemonVersion == clientVersion else {
             connectionState = .incompatible
             connectionError = nil
-            if !attemptedSkewRecovery {
+            // During a launch pass the pass itself settles the version, and
+            // a retry asked for now would be swallowed by it.
+            if !attemptedSkewRecovery, !reconciliationInFlight {
                 attemptedSkewRecovery = true
                 await retry()
             }

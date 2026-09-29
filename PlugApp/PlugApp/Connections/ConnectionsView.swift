@@ -300,6 +300,14 @@ private struct AppLinkRow: View {
         .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(app.name), \(status)")
+        // Combining the row hides its switch from VoiceOver.
+        .accessibilityActions {
+            if !isBusy, app.detected || app.linked {
+                Button(app.linked ? "Stop Using Plug" : "Use Plug") {
+                    run(app.linked ? .unlinkApp(app.target) : .linkApp(app.target))
+                }
+            }
+        }
     }
 
     /// The state as a glyph, so linked and not-linked are told apart before

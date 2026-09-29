@@ -93,6 +93,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   time. In an hour of a missing command, start attempts drop from 312 to about
   60 and log lines from 312 to 3, and recovery logs one line saying how many
   attempts it took.
+- Plug.app polish. It shows the running daemon about four seconds sooner
+  at launch. The menu bar panel dims its server rows and says "Last known"
+  when they are stale. A server the daemon has not loaded a minute after it
+  started reads "Not loaded" with a Reload button, not "Starting" forever.
+  Only starting servers pulse. VoiceOver can reach the fix buttons in panel
+  rows and the Use Plug switch in Connections. About shows the app's version
+  when the daemon is not answering.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling
