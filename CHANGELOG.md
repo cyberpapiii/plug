@@ -65,6 +65,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   that `max_concurrent > 1` is unsafe for stdio servers is gone, since it was
   wrong and fired on every config load. Commands like `plug doctor` and
   `plug config check` no longer print log warnings above their output.
+- A failed button press in Plug.app stays on screen until you dismiss it or
+  eight seconds pass, in the menu bar panel, the window, and under the
+  Settings buttons. It used to vanish at the next poll and showed only while
+  every server was healthy. A sign-in in progress offers Try Again and
+  Cancel, and both stop the waiting `plug auth login`. Clicking a "needs
+  sign-in" notification opens that server, and its Sign In button starts the
+  sign-in.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

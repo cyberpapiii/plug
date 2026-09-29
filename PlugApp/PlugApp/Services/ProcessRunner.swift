@@ -30,19 +30,21 @@ protocol ProcessRunning: Sendable {
     func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult
 }
 
+/// Cancelling the calling task stops the child's whole process group, the
+/// same way a timeout does, and the call throws `CancellationError`.
 struct ProcessRunner: ProcessRunning {
     func run(
         executable: URL,
         arguments: [String],
         timeout: Duration
     ) async throws -> ProcessResult {
-        try await withCheckedThrowingContinuation { continuation in
-            let execution = ProcessExecution(
-                executable: executable,
-                arguments: arguments,
-                continuation: continuation
-            )
-            execution.start(timeout: timeout)
+        let execution = ProcessExecution(executable: executable, arguments: arguments)
+        return try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                execution.start(timeout: timeout, continuation: continuation)
+            }
+        } onCancel: {
+            execution.cancel()
         }
     }
 }
@@ -59,24 +61,35 @@ private final class ProcessExecution: @unchecked Sendable {
     private var stderr: Data?
     private var status: Int32?
     private var timedOut = false
+    private var cancelled = false
 
-    init(
-        executable: URL,
-        arguments: [String],
-        continuation: CheckedContinuation<ProcessResult, Error>
-    ) {
+    init(executable: URL, arguments: [String]) {
         self.executable = executable
         self.arguments = arguments
-        self.continuation = continuation
     }
 
-    func start(timeout: Duration) {
+    func start(timeout: Duration, continuation: CheckedContinuation<ProcessResult, Error>) {
+        lock.lock()
+        self.continuation = continuation
+        let cancelledBeforeStart = cancelled
+        lock.unlock()
+        guard !cancelledBeforeStart else {
+            finishImmediately(throwing: CancellationError())
+            return
+        }
+
+        let group: pid_t
         do {
-            processGroup = try spawnInIsolatedProcessGroup()
+            group = try spawnInIsolatedProcessGroup()
         } catch {
             finishImmediately(throwing: error)
             return
         }
+        lock.lock()
+        processGroup = group
+        // A cancel that landed during the spawn found no group to stop.
+        let cancelledDuringSpawn = cancelled
+        lock.unlock()
 
         DispatchQueue.global(qos: .utility).async { [self] in
             record(stdout: output.fileHandleForReading.readDataToEndOfFile())
@@ -85,14 +98,22 @@ private final class ProcessExecution: @unchecked Sendable {
             record(stderr: error.fileHandleForReading.readDataToEndOfFile())
         }
         DispatchQueue.global(qos: .utility).async { [self] in
-            guard let processGroup else { return }
-            record(status: waitForExit(of: processGroup))
+            record(status: waitForExit(of: group))
         }
 
+        if cancelledDuringSpawn { terminate(group) }
         Task.detached { [weak self] in
             try? await Task.sleep(for: timeout)
             self?.expire()
         }
+    }
+
+    func cancel() {
+        lock.lock()
+        cancelled = true
+        let group = continuation != nil ? processGroup : nil
+        lock.unlock()
+        if let group { terminate(group) }
     }
 
     private func expire() {
@@ -103,6 +124,10 @@ private final class ProcessExecution: @unchecked Sendable {
         }
         timedOut = true
         lock.unlock()
+        terminate(processGroup)
+    }
+
+    private func terminate(_ processGroup: pid_t) {
         _ = Darwin.kill(-processGroup, SIGTERM)
         Task.detached { [weak self] in
             try? await Task.sleep(for: .milliseconds(250))
@@ -207,6 +232,9 @@ private final class ProcessExecution: @unchecked Sendable {
     private func takeCompletionIfReady() -> Completion? {
         guard let continuation, let stdout, let stderr, let status else { return nil }
         self.continuation = nil
+        if cancelled {
+            return Completion(continuation: continuation, result: .failure(CancellationError()))
+        }
         if timedOut {
             return Completion(continuation: continuation, result: .failure(ProcessRunnerError.timedOut))
         }

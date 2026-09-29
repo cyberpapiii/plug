@@ -80,8 +80,11 @@ struct RootView: View {
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
         .overlay(alignment: .bottom) {
-            if let error = model.lastError, model.verdict.tone == .good {
-                ErrorToast(message: error)
+            // Any verdict: a press that failed while Plug is unwell still
+            // deserves its own sentence, and the verdict never says it.
+            if let error = model.actionError {
+                ErrorToast(message: error.message) { run(.dismissActionError) }
+                    .id(error.id)
                     .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
             }
         }

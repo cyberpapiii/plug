@@ -151,6 +151,21 @@ private struct ServiceSettings: View {
                     Spacer()
                 }
                 .listRowSeparator(.hidden)
+
+                // Right under the buttons, because this window is where the
+                // press happened and the main window may not be open at all.
+                if let error = model.actionError {
+                    HStack(alignment: .firstTextBaseline) {
+                        Label(error.message, systemImage: "exclamationmark.triangle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.red)
+                        Spacer()
+                        Button("Dismiss") { run(.dismissActionError) }
+                            .buttonStyle(.link)
+                            .font(.caption)
+                    }
+                    .listRowSeparator(.hidden)
+                }
             } footer: {
                 Text("Restarting reconnects every server. Connected apps pick Plug back up on their own.")
                     .font(.caption)

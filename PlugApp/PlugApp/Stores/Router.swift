@@ -47,6 +47,8 @@ struct PlugIntentRunner {
             Task { await model.retryConnection() }
         case let .signIn(server):
             Task { await model.signIn(server: server) }
+        case let .cancelSignIn(server):
+            model.cancelSignIn(server: server)
         case let .restartServer(name):
             perform { .restartServer(authToken: $0, serverID: name) }
         case let .setServerEnabled(name, enabled):
@@ -94,6 +96,8 @@ struct PlugIntentRunner {
             NSWorkspace.shared.open(
                 URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory)
             )
+        case .dismissActionError:
+            model.dismissActionError()
         case .quit:
             NSApp.terminate(nil)
         }

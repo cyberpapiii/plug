@@ -65,8 +65,18 @@ final class AppModel {
     /// 200 events is not proof that a 201st event exists.
     private(set) var activityWasTruncated = false
     var activityIsCapped: Bool { activityWasTruncated }
-    private(set) var lastError: String?
+    /// Why the last read of the daemon failed. Polling owns this: the next
+    /// good read clears it, and the verdict already says Plug is unreachable.
+    private(set) var connectionError: String?
+    /// A button press that failed. Kept apart from `connectionError` because a
+    /// poll that succeeds says nothing about the press, and clearing one with
+    /// the other used to wipe the message before anyone could read it.
+    private(set) var actionError: ActionError?
+    private var actionErrorExpiry: Task<Void, Never>?
     private(set) var signingInServers: Set<String> = []
+    /// The running `plug auth login` per server, so Cancel and Try Again can
+    /// stop it instead of leaving it waiting on the browser.
+    private var signInTasks: [String: Task<Void, Never>] = [:]
     private(set) var toolCatalog = ToolCatalog()
     private(set) var connectableApps: [LinkableApp] = []
     private(set) var hasLoadedConnectableApps = false
@@ -97,9 +107,12 @@ final class AppModel {
     static let backgroundPollInterval = Duration.seconds(30)
     static let reconnectPollInterval = Duration.seconds(1)
     static let reconnectGrace = Duration.seconds(10)
+    static let actionErrorLifetime = Duration.seconds(8)
     private let foregroundPollInterval: Duration
     private let backgroundPollInterval: Duration
     private let reconnectGrace: Duration
+    private let actionErrorLifetime: Duration
+    private let authFlow: AuthFlowService
     /// When a working connection first failed, while it is `reconnecting`.
     private var connectionLostAt: ContinuousClock.Instant?
 
@@ -128,7 +141,9 @@ final class AppModel {
         appLinker: any AppLinking = AppLinkService(),
         foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
         backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
-        reconnectGrace: Duration = AppModel.reconnectGrace
+        reconnectGrace: Duration = AppModel.reconnectGrace,
+        actionErrorLifetime: Duration = AppModel.actionErrorLifetime,
+        authFlow: AuthFlowService = AuthFlowService()
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
@@ -138,6 +153,8 @@ final class AppModel {
         self.foregroundPollInterval = foregroundPollInterval
         self.backgroundPollInterval = backgroundPollInterval
         self.reconnectGrace = reconnectGrace
+        self.actionErrorLifetime = actionErrorLifetime
+        self.authFlow = authFlow
     }
 
     /// Read live rather than mirrored. A copy refreshed only when a
@@ -321,7 +338,7 @@ final class AppModel {
             do {
                 try await coordinator.restartService()
             } catch {
-                self?.lastError = error.localizedDescription
+                self?.reportActionError(error)
                 await coordinator.retry()
             }
         }
@@ -389,7 +406,7 @@ final class AppModel {
     /// A drop from a working connection reads as reconnecting, and polls
     /// briskly, until it outlasts the grace. Only then is Plug stopped.
     private func connectionLost(_ error: any Error) {
-        lastError = error.localizedDescription
+        connectionError = error.localizedDescription
         guard connectionState == .ready || connectionState == .reconnecting else {
             connectionState = .disconnected
             return
@@ -413,12 +430,12 @@ final class AppModel {
         capabilities = Set(handshake.capabilities)
         guard handshake.sharesSupportedIPCVersion else {
             connectionState = .incompatible
-            lastError = nil
+            connectionError = nil
             return
         }
         guard handshake.daemonVersion == clientVersion else {
             connectionState = .incompatible
-            lastError = nil
+            connectionError = nil
             if !attemptedSkewRecovery {
                 attemptedSkewRecovery = true
                 await retry()
@@ -468,7 +485,7 @@ final class AppModel {
             toolCatalogRevision = revision
         }
         connectionState = .ready
-        lastError = nil
+        connectionError = nil
     }
 
     func performOperation(_ request: (String) -> IPCRequest) async throws {
@@ -476,7 +493,6 @@ final class AppModel {
         let token = try String(contentsOf: tokenURL, encoding: .utf8)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         _ = try await ipc.request(request(token))
-        lastError = nil
         // No forced tool list. Every change an operation can make to it, a
         // switched tool or a rebuilt catalog, moves the snapshot's
         // `tool_catalog_revision`, and the refresh refetches on that alone.
@@ -486,7 +502,26 @@ final class AppModel {
     func perform(_ request: (String) -> IPCRequest) async {
         do {
             try await performOperation(request)
-        } catch { lastError = error.localizedDescription }
+        } catch { reportActionError(error) }
+    }
+
+    /// Shows a failed press until it is dismissed or `actionErrorLifetime`
+    /// passes, whichever comes first. A newer failure replaces it.
+    private func reportActionError(_ error: any Error) {
+        let shown = ActionError(message: error.localizedDescription)
+        actionError = shown
+        actionErrorExpiry?.cancel()
+        actionErrorExpiry = Task { [weak self, actionErrorLifetime] in
+            try? await Task.sleep(for: actionErrorLifetime)
+            guard !Task.isCancelled, self?.actionError?.id == shown.id else { return }
+            self?.actionError = nil
+        }
+    }
+
+    func dismissActionError() {
+        actionErrorExpiry?.cancel()
+        actionErrorExpiry = nil
+        actionError = nil
     }
 
     /// Tools of one server, for its detail view.
@@ -540,25 +575,52 @@ final class AppModel {
             }
             await loadConnectableApps()
             await refresh()
-        } catch { lastError = error.localizedDescription }
+        } catch { reportActionError(error) }
     }
 
     /// Forgets a server's stored account. The button that starts this is behind
     /// a confirmation, so by the time it runs the choice has been made.
     func signOut(server: String) async {
         do {
-            try await AuthFlowService().signOut(server: server)
+            try await authFlow.signOut(server: server)
             await refresh()
-        } catch { lastError = error.localizedDescription }
+        } catch { reportActionError(error) }
     }
 
+    /// Starts a sign-in. Pressed again while one is open, it is Try Again:
+    /// the open attempt holds the browser callback, so it is stopped and
+    /// waited for before the new one starts.
     func signIn(server: String) async {
-        guard signingInServers.insert(server).inserted else { return }
+        if let running = signInTasks[server] {
+            running.cancel()
+            await running.value
+            // A second press that waited on the same attempt has already
+            // started the replacement; one browser tab is enough.
+            if let current = signInTasks[server], current != running { return }
+        }
+        let task = Task { [weak self] in _ = await self?.runSignIn(server: server) }
+        signInTasks[server] = task
+        await task.value
+        if signInTasks[server] == task { signInTasks[server] = nil }
+    }
+
+    /// Stops an open sign-in. The browser tab stays, but nothing is waiting
+    /// on it any more, and the server goes back to offering Sign In.
+    func cancelSignIn(server: String) {
+        signInTasks[server]?.cancel()
+    }
+
+    private func runSignIn(server: String) async {
+        signingInServers.insert(server)
         defer { signingInServers.remove(server) }
         do {
-            try await AuthFlowService().signIn(server: server)
+            try await authFlow.signIn(server: server)
             await refresh()
-        } catch { lastError = error.localizedDescription }
+        } catch let error where Task.isCancelled || error is CancellationError {
+            // Cancelled on purpose. Nothing failed.
+        } catch {
+            reportActionError(error)
+        }
     }
 
     private func runReconciliation(_ operation: @escaping @MainActor () async -> Void) async {
@@ -577,6 +639,11 @@ final class AppModel {
         reconciliationTask = task
         await task.value
     }
+}
+
+struct ActionError: Identifiable, Equatable {
+    let id = UUID()
+    let message: String
 }
 
 private struct ServerConfigReadRequiredError: LocalizedError {

@@ -86,6 +86,47 @@ final class ProcessRunnerTests: XCTestCase {
         XCTAssertLessThan(started.duration(to: clock.now), .seconds(1))
     }
 
+    /// Cancelling the call stops the child's process group, the way a timeout
+    /// does. Before, a cancelled sign-in kept `plug auth login` waiting on the
+    /// browser until its own timeout, minutes later.
+    @MainActor
+    func testCancellingTheCallStopsTheProcessGroup() async {
+        let clock = ContinuousClock()
+        let started = clock.now
+        let running = Task {
+            try await runner.run(executable: shell, arguments: ["-c", "sleep 5 & wait"], timeout: .seconds(10))
+        }
+        try? await Task.sleep(for: .milliseconds(200))
+        running.cancel()
+
+        do {
+            _ = try await running.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertLessThan(started.duration(to: clock.now), .seconds(2))
+    }
+
+    @MainActor
+    func testACallCancelledBeforeItStartsDoesNotRun() async {
+        let clock = ContinuousClock()
+        let started = clock.now
+        let running = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await runner.run(
+                executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["5"], timeout: .seconds(10)
+            )
+        }
+        do {
+            _ = try await running.value
+            XCTFail("Expected cancellation")
+        } catch {
+            XCTAssertTrue(error is CancellationError, "\(error)")
+        }
+        XCTAssertLessThan(started.duration(to: clock.now), .seconds(2))
+    }
+
     /// A child that writes past the 64 KB pipe buffer blocks on the write until
     /// the parent reads. A runner that waits for exit before draining its pipes
     /// deadlocks here and never returns.

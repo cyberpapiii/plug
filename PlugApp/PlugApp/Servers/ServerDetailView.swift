@@ -91,6 +91,11 @@ struct ServerDetailView: View {
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
+                HStack(spacing: Metric.tight) {
+                    Button("Try Again") { run(.signIn(server: server.name)) }
+                    Button("Cancel") { run(.cancelSignIn(server: server.name)) }
+                }
+                .controlSize(.small)
             } else {
                 Button("Sign In") { run(.signIn(server: server.name)) }
                     .buttonStyle(.borderedProminent)

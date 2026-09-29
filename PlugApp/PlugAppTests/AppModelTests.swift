@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import UserNotifications
 import XCTest
 @testable import Plug
 import PlugIPC
@@ -15,6 +16,16 @@ private func makeFixtureTokenURL() throws -> URL {
     let url = URL(fileURLWithPath: "/tmp/plug-app-model-token-\(UUID().uuidString)")
     try "fixture-token".write(to: url, atomically: true, encoding: .utf8)
     return url
+}
+
+/// Polls a condition for up to two seconds.
+@MainActor
+private func eventually(_ condition: () async -> Bool) async -> Bool {
+    for _ in 0..<200 {
+        if await condition() { return true }
+        try? await Task.sleep(for: .milliseconds(10))
+    }
+    return await condition()
 }
 
 final class AppModelTests: XCTestCase {
@@ -640,7 +651,7 @@ final class AppModelTests: XCTestCase {
             }
         }
         var postedIDs: [String] = []
-        let service = NotificationService { id, _, _ in postedIDs.append(id) }
+        let service = NotificationService { postedIDs.append($0.id) }
         let empty = makeNotificationSnapshot()
         let authenticated = makeNotificationSnapshot(authenticated: true)
         let unauthenticated = makeNotificationSnapshot(authenticated: false)
@@ -666,6 +677,138 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    /// A failed press used to be cleared by the next successful poll, two
+    /// seconds later, and was shown only while every server was healthy.
+    @MainActor
+    func testAFailedPressOutlivesTheNextPoll() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL(),
+            appLinker: FailingAppLinker()
+        )
+        await model.start()
+
+        await model.setAppLinked("claude-code", true)
+        XCTAssertEqual(model.actionError?.message, FailingAppLinker.message)
+
+        await model.refresh()
+        XCTAssertEqual(model.connectionState, .ready)
+        XCTAssertEqual(model.actionError?.message, FailingAppLinker.message, "a good poll is not a good press")
+
+        model.dismissActionError()
+        XCTAssertNil(model.actionError)
+    }
+
+    @MainActor
+    func testAFailedPressClearsItselfAfterAWhile() async {
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
+            appLinker: FailingAppLinker(),
+            actionErrorLifetime: .milliseconds(100)
+        )
+        await model.setAppLinked("claude-code", true)
+        XCTAssertNotNil(model.actionError)
+        let cleared = await eventually { model.actionError == nil }
+        XCTAssertTrue(cleared)
+    }
+
+    @MainActor
+    func testCancelStopsAnOpenSignIn() async {
+        let runner = BlockingAuthRunner()
+        let model = makeSignInModel(runner: runner)
+
+        let signIn = Task { await model.signIn(server: "notion") }
+        let started = await eventually { await runner.starts == 1 }
+        XCTAssertTrue(started)
+        XCTAssertTrue(model.signingInServers.contains("notion"))
+
+        model.cancelSignIn(server: "notion")
+        await signIn.value
+
+        let cancellations = await runner.cancellations
+        XCTAssertEqual(cancellations, 1, "the login command is stopped, not left waiting on the browser")
+        XCTAssertTrue(model.signingInServers.isEmpty)
+        XCTAssertNil(model.actionError, "a cancel is not a failure")
+    }
+
+    /// Try Again used to be a no-op while a sign-in was open: the second press
+    /// returned at once and the first attempt kept waiting for minutes.
+    @MainActor
+    func testTryAgainReplacesAnOpenSignIn() async {
+        let runner = BlockingAuthRunner()
+        let model = makeSignInModel(runner: runner)
+
+        let first = Task { await model.signIn(server: "notion") }
+        _ = await eventually { await runner.starts == 1 }
+        let second = Task { await model.signIn(server: "notion") }
+        let restarted = await eventually { await runner.starts == 2 }
+        XCTAssertTrue(restarted)
+        let cancellations = await runner.cancellations
+        XCTAssertEqual(cancellations, 1)
+        XCTAssertTrue(model.signingInServers.contains("notion"))
+
+        model.cancelSignIn(server: "notion")
+        await first.value
+        await second.value
+        XCTAssertTrue(model.signingInServers.isEmpty)
+        XCTAssertNil(model.actionError)
+    }
+
+    @MainActor
+    private func makeSignInModel(runner: BlockingAuthRunner) -> AppModel {
+        AppModel(
+            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
+            authFlow: AuthFlowService(runner: runner, executable: URL(fileURLWithPath: "/usr/bin/true"))
+        )
+    }
+
+    @MainActor
+    func testANeedsSignInNotificationOpensItsServerOrSignsIn() {
+        XCTAssertEqual(
+            NotificationService.intent(forAction: UNNotificationDefaultActionIdentifier, server: "alpha"),
+            .reveal(server: "alpha")
+        )
+        XCTAssertEqual(
+            NotificationService.intent(forAction: NotificationService.signInAction, server: "alpha"),
+            .signIn(server: "alpha")
+        )
+        XCTAssertNil(NotificationService.intent(forAction: UNNotificationDismissActionIdentifier, server: "alpha"))
+        XCTAssertNil(NotificationService.intent(forAction: UNNotificationDefaultActionIdentifier, server: nil))
+
+        let defaults = UserDefaults.standard
+        let previous = defaults.object(forKey: NotificationService.preferenceKey)
+        defaults.set(true, forKey: NotificationService.preferenceKey)
+        defer {
+            if let previous {
+                defaults.set(previous, forKey: NotificationService.preferenceKey)
+            } else {
+                defaults.removeObject(forKey: NotificationService.preferenceKey)
+            }
+        }
+        var notes: [NotificationService.Note] = []
+        let service = NotificationService { notes.append($0) }
+        service.observe(makeNotificationSnapshot(authenticated: true))
+        service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
+        XCTAssertEqual(notes.map(\.server), ["alpha", nil], "only the server notification is clickable")
+
+        // The click that launches the app lands before the interface is up.
+        var performed: [PlugIntent] = []
+        service.handle(action: NotificationService.signInAction, server: "alpha")
+        service.perform = { performed.append($0) }
+        XCTAssertEqual(performed, [.signIn(server: "alpha")])
+        service.handle(action: UNNotificationDefaultActionIdentifier, server: "alpha")
+        XCTAssertEqual(performed, [.signIn(server: "alpha"), .reveal(server: "alpha")])
+    }
+
     @MainActor
     func testNotificationsRequireExplicitOptIn() {
         let defaults = UserDefaults.standard
@@ -678,7 +821,7 @@ final class AppModelTests: XCTestCase {
         }
 
         var postedIDs: [String] = []
-        let service = NotificationService { id, _, _ in postedIDs.append(id) }
+        let service = NotificationService { postedIDs.append($0.id) }
         service.observe(makeNotificationSnapshot(authenticated: true))
         service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
 
@@ -938,6 +1081,35 @@ private final class RecordingInstallationCoordinator: InstallationCoordinating {
 
     func openLog() {
         events.append("coordinator.openLog")
+    }
+}
+
+private struct FailingAppLinker: AppLinking {
+    static let message = "Claude Code's settings file is read-only."
+
+    func apps() async throws -> [LinkableApp] { [] }
+    func link(target: String) async throws {
+        throw CocoaError(.fileWriteNoPermission, userInfo: [NSLocalizedDescriptionKey: Self.message])
+    }
+    func unlink(target: String) async throws {
+        throw CocoaError(.fileWriteNoPermission, userInfo: [NSLocalizedDescriptionKey: Self.message])
+    }
+}
+
+/// A `plug auth login` that waits on the browser until it is cancelled.
+private actor BlockingAuthRunner: ProcessRunning {
+    private(set) var starts = 0
+    private(set) var cancellations = 0
+
+    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        starts += 1
+        do {
+            try await Task.sleep(for: .seconds(5))
+        } catch {
+            cancellations += 1
+            throw error
+        }
+        return ProcessResult(status: 0, stdout: Data(), stderr: Data())
     }
 }
 

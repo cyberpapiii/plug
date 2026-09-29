@@ -42,16 +42,30 @@ extension PageHeader where Content == EmptyView {
 /// verdict's job; this is only for one-off action failures.
 struct ErrorToast: View {
     let message: String
+    var dismiss: (() -> Void)?
 
     var body: some View {
-        Label(message, systemImage: "exclamationmark.triangle.fill")
-            .font(.callout)
-            .lineLimit(2)
-            .padding(.horizontal, Metric.regular)
-            .padding(.vertical, Metric.snug)
-            .nativeGlassSurface(tint: .red.opacity(0.08))
-            .padding()
-            .accessibilityLabel("Error. \(message)")
+        HStack(alignment: .firstTextBaseline, spacing: Metric.snug) {
+            Label(message, systemImage: "exclamationmark.triangle.fill")
+                .font(.callout)
+                .lineLimit(3)
+                .accessibilityLabel("Error. \(message)")
+            if let dismiss {
+                Button(action: dismiss) {
+                    Image(systemName: "xmark")
+                        .font(.caption.weight(.semibold))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Dismiss")
+                .accessibilityLabel("Dismiss error")
+            }
+        }
+        .padding(.horizontal, Metric.regular)
+        .padding(.vertical, Metric.snug)
+        .nativeGlassSurface(tint: .red.opacity(0.08))
+        .padding()
+        .accessibilityElement(children: .contain)
     }
 }
 

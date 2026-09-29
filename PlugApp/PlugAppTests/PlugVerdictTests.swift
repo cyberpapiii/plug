@@ -90,14 +90,17 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(verdict.primary?.intent, .signIn(server: "Notion"))
     }
 
-    func testSignInInProgressDropsTheButtonAndPointsAtTheBrowser() {
+    /// A sign-in in progress used to drop its button, so a closed browser
+    /// tab left nothing to press until the command gave up minutes later.
+    func testSignInInProgressOffersTryAgainAndCancel() {
         let verdict = PlugVerdict.verdict(
             for: PlugSituation(
                 runtime: .running,
                 servers: [server("Notion", health: .signInNeeded, signingIn: true)]
             )
         )
-        XCTAssertNil(verdict.primary)
+        XCTAssertEqual(verdict.primary, .init("Try Again", .signIn(server: "Notion")))
+        XCTAssertEqual(verdict.secondary, .init("Cancel", .cancelSignIn(server: "Notion")))
         XCTAssertEqual(verdict.detail, "Sign-in is open in the browser.")
     }
 
@@ -159,7 +162,13 @@ final class PlugVerdictTests: XCTestCase {
     func testEveryProblemCarriesItsOwnFix() {
         XCTAssertEqual(server("Notion", health: .signInNeeded).fix?.intent, .signIn(server: "Notion"))
         XCTAssertEqual(server("Notion", health: .signInNeeded).fix?.title, "Sign In")
-        XCTAssertNil(server("Notion", health: .signInNeeded, signingIn: true).fix)
+        XCTAssertEqual(server("Notion", health: .signInNeeded, signingIn: true).fix?.title, "Try Again")
+        XCTAssertEqual(server("Notion", health: .signInNeeded, signingIn: true).fix?.intent, .signIn(server: "Notion"))
+        XCTAssertEqual(
+            server("Notion", health: .signInNeeded, signingIn: true).cancelSignIn?.intent,
+            .cancelSignIn(server: "Notion")
+        )
+        XCTAssertNil(server("Notion", health: .signInNeeded).cancelSignIn)
         XCTAssertEqual(server("Linear", health: .down).fix?.intent, .restartServer("Linear"))
         XCTAssertEqual(server("Odd", health: .unknown).fix?.intent, .restartServer("Odd"))
         for health in [ServerHealth.working, .starting, .off] {
