@@ -491,6 +491,142 @@ final class AppModelTests: XCTestCase {
         XCTAssertGreaterThan(reconnectIndex, replacementIndex)
     }
 
+    /// A daemon swap closes the socket the app was using. The first read after
+    /// it used to fail on the dead descriptor and say "Plug is not running"
+    /// until the next poll, up to 30 seconds later, while the new daemon was
+    /// already listening.
+    @MainActor
+    func testASwappedDaemonIsPickedUpOnTheSameRead() async throws {
+        let events = LockedEvents()
+        let socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-swap-\(UUID().uuidString).sock")
+        let oldServer = try OperatorFixtureServer(events: events, socketURL: socketURL)
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: events
+        )
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        XCTAssertEqual(model.connectionState, .ready)
+
+        oldServer.stop()
+        let newServer = try OperatorFixtureServer(events: events, socketURL: socketURL)
+        defer { newServer.stop() }
+        await model.refresh()
+
+        XCTAssertEqual(model.connectionState, .ready)
+        XCTAssertEqual(model.situation.runtime, .running)
+    }
+
+    /// With nothing listening yet, a dropped connection reads as reconnecting
+    /// for the grace period rather than as Plug being down.
+    @MainActor
+    func testALostConnectionReconnectsBeforeItIsCalledStopped() async throws {
+        for (grace, expected) in [
+            (Duration.seconds(60), AppModel.ConnectionState.reconnecting),
+            (Duration.zero, AppModel.ConnectionState.disconnected),
+        ] {
+            let events = LockedEvents()
+            let server = try OperatorFixtureServer(events: events)
+            let model = AppModel(
+                ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+                coordinator: RecordingInstallationCoordinator(
+                    state: .healthy(makeInstallationSnapshot()),
+                    events: events
+                ),
+                tokenURL: try makeFixtureTokenURL(),
+                reconnectGrace: grace
+            )
+            await model.start()
+            XCTAssertEqual(model.connectionState, .ready)
+
+            server.stop()
+            await model.refresh()
+
+            XCTAssertEqual(model.connectionState, expected)
+            if expected == .reconnecting {
+                XCTAssertEqual(model.verdict.title, "Reconnecting…")
+                XCTAssertEqual(model.verdict.tone, .busy)
+            } else {
+                XCTAssertEqual(model.verdict.title, "Plug is not running")
+            }
+        }
+    }
+
+    /// A poll of a stopped Plug used to flip the headline to "Starting…" for
+    /// the length of every attempt, so it flickered each poll.
+    @MainActor
+    func testPollingAStoppedPlugKeepsSayingSo() async throws {
+        let events = LockedEvents()
+        let socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-down-\(UUID().uuidString).sock")
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
+            coordinator: RecordingInstallationCoordinator(
+                state: .healthy(makeInstallationSnapshot()),
+                events: events
+            ),
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        XCTAssertEqual(model.connectionState, .disconnected)
+
+        let server = try OperatorFixtureServer(events: events, socketURL: socketURL)
+        defer { server.stop() }
+        let gate = DispatchSemaphore(value: 0)
+        server.snapshotGate = gate
+        let read = Task { await model.refresh() }
+        while !events.values.contains("ipc.snapshot") {
+            try await Task.sleep(for: .milliseconds(5))
+        }
+        XCTAssertEqual(model.connectionState, .disconnected, "a poll in flight must not say Starting")
+        server.snapshotGate = nil
+        gate.signal()
+        await read.value
+        XCTAssertEqual(model.connectionState, .ready)
+    }
+
+    /// Restart used to run outside the reconciliation gate, so polling went on
+    /// during the swap, the headline said "not running", and pressing its
+    /// Start Plug button started a second swap on top of the first.
+    @MainActor
+    func testRestartHoldsTheGateAndSaysRestarting() async throws {
+        let events = LockedEvents()
+        let gate = AsyncGate()
+        let server = try OperatorFixtureServer(events: events)
+        defer { server.stop() }
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: events
+        )
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
+        )
+        await model.start()
+        coordinator.restartOperation = { await gate.wait() }
+
+        let restart = Task { await model.restartService() }
+        await gate.enteredWait()
+        XCTAssertEqual(model.verdict.title, "Restarting…")
+        let snapshotsDuringRestart = events.values.filter { $0 == "ipc.snapshot" }.count
+        await model.refresh()
+        let start = Task { await model.retryConnection() }
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertEqual(events.values.filter { $0 == "ipc.snapshot" }.count, snapshotsDuringRestart)
+        await gate.release()
+        await restart.value
+        await start.value
+
+        XCTAssertFalse(events.values.contains("coordinator.retry"), "Start Plug waited instead of swapping again")
+        XCTAssertEqual(events.values.filter { $0 == "coordinator.restartService" }.count, 1)
+        XCTAssertEqual(model.connectionState, .ready)
+        XCTAssertFalse(model.isRestartingService)
+    }
+
     @MainActor
     func testNotificationsStaySilentInitiallyAndDeduplicateTransitions() {
         let defaults = UserDefaults.standard
@@ -790,6 +926,14 @@ private final class RecordingInstallationCoordinator: InstallationCoordinating {
     func retry() async {
         events.append("coordinator.retry")
         await reconcile(trigger: .retry)
+    }
+
+    /// Runs while a restart is under way. Throwing makes the restart fail.
+    var restartOperation: (() async throws -> Void)?
+
+    func restartService() async throws {
+        events.append("coordinator.restartService")
+        try await restartOperation?()
     }
 
     func openLog() {

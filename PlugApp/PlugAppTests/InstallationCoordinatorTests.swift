@@ -1488,6 +1488,10 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
     func adopt() async throws {
         await events.append("daemon.adopt")
     }
+
+    func restart() async throws {
+        await events.append("daemon.restart")
+    }
 }
 
 @MainActor
@@ -1576,6 +1580,10 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
         await events.append("daemon.adopt")
         leftoverLoaded = false
         adopted = true
+    }
+
+    func restart() async throws {
+        await events.append("daemon.restart")
     }
 }
 

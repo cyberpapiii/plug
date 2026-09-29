@@ -8,6 +8,7 @@ protocol InstallationCoordinating: AnyObject {
     func reconcile(trigger: ReconciliationTrigger) async
     func adopt() async
     func retry() async
+    func restartService() async throws
     func openLog()
 }
 
@@ -16,7 +17,10 @@ extension InstallationCoordinator: InstallationCoordinating {}
 
 @MainActor @Observable
 final class AppModel {
-    enum ConnectionState: Equatable { case disconnected, connecting, incompatible, ready }
+    /// `reconnecting` is a working connection that just dropped. A daemon swap
+    /// looks exactly like that for about a second, so it is not called
+    /// stopped until the drop outlasts `reconnectGrace`.
+    enum ConnectionState: Equatable { case disconnected, connecting, reconnecting, incompatible, ready }
 
     static let defaultClientVersion = PlugIPCClient.clientVersion(
         from: Bundle.main.infoDictionary ?? [:]
@@ -91,11 +95,17 @@ final class AppModel {
 
     static let foregroundPollInterval = Duration.seconds(2)
     static let backgroundPollInterval = Duration.seconds(30)
+    static let reconnectPollInterval = Duration.seconds(1)
+    static let reconnectGrace = Duration.seconds(10)
     private let foregroundPollInterval: Duration
     private let backgroundPollInterval: Duration
+    private let reconnectGrace: Duration
+    /// When a working connection first failed, while it is `reconnecting`.
+    private var connectionLostAt: ContinuousClock.Instant?
 
     private var pollInterval: Duration {
-        watcherCount > 0 ? foregroundPollInterval : backgroundPollInterval
+        let interval = watcherCount > 0 ? foregroundPollInterval : backgroundPollInterval
+        return connectionState == .reconnecting ? min(interval, Self.reconnectPollInterval) : interval
     }
 
     /// Called when a surface appears or disappears. Balanced pairs only.
@@ -117,7 +127,8 @@ final class AppModel {
         tokenURL: URL = PlugIPCClient.defaultTokenURL,
         appLinker: any AppLinking = AppLinkService(),
         foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
-        backgroundPollInterval: Duration = AppModel.backgroundPollInterval
+        backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
+        reconnectGrace: Duration = AppModel.reconnectGrace
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
@@ -126,6 +137,7 @@ final class AppModel {
         self.appLinker = appLinker
         self.foregroundPollInterval = foregroundPollInterval
         self.backgroundPollInterval = backgroundPollInterval
+        self.reconnectGrace = reconnectGrace
     }
 
     /// Read live rather than mirrored. A copy refreshed only when a
@@ -211,11 +223,13 @@ final class AppModel {
     }
 
     private var runtimeState: PlugSituation.Runtime {
+        if isRestartingService { return .restarting }
         switch connectionState {
-        case .ready: .running
-        case .connecting: .starting
-        case .incompatible: .versionMismatch
-        case .disconnected: .stopped
+        case .ready: return .running
+        case .connecting: return .starting
+        case .reconnecting: return .reconnecting
+        case .incompatible: return .versionMismatch
+        case .disconnected: return .stopped
         }
     }
 
@@ -287,7 +301,33 @@ final class AppModel {
 
     func retryConnection() async {
         attemptedSkewRecovery = false
+        // Someone pressed Start. Polls no longer flip a stopped Plug to
+        // "Starting…", so the press is the one place that says it is trying.
+        if connectionState == .disconnected { connectionState = .connecting }
         await retry()
+        await refresh()
+    }
+
+    /// Restarts the background service inside the reconciliation gate, so
+    /// polling stands aside while the daemon is swapped and a Start Plug
+    /// pressed meanwhile waits for this swap instead of starting a second one.
+    func restartService() async {
+        guard !isRestartingService else { return }
+        isRestartingService = true
+        // A reconciliation already running would swallow this one; let it
+        // finish first so the restart that was asked for still happens.
+        if let reconciliationTask { await reconciliationTask.value }
+        await runReconciliation { [weak self, coordinator] in
+            do {
+                try await coordinator.restartService()
+            } catch {
+                self?.lastError = error.localizedDescription
+                await coordinator.retry()
+            }
+        }
+        isRestartingService = false
+        // The daemon behind the open descriptor is gone.
+        await ipc.disconnect()
         await refresh()
     }
 
@@ -325,73 +365,110 @@ final class AppModel {
         await task.value
     }
 
+    /// No `.connecting` flip on the way in: a poll of a stopped Plug used to
+    /// say "Starting…" for the length of each failed attempt, so the headline
+    /// flickered between that and "not running" every poll.
     private func readDaemonState(forceCatalog: Bool) async {
-        if connectionState != .ready { connectionState = .connecting }
+        let wasReady = connectionState == .ready
         do {
-            let handshake = try await ipc.connect()
-            capabilities = Set(handshake.capabilities)
-            guard handshake.sharesSupportedIPCVersion else {
-                connectionState = .incompatible
-                lastError = nil
-                return
+            do {
+                try await readDaemonStateOnce(forceCatalog: forceCatalog)
+            } catch _ where wasReady {
+                // A working connection that fails was most likely cut by a
+                // daemon swap. The client closed the dead descriptor, so one
+                // more read reaches whichever daemon is listening now instead
+                // of reporting the old one's exit until the next poll.
+                try await readDaemonStateOnce(forceCatalog: forceCatalog)
             }
-            guard handshake.daemonVersion == clientVersion else {
-                connectionState = .incompatible
-                lastError = nil
-                if !attemptedSkewRecovery {
-                    attemptedSkewRecovery = true
-                    await retry()
-                }
-                return
-            }
-            attemptedSkewRecovery = false
-            let token = try String(contentsOf: tokenURL, encoding: .utf8)
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
-                throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
-            }
-            let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
-            let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
-            snapshot = value
-            hasLoadedSnapshot = true
-            NotificationService.shared.observe(value)
-            if case let .activity(events) = try await ipc.request(
-                .activity(
-                    authToken: token,
-                    afterSequence: activityCursor,
-                    limit: Self.activityLimit + 1,
-                    failuresOnly: false
-                )
-            ) {
-                if activityCursor == 0 {
-                    activityWasTruncated = events.count > Self.activityLimit
-                    activities = Array(events.suffix(Self.activityLimit))
-                } else if !events.isEmpty {
-                    let merged = activities + events
-                    activityWasTruncated = activityWasTruncated
-                        || merged.count > Self.activityLimit
-                    activities = Array(merged.suffix(Self.activityLimit))
-                }
-            }
-            // The tool list is nearly a megabyte and the snapshot above
-            // already reports when it would answer differently, so ask for
-            // it only then. This used to refetch on a timer as well,
-            // because the fingerprint was assembled here from server
-            // fields and could not see a tool disabled from the CLI. The
-            // daemon reports that now.
-            let revision = value.toolCatalogRevision
-            if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
-               case let .tools(tools) = try await ipc.request(.listTools)
-            {
-                toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
-                toolCatalogRevision = revision
-            }
-            connectionState = .ready
-            lastError = nil
+            connectionLostAt = nil
         } catch {
-            connectionState = .disconnected
-            lastError = error.localizedDescription
+            connectionLost(error)
         }
+    }
+
+    /// A drop from a working connection reads as reconnecting, and polls
+    /// briskly, until it outlasts the grace. Only then is Plug stopped.
+    private func connectionLost(_ error: any Error) {
+        lastError = error.localizedDescription
+        guard connectionState == .ready || connectionState == .reconnecting else {
+            connectionState = .disconnected
+            return
+        }
+        let now = ContinuousClock.now
+        let since = connectionLostAt ?? now
+        guard now - since < reconnectGrace else {
+            connectionState = .disconnected
+            connectionLostAt = nil
+            return
+        }
+        connectionLostAt = since
+        guard connectionState != .reconnecting else { return }
+        connectionState = .reconnecting
+        // The loop may be halfway through a long background sleep.
+        if monitoringTask != nil { startMonitoring() }
+    }
+
+    private func readDaemonStateOnce(forceCatalog: Bool) async throws {
+        let handshake = try await ipc.connect()
+        capabilities = Set(handshake.capabilities)
+        guard handshake.sharesSupportedIPCVersion else {
+            connectionState = .incompatible
+            lastError = nil
+            return
+        }
+        guard handshake.daemonVersion == clientVersion else {
+            connectionState = .incompatible
+            lastError = nil
+            if !attemptedSkewRecovery {
+                attemptedSkewRecovery = true
+                await retry()
+            }
+            return
+        }
+        attemptedSkewRecovery = false
+        let token = try String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
+            throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
+        }
+        let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
+        let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
+        snapshot = value
+        hasLoadedSnapshot = true
+        NotificationService.shared.observe(value)
+        if case let .activity(events) = try await ipc.request(
+            .activity(
+                authToken: token,
+                afterSequence: activityCursor,
+                limit: Self.activityLimit + 1,
+                failuresOnly: false
+            )
+        ) {
+            if activityCursor == 0 {
+                activityWasTruncated = events.count > Self.activityLimit
+                activities = Array(events.suffix(Self.activityLimit))
+            } else if !events.isEmpty {
+                let merged = activities + events
+                activityWasTruncated = activityWasTruncated
+                    || merged.count > Self.activityLimit
+                activities = Array(merged.suffix(Self.activityLimit))
+            }
+        }
+        // The tool list is nearly a megabyte and the snapshot above
+        // already reports when it would answer differently, so ask for
+        // it only then. This used to refetch on a timer as well,
+        // because the fingerprint was assembled here from server
+        // fields and could not see a tool disabled from the CLI. The
+        // daemon reports that now.
+        let revision = value.toolCatalogRevision
+        if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
+           case let .tools(tools) = try await ipc.request(.listTools)
+        {
+            toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
+            toolCatalogRevision = revision
+        }
+        connectionState = .ready
+        lastError = nil
     }
 
     func performOperation(_ request: (String) -> IPCRequest) async throws {
@@ -450,17 +527,6 @@ final class AppModel {
         } catch {
             connectableAppsError = error.localizedDescription
         }
-    }
-
-    func beginServiceRestart() -> Bool {
-        guard !isRestartingService else { return false }
-        isRestartingService = true
-        return true
-    }
-
-    func finishServiceRestart(error: (any Error)? = nil) {
-        isRestartingService = false
-        if let error { lastError = error.localizedDescription }
     }
 
     func setAppLinked(_ target: String, _ linked: Bool) async {

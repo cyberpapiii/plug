@@ -33,6 +33,7 @@ protocol DaemonServiceManaging: AnyObject {
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake
     func adopt() async throws
+    func restart() async throws
 }
 
 @MainActor
@@ -125,6 +126,12 @@ final class InstallationCoordinator {
 
     func retry() async {
         await reconcile(trigger: .retry)
+    }
+
+    /// Swaps this app's own daemon for a fresh one. The daemon manager refuses
+    /// any daemon it has not verified as app-owned, so this never adopts one.
+    func restartService() async throws {
+        try await daemonManager.restart()
     }
 
     func openLog() {

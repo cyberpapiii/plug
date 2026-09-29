@@ -150,6 +150,11 @@ struct PlugSituation: Equatable, Sendable {
     enum Runtime: Equatable, Sendable {
         case running
         case starting
+        /// A working connection dropped moments ago, as it does for about a
+        /// second whenever the daemon is swapped.
+        case reconnecting
+        /// The person asked for a restart and it is under way.
+        case restarting
         case stopped
         case versionMismatch
     }
@@ -330,6 +335,20 @@ enum PlugVerdict {
                 symbol: "bolt.horizontal.circle",
                 title: "Starting…",
                 detail: "Connecting to servers."
+            )
+        case .reconnecting:
+            return Verdict(
+                tone: .busy,
+                symbol: "bolt.horizontal.circle",
+                title: "Reconnecting…",
+                detail: "Waiting for the background service."
+            )
+        case .restarting:
+            return Verdict(
+                tone: .busy,
+                symbol: "bolt.horizontal.circle",
+                title: "Restarting…",
+                detail: "Connected apps pick Plug back up on their own."
             )
         case .stopped:
             return Verdict(

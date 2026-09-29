@@ -235,29 +235,33 @@ private struct ServiceSettings: View {
     }
 
     private var serviceStatus: String {
+        if model.isRestartingService { return "Restarting" }
         switch model.connectionState {
-        case .ready: "Running"
-        case .connecting: "Connecting"
-        case .incompatible: "Update required"
-        case .disconnected: "Not running"
+        case .ready: return "Running"
+        case .connecting: return "Connecting"
+        case .reconnecting: return "Reconnecting"
+        case .incompatible: return "Update required"
+        case .disconnected: return "Not running"
         }
     }
 
     private var serviceSymbol: String {
+        if model.isRestartingService { return "circle.dotted" }
         switch model.connectionState {
-        case .ready: "checkmark.circle.fill"
-        case .connecting: "circle.dotted"
-        case .incompatible: "arrow.triangle.2.circlepath"
-        case .disconnected: "xmark.circle.fill"
+        case .ready: return "checkmark.circle.fill"
+        case .connecting, .reconnecting: return "circle.dotted"
+        case .incompatible: return "arrow.triangle.2.circlepath"
+        case .disconnected: return "xmark.circle.fill"
         }
     }
 
     private var serviceColor: Color {
+        if model.isRestartingService { return .secondary }
         switch model.connectionState {
-        case .ready: .green
-        case .connecting: .secondary
-        case .incompatible: .orange
-        case .disconnected: .red
+        case .ready: return .green
+        case .connecting, .reconnecting: return .secondary
+        case .incompatible: return .orange
+        case .disconnected: return .red
         }
     }
 
