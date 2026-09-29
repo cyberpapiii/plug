@@ -2253,8 +2253,18 @@ impl ServerManager {
 
         if !entries.is_empty() {
             tracing::info!(count = entries.len(), "shutting down upstream servers");
-            join_all(entries.into_iter().map(|(name, upstream_arc)| {
-                retire_upstream_owned(name, upstream_arc, "shutdown_all")
+            join_all(entries.into_iter().map(|(name, upstream_arc)| async move {
+                // A request still in flight on this connection holds a clone:
+                // the daemon forwards roots/list_changed to every upstream as
+                // its clients disconnect, which races this. Cancelling fails
+                // that request, so its holder lets go within moments.
+                upstream_arc.client.cancellation_token().cancel();
+                let deadline = tokio::time::Instant::now() + RETIRE_OWNERSHIP_WAIT;
+                while Arc::strong_count(&upstream_arc) > 1 && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+                retire_upstream_owned(name, upstream_arc, "shutdown_all").await;
             }))
             .await;
         }
@@ -2562,12 +2572,17 @@ pub(crate) async fn retire_upstream_owned(
             tracing::warn!(
                 server = %name,
                 reason,
+                holders = Arc::strong_count(&arc) - 1,
                 "could not take ownership of upstream; sent cancellation and dropped Arc"
             );
             drop(arc);
         }
     }
 }
+
+/// How long shutdown waits for other holders of a cancelled upstream to let go
+/// before it gives up on closing it.
+const RETIRE_OWNERSHIP_WAIT: Duration = Duration::from_secs(1);
 
 /// How long a stdio server gets to exit on its own after stdin closes before
 /// it is sent SIGTERM.
@@ -5861,6 +5876,66 @@ mod tests {
             write.write_all(&encoded).await.expect("write response");
             write.flush().await.expect("flush response");
         }
+    }
+
+    /// Shutdown races the daemon's per-client cleanup, which forwards
+    /// `roots/list_changed` to every upstream. An HTTP upstream is still
+    /// borrowed by that notification when shutdown reaches it, and shutdown
+    /// used to give up on it at once, so its close was never awaited.
+    #[tokio::test]
+    async fn shutdown_waits_for_a_request_in_flight_on_the_upstream() {
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        tokio::spawn(serve_raw_legacy_upstream_ignoring_tasks_list(
+            server_transport,
+        ));
+        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+        let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("silent"),
+            Arc::clone(&tools),
+            std::sync::Weak::new(),
+        ))
+        .serve(client_transport)
+        .await
+        .expect("connect upstream test client");
+        let upstream = Arc::new(UpstreamServer {
+            name: "silent".to_string(),
+            config: test_server_config(),
+            client,
+            tools,
+            capabilities: ServerCapabilities::default(),
+            upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate_state: 0,
+            connection: ConnectionGeneration::new(),
+            health: ServerHealth::Healthy,
+            child_pid: None,
+        });
+
+        // The server never answers ping, so this request holds the upstream
+        // until retirement cancels the connection.
+        let in_flight = {
+            let upstream = Arc::clone(&upstream);
+            tokio::spawn(async move {
+                let _ = upstream
+                    .client
+                    .peer()
+                    .send_request(rmcp::model::ClientRequest::PingRequest(Default::default()))
+                    .await;
+            })
+        };
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!in_flight.is_finished(), "the ping should still be pending");
+
+        let weak = Arc::downgrade(&upstream);
+        let mgr = ServerManager::new();
+        mgr.insert_upstream("silent".to_string(), upstream);
+        mgr.shutdown_all().await;
+        assert!(
+            weak.upgrade().is_none(),
+            "shutdown returned without taking ownership of the upstream"
+        );
+        in_flight.await.expect("in-flight request task");
     }
 
     /// The legacy task probe used to wait out the whole `call_timeout_secs`
