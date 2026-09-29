@@ -32,6 +32,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   shutdown timed out" warnings it caused are gone.
 - The daemon keeps its last 14 daily log files and deletes older ones. It
   used to keep them forever.
+- A daemon swap now closes HTTP servers properly. Disconnecting clients were
+  still notifying them when shutdown reached them, so shutdown gave up on
+  closing each one and logged "could not take ownership of upstream". It now
+  waits up to a second for that notification to let go.
 - Quieter logs and status. A connector that asks for an older MCP version no
   longer logs a fallback warning, the connect log reports the version actually
   negotiated, and `plug auth status` shows a disabled OAuth server as
