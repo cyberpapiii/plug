@@ -6,7 +6,9 @@ use super::ConnectionContext;
 
 /// Handle `AuthStatus` — return per-server OAuth state from config + credential stores.
 pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
-    auth_status_from_statuses(ctx, &ctx.server_manager.server_statuses()).await
+    IpcResponse::AuthStatus {
+        servers: auth_status_from_statuses(ctx, &ctx.server_manager.server_statuses()).await,
+    }
 }
 
 /// The body of `AuthStatus`, against server statuses the caller already has.
@@ -14,22 +16,18 @@ pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse
 /// `OperatorSnapshot` embeds this response and also returns the same statuses,
 /// and building them is a clone per configured server. Taking them as an
 /// argument keeps that work to once per request instead of once per use.
+///
+/// It reads the config the daemon is running, not config.toml. The app polls
+/// the snapshot every few seconds, and reloading the file each time cost a
+/// parse and a validation per poll, and failed the whole snapshot while the
+/// file was mid-edit. The config watcher keeps the running config current.
 pub(super) async fn auth_status_from_statuses(
     ctx: &ConnectionContext,
     statuses: &[plug_core::types::ServerStatus],
-) -> IpcResponse {
+) -> Vec<plug_core::ipc::IpcAuthServerInfo> {
     use plug_core::oauth;
 
-    let config = plug_core::config::load_config(Some(&ctx.config_path));
-    let config = match config {
-        Ok(cfg) => cfg,
-        Err(e) => {
-            return IpcResponse::Error {
-                code: "CONFIG_LOAD_FAILED".to_string(),
-                message: e.to_string(),
-            };
-        }
-    };
+    let config = std::sync::Arc::clone(&ctx.engine.config());
 
     let status_map: std::collections::HashMap<&str, &plug_core::types::ServerStatus> =
         statuses.iter().map(|s| (s.server_id.as_str(), s)).collect();
@@ -74,7 +72,7 @@ pub(super) async fn auth_status_from_statuses(
         });
     }
 
-    IpcResponse::AuthStatus { servers }
+    servers
 }
 
 #[cfg(test)]

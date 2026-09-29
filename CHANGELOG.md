@@ -31,6 +31,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   longer logs a fallback warning, the connect log reports the version actually
   negotiated, and `plug auth status` shows a disabled OAuth server as
   "disabled" instead of warning about its stale credentials.
+- A config.toml that does not parse, such as one saved mid-edit, no longer
+  blanks Plug.app's status. The daemon keeps serving its last good config, the
+  status reports the parse error, and each status poll reads the file once
+  instead of twice.
 
 - The menu bar panel is redesigned. A larger tinted headline says whether Plug
   is working and carries its fix, a thin progress line shows servers settling

@@ -132,6 +132,10 @@ pub struct OperatorSnapshot {
     pub client_visibility: Vec<OperatorClientVisibility>,
     pub upstream_auth: Vec<IpcAuthServerInfo>,
     pub downstream_clients: Vec<crate::downstream_oauth::RegisteredClientSummary>,
+    /// Why config.toml could not be read, when it could not. The daemon keeps
+    /// running its last good config, and `configured_servers` then lists that.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_error: Option<String>,
 }
 
 /// Requests sent from CLI → daemon over Unix socket.
@@ -2196,6 +2200,7 @@ mod tests {
                         last_used_at: None,
                         expires_at: 1_800_000_000,
                     }],
+                    config_error: None,
                 }),
             }
         }

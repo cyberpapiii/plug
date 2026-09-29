@@ -59,6 +59,25 @@ fn load_editable_config(path: &std::path::Path) -> Result<plug_core::config::Con
     })
 }
 
+/// A config parse error without the quoted source lines. The TOML parser
+/// echoes the offending line, and in config.toml that line can hold a token;
+/// the snapshot is polled constantly and the app may show this text.
+fn config_error_summary(message: &str) -> String {
+    message
+        .lines()
+        .filter(|line| {
+            let line = line.trim_start();
+            !line
+                .trim_start_matches(|c: char| c.is_ascii_digit())
+                .trim_start()
+                .starts_with('|')
+        })
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 mod notify;
 use notify::send_ipc_control_notification;
 
@@ -1483,10 +1502,19 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             ),
         },
         IpcRequest::OperatorSnapshot { .. } => {
-            let config = match load_editable_config(&ctx.config_path) {
-                Ok(config) => config,
-                Err(response) => return response,
-            };
+            // The configured servers come from the file, so the app can see a
+            // server the daemon has not loaded. A file that does not parse,
+            // often one saved mid-edit, must not blank the app while the
+            // daemon keeps serving its last good config: report the error and
+            // list the running config instead.
+            let (config, config_error) =
+                match plug_core::operator::load_editable_config(&ctx.config_path) {
+                    Ok(config) => (std::sync::Arc::new(config), None),
+                    Err(error) => (
+                        std::sync::Arc::clone(&ctx.engine.config()),
+                        Some(config_error_summary(&error.to_string())),
+                    ),
+                };
             let mut configured_servers = config
                 .servers
                 .iter()
@@ -1517,13 +1545,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .collect();
             let mut server_statuses = ctx.server_manager.server_statuses();
             strip_upstream_icons(&mut server_statuses);
-            let upstream_auth = match auth_status_from_statuses(ctx, &server_statuses).await {
-                IpcResponse::AuthStatus { servers } => servers,
-                IpcResponse::Error { code, message } => {
-                    return IpcResponse::Error { code, message };
-                }
-                _ => Vec::new(),
-            };
+            let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
             let downstream_clients = match ctx.downstream_oauth.as_ref() {
                 Some(manager) => manager.list_clients().await,
                 None => Vec::new(),
@@ -1540,6 +1562,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     client_visibility,
                     upstream_auth,
                     downstream_clients,
+                    config_error,
                 }),
             }
         }
@@ -2608,6 +2631,52 @@ mod tests {
             session_id: None,
             reverse_request_rx: None,
         }
+    }
+
+    /// The app polls this snapshot every few seconds. A config.toml saved
+    /// mid-edit used to fail the whole snapshot and blank the app while the
+    /// daemon kept serving its last good config.
+    #[tokio::test]
+    async fn operator_snapshot_survives_an_unparsable_config_file() {
+        let config_path = temp_config_path("snapshot-bad-config");
+        let server_name = format!("oauth-snapshot-{}", std::process::id());
+        write_oauth_config(&config_path, &[server_name.as_str()]);
+        clear_store(&server_name).await;
+        let mut ctx = auth_status_test_context(config_path);
+        std::fs::write(
+            &ctx.config_path,
+            "[servers.broken]\nauth_token = \"sk-secret-value\n",
+        )
+        .unwrap();
+
+        let response = dispatch_request(
+            &IpcRequest::OperatorSnapshot {
+                auth_token: "test-token".to_string(),
+            },
+            &mut ctx,
+        )
+        .await;
+        let IpcResponse::OperatorSnapshot { snapshot } = response else {
+            panic!("expected a snapshot, got {response:?}");
+        };
+
+        let config_error = snapshot.config_error.as_deref().expect("config_error");
+        assert!(config_error.contains("line 2"), "{config_error}");
+        assert!(
+            !config_error.contains("sk-secret-value"),
+            "the error must not quote the config: {config_error}"
+        );
+        let configured: Vec<_> = snapshot
+            .configured_servers
+            .iter()
+            .map(|server| server.name.as_str())
+            .collect();
+        assert_eq!(configured, vec![server_name.as_str()]);
+        assert_eq!(snapshot.upstream_auth.len(), 1);
+        assert_eq!(snapshot.upstream_auth[0].name, server_name);
+
+        clear_store(&server_name).await;
+        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
