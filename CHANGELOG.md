@@ -27,6 +27,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   its stdin closes, like Figma's, now gets SIGTERM after a quarter second
   instead of holding shutdown for the full timeout, and the "upstream
   shutdown timed out" warnings it caused are gone.
+- The daemon keeps its last 14 daily log files and deletes older ones. It
+  used to keep them forever.
 - Quieter logs and status. A connector that asks for an older MCP version no
   longer logs a fallback warning, the connect log reports the version actually
   negotiated, and `plug auth status` shows a disabled OAuth server as
