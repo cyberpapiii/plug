@@ -876,48 +876,7 @@ impl super::ToolRouter {
 #[cfg(test)]
 mod metadata_budget_tests {
     use super::*;
-    use std::fmt::Write as _;
-    use std::sync::{Arc, Mutex};
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Metadata, Subscriber};
-
-    #[derive(Clone, Default)]
-    struct EventCapture(Arc<Mutex<String>>);
-
-    struct EventVisitor<'a>(&'a mut String);
-
-    impl Visit for EventVisitor<'_> {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            let _ = write!(self.0, "{}={value:?} ", field.name());
-        }
-    }
-
-    impl Subscriber for EventCapture {
-        fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
-            true
-        }
-
-        fn new_span(&self, _span: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-
-        fn record(&self, _span: &Id, _values: &Record<'_>) {}
-
-        fn record_follows_from(&self, _span: &Id, _follows: &Id) {}
-
-        fn event(&self, event: &Event<'_>) {
-            let mut fields = String::new();
-            event.record(&mut EventVisitor(&mut fields));
-            let mut captured = self.0.lock().expect("event capture lock");
-            captured.push_str(&fields);
-            captured.push('\n');
-        }
-
-        fn enter(&self, _span: &Id) {}
-
-        fn exit(&self, _span: &Id) {}
-    }
+    use crate::test_log::EventCapture;
 
     fn large_valid_meta(key: &str, value_prefix: &str) -> MetaObject {
         let value = format!("{value_prefix}{}", "x".repeat(15 * 1024));
@@ -934,9 +893,8 @@ mod metadata_budget_tests {
         const PEER_KEY: &str = "attacker.example/never-log-this-key";
         const PEER_VALUE: &str = "metadata-value-must-not-leak-";
         let capture = EventCapture::default();
-        let captured = Arc::clone(&capture.0);
 
-        let descriptors = tracing::subscriber::with_default(capture, || {
+        let descriptors = tracing::subscriber::with_default(capture.clone(), || {
             let mut budget = CatalogMetadataBudget::default();
             let mut descriptors = (0..40)
                 .map(|id| {
@@ -981,7 +939,7 @@ mod metadata_budget_tests {
             .sum::<usize>();
         assert!(retained_bytes <= MAX_CATALOG_METADATA_BYTES_PER_UPSTREAM);
 
-        let diagnostics = captured.lock().expect("captured diagnostics").clone();
+        let diagnostics = capture.text();
         assert_eq!(
             diagnostics
                 .matches("catalog extension metadata budget exhausted")

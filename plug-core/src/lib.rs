@@ -40,3 +40,6 @@ pub mod tool_naming;
 pub mod transport;
 pub mod types;
 pub mod watcher;
+
+#[cfg(test)]
+mod test_log;

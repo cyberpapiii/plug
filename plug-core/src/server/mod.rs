@@ -1597,7 +1597,9 @@ impl ServerManager {
                     on_settled(&name);
                 }
                 Ok((name, Err(e))) => {
-                    tracing::error!(server = %name, error = %e, "failed to start server");
+                    // A warning: recovery retries it straight away, and at
+                    // boot a local upstream is often just not listening yet.
+                    tracing::warn!(server = %name, error = %e, "server failed to start");
                     if let Some(server_config) = config.servers.get(&name) {
                         self.record_error(&name, server_config, &e);
                         self.record_start_failure(&name, server_config, &e);
