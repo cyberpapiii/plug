@@ -18,6 +18,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   list` shows when each registration was made, last used, and expires. Every
   "restart Plug" hint now points to Plug.app's Restart button when the app is
   installed, and `plug stop` answers with a sentence.
+- A failed server now says why. `plug status`, `plug servers`, `plug doctor`
+  and the app show the error from its last start or reconnect, including the
+  last line a local server printed before it exited, with its secrets
+  redacted. `plug doctor` also warns when a server's command is found only
+  through your login shell PATH, which the daemon cannot always read at boot.
+  The daemon no longer logs a stdio server's arguments, which can hold tokens.
 - Node-based stdio servers such as Figma no longer stay down after a reboot.
   When the login shell was too slow to report its PATH at boot, Plug kept that
   failure until the daemon restarted, so `node` and `npx` could not be found.

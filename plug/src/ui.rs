@@ -233,6 +233,14 @@ pub(crate) fn status_label(
     }
 }
 
+/// The daemon's reason a server is not healthy, on its own line under the
+/// server's row. Prints nothing when there is no reason.
+pub(crate) fn print_reason(server: &plug_core::types::ServerStatus) {
+    if let Some(error) = &server.error {
+        println!("      {}", style(format!("↳ {error}")).dim());
+    }
+}
+
 pub(crate) fn print_info_line(message: impl std::fmt::Display) {
     println!("{} {}", style("›").cyan().bold(), message);
 }

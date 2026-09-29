@@ -80,6 +80,7 @@
       {
         "auth_status": "none",
         "availability": "healthy",
+        "error": "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)",
         "health": "Failed",
         "metrics": null,
         "server_id": "failed",

@@ -1706,6 +1706,7 @@ mod tests {
             connection: crate::server::ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
             child_pid: None,
+            stderr_tail: None,
         }
     }
 
@@ -2669,6 +2670,7 @@ mod tests {
             connection: crate::server::ConnectionGeneration::new(),
             health: ServerHealth::Healthy,
             child_pid: None,
+            stderr_tail: None,
         }
     }
 

@@ -2123,12 +2123,17 @@ mod tests {
         fn server(name: &str, health: ServerHealth, tool_count: usize) -> ServerStatus {
             // Built from JSON so fields added to ServerStatus later take their
             // serde defaults instead of breaking this fixture.
-            serde_json::from_value(serde_json::json!({
+            let mut status = serde_json::json!({
                 "server_id": name,
                 "health": health,
                 "tool_count": tool_count,
-            }))
-            .expect("server status")
+            });
+            if health == ServerHealth::Failed {
+                status["error"] = serde_json::json!(
+                    "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)"
+                );
+            }
+            serde_json::from_value(status).expect("server status")
         }
 
         fn canonical_snapshot_response() -> IpcResponse {

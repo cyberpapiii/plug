@@ -9,7 +9,7 @@ use crate::runtime::{
 };
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
-    print_warning_line, status_label, status_marker, summarize_server_auth,
+    print_reason, print_warning_line, status_label, status_marker, summarize_server_auth,
     summarize_server_target, summarize_server_transport,
 };
 
@@ -684,6 +684,7 @@ pub(crate) async fn cmd_status(
                         target,
                         s.tool_count
                     );
+                    print_reason(s);
                 }
 
                 if !auth_required_servers.is_empty() || !failed_servers.is_empty() {
@@ -702,7 +703,7 @@ pub(crate) async fn cmd_status(
                         print_label_value(
                             "Failed",
                             format!(
-                                "{} failed — run `plug doctor` to inspect connectivity and runtime context",
+                                "{} failed — the reason is under each server; Plug keeps retrying",
                                 failed_servers.join(", ")
                             ),
                         );
@@ -960,6 +961,7 @@ mod tests {
             availability: Default::default(),
             selected_protocol_era: None,
             selected_protocol_version: None,
+            error: None,
             last_seen: None,
         }];
         let json = status_json(
@@ -1020,6 +1022,7 @@ mod tests {
             availability: plug_core::types::Availability::Degraded,
             selected_protocol_era: None,
             selected_protocol_version: None,
+            error: None,
             last_seen: None,
         }];
         let json = status_json(
