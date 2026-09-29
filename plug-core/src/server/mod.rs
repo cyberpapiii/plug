@@ -321,19 +321,24 @@ pub(crate) fn resolve_stdio_command(command: &str, login_path: Option<&OsStr>) -
 }
 
 /// The PATH for stdio servers: the user's login-shell PATH on macOS, `None`
-/// elsewhere. A successful probe is cached for the life of the process. A
-/// failed one is not: after a reboot the login shell can take longer than the
-/// probe allows, and caching that failure left every Node server unable to
-/// find `node` until the daemon restarted. Until a probe succeeds, callers
-/// get the inherited PATH plus the standard Homebrew directories.
+/// elsewhere. A successful probe is cached for the life of the process and
+/// saved next to the config. A failed one is not cached: after a reboot the
+/// login shell can take longer than the probe allows, and caching that
+/// failure left every Node server unable to find `node` until the daemon
+/// restarted. Until a probe succeeds, callers get the PATH an earlier probe
+/// saved, so a boot does not wait on the shell, or else the inherited PATH
+/// plus the standard Homebrew directories.
 pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
     #[cfg(target_os = "macos")]
     {
         static CACHE: LoginPathCache = LoginPathCache::new();
         static FALLBACK: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
+        // Unit tests must not read or overwrite the developer's saved PATH.
+        let store = (!cfg!(test)).then(|| crate::config::config_dir().join(SAVED_LOGIN_PATH_FILE));
         let probed = cached_login_path(
             &CACHE,
             LOGIN_SHELL_PROBE_RETRY,
+            store,
             probe_login_shell_path(
                 "/bin/zsh",
                 &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
@@ -354,6 +359,8 @@ pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
 #[cfg(target_os = "macos")]
 struct LoginPathCache {
     path: std::sync::OnceLock<OsString>,
+    /// The PATH an earlier successful probe saved to disk, read once.
+    saved: std::sync::OnceLock<Option<OsString>>,
     /// When the last probe failed. The lock also keeps concurrent server
     /// starts from probing at once.
     last_failure: tokio::sync::Mutex<Option<tokio::time::Instant>>,
@@ -364,6 +371,7 @@ impl LoginPathCache {
     const fn new() -> Self {
         Self {
             path: std::sync::OnceLock::new(),
+            saved: std::sync::OnceLock::new(),
             last_failure: tokio::sync::Mutex::const_new(None),
         }
     }
@@ -373,30 +381,85 @@ impl LoginPathCache {
 /// is older than `retry_after`. The probe runs on a spawned task, so a caller
 /// cancelled mid-probe (a start timeout shorter than the probe's) cannot
 /// leave it half done and make the next start pay for it again.
+///
+/// When `store` holds a PATH from an earlier successful probe, callers get it
+/// at once and the probe refreshes the cache and the file in the background.
+/// Right after a reboot the probe can take its full timeout, and every stdio
+/// server would otherwise wait on it.
 #[cfg(target_os = "macos")]
 async fn cached_login_path(
     cache: &'static LoginPathCache,
     retry_after: Duration,
+    store: Option<PathBuf>,
     probe: impl Future<Output = Option<OsString>> + Send + 'static,
 ) -> Option<&'static OsStr> {
-    if cache.path.get().is_none() {
-        let _ = tokio::spawn(async move {
-            let mut last_failure = cache.last_failure.lock().await;
-            if cache.path.get().is_some()
-                || last_failure.is_some_and(|at| at.elapsed() < retry_after)
-            {
-                return;
-            }
-            match probe.await {
-                Some(path) => {
-                    let _ = cache.path.set(path);
-                }
-                None => *last_failure = Some(tokio::time::Instant::now()),
-            }
-        })
-        .await;
+    if let Some(path) = cache.path.get() {
+        return Some(path);
     }
+    let saved = cache
+        .saved
+        .get_or_init(|| store.as_deref().and_then(read_saved_login_path));
+    let refresh = tokio::spawn(async move {
+        let mut last_failure = cache.last_failure.lock().await;
+        if cache.path.get().is_some() || last_failure.is_some_and(|at| at.elapsed() < retry_after) {
+            return;
+        }
+        match probe.await {
+            Some(path) => {
+                if let Some(store) = &store {
+                    save_login_path(store, &path);
+                }
+                let _ = cache.path.set(path);
+            }
+            None => *last_failure = Some(tokio::time::Instant::now()),
+        }
+    });
+    if let Some(saved) = saved {
+        return Some(saved);
+    }
+    let _ = refresh.await;
     cache.path.get().map(OsString::as_os_str)
+}
+
+/// The file in the config directory that holds the last successful probe's
+/// PATH.
+#[cfg(target_os = "macos")]
+const SAVED_LOGIN_PATH_FILE: &str = "login-shell-path";
+
+/// A saved PATH, or `None` when the file is missing, not UTF-8, or names no
+/// absolute directory.
+#[cfg(target_os = "macos")]
+fn read_saved_login_path(store: &Path) -> Option<OsString> {
+    let contents = std::fs::read_to_string(store).ok()?;
+    let path = contents.trim();
+    std::env::split_paths(path)
+        .any(|dir| dir.is_absolute())
+        .then(|| OsString::from(path))
+}
+
+/// Save the PATH atomically, readable only by the user. A failure costs the
+/// next boot the probe's wait and nothing else, so it is only logged.
+#[cfg(target_os = "macos")]
+fn save_login_path(store: &Path, path: &OsStr) {
+    use std::io::Write;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let temp = store.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
+    let result = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&temp)
+        .and_then(|mut file| {
+            file.write_all(path.as_bytes())?;
+            file.sync_all()
+        })
+        .and_then(|()| std::fs::rename(&temp, store));
+    if let Err(error) = result {
+        let _ = std::fs::remove_file(&temp);
+        tracing::debug!(%error, path = %store.display(), "could not save the login shell PATH");
+    }
 }
 
 /// The inherited PATH plus the Homebrew directories where `node`, `npx`, and
@@ -2732,7 +2795,7 @@ mod tests {
 
         let cancelled = tokio::time::timeout(
             Duration::from_millis(50),
-            cached_login_path(&CACHE, Duration::from_secs(30), probe()),
+            cached_login_path(&CACHE, Duration::from_secs(30), None, probe()),
         )
         .await;
         assert!(cancelled.is_err(), "caller should time out mid-probe");
@@ -2744,7 +2807,7 @@ mod tests {
             "the probe must finish and fill the cache after its caller is gone"
         );
         assert_eq!(
-            cached_login_path(&CACHE, Duration::from_secs(30), probe()).await,
+            cached_login_path(&CACHE, Duration::from_secs(30), None, probe()).await,
             Some(OsStr::new("/bin"))
         );
     }
@@ -2759,22 +2822,108 @@ mod tests {
         let failing = || async { None };
         let working = || async { Some(OsString::from("/opt/homebrew/bin")) };
 
-        assert_eq!(cached_login_path(&CACHE, retry, failing()).await, None);
         assert_eq!(
-            cached_login_path(&CACHE, retry, working()).await,
+            cached_login_path(&CACHE, retry, None, failing()).await,
+            None
+        );
+        assert_eq!(
+            cached_login_path(&CACHE, retry, None, working()).await,
             None,
             "a probe inside the retry window is skipped"
         );
         tokio::time::sleep(retry * 2).await;
         assert_eq!(
-            cached_login_path(&CACHE, retry, working()).await,
+            cached_login_path(&CACHE, retry, None, working()).await,
             Some(OsStr::new("/opt/homebrew/bin"))
         );
         assert_eq!(
-            cached_login_path(&CACHE, retry, failing()).await,
+            cached_login_path(&CACHE, retry, None, failing()).await,
             Some(OsStr::new("/opt/homebrew/bin")),
             "a successful probe is kept"
         );
+    }
+
+    /// Right after a reboot the probe can take its full 5s timeout. A PATH
+    /// saved by an earlier probe must be used at once, not after the probe.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_saved_login_path_is_used_without_waiting_for_the_probe() {
+        static CACHE: LoginPathCache = LoginPathCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
+        std::fs::write(&store, "/saved/bin:/usr/bin\n").unwrap();
+        let slow = async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            Some(OsString::from("/probed/bin"))
+        };
+
+        let started = std::time::Instant::now();
+        assert_eq!(
+            cached_login_path(&CACHE, Duration::from_secs(30), Some(store.clone()), slow).await,
+            Some(OsStr::new("/saved/bin:/usr/bin"))
+        );
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "the saved PATH must not wait for the probe"
+        );
+
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert_eq!(
+            cached_login_path(
+                &CACHE,
+                Duration::from_secs(30),
+                Some(store.clone()),
+                async { None }
+            )
+            .await,
+            Some(OsStr::new("/probed/bin")),
+            "the background probe replaces the saved PATH"
+        );
+        assert_eq!(std::fs::read_to_string(&store).unwrap(), "/probed/bin");
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_successful_probe_is_saved_for_the_next_boot() {
+        static CACHE: LoginPathCache = LoginPathCache::new();
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
+
+        assert_eq!(
+            cached_login_path(
+                &CACHE,
+                Duration::from_secs(30),
+                Some(store.clone()),
+                async { Some(OsString::from("/probed/bin")) }
+            )
+            .await,
+            Some(OsStr::new("/probed/bin"))
+        );
+        assert_eq!(
+            read_saved_login_path(&store),
+            Some(OsString::from("/probed/bin"))
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_unusable_saved_login_path_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
+        assert_eq!(read_saved_login_path(&store), None, "missing");
+        std::fs::write(&store, "").unwrap();
+        assert_eq!(read_saved_login_path(&store), None, "empty");
+        std::fs::write(&store, " \n").unwrap();
+        assert_eq!(read_saved_login_path(&store), None, "blank");
+        std::fs::write(&store, "relative/bin").unwrap();
+        assert_eq!(read_saved_login_path(&store), None, "no absolute dir");
+        std::fs::write(&store, [0xff, 0xfe, b'/']).unwrap();
+        assert_eq!(read_saved_login_path(&store), None, "not UTF-8");
     }
 
     #[cfg(target_os = "macos")]

@@ -14,6 +14,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   failure until the daemon restarted, so `node` and `npx` could not be found.
   It now retries the lookup and falls back to the Homebrew directories
   meanwhile.
+- Stdio servers start about five seconds sooner after a reboot. Plug saves the
+  PATH its last login-shell lookup found and uses it at once, refreshing it in
+  the background, instead of waiting on a login shell that is still slow.
 - `scripts/perf.sh` measures the journeys Plug owns against the installed
   app: connector startup, tools/list, ping and call overhead, and from the
   logs, per-server call latency, daemon startup, and the daemon swap gap.
