@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Node-based stdio servers such as Figma no longer stay down after a reboot.
+  When the login shell was too slow to report its PATH at boot, Plug kept that
+  failure until the daemon restarted, so `node` and `npx` could not be found.
+  It now retries the lookup and falls back to the Homebrew directories
+  meanwhile.
 - `scripts/perf.sh` measures the journeys Plug owns against the installed
   app: connector startup, tools/list, ping and call overhead, and from the
   logs, per-server call latency, daemon startup, and the daemon swap gap.
