@@ -9,10 +9,17 @@ enum ServerHealth: Equatable, Sendable {
     case starting
     case signInNeeded
     case down
+    /// Configured, but the daemon has been up for a while and still reports
+    /// nothing about it. Usually a server added to the file without a reload.
+    case notLoaded
     case off
     case unknown
 
-    init(daemonValue: String?, enabled: Bool) {
+    /// How long a running daemon may say nothing about a configured server
+    /// before that silence stops meaning "still starting".
+    static let notLoadedAfterSecs: UInt64 = 60
+
+    init(daemonValue: String?, enabled: Bool, daemonUptimeSecs: UInt64 = 0) {
         guard enabled else {
             self = .off
             return
@@ -21,6 +28,7 @@ enum ServerHealth: Equatable, Sendable {
         // Degraded still routes calls, so it reads as running rather than
         // as an unknown state that asks for attention.
         case "Healthy", "Degraded": self = .working
+        case nil where daemonUptimeSecs > Self.notLoadedAfterSecs: self = .notLoaded
         case "Starting", nil: self = .starting
         case "AuthRequired": self = .signInNeeded
         case "Failed": self = .down
@@ -36,6 +44,7 @@ enum ServerHealth: Equatable, Sendable {
         case .starting: "Starting"
         case .signInNeeded: "Sign-in needed"
         case .down: "Down"
+        case .notLoaded: "Not loaded"
         case .off: "Off"
         case .unknown: "Unknown"
         }
@@ -44,7 +53,7 @@ enum ServerHealth: Equatable, Sendable {
     /// True when this server is the reason someone opened Plug.
     var needsAttention: Bool {
         switch self {
-        case .signInNeeded, .down, .unknown: true
+        case .signInNeeded, .down, .notLoaded, .unknown: true
         case .working, .starting, .off: false
         }
     }
@@ -119,8 +128,16 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         switch health {
         case .signInNeeded: .init(isSigningIn ? "Try Again" : "Sign In", .signIn(server: name))
         case .down, .unknown: .init("Restart", .restartServer(name))
+        case .notLoaded: .init("Reload", .reloadConfiguration)
         case .working, .starting, .off: nil
         }
+    }
+
+    /// What is wrong, for a server whose fix is not a sign-in.
+    var problem: String {
+        health == .notLoaded
+            ? "Plug has not loaded this server. Reloading the configuration starts it."
+            : "Plug couldn't reach this server."
     }
 
     /// Stops a sign-in that is open in the browser.
@@ -411,7 +428,9 @@ enum PlugVerdict {
                     tone: .attention,
                     symbol: "bolt.trianglebadge.exclamationmark",
                     title: "\(only.name) is \(only.health.label.lowercased())",
-                    detail: only.error ?? "All other servers are running.",
+                    detail: only.health == .notLoaded
+                        ? only.problem
+                        : only.error ?? "All other servers are running.",
                     primary: only.fix
                 )
             }

@@ -108,7 +108,7 @@ struct ServerDetailView: View {
 
     private func problemCard(_ button: Verdict.Button) -> some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
-            Text("Plug couldn't reach this server.").font(.callout.weight(.medium))
+            Text(server.problem).font(.callout.weight(.medium))
             if let error = server.error, !error.isEmpty {
                 Text(error)
                     .font(.caption.monospaced())

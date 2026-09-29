@@ -94,7 +94,7 @@ struct PlugPopover: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
-                Text(serversSummary)
+                Text(Self.serversSummary(situation, stale: model.dataIsStale))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
                     .contentTransition(.numericText())
@@ -113,6 +113,8 @@ struct PlugPopover: View {
                 .padding(.horizontal, Metric.tight)
                 .padding(.bottom, Metric.tight)
             }
+            // The rows are what the daemon said last, not what it says now.
+            .opacity(model.dataIsStale ? 0.55 : 1)
             .frame(height: listHeight)
             .scrollBounceBehavior(.basedOnSize)
             .scrollFade(enabled: servers.count > Metric.popoverVisibleRows)
@@ -128,14 +130,19 @@ struct PlugPopover: View {
         return CGFloat(rows) * Metric.popoverRowHeight + partial + Metric.tight
     }
 
-    private var serversSummary: String {
+    /// Stale rows say so, the way the Servers page does, so a list read
+    /// before the daemon went away is not taken for the current state.
+    static func serversSummary(_ situation: PlugSituation, stale: Bool) -> String {
         let working = situation.workingServers.count
-        let total = servers.count
+        let total = situation.activeServers.count
+        let summary: String
         if working == total {
             let tools = situation.totalTools
-            return tools == 1 ? "1 tool" : "\(tools) tools"
+            summary = tools == 1 ? "1 tool" : "\(tools) tools"
+        } else {
+            summary = "\(working) of \(total) running"
         }
-        return "\(working) of \(total) running"
+        return stale ? "Last known · \(summary)" : summary
     }
 
     // MARK: - Connected apps
@@ -253,6 +260,15 @@ private struct PanelServerRow: View {
         .onHover { hovering = $0 }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(server.name), \(server.health.label)")
+        // Combining the row hides the button inside it from VoiceOver, so
+        // the same fix is offered as a named action on the row.
+        .accessibilityActions {
+            if let cancel = server.cancelSignIn {
+                Button(cancel.title) { run(cancel.intent) }
+            } else if server.health.needsAttention, let fix = server.fix {
+                Button(fix.title) { run(fix.intent) }
+            }
+        }
     }
 
     @ViewBuilder private var trailing: some View {

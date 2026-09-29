@@ -52,11 +52,15 @@ extension ServerHealth {
         switch self {
         case .working: .green
         case .starting: .secondary
-        case .signInNeeded: .orange
+        case .signInNeeded, .notLoaded: .orange
         case .down, .unknown: .red
         case .off: .secondary
         }
     }
+
+    /// Motion means "wait, this is changing". A server that is simply up is
+    /// not changing, and a whole column of pulsing dots read as unsettled.
+    var pulses: Bool { isSettling }
 
     /// Shape, not just colour, carries the state.
     var symbol: String {
@@ -65,6 +69,7 @@ extension ServerHealth {
         case .starting: "circle.dotted"
         case .signInNeeded: "person.badge.key.fill"
         case .down: "exclamationmark.circle.fill"
+        case .notLoaded: "circle.dashed"
         case .unknown: "questionmark.circle.fill"
         case .off: "circle.slash"
         }
@@ -79,44 +84,28 @@ struct StatusGlyph: View {
     let health: ServerHealth
     var size: Font = .body
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var livePulse = false
 
     var body: some View {
         Group {
             if health == .working {
                 ZStack {
                     Circle()
-                        .fill(health.color.opacity(livePulse ? 0.16 : 0.07))
-                        .frame(width: 16, height: 16)
-                        .scaleEffect(livePulse ? 1 : 0.72)
+                        .fill(health.color.opacity(0.12))
+                        .frame(width: 14, height: 14)
                     Circle()
                         .fill(health.color)
                         .frame(width: 7, height: 7)
                 }
-                .animation(
-                    reduceMotion
-                        ? nil
-                        : .easeInOut(duration: 1.35).repeatForever(autoreverses: true),
-                    value: livePulse
-                )
             } else {
                 Image(systemName: health.symbol)
                     .font(size)
                     .foregroundStyle(health.color)
                     .symbolRenderingMode(.hierarchical)
+                    .symbolEffect(.pulse, options: .repeating, isActive: health.pulses && !reduceMotion)
             }
         }
         .frame(width: 18, height: 18)
         .accessibilityLabel(health.label)
-        .onAppear {
-            livePulse = health == .working && !reduceMotion
-        }
-        .onChange(of: health) { _, newHealth in
-            livePulse = newHealth == .working && !reduceMotion
-        }
-        .onChange(of: reduceMotion) { _, isReduced in
-            livePulse = health == .working && !isReduced
-        }
     }
 }
 

@@ -217,6 +217,41 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).symbol, "circle.fill")
     }
 
+    /// Only a state that is changing moves. A running server used to pulse,
+    /// so a healthy list looked busy.
+    func testOnlySettlingServersPulse() {
+        XCTAssertTrue(ServerHealth.starting.pulses)
+        for health in [ServerHealth.working, .signInNeeded, .down, .notLoaded, .off, .unknown] {
+            XCTAssertFalse(health.pulses, "\(health) should hold still")
+        }
+    }
+
+    /// A server with no runtime status used to read "Starting" forever. After
+    /// the daemon has been up a minute, silence means it was never loaded.
+    func testAServerTheDaemonNeverLoadedSaysSoAndOffersAReload() {
+        XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 5), .starting)
+        XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 61), .notLoaded)
+        XCTAssertEqual(ServerHealth(daemonValue: "Starting", enabled: true, daemonUptimeSecs: 600), .starting)
+        XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: false, daemonUptimeSecs: 600), .off)
+
+        let missing = server("Linear", health: .notLoaded)
+        XCTAssertEqual(missing.fix, .init("Reload", .reloadConfiguration))
+        let verdict = PlugVerdict.verdict(
+            for: PlugSituation(runtime: .running, servers: [missing, server("ok")])
+        )
+        XCTAssertEqual(verdict.title, "Linear is not loaded")
+        XCTAssertEqual(verdict.primary?.intent, .reloadConfiguration)
+        XCTAssertEqual(verdict.tone, .attention)
+    }
+
+    /// The panel's rows used to look current after the daemon went away.
+    @MainActor
+    func testThePanelSaysWhenItsRowsAreOnlyLastKnown() {
+        let situation = PlugSituation(runtime: .reconnecting, servers: [server("a", tools: 3)])
+        XCTAssertEqual(PlugPopover.serversSummary(situation, stale: false), "3 tools")
+        XCTAssertEqual(PlugPopover.serversSummary(situation, stale: true), "Last known · 3 tools")
+    }
+
     func testConnectedAppsGroupSessionsByAppInFirstSeenOrder() {
         let targets = AppIcons.distinctTargets(forClientTypes: [
             "claude-code", "Codex CLI", "claude-code", "Claude Desktop"

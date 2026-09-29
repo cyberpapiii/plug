@@ -809,6 +809,55 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(performed, [.signIn(server: "alpha"), .reveal(server: "alpha")])
     }
 
+    /// Launch used to wait for the whole installation pass, about four
+    /// seconds, before asking a daemon that was already running anything.
+    @MainActor
+    func testLaunchReadsTheDaemonWhileTheInstallIsOnlyBeingInspected() async throws {
+        let events = LockedEvents()
+        let gate = AsyncGate()
+        let coordinator = RecordingInstallationCoordinator(
+            state: .reconcilingUpdate(.inspecting),
+            events: events,
+            operation: { await gate.wait() }
+        )
+        let server = try OperatorFixtureServer(events: events)
+        defer { server.stop() }
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL()
+        )
+
+        let started = Task { await model.start() }
+        await gate.enteredWait()
+        let read = await eventually { model.hasLoadedSnapshot }
+        XCTAssertTrue(read, "the running daemon is read while the pass only inspects")
+        XCTAssertEqual(model.connectionState, .ready)
+
+        // A phase that changes the install still keeps reads out.
+        coordinator.state = .reconcilingUpdate(.replacingDaemon)
+        let snapshots = events.values.filter { $0 == "ipc.snapshot" }.count
+        await model.refresh()
+        XCTAssertEqual(events.values.filter { $0 == "ipc.snapshot" }.count, snapshots)
+
+        coordinator.state = .healthy(makeInstallationSnapshot())
+        await gate.release()
+        await started.value
+        XCTAssertEqual(model.connectionState, .ready)
+    }
+
+    /// About used to say "Version unavailable" whenever the daemon was not
+    /// answering, though the app always knows its own version.
+    @MainActor
+    func testAboutFallsBackToTheAppVersion() {
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: "9.8.7"),
+            coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
+            clientVersion: "9.8.7"
+        )
+        XCTAssertEqual(model.displayVersion, "9.8.7")
+    }
+
     @MainActor
     func testNotificationsRequireExplicitOptIn() {
         let defaults = UserDefaults.standard
@@ -1005,6 +1054,11 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertEqual(ordered.map(\.id), ["failed", "auth", "healthy", "degraded"])
         XCTAssertEqual(ordered.map(\.health), [.down, .signInNeeded, .working, .working])
+
+        var missing = try presentation("missing", health: nil)
+        XCTAssertEqual(missing.health, .starting)
+        missing.daemonUptimeSecs = 300
+        XCTAssertEqual(missing.health, .notLoaded, "the daemon's uptime reaches the row")
     }
 
     @MainActor

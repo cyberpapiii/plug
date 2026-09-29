@@ -402,8 +402,5 @@ private struct AboutSettings: View {
         .padding(Metric.roomy)
     }
 
-    private var versionText: String {
-        let version = model.situation.version
-        return version.isEmpty ? "Version unavailable" : "Version \(version)"
-    }
+    private var versionText: String { "Version \(model.displayVersion)" }
 }
