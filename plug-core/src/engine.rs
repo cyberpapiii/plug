@@ -1494,51 +1494,63 @@ mod tests {
         engine.shutdown().await;
     }
 
-    /// Test 6: drives `do_reconnect` (via the public `reconnect_server` entry
-    /// point) end to end. "foo" is configured to hang past its 1s connect
-    /// timeout — every dial reliably fails with a retryable "timed out"
-    /// error, first appending a marker to `dial_log` so the test can count
-    /// real dial attempts deterministically (a wall-clock assertion would be
-    /// timing-sensitive; a file is not). A concurrent reload removes "foo"
-    /// while attempt 1 is still in flight — well before the retry-loop's
-    /// early-exit check runs at the top of attempt 2 — so the loop must
-    /// abandon without dialing again.
-    ///
-    /// Seam note: this works because `do_reconnect`'s retry loop has an
-    /// explicit synchronization point (the inter-attempt sleep) and only
-    /// needs attempt 1 to *fail*, which a command that hangs past
-    /// `timeout_secs` gives deterministically. `restart_server` (test 5) has
-    /// no retry loop — its only window is the single in-flight connect, which
-    /// would need to *succeed* after the interleaving to reach the commit
-    /// call at all; that requires a mock upstream that starts failing then
-    /// starts succeeding on a fixed config, which no existing fixture
-    /// provides. Per the plan, test 5 (and test 7, which has the same
-    /// fail-then-succeed requirement) are documented here as not driveable
-    /// without building new mock-server machinery, rather than built.
+    /// Remove the server after its first initialize request arrives, then
+    /// release a retryable failure. Channels fix that ordering independently
+    /// of shell startup, process scheduling, and connection timeouts.
     #[tokio::test]
     async fn reconnect_abandons_between_retries_when_server_removed() {
-        let dial_log = tempfile::NamedTempFile::new().expect("create dial log");
-        let dial_log_path = dial_log.path().to_string_lossy().to_string();
+        let (attempt_tx, mut attempt_rx) = tokio::sync::mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Notify::new());
+        let dial_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let app = axum::Router::new().route(
+            "/mcp",
+            axum::routing::post({
+                let release = Arc::clone(&release);
+                let dial_count = Arc::clone(&dial_count);
+                move || {
+                    let release = Arc::clone(&release);
+                    let dial_count = Arc::clone(&dial_count);
+                    let attempt_tx = attempt_tx.clone();
+                    async move {
+                        dial_count.fetch_add(1, Ordering::SeqCst);
+                        attempt_tx.send(()).expect("report initialize attempt");
+                        release.notified().await;
+                        axum::http::StatusCode::NOT_FOUND
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test upstream");
+        let address = listener.local_addr().expect("test upstream address");
+        let stop_upstream = tokio_util::sync::CancellationToken::new();
+        let upstream_task = {
+            let stop = stop_upstream.clone();
+            tokio::spawn(async move {
+                axum::serve(listener, app)
+                    .with_graceful_shutdown(stop.cancelled_owned())
+                    .await
+                    .expect("serve test upstream");
+            })
+        };
 
         let mut config = Config::default();
         config.servers.insert(
             "foo".to_string(),
             crate::config::ServerConfig {
-                command: Some("sh".to_string()),
-                args: vec![
-                    "-c".to_string(),
-                    format!("echo dial >> {dial_log_path}; sleep 5"),
-                ],
+                command: None,
+                args: Vec::new(),
                 env: HashMap::new(),
                 enabled: true,
-                transport: TransportType::Stdio,
+                transport: TransportType::Http,
                 protocol_mode: Default::default(),
-                url: None,
+                url: Some(format!("http://{address}/mcp")),
                 auth_token: None,
                 auth: None,
                 oauth_client_id: None,
                 oauth_scopes: None,
-                timeout_secs: 1,
+                timeout_secs: 30,
                 call_timeout_secs: 300,
                 max_concurrent: 1,
                 health_check_interval_secs: 60,
@@ -1553,21 +1565,26 @@ mod tests {
 
         let engine = Arc::new(Engine::new(config));
 
-        // Remove "foo" partway through attempt 1's ~1s connect timeout —
-        // comfortably before the early-exit check at the top of attempt 2
-        // (which runs only after attempt 1 fails AND the 100ms inter-attempt
-        // sleep elapses, i.e. around the 1.1s mark).
-        let reload_engine = Arc::clone(&engine);
-        let reload_task = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            reload_engine
-                .reload_config(Config::default())
-                .await
-                .expect("reload succeeds");
-        });
+        let reconnect_task = {
+            let engine = Arc::clone(&engine);
+            tokio::spawn(async move { engine.reconnect_server("foo").await })
+        };
 
-        let result = engine.reconnect_server("foo").await;
-        reload_task.await.expect("reload task panicked");
+        tokio::time::timeout(Duration::from_secs(15), attempt_rx.recv())
+            .await
+            .expect("first initialize request arrives")
+            .expect("upstream reports the first attempt");
+        engine
+            .reload_config(Config::default())
+            .await
+            .expect("reload succeeds");
+        // A permit is retained even if the handler has not yet started waiting.
+        release.notify_one();
+
+        let result = tokio::time::timeout(Duration::from_secs(15), reconnect_task)
+            .await
+            .expect("removed server stops reconnecting")
+            .expect("reconnect task panicked");
 
         assert!(
             result.is_ok(),
@@ -1579,16 +1596,15 @@ mod tests {
             "removed server must not be resurrected"
         );
 
-        let dial_count = std::fs::read_to_string(&dial_log_path)
-            .expect("read dial log")
-            .lines()
-            .count();
         assert_eq!(
-            dial_count, 1,
+            dial_count.load(Ordering::SeqCst),
+            1,
             "retry loop must abandon before dialing again once the server is gone"
         );
 
         engine.shutdown().await;
+        stop_upstream.cancel();
+        upstream_task.await.expect("upstream task panicked");
     }
 
     #[test]
