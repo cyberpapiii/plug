@@ -359,12 +359,22 @@ impl StdioPathSource {
 
 /// [`stdio_login_path`] and where it came from.
 async fn stdio_path() -> (Option<&'static OsStr>, StdioPathSource) {
-    #[cfg(target_os = "macos")]
+    // Unit tests use the test runner's PATH. A real login shell can outlive
+    // Tokio's paused clock and consume a test's virtual retry window. The
+    // probe and cache have their own tests below with controlled inputs.
+    #[cfg(all(target_os = "macos", test))]
+    {
+        static PATH: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
+        (
+            PATH.get_or_init(|| std::env::var_os("PATH")).as_deref(),
+            StdioPathSource::Inherited,
+        )
+    }
+    #[cfg(all(target_os = "macos", not(test)))]
     {
         static CACHE: LoginPathCache = LoginPathCache::new();
         static FALLBACK: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
-        // Unit tests must not read or overwrite the developer's saved PATH.
-        let store = (!cfg!(test)).then(|| crate::config::config_dir().join(SAVED_LOGIN_PATH_FILE));
+        let store = Some(crate::config::config_dir().join(SAVED_LOGIN_PATH_FILE));
         let probed = cached_login_path(
             &CACHE,
             LOGIN_SHELL_PROBE_RETRY,
@@ -552,12 +562,12 @@ fn fallback_stdio_path(inherited: Option<OsString>) -> OsString {
 }
 
 /// A failed probe is retried on the next stdio start after this long.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 const LOGIN_SHELL_PROBE_RETRY: Duration = Duration::from_secs(30);
 
 /// An interactive login shell runs the user's dotfiles, which can hang. A stuck
 /// shell delays the first stdio start by at most this long, never forever.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", not(test)))]
 const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "macos")]
