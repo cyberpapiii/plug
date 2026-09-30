@@ -11,7 +11,7 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as
   found; no sweep.
-- Live downstream OAuth certification is done only for Claude Desktop. ChatGPT,
+- Live downstream OAuth certification is done for Claude Desktop and ChatGPT.
   Codex, Cursor, OpenCode, and a real WebKit platform-passkey ceremony are
   unproven.
 - The five signed PlugApp fixture tests run only on a Developer ID host, which

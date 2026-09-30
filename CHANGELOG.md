@@ -7,6 +7,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Fixed
+
+- Remote OAuth clients such as ChatGPT can connect when their client metadata
+  lists `none` among supported authentication methods, even when their legacy
+  preference is `private_key_jwt`. Older metadata and dynamic registration keep
+  their existing checks. Unsupported token assertions and authorization headers
+  are rejected instead of being silently ignored; PKCE and owner consent remain
+  required.
+
 ### Changed
 
 - `plug doctor` can come back clean. With downstream OAuth it now fetches the
