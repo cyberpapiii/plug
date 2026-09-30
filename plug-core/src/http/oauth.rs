@@ -327,6 +327,7 @@ pub(super) async fn oauth_owner_enroll_complete(
 
 pub(super) async fn oauth_token(
     State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
     params: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
     let Some(manager) = &state.downstream_oauth else {
@@ -338,6 +339,14 @@ pub(super) async fn oauth_token(
     };
     if params.contains_key("client_secret") {
         return oauth_error_response(&DownstreamOauthError::UnsupportedClientAuthMethod);
+    }
+    // This endpoint advertises only public-client authentication. Never ignore
+    // an assertion or an Authorization header and treat it as verified.
+    if params.contains_key("client_assertion")
+        || params.contains_key("client_assertion_type")
+        || headers.contains_key(header::AUTHORIZATION)
+    {
+        return oauth_error_response(&DownstreamOauthError::InvalidClient);
     }
     let Some(client_id) = params.get("client_id") else {
         return oauth_error_response(&DownstreamOauthError::InvalidClient);

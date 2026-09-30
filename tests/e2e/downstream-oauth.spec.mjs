@@ -140,6 +140,8 @@ class PlugProcess {
     const configPath = join(root, "config.toml");
     const environment = {
       ...process.env,
+      // Run the isolated fixture binary, never delegate to the installed app.
+      PLUG_DEV: "1",
       HOME: root,
       XDG_CONFIG_HOME: join(root, "config"),
       XDG_CACHE_HOME: join(root, "cache"),

@@ -3017,6 +3017,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn token_endpoint_rejects_unsupported_auth_without_consuming_refresh_token() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let (client_id, grant) = issue_test_oauth_grant(&manager, "tools:read").await;
+        let refresh_token = grant.refresh_token.expect("refresh token");
+        let app = build_router(oauth_test_state_with_manager(manager));
+        for (extra, authorization) in [
+            ("&client_assertion=fake-assertion", None),
+            (
+                "&client_assertion_type=urn%3Aietf%3Aparams%3Aoauth%3Aclient-assertion-type%3Ajwt-bearer",
+                None,
+            ),
+            ("&client_assertion=&client_assertion_type=", None),
+            ("", Some("Basic ZmFrZTpmYWtl")),
+            ("", Some("Bearer fake-token")),
+            ("", None),
+        ] {
+            let mut request = HttpRequest::builder()
+                .method("POST")
+                .uri("/oauth/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded");
+            if let Some(authorization) = authorization {
+                request = request.header(header::AUTHORIZATION, authorization);
+            }
+            let response = app.clone().oneshot(request.body(Body::from(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}&resource=https%3A%2F%2Fplug.example.com%2Fmcp{extra}"
+            ))).unwrap()).await.unwrap();
+            let status = response.status();
+            let body = axum::body::to_bytes(response.into_body(), 10_000)
+                .await
+                .unwrap();
+            let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            if extra.is_empty() && authorization.is_none() {
+                assert_eq!(status, StatusCode::OK);
+                assert!(value["access_token"].is_string());
+            } else {
+                assert_eq!(
+                    status,
+                    StatusCode::UNAUTHORIZED,
+                    "{extra} {authorization:?}"
+                );
+                assert_eq!(value["error"], "invalid_client");
+                assert!(value.get("access_token").is_none());
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn legacy_oauth_principal_scopes_gate_method_families() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;

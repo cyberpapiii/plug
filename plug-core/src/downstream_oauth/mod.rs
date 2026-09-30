@@ -643,6 +643,7 @@ struct ClientMetadataDocument {
     client_name: Option<String>,
     redirect_uris: Vec<String>,
     token_endpoint_auth_method: Option<String>,
+    token_endpoint_auth_methods_supported: Option<Vec<String>>,
     grant_types: Option<Vec<String>>,
     response_types: Option<Vec<String>>,
 }
@@ -1812,6 +1813,32 @@ fn validate_metadata_document(
     // authorization server it can use. Require the flow Plug will select, but
     // do not reject unrelated extension capabilities. Dynamic registration is
     // authorization-server-specific and intentionally remains stricter.
+    // SEP-3149 clients publish all supported methods; the singular field is
+    // only a legacy preference in that case. Plug advertises only `none`, so
+    // require that exact intersection without accepting a confidential-only
+    // client as public. Older documents retain their singular-field behavior.
+    let public_client_supported = match &document.token_endpoint_auth_methods_supported {
+        Some(methods) => methods.iter().any(|method| method == "none"),
+        None => {
+            document
+                .token_endpoint_auth_method
+                .as_deref()
+                .unwrap_or("none")
+                == "none"
+        }
+    };
+    // CIMD cannot establish a shared client secret. Reject such declarations
+    // even if the document also offers a public-client method.
+    let declares_shared_secret = document
+        .token_endpoint_auth_method
+        .iter()
+        .chain(
+            document
+                .token_endpoint_auth_methods_supported
+                .iter()
+                .flatten(),
+        )
+        .any(|method| method.starts_with("client_secret_"));
     if document.client_id != expected_client_id
         || document.redirect_uris.is_empty()
         || document.redirect_uris.len() > 10
@@ -1819,11 +1846,8 @@ fn validate_metadata_document(
             .redirect_uris
             .iter()
             .any(|uri| !valid_redirect_uri(uri))
-        || document
-            .token_endpoint_auth_method
-            .as_deref()
-            .unwrap_or("none")
-            != "none"
+        || !public_client_supported
+        || declares_shared_secret
         || document
             .grant_types
             .as_ref()
@@ -2398,6 +2422,7 @@ fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+    use serde_json::json;
 
     fn temp_state_path() -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -4918,6 +4943,83 @@ mod tests {
         assert!(!valid_redirect_uri(
             "https://client.example/callback#fragment"
         ));
+    }
+
+    #[test]
+    fn metadata_auth_method_negotiation_accepts_public_client_intersection() {
+        // ChatGPT's published transition document declares a legacy preference,
+        // not a requirement, when the supported-method list is present.
+        let chatgpt: ClientMetadataDocument = serde_json::from_str(
+            r#"{
+                "client_id": "https://chatgpt.com/oauth/FX1pUhSigWrs/client.json",
+                "client_uri": "https://chatgpt.com/",
+                "redirect_uris": ["https://chatgpt.com/connector/oauth/FX1pUhSigWrs"],
+                "token_endpoint_auth_method": "private_key_jwt",
+                "token_endpoint_auth_methods_supported": ["none", "private_key_jwt"],
+                "grant_types": ["authorization_code", "refresh_token"],
+                "response_types": ["code"],
+                "client_name": "ChatGPT",
+                "token_endpoint_auth_signing_alg": "RS256",
+                "jwks_uri": "https://chatgpt.com/oauth/jwks.json"
+            }"#,
+        )
+        .expect("published ChatGPT metadata shape");
+        assert_eq!(
+            validate_metadata_document(&chatgpt.client_id, &chatgpt),
+            Ok(())
+        );
+
+        for methods in [
+            json!({}),
+            json!({"token_endpoint_auth_method": "none"}),
+            json!({"token_endpoint_auth_methods_supported": ["none"]}),
+            json!({"token_endpoint_auth_method": "private_key_jwt", "token_endpoint_auth_methods_supported": ["private_key_jwt", "none"]}),
+            json!({"token_endpoint_auth_methods_supported": ["future_method", "none"]}),
+        ] {
+            let mut value = json!({
+                "client_id": "https://client.example/metadata.json",
+                "redirect_uris": ["https://client.example/callback"]
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(methods.as_object().unwrap().clone());
+            let document: ClientMetadataDocument = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                validate_metadata_document(&document.client_id, &document),
+                Ok(()),
+                "{methods}"
+            );
+        }
+    }
+
+    #[test]
+    fn metadata_auth_method_negotiation_rejects_no_overlap_and_shared_secrets() {
+        for methods in [
+            json!({"token_endpoint_auth_methods_supported": []}),
+            json!({"token_endpoint_auth_methods_supported": ["private_key_jwt"]}),
+            json!({"token_endpoint_auth_method": "none", "token_endpoint_auth_methods_supported": ["private_key_jwt"]}),
+            json!({"token_endpoint_auth_method": "private_key_jwt"}),
+            json!({"token_endpoint_auth_method": "client_secret_basic", "token_endpoint_auth_methods_supported": ["none"]}),
+            json!({"token_endpoint_auth_methods_supported": ["none", "client_secret_post"]}),
+            json!({"token_endpoint_auth_methods_supported": ["none", "client_secret_jwt"]}),
+            json!({"token_endpoint_auth_methods_supported": ["none", "client_secret_basic"]}),
+        ] {
+            let mut value = json!({
+                "client_id": "https://client.example/metadata.json",
+                "redirect_uris": ["https://client.example/callback"]
+            });
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(methods.as_object().unwrap().clone());
+            let document: ClientMetadataDocument = serde_json::from_value(value).unwrap();
+            assert_eq!(
+                validate_metadata_document(&document.client_id, &document),
+                Err(DownstreamOauthError::InvalidClientMetadata),
+                "{methods}"
+            );
+        }
     }
 
     #[test]
