@@ -139,6 +139,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Tool calls no longer fail in Claude Code with "missing required resultType".
+  A local client that connected through `plug connect` on protocol `2026-07-28`
+  got every proxied tool result without that field and rejected it. The
+  connector now completes it on those sessions, including when the client opens
+  with a plain `initialize` that negotiates `2026-07-28`. Older clients are
+  unchanged.
 - Updating Plug.app no longer leaves about twelve seconds without a daemon.
   The replacement killed the daemon registration had just started, and
   launchd's respawn throttle held the restart back; the gap is now under two

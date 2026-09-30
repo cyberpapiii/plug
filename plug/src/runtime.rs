@@ -1273,6 +1273,9 @@ fn is_modern_stdio_message(value: &serde_json::Value) -> bool {
 struct StdioProtocolState {
     modern_confirmed: bool,
     pending_discovery_ids: std::collections::HashSet<String>,
+    /// Plain `initialize` requests that asked for `2026-07-28`. The era is
+    /// confirmed only when the reply negotiates that same version.
+    pending_modern_initialize_ids: std::collections::HashSet<String>,
 }
 
 impl StdioProtocolState {
@@ -1284,6 +1287,7 @@ impl StdioProtocolState {
         if !modern_downstream_enabled {
             self.modern_confirmed = false;
             self.pending_discovery_ids.clear();
+            self.pending_modern_initialize_ids.clear();
             return false;
         }
 
@@ -1296,12 +1300,17 @@ impl StdioProtocolState {
         if explicit_legacy_initialize {
             self.modern_confirmed = false;
             self.pending_discovery_ids.clear();
+            self.pending_modern_initialize_ids.clear();
             return false;
         }
 
         if method == Some("server/discover") {
             if let Some(id) = value.get("id") {
                 self.pending_discovery_ids.insert(id.to_string());
+            }
+        } else if method == Some("initialize") {
+            if let Some(id) = value.get("id") {
+                self.pending_modern_initialize_ids.insert(id.to_string());
             }
         } else if is_modern_stdio_message(value) {
             self.modern_confirmed = true;
@@ -1310,20 +1319,28 @@ impl StdioProtocolState {
     }
 
     fn observe_outbound(&mut self, value: &serde_json::Value) -> bool {
-        if let Some(id) = value.get("id")
-            && self.pending_discovery_ids.remove(&id.to_string())
-            && value.get("result").is_some()
-            && value.get("error").is_none()
-        {
-            self.modern_confirmed = true;
+        if let Some(id) = value.get("id") {
+            let id = id.to_string();
+            let discovered = self.pending_discovery_ids.remove(&id)
+                && value.get("result").is_some()
+                && value.get("error").is_none();
+            let negotiated_modern = self.pending_modern_initialize_ids.remove(&id)
+                && value
+                    .pointer("/result/protocolVersion")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+            if discovered || negotiated_modern {
+                self.modern_confirmed = true;
+            }
         }
         self.modern_confirmed
     }
 }
 
 /// Byte-level protocol adapter. Legacy sessions retain the exact SEP-1686
-/// request/response vocabulary; a gated modern session passes through without
-/// those rewrites, beginning with `server/discover` as its first message.
+/// request/response vocabulary; a gated modern session skips those rewrites and
+/// has `resultType` completed on every result, beginning with `server/discover`
+/// or an `initialize` that negotiates `2026-07-28` as its first message.
 fn stdio_transport(modern_gate: Arc<dyn Fn() -> bool + Send + Sync>) -> tokio::io::DuplexStream {
     bridge_transport(tokio::io::stdin(), tokio::io::stdout(), modern_gate)
 }
@@ -1404,7 +1421,9 @@ where
             } else {
                 false
             };
-            if !is_modern {
+            if is_modern {
+                plug_core::protocol::rewrite_modern_response(&mut value);
+            } else {
                 plug_core::protocol::rewrite_legacy_response(&mut value, task_response);
             }
             if let Ok(mut encoded) = serde_json::to_vec(&value) {
@@ -1766,7 +1785,7 @@ mod tests {
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore};
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt as _, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio_rustls::TlsConnector;
     use tower::util::ServiceExt;
 
@@ -1910,6 +1929,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn modern_initialize_confirms_the_era_only_when_the_reply_negotiates_it() {
+        let initialize = |id: u64| {
+            serde_json::json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "initialize",
+                "params": {"protocolVersion": "2026-07-28"}
+            })
+        };
+        let mut protocol = StdioProtocolState::default();
+        assert!(!protocol.observe_inbound(&initialize(1), true));
+        assert!(!protocol.observe_outbound(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {"protocolVersion": "2025-11-25"}
+        })));
+        assert!(!protocol.observe_inbound(&initialize(2), true));
+        assert!(protocol.observe_outbound(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "result": {"protocolVersion": "2026-07-28"}
+        })));
+        assert!(
+            !protocol.observe_inbound(&initialize(3), false),
+            "a live gate disable must clear the confirmed modern era"
+        );
+    }
+
     // Shared with the daemon and ipc_proxy test modules so all global runtime-path
     // tests serialize on one lock (see daemon::runtime_paths_test_lock).
     fn runtime_path_test_lock() -> &'static tokio::sync::Mutex<()> {
@@ -2015,6 +2063,262 @@ mod tests {
             .connect(server_name, tcp)
             .await
             .expect("complete tls handshake")
+    }
+
+    /// Host and service ends of a `bridge_transport`, driven line by line so a
+    /// test sees exactly what crosses the stdio seam in each direction.
+    struct BridgeHarness {
+        host_in: tokio::io::DuplexStream,
+        host_out: tokio::io::Lines<BufReader<tokio::io::DuplexStream>>,
+        service_in: tokio::io::Lines<BufReader<tokio::io::ReadHalf<tokio::io::DuplexStream>>>,
+        service_out: tokio::io::WriteHalf<tokio::io::DuplexStream>,
+    }
+
+    impl BridgeHarness {
+        fn new(modern_gate: bool) -> Self {
+            let (host_in, bridge_input) = tokio::io::duplex(64 * 1024);
+            let (bridge_output, host_out) = tokio::io::duplex(64 * 1024);
+            let service =
+                bridge_transport(bridge_input, bridge_output, Arc::new(move || modern_gate));
+            let (service_read, service_out) = tokio::io::split(service);
+            Self {
+                host_in,
+                host_out: BufReader::new(host_out).lines(),
+                service_in: BufReader::new(service_read).lines(),
+                service_out,
+            }
+        }
+
+        /// Send `request` from the host, have the service answer it with
+        /// `reply_body` (`{"result": ..}` or `{"error": ..}`), and return what
+        /// the host receives back.
+        async fn round_trip(
+            &mut self,
+            request: serde_json::Value,
+            reply_body: serde_json::Value,
+        ) -> serde_json::Value {
+            let step = Duration::from_secs(5);
+            let mut line = serde_json::to_vec(&request).expect("encode request");
+            line.push(b'\n');
+            self.host_in.write_all(&line).await.expect("host write");
+            tokio::time::timeout(step, self.service_in.next_line())
+                .await
+                .expect("service receives the forwarded request")
+                .expect("service read")
+                .expect("service line");
+            let mut reply = serde_json::json!({"jsonrpc": "2.0", "id": request["id"]});
+            reply
+                .as_object_mut()
+                .expect("reply object")
+                .extend(reply_body.as_object().expect("reply body object").clone());
+            let mut line = serde_json::to_vec(&reply).expect("encode reply");
+            line.push(b'\n');
+            self.service_out
+                .write_all(&line)
+                .await
+                .expect("service write");
+            let line = tokio::time::timeout(step, self.host_out.next_line())
+                .await
+                .expect("host receives the reply")
+                .expect("host read")
+                .expect("host line");
+            serde_json::from_str(&line).expect("reply is JSON")
+        }
+    }
+
+    const MODERN_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+    fn modern_tools_call(id: u64) -> serde_json::Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": "Context7__resolve_library_id",
+                "arguments": {},
+                "_meta": {MODERN_META_KEY: "2026-07-28"}
+            }
+        })
+    }
+
+    fn proxied_tool_result() -> serde_json::Value {
+        serde_json::json!({"result": {"content": [], "isError": false}})
+    }
+
+    #[tokio::test]
+    async fn stdio_modern_discovery_session_completes_proxied_tool_results() {
+        let mut bridge = BridgeHarness::new(true);
+        let discovered = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {}
+                }),
+                serde_json::json!({"result": {
+                    "resultType": "complete",
+                    "supportedVersions": ["2026-07-28"]
+                }}),
+            )
+            .await;
+        assert_eq!(discovered["result"]["resultType"], "complete");
+
+        let called = bridge
+            .round_trip(modern_tools_call(2), proxied_tool_result())
+            .await;
+        assert_eq!(called["result"]["resultType"], "complete");
+        assert_eq!(called["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn stdio_plain_initialize_at_modern_version_completes_proxied_tool_results() {
+        let mut bridge = BridgeHarness::new(true);
+        let initialized = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": {},
+                        "clientInfo": {"name": "modern-initialize", "version": "1.0"}
+                    }
+                }),
+                serde_json::json!({"result": {
+                    "protocolVersion": "2026-07-28",
+                    "capabilities": {},
+                    "serverInfo": {"name": "plug", "version": "0"}
+                }}),
+            )
+            .await;
+        assert_eq!(initialized["result"]["protocolVersion"], "2026-07-28");
+        assert_eq!(initialized["result"]["resultType"], "complete");
+
+        // A plain-initialize client carries no per-request protocol metadata.
+        let called = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "Context7__resolve_library_id", "arguments": {}}
+                }),
+                proxied_tool_result(),
+            )
+            .await;
+        assert_eq!(called["result"]["resultType"], "complete");
+    }
+
+    #[tokio::test]
+    async fn stdio_modern_session_keeps_input_required_and_errors_unchanged() {
+        let mut bridge = BridgeHarness::new(true);
+        bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "server/discover",
+                    "params": {}
+                }),
+                serde_json::json!({"result": {"supportedVersions": ["2026-07-28"]}}),
+            )
+            .await;
+
+        let input = bridge
+            .round_trip(
+                modern_tools_call(2),
+                serde_json::json!({"result": {"resultType": "input_required"}}),
+            )
+            .await;
+        assert_eq!(input["result"]["resultType"], "input_required");
+
+        let failed = bridge
+            .round_trip(
+                modern_tools_call(3),
+                serde_json::json!({"error": {"code": -32602, "message": "bad"}}),
+            )
+            .await;
+        assert_eq!(failed["error"]["code"], -32602);
+        assert!(failed.get("result").is_none());
+    }
+
+    #[tokio::test]
+    async fn stdio_legacy_initialize_session_still_omits_result_type() {
+        let mut bridge = BridgeHarness::new(true);
+        let initialized = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2025-11-25",
+                        "capabilities": {},
+                        "clientInfo": {"name": "legacy", "version": "1.0"}
+                    }
+                }),
+                serde_json::json!({"result": {
+                    "protocolVersion": "2025-11-25",
+                    "capabilities": {},
+                    "serverInfo": {"name": "plug", "version": "0"}
+                }}),
+            )
+            .await;
+        assert!(initialized["result"].get("resultType").is_none());
+
+        let called = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "Context7__resolve_library_id", "arguments": {}}
+                }),
+                serde_json::json!({"result": {
+                    "resultType": "complete",
+                    "content": [],
+                    "isError": false
+                }}),
+            )
+            .await;
+        assert!(called["result"].get("resultType").is_none());
+        assert_eq!(called["result"]["isError"], false);
+    }
+
+    #[tokio::test]
+    async fn stdio_modern_initialize_refused_by_the_daemon_stays_legacy() {
+        let mut bridge = BridgeHarness::new(true);
+        let refused = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": "2026-07-28",
+                        "capabilities": {},
+                        "clientInfo": {"name": "refused", "version": "1.0"}
+                    }
+                }),
+                serde_json::json!({"error": {"code": -32602, "message": "unsupported"}}),
+            )
+            .await;
+        assert_eq!(refused["error"]["code"], -32602);
+
+        let called = bridge
+            .round_trip(
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {"name": "Context7__resolve_library_id", "arguments": {}}
+                }),
+                serde_json::json!({"result": {"resultType": "complete", "content": []}}),
+            )
+            .await;
+        assert!(called["result"].get("resultType").is_none());
     }
 
     #[tokio::test]
