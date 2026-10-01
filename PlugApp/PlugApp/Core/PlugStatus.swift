@@ -180,6 +180,7 @@ struct PlugSituation: Equatable, Sendable {
         /// The person asked for a restart and it is under way.
         case restarting
         case stopped
+        case off
         case versionMismatch
     }
 
@@ -241,6 +242,7 @@ enum PlugIntent: Equatable, Sendable {
     /// Restart the background service through the same path the installer
     /// uses. Nothing in the app ever kills it directly.
     case restartService
+    case setServiceEnabled(Bool)
     case reloadConfiguration
     /// Copy servers over from the other AI apps on this Mac.
     case importServers
@@ -260,6 +262,7 @@ enum PlugIntent: Equatable, Sendable {
 struct Verdict: Equatable, Sendable {
     enum Tone: Equatable, Sendable {
         case good
+        case quiet
         case busy
         case attention
         case blocked
@@ -385,6 +388,14 @@ enum PlugVerdict {
                 detail: "Connected apps cannot reach any servers.",
                 primary: .init("Start Plug", .reconnect)
             )
+        case .off:
+            return Verdict(
+                tone: .quiet,
+                symbol: "bolt.slash",
+                title: "Plug is off",
+                detail: "Turn on to make tools available to your apps.",
+                primary: .init("Turn On", .setServiceEnabled(true))
+            )
         case .versionMismatch:
             return Verdict(
                 tone: .attention,
@@ -480,6 +491,7 @@ enum PlugVerdict {
     static func menuBarSymbol(for verdict: Verdict) -> String {
         switch verdict.tone {
         case .good: "bolt.fill"
+        case .quiet: "bolt.slash"
         case .busy: "bolt.horizontal.circle"
         case .attention: "bolt.trianglebadge.exclamationmark.fill"
         case .blocked: "bolt.slash.fill"

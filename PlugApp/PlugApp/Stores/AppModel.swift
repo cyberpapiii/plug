@@ -9,6 +9,7 @@ protocol InstallationCoordinating: AnyObject {
     func adopt() async
     func retry() async
     func restartService() async throws
+    func stopService() async throws
     func openLog()
 }
 
@@ -46,6 +47,12 @@ final class AppModel {
     private let appLinker: any AppLinking
     private let tokenURL: URL
     private let clientVersion: String
+    private let serviceDisabledURL: URL
+    private(set) var serviceEnabled: Bool
+    private(set) var isChangingService = false
+    static var defaultServiceDisabledURL: URL {
+        PlugIPCClient.defaultSocketURL.deletingLastPathComponent().appending(path: "service-disabled")
+    }
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var refreshRequestedAgain = false
@@ -145,7 +152,8 @@ final class AppModel {
         backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
         reconnectGrace: Duration = AppModel.reconnectGrace,
         actionErrorLifetime: Duration = AppModel.actionErrorLifetime,
-        authFlow: AuthFlowService = AuthFlowService()
+        authFlow: AuthFlowService = AuthFlowService(),
+        serviceDisabledURL: URL = AppModel.defaultServiceDisabledURL
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
@@ -157,6 +165,9 @@ final class AppModel {
         self.reconnectGrace = reconnectGrace
         self.actionErrorLifetime = actionErrorLifetime
         self.authFlow = authFlow
+        self.serviceDisabledURL = serviceDisabledURL
+        self.serviceEnabled = !FileManager.default.fileExists(atPath: serviceDisabledURL.path)
+        if !serviceEnabled { connectionState = .disconnected }
     }
 
     /// Read live rather than mirrored. A copy refreshed only when a
@@ -172,7 +183,7 @@ final class AppModel {
         return false
     }
 
-    private var readsAllowed: Bool { !reconciliationInFlight || isOnlyInspecting }
+    private var readsAllowed: Bool { serviceEnabled && !isChangingService && (!reconciliationInFlight || isOnlyInspecting) }
 
     var visibleServers: [ServerPresentation] {
         let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
@@ -240,6 +251,7 @@ final class AppModel {
     }
 
     private var setupState: PlugSituation.Setup {
+        if !serviceEnabled { return .ready }
         switch installationState {
         case .healthy: return .ready
         case .adoptionRequired: return .needsPermission
@@ -255,6 +267,7 @@ final class AppModel {
     }
 
     private var runtimeState: PlugSituation.Runtime {
+        if !serviceEnabled { return .off }
         if isRestartingService { return .restarting }
         switch connectionState {
         case .ready: return .running
@@ -285,7 +298,7 @@ final class AppModel {
         hasLoadedSnapshot && connectionState != .ready
     }
 
-    var canMutate: Bool { connectionState == .ready }
+    var canMutate: Bool { serviceEnabled && !isChangingService && connectionState == .ready }
 
     /// Recent calls that touched one server, newest first.
     func recentActivity(for server: String, limit: Int = 12) -> [ActivityEvent] {
@@ -299,6 +312,7 @@ final class AppModel {
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
+        guard serviceEnabled else { return }
         // Every launch opens with a pass that only reads the installation,
         // and the daemon is nearly always already running. Waiting for the
         // pass before asking the daemon anything kept a healthy Plug on
@@ -326,6 +340,7 @@ final class AppModel {
     }
 
     func reconcile(trigger: ReconciliationTrigger) async {
+        guard serviceEnabled, !isChangingService else { return }
         await runReconciliation { [coordinator] in
             await coordinator.reconcile(trigger: trigger)
         }
@@ -345,6 +360,7 @@ final class AppModel {
     }
 
     func retryConnection() async {
+        if !serviceEnabled { await setServiceEnabled(true); return }
         attemptedSkewRecovery = false
         // Someone pressed Start. Polls no longer flip a stopped Plug to
         // "Starting…", so the press is the one place that says it is trying.
@@ -357,6 +373,7 @@ final class AppModel {
     /// polling stands aside while the daemon is swapped and a Start Plug
     /// pressed meanwhile waits for this swap instead of starting a second one.
     func restartService() async {
+        guard serviceEnabled, !isChangingService else { return }
         guard !isRestartingService else { return }
         isRestartingService = true
         // A reconciliation already running would swallow this one; let it
@@ -378,6 +395,42 @@ final class AppModel {
 
     func openLog() {
         coordinator.openLog()
+    }
+
+    func setServiceEnabled(_ enabled: Bool) async {
+        guard enabled != serviceEnabled, !isChangingService else { return }
+        isChangingService = true
+        if let reconciliationTask { await reconciliationTask.value }
+        if let refreshTask { await refreshTask.value }
+        do {
+            if enabled {
+                try FileManager.default.removeItem(at: serviceDisabledURL)
+                serviceEnabled = true
+                connectionState = .connecting
+                // Turning on is explicit consent to register our own agent.
+                await coordinator.adopt()
+            } else {
+                try FileManager.default.createDirectory(
+                    at: serviceDisabledURL.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                try Data().write(to: serviceDisabledURL, options: .atomic)
+                do { try await coordinator.stopService() }
+                catch {
+                    try FileManager.default.removeItem(at: serviceDisabledURL)
+                    throw error
+                }
+                serviceEnabled = false
+                monitoringTask?.cancel()
+                await ipc.disconnect()
+                connectionState = .disconnected
+                connectionLostAt = nil
+            }
+        } catch { reportActionError(error) }
+        isChangingService = false
+        if serviceEnabled {
+            await refresh()
+            startMonitoring()
+        }
     }
 
     /// Reads the daemon's state. A call that arrives while a read is already

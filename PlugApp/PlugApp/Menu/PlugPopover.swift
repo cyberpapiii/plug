@@ -27,15 +27,15 @@ struct PlugPopover: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             header
-            if !servers.isEmpty {
+            if model.serviceEnabled, !servers.isEmpty {
                 PanelDivider()
                 serverList
             }
-            if situation.connectedApps > 0 {
+            if model.serviceEnabled, situation.connectedApps > 0 {
                 PanelDivider()
                 connectedAppsRow
             }
-            if !recentCalls.isEmpty {
+            if model.serviceEnabled, !recentCalls.isEmpty {
                 PanelDivider()
                 recent
             }
@@ -53,6 +53,13 @@ struct PlugPopover: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
+            HStack {
+                Text("Plug").font(.headline)
+                Spacer()
+                ServicePowerToggle(model: model, run: run)
+                .labelsHidden()
+                .controlSize(.small)
+            }
             VerdictView(verdict: model.verdict, style: .hero, run: send)
             if let error = model.actionError {
                 HStack(alignment: .firstTextBaseline, spacing: Metric.tight) {
@@ -264,9 +271,9 @@ struct PlugPopover: View {
             .accessibilityLabel("Settings")
 
             Button { run(.quit) } label: {
-                Image(systemName: "power")
+                Text("Quit")
             }
-            .buttonStyle(QuietControlButtonStyle(iconOnly: true))
+            .buttonStyle(QuietControlButtonStyle())
             .help("Quit Plug. Your servers keep running.")
             .accessibilityLabel("Quit Plug")
         }
@@ -383,17 +390,19 @@ private struct RecentCallRow: View {
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
+                .frame(maxWidth: .infinity, alignment: .leading)
             if let server = parts.server {
                 Text(server)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .layoutPriority(-1)
+                    .frame(width: 58, alignment: .leading)
             }
             Spacer(minLength: Metric.tight)
             Text("\(event.latencyMs) ms")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.tertiary)
+                .fixedSize()
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(

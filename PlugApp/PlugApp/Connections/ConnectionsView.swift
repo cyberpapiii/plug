@@ -24,7 +24,7 @@ struct AppRoster: Equatable {
         for app in apps {
             let own = sessions.filter { Self.targets(of: $0).contains(app.target) }
             claimed.formUnion(own.map(\.sessionId))
-            if app.live || !own.isEmpty {
+            if !own.isEmpty {
                 connected.append(Connected(app: app, sessions: own))
             } else {
                 idle.append(app)
@@ -406,7 +406,7 @@ private struct AppLinkRow: View {
 
     /// The state as a glyph, so linked and not-linked are told apart before
     /// the sentence is read.
-    private var isLive: Bool { app.live || sessionCount > 0 }
+    private var isLive: Bool { sessionCount > 0 }
 
     private var statusSymbol: String {
         if isLive { return "bolt.fill" }
@@ -416,7 +416,7 @@ private struct AppLinkRow: View {
 
     private var status: String {
         if isLive {
-            let count = max(sessionCount, app.sessions)
+            let count = sessionCount
             return count == 1 ? "1 session" : "\(count) sessions"
         }
         guard app.linked else { return app.detected ? "Not using Plug" : "Not installed" }

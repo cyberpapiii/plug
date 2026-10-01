@@ -34,6 +34,7 @@ protocol DaemonServiceManaging: AnyObject {
     ) async throws -> OperatorHandshake
     func adopt() async throws
     func restart() async throws
+    func stop() async throws
 }
 
 @MainActor
@@ -94,6 +95,7 @@ final class InstallationCoordinator {
     }
 
     func reconcile(trigger: ReconciliationTrigger) async {
+        guard !FileManager.default.fileExists(atPath: AppModel.defaultServiceDisabledURL.path) else { return }
         guard shouldStart(trigger: trigger) else { return }
         if trigger == .retry || trigger == .explicitAdoption {
             // A person asked. Start the timeout budget over and drop any
@@ -132,6 +134,16 @@ final class InstallationCoordinator {
     /// any daemon it has not verified as app-owned, so this never adopts one.
     func restartService() async throws {
         try await daemonManager.restart()
+    }
+
+    func stopService() async throws {
+        scheduledRetry?.cancel()
+        scheduledRetry = nil
+        if let inFlight { await inFlight.value }
+        scheduledRetry?.cancel()
+        scheduledRetry = nil
+        retryGeneration += 1
+        try await daemonManager.stop()
     }
 
     func openLog() {

@@ -435,6 +435,7 @@ async fn wait_for_daemon_socket(started: bool, already_starting: bool) -> anyhow
 }
 
 pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> {
+    ensure_service_enabled(&crate::daemon::socket_path().with_file_name("service-disabled"))?;
     if crate::daemon::connect_to_daemon().await.is_some() {
         return Ok(false);
     }
@@ -508,9 +509,32 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     wait_for_daemon_socket(true, false).await
 }
 
+fn ensure_service_enabled(marker: &Path) -> anyhow::Result<()> {
+    if marker.try_exists()? {
+        anyhow::bail!("Plug is off. Turn it on in Plug.app.");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn intentional_off_blocks_connector_start_until_marker_is_removed() {
+        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir(&directory).unwrap();
+        let marker = directory.join("service-disabled");
+        assert!(ensure_service_enabled(&marker).is_ok());
+        std::fs::write(&marker, "").unwrap();
+        assert_eq!(
+            ensure_service_enabled(&marker).unwrap_err().to_string(),
+            "Plug is off. Turn it on in Plug.app."
+        );
+        std::fs::remove_file(&marker).unwrap();
+        assert!(ensure_service_enabled(&marker).is_ok());
+        std::fs::remove_dir(directory).unwrap();
+    }
 
     #[test]
     fn installed_app_never_creates_or_repairs_cli_service() {

@@ -123,6 +123,7 @@ private struct ServiceSettings: View {
     var body: some View {
         Form {
             Section {
+                ServicePowerToggle(model: model, run: run)
                 LabeledContent {
                     Text(serviceStatus)
                         .foregroundStyle(model.connectionState == .ready ? .primary : .secondary)
@@ -138,7 +139,7 @@ private struct ServiceSettings: View {
                     } label: {
                         Label("Restart", systemImage: "arrow.clockwise")
                     }
-                    .disabled(model.isRestartingService)
+                    .disabled(model.isRestartingService || !model.serviceEnabled || model.isChangingService)
 
                     Button {
                         run(.reloadConfiguration)
@@ -146,6 +147,7 @@ private struct ServiceSettings: View {
                         Label("Reload Configuration", systemImage: "arrow.triangle.2.circlepath")
                     }
                     .help("Reload server settings without restarting Plug")
+                    .disabled(!model.canMutate)
 
                     if model.isRestartingService { ProgressView().controlSize(.small) }
                     Spacer()
@@ -250,6 +252,7 @@ private struct ServiceSettings: View {
     }
 
     private var serviceStatus: String {
+        if !model.serviceEnabled { return "Off" }
         if model.isRestartingService { return "Restarting" }
         switch model.connectionState {
         case .ready: return "Running"
@@ -261,6 +264,7 @@ private struct ServiceSettings: View {
     }
 
     private var serviceSymbol: String {
+        if !model.serviceEnabled { return "bolt.slash" }
         if model.isRestartingService { return "circle.dotted" }
         switch model.connectionState {
         case .ready: return "checkmark.circle.fill"
@@ -271,6 +275,7 @@ private struct ServiceSettings: View {
     }
 
     private var serviceColor: Color {
+        if !model.serviceEnabled { return .secondary }
         if model.isRestartingService { return .secondary }
         switch model.connectionState {
         case .ready: return .green
