@@ -148,7 +148,7 @@ struct PlugPopover: View {
     // MARK: - Connected apps
 
     private var connectedAppsRow: some View {
-        Button { send(.openWindow(.connections)) } label: {
+        Button { send(.openWindow(.apps)) } label: {
             HStack(spacing: Metric.snug) {
                 AppIconStack(targets: situation.connectedAppTargets)
                 Text(connectedAppsText)

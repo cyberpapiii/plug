@@ -49,18 +49,7 @@ struct ServersView: View {
                 }
             }
         }
-        .onChange(of: search) {
-            Task { @MainActor in
-                await Task.yield()
-                router.selectedServer = nil
-            }
-        }
-        .inspector(isPresented: inspectorShown) {
-            if let selected {
-                ServerDetailView(model: model, server: selected, router: router, run: run)
-                    .inspectorColumnWidth(min: 280, ideal: 320, max: 380)
-            }
-        }
+        .onChange(of: visibleNames, initial: true) { keepSelectionVisible() }
         .sheet(isPresented: $router.isAddingServer) {
             AddServerView(model: model)
         }
@@ -72,33 +61,59 @@ struct ServersView: View {
         }
     }
 
-    /// The inspector is open exactly when a server is selected, and closing it
-    /// clears the selection, so the two can never disagree.
-    private var inspectorShown: Binding<Bool> {
-        Binding(
-            get: { selected != nil },
-            set: { shown in if !shown { router.selectedServer = nil } }
-        )
-    }
-
     private var selected: ServerFacts? {
         model.situation.servers.first { $0.name == router.selectedServer }
     }
 
-    private var list: some View {
-        List(selection: $router.selectedServer) {
-            group("Needs attention", servers: matching(model.situation.troubledServers))
-            group("Starting", servers: matching(startingServers))
-            group("Running", servers: matching(runningServers))
-            group("Off", servers: matching(offServers))
-        }
-        .listStyle(.inset)
-        .frame(maxWidth: Metric.contentMaxWidth)
-        .frame(maxWidth: .infinity)
-        .overlay {
-            if matching(model.situation.servers).isEmpty {
-                ContentUnavailableView.search(text: search)
+    /// Servers on the left, the selected one in full on the right. A server is
+    /// always selected, so the right side is never an empty placeholder.
+    @ViewBuilder private var list: some View {
+        if visibleNames.isEmpty {
+            ContentUnavailableView.search(text: search)
+        } else {
+            HStack(spacing: 0) {
+                List(selection: $router.selectedServer) {
+                    group("Needs attention", servers: matching(model.situation.troubledServers))
+                    group("Starting", servers: matching(startingServers))
+                    group("Running", servers: matching(runningServers))
+                    group("Off", servers: matching(offServers))
+                }
+                .listStyle(.inset)
+                .frame(width: Metric.serverListWidth)
+                Divider()
+                if let selected {
+                    ServerDetailView(
+                        model: model,
+                        server: selected,
+                        query: search,
+                        router: router,
+                        run: run
+                    )
+                    .id(selected.name)
+                } else {
+                    Color.clear
+                }
             }
+            .frame(maxWidth: Metric.contentMaxWidth)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    private var visibleNames: [String] {
+        (matching(model.situation.troubledServers)
+            + matching(startingServers)
+            + matching(runningServers)
+            + matching(offServers)).map(\.name)
+    }
+
+    /// NSTableView is still finishing its own update when the list changes, so
+    /// the selection moves on the next main-actor turn.
+    private func keepSelectionVisible() {
+        let names = visibleNames
+        if let current = router.selectedServer, names.contains(current) { return }
+        Task { @MainActor in
+            await Task.yield()
+            router.selectedServer = names.first
         }
     }
 
@@ -113,7 +128,7 @@ struct ServersView: View {
                 .listRowSeparator(.hidden)
                 .listRowBackground(Color.clear)
             ForEach(servers) { server in
-                ServerListRow(server: server, run: run)
+                ServerListRow(server: server)
                     .tag(server.name)
                     .listRowSeparator(.hidden)
                     .listRowInsets(Metric.listRowInsets)
@@ -142,18 +157,22 @@ struct ServersView: View {
         model.situation.servers.filter { !$0.enabled }
     }
 
+    /// A search keeps a server whose name matches, and one that has a tool
+    /// matching, so a tool can be found without knowing which server has it.
     private func matching(_ servers: [ServerFacts]) -> [ServerFacts] {
         let query = search.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return servers }
-        return servers.filter { $0.name.localizedCaseInsensitiveContains(query) }
+        let withTools = model.toolCatalog.servers(withToolsMatching: query)
+        return servers.filter {
+            $0.name.localizedCaseInsensitiveContains(query) || withTools.contains($0.name)
+        }
     }
 }
 
-/// A server as a row: state, name, what it offers, and — when something is
-/// wrong — the button that fixes it, without opening anything first.
+/// A server as a row: state, name, and what it offers. The fix for a
+/// troubled server is in the details beside the list.
 private struct ServerListRow: View {
     let server: ServerFacts
-    let run: (PlugIntent) -> Void
 
     var body: some View {
         HStack(spacing: Metric.snug) {
@@ -167,28 +186,20 @@ private struct ServerListRow: View {
                     .truncationMode(.middle)
             }
             Spacer(minLength: Metric.tight)
-            if let fix = server.fix {
-                if let cancel = server.cancelSignIn {
-                    Button(cancel.title) { run(cancel.intent) }
-                        .controlSize(.small)
-                }
-                Button(fix.title) { run(fix.intent) }
-                    .controlSize(.small)
-            } else if server.health == .working {
-                Text(server.toolCountText)
+            if server.health == .working {
+                Text("\(server.toolCount)")
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
+                    .accessibilityLabel(server.toolCountText)
             }
         }
         .padding(.vertical, Metric.tight)
         .contentShape(Rectangle())
-        .accessibilityElement(children: .contain)
+        .accessibilityElement(children: .combine)
     }
 
     private var subtitle: String {
-        if server.health.needsAttention, let error = server.error, !error.isEmpty {
-            return error.split(separator: "\n").first.map(String.init) ?? error
-        }
+        if server.health.needsAttention { return server.health.label }
         if !server.enabled { return server.health.label }
         return server.transportLabel
     }

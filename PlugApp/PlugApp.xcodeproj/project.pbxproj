@@ -17,6 +17,7 @@
 		1727DBB0F7C3147BA74B940A /* AppLinkService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EECB5A101BC8CAF84B2DA4D /* AppLinkService.swift */; };
 		17D83615A424704B1CC1366D /* UnifiedReconciliationFixtureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32DABE7B3A070D7DE0195A25 /* UnifiedReconciliationFixtureTests.swift */; };
 		2089DA66D395D3CB66FC5A26 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0D96A945383702097BA4CCEA /* Assets.xcassets */; };
+		2262A73184055B0A85EBE4EE /* ToolRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5046B427725A1A125529AF2 /* ToolRow.swift */; };
 		273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E1C65673D42038754E140C /* ProcessRunnerTests.swift */; };
 		2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBC2D67DE9038B09D240E689 /* PlugStatus.swift */; };
 		2C730DB265AF0C768DE18BAF /* Router.swift in Sources */ = {isa = PBXBuildFile; fileRef = 246CCC51D3BBEE0246E4E96F /* Router.swift */; };
@@ -53,7 +54,6 @@
 		D0E6D2C5CE02C83CA2608F7D /* ServerDraftParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */; };
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
-		D493DD449196A1E61453FA99 /* ToolsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = FA534EAE5C6EB28861A7201A /* ToolsView.swift */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
 		DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */; };
 		E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */ = {isa = PBXBuildFile; fileRef = AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */; };
@@ -128,12 +128,12 @@
 		D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugPaths.swift; sourceTree = "<group>"; };
 		D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugVerdictTests.swift; sourceTree = "<group>"; };
 		E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSurfaceTests.swift; sourceTree = "<group>"; };
+		E5046B427725A1A125529AF2 /* ToolRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolRow.swift; sourceTree = "<group>"; };
 		E823B05501E7735EEA26993A /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
 		EC1CDCB2E539B73277AFE537 /* CheckupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckupService.swift; sourceTree = "<group>"; };
 		F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerDraftParserTests.swift; sourceTree = "<group>"; };
 		F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManagerTests.swift; sourceTree = "<group>"; };
 		F997E24A4662F9A301F2CD2C /* LegacyInstallMigrator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigrator.swift; sourceTree = "<group>"; };
-		FA534EAE5C6EB28861A7201A /* ToolsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolsView.swift; sourceTree = "<group>"; };
 		FBC2D67DE9038B09D240E689 /* PlugStatus.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugStatus.swift; sourceTree = "<group>"; };
 		FC27919600003A59354FBEF6 /* AuthFlowServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlowServiceTests.swift; sourceTree = "<group>"; };
 		FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = com.plug.daemon.plist; sourceTree = "<group>"; };
@@ -232,7 +232,7 @@
 			isa = PBXGroup;
 			children = (
 				0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */,
-				FA534EAE5C6EB28861A7201A /* ToolsView.swift */,
+				E5046B427725A1A125529AF2 /* ToolRow.swift */,
 			);
 			path = Tools;
 			sourceTree = "<group>";
@@ -558,7 +558,7 @@
 				62FB2A2B8196D3C86DAF8E9E /* SettingsView.swift in Sources */,
 				5BA8E9724BF22D7D0CB34DCB /* ToolCatalog.swift in Sources */,
 				073040F588BBBE1EBFDC7858 /* ToolDetailView.swift in Sources */,
-				D493DD449196A1E61453FA99 /* ToolsView.swift in Sources */,
+				2262A73184055B0A85EBE4EE /* ToolRow.swift in Sources */,
 				4CCD74568EADAD432672189D /* UpdateService.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

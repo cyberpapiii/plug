@@ -1,15 +1,19 @@
 import PlugIPC
 import SwiftUI
 
-/// One server, in full. This absorbed the old Auth section: an account that
-/// needs signing in belongs to a server, so it is shown and fixed here.
+/// One server, in full. This absorbed the old Auth and Tools sections: an
+/// account that needs signing in and the tools a server offers both belong to
+/// that server, so they are shown, fixed, and switched here.
 struct ServerDetailView: View {
     let model: AppModel
     let server: ServerFacts
+    /// The window's search. It narrows the tool list below.
+    let query: String
     @Bindable var router: Router
     let run: (PlugIntent) -> Void
     @State private var confirmRemoval = false
     @State private var confirmSignOut = false
+    @State private var showsOffOnly = false
 
     var body: some View {
         ScrollView {
@@ -22,11 +26,14 @@ struct ServerDetailView: View {
                 }
                 details
                 if !recentCalls.isEmpty { recent }
-                actions
+                tools
             }
             .padding(Metric.roomy)
         }
         .scrollBounceBehavior(.basedOnSize)
+        .onChange(of: offCount) { _, count in
+            if count == 0 { showsOffOnly = false }
+        }
         .confirmationDialog(
             "Sign out of \(server.name)?",
             isPresented: $confirmSignOut,
@@ -52,23 +59,46 @@ struct ServerDetailView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(alignment: .top, spacing: Metric.snug) {
+        HStack(alignment: .center, spacing: Metric.snug) {
             StatusGlyph(health: server.health, size: .title2)
             VStack(alignment: .leading, spacing: 1) {
                 Text(server.name).font(.title3.weight(.semibold))
                 Text(statusLine).font(.callout).foregroundStyle(.secondary)
             }
-            Spacer(minLength: 0)
-            Button {
-                router.selectedServer = nil
-            } label: {
-                Image(systemName: "xmark.circle.fill").foregroundStyle(.tertiary)
-                    .frame(width: 24, height: 24)
+            Spacer(minLength: Metric.tight)
+            HStack(spacing: Metric.tight) {
+                if server.enabled {
+                    Button("Restart") { run(.restartServer(server.name)) }
+                }
+                Button("Edit…") { run(.editServer(server.name)) }
+                Menu {
+                    if server.usesOAuth, server.health != .signInNeeded {
+                        Button("Sign Out…") { confirmSignOut = true }
+                    }
+                    Button("Remove Server…", role: .destructive) { confirmRemoval = true }
+                } label: {
+                    Image(systemName: "ellipsis")
+                }
+                .menuIndicator(.hidden)
+                .fixedSize()
+                .help("More")
+                .accessibilityLabel("More")
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Close details")
-            .help("Close details")
+            .controlSize(.small)
+            Toggle(
+                "On",
+                isOn: Binding(
+                    get: { server.enabled },
+                    set: { run(.setServerEnabled(server.name, $0)) }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.small)
+            .help(server.enabled ? "Turn off \(server.name)" : "Turn on \(server.name)")
+            .accessibilityLabel("\(server.name) on")
         }
+        .disabled(!model.canMutate)
     }
 
     private var statusLine: String {
@@ -213,29 +243,92 @@ struct ServerDetailView: View {
         return tool
     }
 
-    // MARK: - Actions
+    // MARK: - Tools
 
-    private var actions: some View {
+    private var allTools: [ToolFacts] { model.toolCatalog.tools(for: server.name) }
+    private var offCount: Int { allTools.filter { !$0.isOn }.count }
+
+    private var shownTools: [ToolFacts] {
+        let matched = model.toolCatalog.tools(for: server.name, matching: query)
+        return showsOffOnly ? matched.filter { !$0.isOn } : matched
+    }
+
+    private var toolsSummary: String {
+        let total = allTools.count
+        let shown = shownTools.count
+        if shown < total, !showsOffOnly { return "\(shown) of \(total)" }
+        if offCount > 0 { return "\(total - offCount) of \(total) on" }
+        return total == 1 ? "1 tool" : "\(total) tools"
+    }
+
+    @ViewBuilder private var tools: some View {
         VStack(alignment: .leading, spacing: Metric.tight) {
-            SectionLabel(text: "Manage")
-            HStack(spacing: Metric.tight) {
-                if server.enabled {
-                    Button("Restart") { run(.restartServer(server.name)) }
-                } else {
-                    Button("Turn On") { run(.setServerEnabled(server.name, true)) }
-                }
-                Button("Edit…") { run(.editServer(server.name)) }
-                Menu("More") {
-                    if server.enabled {
-                        Button("Turn Off") { run(.setServerEnabled(server.name, false)) }
+            HStack(spacing: Metric.snug) {
+                SectionLabel(text: "Tools", trailing: allTools.isEmpty ? nil : toolsSummary)
+                if offCount > 0 {
+                    Picker("Show", selection: $showsOffOnly) {
+                        Text("All").tag(false)
+                        Text("Off \(offCount)").tag(true)
                     }
-                    if server.usesOAuth, server.health != .signInNeeded {
-                        Button("Sign Out…") { confirmSignOut = true }
-                    }
-                    Button("Remove Server…", role: .destructive) { confirmRemoval = true }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .controlSize(.small)
+                    .fixedSize()
                 }
             }
-            .controlSize(.small)
+            if allTools.isEmpty {
+                Text(server.health == .working ? "This server offers no tools." : "Tools appear once the server is running.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else if shownTools.isEmpty {
+                Text("No tool matches “\(query.trimmingCharacters(in: .whitespaces))”.")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+            } else {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(shownTools) { tool in
+                        toolRow(tool)
+                    }
+                }
+                // Rows carry their own inset; pull them back so tool names
+                // line up with the section label.
+                .padding(.horizontal, -Metric.snug)
+            }
+        }
+    }
+
+    private func toolRow(_ tool: ToolFacts) -> some View {
+        let canManage = model.canManageTools && model.canMutate
+        let isBusy = model.busyTools.contains(tool.name)
+        return ToolRow(
+            tool: tool,
+            canManage: canManage,
+            isBusy: isBusy,
+            onSelect: { router.selectedTool = tool.name },
+            run: run
+        )
+        .padding(.horizontal, Metric.snug)
+        .frame(minHeight: tool.summary?.isEmpty == false ? 46 : 36)
+        .hoverHighlight(cornerRadius: 7)
+        .contentShape(Rectangle())
+        .accessibilityAction(named: "Show details") { router.selectedTool = tool.name }
+        .popover(
+            isPresented: Binding(
+                get: { router.selectedTool == tool.name },
+                set: { shown in if !shown, router.selectedTool == tool.name { router.selectedTool = nil } }
+            ),
+            arrowEdge: .trailing
+        ) {
+            ToolDetailView(
+                tool: tool,
+                catalog: model.toolCatalog,
+                canManage: canManage,
+                isBusy: isBusy,
+                router: router,
+                run: run
+            )
+            .frame(width: 320)
+            .frame(maxHeight: 420)
         }
     }
 }

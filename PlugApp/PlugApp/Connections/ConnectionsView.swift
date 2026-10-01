@@ -45,18 +45,18 @@ struct ConnectionsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PageHeader("Connections", detail: connectionSummary)
+            PageHeader("Apps", detail: connectionSummary)
 
             Group {
                 if model.isLoadingInitialData {
-                    LoadingPage(message: "Loading connections…")
+                    LoadingPage(message: "Loading apps…")
                 } else if model.initialDataUnavailable {
-                    UnavailablePage(item: "Connections") { run(.reconnect) }
+                    UnavailablePage(item: "Apps") { run(.reconnect) }
                 } else if isEmpty {
                     EmptyPage(
                         title: search.isEmpty
                             ? (model.connectableAppsError == nil ? "Nothing is connected" : "App scan failed")
-                            : "No matching connections",
+                            : "No matching apps",
                         message: search.isEmpty
                             ? (model.connectableAppsError
                                 ?? "When an AI app connects through Plug it shows up here, along with everything it can reach.")
