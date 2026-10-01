@@ -89,7 +89,9 @@ struct RootView: View {
     /// Tools are searched from Servers, so its field says so.
     private var searchPrompt: String {
         switch router.section {
-        case .servers: "Search servers and tools"
+        // The servers prompt names both things it finds and still fits the
+        // toolbar field at the minimum window width.
+        case .servers: "Servers and tools"
         case .apps: "Search apps"
         case .activity: "Search activity"
         }

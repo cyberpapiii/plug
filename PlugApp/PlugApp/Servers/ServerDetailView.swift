@@ -161,11 +161,6 @@ struct ServerDetailView: View {
         VStack(alignment: .leading, spacing: Metric.snug) {
             SectionLabel(text: "Details")
             detailRow("Kind", server.transportLabel, symbol: server.transportSymbol)
-            detailRow(
-                "Tools",
-                server.health == .working ? "\(server.toolCount)" : "—",
-                symbol: "wrench.and.screwdriver"
-            )
             if server.usesOAuth {
                 detailRow("Account", accountLabel, symbol: accountSymbol)
             }

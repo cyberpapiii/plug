@@ -5,6 +5,17 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The window has three sections: Servers, Apps, and Activity. Tools moved
+  into the server they belong to: Servers shows the list on the left and the
+  selected server in full on the right, with its tools and their switches.
+  Searching in Servers finds tools as well as servers, and clicking a tool
+  shows its details beside it. A server's header carries Restart, Edit, and
+  an on/off switch. Connections is now called Apps.
+
 ## [0.8.12] - 2026-10-01
 
 ### Changed
