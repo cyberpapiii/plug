@@ -7,6 +7,30 @@ import XCTest
 
 @MainActor
 final class DaemonServiceManagerTests: XCTestCase {
+    func testStopUnregistersOwnedServiceWithoutStartingOrSuspendingClients() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let backend = FakeDaemonBackend(enabled: true, handshakes: [handshake("0.7.0")])
+        let manager = makeManager(inspector: SequenceLaunchdInspector([
+            .appManagedCurrent(current), .appManagedCurrent(current),
+        ]), backend: backend)
+        try await manager.stop()
+        XCTAssertFalse(backend.enabled)
+        XCTAssertEqual(backend.events, [.unregister])
+    }
+
+    func testStopDoesNotUnregisterUnknownService() async throws {
+        let backend = FakeDaemonBackend(enabled: true)
+        let manager = makeManager(inspector: SequenceLaunchdInspector([.unknown([])]), backend: backend)
+        do {
+            try await manager.stop()
+            XCTFail("Unknown ownership must not be stopped")
+        } catch let error as DaemonServiceError {
+            XCTAssertEqual(error, .unknownOwnership)
+        }
+        XCTAssertTrue(backend.enabled)
+        XCTAssertTrue(backend.events.isEmpty)
+    }
+
     private let canonical = VerifiedAppInstallation(
         bundleURL: URL(fileURLWithPath: "/Applications/Plug.app"),
         executableURL: URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),

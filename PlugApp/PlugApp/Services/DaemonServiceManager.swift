@@ -252,6 +252,30 @@ final class DaemonServiceManager {
         }
     }
 
+    /// Stop only this app's verified agent. Quit remains unrelated to service
+    /// ownership; connectors are never left suspended while Plug is off.
+    func stop() async throws {
+        let canonical = try await appInspector.inspectCurrentApp()
+        let ownership = try await launchdInspector.daemonJobs(
+            canonical: canonical, recognizedLegacyPaths: legacyPaths
+        )
+        switch ownership {
+        case .appManagedCurrent, .appManagedStale:
+            let current = try await launchdInspector.daemonJobs(
+                canonical: canonical, recognizedLegacyPaths: legacyPaths
+            )
+            guard current == ownership else { throw DaemonServiceError.evidenceChanged }
+            try await backend.unregisterAgent()
+            guard !backend.enabled else { throw DaemonServiceError.commandFailed("Plug could not turn off. Try again.") }
+        case .unmanaged where !backend.enabled:
+            return
+        case .recognizedLegacy, .unmanaged:
+            throw DaemonServiceError.adoptionRequired
+        case .unknown:
+            throw DaemonServiceError.unknownOwnership
+        }
+    }
+
     func setMainAppAtLogin(_ enabled: Bool) throws {
         let service = SMAppService.mainApp
         if enabled, service.status != .enabled { try service.register() }

@@ -1,5 +1,31 @@
 import SwiftUI
 
+/// One control and confirmation for the menu panel and service settings.
+struct ServicePowerToggle: View {
+    let model: AppModel
+    let run: (PlugIntent) -> Void
+    @State private var confirmingOff = false
+
+    var body: some View {
+        Toggle("Plug", isOn: Binding(
+            get: { model.serviceEnabled },
+            set: { enabled in
+                if enabled { run(.setServiceEnabled(true)) }
+                else { confirmingOff = true }
+            }
+        ))
+        .toggleStyle(.switch)
+        .disabled(model.isChangingService || model.isRestartingService)
+        .accessibilityLabel("Plug on")
+        .confirmationDialog("Turn off Plug?", isPresented: $confirmingOff) {
+            Button("Turn Off", role: .destructive) { run(.setServiceEnabled(false)) }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Connected apps lose access to every server until you turn Plug on again. Your settings stay saved.")
+        }
+    }
+}
+
 // MARK: - Metrics
 
 /// One spacing scale for the whole app. Every gap in Plug is one of these.
@@ -30,6 +56,7 @@ extension Verdict.Tone {
     var color: Color {
         switch self {
         case .good: .green
+        case .quiet: .secondary
         case .busy: .secondary
         case .attention: .orange
         case .blocked: .red
@@ -41,6 +68,7 @@ extension Verdict.Tone {
     var tint: Color {
         switch self {
         case .good: .green.opacity(0.14)
+        case .quiet: .secondary.opacity(0.12)
         case .busy: .secondary.opacity(0.12)
         case .attention: .orange.opacity(0.18)
         case .blocked: .red.opacity(0.18)

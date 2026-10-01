@@ -288,14 +288,23 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(roster.other.map(\.sessionId), ["z9"])
     }
 
-    func testAnAppTheScanCallsLiveIsConnectedBeforeItsSessionArrives() throws {
+    func testStaleAppScanCannotInventAConnectedSession() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true,"linked":true,"live":true,"live_sessions":1}]"#),
             sessions: []
         )
-        XCTAssertEqual(roster.connected.map(\.app.target), ["cursor"])
-        XCTAssertTrue(roster.connected[0].sessions.isEmpty)
-        XCTAssertTrue(roster.idle.isEmpty)
+        XCTAssertTrue(roster.connected.isEmpty)
+        XCTAssertEqual(roster.idle.map(\.target), ["cursor"])
+    }
+
+    func testClaudeCodeAndCodexSessionsStayWithTheirOwnApps() throws {
+        let roster = AppRoster(
+            apps: try apps(#"[{"target":"codex-cli","detected":true},{"target":"claude-code","detected":true}]"#),
+            sessions: try sessions(#"[{"transport":"ipc","session_id":"codex-1","client_type":"Codex CLI","client_info":"codex-mcp-client","connected_secs":5},{"transport":"ipc","session_id":"claude-1","client_type":"Claude Code","client_info":"claude-code","connected_secs":9}]"#)
+        )
+        XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["codex-1"])
+        XCTAssertEqual(roster.connected[1].sessions.map(\.sessionId), ["claude-1"])
+        XCTAssertTrue(roster.other.isEmpty)
     }
 }
 

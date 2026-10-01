@@ -1492,6 +1492,8 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
     func restart() async throws {
         await events.append("daemon.restart")
     }
+
+    func stop() async throws { await events.append("daemon.stop") }
 }
 
 @MainActor
@@ -1585,6 +1587,8 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
     func restart() async throws {
         await events.append("daemon.restart")
     }
+
+    func stop() async throws { await events.append("daemon.stop") }
 }
 
 private func makeHandshake(version: String) -> OperatorHandshake {

@@ -29,6 +29,39 @@ private func eventually(_ condition: () async -> Bool) async -> Bool {
 }
 
 final class AppModelTests: XCTestCase {
+    @MainActor
+    func testTurningOffPersistsBeforeStopAndPreventsLaunchRecovery() async throws {
+        let marker = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let events = LockedEvents()
+        let coordinator = RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: events)
+        coordinator.stopOperation = { XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path)) }
+        let model = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        await model.setServiceEnabled(false)
+        XCTAssertFalse(model.serviceEnabled)
+        XCTAssertEqual(model.verdict.title, "Plug is off")
+        let relaunched = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        await relaunched.start()
+        XCTAssertFalse(relaunched.serviceEnabled)
+        XCTAssertFalse(events.values.contains("coordinator.reconcile"))
+        await model.setServiceEnabled(true)
+        XCTAssertTrue(model.serviceEnabled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertTrue(events.values.contains("coordinator.adopt"))
+    }
+
+    @MainActor
+    func testFailedStopRestoresOnPreferenceAndShowsError() async throws {
+        let marker = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let coordinator = RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents())
+        coordinator.stopOperation = { throw CocoaError(.fileWriteNoPermission) }
+        let model = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        await model.setServiceEnabled(false)
+        XCTAssertTrue(model.serviceEnabled)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
+        XCTAssertNotNil(model.actionError)
+    }
     /// A model that has not asked yet reports `.connecting`, not
     /// `.disconnected`. The difference is what the menu bar says while Plug
     /// starts: "Starting…" rather than "Plug is not running".
@@ -1096,6 +1129,12 @@ final class AppModelTests: XCTestCase {
 
 @MainActor
 private final class RecordingInstallationCoordinator: InstallationCoordinating {
+    var stopOperation: (() async throws -> Void)?
+
+    func stopService() async throws {
+        events.append("coordinator.stopService")
+        try await stopOperation?()
+    }
     var state: InstallationState
     let events: LockedEvents
     var operation: (() async -> Void)?

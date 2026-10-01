@@ -57,6 +57,12 @@ install_app_bundle() {
   # Yesterday's retired bundles have no processes left to protect.
   find "$attic" -maxdepth 1 -name 'Plug.app.*' -mtime +0 -exec rm -rf {} + 2>/dev/null || true
 
+  # Installing an update must not override the person's intentional off state.
+  if [[ -f "$HOME/Library/Application Support/plug/service-disabled" ]]; then
+    echo "install: Plug $version is installed and remains off"
+    return 0
+  fi
+
   # The old daemon keeps answering on the socket until the app replaces it,
   # so a bare status check would pass against the retired build. Wait for the
   # launchd job to carry the new bundle's build number.

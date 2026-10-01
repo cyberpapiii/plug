@@ -90,6 +90,8 @@ struct PlugIntentRunner {
             UpdateService.shared.checkForUpdates()
         case .restartService:
             Task { await model.restartService() }
+        case let .setServiceEnabled(enabled):
+            Task { await model.setServiceEnabled(enabled) }
         case .reloadConfiguration:
             perform { .reload(authToken: $0) }
         case .openLogs:

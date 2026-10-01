@@ -9,6 +9,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- The menu bar panel has a Plug on/off switch, separate from Quit. Turning
+  off confirms that connected apps lose access, stops the app-owned background
+  service, and stays off across launches. Turning on restores the service.
+  Quit only closes the menu bar app and leaves a running service alone.
+  Recent-call durations keep their full width beside long tool names.
+- Apps uses the current session list for connected state and counts. A stale
+  app scan no longer invents a connected app or keeps an old session count.
+
 - The window has three sections: Servers, Apps, and Activity. Tools moved
   into the server they belong to: Servers shows the list on the left and the
   selected server in full on the right, with its tools and their switches.
