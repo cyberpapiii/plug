@@ -15,6 +15,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Searching in Servers finds tools as well as servers, and clicking a tool
   shows its details beside it. A server's header carries Restart, Edit, and
   an on/off switch. Connections is now called Apps.
+- Apps groups by what matters first: Connected now, On this Mac, and Remote
+  clients. A connected app opens to show each of its sessions with its id,
+  how long it has been open, and how many tools it can reach. A remote
+  client shows the site it signs in from, or a short id, in place of its
+  registration method.
 
 ## [0.8.12] - 2026-10-01
 
