@@ -1,19 +1,17 @@
 import SwiftUI
 
-/// What the window is for. Signing in to a server used to be its own section;
-/// it now lives on the server itself, because a problem should be fixable
-/// where it is seen. Tools are their own section because they are what a
-/// connected app actually gets, and they are switched on and off one by one.
+/// What the window is for. Signing in to a server used to be its own section,
+/// and so did tools; both now live on the server they belong to, because a
+/// server's account and its tools are found and fixed where the server is.
 enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case servers = "Servers"
-    case tools = "Tools"
-    case connections = "Connections"
+    case apps = "Apps"
     case activity = "Activity"
 
     var id: Self { self }
 }
 
-/// The window. No sidebar: four peers do not earn a permanent column, and the
+/// The window. No sidebar: three peers do not earn a permanent column, and the
 /// space is better spent on the content itself.
 struct RootView: View {
     let model: AppModel
@@ -35,9 +33,7 @@ struct RootView: View {
             switch router.section {
             case .servers:
                 ServersView(model: model, router: router, search: $search, run: run)
-            case .tools:
-                ToolsView(model: model, router: router, query: $search, run: run)
-            case .connections:
+            case .apps:
                 ConnectionsView(model: model, search: $search, run: run)
             case .activity:
                 ActivityView(model: model, search: $search, run: run)
@@ -52,7 +48,7 @@ struct RootView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(minWidth: 280, idealWidth: 340, maxWidth: 340)
+                .frame(minWidth: 220, idealWidth: 270, maxWidth: 270)
             }
 
             // Plug has no menu bar of its own — it is an accessory app — so the
@@ -71,7 +67,7 @@ struct RootView: View {
         .searchable(
             text: $search,
             placement: .toolbar,
-            prompt: "Search \(router.section.rawValue.lowercased())"
+            prompt: searchPrompt
         )
         .navigationTitle("Plug")
         .onChange(of: router.section) {
@@ -90,4 +86,14 @@ struct RootView: View {
         }
     }
 
+    /// Tools are searched from Servers, so its field says so.
+    private var searchPrompt: String {
+        switch router.section {
+        // The servers prompt names both things it finds and still fits the
+        // toolbar field at the minimum window width.
+        case .servers: "Servers and tools"
+        case .apps: "Search apps"
+        case .activity: "Search activity"
+        }
+    }
 }

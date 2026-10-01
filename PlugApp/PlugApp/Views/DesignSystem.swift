@@ -21,6 +21,7 @@ enum Metric {
     /// Keep long management lists readable on wide displays without making
     /// rows feel pinned to the window edges.
     static let contentMaxWidth: CGFloat = 960
+    static let serverListWidth: CGFloat = 260
 }
 
 // MARK: - Tone

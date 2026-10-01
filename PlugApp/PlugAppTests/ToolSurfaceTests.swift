@@ -58,6 +58,21 @@ final class ToolCatalogTests: XCTestCase {
         XCTAssertEqual(groups.flatMap(\.tools).map(\.name), ["figma__export_frame"])
     }
 
+    func testSearchNarrowsOneServersToolsButNamingTheServerKeepsAll() {
+        XCTAssertEqual(
+            catalog.tools(for: "figma", matching: "export").map(\.shortName),
+            ["export_frame"]
+        )
+        XCTAssertEqual(catalog.tools(for: "figma", matching: "figma").count, 2)
+        XCTAssertEqual(catalog.tools(for: "figma", matching: " ").count, 2)
+    }
+
+    func testSearchFindsTheServersThatHaveAMatchingTool() {
+        XCTAssertEqual(catalog.servers(withToolsMatching: "export an image"), ["figma"])
+        XCTAssertTrue(catalog.servers(withToolsMatching: "").isEmpty)
+        XCTAssertTrue(catalog.servers(withToolsMatching: "no such tool").isEmpty)
+    }
+
     func testSearchIgnoresSurroundingSpaceAndCase() {
         XCTAssertEqual(catalog.groups(matching: "  NOTION "), catalog.groups(matching: "notion"))
     }

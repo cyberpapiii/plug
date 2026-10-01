@@ -103,6 +103,22 @@ struct ToolCatalog: Equatable, Sendable {
     func tools(for server: String) -> [ToolFacts] {
         tools.filter { $0.server == server }.sorted { $0.shortName < $1.shortName }
     }
+
+    /// One server's tools that match a query, by the same rule as `groups`:
+    /// a query naming the server keeps all of its tools.
+    func tools(for server: String, matching query: String) -> [ToolFacts] {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let own = tools(for: server)
+        return needle.isEmpty ? own : own.filter { $0.matches(needle) }
+    }
+
+    /// The servers with at least one tool matching a query. Empty for an
+    /// empty query, which matches nothing in particular.
+    func servers(withToolsMatching query: String) -> Set<String> {
+        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        guard !needle.isEmpty else { return [] }
+        return Set(tools.filter { $0.matches(needle) }.map(\.server))
+    }
 }
 
 private extension ToolFacts {
