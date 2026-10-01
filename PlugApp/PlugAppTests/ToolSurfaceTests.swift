@@ -247,3 +247,54 @@ final class EditServerEnvironmentTests: XCTestCase {
         )
     }
 }
+
+/// The Apps screen places every app against the open sessions. These pin
+/// which group an app lands in and that no session is counted twice or lost.
+final class AppRosterTests: XCTestCase {
+    private func apps(_ json: String) throws -> [LinkableApp] {
+        try JSONDecoder().decode([LinkableApp].self, from: Data(json.utf8))
+    }
+
+    private func sessions(_ json: String) throws -> [LiveSession] {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return try decoder.decode([LiveSession].self, from: Data(json.utf8))
+    }
+
+    func testAnAppWithAnOpenSessionIsConnectedAndOwnsIt() throws {
+        let roster = AppRoster(
+            apps: try apps(#"[{"target":"codex-cli","linked":true,"detected":true},{"target":"cursor","detected":true}]"#),
+            sessions: try sessions(
+                """
+                [{"transport":"ipc","session_id":"a1","client_type":"codex","connected_secs":5},
+                 {"transport":"ipc","session_id":"a2","client_type":"codex","connected_secs":9}]
+                """
+            )
+        )
+        XCTAssertEqual(roster.connected.map(\.app.target), ["codex-cli"])
+        XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["a1", "a2"])
+        XCTAssertEqual(roster.idle.map(\.target), ["cursor"])
+        XCTAssertTrue(roster.other.isEmpty)
+    }
+
+    func testASessionFromNoKnownAppIsKeptApart() throws {
+        let roster = AppRoster(
+            apps: try apps(#"[{"target":"cursor","detected":true}]"#),
+            sessions: try sessions(
+                #"[{"transport":"ipc","session_id":"z9","client_type":"unknown","client_info":"ditto-history","connected_secs":1}]"#
+            )
+        )
+        XCTAssertTrue(roster.connected.isEmpty)
+        XCTAssertEqual(roster.other.map(\.sessionId), ["z9"])
+    }
+
+    func testAnAppTheScanCallsLiveIsConnectedBeforeItsSessionArrives() throws {
+        let roster = AppRoster(
+            apps: try apps(#"[{"target":"cursor","detected":true,"linked":true,"live":true,"live_sessions":1}]"#),
+            sessions: []
+        )
+        XCTAssertEqual(roster.connected.map(\.app.target), ["cursor"])
+        XCTAssertTrue(roster.connected[0].sessions.isEmpty)
+        XCTAssertTrue(roster.idle.isEmpty)
+    }
+}

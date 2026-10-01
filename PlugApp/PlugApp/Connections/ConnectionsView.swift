@@ -1,6 +1,49 @@
 import PlugIPC
 import SwiftUI
 
+/// The apps on this Mac, split by the one thing a person checks first: is it
+/// talking to Plug right now. Pure value so the grouping can be tested.
+struct AppRoster: Equatable {
+    struct Connected: Identifiable, Equatable {
+        var id: String { app.target }
+        let app: LinkableApp
+        let sessions: [LiveSession]
+    }
+
+    /// Apps with an open session, each with the sessions that belong to it.
+    let connected: [Connected]
+    /// Installed or configured apps with nothing open.
+    let idle: [LinkableApp]
+    /// Open sessions from something Plug has no app entry for.
+    let other: [LiveSession]
+
+    init(apps: [LinkableApp], sessions: [LiveSession]) {
+        var claimed = Set<String>()
+        var connected: [Connected] = []
+        var idle: [LinkableApp] = []
+        for app in apps {
+            let own = sessions.filter { Self.targets(of: $0).contains(app.target) }
+            claimed.formUnion(own.map(\.sessionId))
+            if app.live || !own.isEmpty {
+                connected.append(Connected(app: app, sessions: own))
+            } else {
+                idle.append(app)
+            }
+        }
+        self.connected = connected
+        self.idle = idle
+        self.other = sessions.filter { !claimed.contains($0.sessionId) }
+    }
+
+    static func targets(of session: LiveSession) -> Set<String> {
+        var targets = [AppIcons.target(forClientType: session.clientType)]
+        if let info = session.clientInfo, !info.isEmpty {
+            targets.append(AppIcons.target(forClientType: info))
+        }
+        return Set(targets)
+    }
+}
+
 /// Who can use Plug. The old app split this in two — "Clients" listed apps and
 /// "Auth" listed the grants for the same apps — so the audit question ("who
 /// reaches my tools, and how do I cut them off?") could not be answered in one
@@ -26,22 +69,27 @@ struct ConnectionsView: View {
     private var apps: [LinkableApp] {
         allApps.filter { matches($0.name) || matches($0.target) }
     }
-    private var usingApps: [LinkableApp] { apps.filter(\.linked) }
-    private var availableApps: [LinkableApp] { apps.filter { !$0.linked } }
+    /// Every app is placed against all sessions, then search narrows what
+    /// shows, so a session never moves to "Other" because its app was
+    /// filtered out.
+    private var roster: AppRoster { AppRoster(apps: allApps, sessions: sessions) }
+    private var connectedApps: [AppRoster.Connected] {
+        roster.connected.filter { matches($0.app.name) || matches($0.app.target) }
+    }
+    private var idleApps: [LinkableApp] {
+        roster.idle.filter { matches($0.name) || matches($0.target) }
+    }
     private var grants: [DownstreamClient] {
         model.snapshot.downstreamClients.filter {
             matches($0.clientName) || matches($0.source) || matches($0.clientId)
         }
     }
     private var unmatchedSessions: [LiveSession] {
-        sessions.filter { session in
-            let targets = sessionTargets(session)
-            return !allApps.contains { app in targets.contains(app.target) }
-                && (matches(displayName(session))
-                    || matches(session.transport)
-                    || matches(session.sessionId))
+        roster.other.filter {
+            matches(displayName($0)) || matches($0.transport) || matches($0.sessionId)
         }
     }
+    @State private var expanded: Set<String> = []
 
     var body: some View {
         VStack(spacing: 0) {
@@ -90,39 +138,53 @@ struct ConnectionsView: View {
                             }
                             .listRowSeparator(.hidden)
                         }
-                        appSection("Using Plug", apps: usingApps)
-                        appSection("Available apps", apps: availableApps)
-                        if !apps.isEmpty {
-                            Text("Turn on an app to add Plug to its settings. Restart that app to pick up the change.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .padding(.bottom, Metric.regular)
-                                .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
-                        }
-                        if !unmatchedSessions.isEmpty {
-                            SectionLabel(
-                                text: "Other connections",
-                                trailing: unmatchedSessions.count == 1
-                                    ? "1 connection"
-                                    : "\(unmatchedSessions.count) connections"
+                        if !connectedApps.isEmpty || !unmatchedSessions.isEmpty {
+                            sectionLabel(
+                                "Connected now",
+                                count: connectedApps.count + unmatchedSessions.count,
+                                unit: "app"
                             )
-                                .padding(.top, Metric.regular)
+                            ForEach(connectedApps) { entry in
+                                AppLinkRow(
+                                    app: entry.app,
+                                    sessionCount: entry.sessions.count,
+                                    isExpanded: expansion(entry.app.target),
+                                    isBusy: model.busyApps.contains(entry.app.target),
+                                    run: run
+                                )
                                 .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
+                                if expanded.contains(entry.app.target) {
+                                    ForEach(entry.sessions) { session in
+                                        sessionLine(session)
+                                            .listRowSeparator(.hidden)
+                                    }
+                                }
+                            }
                             ForEach(unmatchedSessions) { session in
                                 sessionRow(session)
                                     .listRowSeparator(.hidden)
                             }
                         }
-                        if !grants.isEmpty {
-                            SectionLabel(
-                                text: "Remote access",
-                                trailing: grants.count == 1 ? "1 client" : "\(grants.count) clients"
-                            )
-                                .padding(.top, Metric.regular)
+                        if !idleApps.isEmpty {
+                            sectionLabel("On this Mac", count: idleApps.count, unit: "app")
+                            ForEach(idleApps) { app in
+                                AppLinkRow(
+                                    app: app,
+                                    sessionCount: 0,
+                                    isExpanded: nil,
+                                    isBusy: model.busyApps.contains(app.target),
+                                    run: run
+                                )
+                                .listRowSeparator(.hidden)
+                            }
+                            Text("Turn on an app to add Plug to its settings. Restart that app to pick up the change.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
                                 .listRowSeparator(.hidden)
                                 .listRowBackground(Color.clear)
+                        }
+                        if !grants.isEmpty {
+                            sectionLabel("Remote clients", count: grants.count, unit: "client")
                             ForEach(grants) { grant in
                                 GrantRow(grant: grant, run: run)
                                     .listRowSeparator(.hidden)
@@ -148,25 +210,40 @@ struct ConnectionsView: View {
             && !model.isLoadingConnectableApps
     }
 
-    @ViewBuilder
-    private func appSection(_ title: String, apps: [LinkableApp]) -> some View {
-        if !apps.isEmpty {
-            SectionLabel(
-                text: title,
-                trailing: apps.count == 1 ? "1 app" : "\(apps.count) apps"
-            )
+    private func sectionLabel(_ title: String, count: Int, unit: String) -> some View {
+        SectionLabel(text: title, trailing: count == 1 ? "1 \(unit)" : "\(count) \(unit)s")
             .padding(.top, Metric.regular)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
-            ForEach(apps) { app in
-                AppLinkRow(
-                    app: app,
-                    isBusy: model.busyApps.contains(app.target),
-                    run: run
-                )
-                .listRowSeparator(.hidden)
+    }
+
+    private func expansion(_ target: String) -> Binding<Bool> {
+        Binding(
+            get: { expanded.contains(target) },
+            set: { isOn in
+                if isOn { expanded.insert(target) } else { expanded.remove(target) }
             }
+        )
+    }
+
+    /// One session of an app whose row is already above it: the id that tells
+    /// it apart, how long it has been open, and what it can reach.
+    private func sessionLine(_ session: LiveSession) -> some View {
+        HStack(spacing: Metric.snug) {
+            Text(session.sessionId.prefix(8))
+                .font(.caption.monospaced())
+                .textSelection(.enabled)
+            Text(duration(session.connectedSecs))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Spacer(minLength: Metric.tight)
+            Text(toolsText(session))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
         }
+        .padding(.leading, 22 + Metric.snug)
+        .accessibilityElement(children: .combine)
     }
 
     private func matches(_ value: String) -> Bool {
@@ -179,14 +256,6 @@ struct ConnectionsView: View {
         let count = sessions.count
         let summary = "\(count) open \(count == 1 ? "session" : "sessions")"
         return model.dataIsStale ? "Last known · \(summary)" : summary
-    }
-
-    private func sessionTargets(_ session: LiveSession) -> Set<String> {
-        var targets = [AppIcons.target(forClientType: session.clientType)]
-        if let info = session.clientInfo, !info.isEmpty {
-            targets.append(AppIcons.target(forClientType: info))
-        }
-        return Set(targets)
     }
 
     private func sessionRow(_ session: LiveSession) -> some View {
@@ -263,24 +332,44 @@ struct ConnectionsView: View {
 /// An AI app on this Mac, and whether Plug is wired into it.
 private struct AppLinkRow: View {
     let app: LinkableApp
+    /// Open sessions counted from the live snapshot, which is fresher than
+    /// the app scan.
+    let sessionCount: Int
+    /// Set when the row has sessions to show underneath.
+    let isExpanded: Binding<Bool>?
     let isBusy: Bool
     let run: (PlugIntent) -> Void
 
     var body: some View {
         HStack(spacing: Metric.snug) {
             AppGlyph(target: app.target, name: app.name)
-                .opacity(app.detected || app.linked ? 1 : 0.4)
+                .opacity(app.detected || app.linked || sessionCount > 0 ? 1 : 0.4)
             VStack(alignment: .leading, spacing: Metric.rowGap) {
                 Text(app.name)
                     .font(.body)
                     .foregroundStyle(app.detected || app.linked ? .primary : .secondary)
                 Label(status, systemImage: statusSymbol)
                     .font(.caption)
-                    .foregroundStyle(app.linked ? Color.green : Color.secondary)
+                    .foregroundStyle(isLive ? Color.green : Color.secondary)
                     .labelStyle(.titleAndIcon)
             }
             .layoutPriority(1)
             Spacer(minLength: Metric.tight)
+            if let isExpanded, sessionCount > 0 {
+                Button {
+                    isExpanded.wrappedValue.toggle()
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
+                        .frame(width: 24, height: 24)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help(isExpanded.wrappedValue ? "Hide sessions" : "Show sessions")
+                .accessibilityLabel(isExpanded.wrappedValue ? "Hide sessions" : "Show sessions")
+            }
             if isBusy {
                 ProgressView().controlSize(.small)
             } else if app.detected || app.linked {
@@ -302,6 +391,11 @@ private struct AppLinkRow: View {
         .accessibilityLabel("\(app.name), \(status)")
         // Combining the row hides its switch from VoiceOver.
         .accessibilityActions {
+            if let isExpanded, sessionCount > 0 {
+                Button(isExpanded.wrappedValue ? "Hide Sessions" : "Show Sessions") {
+                    isExpanded.wrappedValue.toggle()
+                }
+            }
             if !isBusy, app.detected || app.linked {
                 Button(app.linked ? "Stop Using Plug" : "Use Plug") {
                     run(app.linked ? .unlinkApp(app.target) : .linkApp(app.target))
@@ -312,22 +406,22 @@ private struct AppLinkRow: View {
 
     /// The state as a glyph, so linked and not-linked are told apart before
     /// the sentence is read.
+    private var isLive: Bool { app.live || sessionCount > 0 }
+
     private var statusSymbol: String {
+        if isLive { return "bolt.fill" }
         guard app.linked else { return app.detected ? "circle" : "questionmark.app.dashed" }
-        return app.live ? "bolt.fill" : "checkmark.circle.fill"
+        return "checkmark.circle"
     }
 
     private var status: String {
-        guard app.linked else { return app.detected ? "Available on this Mac" : "Not installed" }
-        if !app.detected { return "Configured · app not found" }
-        if app.live {
-            return app.sessions == 1 ? "Connected now · 1 session" : "Connected now · \(app.sessions) sessions"
+        if isLive {
+            let count = max(sessionCount, app.sessions)
+            return count == 1 ? "1 session" : "\(count) sessions"
         }
-        switch app.transport?.lowercased() {
-        case "stdio": return "Ready to use Plug on this Mac"
-        case "http": return "Ready to use Plug over the network"
-        default: return "Ready to use Plug"
-        }
+        guard app.linked else { return app.detected ? "Not using Plug" : "Not installed" }
+        if !app.detected { return "Set up · app not found" }
+        return app.transport?.lowercased() == "http" ? "Ready · over the network" : "Ready"
     }
 }
 
@@ -370,8 +464,11 @@ private struct GrantRow: View {
     }
 
     private var grantDetail: String {
-        let source = grant.source.trimmingCharacters(in: .whitespacesAndNewlines)
-        let identity = source.isEmpty ? "ID \(grant.clientId.prefix(8))" : source
-        return identity
+        // A client that identifies itself by web address is named by that
+        // site. One Plug registered gets a short id, since two can share a
+        // name. The registration method is not shown: nobody can act on it.
+        if let host = URL(string: grant.clientId)?.host() { return host }
+        let id = grant.clientId.hasPrefix("plug_") ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
+        return "ID \(id.prefix(8))"
     }
 }
