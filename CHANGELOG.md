@@ -20,6 +20,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   how long it has been open, and how many tools it can reach. A remote
   client shows the site it signs in from, or a short id, in place of its
   registration method.
+- The menu bar panel lists the three most recent tool calls, with the server,
+  the outcome, and how long each took. Clicking them opens Activity.
 
 ## [0.8.12] - 2026-10-01
 

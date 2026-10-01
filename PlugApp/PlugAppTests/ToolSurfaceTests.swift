@@ -298,3 +298,43 @@ final class AppRosterTests: XCTestCase {
         XCTAssertTrue(roster.idle.isEmpty)
     }
 }
+
+@MainActor
+final class PopoverRecentTests: XCTestCase {
+    private func event(_ sequence: UInt64, tool: String?, server: String? = "Figma") -> ActivityEvent {
+        ActivityEvent(
+            sequence: sequence,
+            occurredAtMs: sequence,
+            client: nil,
+            method: tool == nil ? "tools/list" : "tools/call",
+            server: server,
+            tool: tool,
+            latencyMs: 10,
+            outcome: "success"
+        )
+    }
+
+    func testRecentCallsAreToolCallsNewestFirst() {
+        let events = [
+            event(1, tool: "Figma__get_file"),
+            event(2, tool: nil),
+            event(3, tool: "Slack__channels_list"),
+            event(4, tool: ""),
+            event(5, tool: "Notion__search"),
+            event(6, tool: "Gmail__send_message"),
+        ]
+        XCTAssertEqual(PlugPopover.recentCalls(events, limit: 3).map(\.sequence), [6, 5, 3])
+    }
+
+    func testCallPartsSplitTheServerPrefix() {
+        let parts = PlugPopover.callParts(event(1, tool: "Figma__get_file", server: "figma"))
+        XCTAssertEqual(parts.server, "Figma")
+        XCTAssertEqual(parts.tool, "get_file")
+    }
+
+    func testCallPartsKeepAnUnprefixedName() {
+        let parts = PlugPopover.callParts(event(1, tool: "search", server: "notion"))
+        XCTAssertEqual(parts.server, "notion")
+        XCTAssertEqual(parts.tool, "search")
+    }
+}

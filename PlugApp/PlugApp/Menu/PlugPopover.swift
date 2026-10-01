@@ -1,4 +1,5 @@
 import AppKit
+import PlugIPC
 import SwiftUI
 
 /// The app.
@@ -11,8 +12,9 @@ import SwiftUI
 ///
 /// Shape of the panel, top to bottom: one headline with its fix, a thin
 /// progress line while servers settle, the server list with trouble pinned to
-/// the top and its fix inline, who is connected, and the controls. Servers
-/// never leave the list when they break, so rows do not jump around.
+/// the top and its fix inline, who is connected, the last few tool calls, and
+/// the controls. Servers never leave the list when they break, so rows do not
+/// jump around.
 struct PlugPopover: View {
     let model: AppModel
     let run: (PlugIntent) -> Void
@@ -32,6 +34,10 @@ struct PlugPopover: View {
             if situation.connectedApps > 0 {
                 PanelDivider()
                 connectedAppsRow
+            }
+            if !recentCalls.isEmpty {
+                PanelDivider()
+                recent
             }
             PanelDivider()
             footer
@@ -175,6 +181,56 @@ struct PlugPopover: View {
         return situation.connectedApps == 1 ? "1 app connected" : "\(situation.connectedApps) apps connected"
     }
 
+    // MARK: - Recent
+
+    private var recentCalls: [ActivityEvent] {
+        Self.recentCalls(model.activities, limit: 3)
+    }
+
+    /// The newest tool calls. Listing, pings, and other protocol traffic are
+    /// not what anyone opens the panel to see.
+    static func recentCalls(_ activities: [ActivityEvent], limit: Int) -> [ActivityEvent] {
+        activities
+            .filter { $0.tool?.isEmpty == false }
+            .sorted { $0.sequence > $1.sequence }
+            .prefix(limit)
+            .map { $0 }
+    }
+
+    /// Tool names arrive as `Server__tool`. The row states the server once, in
+    /// words, so the tool half stands alone.
+    static func callParts(_ event: ActivityEvent) -> (server: String?, tool: String) {
+        let tool = event.tool ?? event.method
+        guard let range = tool.range(of: "__"), range.lowerBound > tool.startIndex,
+              range.upperBound < tool.endIndex
+        else { return (event.server, tool) }
+        return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))
+    }
+
+    private var recent: some View {
+        Button { send(.openWindow(.activity)) } label: {
+            VStack(alignment: .leading, spacing: Metric.tight) {
+                HStack(spacing: Metric.tight) {
+                    Text("Recent")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer(minLength: 0)
+                    Image(systemName: "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                ForEach(recentCalls) { event in
+                    RecentCallRow(event: event, parts: Self.callParts(event))
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(QuietRowButtonStyle())
+        .padding(.horizontal, Metric.tight)
+        .padding(.vertical, Metric.tight)
+        .help("See all activity")
+    }
+
     // MARK: - Footer
 
     private var footer: some View {
@@ -306,6 +362,43 @@ private struct PanelServerRow: View {
         case .working: server.toolCountText
         default: server.health.label
         }
+    }
+}
+
+/// One tool call: whether it worked, what ran, where, and how long it took.
+private struct RecentCallRow: View {
+    let event: ActivityEvent
+    let parts: (server: String?, tool: String)
+
+    private var succeeded: Bool { event.outcome == "success" }
+
+    var body: some View {
+        HStack(spacing: Metric.tight) {
+            Image(systemName: succeeded ? "checkmark" : "exclamationmark.triangle.fill")
+                .font(.caption2)
+                .foregroundStyle(succeeded ? Color.secondary : .orange)
+                .frame(width: 12)
+            Text(parts.tool)
+                .font(.caption.monospaced())
+                .foregroundStyle(.primary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            if let server = parts.server {
+                Text(server)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .layoutPriority(-1)
+            }
+            Spacer(minLength: Metric.tight)
+            Text("\(event.latencyMs) ms")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.tertiary)
+        }
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(parts.tool)\(parts.server.map { ", \($0)" } ?? ""), \(succeeded ? "succeeded" : "failed"), \(event.latencyMs) milliseconds"
+        )
     }
 }
 
