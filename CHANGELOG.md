@@ -5,16 +5,7 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- Remote OAuth clients such as ChatGPT can connect when their client metadata
-  lists `none` among supported authentication methods, even when their legacy
-  preference is `private_key_jwt`. Older metadata and dynamic registration keep
-  their existing checks. Unsupported token assertions and authorization headers
-  are rejected instead of being silently ignored; PKCE and owner consent remain
-  required.
+## [0.8.12] - 2026-10-01
 
 ### Changed
 
@@ -154,6 +145,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   connector now completes it on those sessions, including when the client opens
   with a plain `initialize` that negotiates `2026-07-28`. Older clients are
   unchanged.
+- Remote OAuth clients such as ChatGPT can connect when their client metadata
+  lists `none` among supported authentication methods, even when their legacy
+  preference is `private_key_jwt`. Older metadata and dynamic registration keep
+  their existing checks. Unsupported token assertions and authorization headers
+  are rejected instead of being silently ignored; PKCE and owner consent remain
+  required.
 - Updating Plug.app no longer leaves about twelve seconds without a daemon.
   The replacement killed the daemon registration had just started, and
   launchd's respawn throttle held the restart back; the gap is now under two
