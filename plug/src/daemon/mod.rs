@@ -1542,6 +1542,17 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                             Some(live_session_lazy_key(session).as_str()),
                         )
                         .len(),
+                    client_key: session.client_key(),
+                })
+                .collect();
+            let client_names = config
+                .clients
+                .iter()
+                .filter_map(|(key, settings)| {
+                    Some(plug_core::ipc::ClientName {
+                        key: key.clone(),
+                        name: settings.name.clone()?,
+                    })
                 })
                 .collect();
             let mut server_statuses = ctx.server_manager.server_statuses();
@@ -1563,6 +1574,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     client_visibility,
                     upstream_auth,
                     downstream_clients,
+                    client_names,
                     config_error,
                 }),
             }
@@ -1659,6 +1671,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 plug_core::operator::OperatorMutation::SetToolEnabled {
                     tool: tool.clone(),
                     enabled: *enabled,
+                },
+            )
+            .await
+        }
+        IpcRequest::RenameClient { key, name, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::RenameClient {
+                    key: key.clone(),
+                    name: name.clone(),
                 },
             )
             .await

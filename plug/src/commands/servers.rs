@@ -298,7 +298,7 @@ pub(crate) async fn cmd_server_command(
     }
 }
 
-async fn apply_server_mutation(
+pub(crate) async fn apply_server_mutation(
     config_path: Option<&std::path::PathBuf>,
     mutation: plug_core::operator::OperatorMutation,
 ) -> anyhow::Result<plug_core::operator::OperatorMutationResult> {
@@ -340,6 +340,13 @@ async fn apply_server_mutation(
             plug_core::ipc::IpcRequest::SetToolEnabled {
                 tool,
                 enabled,
+                auth_token,
+            }
+        }
+        plug_core::operator::OperatorMutation::RenameClient { key, name } => {
+            plug_core::ipc::IpcRequest::RenameClient {
+                key,
+                name,
                 auth_token,
             }
         }

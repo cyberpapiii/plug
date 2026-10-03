@@ -111,6 +111,22 @@ pub struct OperatorClientVisibility {
     pub session_id: String,
     pub client_type: crate::types::ClientType,
     pub visible_tool_count: usize,
+    /// What the client's settings are stored under, when Plug can tell one
+    /// such client from another.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+}
+
+/// A name the owner gave a client.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientName {
+    pub key: String,
+    pub name: String,
+}
+
+/// The settings key of a remote client that holds a grant.
+pub fn grant_client_key(client_id: &str) -> String {
+    format!("oauth:{client_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -132,6 +148,10 @@ pub struct OperatorSnapshot {
     pub client_visibility: Vec<OperatorClientVisibility>,
     pub upstream_auth: Vec<IpcAuthServerInfo>,
     pub downstream_clients: Vec<crate::downstream_oauth::RegisteredClientSummary>,
+    /// Names the owner gave clients. A list, not a map, because the keys hold
+    /// paths and a reader may rewrite map keys.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_names: Vec<ClientName>,
     /// Why config.toml could not be read, when it could not. The daemon keeps
     /// running its last good config, and `configured_servers` then lists that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -202,6 +222,12 @@ pub enum IpcRequest {
         auth_token: String,
         tool: String,
         enabled: bool,
+    },
+    /// Give a client a name by editing `clients`. An empty name removes it.
+    RenameClient {
+        auth_token: String,
+        key: String,
+        name: String,
     },
 
     /// Restart a specific upstream server.
@@ -377,6 +403,12 @@ impl fmt::Debug for IpcRequest {
             Self::RemoveServer { name, .. } => f
                 .debug_struct("RemoveServer")
                 .field("auth_token", &"[REDACTED]")
+                .field("name", name)
+                .finish(),
+            Self::RenameClient { key, name, .. } => f
+                .debug_struct("RenameClient")
+                .field("auth_token", &"[REDACTED]")
+                .field("key", key)
                 .field("name", name)
                 .finish(),
             Self::SetServerEnabled { name, enabled, .. } => f
@@ -733,6 +765,28 @@ pub struct IpcLiveSessionInfo {
     pub last_activity_secs: Option<u64>,
 }
 
+impl IpcLiveSessionInfo {
+    /// What this client's settings are stored under.
+    ///
+    /// A client Plug recognises is its target slug. One it does not is the
+    /// program that started it, which Plug reads from the process table. A
+    /// session with neither has no key: what a client says about itself is
+    /// not a safe thing to hang settings on.
+    pub fn client_key(&self) -> Option<String> {
+        if let Some(slug) = self.client_type.target_slug() {
+            return Some(slug.to_string());
+        }
+        if self.client_type != crate::types::ClientType::Unknown {
+            return None;
+        }
+        let host = self.host.as_ref()?;
+        Some(format!(
+            "host:{}",
+            host.app.as_ref().unwrap_or(&host.executable)
+        ))
+    }
+}
+
 /// Per-server OAuth authentication info returned by `AuthStatus`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcAuthServerInfo {
@@ -975,6 +1029,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::RemoveServer { .. }
             | IpcRequest::SetServerEnabled { .. }
             | IpcRequest::SetToolEnabled { .. }
+            | IpcRequest::RenameClient { .. }
     )
 }
 
@@ -993,7 +1048,8 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::UpdateServer { auth_token, .. }
         | IpcRequest::RemoveServer { auth_token, .. }
         | IpcRequest::SetServerEnabled { auth_token, .. }
-        | IpcRequest::SetToolEnabled { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::SetToolEnabled { auth_token, .. }
+        | IpcRequest::RenameClient { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -1877,6 +1933,52 @@ mod tests {
     }
 
     #[test]
+    fn a_client_key_comes_from_what_plug_observes_never_from_what_the_client_says() {
+        let session = |client_type, host| IpcLiveSessionInfo {
+            transport: LiveSessionTransport::DaemonProxy,
+            client_id: Some("client-1".to_string()),
+            session_id: "session-1".to_string(),
+            client_type,
+            client_info: Some("Cursor".to_string()),
+            adapter_version: None,
+            host,
+            connected_secs: 1,
+            last_activity_secs: None,
+        };
+        let host = |app: Option<&str>| ClientHost {
+            name: "Hermes".to_string(),
+            executable: "/opt/hermes/bin/python3".to_string(),
+            app: app.map(str::to_string),
+        };
+        use crate::types::ClientType;
+
+        assert_eq!(
+            session(ClientType::Cursor, Some(host(None)))
+                .client_key()
+                .as_deref(),
+            Some("cursor")
+        );
+        assert_eq!(
+            session(
+                ClientType::Unknown,
+                Some(host(Some("/Applications/Hermes.app")))
+            )
+            .client_key()
+            .as_deref(),
+            Some("host:/Applications/Hermes.app")
+        );
+        assert_eq!(
+            session(ClientType::Unknown, Some(host(None)))
+                .client_key()
+                .as_deref(),
+            Some("host:/opt/hermes/bin/python3")
+        );
+        // It calls itself Cursor, but nothing Plug can see backs that up.
+        assert_eq!(session(ClientType::Unknown, None).client_key(), None);
+        assert_eq!(session(ClientType::GrokBot, None).client_key(), None);
+    }
+
+    #[test]
     fn register_carries_the_host_program_and_omits_it_when_unknown() {
         let host = ClientHost {
             name: "Hermes".to_string(),
@@ -2249,6 +2351,7 @@ mod tests {
                         session_id: "session-1".to_string(),
                         client_type: crate::types::ClientType::ClaudeCode,
                         visible_tool_count: 16,
+                        client_key: None,
                     }],
                     upstream_auth: vec![IpcAuthServerInfo {
                         name: "auth-required".to_string(),
@@ -2268,6 +2371,7 @@ mod tests {
                         last_used_at: None,
                         expires_at: 1_800_000_000,
                     }],
+                    client_names: Vec::new(),
                     config_error: None,
                 }),
             }

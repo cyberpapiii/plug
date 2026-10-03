@@ -310,6 +310,42 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(named[1].host?.app)
     }
 
+    func testANameTheOwnerGaveWinsAndFollowsTheClientNotTheSession() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let key = "host:/opt/hermes_agent/bin/python3"
+        let visibility = try decoder.decode(
+            [ClientVisibility].self,
+            from: Data(
+                """
+                [{"session_id":"h1","client_type":"Unknown","visible_tool_count":3,"client_key":"\(key)"},
+                 {"session_id":"h2","client_type":"Unknown","visible_tool_count":3,"client_key":"\(key)"},
+                 {"session_id":"h3","client_type":"Unknown","visible_tool_count":3}]
+                """.utf8
+            )
+        )
+        let stored = try decoder.decode(
+            [ClientName].self,
+            from: Data(#"[{"key":"\#(key)","name":"Hermes"},{"key":"oauth:abc","name":"Phone"}]"#.utf8)
+        )
+        let names = ClientNames(visibility: visibility, names: stored)
+        let live = try sessions(
+            """
+            [{"transport":"daemon_proxy","session_id":"h1","client_type":"Unknown","client_info":"mcp","connected_secs":1,
+              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"}},
+             {"transport":"daemon_proxy","session_id":"h2","client_type":"Unknown","client_info":"mcp","connected_secs":1,
+              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"}},
+             {"transport":"daemon_proxy","session_id":"h3","client_type":"Unknown","client_info":"mcp","connected_secs":1}]
+            """
+        )
+
+        XCTAssertEqual(live.map(names.displayName), ["Hermes", "Hermes", "Unidentified local client h3"])
+        XCTAssertEqual(names.key(of: live[0]), key)
+        XCTAssertNil(names.key(of: live[2]), "a session with nothing to store a name under cannot be renamed")
+        XCTAssertEqual(names.name(forKey: "oauth:abc"), "Phone")
+        XCTAssertNil(names.name(forKey: "oauth:other"))
+    }
+
     func testStaleAppScanCannotInventAConnectedSession() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true,"linked":true,"live":true,"live_sessions":1}]"#),

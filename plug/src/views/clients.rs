@@ -292,12 +292,13 @@ fn live_session_groups(
 
 fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView]) {
     println!(
-        "  {:<18} {:<14} {:<12} {:<10} {:<10}",
+        "  {:<18} {:<14} {:<12} {:<10} {:<10} {}",
         style("SESSION").dim(),
         style("CLIENT").dim(),
         style("TRANSPORT").dim(),
         style("CONNECTED").dim(),
-        style("IDLE").dim()
+        style("IDLE").dim(),
+        style("KEY").dim()
     );
     println!(
         "  {}",
@@ -309,12 +310,13 @@ fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView
             .map(crate::ui::format_duration)
             .unwrap_or_else(|| "-".to_string());
         println!(
-            "  {:<18} {:<14} {:<12} {:<10} {:<10}",
+            "  {:<18} {:<14} {:<12} {:<10} {:<10} {}",
             &session.session_id[..session.session_id.len().min(18)],
             session.label(),
             session.transport,
             crate::ui::format_duration(session.connected_secs),
             idle,
+            session.key.as_deref().unwrap_or("-"),
         );
     }
 }
@@ -361,7 +363,7 @@ pub(crate) async fn cmd_client_list(
         let config_error = config_result.as_ref().err().map(|error| error.to_string());
         let config = config_result.ok();
         let clients = client_views(&live, config.as_ref());
-        let live_sessions = live_session_views(&live);
+        let live_sessions = live_session_views(&live, config.as_ref());
 
         if matches!(output, OutputFormat::Json) {
             println!(
@@ -540,6 +542,8 @@ mod tests {
             client_id: None,
             client_info: Some("Claude Desktop".to_string()),
             host: None,
+            key: None,
+            name: None,
             connected_secs: 12,
             last_activity_secs: Some(3),
         }];
@@ -717,6 +721,8 @@ mod tests {
             client_id: None,
             client_info: None,
             host: None,
+            key: None,
+            name: None,
             connected_secs,
             last_activity_secs: None,
         }
@@ -737,6 +743,43 @@ mod tests {
         let groups = live_session_groups(&sessions);
         let clients = groups.iter().map(|group| group.client).collect::<Vec<_>>();
         assert_eq!(clients, ["Cursor", "Hermes", "Unknown"]);
+    }
+
+    #[test]
+    fn a_client_to_rename_is_found_by_the_name_it_shows_under() {
+        use crate::commands::clients::resolve_client_key;
+        let mut hermes = session("Unknown", "daemon_proxy", 30);
+        hermes.host = Some(plug_core::ipc::ClientHost {
+            name: "python3".to_string(),
+            executable: "/opt/hermes/bin/python3".to_string(),
+            app: None,
+        });
+        hermes.key = Some("host:/opt/hermes/bin/python3".to_string());
+        let mut renamed = hermes.clone();
+        renamed.name = Some("Hermes".to_string());
+        let nameless = session("Unknown", "daemon_proxy", 5);
+
+        let key = |wanted, sessions: &[LiveSessionView]| {
+            resolve_client_key(wanted, sessions).map_err(|error| error.to_string())
+        };
+        assert_eq!(
+            key("PYTHON3", &[hermes.clone()]).unwrap(),
+            "host:/opt/hermes/bin/python3"
+        );
+        assert_eq!(renamed.label(), "Hermes");
+        assert_eq!(
+            key("hermes", &[renamed]).unwrap(),
+            "host:/opt/hermes/bin/python3"
+        );
+        // Not connected: a key or a known client is taken as given.
+        assert_eq!(key("cursor", &[]).unwrap(), "cursor");
+        assert_eq!(key("oauth:abc", &[]).unwrap(), "oauth:abc");
+        assert!(key("hermes", &[]).unwrap_err().contains("plug clients -v"));
+        assert!(
+            key("Unknown", &[nameless])
+                .unwrap_err()
+                .contains("cannot tell")
+        );
     }
 
     fn client(name: &str, linked: bool, detected: bool, live: bool) -> ClientView {
