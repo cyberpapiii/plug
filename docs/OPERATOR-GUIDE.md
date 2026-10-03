@@ -22,9 +22,12 @@ Linux builds from source with `cargo install`. Source development runs `./script
 
 Plug has one configured upstream set and many downstream clients.
 
-- `plug start` starts the shared daemon, IPC listener, and HTTP server.
+- One shared daemon owns the IPC listener and the HTTP server. On macOS
+  Plug.app starts and restarts it; use the app's on/off switch and Restart
+  control. On Linux, `plug start` starts it.
 - `plug connect` is the stdio adapter most local clients use.
 - `/mcp` is the Streamable HTTP endpoint for HTTP-capable clients.
+- `/events/slack` exists only when Slack event delivery is configured.
 - `plug status`, `plug clients`, `plug servers`, `plug tools`, and `plug doctor` are the primary operator surfaces.
 
 Useful files:
@@ -104,6 +107,12 @@ public_base_url = "https://plug.example.com"
 oauth_scopes = ["tools:read"]
 ```
 
+`oauth_scopes` is the set a client may be granted. Leave it out to offer the
+default set (`tools:read`, `resources:read`, `prompts:read`, `completion:use`,
+`tasks:use`, `subscriptions:listen`, `logging:configure`, `logging:read`,
+`continuations:complete`). `events:subscribe` is never in the default set; add
+it explicitly for [Slack event delivery](slack-mcp-events.md).
+
 Clients connect with only the MCP URL, for example
 `https://plug.example.com/mcp`. Plug supports public-client Dynamic Client
 Registration and OAuth Client ID Metadata Documents; it does not require a
@@ -166,6 +175,15 @@ calculate short-lived, single-use HMAC proofs bound to the exact method, path,
 nonces, and final-credential-removal intent. The reusable token is never sent
 in an HTTP request or URL and is not printed or logged. Operator requests also
 require Plug's exact local listener authority and reject forwarded requests.
+
+## Slack Event Delivery
+
+Optional. Plug can receive Slack's Events API and deliver filtered messages to
+one authorized remote client as an MCP event. It needs OAuth mode, the modern
+downstream gate, an enabled `slack` upstream, and a signing secret stored with
+`plug auth slack-events set`. It is Slack-only; no other server's events are
+forwarded. Setup, limits, and shutdown are in
+[slack-mcp-events.md](slack-mcp-events.md).
 
 ## Upstream OAuth
 

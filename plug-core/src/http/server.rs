@@ -58,6 +58,7 @@ pub struct HttpState {
     pub cancel: CancellationToken,
     pub auth_mode: crate::config::DownstreamAuthMode,
     pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
+    pub slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
     pub sse_channel_capacity: usize,
     pub allowed_origins: Vec<Arc<str>>,
     pub notification_task_started: AtomicBool,
@@ -701,9 +702,63 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         ))
         .layer(DefaultBodyLimit::disable())
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
-        .with_state(state);
+        .with_state(state.clone());
 
-    discovery.merge(mcp)
+    if state.slack_events.is_some() {
+        let source = Router::new()
+            .route(crate::slack_events::SOURCE_PATH, post(slack_event_source))
+            .layer(DefaultBodyLimit::max(256 * 1024))
+            .with_state(state);
+        source.merge(discovery).merge(mcp)
+    } else {
+        discovery.merge(mcp)
+    }
+}
+
+async fn slack_event_source(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    let Some(events) = &state.slack_events else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    match events.ingest(&headers, &body).await {
+        Ok(value) => Json(value).into_response(),
+        Err(error) => {
+            let status = match error.code {
+                -32001 => StatusCode::UNAUTHORIZED,
+                -32602 => StatusCode::BAD_REQUEST,
+                _ => StatusCode::SERVICE_UNAVAILABLE,
+            };
+            (status, Json(json!({"error":error.message}))).into_response()
+        }
+    }
+}
+
+fn discoverable_events<'a>(
+    state: &'a HttpState,
+    auth: &AuthStatus,
+) -> Option<&'a Arc<crate::slack_events::SlackEvents>> {
+    let AuthStatus::Authenticated(Some(claims)) = auth else {
+        return None;
+    };
+    state.slack_events.as_ref().filter(|events| {
+        claims.principal_lifecycle.is_active() && events.discoverable_to(&claims.client_id)
+    })
+}
+
+fn permitted_events<'a>(
+    state: &'a HttpState,
+    auth: &AuthStatus,
+) -> Option<&'a Arc<crate::slack_events::SlackEvents>> {
+    let AuthStatus::Authenticated(Some(claims)) = auth else {
+        return None;
+    };
+    state.slack_events.as_ref().filter(|events| {
+        claims.principal_lifecycle.is_active()
+            && events.available_to(&claims.client_id, &claims.scopes)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -1491,6 +1546,23 @@ async fn handle_request(
 ) -> Result<Response, HttpError> {
     let request_id = req.id.clone();
     let modern = era == crate::protocol::ProtocolEra::Modern;
+    // Fixed protocol metadata only: never log credentials, identifiers or parameters.
+    let discovery_method = match &req.request {
+        ClientRequest::InitializeRequest(_) => Some("initialize"),
+        ClientRequest::DiscoverRequest(_) => Some("server/discover"),
+        ClientRequest::CustomRequest(custom) if custom.method == "events/list" => {
+            Some("events/list")
+        }
+        _ => None,
+    };
+    if let Some(method) = discovery_method {
+        tracing::info!(
+            method,
+            protocol_era = if modern { "modern" } else { "legacy" },
+            selected_event_client = discoverable_events(state, &auth_status).is_some(),
+            "MCP Events discovery request"
+        );
+    }
     let request_meta = modern.then(|| rmcp::model::GetMeta::get_meta(&req.request).clone());
     let policy_context = if modern {
         modern_http_call_context(
@@ -1536,10 +1608,32 @@ async fn handle_request(
             result.set_server_info(crate::branding::plug_implementation(env!(
                 "CARGO_PKG_VERSION"
             )));
-            json_response_for_era(
-                &ServerJsonRpcMessage::response(ServerResult::DiscoverResult(result), request_id),
-                era,
-            )
+            if discoverable_events(state, &auth_status).is_some() {
+                tracing::info!(
+                    method = "server/discover",
+                    status = 200,
+                    events_advertised = true,
+                    "MCP Events discovery outcome"
+                );
+                let mut value = serde_json::to_value(result)
+                    .map_err(|_| HttpError::Internal("discovery serialization failed".into()))?;
+                value["capabilities"]["events"] = json!({});
+                json_response_for_era(
+                    &ServerJsonRpcMessage::response(
+                        ServerResult::CustomResult(CustomResult::new(value)),
+                        request_id,
+                    ),
+                    era,
+                )
+            } else {
+                json_response_for_era(
+                    &ServerJsonRpcMessage::response(
+                        ServerResult::DiscoverResult(result),
+                        request_id,
+                    ),
+                    era,
+                )
+            }
         }
         ClientRequest::InitializeRequest(init_req) => {
             if modern {
@@ -1770,6 +1864,128 @@ async fn handle_request(
                 }
             }
             json_response_for_era(&response_msg, era)
+        }
+
+        ClientRequest::CustomRequest(custom)
+            if modern
+                && matches!(
+                    custom.method.as_str(),
+                    "events/list" | "events/subscribe" | "events/unsubscribe"
+                ) =>
+        {
+            let subscription_method = match custom.method.as_str() {
+                "events/subscribe" => Some("events/subscribe"),
+                "events/unsubscribe" => Some("events/unsubscribe"),
+                _ => None,
+            };
+            if let Some(method) = subscription_method {
+                tracing::info!(
+                    method,
+                    status = "received",
+                    "MCP Events subscription request"
+                );
+            }
+            // Advertise a scope challenge only to the configured active client.
+            // This is incremental consent, never a grant or an event subscription.
+            if custom.method != "events/list"
+                && let AuthStatus::Authenticated(Some(claims)) = &auth_status
+                && claims.principal_lifecycle.is_active()
+                && state
+                    .slack_events
+                    .as_ref()
+                    .is_some_and(|events| events.discoverable_to(&claims.client_id))
+                && !claims
+                    .scopes
+                    .iter()
+                    .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
+                && let Some(manager) = &state.downstream_oauth
+            {
+                if let Some(method) = subscription_method {
+                    tracing::info!(
+                        method,
+                        status = 403,
+                        missing_scope = crate::slack_events::EVENT_SCOPE,
+                        "MCP Events subscription outcome"
+                    );
+                }
+                return Err(HttpError::InsufficientScopeWithMetadata {
+                    metadata_url: protected_resource_metadata_url(manager.base_url()),
+                    scope: crate::slack_events::EVENT_SCOPE.to_string(),
+                });
+            }
+            // Static catalog discovery must precede incremental subscription consent.
+            let eligible = if custom.method == "events/list" {
+                discoverable_events(state, &auth_status)
+            } else {
+                permitted_events(state, &auth_status)
+            };
+            let Some(events) = eligible else {
+                if let Some(method) = subscription_method {
+                    tracing::info!(
+                        method,
+                        status = "jsonrpc_error",
+                        "MCP Events subscription outcome"
+                    );
+                }
+                return json_response_for_era(
+                    &ServerJsonRpcMessage::error(
+                        McpError::new(ErrorCode(-32001), "event access denied", None),
+                        Some(request_id),
+                    ),
+                    era,
+                );
+            };
+            let params = custom.params.unwrap_or_else(|| json!({}));
+            let result = match custom.method.as_str() {
+                "events/list" => {
+                    if params
+                        .as_object()
+                        .is_none_or(|p| p.keys().any(|k| k != "_meta" && k != "cursor"))
+                        || params.get("cursor").is_some_and(|v| !v.is_null())
+                    {
+                        Err(crate::slack_events::EventError {
+                            code: -32602,
+                            message: "invalid event list parameters",
+                            reason: None,
+                        })
+                    } else {
+                        tracing::info!(
+                            method = "events/list",
+                            status = 200,
+                            "MCP Events discovery outcome"
+                        );
+                        Ok(events.catalog())
+                    }
+                }
+                "events/subscribe" => events.subscribe(&params).await,
+                _ => events.unsubscribe(&params).await,
+            };
+            if let Some(method) = subscription_method {
+                tracing::info!(
+                    method,
+                    status = if result.is_ok() {
+                        "200"
+                    } else {
+                        "jsonrpc_error"
+                    },
+                    "MCP Events subscription outcome"
+                );
+            }
+            let response = match result {
+                Ok(value) => ServerJsonRpcMessage::response(
+                    ServerResult::CustomResult(CustomResult::new(value)),
+                    request_id,
+                ),
+                Err(error) => ServerJsonRpcMessage::error(
+                    McpError::new(
+                        ErrorCode(error.code),
+                        error.message,
+                        error.reason.map(|reason| json!({"reason":reason})),
+                    ),
+                    Some(request_id),
+                ),
+            };
+            json_response_for_era(&response, era)
         }
 
         ClientRequest::CustomRequest(custom)
@@ -2529,6 +2745,8 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
+    include!("events_tests.rs");
+
     #[test]
     fn modern_tool_call_deserialization_preserves_progress_metadata() {
         let message: ClientJsonRpcMessage = serde_json::from_value(serde_json::json!({
@@ -2610,6 +2828,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2836,6 +3055,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3795,6 +4015,7 @@ mod tests {
             cancel: state.cancel.clone(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
+            slack_events: None,
             sse_channel_capacity: state.sse_channel_capacity,
             allowed_origins: state.allowed_origins.clone(),
             notification_task_started: AtomicBool::new(false),
@@ -4312,6 +4533,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -4587,6 +4809,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: vec![Arc::from("https://claude.ai")],
             notification_task_started: AtomicBool::new(false),
@@ -5703,6 +5926,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Bearer,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -5830,6 +6054,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -5892,6 +6117,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -5957,6 +6183,7 @@ mod tests {
                 "tools:read".to_string(),
                 "offline_access".to_string(),
             ])),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -7167,6 +7394,7 @@ mod tests {
                 "tools:read".to_string(),
                 "offline_access".to_string(),
             ])),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -7221,6 +7449,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -7831,6 +8060,7 @@ mod tests {
             cancel: CancellationToken::new(),
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),

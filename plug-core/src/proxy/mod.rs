@@ -2687,6 +2687,16 @@ impl ToolRouter {
         }
     }
 
+    /// Resolve an internal read-only probe through the published tool catalog.
+    pub(crate) fn event_probe_tool(&self, original: &str) -> Option<String> {
+        self.cache
+            .load()
+            .routes
+            .iter()
+            .find(|(_, (server, tool))| server == "slack" && tool == original)
+            .map(|(name, _)| name.clone())
+    }
+
     /// Call a tool by its prefixed name, routing to the correct upstream server.
     ///
     /// Applies: health gate → circuit breaker → semaphore → timeout.
