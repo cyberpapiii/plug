@@ -21,7 +21,7 @@ struct ServicePowerToggle: View {
             Button("Turn Off", role: .destructive) { run(.setServiceEnabled(false)) }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("Connected apps lose access to every server until you turn Plug on again. Your settings stay saved.")
+            Text("Connected clients lose access to every server until you turn Plug on again. Your settings stay saved.")
         }
     }
 }

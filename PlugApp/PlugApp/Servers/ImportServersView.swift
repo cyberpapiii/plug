@@ -23,7 +23,7 @@ struct ImportServersView: View {
         VStack(alignment: .leading, spacing: Metric.regular) {
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text("Import servers").font(.title2.weight(.semibold))
-                Text("Servers already set up in your other AI apps. Their settings are left as they are.")
+                Text("Servers already set up in other clients on this Mac. Their settings are left as they are.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }

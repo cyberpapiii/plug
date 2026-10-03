@@ -84,7 +84,7 @@ Workflow:
 #[command(
     name = "plug",
     version,
-    about = "MCP multiplexer — one config, every client connected",
+    about = "MCP gateway — one config, every client connected",
     after_help = HELP_OVERVIEW,
     styles = ui::cli_styles()
 )]

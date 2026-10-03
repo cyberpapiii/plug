@@ -5,7 +5,7 @@ import SwiftUI
 /// server's account and its tools are found and fixed where the server is.
 enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case servers = "Servers"
-    case apps = "Apps"
+    case clients = "Clients"
     case activity = "Activity"
 
     var id: Self { self }
@@ -33,8 +33,8 @@ struct RootView: View {
             switch router.section {
             case .servers:
                 ServersView(model: model, router: router, search: $search, run: run)
-            case .apps:
-                ConnectionsView(model: model, search: $search, run: run)
+            case .clients:
+                ClientsView(model: model, search: $search, run: run)
             case .activity:
                 ActivityView(model: model, search: $search, run: run)
             }
@@ -92,7 +92,7 @@ struct RootView: View {
         // The servers prompt names both things it finds and still fits the
         // toolbar field at the minimum window width.
         case .servers: "Servers and tools"
-        case .apps: "Search apps"
+        case .clients: "Search clients"
         case .activity: "Search activity"
         }
     }

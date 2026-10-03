@@ -24,6 +24,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- The window's Apps tab is now Clients, and every program that uses tools
+  through Plug is called a client across the app, the README, and the docs.
+  Agents, apps, and scripts are all clients; `plug clients` already said so.
+  The vision doc (`docs/VISION.md`) now carries the five words Plug uses and
+  the words it avoids.
 - Docs match the shipped product: the README describes the app, the
   architecture and dual-era guides describe `main` instead of a development
   branch, and the August app design review moved to `docs/archive/`.

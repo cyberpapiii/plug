@@ -244,7 +244,7 @@ enum PlugIntent: Equatable, Sendable {
     case restartService
     case setServiceEnabled(Bool)
     case reloadConfiguration
-    /// Copy servers over from the other AI apps on this Mac.
+    /// Copy servers over from the other clients on this Mac.
     case importServers
     /// Forget a server's stored account.
     case signOut(server: String)
@@ -332,7 +332,7 @@ enum PlugVerdict {
                 tone: .attention,
                 symbol: "bolt.badge.checkmark",
                 title: "Background running is off",
-                detail: "Plug serves connected apps only while it runs in the background.",
+                detail: "Plug serves connected clients only while it runs in the background.",
                 primary: .init("Turn On", .allowBackgroundRunning)
             )
         case let .needsRepair(detail):
@@ -378,14 +378,14 @@ enum PlugVerdict {
                 tone: .busy,
                 symbol: "bolt.horizontal.circle",
                 title: "Restarting…",
-                detail: "Connected apps pick Plug back up on their own."
+                detail: "Connected clients pick Plug back up on their own."
             )
         case .stopped:
             return Verdict(
                 tone: .blocked,
                 symbol: "bolt.slash",
                 title: "Plug is not running",
-                detail: "Connected apps cannot reach any servers.",
+                detail: "Connected clients cannot reach any servers.",
                 primary: .init("Start Plug", .reconnect)
             )
         case .off:
@@ -393,7 +393,7 @@ enum PlugVerdict {
                 tone: .quiet,
                 symbol: "bolt.slash",
                 title: "Plug is off",
-                detail: "Turn on to make tools available to your apps.",
+                detail: "Turn on to make tools available to your clients.",
                 primary: .init("Turn On", .setServiceEnabled(true))
             )
         case .versionMismatch:

@@ -73,7 +73,7 @@ struct ToolDetailView: View {
                 }
             } else if canManage {
                 Toggle(
-                    "Available to connected apps",
+                    "Available to connected clients",
                     isOn: Binding(
                         get: { tool.isOn },
                         set: { run(.setToolEnabled(tool.name, $0)) }

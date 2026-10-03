@@ -2,7 +2,7 @@
 
 This is the authoritative agent instruction file for this repository. `CLAUDE.md` is only a compatibility pointer to this file.
 
-Plug is a Rust MCP multiplexer: one local config serves every AI client on the
+Plug is a Rust MCP gateway: one local config serves every AI client on the
 Mac. `Plug.app` (SwiftUI, menu bar) bundles the daemon and owns its lifecycle
 through SMAppService. The `plug` CLI talks to that daemon over a Unix socket
 (`plug connect` for local stdio clients) and the daemon also serves remote

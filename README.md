@@ -2,7 +2,7 @@
 
 **One binary. Every client. Every server. Zero friction.**
 
-A ruthlessly minimal MCP multiplexer written in Rust. The single point of connection between all your AI coding clients and all your MCP servers — simultaneously, concurrently, without conflicts.
+A ruthlessly minimal MCP gateway written in Rust. The single point of connection between all your AI coding clients and all your MCP servers — simultaneously, concurrently, without conflicts.
 
 ```
 Claude Code ──┐                      ┌── github (12 tools)

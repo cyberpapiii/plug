@@ -79,7 +79,7 @@ private struct GeneralSettings: View {
                     .listRowSeparator(.hidden)
                 }
                 Toggle(isOn: $notify) {
-                    Label("Tell me when a server needs sign-in or a new app connects", systemImage: "bell")
+                    Label("Tell me when a server needs sign-in or a new client connects", systemImage: "bell")
                 }
                 .listRowSeparator(.hidden)
                 .onChange(of: notify) { _, enabled in
@@ -169,7 +169,7 @@ private struct ServiceSettings: View {
                     .listRowSeparator(.hidden)
                 }
             } footer: {
-                Text("Restarting reconnects every server. Connected apps pick Plug back up on their own.")
+                Text("Restarting reconnects every server. Connected clients pick Plug back up on their own.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -397,7 +397,7 @@ private struct AboutSettings: View {
             }
             .disabled(!UpdateService.shared.canCheckForUpdates)
 
-            Text("Plug keeps your MCP servers available to every connected AI app.")
+            Text("Plug keeps your MCP servers available to every connected client.")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .multilineTextAlignment(.center)

@@ -48,7 +48,7 @@ struct AppRoster: Equatable {
 /// "Auth" listed the grants for the same apps — so the audit question ("who
 /// reaches my tools, and how do I cut them off?") could not be answered in one
 /// place. It can now.
-struct ConnectionsView: View {
+struct ClientsView: View {
     let model: AppModel
     @Binding var search: String
     let run: (PlugIntent) -> Void
@@ -93,21 +93,21 @@ struct ConnectionsView: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            PageHeader("Apps", detail: connectionSummary)
+            PageHeader("Clients", detail: connectionSummary)
 
             Group {
                 if model.isLoadingInitialData {
-                    LoadingPage(message: "Loading apps…")
+                    LoadingPage(message: "Loading clients…")
                 } else if model.initialDataUnavailable {
-                    UnavailablePage(item: "Apps") { run(.reconnect) }
+                    UnavailablePage(item: "Clients") { run(.reconnect) }
                 } else if isEmpty {
                     EmptyPage(
                         title: search.isEmpty
-                            ? (model.connectableAppsError == nil ? "Nothing is connected" : "App scan failed")
-                            : "No matching apps",
+                            ? (model.connectableAppsError == nil ? "Nothing is connected" : "Client scan failed")
+                            : "No matching clients",
                         message: search.isEmpty
                             ? (model.connectableAppsError
-                                ?? "When an AI app connects through Plug it shows up here, along with everything it can reach.")
+                                ?? "When a client connects through Plug it shows up here, along with everything it can reach.")
                             : "Nothing connected to Plug matches “\(search.trimmingCharacters(in: .whitespaces))”.",
                         symbol: search.isEmpty
                             ? (model.connectableAppsError == nil
@@ -120,7 +120,7 @@ struct ConnectionsView: View {
                         if model.isLoadingConnectableApps && apps.isEmpty {
                             HStack(spacing: Metric.snug) {
                                 ProgressView().controlSize(.small)
-                                Text("Looking for AI apps…").foregroundStyle(.secondary)
+                                Text("Looking for clients…").foregroundStyle(.secondary)
                             }
                             .listRowSeparator(.hidden)
                         } else if let error = model.connectableAppsError, apps.isEmpty {
@@ -142,7 +142,7 @@ struct ConnectionsView: View {
                             sectionLabel(
                                 "Connected now",
                                 count: connectedApps.count + unmatchedSessions.count,
-                                unit: "app"
+                                unit: "client"
                             )
                             ForEach(connectedApps) { entry in
                                 AppLinkRow(
@@ -166,7 +166,7 @@ struct ConnectionsView: View {
                             }
                         }
                         if !idleApps.isEmpty {
-                            sectionLabel("On this Mac", count: idleApps.count, unit: "app")
+                            sectionLabel("On this Mac", count: idleApps.count, unit: "client")
                             ForEach(idleApps) { app in
                                 AppLinkRow(
                                     app: app,
@@ -177,14 +177,14 @@ struct ConnectionsView: View {
                                 )
                                 .listRowSeparator(.hidden)
                             }
-                            Text("Turn on an app to add Plug to its settings. Restart that app to pick up the change.")
+                            Text("Turn on a client to add Plug to its settings. Restart it to pick up the change.")
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                                 .listRowSeparator(.hidden)
                                 .listRowBackground(Color.clear)
                         }
                         if !grants.isEmpty {
-                            sectionLabel("Remote clients", count: grants.count, unit: "client")
+                            sectionLabel("Remote", count: grants.count, unit: "client")
                             ForEach(grants) { grant in
                                 GrantRow(grant: grant, run: run)
                                     .listRowSeparator(.hidden)
@@ -329,7 +329,7 @@ struct ConnectionsView: View {
     }
 }
 
-/// An AI app on this Mac, and whether Plug is wired into it.
+/// A client on this Mac, and whether Plug is wired into it.
 private struct AppLinkRow: View {
     let app: LinkableApp
     /// Open sessions counted from the live snapshot, which is fresher than

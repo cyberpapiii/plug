@@ -158,10 +158,10 @@ struct PlugPopover: View {
         return stale ? "Last known · \(summary)" : summary
     }
 
-    // MARK: - Connected apps
+    // MARK: - Connected clients
 
     private var connectedAppsRow: some View {
-        Button { send(.openWindow(.apps)) } label: {
+        Button { send(.openWindow(.clients)) } label: {
             HStack(spacing: Metric.snug) {
                 AppIconStack(targets: situation.connectedAppTargets)
                 Text(connectedAppsText)
@@ -177,7 +177,7 @@ struct PlugPopover: View {
         .buttonStyle(QuietRowButtonStyle())
         .padding(.horizontal, Metric.tight)
         .padding(.vertical, Metric.tight)
-        .help("See connected apps")
+        .help("See connected clients")
     }
 
     private var connectedAppsText: String {
@@ -185,7 +185,7 @@ struct PlugPopover: View {
         if !names.isEmpty, names.count == situation.connectedApps, names.count <= 2 {
             return names.joined(separator: " and ") + " connected"
         }
-        return situation.connectedApps == 1 ? "1 app connected" : "\(situation.connectedApps) apps connected"
+        return situation.connectedApps == 1 ? "1 client connected" : "\(situation.connectedApps) clients connected"
     }
 
     // MARK: - Recent

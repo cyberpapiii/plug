@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// One tool: what it does, and whether connected apps can see it.
+/// One tool: what it does, and whether connected clients can see it.
 struct ToolRow: View {
     let tool: ToolFacts
     let canManage: Bool

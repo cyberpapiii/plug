@@ -12,10 +12,8 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## Open
 
-- Make the product match the words in `docs/VISION.md`. The app says Apps,
-  Remote clients, connected apps, AI app, and "New client connected" for
-  agents; the CLI command is `plug clients`; the code calls them Connections;
-  the client registry still lists Windsurf.
+- Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
+  `connectedApps`, `busyApps`). Rename when touching those files.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as
   found; no sweep.
 - Live downstream OAuth certification is done for Claude Desktop and ChatGPT.
@@ -29,10 +27,11 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- Identity for connected agents: rename one, give it an icon, and recognise
-  unknown and remote ones.
-- Per-agent access: choose which servers and tools each agent sees, bound to
-  how the agent connects and never to the name it reports.
+- Identity for connected clients: rename one, give it an icon, and recognise
+  unknown and remote ones. The client registry still lists Windsurf and lacks
+  Grok Bot and Grok Build.
+- Per-client access: choose which servers and tools each client sees, bound to
+  how the client connects and never to the name it reports.
 - General events: forward the events a server emits, add push recipes for
   services beside Slack, and watch a tool on a schedule for changes.
 - A guided first run in the app. Import and one-switch linking exist, but
