@@ -232,6 +232,7 @@ async fn operator_live_sessions(
             client_type: snapshot.client_type,
             client_info: None,
             adapter_version: None,
+            host: None,
             connected_secs: snapshot.connected_seconds,
             last_activity_secs: Some(snapshot.idle_seconds),
         })
@@ -1215,6 +1216,7 @@ pub(crate) async fn establish_daemon_proxy_session(
             client_id: client_id.clone(),
             client_info: client_info.clone(),
             adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+            host: crate::client_host::current(),
         };
         let payload = serde_json::to_vec(&register_req)?;
         plug_core::ipc::write_frame(&mut writer, &payload).await?;
@@ -2565,6 +2567,7 @@ mod tests {
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
+            host: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2575,6 +2578,7 @@ mod tests {
             client_type: plug_core::types::ClientType::ClaudeDesktop,
             client_info: None,
             adapter_version: None,
+            host: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2601,6 +2605,7 @@ mod tests {
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
+            host: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2627,6 +2632,7 @@ mod tests {
             client_type: plug_core::types::ClientType::ClaudeCode,
             client_info: Some("Claude Code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
+            host: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2653,6 +2659,7 @@ mod tests {
             client_type: plug_core::types::ClientType::ClaudeDesktop,
             client_info: None,
             adapter_version: None,
+            host: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2731,6 +2738,7 @@ mod tests {
                 client_type: plug_core::types::ClientType::ClaudeCode,
                 client_info: Some("Claude Code".to_string()),
                 adapter_version: Some("0.6.5".to_string()),
+                host: None,
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -2741,6 +2749,7 @@ mod tests {
                 client_type: plug_core::types::ClientType::ClaudeDesktop,
                 client_info: None,
                 adapter_version: None,
+                host: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },

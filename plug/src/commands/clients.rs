@@ -60,8 +60,23 @@ pub(crate) struct LiveSessionView {
     pub(crate) session_id: String,
     pub(crate) client_type: String,
     pub(crate) client_info: Option<String>,
+    /// The program that started a local connector, read from the process
+    /// table rather than from what the client says about itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<plug_core::ipc::ClientHost>,
     pub(crate) connected_secs: u64,
     pub(crate) last_activity_secs: Option<u64>,
+}
+
+impl LiveSessionView {
+    /// What to call the session: the client Plug recognised, else the program
+    /// that started it.
+    pub(crate) fn label(&self) -> &str {
+        match &self.host {
+            Some(host) if self.client_type == "Unknown" => &host.name,
+            _ => &self.client_type,
+        }
+    }
 }
 
 pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
@@ -506,6 +521,7 @@ pub(crate) fn live_session_views(
             session_id: session.session_id.clone(),
             client_type: session.client_type.to_string(),
             client_info: session.client_info.clone(),
+            host: session.host.clone(),
             connected_secs: session.connected_secs,
             last_activity_secs: session.last_activity_secs,
         })

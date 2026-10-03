@@ -21,6 +21,7 @@ struct ClientSession {
     client_id: String,
     client_info: Option<String>,
     adapter_version: Option<String>,
+    host: Option<plug_core::ipc::ClientHost>,
     connected_at: Instant,
     capabilities: ClientCapabilities,
     cancellation_capability: String,
@@ -50,11 +51,14 @@ impl ClientRegistry {
     /// The Unix socket and connection lifetime are the resource boundary. Each
     /// connection is automatically deregistered when its socket closes, while a
     /// reconnect with the same stable client ID replaces the prior session.
-    pub(super) fn register(
+    ///
+    /// `host` is the program that started the connector, when it reported one.
+    pub(super) fn register_hosted(
         &self,
         client_id: String,
         client_info: Option<String>,
         adapter_version: Option<String>,
+        host: Option<plug_core::ipc::ClientHost>,
     ) -> RegistrationResult {
         let session_id = uuid::Uuid::new_v4().to_string();
         let cancellation_capability = format!(
@@ -81,6 +85,7 @@ impl ClientRegistry {
                 client_id,
                 client_info,
                 adapter_version,
+                host,
                 connected_at: Instant::now(),
                 capabilities: ClientCapabilities::default(),
                 cancellation_capability: cancellation_capability.clone(),
@@ -92,6 +97,16 @@ impl ClientRegistry {
             replaced_session_id,
             cancellation_capability,
         }
+    }
+
+    #[cfg(test)]
+    pub(super) fn register(
+        &self,
+        client_id: String,
+        client_info: Option<String>,
+        adapter_version: Option<String>,
+    ) -> RegistrationResult {
+        self.register_hosted(client_id, client_info, adapter_version, None)
     }
 
     /// Deregister a client session.
@@ -193,6 +208,7 @@ impl ClientRegistry {
                     .unwrap_or(plug_core::types::ClientType::Unknown),
                 client_info: entry.client_info.clone(),
                 adapter_version: entry.adapter_version.clone(),
+                host: entry.host.clone(),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })
@@ -215,9 +231,10 @@ mod tests {
         let (registry, _count_rx) = ClientRegistry::new();
 
         for i in 0..256 {
-            registry.register(
+            registry.register_hosted(
                 format!("client-{i}"),
                 Some("codex-desktop".to_string()),
+                None,
                 None,
             );
         }
@@ -229,14 +246,16 @@ mod tests {
     fn register_replaces_existing_session_for_same_client_id() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        let first = registry.register(
+        let first = registry.register_hosted(
             "client-123".to_string(),
             Some("claude-code".to_string()),
             None,
+            None,
         );
-        let second = registry.register(
+        let second = registry.register_hosted(
             "client-123".to_string(),
             Some("claude-code".to_string()),
+            None,
             None,
         );
 
@@ -258,14 +277,16 @@ mod tests {
     fn deregistering_replaced_session_does_not_remove_active_replacement() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        let first = registry.register(
+        let first = registry.register_hosted(
             "client-123".to_string(),
             Some("claude-code".to_string()),
             None,
+            None,
         );
-        let second = registry.register(
+        let second = registry.register_hosted(
             "client-123".to_string(),
             Some("claude-code".to_string()),
+            None,
             None,
         );
 
@@ -276,13 +297,33 @@ mod tests {
     }
 
     #[test]
+    fn registration_keeps_the_host_program_in_live_inventory() {
+        let (registry, _count_rx) = ClientRegistry::new();
+        let host = plug_core::ipc::ClientHost {
+            name: "Hermes".to_string(),
+            executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
+            app: Some("/Applications/Hermes.app".to_string()),
+        };
+
+        registry.register_hosted(
+            "client-123".to_string(),
+            Some("mcp".to_string()),
+            None,
+            Some(host.clone()),
+        );
+
+        assert_eq!(registry.list_live_sessions()[0].host, Some(host));
+    }
+
+    #[test]
     fn registration_preserves_adapter_version_in_live_inventory() {
         let (registry, _count_rx) = ClientRegistry::new();
 
-        registry.register(
+        registry.register_hosted(
             "client-123".to_string(),
             Some("claude-code".to_string()),
             Some("0.6.5".to_string()),
+            None,
         );
 
         assert_eq!(

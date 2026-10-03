@@ -268,7 +268,7 @@ fn live_session_groups(
         };
         match groups
             .iter_mut()
-            .find(|group| group.client == session.client_type)
+            .find(|group| group.client == session.label())
         {
             Some(group) => {
                 group.sessions += 1;
@@ -279,7 +279,7 @@ fn live_session_groups(
                     group.longest_connected_secs.max(session.connected_secs);
             }
             None => groups.push(LiveSessionGroup {
-                client: &session.client_type,
+                client: session.label(),
                 sessions: 1,
                 transports: vec![transport],
                 longest_connected_secs: session.connected_secs,
@@ -311,7 +311,7 @@ fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView
         println!(
             "  {:<18} {:<14} {:<12} {:<10} {:<10}",
             &session.session_id[..session.session_id.len().min(18)],
-            session.client_type,
+            session.label(),
             session.transport,
             crate::ui::format_duration(session.connected_secs),
             idle,
@@ -539,6 +539,7 @@ mod tests {
             transport: "http".to_string(),
             client_id: None,
             client_info: Some("Claude Desktop".to_string()),
+            host: None,
             connected_secs: 12,
             last_activity_secs: Some(3),
         }];
@@ -715,9 +716,27 @@ mod tests {
             transport: transport.to_string(),
             client_id: None,
             client_info: None,
+            host: None,
             connected_secs,
             last_activity_secs: None,
         }
+    }
+
+    #[test]
+    fn an_unrecognised_session_is_grouped_under_the_program_that_started_it() {
+        let mut hosted = session("Unknown", "daemon_proxy", 30);
+        hosted.host = Some(plug_core::ipc::ClientHost {
+            name: "Hermes".to_string(),
+            executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
+            app: Some("/Applications/Hermes.app".to_string()),
+        });
+        let mut named = session("Cursor", "daemon_proxy", 10);
+        named.host = hosted.host.clone();
+        let sessions = [hosted, named, session("Unknown", "daemon_proxy", 5)];
+
+        let groups = live_session_groups(&sessions);
+        let clients = groups.iter().map(|group| group.client).collect::<Vec<_>>();
+        assert_eq!(clients, ["Cursor", "Hermes", "Unknown"]);
     }
 
     fn client(name: &str, linked: bool, detected: bool, live: bool) -> ClientView {

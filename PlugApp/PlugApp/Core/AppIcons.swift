@@ -74,10 +74,14 @@ enum AppIcons {
 
     /// The app's real icon, when this Mac has the app.
     @MainActor
-    static func image(target: String, name: String) -> NSImage? {
+    static func image(target: String, name: String, appPath: String? = nil) -> NSImage? {
         if let identifier = bundleIdentifiers[target.lowercased()],
            let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
             return NSWorkspace.shared.icon(forFile: url.path)
+        }
+        // A client Plug has no entry for, started by an app that is right here.
+        if let appPath, FileManager.default.fileExists(atPath: appPath) {
+            return NSWorkspace.shared.icon(forFile: appPath)
         }
         guard !name.isEmpty else { return nil }
         for directory in ["/Applications", "\(NSHomeDirectory())/Applications"] {
@@ -152,11 +156,13 @@ enum AppIcons {
 struct AppGlyph: View {
     let target: String
     let name: String
+    /// The app bundle behind a client with no entry of its own.
+    var appPath: String? = nil
     var size: CGFloat = 22
 
     var body: some View {
         Group {
-            if let icon = AppIcons.image(target: target, name: name) {
+            if let icon = AppIcons.image(target: target, name: name, appPath: appPath) {
                 Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)

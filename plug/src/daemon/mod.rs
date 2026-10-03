@@ -1445,6 +1445,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 client_type: snapshot.client_type,
                 client_info: None,
                 adapter_version: None,
+                host: None,
                 connected_secs: snapshot.connected_seconds,
                 last_activity_secs: Some(snapshot.idle_seconds),
             })
@@ -1702,6 +1703,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             client_id,
             client_info,
             adapter_version,
+            host,
         } => {
             if !(plug_core::ipc::IPC_PROTOCOL_VERSION_MIN..=plug_core::ipc::IPC_PROTOCOL_VERSION)
                 .contains(protocol_version)
@@ -1720,10 +1722,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             if let Some(ref old_session) = ctx.session_id {
                 ctx.client_registry.deregister(old_session);
             }
-            let registration = ctx.client_registry.register(
+            let registration = ctx.client_registry.register_hosted(
                 client_id.clone(),
                 client_info.clone(),
                 adapter_version.clone(),
+                host.clone(),
             );
             if let Some(ref replaced_session_id) = registration.replaced_session_id {
                 tracing::info!(
@@ -3261,6 +3264,7 @@ mod tests {
             client_id: "client-123".to_string(),
             client_info: None,
             adapter_version: None,
+            host: None,
         }));
     }
 
@@ -3540,6 +3544,7 @@ mod tests {
                     client_id: uuid::Uuid::new_v4().to_string(),
                     client_info: Some("plug-test".to_string()),
                     adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+                    host: None,
                 },
             )
             .await;
@@ -3876,6 +3881,7 @@ mod tests {
             client_type: plug_core::types::ClientType::Unknown,
             client_info: None,
             adapter_version: None,
+            host: None,
             connected_secs: 0,
             last_activity_secs: None,
         };
@@ -5401,6 +5407,7 @@ mod tests {
                     client_id: "client".to_string(),
                     client_info: None,
                     adapter_version: None,
+                    host: None,
                 },
                 &mut ctx,
             )

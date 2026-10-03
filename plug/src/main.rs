@@ -39,6 +39,7 @@ pub(crate) fn install_test_credential_environment() {
     });
 }
 
+mod client_host;
 mod commands;
 mod daemon;
 // The unified installation model is fully exercised on macOS and in tests;

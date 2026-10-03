@@ -64,8 +64,19 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     public let sessionId: String
     public let clientType: String
     public let clientInfo: String?
+    /// The program that started a local connector. The daemon reads it from
+    /// the process table, so the client cannot choose it.
+    public let host: ClientHost?
     public let connectedSecs: UInt64
     public let lastActivitySecs: UInt64?
+}
+
+public struct ClientHost: Codable, Equatable, Sendable {
+    /// The app bundle's name, or the executable's file name.
+    public let name: String
+    public let executable: String
+    /// The app bundle the executable runs from, when it runs from one.
+    public let app: String?
 }
 
 public struct ClientVisibility: Codable, Equatable, Sendable {

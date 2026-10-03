@@ -12,9 +12,9 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## Open
 
-- Identity for connected clients: a name and icon for unknown local clients,
-  read from the process behind `plug connect` rather than the name the client
-  reports; the same for remote ones; then renaming a client.
+- Identity for connected clients: a name and icon for remote clients Plug does
+  not recognise, then renaming a client. Local ones are named after the
+  program that started them.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as
