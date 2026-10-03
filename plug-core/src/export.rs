@@ -27,6 +27,9 @@ pub enum ExportTarget {
     Nanobot,
     Junie,
     Kilo,
+    Pi,
+    Warp,
+    Kiro,
     Antigravity,
     Goose,
 }
@@ -56,6 +59,9 @@ impl std::str::FromStr for ExportTarget {
             "nanobot" => Ok(Self::Nanobot),
             "junie" => Ok(Self::Junie),
             "kilo" => Ok(Self::Kilo),
+            "pi" => Ok(Self::Pi),
+            "warp" => Ok(Self::Warp),
+            "kiro" => Ok(Self::Kiro),
             "antigravity" => Ok(Self::Antigravity),
             "goose" => Ok(Self::Goose),
             _ => Err(format!("unknown export target: {s}")),
@@ -84,6 +90,9 @@ impl ExportTarget {
             Self::Nanobot => "Nanobot",
             Self::Junie => "JetBrains Junie",
             Self::Kilo => "Kilo Code",
+            Self::Pi => "Pi",
+            Self::Warp => "Warp",
+            Self::Kiro => "Kiro",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
         }
@@ -110,6 +119,9 @@ impl ExportTarget {
             "nanobot",
             "junie",
             "kilo",
+            "pi",
+            "warp",
+            "kiro",
             "antigravity",
             "goose",
         ]
@@ -161,6 +173,9 @@ pub fn export_config(options: &ExportOptions) -> String {
         | ExportTarget::OpenCode
         | ExportTarget::Junie
         | ExportTarget::Kilo
+        | ExportTarget::Pi
+        | ExportTarget::Warp
+        | ExportTarget::Kiro
         | ExportTarget::Antigravity => export_json_mcp_servers(options, "mcpServers"),
 
         // VS Code's own files use a top-level "servers"
@@ -467,6 +482,32 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
                 Some(home.join(".config/kilo/opencode.json"))
             }
         }
+        // Built in since Pi 0.99.0.
+        // https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/mcp.md
+        ExportTarget::Pi => {
+            if project {
+                Some(std::path::PathBuf::from(".pi/mcp.json"))
+            } else {
+                Some(home.join(".pi/agent/mcp.json"))
+            }
+        }
+        // Warp starts the servers in these files on its own.
+        // https://docs.warp.dev/agent-platform/capabilities/mcp/
+        ExportTarget::Warp => {
+            if project {
+                Some(std::path::PathBuf::from(".warp/.mcp.json"))
+            } else {
+                Some(home.join(".warp/.mcp.json"))
+            }
+        }
+        // https://kiro.dev/docs/mcp/configuration/
+        ExportTarget::Kiro => {
+            if project {
+                Some(std::path::PathBuf::from(".kiro/settings/mcp.json"))
+            } else {
+                Some(home.join(".kiro/settings/mcp.json"))
+            }
+        }
         ExportTarget::Antigravity => {
             #[cfg(target_os = "macos")]
             {
@@ -581,6 +622,18 @@ mod tests {
         assert_eq!(plug["type"], "http");
         assert_eq!(plug["tools"], serde_json::json!(["*"]));
 
+        for (name, user, project) in [
+            ("pi", ".pi/agent/mcp.json", ".pi/mcp.json"),
+            ("warp", ".warp/.mcp.json", ".warp/.mcp.json"),
+            ("kiro", ".kiro/settings/mcp.json", ".kiro/settings/mcp.json"),
+        ] {
+            let target: ExportTarget = name.parse().unwrap();
+            assert!(default_config_path(target, false).unwrap().ends_with(user));
+            assert_eq!(
+                default_config_path(target, true).unwrap(),
+                std::path::PathBuf::from(project)
+            );
+        }
         // VS Code and Copilot CLI must not write the same user file.
         assert_ne!(
             default_config_path(ExportTarget::VSCodeCopilot, false),

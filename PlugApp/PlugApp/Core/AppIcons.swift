@@ -39,7 +39,7 @@ enum AppIcons {
     /// Targets that are command line tools. They have no icon to show, and a
     /// terminal glyph says more about them than a generic app square would.
     private static let commandLineTargets: Set<String> = [
-        "cline-cli", "gemini-cli", "grok-build", "copilot-cli",
+        "cline-cli", "gemini-cli", "grok-build", "copilot-cli", "pi",
         "goose", "opencode", "nanobot", "crush",
     ]
 

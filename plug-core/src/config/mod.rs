@@ -939,6 +939,9 @@ fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
         crate::export::ExportTarget::Nanobot => Some("nanobot"),
         crate::export::ExportTarget::Junie => Some("junie"),
         crate::export::ExportTarget::Kilo => Some("kilo"),
+        crate::export::ExportTarget::Pi => Some("pi"),
+        crate::export::ExportTarget::Warp => Some("warp"),
+        crate::export::ExportTarget::Kiro => Some("kiro"),
         crate::export::ExportTarget::Antigravity => Some("antigravity"),
         crate::export::ExportTarget::Goose => Some("goose"),
     }

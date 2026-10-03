@@ -43,6 +43,9 @@ pub enum ClientSource {
     Nanobot,
     Junie,
     Kilo,
+    Pi,
+    Warp,
+    Kiro,
     Antigravity,
     Goose,
 }
@@ -69,6 +72,9 @@ impl ClientSource {
             Self::Nanobot => "Nanobot",
             Self::Junie => "JetBrains Junie",
             Self::Kilo => "Kilo Code",
+            Self::Pi => "Pi",
+            Self::Warp => "Warp",
+            Self::Kiro => "Kiro",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
         }
@@ -95,6 +101,9 @@ impl ClientSource {
             Self::Nanobot,
             Self::Junie,
             Self::Kilo,
+            Self::Pi,
+            Self::Warp,
+            Self::Kiro,
             Self::Antigravity,
             Self::Goose,
         ]
@@ -291,6 +300,24 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
                 PathBuf::from("opencode.json"),
             ]
         }
+        ClientSource::Pi => {
+            vec![
+                home.join(".pi/agent/mcp.json"),
+                PathBuf::from(".pi/mcp.json"),
+            ]
+        }
+        ClientSource::Warp => {
+            vec![
+                home.join(".warp/.mcp.json"),
+                PathBuf::from(".warp/.mcp.json"),
+            ]
+        }
+        ClientSource::Kiro => {
+            vec![
+                home.join(".kiro/settings/mcp.json"),
+                PathBuf::from(".kiro/settings/mcp.json"),
+            ]
+        }
         ClientSource::Antigravity => antigravity_paths(&home),
         ClientSource::Goose => goose_paths(&home),
     }
@@ -383,6 +410,9 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::OpenCode
         | ClientSource::Junie
         | ClientSource::Kilo
+        | ClientSource::Pi
+        | ClientSource::Warp
+        | ClientSource::Kiro
         | ClientSource::Antigravity => parse_json_mcp_servers(&content, source, "mcpServers"),
 
         // Nanobot uses tools.mcpServers
@@ -883,6 +913,9 @@ fn resolve_name_against_set(
         ClientSource::Nanobot => "nanobot",
         ClientSource::Junie => "junie",
         ClientSource::Kilo => "kilo",
+        ClientSource::Pi => "pi",
+        ClientSource::Warp => "warp",
+        ClientSource::Kiro => "kiro",
         ClientSource::Antigravity => "antigravity",
         ClientSource::Goose => "goose",
     };

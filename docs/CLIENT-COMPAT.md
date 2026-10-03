@@ -53,6 +53,9 @@ For Linux and source builds, see the [operator guide](OPERATOR-GUIDE.md).
 | Devin | stdio, SSE, Streamable HTTP | None documented (legacy Cascade agent: **100**) | JSON | `~/.config/devin/mcp_config.json` |
 | VS Code Copilot | stdio, SSE, Streamable HTTP | **128** | JSON | `.vscode/mcp.json` or `~/Library/Application Support/Code/User/mcp.json` |
 | GitHub Copilot CLI | stdio, Streamable HTTP | None documented | JSON | `~/.copilot/mcp-config.json` |
+| Pi | stdio, Streamable HTTP (no SSE) | None documented | JSON | `~/.pi/agent/mcp.json` or `.pi/mcp.json` |
+| Warp | stdio, Streamable HTTP | None documented | JSON | `~/.warp/.mcp.json` or `.warp/.mcp.json` |
+| Kiro | stdio, Streamable HTTP | None documented | JSON | `~/.kiro/settings/mcp.json` or `.kiro/settings/mcp.json` |
 | Gemini CLI | stdio, SSE, Streamable HTTP | None documented | JSON | `~/.gemini/settings.json` |
 | Codex CLI | stdio, Streamable HTTP | None documented | TOML | `~/.codex/config.toml` |
 | Grok Build | stdio, Streamable HTTP | None documented | TOML | `~/.grok/config.toml` |
@@ -278,6 +281,13 @@ The key is `servers`, not `mcpServers`. VS Code also reads Copilot CLI's
 `type` and `tools` are required. A remote entry uses `"type": "http"` and a
 `url`. Checked against GitHub's docs on 2026-10-03.
 
+### Pi, Warp, Kiro
+
+All three take the plain `mcpServers` shape: `command` and `args` for a local
+server, `url` for a remote one. Pi has had MCP built in since 0.99.0 and
+rejects `"type": "sse"`. Warp starts the servers it finds in its file without
+being asked. Checked against each vendor's docs on 2026-10-03.
+
 **BEHAVIOR — 128 TOOL LIMIT**:
 - Hard limit of 128 tools
 - OAuth 2.1 supported for remote servers
@@ -492,6 +502,9 @@ full catalog.
 | Devin | `~/.config/devin/mcp_config.json`, plus the legacy `~/.codeium/windsurf/mcp_config.json` | JSON |
 | VS Code | `~/Library/Application Support/Code/User/mcp.json`, `~/.vscode/mcp.json`, or `.vscode/mcp.json` in cwd | JSON |
 | GitHub Copilot CLI | `~/.copilot/mcp-config.json` or `.github/mcp.json` in cwd | JSON |
+| Pi | `~/.pi/agent/mcp.json` or `.pi/mcp.json` in cwd | JSON |
+| Warp | `~/.warp/.mcp.json` or `.warp/.mcp.json` in cwd | JSON |
+| Kiro | `~/.kiro/settings/mcp.json` or `.kiro/settings/mcp.json` in cwd | JSON |
 | Codex | `~/.codex/config.toml` | TOML |
 | Grok Build | `~/.grok/config.toml` | TOML |
 | Gemini | `~/.gemini/settings.json` | JSON |

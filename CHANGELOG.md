@@ -9,6 +9,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Pi, Warp, and Kiro are clients. `plug link pi`, `plug link warp`, and
+  `plug link kiro` write each one's own MCP file, the Clients tab lists them,
+  and `plug import` reads servers from them.
 - GitHub Copilot CLI is a client. `plug link copilot-cli` and the Clients tab
   write `~/.copilot/mcp-config.json` with the `type` and `tools` fields Copilot
   CLI requires, and `plug import copilot-cli` reads servers from it.

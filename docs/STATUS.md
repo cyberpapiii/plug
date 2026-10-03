@@ -15,10 +15,13 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 - `plug clients` still lists a remote session Plug does not recognise as
   Unknown. The app names it after its grant.
 - Clients missing from the registry, most used first (surveyed 2026-10-03):
-  Pi, Warp, Kiro, Hermes Agent, Muse Code, Kimi Code, Amp, then Qwen Code and
-  OpenClaw. Check each config path against the vendor's
-  docs on the day before writing to it. Remote-only, name and icon at most:
-  Claude web and mobile, Grok web connectors, Perplexity, Gemini, Le Chat.
+  Hermes Agent, Muse Code, Kimi Code, Amp, then Qwen Code and OpenClaw. Check
+  each config path against the vendor's docs on the day before writing to it.
+  Remote-only, name and icon at most: Claude web and mobile, Grok web
+  connectors, Perplexity, Gemini, Le Chat.
+- Warp and Kiro link but show no app icon: their bundle identifiers were not
+  read off an installed copy. A connected Pi, Warp, or Kiro is named from what
+  it reports, with no client type behind it.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as

@@ -162,7 +162,7 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 **plug** fixes this:
 
 - **One config** — define your servers once (`~/Library/Application Support/plug/config.toml` on macOS)
-- **Every client** — Claude Code, Cursor, Gemini CLI, Codex, Grok Build, Devin, VS Code Copilot, GitHub Copilot CLI, OpenCode, Zed
+- **Every client** — Claude Code, Cursor, Gemini CLI, Codex, Grok Build, Devin, VS Code Copilot, GitHub Copilot CLI, Pi, Warp, Kiro, OpenCode, Zed
 - **Shared connections** — N clients share 1 upstream connection per server (not N connections)
 - **Client-aware** — automatically respects per-client tool limits (VS Code Copilot: 128, Devin's Cascade agent: 100)
 - **Lazy tool discovery** — clients like OpenCode can start with a tiny search bridge instead of seeing hundreds of tool schemas up front

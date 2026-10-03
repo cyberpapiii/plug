@@ -881,6 +881,9 @@ async fn check_client_configs() -> CheckResult {
         "nanobot",
         "junie",
         "kilo",
+        "pi",
+        "warp",
+        "kiro",
         "antigravity",
         "goose",
     ];
