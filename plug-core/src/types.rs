@@ -901,10 +901,18 @@ pub enum ClientType {
     ClaudeCode,
     ClaudeDesktop,
     Cursor,
-    Windsurf,
+    /// Devin Desktop and the Devin CLI, formerly Windsurf. Cascade, the
+    /// desktop app's legacy agent, still introduces itself as
+    /// `windsurf-client`.
+    Devin,
     VSCodeCopilot,
     GeminiCli,
     CodexCli,
+    /// xAI's coding agent CLI.
+    GrokBuild,
+    /// xAI's desktop agent. It reaches Plug over the public internet only, so
+    /// it has no link target and shows up as a remote client.
+    GrokBot,
     OpenCode,
     Zed,
     Unknown,
@@ -917,20 +925,24 @@ impl ClientType {
             ClientType::ClaudeCode => Some("claude-code"),
             ClientType::ClaudeDesktop => Some("claude-desktop"),
             ClientType::Cursor => Some("cursor"),
-            ClientType::Windsurf => Some("windsurf"),
+            ClientType::Devin => Some("devin"),
             ClientType::VSCodeCopilot => Some("vscode"),
             ClientType::GeminiCli => Some("gemini-cli"),
             ClientType::CodexCli => Some("codex-cli"),
+            ClientType::GrokBuild => Some("grok-build"),
+            ClientType::GrokBot | ClientType::Unknown => None,
             ClientType::OpenCode => Some("opencode"),
             ClientType::Zed => Some("zed"),
-            ClientType::Unknown => None,
         }
     }
 
     /// Returns the maximum number of tools this client supports, if known.
     pub fn tool_limit(&self) -> Option<usize> {
         match self {
-            ClientType::Windsurf => Some(100),
+            // Cascade's ceiling. Devin Local publishes none, but it is not
+            // yet known to report a distinct `clientInfo.name`, so the cap
+            // applies to whatever calls itself Devin.
+            ClientType::Devin => Some(100),
             ClientType::VSCodeCopilot => Some(128),
             _ => None,
         }
@@ -1027,10 +1039,12 @@ impl std::fmt::Display for ClientType {
             ClientType::ClaudeCode => "Claude Code",
             ClientType::ClaudeDesktop => "Claude Desktop",
             ClientType::Cursor => "Cursor",
-            ClientType::Windsurf => "Windsurf",
+            ClientType::Devin => "Devin",
             ClientType::VSCodeCopilot => "VS Code Copilot",
             ClientType::GeminiCli => "Gemini CLI",
             ClientType::CodexCli => "Codex CLI",
+            ClientType::GrokBuild => "Grok Build",
+            ClientType::GrokBot => "Grok Bot",
             ClientType::OpenCode => "OpenCode",
             ClientType::Zed => "Zed",
             ClientType::Unknown => "Unknown",

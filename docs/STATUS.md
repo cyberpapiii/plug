@@ -12,6 +12,9 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## Open
 
+- Identity for connected clients: a name and icon for unknown local clients,
+  read from the process behind `plug connect` rather than the name the client
+  reports; the same for remote ones; then renaming a client.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as
@@ -27,9 +30,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- Identity for connected clients: rename one, give it an icon, and recognise
-  unknown and remote ones. The client registry still lists Windsurf and lacks
-  Grok Bot and Grok Build.
 - Per-client access: choose which servers and tools each client sees, bound to
   how the client connects and never to the name it reports.
 - General events: forward the events a server emits, add push recipes for

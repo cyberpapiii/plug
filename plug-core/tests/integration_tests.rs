@@ -1870,7 +1870,7 @@ fn test_client_detection_exact_matches() {
     assert_eq!(detect_client("claude-code"), ClientType::ClaudeCode);
     assert_eq!(detect_client("claude-ai"), ClientType::ClaudeDesktop);
     assert_eq!(detect_client("cursor-vscode"), ClientType::Cursor);
-    assert_eq!(detect_client("windsurf-client"), ClientType::Windsurf);
+    assert_eq!(detect_client("windsurf-client"), ClientType::Devin);
     assert_eq!(
         detect_client("Visual-Studio-Code"),
         ClientType::VSCodeCopilot
@@ -1892,7 +1892,7 @@ fn test_client_detection_fuzzy() {
     assert_eq!(detect_client("Claude Code v2"), ClientType::ClaudeCode);
     assert_eq!(detect_client("claude-desktop"), ClientType::ClaudeDesktop);
     assert_eq!(detect_client("cursor-next"), ClientType::Cursor);
-    assert_eq!(detect_client("codeium-editor"), ClientType::Windsurf);
+    assert_eq!(detect_client("codeium-editor"), ClientType::Devin);
     assert_eq!(detect_client("github-copilot"), ClientType::VSCodeCopilot);
     assert_eq!(detect_client("codex-cli"), ClientType::CodexCli);
 }

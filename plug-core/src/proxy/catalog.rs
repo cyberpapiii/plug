@@ -758,7 +758,7 @@ impl super::ToolRouter {
             return Arc::clone(&snapshot.tools_all);
         }
         match client_type {
-            ClientType::Windsurf => Arc::clone(&snapshot.tools_windsurf),
+            ClientType::Devin => Arc::clone(&snapshot.tools_devin),
             ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),
             _ => Arc::clone(&snapshot.tools_all),
         }

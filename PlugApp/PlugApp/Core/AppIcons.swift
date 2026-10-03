@@ -26,9 +26,10 @@ enum AppIcons {
         "cursor": "com.todesktop.230313mzl4w4u92",
         "vscode": "com.microsoft.VSCode",
         "opencode": "ai.opencode.desktop",
-        // Cognition's Devin app retains this bundle identifier for backward
-        // compatibility with the former Windsurf desktop app.
-        "windsurf": "com.exafunction.windsurf",
+        // Devin.app kept the bundle identifier of the Windsurf app it was.
+        "devin": "com.exafunction.windsurf",
+        // Grok Bot is a remote client, but its Mac app supplies the icon.
+        "grok-bot": "com.anysphere.sand",
         "zed": "dev.zed.Zed",
         "antigravity": "com.google.antigravity",
         "junie": "com.jetbrains.junie",
@@ -38,7 +39,7 @@ enum AppIcons {
     /// Targets that are command line tools. They have no icon to show, and a
     /// terminal glyph says more about them than a generic app square would.
     private static let commandLineTargets: Set<String> = [
-        "cline-cli", "gemini-cli",
+        "cline-cli", "gemini-cli", "grok-build",
         "goose", "opencode", "nanobot", "crush",
     ]
 
@@ -105,7 +106,12 @@ enum AppIcons {
         }
         if compact.contains("devin") || compact.contains("cascade") ||
             compact.contains("windsurf") || compact.contains("codeium") {
-            return "windsurf"
+            return "devin"
+        }
+        // The two xAI clients share a first word. The daemon's own
+        // detection splits them the same way.
+        if compact.contains("grok") {
+            return compact.contains("bot") ? "grok-bot" : "grok-build"
         }
         for target in bundleIdentifiers.keys where value.contains(target) { return target }
         for target in commandLineTargets where value.contains(target) { return target }
@@ -132,7 +138,9 @@ enum AppIcons {
         case "claude-code": return "Claude Code"
         case "codex", "codex-cli": return "Codex CLI"
         case "cursor": return "Cursor"
-        case "windsurf": return "Devin"
+        case "devin": return "Devin"
+        case "grok-build": return "Grok Build"
+        case "grok-bot": return "Grok Bot"
         case "opencode": return "OpenCode"
         case "goose": return "Goose"
         default: return nil

@@ -10,7 +10,7 @@ pub fn detect_client(client_info_name: &str) -> ClientType {
         "claude-code" => return ClientType::ClaudeCode,
         "claude-ai" => return ClientType::ClaudeDesktop,
         "cursor-vscode" => return ClientType::Cursor,
-        "windsurf-client" => return ClientType::Windsurf,
+        "windsurf-client" => return ClientType::Devin,
         "Visual-Studio-Code" => return ClientType::VSCodeCopilot,
         "gemini-cli-mcp-client" => return ClientType::GeminiCli,
         "opencode" => return ClientType::OpenCode,
@@ -26,14 +26,26 @@ pub fn detect_client(client_info_name: &str) -> ClientType {
         ClientType::ClaudeDesktop
     } else if name.contains("cursor") {
         ClientType::Cursor
-    } else if name.contains("windsurf") || name.contains("codeium") {
-        ClientType::Windsurf
+    } else if name.contains("devin")
+        || name.contains("cascade")
+        || name.contains("windsurf")
+        || name.contains("codeium")
+    {
+        ClientType::Devin
     } else if name.contains("copilot") || name.contains("vscode") {
         ClientType::VSCodeCopilot
     } else if name.contains("gemini") {
         ClientType::GeminiCli
     } else if name.contains("codex") {
         ClientType::CodexCli
+    } else if name.contains("grok") {
+        // Neither xAI client's `clientInfo.name` is documented. Grok Bot is
+        // the one with "bot" in its name; everything else Grok is the CLI.
+        if name.contains("bot") {
+            ClientType::GrokBot
+        } else {
+            ClientType::GrokBuild
+        }
     } else if name.contains("opencode") {
         ClientType::OpenCode
     } else if name.contains("zed") {
@@ -52,7 +64,7 @@ mod tests {
         assert_eq!(detect_client("claude-code"), ClientType::ClaudeCode);
         assert_eq!(detect_client("claude-ai"), ClientType::ClaudeDesktop);
         assert_eq!(detect_client("cursor-vscode"), ClientType::Cursor);
-        assert_eq!(detect_client("windsurf-client"), ClientType::Windsurf);
+        assert_eq!(detect_client("windsurf-client"), ClientType::Devin);
         assert_eq!(
             detect_client("Visual-Studio-Code"),
             ClientType::VSCodeCopilot
@@ -70,10 +82,16 @@ mod tests {
         assert_eq!(detect_client("Claude Code v2"), ClientType::ClaudeCode);
         assert_eq!(detect_client("claude-desktop"), ClientType::ClaudeDesktop);
         assert_eq!(detect_client("cursor-next"), ClientType::Cursor);
-        assert_eq!(detect_client("codeium-editor"), ClientType::Windsurf);
+        assert_eq!(detect_client("codeium-editor"), ClientType::Devin);
+        assert_eq!(detect_client("devin-cli"), ClientType::Devin);
+        assert_eq!(detect_client("Cascade (Devin Desktop)"), ClientType::Devin);
         assert_eq!(detect_client("github-copilot"), ClientType::VSCodeCopilot);
         assert_eq!(detect_client("gemini-cli-v2"), ClientType::GeminiCli);
         assert_eq!(detect_client("codex-cli"), ClientType::CodexCli);
+        assert_eq!(detect_client("grok-cli"), ClientType::GrokBuild);
+        assert_eq!(detect_client("Grok Build"), ClientType::GrokBuild);
+        assert_eq!(detect_client("grok-bot"), ClientType::GrokBot);
+        assert_eq!(detect_client("Grok Bot"), ClientType::GrokBot);
         assert_eq!(detect_client("opencode-v2"), ClientType::OpenCode);
         assert_eq!(detect_client("zed-preview"), ClientType::Zed);
     }
@@ -86,7 +104,7 @@ mod tests {
 
     #[test]
     fn tool_limit_known_clients() {
-        assert_eq!(ClientType::Windsurf.tool_limit(), Some(100));
+        assert_eq!(ClientType::Devin.tool_limit(), Some(100));
         assert_eq!(ClientType::VSCodeCopilot.tool_limit(), Some(128));
     }
 
@@ -97,6 +115,8 @@ mod tests {
         assert_eq!(ClientType::Cursor.tool_limit(), None);
         assert_eq!(ClientType::GeminiCli.tool_limit(), None);
         assert_eq!(ClientType::CodexCli.tool_limit(), None);
+        assert_eq!(ClientType::GrokBuild.tool_limit(), None);
+        assert_eq!(ClientType::GrokBot.tool_limit(), None);
         assert_eq!(ClientType::OpenCode.tool_limit(), None);
         assert_eq!(ClientType::Zed.tool_limit(), None);
         assert_eq!(ClientType::Unknown.tool_limit(), None);
@@ -107,10 +127,12 @@ mod tests {
         assert_eq!(ClientType::ClaudeCode.to_string(), "Claude Code");
         assert_eq!(ClientType::ClaudeDesktop.to_string(), "Claude Desktop");
         assert_eq!(ClientType::Cursor.to_string(), "Cursor");
-        assert_eq!(ClientType::Windsurf.to_string(), "Windsurf");
+        assert_eq!(ClientType::Devin.to_string(), "Devin");
         assert_eq!(ClientType::VSCodeCopilot.to_string(), "VS Code Copilot");
         assert_eq!(ClientType::GeminiCli.to_string(), "Gemini CLI");
         assert_eq!(ClientType::CodexCli.to_string(), "Codex CLI");
+        assert_eq!(ClientType::GrokBuild.to_string(), "Grok Build");
+        assert_eq!(ClientType::GrokBot.to_string(), "Grok Bot");
         assert_eq!(ClientType::OpenCode.to_string(), "OpenCode");
         assert_eq!(ClientType::Zed.to_string(), "Zed");
         assert_eq!(ClientType::Unknown.to_string(), "Unknown");
@@ -119,7 +141,12 @@ mod tests {
     #[test]
     fn target_slug_maps_known_clients_to_config_targets() {
         assert_eq!(ClientType::ClaudeCode.target_slug(), Some("claude-code"));
+        assert_eq!(ClientType::Devin.target_slug(), Some("devin"));
+        assert_eq!(ClientType::GrokBuild.target_slug(), Some("grok-build"));
         assert_eq!(ClientType::OpenCode.target_slug(), Some("opencode"));
+        // Grok Bot cannot be pointed at Plug from this Mac, so it has no
+        // target to link.
+        assert_eq!(ClientType::GrokBot.target_slug(), None);
         assert_eq!(ClientType::Unknown.target_slug(), None);
     }
 }

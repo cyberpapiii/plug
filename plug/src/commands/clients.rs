@@ -70,11 +70,12 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Claude Code", "claude-code"),
         ("Cursor", "cursor"),
         ("VS Code Copilot", "vscode"),
-        // Devin is the current product name. Keep the Windsurf target because
-        // Devin still reads the legacy config path and client identifier.
-        ("Devin", "windsurf"),
+        ("Devin", "devin"),
         ("Gemini CLI", "gemini-cli"),
         ("Codex CLI", "codex-cli"),
+        // Grok Bot is not here: it reaches Plug over the public internet
+        // only, so there is no file on this Mac to link.
+        ("Grok Build", "grok-build"),
         ("OpenCode", "opencode"),
         ("Zed", "zed"),
         ("Cline (VS Code)", "cline"),
@@ -1852,9 +1853,18 @@ extensions:
     }
 
     #[test]
-    fn client_inventory_uses_current_devin_name_and_omits_roocode() {
+    fn client_inventory_names_current_products() {
         let clients = all_client_targets();
-        assert!(clients.contains(&("Devin", "windsurf")));
+        assert!(clients.contains(&("Devin", "devin")));
+        assert!(clients.contains(&("Grok Build", "grok-build")));
+        assert!(!clients.iter().any(|(name, _)| name.contains("Windsurf")));
         assert!(!clients.iter().any(|(_, target)| *target == "roocode"));
+        // Every registry target parses, so `plug link` accepts each row.
+        for (_, target) in clients {
+            assert!(
+                target.parse::<plug_core::export::ExportTarget>().is_ok(),
+                "{target} is not an export target"
+            );
+        }
     }
 }

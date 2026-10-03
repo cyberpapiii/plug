@@ -27,10 +27,11 @@ pub(crate) fn cmd_import(
                 "claude-desktop" => Some(ClientSource::ClaudeDesktop),
                 "claude-code" => Some(ClientSource::ClaudeCode),
                 "cursor" => Some(ClientSource::Cursor),
-                "windsurf" => Some(ClientSource::Windsurf),
+                "devin" | "windsurf" => Some(ClientSource::Devin),
                 "vscode" => Some(ClientSource::VSCodeCopilot),
                 "gemini-cli" => Some(ClientSource::GeminiCli),
                 "codex-cli" => Some(ClientSource::CodexCli),
+                "grok-build" | "grok" => Some(ClientSource::GrokBuild),
                 "opencode" => Some(ClientSource::OpenCode),
                 "zed" => Some(ClientSource::Zed),
                 "cline" => Some(ClientSource::Cline),
@@ -2044,14 +2045,14 @@ mod tests {
             registered("Claude", "a"),
             registered("Cursor", "b"),
             registered("Cursor", "c"),
-            registered("Windsurf", "d"),
-            registered("Windsurf", "e"),
-            registered("Windsurf", "f"),
+            registered("Devin", "d"),
+            registered("Devin", "e"),
+            registered("Devin", "f"),
         ])
         .expect("duplicates warn");
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(
-            check.message.contains("Cursor ×2, Windsurf ×3"),
+            check.message.contains("Cursor ×2, Devin ×3"),
             "{}",
             check.message
         );

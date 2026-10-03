@@ -186,9 +186,11 @@ pub fn default_lazy_tool_mode_for_client(client_type: crate::types::ClientType) 
         | crate::types::ClientType::CodexCli => LazyToolMode::Native,
         crate::types::ClientType::OpenCode => LazyToolMode::Bridge,
         crate::types::ClientType::ClaudeDesktop
-        | crate::types::ClientType::Windsurf
+        | crate::types::ClientType::Devin
         | crate::types::ClientType::VSCodeCopilot
         | crate::types::ClientType::GeminiCli
+        | crate::types::ClientType::GrokBuild
+        | crate::types::ClientType::GrokBot
         | crate::types::ClientType::Zed
         | crate::types::ClientType::Unknown => LazyToolMode::Standard,
     }
@@ -205,10 +207,11 @@ pub fn lazy_tool_client_type_for_target(target: &str) -> Option<crate::types::Cl
         "claude-code" => Some(crate::types::ClientType::ClaudeCode),
         "claude-desktop" => Some(crate::types::ClientType::ClaudeDesktop),
         "cursor" => Some(crate::types::ClientType::Cursor),
-        "windsurf" => Some(crate::types::ClientType::Windsurf),
+        "devin" => Some(crate::types::ClientType::Devin),
         "vscode" => Some(crate::types::ClientType::VSCodeCopilot),
         "gemini-cli" => Some(crate::types::ClientType::GeminiCli),
         "codex-cli" => Some(crate::types::ClientType::CodexCli),
+        "grok-build" => Some(crate::types::ClientType::GrokBuild),
         "opencode" => Some(crate::types::ClientType::OpenCode),
         "zed" => Some(crate::types::ClientType::Zed),
         _ => None,
@@ -898,10 +901,11 @@ fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
         crate::export::ExportTarget::ClaudeDesktop => Some("claude-desktop"),
         crate::export::ExportTarget::ClaudeCode => Some("claude-code"),
         crate::export::ExportTarget::Cursor => Some("cursor"),
-        crate::export::ExportTarget::Windsurf => Some("windsurf"),
+        crate::export::ExportTarget::Devin => Some("devin"),
         crate::export::ExportTarget::VSCodeCopilot => Some("vscode"),
         crate::export::ExportTarget::GeminiCli => Some("gemini-cli"),
         crate::export::ExportTarget::CodexCli => Some("codex-cli"),
+        crate::export::ExportTarget::GrokBuild => Some("grok-build"),
         crate::export::ExportTarget::OpenCode => Some("opencode"),
         crate::export::ExportTarget::Zed => Some("zed"),
         crate::export::ExportTarget::Cline => Some("cline"),

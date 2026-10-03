@@ -166,7 +166,7 @@ fn router_with_git_commit_tool() -> ToolRouter {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -518,7 +518,7 @@ fn list_tools_for_client_returns_correct_counts() {
         })
         .collect();
 
-    let tools_windsurf = Arc::new(tools.iter().take(100).cloned().collect::<Vec<_>>());
+    let tools_devin = Arc::new(tools.iter().take(100).cloned().collect::<Vec<_>>());
     let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect::<Vec<_>>());
     let tools_all = Arc::new(tools);
 
@@ -530,7 +530,7 @@ fn list_tools_for_client_returns_correct_counts() {
             tools_by_name_lower: HashMap::new(),
             tools_all,
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf,
+            tools_devin,
             tools_copilot,
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -543,10 +543,7 @@ fn list_tools_for_client_returns_correct_counts() {
         .with_indexes(),
     ));
 
-    assert_eq!(
-        router.list_tools_for_client(ClientType::Windsurf).len(),
-        100
-    );
+    assert_eq!(router.list_tools_for_client(ClientType::Devin).len(), 100);
     assert_eq!(
         router
             .list_tools_for_client(ClientType::VSCodeCopilot)
@@ -564,9 +561,9 @@ fn list_tools_for_client_returns_correct_counts() {
 fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() {
     // Pins the invariant the refresh_tools() filtered-view gate depends on:
     // when `tool_filter_enabled` is false, `refresh_tools()` no longer
-    // populates `tools_windsurf` / `tools_copilot` (they're left empty).
+    // populates `tools_devin` / `tools_copilot` (they're left empty).
     // `list_tools_for_client_session` must still return the FULL catalog for
-    // Windsurf/Copilot in that case — it has to return `tools_all` early
+    // Devin/Copilot in that case — it has to return `tools_all` early
     // before ever reading those two fields.
     let sm = Arc::new(ServerManager::new());
     let config = RouterConfig {
@@ -586,7 +583,7 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
         .collect();
 
     // Simulate what refresh_tools() now produces when filtering is
-    // disabled: tools_windsurf/tools_copilot stay empty.
+    // disabled: tools_devin/tools_copilot stay empty.
     router.cache.store(Arc::new(
         RouterSnapshot {
             routes: HashMap::new(),
@@ -595,7 +592,7 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
             tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -610,10 +607,10 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
 
     assert_eq!(
         router
-            .list_tools_for_client_session(ClientType::Windsurf, None)
+            .list_tools_for_client_session(ClientType::Devin, None)
             .len(),
         150,
-        "Windsurf must still see the full catalog, not the empty pre-cached view"
+        "Devin must still see the full catalog, not the empty pre-cached view"
     );
     assert_eq!(
         router
@@ -641,7 +638,7 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
             tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -747,7 +744,7 @@ fn search_tools_returns_matches() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -885,7 +882,7 @@ fn meta_tool_mode_lists_only_meta_tools() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -931,7 +928,7 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -976,7 +973,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1041,7 +1038,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1107,7 +1104,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1173,7 +1170,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1352,7 +1349,7 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1460,7 +1457,7 @@ fn case_insensitive_route_lookup() {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1509,7 +1506,7 @@ async fn call_tool_times_out_waiting_for_semaphore() {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1617,7 +1614,7 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
             routes_lower: HashMap::new(),
             tools_by_name: HashMap::new(),
             tools_by_name_lower: HashMap::new(),
-            tools_windsurf: Arc::new(tools.iter().take(100).cloned().collect()),
+            tools_devin: Arc::new(tools.iter().take(100).cloned().collect()),
             tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
@@ -2490,7 +2487,7 @@ fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -3295,7 +3292,7 @@ fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
         tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_windsurf: Arc::new(Vec::new()),
+        tools_devin: Arc::new(Vec::new()),
         tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
@@ -3324,7 +3321,7 @@ fn publish_tool_route_snapshot_with_original(
         )]),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_windsurf: Arc::new(Vec::new()),
+        tools_devin: Arc::new(Vec::new()),
         tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
@@ -3356,7 +3353,7 @@ fn publish_tool_route_snapshot_with_metadata(
             Arc::new(serde_json::Map::new()),
         )]),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_windsurf: Arc::new(Vec::new()),
+        tools_devin: Arc::new(Vec::new()),
         tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
