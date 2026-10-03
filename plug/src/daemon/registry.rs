@@ -209,6 +209,7 @@ impl ClientRegistry {
                 client_info: entry.client_info.clone(),
                 adapter_version: entry.adapter_version.clone(),
                 host: entry.host.clone(),
+                grant: None,
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })

@@ -228,6 +228,7 @@ async fn operator_live_sessions(
                 }
             },
             client_id: None,
+            grant: snapshot.grant,
             session_id: snapshot.session_id,
             client_type: snapshot.client_type,
             client_info: None,
@@ -2568,6 +2569,7 @@ mod tests {
             client_info: Some("Claude Code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
             host: None,
+            grant: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2579,6 +2581,7 @@ mod tests {
             client_info: None,
             adapter_version: None,
             host: None,
+            grant: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2606,6 +2609,7 @@ mod tests {
             client_info: Some("Claude Code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
             host: None,
+            grant: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2633,6 +2637,7 @@ mod tests {
             client_info: Some("Claude Code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
             host: None,
+            grant: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2660,6 +2665,7 @@ mod tests {
             client_info: None,
             adapter_version: None,
             host: None,
+            grant: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2739,6 +2745,7 @@ mod tests {
                 client_info: Some("Claude Code".to_string()),
                 adapter_version: Some("0.6.5".to_string()),
                 host: None,
+                grant: None,
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -2750,6 +2757,7 @@ mod tests {
                 client_info: None,
                 adapter_version: None,
                 host: None,
+                grant: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },

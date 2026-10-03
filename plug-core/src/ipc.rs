@@ -761,6 +761,10 @@ pub struct IpcLiveSessionInfo {
     /// session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<ClientHost>,
+    /// The OAuth client whose token opened a remote session. Never set for a
+    /// local connector.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
     pub connected_secs: u64,
     pub last_activity_secs: Option<u64>,
 }
@@ -768,11 +772,18 @@ pub struct IpcLiveSessionInfo {
 impl IpcLiveSessionInfo {
     /// What this client's settings are stored under.
     ///
-    /// A client Plug recognises is its target slug. One it does not is the
-    /// program that started it, which Plug reads from the process table. A
-    /// session with neither has no key: what a client says about itself is
-    /// not a safe thing to hang settings on.
+    /// A remote session is the grant it came in on, which Plug verified. A
+    /// local client Plug recognises is its target slug. One it does not is
+    /// the program that started it, which Plug reads from the process table.
+    /// A session with none of these has no key.
+    ///
+    /// The target slug is worked out from the name a local client reports,
+    /// so it is good enough for a display name and not for access. Only the
+    /// grant is verified.
     pub fn client_key(&self) -> Option<String> {
+        if let Some(grant) = &self.grant {
+            return Some(grant_client_key(grant));
+        }
         if let Some(slug) = self.client_type.target_slug() {
             return Some(slug.to_string());
         }
@@ -1586,6 +1597,7 @@ mod tests {
                     client_info: Some("claude-code".to_string()),
                     adapter_version: Some("0.6.5".to_string()),
                     host: None,
+                    grant: None,
                     connected_secs: 12,
                     last_activity_secs: Some(1),
                 }],
@@ -1942,6 +1954,7 @@ mod tests {
             client_info: Some("Cursor".to_string()),
             adapter_version: None,
             host,
+            grant: None,
             connected_secs: 1,
             last_activity_secs: None,
         };
@@ -1976,6 +1989,11 @@ mod tests {
         // It calls itself Cursor, but nothing Plug can see backs that up.
         assert_eq!(session(ClientType::Unknown, None).client_key(), None);
         assert_eq!(session(ClientType::GrokBot, None).client_key(), None);
+
+        // A remote session is the grant it came in on, whatever it says it is.
+        let mut remote = session(ClientType::Cursor, None);
+        remote.grant = Some("client-abc".to_string());
+        assert_eq!(remote.client_key().as_deref(), Some("oauth:client-abc"));
     }
 
     #[test]
@@ -2344,6 +2362,7 @@ mod tests {
                         client_info: Some("claude-code 2.0".to_string()),
                         adapter_version: None,
                         host: None,
+                        grant: None,
                         connected_secs: 30,
                         last_activity_secs: Some(2),
                     }],

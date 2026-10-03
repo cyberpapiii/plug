@@ -346,6 +346,51 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(names.name(forKey: "oauth:other"))
     }
 
+    func testARemoteSessionIsNamedAfterItsGrantUnlessPlugKnowsTheProduct() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let visibility = try decoder.decode(
+            [ClientVisibility].self,
+            from: Data(
+                #"""
+                [{"session_id":"r1","client_type":"Unknown","visible_tool_count":3,"client_key":"oauth:abc"},
+                 {"session_id":"r2","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"},
+                 {"session_id":"r3","client_type":"Unknown","visible_tool_count":3,"client_key":"oauth:gone"}]
+                """#.utf8
+            )
+        )
+        let grants = try decoder.decode(
+            [DownstreamClient].self,
+            from: Data(
+                #"""
+                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic"},
+                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic"}]
+                """#.utf8
+            )
+        )
+        let live = try sessions(
+            """
+            [{"transport":"http","session_id":"r1","client_type":"Unknown","connected_secs":1},
+             {"transport":"http","session_id":"r2","client_type":"Cursor","connected_secs":1},
+             {"transport":"http","session_id":"r3","client_type":"Unknown","connected_secs":1}]
+            """
+        )
+
+        let names = ClientNames(visibility: visibility, names: [], grants: grants)
+        XCTAssertEqual(
+            live.map(names.displayName),
+            ["Perplexity", "Cursor", "Unidentified remote client r3"]
+        )
+        XCTAssertEqual(names.key(of: live[0]), "oauth:abc", "a remote session is renamed through its grant")
+
+        let renamed = ClientNames(
+            visibility: visibility,
+            names: try decoder.decode([ClientName].self, from: Data(#"[{"key":"oauth:def","name":"Work laptop"}]"#.utf8)),
+            grants: grants
+        )
+        XCTAssertEqual(renamed.displayName(live[1]), "Work laptop")
+    }
+
     func testStaleAppScanCannotInventAConnectedSession() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true,"linked":true,"live":true,"live_sessions":1}]"#),

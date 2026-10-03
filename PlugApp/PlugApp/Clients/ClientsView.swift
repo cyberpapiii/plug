@@ -45,16 +45,22 @@ struct AppRoster: Equatable {
 }
 
 extension LiveSession {
-    /// What to call a session, best witness first: a client Plug knows, then
-    /// the program that started the connector, then whatever the client said
-    /// about itself. Pure, so the order can be tested.
-    var displayName: String {
+    /// The product name of a client Plug knows, nil for any other.
+    var knownName: String? {
         for value in [clientType, clientInfo].compactMap({ $0 }) {
             let target = AppIcons.target(forClientType: value)
             if let canonical = AppIcons.displayName(forTarget: target) {
                 return canonical
             }
         }
+        return nil
+    }
+
+    /// What to call a session, best witness first: a client Plug knows, then
+    /// the program that started the connector, then whatever the client said
+    /// about itself. Pure, so the order can be tested.
+    var displayName: String {
+        if let knownName { return knownName }
         let type = clientType
             .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")
@@ -73,7 +79,8 @@ extension LiveSession {
         }
         guard isUnknown else { return type }
         if let host, !host.name.isEmpty { return host.name }
-        return "Unidentified local client \(sessionId.prefix(4))"
+        let remote = ["http", "streamable_http", "sse"].contains(transport.lowercased())
+        return "Unidentified \(remote ? "remote" : "local") client \(sessionId.prefix(4))"
     }
 }
 
@@ -84,17 +91,27 @@ extension LiveSession {
 struct ClientNames: Equatable {
     private let keys: [String: String]
     private let names: [String: String]
+    /// The name each remote client registered its grant under.
+    private let grantNames: [String: String]
 
-    init(visibility: [ClientVisibility], names: [ClientName]) {
+    init(visibility: [ClientVisibility], names: [ClientName], grants: [DownstreamClient] = []) {
         keys = Dictionary(
             visibility.compactMap { entry in entry.clientKey.map { (entry.sessionId, $0) } },
             uniquingKeysWith: { first, _ in first }
         )
         self.names = Dictionary(names.map { ($0.key, $0.name) }, uniquingKeysWith: { first, _ in first })
+        grantNames = Dictionary(
+            grants.filter { !$0.clientName.isEmpty }.map { ($0.clientKey, $0.clientName) },
+            uniquingKeysWith: { first, _ in first }
+        )
     }
 
     init(snapshot: OperatorSnapshot) {
-        self.init(visibility: snapshot.clientVisibility, names: snapshot.clientNames ?? [])
+        self.init(
+            visibility: snapshot.clientVisibility,
+            names: snapshot.clientNames ?? [],
+            grants: snapshot.downstreamClients
+        )
     }
 
     /// Nil for a session the daemon cannot tell apart from other clients.
@@ -103,8 +120,15 @@ struct ClientNames: Equatable {
 
     func name(forKey key: String?) -> String? { key.flatMap { names[$0] } }
 
+    /// The owner's name first, then a product Plug knows. A remote session
+    /// Plug does not know takes the name on its grant, which the owner
+    /// approved, ahead of whatever the session says about itself.
     func displayName(_ session: LiveSession) -> String {
-        name(forKey: key(of: session)) ?? session.displayName
+        let key = key(of: session)
+        return name(forKey: key)
+            ?? session.knownName
+            ?? key.flatMap { grantNames[$0] }
+            ?? session.displayName
     }
 }
 

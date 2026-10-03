@@ -32,6 +32,7 @@ struct SessionState {
     replay_events: VecDeque<SseEvent>,
     next_event_id: u64,
     client_type: crate::types::ClientType,
+    grant: Option<String>,
     broadcast_audience: crate::session::BroadcastAudience,
 }
 
@@ -53,6 +54,7 @@ impl StatefulSessionStore {
                     session_id: entry.key().clone(),
                     transport: DownstreamTransport::Http,
                     client_type: state.client_type,
+                    grant: state.grant.clone(),
                     connected_seconds: state.created_at.elapsed().as_secs(),
                     idle_seconds: state.last_activity.elapsed().as_secs(),
                     timeout_seconds: self.timeout.as_secs(),
@@ -393,6 +395,7 @@ impl SessionStore for StatefulSessionStore {
                 replay_events: VecDeque::new(),
                 next_event_id: 1,
                 client_type: crate::types::ClientType::Unknown,
+                grant: None,
                 broadcast_audience: crate::session::BroadcastAudience::default(),
             },
         );
@@ -439,6 +442,15 @@ impl SessionStore for StatefulSessionStore {
             .get_mut(session_id)
             .ok_or(HttpError::SessionNotFound)?;
         entry.client_type = client_type;
+        Ok(())
+    }
+
+    fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), HttpError> {
+        let mut entry = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
+        entry.grant = Some(client_id);
         Ok(())
     }
 
@@ -798,9 +810,27 @@ mod tests {
         assert_eq!(snapshot.session_id, id);
         assert_eq!(snapshot.transport, DownstreamTransport::Http);
         assert_eq!(snapshot.client_type, crate::types::ClientType::Cursor);
+        assert_eq!(snapshot.grant, None);
         assert_eq!(snapshot.timeout_seconds, 1800);
         assert!(snapshot.connected_seconds <= 1);
         assert!(snapshot.idle_seconds <= 1);
+    }
+
+    #[test]
+    fn a_session_opened_with_a_grant_reports_that_grant() {
+        let store = StatefulSessionStore::new(1800, 100);
+        let id = store.create_session().unwrap();
+        store.set_grant(&id, "client-abc".to_string()).unwrap();
+
+        assert_eq!(
+            store.list_sessions()[0].grant.as_deref(),
+            Some("client-abc")
+        );
+        assert!(
+            store
+                .set_grant("missing", "client-abc".to_string())
+                .is_err()
+        );
     }
 
     #[test]
