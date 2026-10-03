@@ -1272,6 +1272,40 @@ impl DownstreamOauthManager {
         clients
     }
 
+    /// Recheck a durable event subscription without retaining an access token.
+    /// A live access or refresh grant must still authorize this resource/scope.
+    pub async fn permits_event_delivery(&self, client_id: &str, scope: &str) -> bool {
+        if self.durability_degraded() {
+            return false;
+        }
+        let guard = self.state.lock().await;
+        let now = epoch_secs();
+        if guard.revoked_client_ids.contains(client_id)
+            || !guard
+                .clients
+                .get(client_id)
+                .is_some_and(|client| client.expires_at > now)
+            || !self
+                .principal_lifecycles
+                .get(client_id)
+                .is_some_and(|lease| lease.active.load(Ordering::SeqCst))
+        {
+            return false;
+        }
+        let resource = format!("{}/mcp", self.base_url().trim_end_matches('/'));
+        guard.access_tokens.values().any(|grant| {
+            grant.client_id == client_id
+                && grant.expires_at > now
+                && grant.resource == resource
+                && grant.scopes.iter().any(|s| s == scope)
+        }) || guard.refresh_tokens.values().any(|grant| {
+            grant.client_id == client_id
+                && grant.expires_at > now
+                && grant.resource == resource
+                && grant.scopes.iter().any(|s| s == scope)
+        })
+    }
+
     pub async fn revoke_client(&self, client_id: &str) -> Result<bool, DownstreamOauthError> {
         self.ensure_durable()?;
         let mut guard = self.state.lock().await;

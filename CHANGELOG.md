@@ -5,6 +5,29 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Opt-in Slack event delivery. With `[http.slack_events]` configured, Plug
+  receives Slack's Events API at `/events/slack`, keeps coworker mentions of one
+  Slack user and replies in those threads across public channels, and delivers
+  each as `slack.ditto_message` to one chosen downstream OAuth client through
+  modern MCP Events (`events/list`, `events/subscribe`, `events/unsubscribe`,
+  scope `events:subscribe`). Callbacks are verified and signed, subscriptions
+  and the retry queue survive restarts, and the Slack signing secret is entered
+  at a hidden prompt (`plug auth slack-events set`) and kept in the Keychain.
+  Off unless configured; Slack only. See `docs/slack-mcp-events.md`.
+- `owner_proof_until` lets the owner prove Slack event delivery alone for up to
+  one hour by sending one exact test marker. Every other owner message stays
+  excluded.
+
+### Changed
+
+- Docs match the shipped product: the README describes the app, the
+  architecture and dual-era guides describe `main` instead of a development
+  branch, and the August app design review moved to `docs/archive/`.
+
 ## [0.8.13] - 2026-10-01
 
 ### Changed
@@ -945,7 +968,7 @@ Detailed notes: [MCP 2026 dual-era modernization](docs/archive/release-notes/REL
 - **cli**: `plug connect`, `plug status` commands (TUI surface later removed; CLI-first)
 - **dist**: single binary, zero runtime dependencies
 
-[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.7.2...HEAD
+[Unreleased]: https://github.com/cyberpapiii/plug/compare/v0.8.13...HEAD
 [0.7.2]: https://github.com/cyberpapiii/plug/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/cyberpapiii/plug/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/cyberpapiii/plug/compare/v0.6.4...v0.7.0

@@ -58,6 +58,10 @@ For Linux and source builds, see the [operator guide](OPERATOR-GUIDE.md).
 | Zed | stdio only | None documented | JSON | `settings.json` |
 | Factory/Droid | stdio, HTTP | None documented | CLI config | Varies |
 
+Remote connectors (Claude Desktop's remote connector, ChatGPT) reach Plug at
+`https://<public_base_url>/mcp` with downstream OAuth instead of `plug connect`.
+Both are certified live; setup is in the [operator guide](OPERATOR-GUIDE.md).
+
 ---
 
 ## Lazy Tool Discovery Defaults
@@ -391,7 +395,7 @@ This shows which features each client actually supports (not just what the spec 
 
 ## Client Detection Strategy
 
-Detect client type from `clientInfo.name` in `InitializeRequest` using exact match as primary, fuzzy fallback as secondary (ADR-007):
+Detect client type from `clientInfo.name` in `InitializeRequest` using exact match as primary, fuzzy fallback as secondary (ADR-007 in `docs/archive/DECISIONS.md`):
 
 **Confirmed `clientInfo.name` values** (verified 2026-03-03):
 
@@ -410,7 +414,7 @@ Detection is exact match first, then a lowercase fuzzy fallback, in
 `plug-core/src/client_detect.rs`. Unknown clients get no tool limit and the
 full catalog.
 
-**Source**: Apify MCP Client Capabilities Index, `docs/research/client-validation.md`
+**Source**: Apify MCP Client Capabilities Index, `docs/archive/research/client-validation.md`
 
 ---
 

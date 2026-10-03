@@ -5,7 +5,10 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## In progress
 
-- Nothing.
+- Slack event delivery (`docs/slack-mcp-events.md`) is merged and running on
+  one Mac. Unproven: the dot answering a delivered event in the same thread,
+  delivery from public channels the owner has not joined, and unattended
+  renewal of the one-day subscription.
 
 ## Open
 
@@ -22,6 +25,9 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 - Fully live runtime reconfiguration.
 - Modern-era follow-through behind gates (`subscriptions/listen`, mixed-era
   MRTR) until production clients speak MCP 2026.
+- A general event system. Slack is the only event source; other upstream
+  servers' events are not forwarded and there is no adapter framework. Revisit
+  when a second source is actually wanted.
 - Linux tarballs, the shell installer, and the `plug` Homebrew Formula; the
   tap still carries the 0.8.10 formula and nothing updates it. Bring them back
   when someone asks.

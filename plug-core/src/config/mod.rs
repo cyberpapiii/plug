@@ -287,6 +287,9 @@ fn resolved_policy(mode: LazyToolMode, origin: LazyToolModeOrigin) -> ResolvedLa
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
+    /// Public-channel Slack MCP Events adapter. Absent means no event routes or state.
+    #[serde(default)]
+    pub slack_events: Option<crate::slack_events::SlackEventsConfig>,
     /// Opt in to the MCP 2026-07-28 downstream lifecycle. This remains false
     /// until modern conformance has been run for the installed release.
     #[serde(default)]
@@ -321,6 +324,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            slack_events: None,
             modern_downstream_enabled: false,
             auth_mode: DownstreamAuthMode::default(),
             public_base_url: None,
@@ -631,6 +635,28 @@ pub fn sanitize_server_name_for_path(name: &str) -> Result<&str, String> {
 /// Returns an empty vec if the config is valid.
 pub fn validate_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
+    if let Some(events) = &config.http.slack_events {
+        errors.extend(events.validate());
+        if !config.http.modern_downstream_enabled
+            || config.http.auth_mode != DownstreamAuthMode::Oauth
+        {
+            errors.push("http.slack_events requires modern downstream MCP and OAuth".into());
+        }
+        if !config.http.oauth_scopes.as_ref().is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
+        }) {
+            errors.push("http.slack_events requires explicit events:subscribe OAuth scope".into());
+        }
+        if !config
+            .servers
+            .get("slack")
+            .is_some_and(|server| server.enabled)
+        {
+            errors.push("http.slack_events requires the enabled slack upstream".into());
+        }
+    }
 
     if config.supervision.enabled {
         if config.supervision.degraded_restart_threshold == 0 {

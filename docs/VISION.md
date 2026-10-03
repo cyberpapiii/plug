@@ -70,6 +70,10 @@ Humans and agents are equal citizens.
 - MCP behavior should pass through faithfully by default.
 - Optional enrichment must be explicit or tightly scoped.
 - If upstream sends it, downstream should receive it unless `plug` is deliberately adding value.
+- One deliberate exception exists: the opt-in Slack event adapter
+  (`docs/slack-mcp-events.md`) originates an event instead of passing one
+  through. It is off unless configured, and it is not a pattern to extend
+  without a second real need.
 
 **Test**: Does removing `plug` from the chain preserve tool behavior in the default case?
 

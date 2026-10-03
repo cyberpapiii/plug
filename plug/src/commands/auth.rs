@@ -173,6 +173,7 @@ pub(crate) async fn cmd_auth(
             )
             .await
         }
+        crate::AuthCommands::SlackEvents { command } => cmd_slack_event_credential(command),
         crate::AuthCommands::Status => cmd_auth_status(config_path, output).await,
         crate::AuthCommands::Logout { server } => cmd_auth_logout(&server).await,
         crate::AuthCommands::Clients { command } => {
@@ -182,6 +183,46 @@ pub(crate) async fn cmd_auth(
             cmd_downstream_oauth_owner(config_path, command, output).await
         }
     }
+}
+
+fn require_interactive_signing_secret_entry(
+    input_terminal: bool,
+    output_terminal: bool,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        input_terminal && output_terminal,
+        "signing secret entry requires an interactive terminal; secret flags, pipes, and environment input are not supported"
+    );
+    Ok(())
+}
+
+fn cmd_slack_event_credential(command: crate::SlackEventCredentialCommands) -> anyhow::Result<()> {
+    use plug_core::slack_events::credentials::{KeychainSigningSecrets, SigningCredential};
+    use std::io::IsTerminal;
+    match command {
+        crate::SlackEventCredentialCommands::Set { team_id, app_id } => {
+            let credential = SigningCredential::new(&team_id, &app_id)?;
+            require_interactive_signing_secret_entry(
+                std::io::stdin().is_terminal(),
+                std::io::stdout().is_terminal(),
+            )?;
+            let secret = dialoguer::Password::new()
+                .with_prompt("Slack MCP signing secret (input hidden)")
+                .with_confirmation("Confirm signing secret", "Inputs do not match")
+                .interact()?;
+            credential.save(&KeychainSigningSecrets, &secret.into())?;
+            ui::print_success_line(
+                "Stored Slack Events signing secret in the OS Keychain. Enable configuration and restart only through Plug.app when ready.",
+            );
+        }
+        crate::SlackEventCredentialCommands::Remove { team_id, app_id } => {
+            SigningCredential::new(&team_id, &app_id)?.remove(&KeychainSigningSecrets)?;
+            ui::print_success_line(
+                "Removed stored Slack Events signing secret. A running receiver keeps its loaded secret until the managed restart.",
+            );
+        }
+    }
+    Ok(())
 }
 
 struct LocalOperatorClient {
@@ -1511,6 +1552,14 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn slack_events_secret_entry_requires_terminal_without_accessing_credentials() {
+        for (input, output) in [(false, false), (false, true), (true, false)] {
+            assert!(require_interactive_signing_secret_entry(input, output).is_err());
+        }
+        assert!(require_interactive_signing_secret_entry(true, true).is_ok());
+    }
 
     #[test]
     fn registered_client_timeline_shows_age_use_and_expiry() {

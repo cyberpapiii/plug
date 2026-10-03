@@ -1,10 +1,6 @@
 # MCP 2026 dual-era protocol guide
 
-> Development-branch status: this guide describes code on the MCP modernization
-> branch as of August 4, 2026. It is not a claim about `main`, a published
-> release, or the Plug binary currently installed on your machine.
-
-Plug is becoming an MCP `2026-07-28` gateway without forcing every client and
+Plug is an MCP `2026-07-28` gateway without forcing every client and
 server to upgrade at the same time. The modern path is explicit and opt-in; the
 legacy path remains the default because the clients observed on the development
 machine still use the earlier lifecycle.
@@ -15,11 +11,11 @@ Plug negotiates the downstream client and each upstream server independently.
 The routing, ownership, task, subscription, and policy engines remain shared.
 Only the wire-level lifecycle is adapted at the edges.
 
-In this branch, modern downstream negotiation is gated across HTTP, stdio, and
+Modern downstream negotiation is gated across HTTP, stdio, and
 daemon IPC. Existing clients still negotiate the legacy lifecycle by default;
 enabling the gate adds the modern option instead of forcing a cutover.
 
-| Downstream client | Upstream server | Branch behavior |
+| Downstream client | Upstream server | Behavior |
 | --- | --- | --- |
 | Legacy | Legacy | Preserve the current `initialize`-based behavior. |
 | Legacy | Modern | Catalog negotiation can succeed, but `tools/call` is rejected before upstream effects because a legacy client cannot represent an unexpected modern input request. |
@@ -77,8 +73,8 @@ The per-server values are:
   the JSON-RPC method-not-found error.
 - `modern`: require `server/discover`; do not fall back to legacy behavior.
 
-Plug on this branch pins RMCP exactly to `3.1.0`. That SDK foundation supports
-both protocol eras, but the branch still uses explicit Plug gates and tests
+Plug pins RMCP exactly to `3.1.0`. That SDK foundation supports
+both protocol eras, but Plug still uses explicit gates and tests
 because the SDK upgrade alone cannot validate Plug's routing, ownership, OAuth,
 task, subscription, and reverse-request behavior.
 
@@ -86,9 +82,10 @@ task, subscription, and reverse-request behavior.
 
 Start with one known modern upstream. Do not enable every server at once. An
 upstream-only canary proves discovery, catalog, and health behavior; legacy
-clients cannot call that modern upstream's tools through this branch.
+clients cannot call that modern upstream's tools.
 
-1. Back up `~/.config/plug/config.toml`.
+1. Back up the config (`~/Library/Application Support/plug/config.toml` on
+   macOS, `~/.config/plug/config.toml` on Linux).
 2. Add the global upstream gate and set one HTTP server to `auto`:
 
    ```toml

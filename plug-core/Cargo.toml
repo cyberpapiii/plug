@@ -20,6 +20,8 @@ tracing.workspace = true
 arc-swap.workspace = true
 uuid.workspace = true
 sha2.workspace = true
+hmac.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 url.workspace = true
 passkey-auth.workspace = true
 directories.workspace = true

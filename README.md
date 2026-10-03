@@ -54,6 +54,19 @@ Builds `Plug.app` from the working tree, signs it with the Developer ID in
 your login keychain, installs it, and lets the app replace its daemon. See
 `CONTRIBUTING.md`.
 
+### The app
+
+Plug lives in the menu bar. The panel shows whether everything is working, an
+on/off switch for Plug itself (separate from Quit), and the most recent tool
+calls. The window has three sections:
+
+- **Servers**: every MCP server, its health, sign-in, and its tools
+- **Apps**: the AI clients using Plug, grouped by connected, on this Mac, and
+  remote
+- **Activity**: what was called, by which app, and how it went
+
+Everything the app does is also available from the `plug` command.
+
 ### Connect Claude Desktop
 
 Link Claude Desktop with:
@@ -153,16 +166,18 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 - **Shared connections** — N clients share 1 upstream connection per server (not N connections)
 - **Client-aware** — automatically respects per-client tool limits (Windsurf: 100, VS Code: 128)
 - **Lazy tool discovery** — clients like OpenCode can start with a tiny search bridge instead of seeing hundreds of tool schemas up front
-- **Zero dependencies** — single static binary, no Docker, no database, no account required
+- **Zero dependencies** — one app (or one binary on Linux), no Docker, no database, no account required
 - **OAuth built in** — authenticate to remote MCP servers with `plug auth login`, background token refresh handles the rest
 - **Every transport** — upstream stdio, HTTP, and legacy SSE; downstream stdio and Streamable HTTP/HTTPS
+- **Remote access** — serve the same tools to Claude and ChatGPT connectors over HTTPS with built-in OAuth and an owner passkey
 
 ## Commands
 
 ```sh
 plug                         # Show a compact overview and next actions
-plug start                   # Start the shared background service (IPC + HTTP)
+plug start                   # Start the shared background service (Plug.app does this on macOS)
 plug setup                   # Discover servers and link clients
+plug link                    # Link plug to your AI clients
 plug clients                 # View and manage linked, detected, and live clients
 plug servers                 # View and manage configured servers
 plug tools                   # View and manage the effective tool surface
@@ -175,6 +190,7 @@ plug tools enable --server slack
 plug tools --output json     # Machine-readable output for agent use
 plug auth login --server name  # OAuth login for remote MCP servers
 plug auth status               # Show per-server auth status
+plug auth clients list         # Remote clients authorized through OAuth
 plug connect                   # Internal stdio adapter AI clients invoke
 plug serve                     # Run standalone HTTP/HTTPS in the foreground
 plug serve --daemon            # Run the shared background service (IPC + HTTP)
@@ -291,8 +307,13 @@ Notes:
 | [VISION.md](docs/VISION.md) | Core principles, design philosophy, non-negotiable rules |
 | [CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md) | AI client quirks, limits, and configuration |
 | [OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md) | Production operation: TLS, auth, observability, sandboxing |
+| [guides/mcp-2026-dual-era.md](docs/guides/mcp-2026-dual-era.md) | Legacy and MCP 2026-07-28 side by side, and how to turn the modern path on |
+| [slack-mcp-events.md](docs/slack-mcp-events.md) | Opt-in Slack event delivery to one remote client |
+| [testing/MCP-CONFORMANCE.md](docs/testing/MCP-CONFORMANCE.md) | What is proven locally and against the official conformance suite |
 | [RELEASING.md](docs/RELEASING.md) | How a release is built, signed, and published |
-| [archive/](docs/archive/) | Plans, research, audits, and release notes from before September 2026 |
+| [CONTRIBUTING.md](CONTRIBUTING.md) | Build, check, and ship a change |
+| [CHANGELOG.md](CHANGELOG.md) | What changed, release by release |
+| [archive/](docs/archive/) | Plans, research, design reviews, and audits. History, not maintained |
 
 ## Design Principles
 
@@ -302,12 +323,13 @@ Notes:
 4. **Token-efficient** — 5-layer optimization, client-aware tool filtering
 5. **Clean pass-through** — faithful proxy by default, optional enrichment
 6. **Rock-solid reliable** — circuit breakers, merge cache, graceful degradation
-7. **Future-proof** — MCP 2025-11-25, session-store seam ready for stateless operation
+7. **Dual-era** — legacy MCP by default, MCP 2026-07-28 behind explicit gates
 
 ## Tech Stack
 
 - **Language**: Rust (2024 edition)
-- **MCP SDK**: rmcp (official Rust SDK)
+- **MCP SDK**: rmcp 3.1.0 (official Rust SDK)
+- **App**: SwiftUI, Sparkle updates
 - **CLI**: Clap (derive pattern)
 - **HTTP**: Axum + Tower + Hyper
 - **Async**: Tokio (multi-threaded with work-stealing)

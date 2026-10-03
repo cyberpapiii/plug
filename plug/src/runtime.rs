@@ -743,12 +743,42 @@ fn build_configured_http_runtime(
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
 
+    let slack_events = if let Some(event_config) = &config.http.slack_events {
+        let oauth = downstream_oauth
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("Slack events require OAuth"))?;
+        let secret = plug_core::slack_events::credentials::SigningCredential::new(
+            &event_config.team_id,
+            &event_config.app_id,
+        )?
+        .load(&plug_core::slack_events::credentials::KeychainSigningSecrets)?;
+        let key = plug_core::slack_events::state_key(event_config)?;
+        let events = plug_core::slack_events::SlackEvents::open(
+            event_config.clone(),
+            secret,
+            &plug_core::config::config_dir()
+                .join("slack-events")
+                .join(key),
+            Arc::new(plug_core::slack_events::RuntimeAccess::new(
+                engine,
+                oauth,
+                event_config.clone(),
+            )),
+            Arc::new(plug_core::slack_events::HttpsDelivery),
+        )?;
+        events.spawn(engine.cancel_token().clone());
+        Some(events)
+    } else {
+        None
+    };
+
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: tool_router.clone(),
         sessions: Arc::clone(&sessions),
         cancel: engine.cancel_token().clone(),
         auth_mode: config.http.auth_mode.clone(),
         downstream_oauth: downstream_oauth.clone(),
+        slack_events,
         sse_channel_capacity: config.http.sse_channel_capacity,
         allowed_origins: config
             .http
@@ -2010,6 +2040,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             public_base_url: None,
             oauth_scopes: None,
+            slack_events: None,
             bind_address: "127.0.0.1".to_string(),
             port: addr.port(),
             allowed_origins: Vec::new(),
@@ -2350,6 +2381,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2840,6 +2872,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2888,6 +2921,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2953,6 +2987,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3334,6 +3369,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager.clone()),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3639,6 +3675,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3688,6 +3725,7 @@ mod tests {
             cancel: engine.cancel_token().clone(),
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
+            slack_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),

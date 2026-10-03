@@ -91,7 +91,7 @@ fn linux_keyring_store() -> platform_keyring::Result<Arc<linux_keyutils_keyring_
 }
 
 #[cfg(target_os = "linux")]
-fn initialize_platform_keyring() -> Result<(), String> {
+pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     INIT.get_or_init(|| {
@@ -108,7 +108,7 @@ fn initialize_platform_keyring() -> Result<(), String> {
 /// entry. Building the first entry under a `OnceLock` makes everyone else wait
 /// for the store. Constructing an entry does not touch the Keychain.
 #[cfg(not(target_os = "linux"))]
-fn initialize_platform_keyring() -> Result<(), String> {
+pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     INIT.get_or_init(|| {

@@ -1,7 +1,7 @@
 # Contributing
 
 Plug is a Rust MCP multiplexer with a macOS app that owns the daemon. The
-layout, the commands, and the rules are in `CLAUDE.md`; it is short and it is
+layout, the commands, and the rules are in `AGENTS.md`; it is short and it is
 written for people as much as for agents.
 
 ## Try a change

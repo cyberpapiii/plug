@@ -408,6 +408,11 @@ pub(crate) enum AuthCommands {
         #[arg(long)]
         expires_in: Option<u64>,
     },
+    /// Store or remove the Slack Events signing secret in the OS Keychain
+    SlackEvents {
+        #[command(subcommand)]
+        command: SlackEventCredentialCommands,
+    },
     /// Show OAuth authentication status for all servers
     Status,
     /// Complete an OAuth flow non-interactively with a pre-obtained code
@@ -440,6 +445,24 @@ pub(crate) enum AuthCommands {
     Owner {
         #[command(subcommand)]
         command: OwnerCommands,
+    },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SlackEventCredentialCommands {
+    /// Enter the source app signing secret interactively without echo
+    Set {
+        #[arg(long)]
+        team_id: String,
+        #[arg(long)]
+        app_id: String,
+    },
+    /// Remove the stored signing secret; first disable events and restart through Plug.app
+    Remove {
+        #[arg(long)]
+        team_id: String,
+        #[arg(long)]
+        app_id: String,
     },
 }
 
@@ -819,6 +842,47 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn slack_events_credential_cli_has_no_secret_argument_or_pipe_mode() {
+        let args = [
+            "plug",
+            "auth",
+            "slack-events",
+            "set",
+            "--team-id",
+            "T123",
+            "--app-id",
+            "A123",
+        ];
+        let cli = Cli::try_parse_from(args).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Auth {
+                command: AuthCommands::SlackEvents {
+                    command: SlackEventCredentialCommands::Set { .. }
+                }
+            })
+        ));
+        for extra in ["--secret", "--signing-secret", "--stdin"] {
+            let mut argv = args.to_vec();
+            argv.push(extra);
+            assert!(Cli::try_parse_from(argv).is_err());
+        }
+        assert!(
+            Cli::try_parse_from([
+                "plug",
+                "auth",
+                "slack-events",
+                "remove",
+                "--team-id",
+                "T123",
+                "--app-id",
+                "A123"
+            ])
+            .is_ok()
+        );
     }
 
     #[test]
