@@ -867,6 +867,7 @@ async fn check_client_configs() -> CheckResult {
         "claude-code",
         "cursor",
         "vscode",
+        "copilot-cli",
         "devin",
         "gemini-cli",
         "codex-cli",

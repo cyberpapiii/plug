@@ -209,6 +209,7 @@ pub fn default_lazy_tool_mode_for_client(client_type: crate::types::ClientType) 
         crate::types::ClientType::ClaudeDesktop
         | crate::types::ClientType::Devin
         | crate::types::ClientType::VSCodeCopilot
+        | crate::types::ClientType::CopilotCli
         | crate::types::ClientType::GeminiCli
         | crate::types::ClientType::GrokBuild
         | crate::types::ClientType::GrokBot
@@ -230,6 +231,7 @@ pub fn lazy_tool_client_type_for_target(target: &str) -> Option<crate::types::Cl
         "cursor" => Some(crate::types::ClientType::Cursor),
         "devin" => Some(crate::types::ClientType::Devin),
         "vscode" => Some(crate::types::ClientType::VSCodeCopilot),
+        "copilot-cli" => Some(crate::types::ClientType::CopilotCli),
         "gemini-cli" => Some(crate::types::ClientType::GeminiCli),
         "codex-cli" => Some(crate::types::ClientType::CodexCli),
         "grok-build" => Some(crate::types::ClientType::GrokBuild),
@@ -924,6 +926,7 @@ fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
         crate::export::ExportTarget::Cursor => Some("cursor"),
         crate::export::ExportTarget::Devin => Some("devin"),
         crate::export::ExportTarget::VSCodeCopilot => Some("vscode"),
+        crate::export::ExportTarget::CopilotCli => Some("copilot-cli"),
         crate::export::ExportTarget::GeminiCli => Some("gemini-cli"),
         crate::export::ExportTarget::CodexCli => Some("codex-cli"),
         crate::export::ExportTarget::GrokBuild => Some("grok-build"),

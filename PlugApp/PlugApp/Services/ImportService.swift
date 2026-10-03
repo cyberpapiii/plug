@@ -145,6 +145,7 @@ extension ImportScan {
         case "OpenCode": "opencode"
         case "RooCode": "roocode"
         case "GrokBuild": "grok-build"
+        case "CopilotCli": "copilot-cli"
         default: source.lowercased()
         }
     }
@@ -161,6 +162,7 @@ extension ImportScan {
         case "OpenCode": "OpenCode"
         case "RooCode": "Roo Code"
         case "GrokBuild": "Grok Build"
+        case "CopilotCli": "GitHub Copilot CLI"
         case "": "Another app"
         default: source
         }

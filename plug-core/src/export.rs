@@ -14,6 +14,7 @@ pub enum ExportTarget {
     Cursor,
     Devin,
     VSCodeCopilot,
+    CopilotCli,
     GeminiCli,
     CodexCli,
     GrokBuild,
@@ -42,6 +43,7 @@ impl std::str::FromStr for ExportTarget {
             // product; it stays accepted so old scripts keep working.
             "devin" | "windsurf" => Ok(Self::Devin),
             "vscode" => Ok(Self::VSCodeCopilot),
+            "copilot" | "copilot-cli" => Ok(Self::CopilotCli),
             "gemini" | "gemini-cli" => Ok(Self::GeminiCli),
             "codex" | "codex-cli" => Ok(Self::CodexCli),
             "grok" | "grok-build" => Ok(Self::GrokBuild),
@@ -69,6 +71,7 @@ impl ExportTarget {
             Self::Cursor => "Cursor",
             Self::Devin => "Devin",
             Self::VSCodeCopilot => "VS Code Copilot",
+            Self::CopilotCli => "GitHub Copilot CLI",
             Self::GeminiCli => "Gemini CLI",
             Self::CodexCli => "Codex CLI",
             Self::GrokBuild => "Grok Build",
@@ -94,6 +97,7 @@ impl ExportTarget {
             "cursor",
             "devin",
             "vscode",
+            "copilot-cli",
             "gemini-cli",
             "codex-cli",
             "grok-build",
@@ -159,8 +163,11 @@ pub fn export_config(options: &ExportOptions) -> String {
         | ExportTarget::Kilo
         | ExportTarget::Antigravity => export_json_mcp_servers(options, "mcpServers"),
 
-        // VS Code uses nested "mcp" -> "servers"
+        // VS Code's own files use a top-level "servers"
         ExportTarget::VSCodeCopilot => export_vscode(options),
+
+        // Copilot CLI wants a type and a tool list on every entry
+        ExportTarget::CopilotCli => export_copilot_cli(options),
 
         // Zed uses "context_servers"
         ExportTarget::Zed => export_json_mcp_servers(options, "context_servers"),
@@ -271,23 +278,52 @@ fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
     serde_norway::to_string(&config).unwrap()
 }
 
-/// Generate VS Code config with nested "mcp" -> "servers".
+/// Generate VS Code's `mcp.json`: a top-level `servers` object, in the
+/// workspace file and the user profile file alike.
+/// https://code.visualstudio.com/docs/copilot/customization/mcp-servers
 fn export_vscode(options: &ExportOptions) -> String {
     let server_entry = match options.transport {
         ExportTransport::Stdio => serde_json::json!({
+            "type": "stdio",
             "command": options.command,
             "args": ["connect"]
         }),
         ExportTransport::Http => serde_json::json!({
+            "type": "http",
             "url": resolved_http_url(options)
         }),
     };
 
     let config = serde_json::json!({
-        "mcp": {
-            "servers": {
-                "plug": server_entry
-            }
+        "servers": {
+            "plug": server_entry
+        }
+    });
+
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate GitHub Copilot CLI's `mcp-config.json`. `type` and `tools` are
+/// required on every entry; `"*"` allows every tool.
+/// https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers
+fn export_copilot_cli(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => serde_json::json!({
+            "type": "local",
+            "command": options.command,
+            "args": ["connect"],
+            "tools": ["*"]
+        }),
+        ExportTransport::Http => serde_json::json!({
+            "type": "http",
+            "url": resolved_http_url(options),
+            "tools": ["*"]
+        }),
+    };
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "plug": server_entry
         }
     });
 
@@ -357,13 +393,20 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
                 Some(home.join(".config/devin/mcp_config.json"))
             }
         }
+        // The user file lives in the default profile folder. Until 0.8.14 this
+        // target wrote ~/.copilot/mcp-config.json, which belongs to Copilot
+        // CLI and takes a different shape.
         ExportTarget::VSCodeCopilot => {
             if project {
                 Some(std::path::PathBuf::from(".vscode/mcp.json"))
             } else {
-                Some(home.join(".copilot/mcp-config.json"))
+                Some(dirs::config_dir()?.join("Code/User/mcp.json"))
             }
         }
+        // One user file. The project files Copilot CLI reads, `.mcp.json` and
+        // `.github/mcp.json`, are shared with other clients that reject its
+        // extra fields, so there is no project path.
+        ExportTarget::CopilotCli => Some(home.join(".copilot/mcp-config.json")),
         ExportTarget::GeminiCli => {
             if project {
                 Some(std::path::PathBuf::from(".gemini/settings.json"))
@@ -498,17 +541,51 @@ mod tests {
     }
 
     #[test]
-    fn export_vscode_nested() {
-        let options = ExportOptions {
+    fn export_vscode_uses_top_level_servers() {
+        let options = |transport| ExportOptions {
             target: ExportTarget::VSCodeCopilot,
-            transport: ExportTransport::Stdio,
+            transport,
             port: 3282,
             http_url: None,
             command: "plug".to_string(),
         };
-        let output = export_config(&options);
-        let parsed: serde_json::Value = serde_json::from_str(&output).unwrap();
-        assert_eq!(parsed["mcp"]["servers"]["plug"]["command"], "plug");
+        let stdio: serde_json::Value =
+            serde_json::from_str(&export_config(&options(ExportTransport::Stdio))).unwrap();
+        assert_eq!(stdio["servers"]["plug"]["type"], "stdio");
+        assert_eq!(stdio["servers"]["plug"]["command"], "plug");
+        assert!(stdio.get("mcp").is_none());
+        let http: serde_json::Value =
+            serde_json::from_str(&export_config(&options(ExportTransport::Http))).unwrap();
+        assert_eq!(http["servers"]["plug"]["type"], "http");
+        assert_eq!(http["servers"]["plug"]["url"], "http://localhost:3282/mcp");
+    }
+
+    #[test]
+    fn export_copilot_cli_carries_the_fields_it_requires() {
+        let options = |transport| ExportOptions {
+            target: "copilot-cli".parse().unwrap(),
+            transport,
+            port: 3282,
+            http_url: None,
+            command: "plug".to_string(),
+        };
+        let stdio: serde_json::Value =
+            serde_json::from_str(&export_config(&options(ExportTransport::Stdio))).unwrap();
+        let plug = &stdio["mcpServers"]["plug"];
+        assert_eq!(plug["type"], "local");
+        assert_eq!(plug["command"], "plug");
+        assert_eq!(plug["tools"], serde_json::json!(["*"]));
+        let http: serde_json::Value =
+            serde_json::from_str(&export_config(&options(ExportTransport::Http))).unwrap();
+        let plug = &http["mcpServers"]["plug"];
+        assert_eq!(plug["type"], "http");
+        assert_eq!(plug["tools"], serde_json::json!(["*"]));
+
+        // VS Code and Copilot CLI must not write the same user file.
+        assert_ne!(
+            default_config_path(ExportTarget::VSCodeCopilot, false),
+            default_config_path(ExportTarget::CopilotCli, false)
+        );
     }
 
     #[test]

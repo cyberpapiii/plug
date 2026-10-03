@@ -109,6 +109,7 @@ final class ImportScanTests: XCTestCase {
         XCTAssertEqual(ImportScan.target(forSource: "Devin"), "devin")
         XCTAssertEqual(ImportScan.appName(fromSource: "Devin"), "Devin")
         XCTAssertEqual(ImportScan.target(forSource: "GrokBuild"), "grok-build")
+        XCTAssertEqual(ImportScan.target(forSource: "CopilotCli"), "copilot-cli")
         XCTAssertEqual(ImportScan.appName(fromSource: "GrokBuild"), "Grok Build")
         XCTAssertEqual(ImportScan.appName(fromSource: "GeminiCli"), "Gemini CLI")
         XCTAssertEqual(ImportScan.appName(fromSource: "Zed"), "Zed")

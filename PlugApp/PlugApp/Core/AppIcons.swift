@@ -39,7 +39,7 @@ enum AppIcons {
     /// Targets that are command line tools. They have no icon to show, and a
     /// terminal glyph says more about them than a generic app square would.
     private static let commandLineTargets: Set<String> = [
-        "cline-cli", "gemini-cli", "grok-build",
+        "cline-cli", "gemini-cli", "grok-build", "copilot-cli",
         "goose", "opencode", "nanobot", "crush",
     ]
 
@@ -112,6 +112,11 @@ enum AppIcons {
             compact.contains("windsurf") || compact.contains("codeium") {
             return "devin"
         }
+        // Copilot runs in VS Code and in a terminal. The daemon's own
+        // detection splits them the same way.
+        if compact.contains("copilot") {
+            return compact.contains("cli") ? "copilot-cli" : "vscode"
+        }
         // The two xAI clients share a first word. The daemon's own
         // detection splits them the same way.
         if compact.contains("grok") {
@@ -143,6 +148,7 @@ enum AppIcons {
         case "codex", "codex-cli": return "Codex CLI"
         case "cursor": return "Cursor"
         case "devin": return "Devin"
+        case "copilot-cli": return "GitHub Copilot CLI"
         case "grok-build": return "Grok Build"
         case "grok-bot": return "Grok Bot"
         case "opencode": return "OpenCode"

@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- GitHub Copilot CLI is a client. `plug link copilot-cli` and the Clients tab
+  write `~/.copilot/mcp-config.json` with the `type` and `tools` fields Copilot
+  CLI requires, and `plug import copilot-cli` reads servers from it.
+
 - A remote session knows the grant it came in on. Clients names a remote
   client Plug does not recognise after that grant, shows the matching app's
   icon when the Mac has one, and lets it be renamed from its own row; the name
@@ -61,6 +65,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Docs match the shipped product: the README describes the app, the
   architecture and dual-era guides describe `main` instead of a development
   branch, and the August app design review moved to `docs/archive/`.
+
+### Fixed
+
+- Linking VS Code wrote a file VS Code does not read, in a shape it does not
+  accept. The link now writes top-level `servers` to `mcp.json` in the VS Code
+  user folder, or to `.vscode/mcp.json` for a project link. Link VS Code again
+  to pick this up; the old `mcp` entry in `~/.copilot/mcp-config.json` is
+  ignored by both programs and can be deleted.
 
 ## [0.8.13] - 2026-10-01
 

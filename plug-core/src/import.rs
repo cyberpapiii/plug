@@ -30,6 +30,7 @@ pub enum ClientSource {
     Cursor,
     Devin,
     VSCodeCopilot,
+    CopilotCli,
     GeminiCli,
     CodexCli,
     GrokBuild,
@@ -55,6 +56,7 @@ impl ClientSource {
             Self::Cursor => "Cursor",
             Self::Devin => "Devin",
             Self::VSCodeCopilot => "VS Code Copilot",
+            Self::CopilotCli => "GitHub Copilot CLI",
             Self::GeminiCli => "Gemini CLI",
             Self::CodexCli => "Codex CLI",
             Self::GrokBuild => "Grok Build",
@@ -80,6 +82,7 @@ impl ClientSource {
             Self::Cursor,
             Self::Devin,
             Self::VSCodeCopilot,
+            Self::CopilotCli,
             Self::GeminiCli,
             Self::CodexCli,
             Self::GrokBuild,
@@ -211,11 +214,18 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
             ]
         }
         ClientSource::VSCodeCopilot => {
+            let mut paths = Vec::new();
+            if let Some(config) = dirs::config_dir() {
+                paths.push(config.join("Code/User/mcp.json"));
+            }
+            paths.push(home.join(".vscode/mcp.json"));
+            paths.push(PathBuf::from(".vscode/mcp.json"));
+            paths
+        }
+        ClientSource::CopilotCli => {
             vec![
                 home.join(".copilot/mcp-config.json"),
-                home.join(".vscode/mcp.json"),
-                PathBuf::from(".vscode/mcp.json"),
-                PathBuf::from(".mcp.json"),
+                PathBuf::from(".github/mcp.json"),
             ]
         }
         ClientSource::GeminiCli => {
@@ -364,6 +374,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::ClaudeCode
         | ClientSource::Cursor
         | ClientSource::Devin
+        | ClientSource::CopilotCli
         | ClientSource::GeminiCli
         | ClientSource::Cline
         | ClientSource::ClineCli
@@ -377,7 +388,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         // Nanobot uses tools.mcpServers
         ClientSource::Nanobot => parse_nanobot_config(&content, source),
 
-        // VS Code uses nested "mcp.servers" (or "servers" under "mcp" key)
+        // VS Code uses top-level "servers"; older settings nested it under "mcp"
         ClientSource::VSCodeCopilot => parse_vscode_config(&content, source),
 
         // Zed uses "context_servers"
@@ -559,7 +570,8 @@ fn parse_nanobot_config(
     Ok(Vec::new())
 }
 
-/// Parse VS Code config which nests servers under "mcp" -> "servers".
+/// Parse a VS Code config: top-level "servers" in `mcp.json`, or the older
+/// "mcp" -> "servers" nesting from `settings.json`.
 fn parse_vscode_config(
     content: &str,
     source: ClientSource,
@@ -858,6 +870,7 @@ fn resolve_name_against_set(
         ClientSource::Cursor => "cursor",
         ClientSource::Devin => "devin",
         ClientSource::VSCodeCopilot => "vscode",
+        ClientSource::CopilotCli => "copilot",
         ClientSource::GeminiCli => "gemini",
         ClientSource::CodexCli => "codex",
         ClientSource::GrokBuild => "grok",

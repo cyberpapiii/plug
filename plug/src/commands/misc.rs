@@ -29,6 +29,7 @@ pub(crate) fn cmd_import(
                 "cursor" => Some(ClientSource::Cursor),
                 "devin" | "windsurf" => Some(ClientSource::Devin),
                 "vscode" => Some(ClientSource::VSCodeCopilot),
+                "copilot-cli" | "copilot" => Some(ClientSource::CopilotCli),
                 "gemini-cli" => Some(ClientSource::GeminiCli),
                 "codex-cli" => Some(ClientSource::CodexCli),
                 "grok-build" | "grok" => Some(ClientSource::GrokBuild),
