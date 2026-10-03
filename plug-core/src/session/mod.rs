@@ -152,6 +152,9 @@ pub struct DownstreamSessionSnapshot {
     pub session_id: String,
     pub transport: DownstreamTransport,
     pub client_type: crate::types::ClientType,
+    /// The OAuth client whose token opened the session, when one did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant: Option<String>,
     /// Seconds since the session was created.
     pub connected_seconds: u64,
     /// Seconds since the session was last active.
@@ -180,6 +183,8 @@ pub trait SessionStore: Send + Sync {
         client_type: crate::types::ClientType,
     ) -> Result<(), HttpError>;
     fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError>;
+    /// Record the OAuth client whose token opened the session.
+    fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), HttpError>;
     fn set_broadcast_audience(
         &self,
         session_id: &str,

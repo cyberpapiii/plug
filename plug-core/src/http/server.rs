@@ -1661,6 +1661,13 @@ async fn handle_request(
             );
             // Store client type in session
             let _ = state.sessions.set_client_type(&session_id, client_type);
+            // The grant is what Plug verified. The name above is only what the
+            // client said, so settings for a remote client hang on the grant.
+            if let AuthStatus::Authenticated(Some(claims)) = &auth_status {
+                let _ = state
+                    .sessions
+                    .set_grant(&session_id, claims.client_id.clone());
+            }
 
             // Record what this principal may observe on the shared SSE fan-out.
             // Not ignorable: until this lands the session denies every
@@ -3490,6 +3497,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_session_opened_with_an_oauth_token_records_the_grant_behind_it() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "tools:read").await;
+        let state = oauth_test_state_with_manager(manager);
+        let app = build_router(Arc::clone(&state));
+        let session_id = legacy_oauth_session(&app, &access_token).await;
+
+        let oauth = state.downstream_oauth.as_ref().expect("OAuth manager");
+        let client_id = match oauth
+            .validate_access_token_for(
+                &access_token,
+                &["tools:read".to_string()],
+                &oauth.resource(),
+            )
+            .await
+        {
+            crate::downstream_oauth::AccessTokenValidation::Valid(claims) => claims.client_id,
+            other => panic!("token must validate: {other:?}"),
+        };
+        let snapshots = state.sessions.session_snapshots();
+        let session = snapshots
+            .iter()
+            .find(|snapshot| snapshot.session_id == session_id)
+            .expect("session is tracked");
+        assert_eq!(session.grant.as_deref(), Some(client_id.as_str()));
+    }
+
+    #[tokio::test]
     async fn legacy_tools_read_only_token_is_denied_resources_over_http() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
@@ -4163,6 +4198,10 @@ mod tests {
 
         fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
             self.inner.get_client_type(session_id)
+        }
+
+        fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), HttpError> {
+            self.inner.set_grant(session_id, client_id)
         }
 
         fn set_broadcast_audience(

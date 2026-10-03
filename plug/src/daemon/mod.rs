@@ -1441,6 +1441,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     }
                 },
                 client_id: None,
+                grant: snapshot.grant,
                 session_id: snapshot.session_id,
                 client_type: snapshot.client_type,
                 client_info: None,
@@ -3904,6 +3905,7 @@ mod tests {
             client_info: None,
             adapter_version: None,
             host: None,
+            grant: None,
             connected_secs: 0,
             last_activity_secs: None,
         };

@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A remote session knows the grant it came in on. Clients names a remote
+  client Plug does not recognise after that grant, shows the matching app's
+  icon when the Mac has one, and lets it be renamed from its own row; the name
+  is stored under the grant, so it follows the client across sessions.
+  `plug clients -v` lists the session's key as `oauth:<client id>`.
 - A client can be renamed. Clients has a pencil on every remote client and on
   every local client Plug can tell apart, and `plug clients rename <client>
   "<name>"` does the same; an empty name goes back to the one Plug works out.
