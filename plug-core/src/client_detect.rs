@@ -32,6 +32,10 @@ pub fn detect_client(client_info_name: &str) -> ClientType {
         || name.contains("codeium")
     {
         ClientType::Devin
+    } else if name.contains("copilot") && name.contains("cli") {
+        // Copilot CLI's `clientInfo.name` is not documented. Anything else
+        // Copilot is taken for VS Code, which keeps its 128-tool ceiling.
+        ClientType::CopilotCli
     } else if name.contains("copilot") || name.contains("vscode") {
         ClientType::VSCodeCopilot
     } else if name.contains("gemini") {
@@ -86,6 +90,10 @@ mod tests {
         assert_eq!(detect_client("devin-cli"), ClientType::Devin);
         assert_eq!(detect_client("Cascade (Devin Desktop)"), ClientType::Devin);
         assert_eq!(detect_client("github-copilot"), ClientType::VSCodeCopilot);
+        assert_eq!(detect_client("github-copilot-cli"), ClientType::CopilotCli);
+        assert_eq!(detect_client("Copilot CLI"), ClientType::CopilotCli);
+        assert_eq!(ClientType::CopilotCli.tool_limit(), None);
+        assert_eq!(ClientType::CopilotCli.target_slug(), Some("copilot-cli"));
         assert_eq!(detect_client("gemini-cli-v2"), ClientType::GeminiCli);
         assert_eq!(detect_client("codex-cli"), ClientType::CodexCli);
         assert_eq!(detect_client("grok-cli"), ClientType::GrokBuild);

@@ -906,6 +906,9 @@ pub enum ClientType {
     /// `windsurf-client`.
     Devin,
     VSCodeCopilot,
+    /// GitHub's terminal agent. It shares a config file with VS Code but
+    /// not VS Code's 128-tool ceiling.
+    CopilotCli,
     GeminiCli,
     CodexCli,
     /// xAI's coding agent CLI.
@@ -927,6 +930,7 @@ impl ClientType {
             ClientType::Cursor => Some("cursor"),
             ClientType::Devin => Some("devin"),
             ClientType::VSCodeCopilot => Some("vscode"),
+            ClientType::CopilotCli => Some("copilot-cli"),
             ClientType::GeminiCli => Some("gemini-cli"),
             ClientType::CodexCli => Some("codex-cli"),
             ClientType::GrokBuild => Some("grok-build"),
@@ -1041,6 +1045,7 @@ impl std::fmt::Display for ClientType {
             ClientType::Cursor => "Cursor",
             ClientType::Devin => "Devin",
             ClientType::VSCodeCopilot => "VS Code Copilot",
+            ClientType::CopilotCli => "GitHub Copilot CLI",
             ClientType::GeminiCli => "Gemini CLI",
             ClientType::CodexCli => "Codex CLI",
             ClientType::GrokBuild => "Grok Build",

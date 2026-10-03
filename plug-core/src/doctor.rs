@@ -867,6 +867,7 @@ async fn check_client_configs() -> CheckResult {
         "claude-code",
         "cursor",
         "vscode",
+        "copilot-cli",
         "devin",
         "gemini-cli",
         "codex-cli",
@@ -880,6 +881,9 @@ async fn check_client_configs() -> CheckResult {
         "nanobot",
         "junie",
         "kilo",
+        "pi",
+        "warp",
+        "kiro",
         "antigravity",
         "goose",
     ];

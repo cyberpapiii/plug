@@ -169,6 +169,7 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Claude Code", "claude-code"),
         ("Cursor", "cursor"),
         ("VS Code Copilot", "vscode"),
+        ("GitHub Copilot CLI", "copilot-cli"),
         ("Devin", "devin"),
         ("Gemini CLI", "gemini-cli"),
         ("Codex CLI", "codex-cli"),
@@ -183,6 +184,9 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Nanobot", "nanobot"),
         ("JetBrains Junie", "junie"),
         ("Kilo Code", "kilo"),
+        ("Pi", "pi"),
+        ("Warp", "warp"),
+        ("Kiro", "kiro"),
         ("Google Antigravity", "antigravity"),
         ("Goose", "goose"),
     ]
@@ -282,7 +286,7 @@ pub(crate) fn linked_client_config_from_content(
             let json = serde_json::from_str::<serde_json::Value>(&content).ok()?;
             let plug = match target_enum {
                 ExportTarget::Nanobot => json.get("tools")?.get("mcpServers")?.get("plug")?,
-                ExportTarget::VSCodeCopilot => json.get("mcp")?.get("servers")?.get("plug")?,
+                ExportTarget::VSCodeCopilot => json.get("servers")?.get("plug")?,
                 _ => json
                     .get("mcpServers")
                     .and_then(|s| s.get("plug"))
@@ -1079,7 +1083,7 @@ fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
     let mut json: serde_json::Value =
         serde_json::from_str(existing).unwrap_or_else(|_| serde_json::json!({}));
     if let Some(obj) = json.as_object_mut() {
-        for key in ["mcpServers", "context_servers"] {
+        for key in ["mcpServers", "context_servers", "servers"] {
             if let Some(inner) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
                 inner.remove("plug");
             }
@@ -1488,8 +1492,7 @@ fn replace_json_stdio_command(
             .and_then(|tools| tools.get_mut("mcpServers"))
             .and_then(|servers| servers.get_mut("plug")),
         ExportTarget::VSCodeCopilot => value
-            .get_mut("mcp")
-            .and_then(|mcp| mcp.get_mut("servers"))
+            .get_mut("servers")
             .and_then(|servers| servers.get_mut("plug")),
         _ => {
             if value
@@ -1679,6 +1682,52 @@ port = 4444
             linked.endpoint.as_deref(),
             Some("https://plug.example.com/mcp")
         );
+    }
+
+    #[test]
+    fn vscode_and_copilot_cli_links_survive_a_merge_and_come_back_out() {
+        use plug_core::export::{ExportOptions, ExportTarget, ExportTransport, export_config};
+        for (target, existing, other) in [
+            (
+                ExportTarget::VSCodeCopilot,
+                r#"{"servers":{"other":{"command":"x"}}}"#,
+                "/servers/other",
+            ),
+            (
+                ExportTarget::CopilotCli,
+                r#"{"mcpServers":{"other":{"type":"local","command":"x","tools":["*"]}}}"#,
+                "/mcpServers/other",
+            ),
+        ] {
+            let snippet = export_config(&ExportOptions {
+                target,
+                transport: ExportTransport::Stdio,
+                port: 3282,
+                http_url: None,
+                command: "plug".to_string(),
+            });
+            let merged = merge_json_config(existing, &snippet).expect("merge");
+            let linked = linked_client_config_from_content(
+                std::path::Path::new("mcp.json"),
+                target,
+                &merged,
+            )
+            .expect("linked config");
+            assert_eq!(linked.transport, ExportTransport::Stdio);
+            assert_eq!(linked.command.as_deref(), Some("plug"));
+
+            let unlinked = unmerge_json_config(&merged).expect("unmerge");
+            assert!(
+                linked_client_config_from_content(
+                    std::path::Path::new("mcp.json"),
+                    target,
+                    &unlinked
+                )
+                .is_none()
+            );
+            let value: serde_json::Value = serde_json::from_str(&unlinked).unwrap();
+            assert!(value.pointer(other).is_some(), "{other} must survive");
+        }
     }
 
     #[test]
@@ -1963,6 +2012,10 @@ extensions:
         let clients = all_client_targets();
         assert!(clients.contains(&("Devin", "devin")));
         assert!(clients.contains(&("Grok Build", "grok-build")));
+        assert!(clients.contains(&("GitHub Copilot CLI", "copilot-cli")));
+        for client in [("Pi", "pi"), ("Warp", "warp"), ("Kiro", "kiro")] {
+            assert!(clients.contains(&client));
+        }
         assert!(!clients.iter().any(|(name, _)| name.contains("Windsurf")));
         assert!(!clients.iter().any(|(_, target)| *target == "roocode"));
         // Every registry target parses, so `plug link` accepts each row.

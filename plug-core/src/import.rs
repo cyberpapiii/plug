@@ -30,6 +30,7 @@ pub enum ClientSource {
     Cursor,
     Devin,
     VSCodeCopilot,
+    CopilotCli,
     GeminiCli,
     CodexCli,
     GrokBuild,
@@ -42,6 +43,9 @@ pub enum ClientSource {
     Nanobot,
     Junie,
     Kilo,
+    Pi,
+    Warp,
+    Kiro,
     Antigravity,
     Goose,
 }
@@ -55,6 +59,7 @@ impl ClientSource {
             Self::Cursor => "Cursor",
             Self::Devin => "Devin",
             Self::VSCodeCopilot => "VS Code Copilot",
+            Self::CopilotCli => "GitHub Copilot CLI",
             Self::GeminiCli => "Gemini CLI",
             Self::CodexCli => "Codex CLI",
             Self::GrokBuild => "Grok Build",
@@ -67,6 +72,9 @@ impl ClientSource {
             Self::Nanobot => "Nanobot",
             Self::Junie => "JetBrains Junie",
             Self::Kilo => "Kilo Code",
+            Self::Pi => "Pi",
+            Self::Warp => "Warp",
+            Self::Kiro => "Kiro",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
         }
@@ -80,6 +88,7 @@ impl ClientSource {
             Self::Cursor,
             Self::Devin,
             Self::VSCodeCopilot,
+            Self::CopilotCli,
             Self::GeminiCli,
             Self::CodexCli,
             Self::GrokBuild,
@@ -92,6 +101,9 @@ impl ClientSource {
             Self::Nanobot,
             Self::Junie,
             Self::Kilo,
+            Self::Pi,
+            Self::Warp,
+            Self::Kiro,
             Self::Antigravity,
             Self::Goose,
         ]
@@ -211,11 +223,18 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
             ]
         }
         ClientSource::VSCodeCopilot => {
+            let mut paths = Vec::new();
+            if let Some(config) = dirs::config_dir() {
+                paths.push(config.join("Code/User/mcp.json"));
+            }
+            paths.push(home.join(".vscode/mcp.json"));
+            paths.push(PathBuf::from(".vscode/mcp.json"));
+            paths
+        }
+        ClientSource::CopilotCli => {
             vec![
                 home.join(".copilot/mcp-config.json"),
-                home.join(".vscode/mcp.json"),
-                PathBuf::from(".vscode/mcp.json"),
-                PathBuf::from(".mcp.json"),
+                PathBuf::from(".github/mcp.json"),
             ]
         }
         ClientSource::GeminiCli => {
@@ -279,6 +298,24 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
             vec![
                 home.join(".config/kilo/opencode.json"),
                 PathBuf::from("opencode.json"),
+            ]
+        }
+        ClientSource::Pi => {
+            vec![
+                home.join(".pi/agent/mcp.json"),
+                PathBuf::from(".pi/mcp.json"),
+            ]
+        }
+        ClientSource::Warp => {
+            vec![
+                home.join(".warp/.mcp.json"),
+                PathBuf::from(".warp/.mcp.json"),
+            ]
+        }
+        ClientSource::Kiro => {
+            vec![
+                home.join(".kiro/settings/mcp.json"),
+                PathBuf::from(".kiro/settings/mcp.json"),
             ]
         }
         ClientSource::Antigravity => antigravity_paths(&home),
@@ -364,6 +401,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::ClaudeCode
         | ClientSource::Cursor
         | ClientSource::Devin
+        | ClientSource::CopilotCli
         | ClientSource::GeminiCli
         | ClientSource::Cline
         | ClientSource::ClineCli
@@ -372,12 +410,15 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::OpenCode
         | ClientSource::Junie
         | ClientSource::Kilo
+        | ClientSource::Pi
+        | ClientSource::Warp
+        | ClientSource::Kiro
         | ClientSource::Antigravity => parse_json_mcp_servers(&content, source, "mcpServers"),
 
         // Nanobot uses tools.mcpServers
         ClientSource::Nanobot => parse_nanobot_config(&content, source),
 
-        // VS Code uses nested "mcp.servers" (or "servers" under "mcp" key)
+        // VS Code uses top-level "servers"; older settings nested it under "mcp"
         ClientSource::VSCodeCopilot => parse_vscode_config(&content, source),
 
         // Zed uses "context_servers"
@@ -559,7 +600,8 @@ fn parse_nanobot_config(
     Ok(Vec::new())
 }
 
-/// Parse VS Code config which nests servers under "mcp" -> "servers".
+/// Parse a VS Code config: top-level "servers" in `mcp.json`, or the older
+/// "mcp" -> "servers" nesting from `settings.json`.
 fn parse_vscode_config(
     content: &str,
     source: ClientSource,
@@ -858,6 +900,7 @@ fn resolve_name_against_set(
         ClientSource::Cursor => "cursor",
         ClientSource::Devin => "devin",
         ClientSource::VSCodeCopilot => "vscode",
+        ClientSource::CopilotCli => "copilot",
         ClientSource::GeminiCli => "gemini",
         ClientSource::CodexCli => "codex",
         ClientSource::GrokBuild => "grok",
@@ -870,6 +913,9 @@ fn resolve_name_against_set(
         ClientSource::Nanobot => "nanobot",
         ClientSource::Junie => "junie",
         ClientSource::Kilo => "kilo",
+        ClientSource::Pi => "pi",
+        ClientSource::Warp => "warp",
+        ClientSource::Kiro => "kiro",
         ClientSource::Antigravity => "antigravity",
         ClientSource::Goose => "goose",
     };
