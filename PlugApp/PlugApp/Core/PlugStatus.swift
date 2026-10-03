@@ -234,6 +234,7 @@ enum PlugIntent: Equatable, Sendable {
     case linkApp(String)
     case unlinkApp(String)
     case revokeClient(id: String)
+    case renameClient(key: String, name: String)
     case addServer
     case openWindow(AppSection)
     case openCurrentWindow

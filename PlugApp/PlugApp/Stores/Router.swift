@@ -68,6 +68,8 @@ struct PlugIntentRunner {
             perform { .removeServer(authToken: $0, name: name) }
         case let .revokeClient(id):
             perform { .revokeClient(authToken: $0, clientID: id) }
+        case let .renameClient(key, name):
+            perform { .renameClient(authToken: $0, key: key, name: name) }
         case .addServer:
             router.section = .servers
             router.isAddingServer = true

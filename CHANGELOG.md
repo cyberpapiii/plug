@@ -9,6 +9,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A client can be renamed. Clients has a pencil on every remote client and on
+  every local client Plug can tell apart, and `plug clients rename <client>
+  "<name>"` does the same; an empty name goes back to the one Plug works out.
+  The name is kept in `[clients."<key>"]` in the config, under the client's
+  target, the program that started it, or its grant, never under the name it
+  reports. `plug clients -v` lists each key.
 - A local client Plug does not recognise is named after the program that
   started it. `plug connect` reads its parent from the process table, looking
   past shells and launchers, and reports it when it registers; Clients shows

@@ -48,6 +48,10 @@ pub struct Config {
     /// Disabled tool names or wildcard patterns (e.g. "Slack__*" or "plug__search_tools").
     #[serde(default)]
     pub disabled_tools: Vec<String>,
+    /// Settings for one client, keyed by how Plug identifies it: see
+    /// `IpcLiveSessionInfo::client_key`.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub clients: std::collections::BTreeMap<String, ClientSettings>,
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -85,6 +89,7 @@ impl Default for Config {
             lazy_tools: LazyToolsConfig::default(),
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
+            clients: std::collections::BTreeMap::new(),
             http: HttpConfig::default(),
             modern_upstream_enabled: false,
             daemon_grace_period_secs: 0,
@@ -160,6 +165,22 @@ impl SupervisionConfig {
             None => true,
             Some(elapsed) => elapsed >= required_wait,
         }
+    }
+}
+
+/// What the owner has set for one client.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ClientSettings {
+    /// The name to show in place of the one Plug works out.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+impl ClientSettings {
+    /// Nothing is set, so the entry need not be kept.
+    pub fn is_empty(&self) -> bool {
+        self.name.is_none()
     }
 }
 

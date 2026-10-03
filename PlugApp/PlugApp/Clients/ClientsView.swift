@@ -77,6 +77,37 @@ extension LiveSession {
     }
 }
 
+/// The names the owner gave clients, and which client each session is.
+///
+/// A name belongs to a client, not a session, so it is looked up through the
+/// key the daemon stores it under. Pure value so the lookup can be tested.
+struct ClientNames: Equatable {
+    private let keys: [String: String]
+    private let names: [String: String]
+
+    init(visibility: [ClientVisibility], names: [ClientName]) {
+        keys = Dictionary(
+            visibility.compactMap { entry in entry.clientKey.map { (entry.sessionId, $0) } },
+            uniquingKeysWith: { first, _ in first }
+        )
+        self.names = Dictionary(names.map { ($0.key, $0.name) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    init(snapshot: OperatorSnapshot) {
+        self.init(visibility: snapshot.clientVisibility, names: snapshot.clientNames ?? [])
+    }
+
+    /// Nil for a session the daemon cannot tell apart from other clients.
+    /// There is nothing to store a name under, so it cannot be renamed.
+    func key(of session: LiveSession) -> String? { keys[session.sessionId] }
+
+    func name(forKey key: String?) -> String? { key.flatMap { names[$0] } }
+
+    func displayName(_ session: LiveSession) -> String {
+        name(forKey: key(of: session)) ?? session.displayName
+    }
+}
+
 /// Who can use Plug. The old app split this in two — "Clients" listed apps and
 /// "Auth" listed the grants for the same apps — so the audit question ("who
 /// reaches my tools, and how do I cut them off?") could not be answered in one
@@ -112,9 +143,11 @@ struct ClientsView: View {
     private var idleApps: [LinkableApp] {
         roster.idle.filter { matches($0.name) || matches($0.target) }
     }
+    private var names: ClientNames { ClientNames(snapshot: model.snapshot) }
     private var grants: [DownstreamClient] {
         model.snapshot.downstreamClients.filter {
-            matches($0.clientName) || matches($0.source) || matches($0.clientId)
+            matches(names.name(forKey: $0.clientKey) ?? "") || matches($0.clientName)
+                || matches($0.source) || matches($0.clientId)
         }
     }
     private var unmatchedSessions: [LiveSession] {
@@ -123,6 +156,20 @@ struct ClientsView: View {
         }
     }
     @State private var expanded: Set<String> = []
+    @State private var renaming: Renaming?
+    @State private var newName = ""
+
+    /// The client being renamed.
+    private struct Renaming {
+        let key: String
+        /// Set when the owner already named it, so the name can be taken back.
+        let hasName: Bool
+    }
+
+    private func rename(key: String, shown: String) {
+        newName = shown
+        renaming = Renaming(key: key, hasName: names.name(forKey: key) != nil)
+    }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -180,6 +227,7 @@ struct ClientsView: View {
                             ForEach(connectedApps) { entry in
                                 AppLinkRow(
                                     app: entry.app,
+                                    name: names.name(forKey: entry.app.target) ?? entry.app.name,
                                     sessionCount: entry.sessions.count,
                                     isExpanded: expansion(entry.app.target),
                                     isBusy: model.busyApps.contains(entry.app.target),
@@ -203,6 +251,7 @@ struct ClientsView: View {
                             ForEach(idleApps) { app in
                                 AppLinkRow(
                                     app: app,
+                                    name: names.name(forKey: app.target) ?? app.name,
                                     sessionCount: 0,
                                     isExpanded: nil,
                                     isBusy: model.busyApps.contains(app.target),
@@ -219,7 +268,12 @@ struct ClientsView: View {
                         if !grants.isEmpty {
                             sectionLabel("Remote", count: grants.count, unit: "client")
                             ForEach(grants) { grant in
-                                GrantRow(grant: grant, run: run)
+                                GrantRow(
+                                    grant: grant,
+                                    name: names.name(forKey: grant.clientKey) ?? grant.clientName,
+                                    rename: { rename(key: grant.clientKey, shown: $0) },
+                                    run: run
+                                )
                                     .listRowSeparator(.hidden)
                             }
                             Text("These clients can reach Plug over the network. Revoke anything you don't recognize.")
@@ -236,6 +290,20 @@ struct ClientsView: View {
             }
         }
         .task { await model.loadConnectableApps() }
+        .alert(
+            "Rename Client",
+            isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
+            presenting: renaming
+        ) { target in
+            TextField("Name", text: $newName)
+            Button("Rename") { run(.renameClient(key: target.key, name: newName)) }
+            if target.hasName {
+                Button("Use Original Name") { run(.renameClient(key: target.key, name: "")) }
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: { _ in
+            Text("Only Plug shows this name. The client itself is not changed.")
+        }
     }
 
     private var isEmpty: Bool {
@@ -310,12 +378,20 @@ struct ClientsView: View {
             Text(toolsText(session))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
+            if let key = names.key(of: session) {
+                RenameButton { rename(key: key, shown: displayName(session)) }
+            }
         }
         .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
+        .accessibilityActions {
+            if let key = names.key(of: session) {
+                Button("Rename") { rename(key: key, shown: displayName(session)) }
+            }
+        }
     }
 
-    private func displayName(_ session: LiveSession) -> String { session.displayName }
+    private func displayName(_ session: LiveSession) -> String { names.displayName(session) }
 
     /// Says how it reached Plug in words, not transport identifiers.
     private func connectionDescription(_ session: LiveSession) -> String {
@@ -344,9 +420,28 @@ struct ClientsView: View {
     }
 }
 
+/// Opens the rename prompt for the row it sits in.
+private struct RenameButton: View {
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "pencil")
+                .foregroundStyle(.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("Rename")
+        .accessibilityLabel("Rename")
+    }
+}
+
 /// A client on this Mac, and whether Plug is wired into it.
 private struct AppLinkRow: View {
     let app: LinkableApp
+    /// The name to show: the owner's, else the app's own.
+    let name: String
     /// Open sessions counted from the live snapshot, which is fresher than
     /// the app scan.
     let sessionCount: Int
@@ -360,7 +455,7 @@ private struct AppLinkRow: View {
             AppGlyph(target: app.target, name: app.name)
                 .opacity(app.detected || app.linked || sessionCount > 0 ? 1 : 0.4)
             VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(app.name)
+                Text(name)
                     .font(.body)
                     .foregroundStyle(app.detected || app.linked ? .primary : .secondary)
                 Label(status, systemImage: statusSymbol)
@@ -403,7 +498,7 @@ private struct AppLinkRow: View {
         }
         .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(app.name), \(status)")
+        .accessibilityLabel("\(name), \(status)")
         // Combining the row hides its switch from VoiceOver.
         .accessibilityActions {
             if let isExpanded, sessionCount > 0 {
@@ -442,6 +537,10 @@ private struct AppLinkRow: View {
 
 private struct GrantRow: View {
     let grant: DownstreamClient
+    /// The name to show: the owner's, else the one the client registered.
+    let name: String
+    /// Asks for a new name, starting from the one shown.
+    let rename: (String) -> Void
     let run: (PlugIntent) -> Void
     @State private var confirming = false
 
@@ -453,7 +552,7 @@ private struct GrantRow: View {
                 .frame(width: 22)
                 .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(grant.clientName).font(.body)
+                Text(name).font(.body)
                 Text(grantDetail)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -462,12 +561,13 @@ private struct GrantRow: View {
             }
             .layoutPriority(1)
             Spacer(minLength: Metric.tight)
+            RenameButton { rename(name) }
             Button("Revoke…", role: .destructive) { confirming = true }
                 .controlSize(.small)
         }
         .padding(.vertical, Metric.tight)
         .confirmationDialog(
-            "Revoke \(grant.clientName)?",
+            "Revoke \(name)?",
             isPresented: $confirming,
             titleVisibility: .visible
         ) {

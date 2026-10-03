@@ -160,7 +160,10 @@ enum Commands {
     Reload,
     #[command(display_order = 7)]
     /// View and manage linked, detected, and live AI clients (-v lists each session)
-    Clients,
+    Clients {
+        #[command(subcommand)]
+        command: Option<commands::clients::ClientCommands>,
+    },
     #[command(display_order = 8)]
     /// View and manage configured servers
     Servers,
@@ -512,7 +515,9 @@ async fn main() -> anyhow::Result<()> {
     // `plug clients -v` and `plug tools -v` spend the first -v on listing
     // more rows, so their debug logs start at -vv.
     let log_verbosity = match &cli.command {
-        Some(Commands::Clients) | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
+        Some(Commands::Clients { .. }) | Some(Commands::Tools { .. }) => {
+            cli.verbose.saturating_sub(1)
+        }
         _ => cli.verbose,
     };
     let log_level = match log_verbosity {
@@ -555,10 +560,13 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Servers) => {
             views::servers::cmd_server_list(cli.config.as_ref(), &cli.output).await?
         }
-        Some(Commands::Clients) => {
+        Some(Commands::Clients { command: None }) => {
             views::clients::cmd_client_list(cli.config.as_ref(), &cli.output, cli.verbose > 0)
                 .await?
         }
+        Some(Commands::Clients {
+            command: Some(commands::clients::ClientCommands::Rename { client, name }),
+        }) => commands::clients::cmd_client_rename(cli.config.as_ref(), client, name).await?,
         Some(Commands::Tools { command, server }) => {
             commands::tools::cmd_tool_command(
                 cli.config.as_ref(),
@@ -662,7 +670,7 @@ fn default_log_level(command: Option<&Commands>) -> &'static str {
         Some(Commands::Serve { .. }) | Some(Commands::Connect) => "info",
         Some(Commands::Status { .. })
         | Some(Commands::Servers)
-        | Some(Commands::Clients)
+        | Some(Commands::Clients { .. })
         | Some(Commands::Tools { .. }) => "none",
         _ => "error",
     }

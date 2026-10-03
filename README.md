@@ -179,6 +179,7 @@ plug start                   # Start the shared background service (Plug.app doe
 plug setup                   # Discover servers and link clients
 plug link                    # Link plug to your AI clients
 plug clients                 # View and manage linked, detected, and live clients
+plug clients rename <client> "<name>"   # Give a client a name of your choosing
 plug servers                 # View and manage configured servers
 plug tools                   # View and manage the effective tool surface
 plug status                  # Show runtime health and next useful action

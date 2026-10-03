@@ -13,8 +13,13 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 ## Open
 
 - Identity for connected clients: a name and icon for remote clients Plug does
-  not recognise, then renaming a client. Local ones are named after the
-  program that started them.
+  not recognise. A connected remote session cannot be renamed yet, only its
+  grant, because the session does not carry the grant it came in on.
+- Clients missing from the registry, most used first (surveyed 2026-10-03):
+  GitHub Copilot CLI, Pi, Warp, Kiro, Hermes Agent, Muse Code, Kimi Code, Amp,
+  then Qwen Code and OpenClaw. Check each config path against the vendor's
+  docs on the day before writing to it. Remote-only, name and icon at most:
+  Claude web and mobile, Grok web connectors, Perplexity, Gemini, Le Chat.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as

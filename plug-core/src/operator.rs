@@ -11,11 +11,30 @@ use crate::proxy::is_disabled_tool;
 
 #[derive(Debug, Clone)]
 pub enum OperatorMutation {
-    AddServer { name: String, server: ServerConfig },
-    UpdateServer { name: String, server: ServerConfig },
-    RemoveServer { name: String },
-    SetServerEnabled { name: String, enabled: bool },
-    SetToolEnabled { tool: String, enabled: bool },
+    AddServer {
+        name: String,
+        server: ServerConfig,
+    },
+    UpdateServer {
+        name: String,
+        server: ServerConfig,
+    },
+    RemoveServer {
+        name: String,
+    },
+    SetServerEnabled {
+        name: String,
+        enabled: bool,
+    },
+    SetToolEnabled {
+        tool: String,
+        enabled: bool,
+    },
+    /// Give a client a name of the owner's choosing. An empty name removes it.
+    RenameClient {
+        key: String,
+        name: String,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +133,10 @@ pub fn apply_operator_mutation(
                 disabled_tools: Some(config.disabled_tools.clone()),
             }
         }
+        OperatorMutation::RenameClient { key, name } => {
+            rename_client(&mut config, &key, &name)?;
+            OperatorMutationResult::server(None)
+        }
     };
     persist_config_atomic(path, &config)?;
     Ok((config, result))
@@ -149,6 +172,39 @@ fn set_tool_enabled(config: &mut Config, tool: &str, enabled: bool) -> anyhow::R
     {
         config.disabled_tools.push(tool.to_string());
         config.disabled_tools.sort();
+    }
+    Ok(())
+}
+
+/// The longest name a client can be given. Long enough for any product name,
+/// short enough to fit a row.
+const CLIENT_NAME_MAX_CHARS: usize = 60;
+
+/// Name a client, or with an empty name go back to the one Plug works out.
+///
+/// The key is not checked against connected clients: a name is set once and
+/// has to hold while its client is closed.
+fn rename_client(config: &mut Config, key: &str, name: &str) -> anyhow::Result<()> {
+    let key = key.trim();
+    let name = name.trim();
+    if key.is_empty() {
+        anyhow::bail!("client key is required");
+    }
+    if name.chars().count() > CLIENT_NAME_MAX_CHARS {
+        anyhow::bail!("a client name can be at most {CLIENT_NAME_MAX_CHARS} characters");
+    }
+    if name.chars().any(char::is_control) {
+        anyhow::bail!("a client name cannot contain control characters");
+    }
+    if name.is_empty() {
+        if let Some(settings) = config.clients.get_mut(key) {
+            settings.name = None;
+            if settings.is_empty() {
+                config.clients.remove(key);
+            }
+        }
+    } else {
+        config.clients.entry(key.to_string()).or_default().name = Some(name.to_string());
     }
     Ok(())
 }
@@ -222,6 +278,46 @@ API_KEY = "sk-live-123"
 "#,
         )
         .unwrap()
+    }
+
+    fn rename(path: &Path, key: &str, name: &str) -> anyhow::Result<Config> {
+        apply_operator_mutation(
+            path,
+            OperatorMutation::RenameClient {
+                key: key.into(),
+                name: name.into(),
+            },
+        )
+        .map(|(config, _)| config)
+    }
+
+    #[test]
+    fn a_client_name_is_stored_under_its_key_and_an_empty_name_removes_it() {
+        let path = fixture_path();
+        let key = "host:/Users/someone/.hermes/bin/python3";
+
+        rename(&path, key, "  Hermes  ").unwrap();
+        let stored = load_editable_config(&path).unwrap();
+        assert_eq!(stored.clients[key].name.as_deref(), Some("Hermes"));
+
+        let config = rename(&path, key, "").unwrap();
+        assert!(config.clients.is_empty());
+        assert!(
+            !std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .any(|line| line.starts_with("[clients")),
+            "a config with no named client must not grow an empty table"
+        );
+    }
+
+    #[test]
+    fn a_client_name_that_would_break_a_row_is_refused() {
+        let path = fixture_path();
+        assert!(rename(&path, "cursor", &"x".repeat(61)).is_err());
+        assert!(rename(&path, "cursor", "two\nlines").is_err());
+        assert!(rename(&path, "  ", "Name").is_err());
+        assert!(!path.exists(), "a refused rename must not write the config");
     }
 
     #[test]

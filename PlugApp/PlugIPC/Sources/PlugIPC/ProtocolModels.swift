@@ -83,6 +83,15 @@ public struct ClientVisibility: Codable, Equatable, Sendable {
     public let sessionId: String
     public let clientType: String
     public let visibleToolCount: Int
+    /// What this client's settings are stored under, when the daemon can tell
+    /// one such client from another.
+    public let clientKey: String?
+}
+
+/// A name the owner gave a client.
+public struct ClientName: Codable, Equatable, Sendable {
+    public let key: String
+    public let name: String
 }
 
 public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
@@ -102,6 +111,10 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public let clientName: String
     public let redirectUris: [String]
     public let source: String
+
+    /// What this client's settings are stored under. Matches the daemon's
+    /// `grant_client_key`.
+    public var clientKey: String { "oauth:\(clientId)" }
 }
 
 public struct OperatorSnapshot: Codable, Equatable, Sendable {
@@ -118,6 +131,8 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let clientVisibility: [ClientVisibility]
     public let upstreamAuth: [AuthServer]
     public let downstreamClients: [DownstreamClient]
+    /// Names the owner gave clients. Absent when there are none.
+    public var clientNames: [ClientName]?
 
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",
@@ -302,11 +317,13 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case restartServer(authToken: String, serverID: String)
     case reload(authToken: String)
     case revokeClient(authToken: String, clientID: String)
+    /// An empty name goes back to the name Plug works out.
+    case renameClient(authToken: String, key: String, name: String)
     case shutdown(authToken: String)
 
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
-        case name, server, enabled, serverID, clientID, tool
+        case name, server, enabled, serverID, clientID, tool, key
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -351,6 +368,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .revokeClient(token, clientID):
             try c.encode("RevokeDownstreamClient", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(clientID, forKey: .clientID)
+        case let .renameClient(token, key, name):
+            try c.encode("RenameClient", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode(name, forKey: .name)
         case let .shutdown(token):
             try c.encode("Shutdown", forKey: .type); try c.encode(token, forKey: .authToken)
         }

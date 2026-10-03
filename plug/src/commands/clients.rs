@@ -64,19 +64,103 @@ pub(crate) struct LiveSessionView {
     /// table rather than from what the client says about itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) host: Option<plug_core::ipc::ClientHost>,
+    /// What `plug clients rename` takes to name this client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) key: Option<String>,
+    /// The name the owner gave this client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
     pub(crate) connected_secs: u64,
     pub(crate) last_activity_secs: Option<u64>,
 }
 
 impl LiveSessionView {
-    /// What to call the session: the client Plug recognised, else the program
-    /// that started it.
+    /// What to call the session: the name the owner gave it, else the client
+    /// Plug recognised, else the program that started it.
     pub(crate) fn label(&self) -> &str {
+        if let Some(name) = &self.name {
+            return name;
+        }
         match &self.host {
             Some(host) if self.client_type == "Unknown" => &host.name,
             _ => &self.client_type,
         }
     }
+}
+
+#[derive(clap::Subcommand)]
+pub(crate) enum ClientCommands {
+    /// Give a client a name of your choosing ("" goes back to Plug's name)
+    Rename {
+        /// The client: its key from `plug clients -v`, or the name it shows
+        /// under while connected
+        client: String,
+        /// The new name
+        name: String,
+    },
+}
+
+/// Work out which client `plug clients rename` means.
+///
+/// A connected client can be picked by the name it shows under or by the
+/// start of a session id. Anything else has to be a key, since a name only
+/// means something while its client is connected.
+pub(crate) fn resolve_client_key(
+    wanted: &str,
+    sessions: &[LiveSessionView],
+) -> anyhow::Result<String> {
+    let mut keys = sessions
+        .iter()
+        .filter(|session| {
+            session.label().eq_ignore_ascii_case(wanted)
+                || session.key.as_deref() == Some(wanted)
+                || session.session_id.starts_with(wanted)
+        })
+        .map(|session| session.key.clone())
+        .collect::<Vec<_>>();
+    keys.sort();
+    keys.dedup();
+    match keys.as_slice() {
+        [Some(key)] => Ok(key.clone()),
+        [None] => anyhow::bail!(
+            "Plug cannot tell `{wanted}` apart from other clients, so it has nothing to store a name under"
+        ),
+        [] if wanted.contains(':') || wanted.parse::<ExportTarget>().is_ok() => {
+            Ok(wanted.to_string())
+        }
+        [] => anyhow::bail!(
+            "no connected client is called `{wanted}`; run `plug clients -v` to see each client's key"
+        ),
+        _ => anyhow::bail!(
+            "more than one connected client matches `{wanted}`; use a key from `plug clients -v`"
+        ),
+    }
+}
+
+pub(crate) async fn cmd_client_rename(
+    config_path: Option<&PathBuf>,
+    client: String,
+    name: String,
+) -> anyhow::Result<()> {
+    let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
+    // Names already given are loaded too, so a client can be picked by one.
+    let config = plug_core::config::load_config(config_path).ok();
+    let key = resolve_client_key(&client, &live_session_views(&live, config.as_ref()))?;
+    let name = name.trim().to_string();
+    crate::commands::servers::apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::RenameClient {
+            key: key.clone(),
+            name: name.clone(),
+        },
+    )
+    .await?;
+    if name.is_empty() {
+        print_info_line(format!("{key} goes by the name Plug works out again."));
+    } else {
+        print_info_line(format!("{key} is now called {name}."));
+    }
+    Ok(())
 }
 
 pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
@@ -508,10 +592,16 @@ pub(crate) fn client_views(
 
 pub(crate) fn live_session_views(
     live: &[plug_core::ipc::IpcLiveSessionInfo],
+    config: Option<&plug_core::config::Config>,
 ) -> Vec<LiveSessionView> {
     let mut views = live
         .iter()
-        .map(|session| LiveSessionView {
+        .map(|session| (session, session.client_key()))
+        .map(|(session, key)| LiveSessionView {
+            name: key
+                .as_ref()
+                .and_then(|key| config?.clients.get(key)?.name.clone()),
+            key,
             transport: match session.transport {
                 plug_core::ipc::LiveSessionTransport::DaemonProxy => "daemon_proxy".to_string(),
                 plug_core::ipc::LiveSessionTransport::Http => "http".to_string(),
