@@ -12,10 +12,11 @@ pub enum ExportTarget {
     ClaudeDesktop,
     ClaudeCode,
     Cursor,
-    Windsurf,
+    Devin,
     VSCodeCopilot,
     GeminiCli,
     CodexCli,
+    GrokBuild,
     OpenCode,
     Zed,
     Cline,
@@ -37,10 +38,13 @@ impl std::str::FromStr for ExportTarget {
             "claude-desktop" => Ok(Self::ClaudeDesktop),
             "claude-code" => Ok(Self::ClaudeCode),
             "cursor" => Ok(Self::Cursor),
-            "windsurf" => Ok(Self::Windsurf),
+            // `windsurf` was the target name until Cognition renamed the
+            // product; it stays accepted so old scripts keep working.
+            "devin" | "windsurf" => Ok(Self::Devin),
             "vscode" => Ok(Self::VSCodeCopilot),
             "gemini" | "gemini-cli" => Ok(Self::GeminiCli),
             "codex" | "codex-cli" => Ok(Self::CodexCli),
+            "grok" | "grok-build" => Ok(Self::GrokBuild),
             "opencode" => Ok(Self::OpenCode),
             "zed" => Ok(Self::Zed),
             "cline" => Ok(Self::Cline),
@@ -63,10 +67,11 @@ impl ExportTarget {
             Self::ClaudeDesktop => "Claude Desktop",
             Self::ClaudeCode => "Claude Code",
             Self::Cursor => "Cursor",
-            Self::Windsurf => "Windsurf",
+            Self::Devin => "Devin",
             Self::VSCodeCopilot => "VS Code Copilot",
             Self::GeminiCli => "Gemini CLI",
             Self::CodexCli => "Codex CLI",
+            Self::GrokBuild => "Grok Build",
             Self::OpenCode => "OpenCode",
             Self::Zed => "Zed",
             Self::Cline => "Cline (VS Code)",
@@ -87,10 +92,11 @@ impl ExportTarget {
             "claude-desktop",
             "claude-code",
             "cursor",
-            "windsurf",
+            "devin",
             "vscode",
             "gemini-cli",
             "codex-cli",
+            "grok-build",
             "opencode",
             "zed",
             "cline",
@@ -142,7 +148,7 @@ pub fn export_config(options: &ExportOptions) -> String {
         ExportTarget::ClaudeDesktop
         | ExportTarget::ClaudeCode
         | ExportTarget::Cursor
-        | ExportTarget::Windsurf
+        | ExportTarget::Devin
         | ExportTarget::GeminiCli
         | ExportTarget::Cline
         | ExportTarget::ClineCli
@@ -166,7 +172,7 @@ pub fn export_config(options: &ExportOptions) -> String {
         ExportTarget::Nanobot => export_nanobot(options),
 
         // TOML clients
-        ExportTarget::CodexCli => export_toml(options),
+        ExportTarget::CodexCli | ExportTarget::GrokBuild => export_toml(options),
     }
 }
 
@@ -288,7 +294,8 @@ fn export_vscode(options: &ExportOptions) -> String {
     serde_json::to_string_pretty(&config).unwrap()
 }
 
-/// Generate TOML config for Codex/Nanobot.
+/// Generate TOML config for Codex CLI and Grok Build, which share the
+/// `[mcp_servers.<name>]` shape.
 fn export_toml(options: &ExportOptions) -> String {
     match options.transport {
         ExportTransport::Stdio => format!(
@@ -339,7 +346,17 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
                 Some(home.join(".cursor/mcp.json"))
             }
         }
-        ExportTarget::Windsurf => Some(home.join(".codeium/windsurf/mcp_config.json")),
+        // Devin's own file since Devin CLI v3000.3; Devin Desktop's default
+        // agent reads it too. The Cascade file the Windsurf target wrote,
+        // ~/.codeium/windsurf/mcp_config.json, is import-only now.
+        // https://docs.devin.ai/cli/extensibility/mcp/configuration
+        ExportTarget::Devin => {
+            if project {
+                Some(std::path::PathBuf::from(".devin/mcp_config.json"))
+            } else {
+                Some(home.join(".config/devin/mcp_config.json"))
+            }
+        }
         ExportTarget::VSCodeCopilot => {
             if project {
                 Some(std::path::PathBuf::from(".vscode/mcp.json"))
@@ -355,6 +372,15 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
             }
         }
         ExportTarget::CodexCli => Some(home.join(".codex/config.toml")),
+        // https://docs.x.ai/build/settings: the project file wins over the
+        // user file for `[mcp_servers]`.
+        ExportTarget::GrokBuild => {
+            if project {
+                Some(std::path::PathBuf::from(".grok/config.toml"))
+            } else {
+                Some(home.join(".grok/config.toml"))
+            }
+        }
         ExportTarget::OpenCode => {
             if project {
                 Some(std::path::PathBuf::from("opencode.json"))
@@ -497,6 +523,30 @@ mod tests {
         let output = export_config(&options);
         assert!(output.contains("[mcp_servers.plug]"));
         assert!(output.contains("command = \"plug\""));
+    }
+
+    #[test]
+    fn export_grok_build_toml_http() {
+        let options = ExportOptions {
+            target: ExportTarget::GrokBuild,
+            transport: ExportTransport::Http,
+            port: 3282,
+            http_url: None,
+            command: "plug".to_string(),
+        };
+        let output = export_config(&options);
+        let parsed: toml::Value = toml::from_str(&output).unwrap();
+        let plug = &parsed["mcp_servers"]["plug"];
+        assert_eq!(plug["transport"].as_str(), Some("http"));
+        assert_eq!(plug["url"].as_str(), Some("http://localhost:3282/mcp"));
+    }
+
+    #[test]
+    fn devin_target_accepts_its_former_name() {
+        assert_eq!("windsurf".parse::<ExportTarget>(), Ok(ExportTarget::Devin));
+        assert_eq!("devin".parse::<ExportTarget>(), Ok(ExportTarget::Devin));
+        assert_eq!(ExportTarget::Devin.display_name(), "Devin");
+        assert_eq!("grok".parse::<ExportTarget>(), Ok(ExportTarget::GrokBuild));
     }
 
     #[test]

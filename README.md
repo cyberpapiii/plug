@@ -131,7 +131,7 @@ For Claude Code (`.mcp.json` in your project root):
 }
 ```
 
-For Cursor, Windsurf, Gemini CLI, and others — see [docs/CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md).
+For Cursor, Devin, Gemini CLI, and others — see [docs/CLIENT-COMPAT.md](docs/CLIENT-COMPAT.md).
 
 **3. That's it.** All your servers are available through every client simultaneously.
 
@@ -162,9 +162,9 @@ You use 10 different AI coding tools. Each one needs its own MCP server configur
 **plug** fixes this:
 
 - **One config** — define your servers once (`~/Library/Application Support/plug/config.toml` on macOS)
-- **Every client** — Claude Code, Cursor, Gemini CLI, Codex, Windsurf, VS Code Copilot, OpenCode, Zed
+- **Every client** — Claude Code, Cursor, Gemini CLI, Codex, Grok Build, Devin, VS Code Copilot, OpenCode, Zed
 - **Shared connections** — N clients share 1 upstream connection per server (not N connections)
-- **Client-aware** — automatically respects per-client tool limits (Windsurf: 100, VS Code: 128)
+- **Client-aware** — automatically respects per-client tool limits (VS Code Copilot: 128, Devin's Cascade agent: 100)
 - **Lazy tool discovery** — clients like OpenCode can start with a tiny search bridge instead of seeing hundreds of tool schemas up front
 - **Zero dependencies** — one app (or one binary on Linux), no Docker, no database, no account required
 - **OAuth built in** — authenticate to remote MCP servers with `plug auth login`, background token refresh handles the rest

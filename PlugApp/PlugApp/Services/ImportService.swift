@@ -144,7 +144,7 @@ extension ImportScan {
         case "ClineCli": "cline-cli"
         case "OpenCode": "opencode"
         case "RooCode": "roocode"
-        case "Windsurf": "windsurf"
+        case "GrokBuild": "grok-build"
         default: source.lowercased()
         }
     }
@@ -160,7 +160,7 @@ extension ImportScan {
         case "ClineCli": "Cline CLI"
         case "OpenCode": "OpenCode"
         case "RooCode": "Roo Code"
-        case "Windsurf": "Devin"
+        case "GrokBuild": "Grok Build"
         case "": "Another app"
         default: source
         }

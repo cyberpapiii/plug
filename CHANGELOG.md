@@ -21,9 +21,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `owner_proof_until` lets the owner prove Slack event delivery alone for up to
   one hour by sending one exact test marker. Every other owner message stays
   excluded.
+- Grok Build is a client. `plug link grok-build` writes `[mcp_servers.plug]` to
+  `~/.grok/config.toml` (or `.grok/config.toml` with `--project`), import reads
+  servers from it, and a Grok Build session is named in Clients. Grok Bot,
+  which reaches Plug over the internet only, is recognised by name and shows
+  its icon when the Grok Bot app is installed.
 
 ### Changed
 
+- Devin replaces Windsurf everywhere Plug speaks: the target is `devin`
+  (`windsurf` still works as an alias), it writes
+  `~/.config/devin/mcp_config.json`, the file Devin reads today, and import
+  also scans the old `~/.codeium/windsurf/mcp_config.json`. `plug doctor` no
+  longer warns that a linked Devin accepts only 100 tools; that ceiling is
+  Cascade's, the desktop app's legacy agent, and still applies to a session
+  that introduces itself as `windsurf-client`.
 - The window's Apps tab is now Clients, and every program that uses tools
   through Plug is called a client across the app, the README, and the docs.
   Agents, apps, and scripts are all clients; `plug clients` already said so.

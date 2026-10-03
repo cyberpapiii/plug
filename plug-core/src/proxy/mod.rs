@@ -62,8 +62,8 @@ pub(crate) struct RouterSnapshot {
     pub tools_all: Arc<Vec<Tool>>,
     /// Meta-tool-only list exposed when meta-tool mode is enabled.
     pub meta_tools_all: Arc<Vec<Tool>>,
-    /// Priority-sorted, truncated to 100 (Windsurf).
-    pub tools_windsurf: Arc<Vec<Tool>>,
+    /// Priority-sorted, truncated to 100 (Devin, for Cascade).
+    pub tools_devin: Arc<Vec<Tool>>,
     /// Priority-sorted, truncated to 128 (VS Code Copilot).
     pub tools_copilot: Arc<Vec<Tool>>,
     /// Tool name → (server name, original tool name) routing table.
@@ -801,7 +801,7 @@ impl ToolRouter {
             tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_windsurf: Arc::new(Vec::new()),
+            tools_devin: Arc::new(Vec::new()),
             tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
@@ -1914,7 +1914,7 @@ impl ToolRouter {
     /// Refresh the merged tool list and routing table from all upstream servers.
     ///
     /// Builds the full sorted list plus pre-cached filtered views for each
-    /// known client tool limit (Windsurf: 100, Copilot: 128). All views are
+    /// known client tool limit (Devin: 100, Copilot: 128). All views are
     /// swapped atomically to prevent torn reads. The three live catalog
     /// families (resources, resource templates, prompts) are fetched
     /// concurrently; each is already server-concurrent internally, so a
@@ -2309,7 +2309,7 @@ impl ToolRouter {
         // reader of these two fields, and it always returns `tools_all` early
         // when filtering is disabled, so these views are provably never read
         // in that case.
-        let (tools_windsurf, tools_copilot) = if self.config.tool_filter_enabled {
+        let (tools_devin, tools_copilot) = if self.config.tool_filter_enabled {
             (
                 Arc::new(tools.iter().take(100).cloned().collect()),
                 Arc::new(tools.iter().take(128).cloned().collect()),
@@ -2489,7 +2489,7 @@ impl ToolRouter {
                 tools_by_name_lower: HashMap::new(),
                 tools_all,
                 meta_tools_all: Arc::new(build_meta_tools()),
-                tools_windsurf,
+                tools_devin,
                 tools_copilot,
                 resources_all,
                 resource_templates_all,

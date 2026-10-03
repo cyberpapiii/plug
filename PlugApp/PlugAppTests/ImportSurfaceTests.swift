@@ -106,8 +106,10 @@ final class ImportScanTests: XCTestCase {
         XCTAssertEqual(ImportScan.target(forSource: "VSCodeCopilot"), "vscode")
         XCTAssertEqual(ImportScan.target(forSource: "OpenCode"), "opencode")
         XCTAssertEqual(ImportScan.target(forSource: "CodexCli"), "codex-cli")
-        XCTAssertEqual(ImportScan.target(forSource: "Windsurf"), "windsurf")
-        XCTAssertEqual(ImportScan.appName(fromSource: "Windsurf"), "Devin")
+        XCTAssertEqual(ImportScan.target(forSource: "Devin"), "devin")
+        XCTAssertEqual(ImportScan.appName(fromSource: "Devin"), "Devin")
+        XCTAssertEqual(ImportScan.target(forSource: "GrokBuild"), "grok-build")
+        XCTAssertEqual(ImportScan.appName(fromSource: "GrokBuild"), "Grok Build")
         XCTAssertEqual(ImportScan.appName(fromSource: "GeminiCli"), "Gemini CLI")
         XCTAssertEqual(ImportScan.appName(fromSource: "Zed"), "Zed")
     }

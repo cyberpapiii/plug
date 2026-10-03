@@ -520,35 +520,25 @@ struct ClientToolLimit {
 /// - **Cursor.** Older versions warned above roughly 40-50 tools. Current
 ///   versions use Dynamic Context Discovery and publish no ceiling;
 ///   <https://cursor.com/docs/context/mcp> states no limit.
-/// - **Claude Code, Codex CLI.** No published ceiling.
-/// - **Devin Local**, the agent that replaced Cascade as the Devin Desktop
-///   default. It configures MCP through the Devin CLI rather than the Cascade
-///   config plug writes, and publishes no ceiling;
-///   <https://docs.devin.ai/cli/extensibility/mcp/configuration> (2026-08-30).
-const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[
-    ClientToolLimit {
-        client: "Cascade (Devin Desktop, formerly Windsurf)",
-        // The export target keeps the Windsurf name because the file it writes
-        // still does: ~/.codeium/windsurf/mcp_config.json is Cascade's own
-        // config, which is what makes this the right ceiling to raise for it.
-        target: "windsurf",
-        limit: 100,
-        verified: "2026-08-30",
-        // "Cascade has a limit of 100 total tools that it has access to at any
-        // given time." Cognition acquired Windsurf, so docs.windsurf.com now
-        // redirects here and the page calls Cascade the legacy agent.
-        source: "https://docs.devin.ai/desktop/cascade/mcp",
-    },
-    ClientToolLimit {
-        client: "VS Code Copilot",
-        target: "vscode",
-        limit: 128,
-        verified: "2026-08-30",
-        // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
-        // itself caps at 128, and extra tools are deferred behind `activate_*` stubs.
-        source: "https://github.com/microsoft/vscode/issues/290356",
-    },
-];
+/// - **Claude Code, Codex CLI, Grok Build.** No published ceiling.
+/// - **Devin.** The `devin` target writes `~/.config/devin/mcp_config.json`,
+///   which the Devin CLI and Devin Desktop's default agent read, and neither
+///   publishes a ceiling;
+///   <https://docs.devin.ai/cli/extensibility/mcp/configuration> (2026-10-03).
+///   Cascade, the desktop app's legacy agent, caps at 100
+///   (<https://docs.devin.ai/desktop/cascade/mcp>), but it reads the old
+///   Windsurf file that plug no longer writes, so a linked `devin` target says
+///   nothing about Cascade. `ClientType::Devin` still carries that 100 for the
+///   session filter, keyed on the `windsurf-client` identity Cascade reports.
+const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[ClientToolLimit {
+    client: "VS Code Copilot",
+    target: "vscode",
+    limit: 128,
+    verified: "2026-08-30",
+    // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
+    // itself caps at 128, and extra tools are deferred behind `activate_*` stubs.
+    source: "https://github.com/microsoft/vscode/issues/290356",
+}];
 
 /// Number of plug entries a client config file declares.
 ///
@@ -877,9 +867,10 @@ async fn check_client_configs() -> CheckResult {
         "claude-code",
         "cursor",
         "vscode",
-        "windsurf",
+        "devin",
         "gemini-cli",
         "codex-cli",
+        "grok-build",
         "opencode",
         "zed",
         "cline",

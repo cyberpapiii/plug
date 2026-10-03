@@ -28,10 +28,11 @@ pub enum ClientSource {
     ClaudeDesktop,
     ClaudeCode,
     Cursor,
-    Windsurf,
+    Devin,
     VSCodeCopilot,
     GeminiCli,
     CodexCli,
+    GrokBuild,
     OpenCode,
     Zed,
     Cline,
@@ -52,10 +53,11 @@ impl ClientSource {
             Self::ClaudeDesktop => "Claude Desktop",
             Self::ClaudeCode => "Claude Code",
             Self::Cursor => "Cursor",
-            Self::Windsurf => "Windsurf",
+            Self::Devin => "Devin",
             Self::VSCodeCopilot => "VS Code Copilot",
             Self::GeminiCli => "Gemini CLI",
             Self::CodexCli => "Codex CLI",
+            Self::GrokBuild => "Grok Build",
             Self::OpenCode => "OpenCode",
             Self::Zed => "Zed",
             Self::Cline => "Cline (VS Code)",
@@ -76,10 +78,11 @@ impl ClientSource {
             Self::ClaudeDesktop,
             Self::ClaudeCode,
             Self::Cursor,
-            Self::Windsurf,
+            Self::Devin,
             Self::VSCodeCopilot,
             Self::GeminiCli,
             Self::CodexCli,
+            Self::GrokBuild,
             Self::OpenCode,
             Self::Zed,
             Self::Cline,
@@ -197,8 +200,15 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
                 PathBuf::from(".cursor/mcp.json"),
             ]
         }
-        ClientSource::Windsurf => {
-            vec![home.join(".codeium/windsurf/mcp_config.json")]
+        ClientSource::Devin => {
+            vec![
+                home.join(".config/devin/mcp_config.json"),
+                PathBuf::from(".devin/mcp_config.json"),
+                // Cascade's file from the Windsurf days. Devin no longer
+                // writes it, but a server configured there is still worth
+                // importing.
+                home.join(".codeium/windsurf/mcp_config.json"),
+            ]
         }
         ClientSource::VSCodeCopilot => {
             vec![
@@ -218,6 +228,12 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
             vec![
                 home.join(".codex/config.toml"),
                 PathBuf::from(".codex/config.toml"),
+            ]
+        }
+        ClientSource::GrokBuild => {
+            vec![
+                home.join(".grok/config.toml"),
+                PathBuf::from(".grok/config.toml"),
             ]
         }
         ClientSource::OpenCode => {
@@ -338,7 +354,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
 
     match source {
         // TOML clients: cleanse "plug" entries first to avoid parse errors from duplicates
-        ClientSource::CodexCli => {
+        ClientSource::CodexCli | ClientSource::GrokBuild => {
             let cleansed = unlink_toml(&content);
             parse_toml_mcp_servers(&cleansed, source, "mcp_servers")
         }
@@ -347,7 +363,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         ClientSource::ClaudeDesktop
         | ClientSource::ClaudeCode
         | ClientSource::Cursor
-        | ClientSource::Windsurf
+        | ClientSource::Devin
         | ClientSource::GeminiCli
         | ClientSource::Cline
         | ClientSource::ClineCli
@@ -840,10 +856,11 @@ fn resolve_name_against_set(
         ClientSource::ClaudeDesktop => "claude-desktop",
         ClientSource::ClaudeCode => "claude-code",
         ClientSource::Cursor => "cursor",
-        ClientSource::Windsurf => "windsurf",
+        ClientSource::Devin => "devin",
         ClientSource::VSCodeCopilot => "vscode",
         ClientSource::GeminiCli => "gemini",
         ClientSource::CodexCli => "codex",
+        ClientSource::GrokBuild => "grok",
         ClientSource::OpenCode => "opencode",
         ClientSource::Zed => "zed",
         ClientSource::Cline => "cline",

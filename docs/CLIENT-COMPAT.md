@@ -50,17 +50,20 @@ For Linux and source builds, see the [operator guide](OPERATOR-GUIDE.md).
 | Claude Code | stdio | None (tool search at >10% ctx) | JSON | `.mcp.json` or `~/.claude.json` |
 | Claude Desktop | stdio, SSE, Streamable HTTP | None | JSON | `~/Library/Application Support/Claude/claude_desktop_config.json` |
 | Cursor | stdio, SSE, Streamable HTTP | **None** (Dynamic Context Discovery) | JSON | `.cursor/mcp.json` or `~/.cursor/mcp.json` |
-| Windsurf | stdio, SSE, Streamable HTTP | **100** | JSON | `~/.codeium/windsurf/mcp_config.json` |
+| Devin | stdio, SSE, Streamable HTTP | None documented (legacy Cascade agent: **100**) | JSON | `~/.config/devin/mcp_config.json` |
 | VS Code Copilot | stdio, SSE, Streamable HTTP | **128** | JSON | `.vscode/mcp.json` or settings |
 | Gemini CLI | stdio, SSE, Streamable HTTP | None documented | JSON | `~/.gemini/settings.json` |
 | Codex CLI | stdio, Streamable HTTP | None documented | TOML | `~/.codex/config.toml` |
+| Grok Build | stdio, Streamable HTTP | None documented | TOML | `~/.grok/config.toml` |
 | OpenCode | SSE, Streamable HTTP | None documented | Config file | Varies |
 | Zed | stdio only | None documented | JSON | `settings.json` |
 | Factory/Droid | stdio, HTTP | None documented | CLI config | Varies |
 
-Remote connectors (Claude Desktop's remote connector, ChatGPT) reach Plug at
-`https://<public_base_url>/mcp` with downstream OAuth instead of `plug connect`.
-Both are certified live; setup is in the [operator guide](OPERATOR-GUIDE.md).
+Remote connectors (Claude Desktop's remote connector, ChatGPT, Grok Bot) reach
+Plug at `https://<public_base_url>/mcp` with downstream OAuth instead of
+`plug connect`. Claude Desktop and ChatGPT are certified live; Grok Bot is
+recognised by name and icon but unproven. Setup is in the
+[operator guide](OPERATOR-GUIDE.md).
 
 ---
 
@@ -75,8 +78,9 @@ Both are certified live; setup is in the [operator guide](OPERATOR-GUIDE.md).
 | Codex CLI | `native` | Codex has native lazy/deferred tool search semantics and should receive the normal routed catalog. |
 | OpenCode | `bridge` | OpenCode currently benefits from a `plug`-owned small bridge surface instead of seeing hundreds of tools eagerly. |
 | Claude Desktop | `standard` | No proven lazy/deferred path in `plug`; keep normal full-tool behavior. |
-| Windsurf | `standard` | Keep normal behavior with existing tool-limit filtering. |
+| Devin | `standard` | Keep normal behavior with existing tool-limit filtering. |
 | VS Code Copilot | `standard` | Keep normal behavior with existing tool-limit filtering. |
+| Grok Build | `standard` | No lazy discovery path is documented; keep normal behavior. |
 | Gemini CLI | `standard` | Keep normal behavior and prioritize fast discovery responses. |
 | Zed | `standard` | Keep normal behavior. |
 | Unknown clients | `standard` | Safe fallback: do not hide tools unless the client target is known or configured. |
@@ -206,23 +210,29 @@ Deprecated `meta_tool_mode = true` is separate from bridge mode. It keeps the le
 
 ---
 
-### Windsurf
+### Devin
+
+Formerly Windsurf. The Plug target is `devin`; `windsurf` is still accepted as
+an alias.
 
 **Transport**: stdio, SSE, Streamable HTTP
 **Config format**: JSON
 ```json
-// ~/.codeium/windsurf/mcp_config.json
+// ~/.config/devin/mcp_config.json (Devin CLI v3000.3+ and Devin Desktop)
+// .devin/mcp_config.json in a project
 ```
 
-**BEHAVIOR — 100 TOOL LIMIT** (Devin is the current product name; the config
-path and `windsurf-client` identifier are unchanged):
-- Hard limit of 100 tools across all servers
-- Per-tool toggling IS available (Settings > Cascade)
+**BEHAVIOR**:
+- Devin Desktop's default agent and the Devin CLI publish no tool ceiling.
+- Cascade, the desktop app's legacy agent, caps at 100 tools across all
+  servers and still introduces itself as `windsurf-client`. It reads the old
+  `~/.codeium/windsurf/mcp_config.json`, which Plug imports from but no longer
+  writes.
 
 **plug implications**:
 - Detect from `clientInfo.name`
-- Filter to 100 tools maximum
-- Less critical than Cursor (100 is usually enough) but still enforce
+- A session that reports `windsurf-client` is filtered to 100 tools when
+  `tool_filter_enabled` is on
 
 ---
 
@@ -321,6 +331,34 @@ args = ["connect"]
 
 ---
 
+### Grok Build
+
+xAI's coding agent CLI (`grok`). The Plug target is `grok-build`; `grok` is
+accepted as an alias.
+
+**Transport**: stdio, Streamable HTTP
+**Config format**: TOML, the same `[mcp_servers.<name>]` shape as Codex CLI
+```toml
+# ~/.grok/config.toml, or .grok/config.toml in a project (the project file wins)
+[mcp_servers.plug]
+command = "plug"
+args = ["connect"]
+```
+
+**Other behaviors**:
+- Also reads Claude Code-style `.mcp.json` files, so a project linked for
+  Claude Code is already linked for Grok Build
+- Tools are namespaced `<server>__<tool>`
+- `clientInfo.name` is not documented; detection is fuzzy on `grok`
+
+**Grok Bot**, xAI's desktop agent, is a different client. It attaches MCP
+servers over HTTPS on the public internet only, cannot reach localhost, and has
+no config file on this Mac, so Plug has no link target for it. It reaches Plug
+the way ChatGPT does, through `https://<public_base_url>/mcp` with downstream
+OAuth, and Plug recognises it by name.
+
+---
+
 ### OpenCode
 
 **Transport**: SSE and Streamable HTTP (auto-negotiation)
@@ -374,7 +412,7 @@ args = ["connect"]
 
 This shows which features each client actually supports (not just what the spec defines):
 
-| Feature | Claude Code | Claude Desktop | Cursor | Windsurf | VS Code | Gemini | Codex | OpenCode | Zed |
+| Feature | Claude Code | Claude Desktop | Cursor | Devin | VS Code | Gemini | Codex | OpenCode | Zed |
 |---------|------------|---------------|--------|----------|---------|--------|-------|----------|-----|
 | Tools | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes | Yes |
 | Resources | Yes | Yes | Yes | -- | -- | -- | -- | -- | -- |
@@ -404,7 +442,7 @@ Detect client type from `clientInfo.name` in `InitializeRequest` using exact mat
 | Claude Code | `claude-code` |
 | Claude Desktop | `claude-ai` |
 | Cursor | `cursor-vscode` |
-| Windsurf | `windsurf-client` |
+| Devin (Cascade agent) | `windsurf-client` |
 | VS Code Copilot | `Visual-Studio-Code` |
 | Gemini CLI | `gemini-cli-mcp-client` |
 | OpenCode | `opencode` |
@@ -427,9 +465,10 @@ full catalog.
 | Claude Desktop | `~/Library/Application Support/Claude/claude_desktop_config.json` (macOS) | JSON |
 | Claude Code | `~/.claude.json` or `.mcp.json` in cwd | JSON |
 | Cursor | `~/.cursor/mcp.json` | JSON |
-| Windsurf | `~/.codeium/windsurf/mcp_config.json` | JSON |
+| Devin | `~/.config/devin/mcp_config.json`, plus the legacy `~/.codeium/windsurf/mcp_config.json` | JSON |
 | VS Code | `~/.vscode/mcp.json` or settings.json | JSON |
 | Codex | `~/.codex/config.toml` | TOML |
+| Grok Build | `~/.grok/config.toml` | TOML |
 | Gemini | `~/.gemini/settings.json` | JSON |
 
 All of these store MCP server configs in slightly different JSON/TOML schemas. Plug parses each and normalizes into its own TOML format.
