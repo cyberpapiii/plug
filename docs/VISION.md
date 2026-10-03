@@ -1,151 +1,96 @@
-# Vision, Principles, and Rules
+# Vision
 
-## The Problem
+## What Plug is
 
-A power user in 2026 often uses 5-15 AI coding and agent clients: Claude Code, Cursor, Gemini CLI, Codex, OpenCode, Windsurf, VS Code Copilot, Zed, and more. Each client wants MCP configured differently. Each tends to spawn its own copies of the same servers. The result is duplicated config, duplicate processes, port conflicts, inconsistent tool availability, and wasted debugging time.
+Plug is one place on your Mac that holds every tool you have and gives it to
+every agent you use, wherever that agent runs.
 
-## The Solution
+Some tools only work on your Mac: Messages, Contacts, location, anything that
+reads local files or local apps. Others are remote services. Plug runs them
+all from one always-on Mac, keeps them healthy, signs you in once, and streams
+them to agents on the Mac or in the cloud. You configure once and you own the
+configuration. No agent vendor can lock you in, because the tools live with
+you, not with them.
 
-`plug` is a Rust daemon that sits between AI clients and MCP servers. One install, one config, one place to reason about your MCP setup.
+Plug is an MCP gateway. It is a personal tool, one daemon, operationally
+boring, and it must never be the fragile part of the chain.
 
-Today, the product surface is:
+## Three jobs
 
-- Plug.app, the menu bar app that bundles the daemon and owns its lifecycle
-- the `plug` CLI for scripting, agents, and advanced use
-- a strong core multiplexer behind both
+1. **Give tools to agents.** Real tools, passed through unchanged, with health
+   monitoring, recovery, sign-in, and a record of what happened. This is the
+   core, and it is mature.
+2. **Tell agents when something happens.** Events from a server that emits
+   them, from a push recipe for services like Slack, or from watching a tool
+   for change. Slack is the first source; the feature is general.
+3. **Be understood without help.** A newcomer, or their agent, can install
+   Plug, see its two sides, connect a server and an agent, and know what
+   happened, with no documentation open.
 
----
+## Words
 
-## Core Identity
+Five nouns. Humans and agents use the same ones, and they are the protocol's
+words wherever an agent can see them.
 
-`plug` is:
+| Word | Meaning |
+|---|---|
+| Server | A program that provides tools. On this Mac or remote. |
+| Tool | One thing a server can do. |
+| Agent | A program that uses tools: Claude, ChatGPT, Codex, Cursor. On this Mac or remote. |
+| Event | Something that happened on a server, or a change Plug noticed by watching a tool, delivered to the agents that subscribed. |
+| Activity | The record of tool calls and event deliveries. |
 
-- a personal tool, not an enterprise platform
-- one daemon, not a distributed system
-- a multiplexer, not a framework
-- operationally boring, not flashy
-- opinionated at the UX layer, but simple at the systems layer
+Verbs: add a server, connect an agent, block a tool, subscribe to an event.
+Access is a set of switches on an agent's page, never a new noun. When one
+server needs several sign-ins, the word is *account*.
 
----
+Avoid: *app* (means a server in ChatGPT and Gemini), *client* (protocol term
+in code and a hidden CLI alias, nowhere a person reads), *connection*,
+*connector*, *integration*, *source*, *plugin* (each means something else in
+some product), *trigger* (one word for events), *logs* (the files under
+`~/Library/Logs/plug`), and *multiplexer* (nobody else says it; say MCP
+gateway).
 
-## Design Principles
+## Principles
 
-### 1. Ruthlessly Minimal
+1. **Pass through first.** An agent sees a server's real tools with their real
+   names, schemas, and annotations. Plug adds beside them, never in place of
+   them. The search-then-load mode exists for agents with hard tool caps and
+   is opt-in.
+2. **Plug blocks, the agent asks.** Plug can hide a tool or refuse a call.
+   Asking the human before a call is the agent's job, because only the agent
+   has the conversation.
+3. **One place, many agents.** Per-agent access is bound to how the agent
+   connects (its socket, its OAuth grant), never to the name it reports. It
+   keeps tool lists tidy for agents on this Mac and is a real boundary for
+   remote ones.
+4. **Grandma-simple power.** Advanced options exist and are reached by
+   guidance: a first run, a wizard for the hard steps, plain copy, icons over
+   words. When a flow is inherently complex, Plug guides it rather than
+   hiding it.
+5. **Reliability is the product.** One bad server never poisons the rest.
+   Recovery is automatic. Errors say what to do. Shutdown is clean.
+6. **App first, CLI underneath.** Everyday jobs live in the app. The CLI and
+   `--output json` are for agents and scripts; they talk to the same daemon
+   and never need the window open. Neither surface hides state the other
+   shows.
+7. **Current with the protocol.** Serve both MCP eras while real clients need
+   both. Adopt a new capability when a real client can use it.
 
-Every feature must justify its existence.
+## Not doing
 
-- One binary. Zero runtime dependencies.
-- One config file. TOML. Human-readable.
-- Prefer sensible defaults over additional flags.
-- Prefer straightforward code over speculative abstraction.
+- Teams, organizations, roles, billing, or a hosted service.
+- Docker, a database, or a required cloud account.
+- A second UI beside the app.
+- Running tools through generated code instead of calling them.
+- Becoming an installer or package manager for upstream servers.
 
-**Test**: Can this feature be explained in one sentence?
+## Done looks like
 
-### 2. Zero-Friction
-
-The distance from “I installed plug” to “my clients are using it” should be short.
-
-- `plug setup` must do useful work immediately.
-- The no-args `plug` experience must guide the user toward the next action.
-- Configuration is for customization, not basic operation.
-- No Docker, no database, no required cloud account.
-
-**Test**: Can a new user get to a working setup quickly without reading architecture docs?
-
-### 3. Dual-Audience UX
-
-Humans and agents are equal citizens.
-
-- Humans get a guided CLI with clear next actions.
-- Agents get deterministic `--output json` behavior.
-- Interactive flows should have non-interactive equivalents for the main jobs.
-- The same binary serves both audiences.
-
-**Test**: Can an agent inspect and manage the core setup flows without depending on prompts?
-
-### 4. Clean Pass-Through
-
-`plug` is a multiplexer, not a product that rewrites everything upstream.
-
-- MCP behavior should pass through faithfully by default.
-- Optional enrichment must be explicit or tightly scoped.
-- If upstream sends it, downstream should receive it unless `plug` is deliberately adding value.
-- One deliberate exception exists: the opt-in Slack event adapter
-  (`docs/slack-mcp-events.md`) originates an event instead of passing one
-  through. It is off unless configured, and it is not a pattern to extend
-  without a second real need.
-
-**Test**: Does removing `plug` from the chain preserve tool behavior in the default case?
-
-### 5. Rock-Solid Reliability
-
-`plug` sits in the critical path of AI workflows. It must not be the fragile part.
-
-- One bad server should not poison the rest.
-- Daemon/runtime behavior should recover from transient failures.
-- Shutdown should be clean.
-- Errors should be actionable.
-
-**Test**: Can a server fail without turning the whole product into a mystery?
-
-### 6. App First, CLI Underneath
-
-Plug.app is the product surface. It installs and runs the daemon, shows what
-is working, and fixes what is not.
-
-- Everyday jobs (add a server, sign in, see status, restart) belong in the app.
-- The CLI is for scripting, agents (`--output json`), and advanced use. It talks
-  to the same daemon and never needs the app window open.
-- Neither surface hides state the other can see.
-
-**Test**: Could someone use Plug for a week without opening a terminal?
-
----
-
-## Anti-Principles
-
-Things `plug` should not do in this phase:
-
-1. Require Docker.
-2. Require a database.
-3. Require a cloud account.
-4. Grow a second UI beside the app.
-5. Center transport plumbing in the user-facing story.
-6. Add enterprise features at the cost of simplicity.
-
----
-
-## What “Done” Looks Like
-
-- The command surface maps cleanly to user jobs.
-- `plug` with no args is useful.
-- `setup`, `link`, `status`, and `doctor` form a coherent human workflow.
-- Main admin/setup flows have non-interactive equivalents.
-- Docs describe the product as it actually exists.
-- The backend remains small enough to understand and reliable enough to trust.
-
-## What “Best On The Market” Looks Like
-
-- A developer uses `plug` and stops thinking about MCP wiring.
-- An agent can inspect and manage the runtime without brittle prompt parsing.
-- The CLI feels intentional and calm, not like exposed internals.
-- Reliability is boring.
-
----
-
-## Scope
-
-### In Scope
-
-- MCP protocol multiplexing
-- Shared runtime and daemon behavior
-- Import/export/linking with major AI clients
-- Guided CLI for humans
-- Structured CLI output for agents
-- Health monitoring, recovery, and diagnostics
-
-### Out of Scope For This Phase
-
-- Cloud management features
-- Multi-user or enterprise access control
-- Turning `plug` into an upstream server installer/manager
+- A newcomer finishes the first run and understands the two sides.
+- Every agent on the Agents page has a name and an icon, including unknown and
+  remote ones.
+- Each agent can be given a subset of servers and tools.
+- Any server can be an event source, and any subscribed agent receives it.
+- An agent can set Plug up for its human from a prompt or skill.
+- Docs describe the product as it exists.
