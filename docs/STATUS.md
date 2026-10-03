@@ -37,9 +37,9 @@ line up to Open before starting it.
   how the client connects and never to the name it reports.
 - General events: forward the events a server emits, add push recipes for
   services beside Slack, and watch a tool on a schedule for changes.
-- A first run in the app that a newcomer can finish, including importing
-  servers from clients already installed (`plug import` exists; the app has no
-  screen for it), and a prompt or skill an agent can follow to set Plug up.
+- A guided first run in the app. Import and one-switch linking exist, but
+  nothing walks a newcomer through what Plug is and its two sides. Also a
+  prompt or skill an agent can follow to set Plug up.
 - Block single tools centrally. Asking before a call stays with the client.
 - Several accounts for one server without adding the server twice.
 - Tools from plain HTTP APIs (OpenAPI, GraphQL) with no MCP server.
