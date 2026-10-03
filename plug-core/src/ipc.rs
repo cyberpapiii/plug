@@ -231,6 +231,10 @@ pub enum IpcRequest {
         /// Connector binary version. Absent for older adapters.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         adapter_version: Option<String>,
+        /// The program that started this connector. Absent for older adapters
+        /// and when the process table could not be read.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        host: Option<ClientHost>,
     },
 
     /// Deregister a proxy client session (clean disconnect).
@@ -405,12 +409,14 @@ impl fmt::Debug for IpcRequest {
                 client_id,
                 client_info,
                 adapter_version,
+                host,
             } => f
                 .debug_struct("Register")
                 .field("protocol_version", protocol_version)
                 .field("client_id", client_id)
                 .field("client_info", client_info)
                 .field("adapter_version", adapter_version)
+                .field("host", host)
                 .finish(),
             Self::Deregister { session_id } => f
                 .debug_struct("Deregister")
@@ -694,6 +700,22 @@ pub enum LiveSessionInventoryScope {
     Unavailable,
 }
 
+/// The program on this Mac that started a `plug connect` process.
+///
+/// The connector reads it from the process table, so unlike the name a client
+/// sends in MCP `initialize` it cannot be chosen by the client. It is used for
+/// display only.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientHost {
+    /// What to call it: the app bundle's name, or the executable's file name.
+    pub name: String,
+    /// Path of the executable that started the connector.
+    pub executable: String,
+    /// Path of the outermost `.app` bundle the executable runs from, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcLiveSessionInfo {
     pub transport: LiveSessionTransport,
@@ -703,6 +725,10 @@ pub struct IpcLiveSessionInfo {
     pub client_info: Option<String>,
     #[serde(default)]
     pub adapter_version: Option<String>,
+    /// The program that started a local connector. Never set for a remote
+    /// session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host: Option<ClientHost>,
     pub connected_secs: u64,
     pub last_activity_secs: Option<u64>,
 }
@@ -1276,12 +1302,14 @@ mod tests {
                 client_id: "client-123".to_string(),
                 client_info: Some("claude-code".to_string()),
                 adapter_version: Some("0.6.5".to_string()),
+                host: None,
             },
             IpcRequest::Register {
                 protocol_version: IPC_PROTOCOL_VERSION,
                 client_id: "client-456".to_string(),
                 client_info: None,
                 adapter_version: None,
+                host: None,
             },
             IpcRequest::Deregister {
                 session_id: "sess-123".to_string(),
@@ -1501,6 +1529,7 @@ mod tests {
                     client_type: crate::types::ClientType::ClaudeCode,
                     client_info: Some("claude-code".to_string()),
                     adapter_version: Some("0.6.5".to_string()),
+                    host: None,
                     connected_secs: 12,
                     last_activity_secs: Some(1),
                 }],
@@ -1698,6 +1727,7 @@ mod tests {
             client_id: "client-123".to_string(),
             client_info: None,
             adapter_version: None,
+            host: None,
         }));
         assert!(!requires_auth(&IpcRequest::Deregister {
             session_id: "s".to_string(),
@@ -1825,6 +1855,7 @@ mod tests {
             client_id: "client-123".to_string(),
             client_info: Some("claude-code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
+            host: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -1839,9 +1870,39 @@ mod tests {
             decoded,
             IpcRequest::Register {
                 adapter_version: Some(version),
+                host: None,
                 ..
             } if version == "0.6.5"
         ));
+    }
+
+    #[test]
+    fn register_carries_the_host_program_and_omits_it_when_unknown() {
+        let host = ClientHost {
+            name: "Hermes".to_string(),
+            executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
+            app: Some("/Applications/Hermes.app".to_string()),
+        };
+        let request = |host| IpcRequest::Register {
+            protocol_version: IPC_PROTOCOL_VERSION,
+            client_id: "client-123".to_string(),
+            client_info: None,
+            adapter_version: None,
+            host,
+        };
+
+        let value = serde_json::to_value(request(Some(host.clone()))).unwrap();
+        assert_eq!(value["host"]["name"], "Hermes");
+        match serde_json::from_value::<IpcRequest>(value).unwrap() {
+            IpcRequest::Register { host: parsed, .. } => assert_eq!(parsed, Some(host)),
+            other => panic!("expected Register, got {other:?}"),
+        }
+        assert!(
+            serde_json::to_value(request(None))
+                .unwrap()
+                .get("host")
+                .is_none()
+        );
     }
 
     #[test]
@@ -1858,6 +1919,7 @@ mod tests {
             decoded,
             IpcRequest::Register {
                 adapter_version: None,
+                host: None,
                 ..
             }
         ));
@@ -2179,6 +2241,7 @@ mod tests {
                         client_type: crate::types::ClientType::ClaudeCode,
                         client_info: Some("claude-code 2.0".to_string()),
                         adapter_version: None,
+                        host: None,
                         connected_secs: 30,
                         last_activity_secs: Some(2),
                     }],

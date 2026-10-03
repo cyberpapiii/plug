@@ -9,6 +9,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A local client Plug does not recognise is named after the program that
+  started it. `plug connect` reads its parent from the process table, looking
+  past shells and launchers, and reports it when it registers; Clients shows
+  that app's name and icon in place of "Unidentified local client", and
+  `plug clients` lists it under that name. A client cannot choose this name,
+  unlike the one it sends in `initialize`.
 - Opt-in Slack event delivery. With `[http.slack_events]` configured, Plug
   receives Slack's Events API at `/events/slack`, keeps coworker mentions of one
   Slack user and replies in those threads across public channels, and delivers

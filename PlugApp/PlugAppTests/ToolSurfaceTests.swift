@@ -288,6 +288,28 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(roster.other.map(\.sessionId), ["z9"])
     }
 
+    func testAnUnknownSessionIsNamedAfterTheAppThatStartedIt() throws {
+        let named = try sessions(
+            """
+            [{"transport":"daemon_proxy","session_id":"h1","client_type":"Unknown","client_info":"mcp","connected_secs":1,
+              "host":{"name":"Hermes","executable":"/Applications/Hermes.app/Contents/MacOS/Hermes","app":"/Applications/Hermes.app"}},
+             {"transport":"daemon_proxy","session_id":"h2","client_type":"Unknown","client_info":"ditto-history","connected_secs":1,
+              "host":{"name":"python3","executable":"/usr/bin/python3"}},
+             {"transport":"daemon_proxy","session_id":"h3","client_type":"Unknown","client_info":"mcp","connected_secs":1,
+              "host":{"name":"python3","executable":"/usr/bin/python3"}},
+             {"transport":"daemon_proxy","session_id":"h4","client_type":"Cursor","client_info":"cursor-vscode","connected_secs":1,
+              "host":{"name":"Terminal","executable":"/x/Terminal.app/Contents/MacOS/Terminal","app":"/x/Terminal.app"}},
+             {"transport":"daemon_proxy","session_id":"abcd9","client_type":"Unknown","client_info":"mcp","connected_secs":1}]
+            """
+        )
+        XCTAssertEqual(
+            named.map(\.displayName),
+            ["Hermes", "ditto-history", "python3", "Cursor", "Unidentified local client abcd"]
+        )
+        XCTAssertEqual(named[0].host?.app, "/Applications/Hermes.app")
+        XCTAssertNil(named[1].host?.app)
+    }
+
     func testStaleAppScanCannotInventAConnectedSession() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true,"linked":true,"live":true,"live_sessions":1}]"#),

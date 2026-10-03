@@ -44,6 +44,39 @@ struct AppRoster: Equatable {
     }
 }
 
+extension LiveSession {
+    /// What to call a session, best witness first: a client Plug knows, then
+    /// the program that started the connector, then whatever the client said
+    /// about itself. Pure, so the order can be tested.
+    var displayName: String {
+        for value in [clientType, clientInfo].compactMap({ $0 }) {
+            let target = AppIcons.target(forClientType: value)
+            if let canonical = AppIcons.displayName(forTarget: target) {
+                return canonical
+            }
+        }
+        let type = clientType
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized
+        let isUnknown = type.localizedCaseInsensitiveCompare("unknown") == .orderedSame
+        // An app bundle is a name a person recognises; `python3` is not, so a
+        // command line host only wins over a client that said nothing useful.
+        if isUnknown, let host, host.app != nil, !host.name.isEmpty {
+            return host.name
+        }
+        if let info = clientInfo,
+           !info.isEmpty,
+           info.localizedCaseInsensitiveCompare("mcp") != .orderedSame
+        {
+            return info
+        }
+        guard isUnknown else { return type }
+        if let host, !host.name.isEmpty { return host.name }
+        return "Unidentified local client \(sessionId.prefix(4))"
+    }
+}
+
 /// Who can use Plug. The old app split this in two — "Clients" listed apps and
 /// "Auth" listed the grants for the same apps — so the audit question ("who
 /// reaches my tools, and how do I cut them off?") could not be answered in one
@@ -262,7 +295,8 @@ struct ClientsView: View {
         HStack(spacing: Metric.snug) {
             AppGlyph(
                 target: AppIcons.target(forClientType: session.clientType),
-                name: displayName(session)
+                name: displayName(session),
+                appPath: session.host?.app
             )
             VStack(alignment: .leading, spacing: Metric.rowGap) {
                 Text(displayName(session)).font(.body)
@@ -281,26 +315,7 @@ struct ClientsView: View {
         .accessibilityElement(children: .combine)
     }
 
-    private func displayName(_ session: LiveSession) -> String {
-        for value in [session.clientType, session.clientInfo].compactMap({ $0 }) {
-            let target = AppIcons.target(forClientType: value)
-            if let canonical = AppIcons.displayName(forTarget: target) {
-                return canonical
-            }
-        }
-        if let info = session.clientInfo,
-           !info.isEmpty,
-           info.localizedCaseInsensitiveCompare("mcp") != .orderedSame
-        {
-            return info
-        }
-        let type = session.clientType
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .capitalized
-        guard type.localizedCaseInsensitiveCompare("unknown") == .orderedSame else { return type }
-        return "Unidentified local client \(session.sessionId.prefix(4))"
-    }
+    private func displayName(_ session: LiveSession) -> String { session.displayName }
 
     /// Says how it reached Plug in words, not transport identifiers.
     private func connectionDescription(_ session: LiveSession) -> String {
