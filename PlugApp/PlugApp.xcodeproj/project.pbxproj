@@ -37,7 +37,6 @@
 		6D02466341A5E96732383E80 /* ServerDraftParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */; };
 		711532F652CB8274D9C13EF3 /* AddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB031695DA969096D2B34BD3 /* AddServerView.swift */; };
 		75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */; };
-		763622F2CD115FC4B56D8537 /* ConnectionsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4421712FD919B5174C54F8E1 /* ConnectionsView.swift */; };
 		8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */; };
 		9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */; };
 		9263B9DB0E85D3D9246BCB9C /* legacy_plug_programs.json in Resources */ = {isa = PBXBuildFile; fileRef = 4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */; };
@@ -61,6 +60,7 @@
 		ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */; };
 		F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */; };
 		F1057FCF7F1AA3BDC9856E2E /* DesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = 75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */; };
+		F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0F74CE97E0DF2E6BB479555A /* ClientsView.swift */; };
 		F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */; };
 		F762470FA24AB181FB13685B /* PlugPopover.swift in Sources */ = {isa = PBXBuildFile; fileRef = 744D87194D46A6D1C6BB459D /* PlugPopover.swift */; };
 		FD7472A76A6E545F5CAE7D78 /* ImportSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */; };
@@ -79,6 +79,7 @@
 /* Begin PBXFileReference section */
 		0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolDetailView.swift; sourceTree = "<group>"; };
 		0D96A945383702097BA4CCEA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
+		0F74CE97E0DF2E6BB479555A /* ClientsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientsView.swift; sourceTree = "<group>"; };
 		17049C687463885E5E5C1CF0 /* PlugIPC */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PlugIPC; path = PlugIPC; sourceTree = SOURCE_ROOT; };
 		1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIcons.swift; sourceTree = "<group>"; };
 		1EECB5A101BC8CAF84B2DA4D /* AppLinkService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLinkService.swift; sourceTree = "<group>"; };
@@ -94,7 +95,6 @@
 		39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportSurfaceTests.swift; sourceTree = "<group>"; };
 		3C9504345828F0EF55E53933 /* ImportServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportServersView.swift; sourceTree = "<group>"; };
 		406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspectorTests.swift; sourceTree = "<group>"; };
-		4421712FD919B5174C54F8E1 /* ConnectionsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ConnectionsView.swift; sourceTree = "<group>"; };
 		44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PlugApp.entitlements; sourceTree = "<group>"; };
 		4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = legacy_plug_programs.json; sourceTree = "<group>"; };
 		588717CF2790EF93C4710EE6 /* EditServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerView.swift; sourceTree = "<group>"; };
@@ -158,14 +158,6 @@
 				17049C687463885E5E5C1CF0 /* PlugIPC */,
 			);
 			name = Packages;
-			sourceTree = "<group>";
-		};
-		0F61D9DDA3D2CC8C15A9D715 /* Connections */ = {
-			isa = PBXGroup;
-			children = (
-				4421712FD919B5174C54F8E1 /* ConnectionsView.swift */,
-			);
-			path = Connections;
 			sourceTree = "<group>";
 		};
 		14BE9CF6FE76C465735ECD02 /* Core */ = {
@@ -235,6 +227,14 @@
 				E5046B427725A1A125529AF2 /* ToolRow.swift */,
 			);
 			path = Tools;
+			sourceTree = "<group>";
+		};
+		7340EA9AE1731128CEABBF9F /* Clients */ = {
+			isa = PBXGroup;
+			children = (
+				0F74CE97E0DF2E6BB479555A /* ClientsView.swift */,
+			);
+			path = Clients;
 			sourceTree = "<group>";
 		};
 		7AA042891B4B51AA69A0DAFB /* Products */ = {
@@ -319,7 +319,7 @@
 				44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */,
 				22CC65A9DE8DABA943A6935A /* Activity */,
 				FCC4251DF7B9C1E48B7B3BB8 /* App */,
-				0F61D9DDA3D2CC8C15A9D715 /* Connections */,
+				7340EA9AE1731128CEABBF9F /* Clients */,
 				14BE9CF6FE76C465735ECD02 /* Core */,
 				82BB641BEEA138358B0DB072 /* Menu */,
 				8AF1048C1BBFBA43CABAA2C0 /* Models */,
@@ -534,7 +534,7 @@
 				E5058FBADD4D21BE623948D5 /* AuthFlowService.swift in Sources */,
 				C6185FC89B0385625A2B0673 /* CheckupService.swift in Sources */,
 				D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */,
-				763622F2CD115FC4B56D8537 /* ConnectionsView.swift in Sources */,
+				F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */,
 				150EC31CFAA673C51B37F0BC /* DaemonServiceManager.swift in Sources */,
 				F1057FCF7F1AA3BDC9856E2E /* DesignSystem.swift in Sources */,
 				62A674116B71E58C151041D4 /* EditServerView.swift in Sources */,

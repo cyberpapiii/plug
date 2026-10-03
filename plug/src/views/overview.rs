@@ -255,7 +255,7 @@ pub(crate) async fn cmd_overview(
         return Ok(());
     }
 
-    print_banner("◆", "plug", "MCP multiplexer");
+    print_banner("◆", "plug", "MCP gateway");
 
     if !config_exists {
         print_heading("Overview");

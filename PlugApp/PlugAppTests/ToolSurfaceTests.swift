@@ -248,7 +248,7 @@ final class EditServerEnvironmentTests: XCTestCase {
     }
 }
 
-/// The Apps screen places every app against the open sessions. These pin
+/// The Clients screen places every client against the open sessions. These pin
 /// which group an app lands in and that no session is counted twice or lost.
 final class AppRosterTests: XCTestCase {
     private func apps(_ json: String) throws -> [LinkableApp] {

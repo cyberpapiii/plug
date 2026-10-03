@@ -36,7 +36,7 @@ struct ServersView: View {
                 } else if model.situation.servers.isEmpty {
                     EmptyPage(
                         title: "No servers yet",
-                        message: "Add one and every AI app connected to Plug can use it right away.",
+                        message: "Add one and every client connected to Plug can use it right away.",
                         symbol: "shippingbox",
                         actionTitle: "Add Server",
                         actionIntent: .addServer,

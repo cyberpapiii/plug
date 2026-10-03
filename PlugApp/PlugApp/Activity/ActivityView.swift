@@ -40,7 +40,7 @@ struct ActivityView: View {
                 } else if model.activities.isEmpty {
                     EmptyPage(
                         title: "No activity yet",
-                        message: "Tool calls will appear here with their app, server, time, and result.",
+                        message: "Tool calls will appear here with their client, server, time, and result.",
                         symbol: "clock.arrow.circlepath"
                     )
                 } else if visible.isEmpty {
