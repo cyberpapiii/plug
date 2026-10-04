@@ -187,6 +187,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Plug has a new icon: a white power symbol on blue. It shows in the Dock, in
+  Finder, and inside clients that picture the servers they connect to.
 - Clients shows one row and one switch for each client. Press a row to see
   which servers the client can use, what is connected now, and to rename it.
   Sessions, ids, and Revoke are no longer on the page: turning off a client
