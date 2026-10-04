@@ -142,10 +142,7 @@ struct ServersView: View {
 
     private var serverSummary: String? {
         guard model.hasLoadedSnapshot else { return nil }
-        let count = model.situation.servers.count
-        let tools = model.situation.totalTools
-        let summary = "\(count) \(count == 1 ? "server" : "servers") · \(tools) \(tools == 1 ? "tool" : "tools")"
-        return model.dataIsStale ? "Last known · \(summary)" : summary
+        return model.situation.countsSummary(stale: model.dataIsStale)
     }
 
     private var runningServers: [ServerFacts] {
@@ -190,10 +187,9 @@ private struct ServerListRow: View {
             }
             Spacer(minLength: Metric.tight)
             if server.health == .working {
-                Text("\(server.toolCount)")
+                Text(server.toolCountText)
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
-                    .accessibilityLabel(server.toolCountText)
             }
         }
         .padding(.vertical, Metric.tight)

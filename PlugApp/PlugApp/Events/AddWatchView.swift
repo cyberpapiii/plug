@@ -56,15 +56,15 @@ struct AddWatchView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("Watch a tool").font(.title2.weight(.semibold))
-                Text("Plug calls the tool on a timer and sends an event when its result changes.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
+        SheetFrame(
+            title: "Watch a tool",
+            subtitle: "Plug calls the tool on a timer and sends an event when its result changes.",
+            failure: failure,
+            busy: saving,
+            confirmTitle: saving ? "Starting…" : "Start Watching",
+            confirmDisabled: !canSave,
+            confirm: add
+        ) {
             if servers.isEmpty {
                 Label("No server has tools right now. Add a server, or wait for one to start.", systemImage: "questionmark.circle")
                     .font(.callout)
@@ -73,27 +73,7 @@ struct AddWatchView: View {
             } else {
                 form
             }
-
-            HStack(spacing: Metric.snug) {
-                if let failure {
-                    Label(failure, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button(saving ? "Starting…" : "Start Watching") { add() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!canSave)
-            }
         }
-        .padding(Metric.roomy)
-        .frame(width: 480)
-        .interactiveDismissDisabled(saving)
         .onAppear {
             if server.isEmpty, let first = servers.first { server = first }
         }
@@ -205,6 +185,8 @@ struct AddWatchView: View {
                     .foregroundStyle(argumentsAreValid ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.orange))
                 }
                 Toggle("Show tools that can change things", isOn: $showsAllTools)
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
                 if showsAllTools {
                     Text("Plug calls a watched tool again and again. Only pick one that is safe to repeat.")
                         .font(.caption)

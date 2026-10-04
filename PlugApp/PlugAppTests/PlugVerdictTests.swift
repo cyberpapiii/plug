@@ -246,12 +246,18 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(verdict.tone, .attention)
     }
 
-    /// The panel's rows used to look current after the daemon went away.
-    @MainActor
-    func testThePanelSaysWhenItsRowsAreOnlyLastKnown() {
-        let situation = PlugSituation(runtime: .reconnecting, servers: [server("a", tools: 3)])
-        XCTAssertEqual(PlugPopover.serversSummary(situation, stale: false), "3 tools")
-        XCTAssertEqual(PlugPopover.serversSummary(situation, stale: true), "Last known · 3 tools")
+    /// The panel's rows used to look current after the daemon went away, and
+    /// the panel and the window used to count servers differently.
+    func testThePanelAndTheWindowShareOneCountLine() {
+        let off = server("b", health: .off, enabled: false, tools: 9)
+        let situation = PlugSituation(runtime: .reconnecting, servers: [off, server("a", tools: 3)])
+        XCTAssertEqual(situation.countsSummary(stale: false), "2 servers · 3 tools")
+        XCTAssertEqual(situation.countsSummary(stale: true), "Last known · 2 servers · 3 tools")
+        XCTAssertEqual(situation.listedServers.map(\.name), ["a", "b"])
+        XCTAssertEqual(
+            PlugSituation(servers: [server("a", tools: 1)]).countsSummary(stale: false),
+            "1 server · 1 tool"
+        )
     }
 
     func testConnectedAppsGroupSessionsByAppInFirstSeenOrder() {

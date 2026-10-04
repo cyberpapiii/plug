@@ -444,6 +444,19 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(roster.connected[1].sessions.map(\.sessionId), ["claude-1"])
         XCTAssertTrue(roster.other.isEmpty)
     }
+
+    func testAClientRowSaysOneThingAboutItsState() throws {
+        let list = try apps(#"""
+        [{"target":"cursor","detected":true,"linked":true},
+         {"target":"codex-cli","detected":true},
+         {"target":"goose","linked":true}]
+        """#)
+        XCTAssertEqual(ClientStatus.app(list[0], connections: 2, limit: nil).text, "Connected · 2 connections")
+        XCTAssertEqual(ClientStatus.app(list[0], connections: 1, limit: "kept from 1 server").text, "Connected · kept from 1 server")
+        XCTAssertEqual(ClientStatus.app(list[0], connections: 0, limit: nil).text, "On · not open right now")
+        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "Off")
+        XCTAssertEqual(ClientStatus.app(list[2], connections: 0, limit: nil).text, "On · client not found on this Mac")
+    }
 }
 
 @MainActor

@@ -26,15 +26,15 @@ struct AddAccountView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("Add another account").font(.title2.weight(.semibold))
-                Text("Plug adds \(server) a second time under its own name. Both accounts stay available, each with its own tools.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-
+        SheetFrame(
+            title: "Add another account",
+            subtitle: "Plug adds \(server) a second time under its own name. Both accounts stay available, each with its own tools.",
+            failure: failure,
+            busy: saving,
+            confirmTitle: saving ? "Adding…" : "Add Account",
+            confirmDisabled: !canSave,
+            confirm: add
+        ) {
             VStack(alignment: .leading, spacing: Metric.rowGap) {
                 TextField("Account name, like personal or work", text: $typed)
                     .textFieldStyle(.roundedBorder)
@@ -54,27 +54,7 @@ struct AddAccountView: View {
             .font(.callout)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
-
-            HStack(spacing: Metric.snug) {
-                if let failure {
-                    Label(failure, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-                Spacer(minLength: 0)
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button(saving ? "Adding…" : "Add Account") { add() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(!canSave)
-            }
         }
-        .padding(Metric.roomy)
-        .frame(width: 440)
-        .interactiveDismissDisabled(saving)
     }
 
     private var canSave: Bool { label != nil && !taken && !saving }

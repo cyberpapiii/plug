@@ -62,7 +62,7 @@ struct ToolRow: View {
             )
             .labelsHidden()
             .toggleStyle(.switch)
-            .controlSize(.mini)
+            .controlSize(.small)
             .accessibilityLabel(tool.shortName)
         }
     }

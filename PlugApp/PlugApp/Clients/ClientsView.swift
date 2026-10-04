@@ -177,10 +177,10 @@ struct ClientAccess: Equatable {
     }
 }
 
-/// Who can use Plug. The old app split this in two — "Clients" listed apps and
-/// "Auth" listed the grants for the same apps — so the audit question ("who
-/// reaches my tools, and how do I cut them off?") could not be answered in one
-/// place. It can now.
+/// Who can use Plug. Every client is one row with one switch: on, it can use
+/// Plug; off, it cannot. Everything else about a client, its servers, its
+/// name, what it has open, is one click away in the row's detail, so the list
+/// answers "who reaches my tools, and how do I cut them off?" at a glance.
 struct ClientsView: View {
     let model: AppModel
     @Binding var search: String
@@ -224,11 +224,10 @@ struct ClientsView: View {
             matches(displayName($0)) || matches($0.transport) || matches($0.sessionId)
         }
     }
-    @State private var expanded: Set<String> = []
     @State private var renaming: Renaming?
     @State private var newName = ""
-    /// The session whose server choices are open.
-    @State private var accessSession: String?
+    /// The row whose detail is open.
+    @State private var opened: String?
 
     /// The client being renamed.
     private struct Renaming {
@@ -249,7 +248,7 @@ struct ClientsView: View {
     /// Server choices for an app on this Mac, stored under the name its link
     /// was written for. An app that reaches Plug over the network sends its
     /// requests under its grant instead, and is offered them in its row under
-    /// Remote; a choice made here would not reach it.
+    /// Over the network; a choice made here would not reach it.
     private func access(to app: LinkableApp, sessions: [LiveSession]) -> ClientAccess? {
         guard app.linked || !sessions.isEmpty else { return nil }
         let overNetwork = app.transport?.lowercased() == "http"
@@ -268,8 +267,13 @@ struct ClientsView: View {
     }
 
     private func rename(key: String, shown: String) {
+        opened = nil
         newName = shown
         renaming = Renaming(key: key, hasName: names.name(forKey: key) != nil)
+    }
+
+    private func isOpen(_ id: String) -> Binding<Bool> {
+        Binding(get: { opened == id }, set: { opened = $0 ? id : nil })
     }
 
     var body: some View {
@@ -282,20 +286,28 @@ struct ClientsView: View {
                 } else if model.initialDataUnavailable {
                     UnavailablePage(item: "Clients") { run(.reconnect) }
                 } else if isEmpty {
-                    EmptyPage(
-                        title: search.isEmpty
-                            ? (model.connectableAppsError == nil ? "Nothing is connected" : "Client scan failed")
-                            : "No matching clients",
-                        message: search.isEmpty
-                            ? (model.connectableAppsError
-                                ?? "When a client connects through Plug it shows up here, along with everything it can reach.")
-                            : "Nothing connected to Plug matches “\(search.trimmingCharacters(in: .whitespaces))”.",
-                        symbol: search.isEmpty
-                            ? (model.connectableAppsError == nil
-                                ? "app.connected.to.app.below.fill"
-                                : "exclamationmark.triangle")
-                            : "magnifyingglass"
-                    )
+                    if search.isEmpty, model.connectableAppsError == nil {
+                        EmptyPage(
+                            title: "No clients yet",
+                            message: "A client is an app that uses your servers, such as Claude or Cursor. When Plug finds one on this Mac, it shows here with a switch.",
+                            symbol: "app.connected.to.app.below.fill",
+                            actionTitle: "How Plug works",
+                            actionIntent: .showGuide,
+                            run: run
+                        )
+                    } else if search.isEmpty {
+                        EmptyPage(
+                            title: "Plug could not look for clients",
+                            message: model.connectableAppsError ?? "",
+                            symbol: "exclamationmark.triangle"
+                        )
+                    } else {
+                        EmptyPage(
+                            title: "No matching clients",
+                            message: "No client matches “\(search.trimmingCharacters(in: .whitespaces))”.",
+                            symbol: "magnifyingglass"
+                        )
+                    }
                 } else {
                     List {
                         if model.isLoadingConnectableApps && apps.isEmpty {
@@ -322,72 +334,28 @@ struct ClientsView: View {
                         if !connectedApps.isEmpty || !unmatchedSessions.isEmpty {
                             sectionLabel(
                                 "Connected now",
-                                count: connectedApps.count + unmatchedSessions.count,
-                                unit: "client"
+                                count: connectedApps.count + unmatchedSessions.count
                             )
                             ForEach(connectedApps) { entry in
-                                AppLinkRow(
-                                    app: entry.app,
-                                    name: names.name(forKey: entry.app.target) ?? entry.app.name,
-                                    access: access(to: entry.app, sessions: entry.sessions),
-                                    sessionCount: entry.sessions.count,
-                                    isExpanded: expansion(entry.app.target),
-                                    isBusy: model.busyApps.contains(entry.app.target),
-                                    run: run
-                                )
-                                .listRowSeparator(.hidden)
-                                if expanded.contains(entry.app.target) {
-                                    ForEach(entry.sessions) { session in
-                                        sessionLine(session)
-                                            .listRowSeparator(.hidden)
-                                    }
-                                }
+                                appRow(entry.app, sessions: entry.sessions)
                             }
                             ForEach(unmatchedSessions) { session in
                                 sessionRow(session)
-                                    .listRowSeparator(.hidden)
                             }
                         }
                         if !idleApps.isEmpty {
-                            sectionLabel("On this Mac", count: idleApps.count, unit: "client")
+                            sectionLabel("On this Mac", count: idleApps.count)
                             ForEach(idleApps) { app in
-                                AppLinkRow(
-                                    app: app,
-                                    name: names.name(forKey: app.target) ?? app.name,
-                                    access: access(to: app, sessions: []),
-                                    sessionCount: 0,
-                                    isExpanded: nil,
-                                    isBusy: model.busyApps.contains(app.target),
-                                    run: run
-                                )
-                                .listRowSeparator(.hidden)
+                                appRow(app, sessions: [])
                             }
-                            Text("Turn on a client to add Plug to its settings. Restart it to pick up the change.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
+                            footnote("Turn a client on to add Plug to its settings. Restart the client to pick up the change.")
                         }
                         if !grants.isEmpty {
-                            sectionLabel("Remote", count: grants.count, unit: "client")
+                            sectionLabel("Over the network", count: grants.count)
                             ForEach(grants) { grant in
-                                GrantRow(
-                                    grant: grant,
-                                    name: names.name(forKey: grant.clientKey) ?? grant.clientName,
-                                    access: access(
-                                        key: grant.clientKey,
-                                        name: names.name(forKey: grant.clientKey) ?? grant.clientName
-                                    ),
-                                    rename: { rename(key: grant.clientKey, shown: $0) },
-                                    run: run
-                                )
-                                    .listRowSeparator(.hidden)
+                                grantRow(grant)
                             }
-                            Text("These clients can reach Plug over the network. Revoke anything you don't recognize.")
-                                .font(.caption)
-                                .foregroundStyle(.secondary)
-                                .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
+                            footnote("These clients reach Plug over the network. Turn off any you do not recognize.")
                         }
                     }
                     .listStyle(.inset)
@@ -418,47 +386,111 @@ struct ClientsView: View {
             && !model.isLoadingConnectableApps
     }
 
-    private func sectionLabel(_ title: String, count: Int, unit: String) -> some View {
-        SectionLabel(text: title, trailing: count == 1 ? "1 \(unit)" : "\(count) \(unit)s")
+    private func sectionLabel(_ title: String, count: Int) -> some View {
+        SectionLabel(text: title, trailing: count == 1 ? "1 client" : "\(count) clients")
             .padding(.top, Metric.regular)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
     }
 
-    private func accessShown(_ sessionId: String) -> Binding<Bool> {
-        Binding(
-            get: { accessSession == sessionId },
-            set: { accessSession = $0 ? sessionId : nil }
-        )
+    private func footnote(_ text: String) -> some View {
+        Text(text)
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .listRowSeparator(.hidden)
+            .listRowBackground(Color.clear)
     }
 
-    private func expansion(_ target: String) -> Binding<Bool> {
-        Binding(
-            get: { expanded.contains(target) },
-            set: { isOn in
-                if isOn { expanded.insert(target) } else { expanded.remove(target) }
-            }
-        )
-    }
+    // MARK: - Rows
 
-    /// One session of an app whose row is already above it: the id that tells
-    /// it apart, how long it has been open, and what it can reach.
-    private func sessionLine(_ session: LiveSession) -> some View {
-        HStack(spacing: Metric.snug) {
-            Text(session.sessionId.prefix(8))
-                .font(.caption.monospaced())
-                .textSelection(.enabled)
-            Text(duration(session.connectedSecs))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(1)
-            Spacer(minLength: Metric.tight)
-            Text(toolsText(session))
-                .font(.caption.monospacedDigit())
-                .foregroundStyle(.secondary)
+    /// A client on this Mac. Its switch adds Plug to the client's settings or
+    /// takes it out.
+    private func appRow(_ app: LinkableApp, sessions: [LiveSession]) -> some View {
+        let name = names.name(forKey: app.target) ?? app.name
+        let access = access(to: app, sessions: sessions)
+        let known = app.detected || app.linked
+        return ClientRow(
+            name: name,
+            status: ClientStatus.app(app, connections: sessions.count, limit: access?.summary),
+            isLive: !sessions.isEmpty,
+            dimmed: !known && sessions.isEmpty,
+            isOpen: isOpen("app:\(app.target)"),
+            isBusy: model.busyApps.contains(app.target),
+            switchLabel: "Use Plug",
+            isOn: known ? app.linked : nil,
+            setOn: { run($0 ? .linkApp(app.target) : .unlinkApp(app.target)) }
+        ) {
+            AppGlyph(target: app.target, name: app.name)
+        } detail: {
+            ClientDetail(
+                name: name,
+                about: app.linked
+                    ? "Plug is in this client's settings."
+                    : "Plug is not in this client's settings. Turn it on to add it.",
+                access: access,
+                connections: sessions.map(connection),
+                rename: access.map { access in { rename(key: access.key, shown: name) } },
+                run: run
+            )
         }
-        .padding(.leading, 22 + Metric.snug)
-        .accessibilityElement(children: .combine)
+        .listRowSeparator(.hidden)
+    }
+
+    /// Something connected that Plug has no client entry for. There is nothing
+    /// to switch: it is here because it is connected.
+    private func sessionRow(_ session: LiveSession) -> some View {
+        let name = displayName(session)
+        let key = accessKey(of: session)
+        return ClientRow(
+            name: name,
+            status: ClientStatus(
+                text: connectionDescription(session),
+                symbol: "bolt.fill"
+            ),
+            isLive: true,
+            dimmed: false,
+            isOpen: isOpen("session:\(session.sessionId)"),
+            isBusy: false,
+            switchLabel: "",
+            isOn: nil,
+            setOn: { _ in }
+        ) {
+            AppGlyph(target: sessionTarget(session), name: name, appPath: session.host?.app)
+        } detail: {
+            ClientDetail(
+                name: name,
+                about: "Plug does not know this client by name, so it has no switch. It shows here while it is connected.",
+                access: key.map { access(key: $0, name: name) },
+                connections: [connection(session)],
+                rename: names.key(of: session).map { key in { rename(key: key, shown: name) } },
+                run: run
+            )
+        }
+        .listRowSeparator(.hidden)
+    }
+
+    /// A client allowed in over the network. Its switch is its permission:
+    /// off takes the permission away, and the client has to ask again.
+    private func grantRow(_ grant: DownstreamClient) -> some View {
+        let name = names.name(forKey: grant.clientKey) ?? grant.clientName
+        let access = access(key: grant.clientKey, name: name)
+        return GrantRow(
+            grant: grant,
+            name: name,
+            access: access,
+            isOpen: isOpen("grant:\(grant.clientId)"),
+            rename: { rename(key: grant.clientKey, shown: name) },
+            run: run
+        )
+        .listRowSeparator(.hidden)
+    }
+
+    private func connection(_ session: LiveSession) -> ClientDetail.Connection {
+        ClientDetail.Connection(
+            id: session.sessionId,
+            how: connectionDescription(session),
+            tools: toolsText(session)
+        )
     }
 
     private func matches(_ value: String) -> Bool {
@@ -468,51 +500,9 @@ struct ClientsView: View {
 
     private var connectionSummary: String? {
         guard model.hasLoadedSnapshot else { return nil }
-        let count = sessions.count
-        let summary = "\(count) open \(count == 1 ? "session" : "sessions")"
+        let count = roster.connected.count + roster.other.count
+        let summary = count == 1 ? "1 client connected" : "\(count) clients connected"
         return model.dataIsStale ? "Last known · \(summary)" : summary
-    }
-
-    private func sessionRow(_ session: LiveSession) -> some View {
-        HStack(spacing: Metric.snug) {
-            AppGlyph(
-                target: sessionTarget(session),
-                name: displayName(session),
-                appPath: session.host?.app
-            )
-            VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(displayName(session)).font(.body)
-                Text(connectionDescription(session))
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-            }
-            .layoutPriority(1)
-            Spacer(minLength: Metric.tight)
-            Text(toolsText(session))
-                .font(.callout.monospacedDigit())
-                .foregroundStyle(.secondary)
-            if let key = accessKey(of: session) {
-                AccessButton(
-                    access: access(key: key, name: displayName(session)),
-                    isShown: accessShown(session.sessionId),
-                    run: run
-                )
-            }
-            if let key = names.key(of: session) {
-                RenameButton { rename(key: key, shown: displayName(session)) }
-            }
-        }
-        .padding(.vertical, Metric.tight)
-        .accessibilityElement(children: .combine)
-        .accessibilityActions {
-            if accessKey(of: session) != nil {
-                Button("Choose Servers") { accessSession = session.sessionId }
-            }
-            if let key = names.key(of: session) {
-                Button("Rename") { rename(key: key, shown: displayName(session)) }
-            }
-        }
     }
 
     private func displayName(_ session: LiveSession) -> String { names.displayName(session) }
@@ -550,267 +540,282 @@ struct ClientsView: View {
         guard let count = model.snapshot.clientVisibility
             .first(where: { $0.sessionId == session.sessionId })?
             .visibleToolCount
-        else { return "—" }
+        else { return "" }
         return count == 1 ? "1 tool" : "\(count) tools"
     }
 }
 
-/// Opens the rename prompt for the row it sits in.
-private struct RenameButton: View {
-    let action: () -> Void
+/// The one line under a client's name, with a glyph so the state is told
+/// before the sentence is read. Pure value so the wording can be tested.
+struct ClientStatus: Equatable {
+    let text: String
+    let symbol: String
 
-    var body: some View {
-        Button(action: action) {
-            Image(systemName: "pencil")
-                .foregroundStyle(.secondary)
-                .frame(width: 24, height: 24)
-                .contentShape(Rectangle())
+    init(text: String, symbol: String) {
+        self.text = text
+        self.symbol = symbol
+    }
+
+    /// A client on this Mac: connected, ready, or not using Plug.
+    static func app(_ app: LinkableApp, connections: Int, limit: String?) -> ClientStatus {
+        let state: String
+        let symbol: String
+        if connections > 0 {
+            state = connections == 1 ? "Connected" : "Connected · \(connections) connections"
+            symbol = "bolt.fill"
+        } else if !app.linked {
+            state = app.detected ? "Off" : "Not installed"
+            symbol = app.detected ? "circle" : "questionmark.app.dashed"
+        } else if !app.detected {
+            state = "On · client not found on this Mac"
+            symbol = "checkmark.circle"
+        } else {
+            state = app.transport?.lowercased() == "http" ? "On · over the network" : "On · not open right now"
+            symbol = "checkmark.circle"
         }
-        .buttonStyle(.plain)
-        .help("Rename")
-        .accessibilityLabel("Rename")
+        return ClientStatus(text: limit.map { "\(state) · \($0)" } ?? state, symbol: symbol)
     }
 }
 
-/// Opens the servers a client may use, for the row it sits in.
-private struct AccessButton: View {
-    let access: ClientAccess
-    @Binding var isShown: Bool
+/// One client: its icon, its name, one line about it, and one switch. The row
+/// opens its detail; the switch works without opening anything.
+private struct ClientRow<Glyph: View, Detail: View>: View {
+    let name: String
+    let status: ClientStatus
+    let isLive: Bool
+    let dimmed: Bool
+    @Binding var isOpen: Bool
+    let isBusy: Bool
+    let switchLabel: String
+    /// Nil when this client has nothing to switch.
+    let isOn: Bool?
+    let setOn: (Bool) -> Void
+    @ViewBuilder var glyph: Glyph
+    @ViewBuilder var detail: Detail
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            Button { isOpen = true } label: {
+                HStack(spacing: Metric.snug) {
+                    glyph.opacity(dimmed ? 0.4 : 1)
+                    VStack(alignment: .leading, spacing: Metric.rowGap) {
+                        Text(name)
+                            .font(.body)
+                            .foregroundStyle(dimmed ? .secondary : .primary)
+                        Label(status.text, systemImage: status.symbol)
+                            .font(.caption)
+                            .foregroundStyle(isLive ? Color.green : Color.secondary)
+                            .labelStyle(.titleAndIcon)
+                            .lineLimit(1)
+                    }
+                    Spacer(minLength: Metric.tight)
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Show details")
+            .accessibilityLabel("\(name), \(status.text)")
+            .accessibilityHint("Shows details")
+            .popover(isPresented: $isOpen, arrowEdge: .trailing) { detail }
+
+            if isBusy {
+                ProgressView().controlSize(.small)
+            } else if let isOn {
+                Toggle(switchLabel, isOn: Binding(get: { isOn }, set: setOn))
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .controlSize(.small)
+                    .accessibilityLabel("\(switchLabel), \(name)")
+            }
+        }
+        .padding(.vertical, Metric.tight)
+    }
+}
+
+/// Everything about one client that is not its switch: the servers it can
+/// use, what it has open, and its name.
+private struct ClientDetail: View {
+    /// One open connection of a client.
+    struct Connection: Identifiable {
+        let id: String
+        let how: String
+        let tools: String
+    }
+
+    let name: String
+    let about: String
+    /// Nil when there are no server choices to offer for this client.
+    let access: ClientAccess?
+    let connections: [Connection]
+    /// Nil when Plug has nothing to store a name under.
+    let rename: (() -> Void)?
+    /// A line that identifies the client to someone checking it, such as the
+    /// site it came from.
+    var identity: String?
     let run: (PlugIntent) -> Void
 
     var body: some View {
-        Button { isShown = true } label: {
-            Image(systemName: "slider.horizontal.3")
-                .foregroundStyle(access.isLimited ? Color.accentColor : Color.secondary)
-                .frame(width: 24, height: 24)
-                .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-        .help(access.summary.map { "Choose servers (\($0))" } ?? "Choose servers")
-        .accessibilityLabel("Choose servers")
-        .popover(isPresented: $isShown, arrowEdge: .trailing) {
-            VStack(alignment: .leading, spacing: Metric.snug) {
-                Text("Servers \(access.name) can use")
-                    .font(.headline)
-                if access.servers.isEmpty {
-                    Text("No servers yet.").foregroundStyle(.secondary)
-                }
-                ForEach(access.servers) { server in
-                    Toggle(
-                        isOn: Binding(
-                            get: { !access.blockedServers.contains(server.name) },
-                            set: {
-                                run(.setClientServerBlocked(
-                                    key: access.key, server: server.name, blocked: !$0
-                                ))
-                            }
-                        )
-                    ) {
-                        Text(server.name)
-                            .foregroundStyle(server.enabled ? .primary : .secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                }
-                Text(note)
+        VStack(alignment: .leading, spacing: Metric.regular) {
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(name).font(.headline)
+                Text(about)
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                if let identity {
+                    Text(identity)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .textSelection(.enabled)
+                }
             }
-            .padding(Metric.regular)
-            .frame(width: 280)
+
+            if let access {
+                VStack(alignment: .leading, spacing: Metric.tight) {
+                    SectionLabel(text: "Servers it can use")
+                    if access.servers.isEmpty {
+                        Text("No servers yet.").font(.callout).foregroundStyle(.secondary)
+                    } else {
+                        ScrollView {
+                            VStack(spacing: Metric.tight) {
+                                ForEach(access.servers) { server in
+                                    Toggle(
+                                        isOn: Binding(
+                                            get: { !access.blockedServers.contains(server.name) },
+                                            set: {
+                                                run(.setClientServerBlocked(
+                                                    key: access.key, server: server.name, blocked: !$0
+                                                ))
+                                            }
+                                        )
+                                    ) {
+                                        Text(server.name)
+                                            .foregroundStyle(server.enabled ? .primary : .secondary)
+                                            .frame(maxWidth: .infinity, alignment: .leading)
+                                    }
+                                    .toggleStyle(.switch)
+                                    .controlSize(.small)
+                                }
+                            }
+                        }
+                        .frame(maxHeight: 220)
+                        .scrollBounceBehavior(.basedOnSize)
+                    }
+                    Text(Self.note(for: access))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+
+            if !connections.isEmpty {
+                VStack(alignment: .leading, spacing: Metric.tight) {
+                    SectionLabel(
+                        text: "Connected now",
+                        trailing: connections.count == 1 ? nil : "\(connections.count) connections"
+                    )
+                    ForEach(connections) { connection in
+                        HStack(spacing: Metric.snug) {
+                            Text(connection.how).font(.caption)
+                            Spacer(minLength: Metric.tight)
+                            Text(connection.tools)
+                                .font(.caption.monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        .help("Connection \(connection.id.prefix(8))")
+                    }
+                }
+            }
+
+            if let rename {
+                Button("Rename…", action: rename)
+            }
         }
+        .padding(Metric.regular)
+        .frame(width: 320, alignment: .leading)
     }
 
-    private var note: String {
+    static func note(for access: ClientAccess) -> String {
         var lines = [
             access.isRemote
-                ? "A remote client cannot get around this."
+                ? "A client over the network cannot get around this."
                 : "This keeps a client's list short. It is not a lock: a client on this Mac can connect under another name.",
         ]
         if access.blockedToolCount > 0 {
             let count = access.blockedToolCount
-            lines.append(
-                "Also kept from \(count == 1 ? "1 tool" : "\(count) tools"), set with plug clients block."
-            )
+            lines.append("It is also kept from \(count == 1 ? "1 tool" : "\(count) tools").")
         }
         return lines.joined(separator: " ")
     }
 }
 
-/// A client on this Mac, and whether Plug is wired into it.
-private struct AppLinkRow: View {
-    let app: LinkableApp
-    /// The name to show: the owner's, else the app's own.
-    let name: String
-    /// Nil when there are no server choices to offer for this row.
-    let access: ClientAccess?
-    /// Open sessions counted from the live snapshot, which is fresher than
-    /// the app scan.
-    let sessionCount: Int
-    /// Set when the row has sessions to show underneath.
-    let isExpanded: Binding<Bool>?
-    let isBusy: Bool
-    let run: (PlugIntent) -> Void
-    @State private var choosingServers = false
-
-    var body: some View {
-        HStack(spacing: Metric.snug) {
-            AppGlyph(target: app.target, name: app.name)
-                .opacity(app.detected || app.linked || sessionCount > 0 ? 1 : 0.4)
-            VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(name)
-                    .font(.body)
-                    .foregroundStyle(app.detected || app.linked ? .primary : .secondary)
-                Label(status, systemImage: statusSymbol)
-                    .font(.caption)
-                    .foregroundStyle(isLive ? Color.green : Color.secondary)
-                    .labelStyle(.titleAndIcon)
-            }
-            .layoutPriority(1)
-            Spacer(minLength: Metric.tight)
-            if let isExpanded, sessionCount > 0 {
-                Button {
-                    isExpanded.wrappedValue.toggle()
-                } label: {
-                    Image(systemName: "chevron.right")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .rotationEffect(.degrees(isExpanded.wrappedValue ? 90 : 0))
-                        .frame(width: 24, height: 24)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help(isExpanded.wrappedValue ? "Hide sessions" : "Show sessions")
-                .accessibilityLabel(isExpanded.wrappedValue ? "Hide sessions" : "Show sessions")
-            }
-            if let access {
-                AccessButton(access: access, isShown: $choosingServers, run: run)
-            }
-            if isBusy {
-                ProgressView().controlSize(.small)
-            } else if app.detected || app.linked {
-                Toggle(
-                    "Use Plug",
-                    isOn: Binding(
-                        get: { app.linked },
-                        set: { run($0 ? .linkApp(app.target) : .unlinkApp(app.target)) }
-                    )
-                )
-                .labelsHidden()
-                .toggleStyle(.switch)
-                .controlSize(.mini)
-                .disabled(!app.detected && !app.linked)
-            }
-        }
-        .padding(.vertical, Metric.tight)
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(name), \(status)")
-        // Combining the row hides its switch from VoiceOver.
-        .accessibilityActions {
-            if let isExpanded, sessionCount > 0 {
-                Button(isExpanded.wrappedValue ? "Hide Sessions" : "Show Sessions") {
-                    isExpanded.wrappedValue.toggle()
-                }
-            }
-            if access != nil {
-                Button("Choose Servers") { choosingServers = true }
-            }
-            if !isBusy, app.detected || app.linked {
-                Button(app.linked ? "Stop Using Plug" : "Use Plug") {
-                    run(app.linked ? .unlinkApp(app.target) : .linkApp(app.target))
-                }
-            }
-        }
-    }
-
-    /// The state as a glyph, so linked and not-linked are told apart before
-    /// the sentence is read.
-    private var isLive: Bool { sessionCount > 0 }
-
-    private var statusSymbol: String {
-        if isLive { return "bolt.fill" }
-        guard app.linked else { return app.detected ? "circle" : "questionmark.app.dashed" }
-        return "checkmark.circle"
-    }
-
-    private var status: String {
-        let state = state
-        guard let limit = access?.summary else { return state }
-        return "\(state) · \(limit)"
-    }
-
-    private var state: String {
-        if isLive {
-            let count = sessionCount
-            return count == 1 ? "1 session" : "\(count) sessions"
-        }
-        guard app.linked else { return app.detected ? "Not using Plug" : "Not installed" }
-        if !app.detected { return "Set up · client not found" }
-        return app.transport?.lowercased() == "http" ? "Ready · over the network" : "Ready"
-    }
-}
-
+/// A client allowed in over the network. On means it has permission; turning
+/// it off asks first, because the client has to ask again to come back.
 private struct GrantRow: View {
     let grant: DownstreamClient
     /// The name to show: the owner's, else the one the client registered.
     let name: String
     let access: ClientAccess
-    /// Asks for a new name, starting from the one shown.
-    let rename: (String) -> Void
+    @Binding var isOpen: Bool
+    let rename: () -> Void
     let run: (PlugIntent) -> Void
     @State private var confirming = false
-    @State private var choosingServers = false
 
     var body: some View {
-        HStack(spacing: Metric.snug) {
+        ClientRow(
+            name: name,
+            status: ClientStatus(
+                text: access.summary.map { "\(origin) · \($0)" } ?? origin,
+                symbol: "network"
+            ),
+            isLive: false,
+            dimmed: false,
+            isOpen: $isOpen,
+            isBusy: false,
+            switchLabel: "Allowed",
+            isOn: true,
+            setOn: { if !$0 { confirming = true } }
+        ) {
             Image(systemName: "key.horizontal")
                 .font(.title3)
                 .foregroundStyle(.secondary)
                 .frame(width: 22)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(name).font(.body)
-                Text(grantDetail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-            }
-            .layoutPriority(1)
-            Spacer(minLength: Metric.tight)
-            AccessButton(access: access, isShown: $choosingServers, run: run)
-            RenameButton { rename(name) }
-            Button("Revoke…", role: .destructive) { confirming = true }
-                .controlSize(.small)
+        } detail: {
+            ClientDetail(
+                name: name,
+                about: "You allowed this client to use Plug over the network. Turn it off to take that back.",
+                access: access,
+                connections: [],
+                rename: rename,
+                identity: identity,
+                run: run
+            )
         }
-        .padding(.vertical, Metric.tight)
         .confirmationDialog(
-            "Revoke \(name)?",
+            "Turn off \(name)?",
             isPresented: $confirming,
             titleVisibility: .visible
         ) {
-            Button("Revoke Access", role: .destructive) { run(.revokeClient(id: grant.clientId)) }
+            Button("Turn Off", role: .destructive) { run(.revokeClient(id: grant.clientId)) }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("It loses access immediately and has to ask for permission again.")
+            Text("It stops being able to use Plug right away, and leaves this list. To come back it has to ask you again.")
         }
     }
 
-    private var grantDetail: String {
-        // A client that identifies itself by web address is named by that
-        // site. One Plug registered gets a short id, since two can share a
-        // name. The registration method is not shown: nobody can act on it.
-        let id: String
-        if let host = URL(string: grant.clientId)?.host() {
-            id = host
-        } else {
-            let short = grant.clientId.hasPrefix("plug_")
-                ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
-            id = "ID \(short.prefix(8))"
-        }
-        guard let limit = access.summary else { return id }
-        return "\(id) · \(limit)"
+    /// Where the client came from, when it says: a site is a name a person
+    /// can check. Anything else is simply over the network.
+    private var origin: String {
+        URL(string: grant.clientId)?.host() ?? "Allowed"
+    }
+
+    /// A client Plug registered gets a short id, since two can share a name.
+    /// It is here, not in the row, for the rare time two need telling apart.
+    private var identity: String {
+        if let host = URL(string: grant.clientId)?.host() { return "From \(host)" }
+        let short = grant.clientId.hasPrefix("plug_")
+            ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
+        return "ID \(short.prefix(8))"
     }
 }

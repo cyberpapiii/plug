@@ -214,6 +214,19 @@ struct PlugSituation: Equatable, Sendable {
     var troubledServers: [ServerFacts] { activeServers.filter(\.health.needsAttention) }
     var workingServers: [ServerFacts] { activeServers.filter { $0.health == .working } }
     var totalTools: Int { activeServers.reduce(0) { $0 + $1.toolCount } }
+
+    /// Every server in one order for every list: the ones that are on, then
+    /// the ones that are off.
+    var listedServers: [ServerFacts] { activeServers + servers.filter { !$0.enabled } }
+
+    /// The one count line the window and the menu bar panel both show, so
+    /// they cannot disagree. Rows read before the daemon went away say so.
+    func countsSummary(stale: Bool) -> String {
+        let count = servers.count
+        let tools = totalTools
+        let summary = "\(count) \(count == 1 ? "server" : "servers") · \(tools) \(tools == 1 ? "tool" : "tools")"
+        return stale ? "Last known · \(summary)" : summary
+    }
 }
 
 // MARK: - Intents

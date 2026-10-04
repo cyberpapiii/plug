@@ -187,6 +187,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Clients shows one row and one switch for each client. Press a row to see
+  which servers the client can use, what is connected now, and to rename it.
+  Sessions, ids, and Revoke are no longer on the page: turning off a client
+  that connects over the network asks first, then removes its access.
+- The menu bar panel and the window now agree. Both show the same count line
+  ("12 servers · 140 tools"), the panel lists servers that are off, dimmed and
+  last, and a server row says "14 tools" in both places.
+- Every sheet has the same width, the same footer, and the same way of saying
+  what went wrong, including Add Another Account and Watch a Tool. Switches in
+  rows are one size.
 - A problem says what happened and what to do. A press that fails now reads
   "Could not restart notion.", then the reason, then the next step, and it
   stays until you dismiss it; it used to be the raw error and leave after 8
