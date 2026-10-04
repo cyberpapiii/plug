@@ -204,12 +204,17 @@ final class ServerPlaceTests: XCTestCase {
 
 /// Where an icon comes from when no app on this Mac supplies it.
 final class FoundIconTests: XCTestCase {
-    private func picture(side: Int = 64) throws -> Data {
+    private func picture(side: Int = 64, fill: CGColor? = CGColor(red: 0, green: 0.4, blue: 0.9, alpha: 1)) throws -> Data {
         let rep = try XCTUnwrap(NSBitmapImageRep(
             bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8,
             samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
             colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
         ))
+        if let fill {
+            let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: rep)?.cgContext)
+            context.setFillColor(fill)
+            context.fill(CGRect(x: 0, y: 0, width: side, height: side))
+        }
         return try XCTUnwrap(rep.representation(using: .png, properties: [:]))
     }
 
@@ -316,10 +321,37 @@ final class FoundIconTests: XCTestCase {
         XCTAssertNil(SiteIcon.best(of: []))
     }
 
+    /// An icon that arrives with a wide empty margin used to be taken for a
+    /// bare mark and set, small, on a white tile.
+    func testAnIconWithItsOwnMarginFillsTheSameSpaceAsAnyOther() throws {
+        let side = 128
+        let rep = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ))
+        let context = try XCTUnwrap(NSGraphicsContext(bitmapImageRep: rep)?.cgContext)
+        // A green rounded square in the middle half of an empty picture.
+        let square = CGRect(x: 32, y: 32, width: 64, height: 64)
+        context.addPath(CGPath(roundedRect: square, cornerWidth: 14, cornerHeight: 14, transform: nil))
+        context.setFillColor(CGColor(red: 0, green: 0.8, blue: 0, alpha: 1))
+        context.fillPath()
+        let data = try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+
+        let tiled = try XCTUnwrap(NSBitmapImageRep(data: try XCTUnwrap(IconTile.png(from: data))))
+        let middle = try XCTUnwrap(tiled.colorAt(x: tiled.pixelsWide / 2, y: tiled.pixelsHigh / 2))
+        XCTAssertGreaterThan(middle.greenComponent, middle.redComponent + 0.5)
+        // A fifth of the way in is inside the icon, not on a tile around it.
+        let near = try XCTUnwrap(tiled.colorAt(x: tiled.pixelsWide / 5, y: tiled.pixelsHigh / 2))
+        XCTAssertGreaterThan(near.greenComponent, near.redComponent + 0.5)
+        XCTAssertGreaterThan(near.alphaComponent, 0.9)
+    }
+
     func testOnlyAPictureBecomesAnIcon() throws {
         XCTAssertNotNil(IconTile.png(from: try picture()))
         XCTAssertNil(IconTile.png(from: Data("<html>not found</html>".utf8)))
         XCTAssertNil(IconTile.png(from: try picture(side: 8)), "too small to show")
+        XCTAssertNil(IconTile.png(from: try picture(fill: nil)), "nothing in it")
     }
 
     @MainActor

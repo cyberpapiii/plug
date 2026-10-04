@@ -908,57 +908,96 @@ enum IconTile {
     static func png(from data: Data) -> Data? {
         guard let image = NSImage(data: data) else { return nil }
         var proposed = CGRect(x: 0, y: 0, width: side, height: side)
-        guard let source = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
-              source.width >= 32, source.height >= 32 else { return nil }
-        let space = CGColorSpaceCreateDeviceRGB()
-        let info = CGImageAlphaInfo.premultipliedLast.rawValue
-
-        // Read a small copy to learn the picture's shape.
-        let probe = 64
-        guard let measure = CGContext(
-            data: nil, width: probe, height: probe, bitsPerComponent: 8,
-            bytesPerRow: probe * 4, space: space, bitmapInfo: info
-        ) else { return nil }
-        measure.draw(source, in: CGRect(x: 0, y: 0, width: probe, height: probe))
-        guard let pixels = measure.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
-        var clear = 0
-        var light = 0.0
-        func alpha(_ x: Int, _ y: Int) -> Int { Int(pixels[(y * probe + x) * 4 + 3]) }
-        for index in 0..<(probe * probe) {
-            let a = Double(pixels[index * 4 + 3]) / 255
-            guard a >= 0.5 else { clear += 1; continue }
-            let red = Double(pixels[index * 4]), green = Double(pixels[index * 4 + 1]), blue = Double(pixels[index * 4 + 2])
-            light += (0.299 * red + 0.587 * green + 0.114 * blue) / 255 / a
-        }
-        let solid = probe * probe - clear
-        let clearShare = Double(clear) / Double(probe * probe)
-        let isLight = solid > 0 && light / Double(solid) > 0.8
-        let last = probe - 1
-        let cornersClear = [alpha(0, 0), alpha(last, 0), alpha(0, last), alpha(last, last)].allSatisfy { $0 < 128 }
+        guard let whole = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
+              whole.width >= 32, whole.height >= 32 else { return nil }
+        // A picture often carries an empty margin of its own. Measure and
+        // draw what is inside it, or the margin is added twice.
+        guard let box = shape(of: whole)?.box,
+              let source = whole.cropping(to: box),
+              let shape = shape(of: source) else { return nil }
 
         guard let context = CGContext(
             data: nil, width: side, height: side, bitsPerComponent: 8,
-            bytesPerRow: side * 4, space: space, bitmapInfo: info
+            bytesPerRow: side * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
         ) else { return nil }
         context.interpolationQuality = .high
         let canvas = CGRect(x: 0, y: 0, width: side, height: side)
-        if cornersClear, clearShare < 0.3 {
-            // Already shaped like an icon. Leave it alone.
-            context.draw(source, in: canvas)
+        // App icons keep a margin inside their square; so does this.
+        let tile = canvas.insetBy(dx: canvas.width * 0.08, dy: canvas.width * 0.08)
+        if shape.cornersClear, shape.clearShare < 0.3 {
+            // Already shaped like an icon. Leave its shape alone.
+            context.draw(source, in: fit(source, in: tile))
         } else {
-            // App icons keep a margin inside their square; so does the tile.
-            let tile = canvas.insetBy(dx: canvas.width * 0.08, dy: canvas.width * 0.08)
             let radius = tile.width * 0.24
             context.addPath(CGPath(roundedRect: tile, cornerWidth: radius, cornerHeight: radius, transform: nil))
             context.clip()
-            let bare = clearShare >= 0.3
-            let shade: CGFloat = bare && isLight ? 0.11 : 1
+            let bare = shape.clearShare >= 0.3 || source.width != source.height
+            let shade: CGFloat = bare && shape.isLight ? 0.11 : 1
             context.setFillColor(CGColor(red: shade, green: shade, blue: shade, alpha: 1))
             context.fill(tile)
             let margin = bare ? tile.width * 0.16 : 0
-            context.draw(source, in: tile.insetBy(dx: margin, dy: margin))
+            context.draw(source, in: fit(source, in: tile.insetBy(dx: margin, dy: margin)))
         }
         guard let result = context.makeImage() else { return nil }
         return NSBitmapImageRep(cgImage: result).representation(using: .png, properties: [:])
+    }
+
+    /// The largest rectangle of the picture's proportions inside `rect`.
+    private static func fit(_ image: CGImage, in rect: CGRect) -> CGRect {
+        let scale = min(rect.width / CGFloat(image.width), rect.height / CGFloat(image.height))
+        let width = CGFloat(image.width) * scale, height = CGFloat(image.height) * scale
+        return CGRect(x: rect.midX - width / 2, y: rect.midY - height / 2, width: width, height: height)
+    }
+
+    private struct Shape {
+        /// The part of the picture that is not empty, in its own pixels.
+        let box: CGRect
+        /// How much of the picture is empty.
+        let clearShare: Double
+        let isLight: Bool
+        let cornersClear: Bool
+    }
+
+    /// What a small copy of the picture says about it. Nil for a picture
+    /// with nothing in it.
+    private static func shape(of image: CGImage) -> Shape? {
+        let probe = 64
+        guard let measure = CGContext(
+            data: nil, width: probe, height: probe, bitsPerComponent: 8,
+            bytesPerRow: probe * 4, space: CGColorSpaceCreateDeviceRGB(),
+            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+        ) else { return nil }
+        measure.draw(image, in: CGRect(x: 0, y: 0, width: probe, height: probe))
+        guard let pixels = measure.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        func alpha(_ x: Int, _ y: Int) -> Int { Int(pixels[(y * probe + x) * 4 + 3]) }
+        var clear = 0
+        var light = 0.0
+        var left = probe, right = -1, top = probe, bottom = -1
+        for y in 0..<probe {
+            for x in 0..<probe {
+                let index = y * probe + x
+                let a = Double(pixels[index * 4 + 3]) / 255
+                guard a >= 0.5 else { clear += 1; continue }
+                left = min(left, x); right = max(right, x); top = min(top, y); bottom = max(bottom, y)
+                let red = Double(pixels[index * 4]), green = Double(pixels[index * 4 + 1]), blue = Double(pixels[index * 4 + 2])
+                light += (0.299 * red + 0.587 * green + 0.114 * blue) / 255 / a
+            }
+        }
+        let solid = probe * probe - clear
+        guard solid > 0 else { return nil }
+        let last = probe - 1
+        // The bitmap's first row is the picture's top row, as in a CGImage.
+        let across = CGFloat(image.width) / CGFloat(probe), down = CGFloat(image.height) / CGFloat(probe)
+        let box = CGRect(
+            x: CGFloat(left) * across, y: CGFloat(top) * down,
+            width: CGFloat(right - left + 1) * across, height: CGFloat(bottom - top + 1) * down
+        ).integral.intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        return Shape(
+            box: box,
+            clearShare: Double(clear) / Double(probe * probe),
+            isLight: light / Double(solid) > 0.8,
+            cornersClear: [alpha(0, 0), alpha(last, 0), alpha(0, last), alpha(last, last)].allSatisfy { $0 < 128 }
+        )
     }
 }
