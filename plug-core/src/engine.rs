@@ -94,6 +94,8 @@ pub struct Engine {
     /// when the server returns to healthy.
     supervision_attempts: dashmap::DashMap<String, u32>,
     reload_lock: Mutex<()>,
+    /// The watch engine, once the daemon has opened it. See `crate::events`.
+    watch_events: std::sync::OnceLock<Arc<crate::events::WatchEvents>>,
     /// Whether `start` has finished bringing every configured upstream up.
     ///
     /// The daemon binds its IPC socket before `start` runs, so callers that
@@ -131,6 +133,7 @@ impl Engine {
             recovery_task_flags: dashmap::DashMap::new(),
             supervision_attempts: dashmap::DashMap::new(),
             reload_lock: Mutex::new(()),
+            watch_events: std::sync::OnceLock::new(),
             ready: watch::channel(false).0,
             #[cfg(test)]
             reloads_applied: AtomicU64::new(0),
@@ -778,6 +781,55 @@ impl Engine {
     }
 
     /// Persist and apply one operator mutation under the same lock as reload.
+    /// Hand the engine the watch events the daemon opened, so operator
+    /// requests can report on them.
+    pub fn set_watch_events(&self, events: Arc<crate::events::WatchEvents>) {
+        let _ = self.watch_events.set(events);
+    }
+
+    pub fn watch_events(&self) -> Option<&Arc<crate::events::WatchEvents>> {
+        self.watch_events.get()
+    }
+
+    /// Every configured watch in `config`, with what this run knows about it.
+    pub async fn event_statuses(&self, config: &Config) -> Vec<crate::events::EventStatus> {
+        let mut statuses = Vec::new();
+        for watch in &config.events.watch {
+            let mut status = crate::events::EventStatus::waiting(watch);
+            if let Some(events) = self.watch_events() {
+                events.describe(&mut status).await;
+            }
+            statuses.push(status);
+        }
+        statuses.sort_by(|a, b| a.name.cmp(&b.name));
+        statuses
+    }
+
+    /// Check a watch against the running servers before it is saved, so the
+    /// owner hears about a wrong tool name now and not from a log later.
+    pub fn check_watch(&self, watch: &crate::events::WatchConfig) -> anyhow::Result<()> {
+        let config = self.config.load();
+        let Some(server) = config.servers.get(&watch.server) else {
+            anyhow::bail!("unknown server `{}`", watch.server);
+        };
+        if !server.enabled {
+            anyhow::bail!("server `{}` is turned off", watch.server);
+        }
+        match self.tool_router.watched_tool(&watch.server, &watch.tool) {
+            None => anyhow::bail!(
+                "`{}` has no tool named `{}` right now; see `plug tools {}`",
+                watch.server,
+                watch.tool,
+                watch.server
+            ),
+            Some((_, false)) if !watch.allow_writes => anyhow::bail!(
+                "`{}` is not marked read-only by its server, so calling it on a schedule could change things; add --allow-writes if you are sure it does not",
+                watch.tool
+            ),
+            Some(_) => Ok(()),
+        }
+    }
+
     pub async fn apply_operator_mutation(
         self: &Arc<Self>,
         config_path: &std::path::Path,

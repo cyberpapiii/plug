@@ -787,6 +787,7 @@ fn build_configured_http_runtime(
         .ok()
     });
     if let Some(events) = &watch_events {
+        engine.set_watch_events(Arc::clone(events));
         events.spawn(engine.cancel_token().clone());
     }
 

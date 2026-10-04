@@ -362,6 +362,12 @@ pub(crate) async fn apply_server_mutation(
             blocked,
             auth_token,
         },
+        plug_core::operator::OperatorMutation::AddWatch { watch } => {
+            plug_core::ipc::IpcRequest::AddWatch { watch, auth_token }
+        }
+        plug_core::operator::OperatorMutation::RemoveWatch { event } => {
+            plug_core::ipc::IpcRequest::RemoveWatch { event, auth_token }
+        }
     };
     match crate::daemon::ipc_request(&request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),

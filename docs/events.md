@@ -24,6 +24,15 @@ every_secs = 300         # default 300, minimum 30
 
 `plug reload` picks up added, changed, and removed watches.
 
+The same from the command line, which also checks the tool exists and is
+read-only before saving:
+
+```sh
+plug events watch gmail search_messages --name inbox --arg query=is:unread
+plug events                      # every watch and how it is doing
+plug events unwatch gmail.inbox
+```
+
 What Plug does:
 
 - Calls the tool every `every_secs` seconds.

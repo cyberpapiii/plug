@@ -110,6 +110,71 @@ impl EventsConfig {
     }
 }
 
+/// How a watch is doing, for `plug events` and the app.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchHealth {
+    /// Not checked yet, or events are not possible with this config.
+    #[default]
+    Waiting,
+    /// The last check worked.
+    Watching,
+    /// The server has no tool by that name, or the server is down.
+    ToolMissing,
+    /// The tool is not marked read-only and the watch does not allow writes.
+    NotReadOnly,
+    /// The last call failed or returned an error.
+    CallFailed,
+    /// The last result was too large to send.
+    TooLarge,
+}
+
+/// One event a client can subscribe to, and how it is doing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EventStatus {
+    /// `<server>.<name>`.
+    pub name: String,
+    pub server: String,
+    /// The watched tool. `None` for an event Plug does not make by watching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub every_secs: Option<u64>,
+    #[serde(default)]
+    pub state: WatchHealth,
+    /// Unix seconds of the last check that reached the tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_checked: Option<u64>,
+    /// Unix seconds of the last change that became an event.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_changed: Option<u64>,
+    #[serde(default)]
+    pub subscribers: usize,
+}
+
+impl EventStatus {
+    /// A configured watch nothing is known about yet.
+    pub fn waiting(watch: &WatchConfig) -> Self {
+        Self {
+            name: watch.event_name(),
+            server: watch.server.clone(),
+            tool: Some(watch.tool.clone()),
+            every_secs: Some(watch.every_secs),
+            state: WatchHealth::Waiting,
+            last_checked: None,
+            last_changed: None,
+            subscribers: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Checked {
+    state: WatchHealth,
+    last_checked: Option<u64>,
+    last_changed: Option<u64>,
+}
+
 /// What a watch needs from the running daemon. Kept behind a trait so the
 /// engine is tested without servers, grants, or a network.
 #[allow(
@@ -183,6 +248,8 @@ pub struct WatchEvents {
     sender: Arc<dyn EventDelivery>,
     degraded: AtomicBool,
     wake: Notify,
+    /// How each watch's last check went. Not persisted: it describes this run.
+    checked: std::sync::Mutex<HashMap<String, Checked>>,
 }
 
 impl WatchEvents {
@@ -223,6 +290,7 @@ impl WatchEvents {
             sender,
             degraded: AtomicBool::new(false),
             wake: Notify::new(),
+            checked: std::sync::Mutex::new(HashMap::new()),
         }))
     }
 
@@ -271,6 +339,43 @@ impl WatchEvents {
                 })
             })
             .collect()
+    }
+
+    fn note(&self, event: &str, state: WatchHealth, changed: bool) {
+        let mut checked = self.checked.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = checked.entry(event.to_owned()).or_default();
+        entry.state = state;
+        if !matches!(state, WatchHealth::ToolMissing | WatchHealth::NotReadOnly) {
+            entry.last_checked = Some(now());
+        }
+        if changed {
+            entry.last_changed = Some(now());
+        }
+    }
+
+    /// Fill in what this run knows about `status`'s watch.
+    pub async fn describe(&self, status: &mut EventStatus) {
+        let checked = self
+            .checked
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&status.name)
+            .copied();
+        // A watch the engine is not running has no state worth showing.
+        if let Some(checked) = checked.filter(|_| self.owns(&status.name)) {
+            status.state = checked.state;
+            status.last_checked = checked.last_checked;
+            status.last_changed = checked.last_changed;
+        }
+        let timestamp = now();
+        status.subscribers = self
+            .state
+            .lock()
+            .await
+            .subscriptions
+            .iter()
+            .filter(|s| s.event == status.name && s.expires > timestamp)
+            .count();
     }
 
     fn identity(&self, client_id: &str, params: &Value) -> Result<Subscribing, EventError> {
@@ -475,9 +580,11 @@ impl WatchEvents {
     async fn check(&self, watch: &WatchConfig) -> Result<(), EventError> {
         let event = watch.event_name();
         let Some((tool_name, read_only)) = self.access.tool(watch) else {
+            self.note(&event, WatchHealth::ToolMissing, false);
             return Ok(());
         };
         if !read_only && !watch.allow_writes {
+            self.note(&event, WatchHealth::NotReadOnly, false);
             tracing::warn!(
                 event = %event,
                 "watch skipped: the tool is not marked read-only and allow_writes is off"
@@ -485,6 +592,7 @@ impl WatchEvents {
             return Ok(());
         }
         let Some(result) = self.access.call(&tool_name, watch.arguments.clone()).await else {
+            self.note(&event, WatchHealth::CallFailed, false);
             return Ok(());
         };
         let timestamp = now();
@@ -499,6 +607,7 @@ impl WatchEvents {
         .map_err(|_| unavailable())?;
         if body.len() > MAX_BODY {
             tracing::warn!(event = %event, "watch skipped: the result exceeds the size limit");
+            self.note(&event, WatchHealth::TooLarge, false);
             return Ok(());
         }
         let hash = hex::encode(Sha256::digest(
@@ -507,6 +616,7 @@ impl WatchEvents {
         let mut state = self.state.lock().await;
         let previous = state.baselines.get(&event);
         if previous == Some(&hash) {
+            self.note(&event, WatchHealth::Watching, false);
             return Ok(());
         }
         let changed = previous.is_some();
@@ -534,6 +644,7 @@ impl WatchEvents {
             }
         }
         self.commit(&mut state, next)?;
+        self.note(&event, WatchHealth::Watching, changed);
         self.wake.notify_one();
         Ok(())
     }
