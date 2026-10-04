@@ -33,22 +33,19 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   `plug clients block`; there is no allow list (`only_servers`); every client
   on the shared bearer token is one client, `remote:shared`; and a changed
   block tells every client to re-read its lists, not only the one it touches.
-- Plug needs a real app icon: minimal, distinct, and legible small, because
-  it shows in the Dock, the menu bar, and inside every client Plug connects
-  to. The current one is a placeholder.
 - Text-message agents: Poke takes a custom MCP server and can reach Plug as
   a remote client. Instinct and Tomo document no way to add one (2026-10-04).
-- The app redesign. The audit is done and is #276: every screen, the menu
-  bar, and the CLI's wording, held to the grandma test, with a proposed
-  direction. Nothing is rebuilt until the direction is approved.
-- Order agreed 2026-10-04: clients and their icons (done), secret stores
-  (done), skills pass-through (first step done), then the app redesign, the
-  app icon, and a release.
 - A connected Pi, Warp, or Kiro is named from what it reports, with no client
   type behind it. Warp's and Kiro's icons use identifiers read off Homebrew's
   casks, not off an installed copy.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
+- The redesign in #276 is built but nobody has looked at it yet: the eight
+  moves were checked by tests and by reading the accessibility tree, not by
+  eye. Look at each screen once and file what reads wrong.
+- The app icon (a white power symbol on blue) was chosen without the owner
+  seeing it in the Dock. Confirm it, or swap the files in `docs/assets/` and
+  the app's icon set.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as
   found; no sweep.
 - Live downstream OAuth certification is done for Claude Desktop and ChatGPT.
