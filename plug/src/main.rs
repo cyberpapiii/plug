@@ -66,6 +66,7 @@ Workflow:
     plug clients            Show linked, detected, and live clients
     plug servers            View and manage configured servers
     plug tools              View and manage available tools
+    plug events             Watch a tool and tell clients when it changes
     plug doctor             Diagnose setup problems
 
   Maintain
@@ -174,6 +175,12 @@ enum Commands {
         command: Option<ToolCommands>,
         /// Server name or tool group whose tools to list
         server: Option<String>,
+    },
+    #[command(display_order = 9)]
+    /// Watch a tool and tell clients when its result changes
+    Events {
+        #[command(subcommand)]
+        command: Option<commands::events::EventCommands>,
     },
     #[command(display_order = 10)]
     /// Link plug to your AI clients
@@ -595,6 +602,34 @@ async fn main() -> anyhow::Result<()> {
             commands::clients::cmd_client_block(cli.config.as_ref(), client, servers, tools, false)
                 .await?
         }
+        Some(Commands::Events { command: None }) => {
+            commands::events::cmd_event_list(cli.config.as_ref(), &cli.output).await?
+        }
+        Some(Commands::Events {
+            command:
+                Some(commands::events::EventCommands::Watch {
+                    server,
+                    tool,
+                    name,
+                    every,
+                    args,
+                    allow_writes,
+                }),
+        }) => {
+            commands::events::cmd_event_watch(
+                cli.config.as_ref(),
+                server,
+                tool,
+                name,
+                every,
+                args,
+                allow_writes,
+            )
+            .await?
+        }
+        Some(Commands::Events {
+            command: Some(commands::events::EventCommands::Unwatch { event }),
+        }) => commands::events::cmd_event_unwatch(cli.config.as_ref(), event).await?,
         Some(Commands::Tools { command, server }) => {
             commands::tools::cmd_tool_command(
                 cli.config.as_ref(),

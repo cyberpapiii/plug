@@ -165,6 +165,9 @@ pub struct OperatorSnapshot {
     /// What each client is kept from. Clients kept from nothing are left out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_blocks: Vec<ClientBlocks>,
+    /// The watches in the config and how each is doing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub events: Vec<crate::events::EventStatus>,
     /// Why config.toml could not be read, when it could not. The daemon keeps
     /// running its last good config, and `configured_servers` then lists that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -250,6 +253,16 @@ pub enum IpcRequest {
         kind: crate::operator::ClientBlockKind,
         target: String,
         blocked: bool,
+    },
+    /// Watch a tool for change by editing `events.watch`.
+    AddWatch {
+        auth_token: String,
+        watch: crate::events::WatchConfig,
+    },
+    /// Stop a watch, by event name.
+    RemoveWatch {
+        auth_token: String,
+        event: String,
     },
 
     /// Restart a specific upstream server.
@@ -451,6 +464,16 @@ impl fmt::Debug for IpcRequest {
                 .field("kind", kind)
                 .field("target", target)
                 .field("blocked", blocked)
+                .finish(),
+            Self::AddWatch { watch, .. } => f
+                .debug_struct("AddWatch")
+                .field("auth_token", &"[REDACTED]")
+                .field("event", &watch.event_name())
+                .finish(),
+            Self::RemoveWatch { event, .. } => f
+                .debug_struct("RemoveWatch")
+                .field("auth_token", &"[REDACTED]")
+                .field("event", event)
                 .finish(),
             Self::SetServerEnabled { name, enabled, .. } => f
                 .debug_struct("SetServerEnabled")
@@ -1141,6 +1164,8 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::SetToolEnabled { .. }
             | IpcRequest::RenameClient { .. }
             | IpcRequest::SetClientBlock { .. }
+            | IpcRequest::AddWatch { .. }
+            | IpcRequest::RemoveWatch { .. }
     )
 }
 
@@ -1161,7 +1186,9 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::SetServerEnabled { auth_token, .. }
         | IpcRequest::SetToolEnabled { auth_token, .. }
         | IpcRequest::RenameClient { auth_token, .. }
-        | IpcRequest::SetClientBlock { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::SetClientBlock { auth_token, .. }
+        | IpcRequest::AddWatch { auth_token, .. }
+        | IpcRequest::RemoveWatch { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }
@@ -2526,6 +2553,7 @@ mod tests {
                     }],
                     client_names: Vec::new(),
                     client_blocks: Vec::new(),
+                    events: Vec::new(),
                     config_error: None,
                 }),
             }

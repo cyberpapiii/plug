@@ -42,6 +42,14 @@ pub enum OperatorMutation {
         target: String,
         blocked: bool,
     },
+    /// Watch a tool for change. See `crate::events`.
+    AddWatch {
+        watch: crate::events::WatchConfig,
+    },
+    /// Stop watching, by event name (`<server>.<name>`).
+    RemoveWatch {
+        event: String,
+    },
 }
 
 /// What a per-client block names.
@@ -161,6 +169,29 @@ pub fn apply_operator_mutation(
             blocked,
         } => {
             set_client_block(&mut config, &key, kind, &target, blocked)?;
+            OperatorMutationResult::server(None)
+        }
+        OperatorMutation::AddWatch { watch } => {
+            config.events.watch.push(watch);
+            // Only the event rules: the rest of the file was already accepted.
+            let errors: Vec<String> = crate::config::validate_config(&config)
+                .into_iter()
+                .filter(|error| error.starts_with("events.watch"))
+                .collect();
+            if !errors.is_empty() {
+                anyhow::bail!(errors.join("; "));
+            }
+            OperatorMutationResult::server(None)
+        }
+        OperatorMutation::RemoveWatch { event } => {
+            let before = config.events.watch.len();
+            config
+                .events
+                .watch
+                .retain(|watch| watch.event_name() != event);
+            if config.events.watch.len() == before {
+                anyhow::bail!("no watch named `{event}`");
+            }
             OperatorMutationResult::server(None)
         }
     };
@@ -642,5 +673,54 @@ API_KEY = "sk-live-123"
             Some("Work Cursor")
         );
         block("nobody", ClientBlockKind::Server, "gone", false).unwrap();
+    }
+
+    #[test]
+    fn a_watch_is_added_once_and_removed_by_event_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"[http]
+modern_downstream_enabled = true
+auth_mode = "oauth"
+public_base_url = "https://plug.example.com"
+oauth_scopes = ["tools:read", "events:subscribe"]
+
+[servers.mail]
+command = "mail-mcp"
+"#,
+        )
+        .unwrap();
+        let watch = |name: &str, server: &str| crate::events::WatchConfig {
+            name: name.to_string(),
+            server: server.to_string(),
+            tool: "unread".to_string(),
+            arguments: serde_json::Map::new(),
+            every_secs: 60,
+            allow_writes: false,
+        };
+        let add = |watch| apply_operator_mutation(&path, OperatorMutation::AddWatch { watch });
+
+        let (config, _) = add(watch("inbox", "mail")).unwrap();
+        assert_eq!(config.events.watch.len(), 1);
+        assert!(add(watch("inbox", "mail")).is_err(), "same event twice");
+        assert!(add(watch("inbox", "gone")).is_err(), "unknown server");
+        assert!(add(watch("In Box", "mail")).is_err(), "bad name");
+
+        let reloaded = crate::config::load_config(Some(&path)).unwrap();
+        assert_eq!(reloaded.events, config.events);
+
+        let remove = |event: &str| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::RemoveWatch {
+                    event: event.to_string(),
+                },
+            )
+        };
+        assert!(remove("mail.other").is_err());
+        let (config, _) = remove("mail.inbox").unwrap();
+        assert!(config.events.is_empty());
     }
 }

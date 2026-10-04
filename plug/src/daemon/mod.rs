@@ -1570,6 +1570,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     tools: settings.blocked_tools.clone(),
                 })
                 .collect();
+            let events = ctx.engine.event_statuses(&config).await;
             let mut server_statuses = ctx.server_manager.server_statuses();
             strip_upstream_icons(&mut server_statuses);
             let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
@@ -1591,6 +1592,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     downstream_clients,
                     client_names,
                     client_blocks,
+                    events,
                     config_error,
                 }),
             }
@@ -1715,6 +1717,30 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     kind: *kind,
                     target: target.clone(),
                     blocked: *blocked,
+                },
+            )
+            .await
+        }
+        IpcRequest::AddWatch { watch, .. } => {
+            if let Err(error) = ctx.engine.check_watch(watch) {
+                return IpcResponse::Error {
+                    code: "OPERATOR_MUTATION_FAILED".to_string(),
+                    message: error.to_string(),
+                };
+            }
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::AddWatch {
+                    watch: watch.clone(),
+                },
+            )
+            .await
+        }
+        IpcRequest::RemoveWatch { event, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::RemoveWatch {
+                    event: event.clone(),
                 },
             )
             .await
