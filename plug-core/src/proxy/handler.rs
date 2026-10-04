@@ -80,7 +80,10 @@ impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
             self.protocol_version.to_string(),
         )
         .with_modern_direction_enabled(self.modern_direction_enabled)
-        .with_lifecycle(None, self.cancellation.clone(), None);
+        .with_lifecycle(None, self.cancellation.clone(), None)
+        // A foreground stdio server has one client and no connector to say
+        // how it was linked, so the name it reports is all there is.
+        .with_client_key(crate::ipc::local_client_key(None, self.client_type, None));
         if let Some(metadata) = &self.client_metadata {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));

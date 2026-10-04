@@ -229,6 +229,7 @@ async fn operator_live_sessions(
             },
             client_id: None,
             grant: snapshot.grant,
+            link_target: None,
             session_id: snapshot.session_id,
             client_type: snapshot.client_type,
             client_info: None,
@@ -1218,6 +1219,7 @@ pub(crate) async fn establish_daemon_proxy_session(
             client_info: client_info.clone(),
             adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
             host: crate::client_host::current(),
+            link_target: crate::client_host::link_target(),
         };
         let payload = serde_json::to_vec(&register_req)?;
         plug_core::ipc::write_frame(&mut writer, &payload).await?;
@@ -1542,7 +1544,11 @@ pub(crate) async fn daemon_query<T>(
     }
 }
 
-pub(crate) async fn cmd_connect(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+pub(crate) async fn cmd_connect(
+    config_path: Option<&std::path::PathBuf>,
+    link_target: Option<String>,
+) -> anyhow::Result<()> {
+    crate::client_host::set_link_target(link_target);
     connect_via_daemon(config_path).await.inspect_err(|error| {
         tracing::error!(%error, "daemon proxy failed; refusing to start a private engine");
     })
@@ -2570,6 +2576,7 @@ mod tests {
             adapter_version: Some("0.6.5".to_string()),
             host: None,
             grant: None,
+            link_target: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2582,6 +2589,7 @@ mod tests {
             adapter_version: None,
             host: None,
             grant: None,
+            link_target: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2610,6 +2618,7 @@ mod tests {
             adapter_version: Some("0.6.5".to_string()),
             host: None,
             grant: None,
+            link_target: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2638,6 +2647,7 @@ mod tests {
             adapter_version: Some("0.6.5".to_string()),
             host: None,
             grant: None,
+            link_target: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2666,6 +2676,7 @@ mod tests {
             adapter_version: None,
             host: None,
             grant: None,
+            link_target: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2746,6 +2757,7 @@ mod tests {
                 adapter_version: Some("0.6.5".to_string()),
                 host: None,
                 grant: None,
+                link_target: None,
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -2758,6 +2770,7 @@ mod tests {
                 adapter_version: None,
                 host: None,
                 grant: None,
+                link_target: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },

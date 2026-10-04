@@ -1442,6 +1442,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
                 client_id: None,
                 grant: snapshot.grant,
+                link_target: None,
                 session_id: snapshot.session_id,
                 client_type: snapshot.client_type,
                 client_info: None,
@@ -1727,6 +1728,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             client_info,
             adapter_version,
             host,
+            link_target,
         } => {
             if !(plug_core::ipc::IPC_PROTOCOL_VERSION_MIN..=plug_core::ipc::IPC_PROTOCOL_VERSION)
                 .contains(protocol_version)
@@ -1751,6 +1753,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 adapter_version.clone(),
                 host.clone(),
             );
+            ctx.client_registry
+                .set_link_target(&registration.session_id, link_target.as_deref());
             if let Some(ref replaced_session_id) = registration.replaced_session_id {
                 tracing::info!(
                     client_id = %client_id,
@@ -2174,7 +2178,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             )
             .with_local_principal(plug_core::types::PrincipalId::daemon_ipc_registry(
                 client_id,
-            ));
+            ))
+            .with_client_key(ctx.client_registry.client_key(session_id));
             ctx.engine
                 .tool_router()
                 .cancel_downstream_request(&downstream, reason.clone());
@@ -3288,6 +3293,7 @@ mod tests {
             client_info: None,
             adapter_version: None,
             host: None,
+            link_target: None,
         }));
     }
 
@@ -3568,6 +3574,7 @@ mod tests {
                     client_info: Some("plug-test".to_string()),
                     adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     host: None,
+                    link_target: None,
                 },
             )
             .await;
@@ -3906,6 +3913,7 @@ mod tests {
             adapter_version: None,
             host: None,
             grant: None,
+            link_target: None,
             connected_secs: 0,
             last_activity_secs: None,
         };
@@ -5432,6 +5440,7 @@ mod tests {
                     client_info: None,
                     adapter_version: None,
                     host: None,
+                    link_target: None,
                 },
                 &mut ctx,
             )

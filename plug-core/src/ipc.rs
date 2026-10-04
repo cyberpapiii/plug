@@ -261,6 +261,11 @@ pub enum IpcRequest {
         /// and when the process table could not be read.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         host: Option<ClientHost>,
+        /// The target `plug link` wrote into this client's config
+        /// (`plug connect --client <target>`). Absent for a connector started
+        /// any other way.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        link_target: Option<String>,
     },
 
     /// Deregister a proxy client session (clean disconnect).
@@ -442,6 +447,7 @@ impl fmt::Debug for IpcRequest {
                 client_info,
                 adapter_version,
                 host,
+                link_target,
             } => f
                 .debug_struct("Register")
                 .field("protocol_version", protocol_version)
@@ -449,6 +455,7 @@ impl fmt::Debug for IpcRequest {
                 .field("client_info", client_info)
                 .field("adapter_version", adapter_version)
                 .field("host", host)
+                .field("link_target", link_target)
                 .finish(),
             Self::Deregister { session_id } => f
                 .debug_struct("Deregister")
@@ -746,6 +753,50 @@ pub struct ClientHost {
     /// Path of the outermost `.app` bundle the executable runs from, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app: Option<String>,
+    /// What an interpreter was started to run: a script path or a module
+    /// name. Tells apart two clients that both run under a bare `python3`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub script: Option<String>,
+}
+
+impl ClientHost {
+    /// The settings key of a local client known only by its host.
+    pub fn client_key(&self) -> String {
+        let program = self.app.as_ref().unwrap_or(&self.executable);
+        match &self.script {
+            Some(script) => format!("host:{program}#{script}"),
+            None => format!("host:{program}"),
+        }
+    }
+}
+
+/// The settings key every remote client without a grant of its own shares:
+/// the configured bearer token and an open loopback listener cannot tell one
+/// caller from another.
+pub const SHARED_REMOTE_CLIENT_KEY: &str = "remote:shared";
+
+/// The settings key of a local client.
+///
+/// The target `plug link` wrote into the client's config comes first: the
+/// client cannot change it by reporting a different name. The name it reports
+/// in `initialize` is the fallback for a connector linked before targets were
+/// written, and the host program is what is left for a client Plug does not
+/// know.
+pub fn local_client_key(
+    link_target: Option<&str>,
+    client_type: crate::types::ClientType,
+    host: Option<&ClientHost>,
+) -> Option<String> {
+    if let Some(target) = link_target.and_then(crate::config::canonical_client_target) {
+        return Some(target.to_string());
+    }
+    if let Some(slug) = client_type.target_slug() {
+        return Some(slug.to_string());
+    }
+    if client_type != crate::types::ClientType::Unknown {
+        return None;
+    }
+    host.map(ClientHost::client_key)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -765,6 +816,10 @@ pub struct IpcLiveSessionInfo {
     /// local connector.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<String>,
+    /// The target `plug link` wrote into a local client's config. Never set
+    /// for a remote session.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub link_target: Option<String>,
     pub connected_secs: u64,
     pub last_activity_secs: Option<u64>,
 }
@@ -773,28 +828,22 @@ impl IpcLiveSessionInfo {
     /// What this client's settings are stored under.
     ///
     /// A remote session is the grant it came in on, which Plug verified. A
-    /// local client Plug recognises is its target slug. One it does not is
-    /// the program that started it, which Plug reads from the process table.
-    /// A session with none of these has no key.
+    /// local client is the target it was linked as, or failing that the
+    /// target Plug works out from the name it reports. One Plug does not know
+    /// is the program that started it, read from the process table. A session
+    /// with none of these has no key.
     ///
-    /// The target slug is worked out from the name a local client reports,
-    /// so it is good enough for a display name and not for access. Only the
-    /// grant is verified.
+    /// Only the grant is verified. Any program running as the owner can start
+    /// a connector and claim a local key.
     pub fn client_key(&self) -> Option<String> {
         if let Some(grant) = &self.grant {
             return Some(grant_client_key(grant));
         }
-        if let Some(slug) = self.client_type.target_slug() {
-            return Some(slug.to_string());
-        }
-        if self.client_type != crate::types::ClientType::Unknown {
-            return None;
-        }
-        let host = self.host.as_ref()?;
-        Some(format!(
-            "host:{}",
-            host.app.as_ref().unwrap_or(&host.executable)
-        ))
+        local_client_key(
+            self.link_target.as_deref(),
+            self.client_type,
+            self.host.as_ref(),
+        )
     }
 }
 
@@ -1370,6 +1419,7 @@ mod tests {
                 client_info: Some("claude-code".to_string()),
                 adapter_version: Some("0.6.5".to_string()),
                 host: None,
+                link_target: Some("cursor".to_string()),
             },
             IpcRequest::Register {
                 protocol_version: IPC_PROTOCOL_VERSION,
@@ -1377,6 +1427,7 @@ mod tests {
                 client_info: None,
                 adapter_version: None,
                 host: None,
+                link_target: None,
             },
             IpcRequest::Deregister {
                 session_id: "sess-123".to_string(),
@@ -1598,6 +1649,7 @@ mod tests {
                     adapter_version: Some("0.6.5".to_string()),
                     host: None,
                     grant: None,
+                    link_target: None,
                     connected_secs: 12,
                     last_activity_secs: Some(1),
                 }],
@@ -1796,6 +1848,7 @@ mod tests {
             client_info: None,
             adapter_version: None,
             host: None,
+            link_target: None,
         }));
         assert!(!requires_auth(&IpcRequest::Deregister {
             session_id: "s".to_string(),
@@ -1924,6 +1977,7 @@ mod tests {
             client_info: Some("claude-code".to_string()),
             adapter_version: Some("0.6.5".to_string()),
             host: None,
+            link_target: None,
         };
 
         let value = serde_json::to_value(&req).unwrap();
@@ -1939,6 +1993,7 @@ mod tests {
             IpcRequest::Register {
                 adapter_version: Some(version),
                 host: None,
+                link_target: None,
                 ..
             } if version == "0.6.5"
         ));
@@ -1955,6 +2010,7 @@ mod tests {
             adapter_version: None,
             host,
             grant: None,
+            link_target: None,
             connected_secs: 1,
             last_activity_secs: None,
         };
@@ -1962,6 +2018,7 @@ mod tests {
             name: "Hermes".to_string(),
             executable: "/opt/hermes/bin/python3".to_string(),
             app: app.map(str::to_string),
+            script: None,
         };
         use crate::types::ClientType;
 
@@ -1990,6 +2047,25 @@ mod tests {
         assert_eq!(session(ClientType::Unknown, None).client_key(), None);
         assert_eq!(session(ClientType::GrokBot, None).client_key(), None);
 
+        // The target it was linked as outranks the name it reports, and any
+        // spelling `plug link` accepts lands on one key.
+        let mut linked = session(ClientType::Cursor, Some(host(None)));
+        linked.link_target = Some("codex".to_string());
+        assert_eq!(linked.client_key().as_deref(), Some("codex-cli"));
+        // A target Plug never wrote is ignored.
+        linked.link_target = Some("root".to_string());
+        assert_eq!(linked.client_key().as_deref(), Some("cursor"));
+
+        // Two clients under the same interpreter are told apart by script.
+        let mut scripted = host(None);
+        scripted.script = Some("/opt/hermes/agent.py".to_string());
+        assert_eq!(
+            session(ClientType::Unknown, Some(scripted))
+                .client_key()
+                .as_deref(),
+            Some("host:/opt/hermes/bin/python3#/opt/hermes/agent.py")
+        );
+
         // A remote session is the grant it came in on, whatever it says it is.
         let mut remote = session(ClientType::Cursor, None);
         remote.grant = Some("client-abc".to_string());
@@ -2002,6 +2078,7 @@ mod tests {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),
+            script: None,
         };
         let request = |host| IpcRequest::Register {
             protocol_version: IPC_PROTOCOL_VERSION,
@@ -2009,10 +2086,13 @@ mod tests {
             client_info: None,
             adapter_version: None,
             host,
+            link_target: None,
         };
 
         let value = serde_json::to_value(request(Some(host.clone()))).unwrap();
         assert_eq!(value["host"]["name"], "Hermes");
+        assert!(value.get("link_target").is_none());
+        assert!(value["host"].get("script").is_none());
         match serde_json::from_value::<IpcRequest>(value).unwrap() {
             IpcRequest::Register { host: parsed, .. } => assert_eq!(parsed, Some(host)),
             other => panic!("expected Register, got {other:?}"),
@@ -2040,6 +2120,7 @@ mod tests {
             IpcRequest::Register {
                 adapter_version: None,
                 host: None,
+                link_target: None,
                 ..
             }
         ));
@@ -2363,6 +2444,7 @@ mod tests {
                         adapter_version: None,
                         host: None,
                         grant: None,
+                        link_target: None,
                         connected_secs: 30,
                         last_activity_secs: Some(2),
                     }],
