@@ -61,17 +61,7 @@ struct PlugPopover: View {
             }
             VerdictView(verdict: model.verdict, style: .hero, run: send)
             if let error = model.actionError {
-                HStack(alignment: .firstTextBaseline, spacing: Metric.tight) {
-                    Label(error.message, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .lineLimit(3)
-                    Spacer(minLength: 0)
-                    Button("Dismiss") { send(.dismissActionError) }
-                        .buttonStyle(.link)
-                        .font(.caption)
-                }
-                .accessibilityElement(children: .contain)
+                ProblemNote(error) { send(.dismissActionError) }
             }
             if let progress = settlingProgress {
                 ProgressView(value: progress)
@@ -203,16 +193,6 @@ struct PlugPopover: View {
             .map { $0 }
     }
 
-    /// Tool names arrive as `Server__tool`. The row states the server once, in
-    /// words, so the tool half stands alone.
-    static func callParts(_ event: ActivityEvent) -> (server: String?, tool: String) {
-        let tool = event.tool ?? event.method
-        guard let range = tool.range(of: "__"), range.lowerBound > tool.startIndex,
-              range.upperBound < tool.endIndex
-        else { return (event.server, tool) }
-        return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))
-    }
-
     private var recent: some View {
         Button { send(.openWindow(.activity)) } label: {
             VStack(alignment: .leading, spacing: Metric.tight) {
@@ -226,7 +206,7 @@ struct PlugPopover: View {
                         .foregroundStyle(.tertiary)
                 }
                 ForEach(recentCalls) { event in
-                    RecentCallRow(event: event, parts: Self.callParts(event))
+                    RecentCallRow(call: CallFacts(event))
                 }
             }
             .contentShape(Rectangle())
@@ -370,24 +350,21 @@ private struct PanelServerRow: View {
 
 /// One tool call: whether it worked, what ran, where, and how long it took.
 private struct RecentCallRow: View {
-    let event: ActivityEvent
-    let parts: (server: String?, tool: String)
-
-    private var succeeded: Bool { event.outcome == "success" }
+    let call: CallFacts
 
     var body: some View {
         HStack(spacing: Metric.tight) {
-            Image(systemName: succeeded ? "checkmark" : "exclamationmark.triangle.fill")
+            Image(systemName: call.succeeded ? "checkmark" : "exclamationmark.triangle.fill")
                 .font(.caption2)
-                .foregroundStyle(succeeded ? Color.secondary : .orange)
+                .foregroundStyle(call.succeeded ? Color.secondary : .orange)
                 .frame(width: 12)
-            Text(parts.tool)
+            Text(call.tool)
                 .font(.caption.monospaced())
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            if let server = parts.server {
+            if let server = call.server {
                 Text(server)
                     .font(.caption)
                     .foregroundStyle(.secondary)
@@ -395,14 +372,14 @@ private struct RecentCallRow: View {
                     .frame(width: 58, alignment: .leading)
             }
             Spacer(minLength: Metric.tight)
-            Text("\(event.latencyMs) ms")
+            Text(call.duration)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.tertiary)
                 .fixedSize()
         }
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(parts.tool)\(parts.server.map { ", \($0)" } ?? ""), \(succeeded ? "succeeded" : "failed"), \(event.latencyMs) milliseconds"
+            "\(call.tool)\(call.server.map { ", \($0)" } ?? ""), \(call.result), \(call.spokenDuration)"
         )
     }
 }

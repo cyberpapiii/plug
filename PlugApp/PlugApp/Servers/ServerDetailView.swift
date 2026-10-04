@@ -214,29 +214,26 @@ struct ServerDetailView: View {
         VStack(alignment: .leading, spacing: Metric.tight) {
             SectionLabel(text: "Recent calls")
             ForEach(recentCalls) { event in
+                let call = CallFacts(event)
                 HStack(spacing: Metric.tight) {
-                    Image(systemName: event.outcome == "success" ? "checkmark" : "exclamationmark.triangle.fill")
+                    Image(systemName: call.succeeded ? "checkmark" : "exclamationmark.triangle.fill")
                         .font(.caption2)
-                        .foregroundStyle(event.outcome == "success" ? Color.secondary : .orange)
+                        .foregroundStyle(call.succeeded ? Color.secondary : .orange)
                         .frame(width: 12)
-                    Text(callName(event))
+                    Text(call.tool)
                         .font(.caption.monospaced())
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: Metric.tight)
-                    Text("\(event.latencyMs) ms")
+                    Text(call.duration)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.tertiary)
                 }
+                .help(call.reason ?? call.result)
+                .accessibilityElement(children: .ignore)
+                .accessibilityLabel("\(call.tool), \(call.result), \(call.spokenDuration)")
             }
         }
-    }
-
-    /// The tool that ran. `tools/call` is the transport's word for it and says
-    /// nothing about what happened, so the tool name wins when there is one.
-    private func callName(_ event: ActivityEvent) -> String {
-        guard let tool = event.tool, !tool.isEmpty else { return event.method }
-        return tool
     }
 
     // MARK: - Tools

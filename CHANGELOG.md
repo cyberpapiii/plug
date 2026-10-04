@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Activity rows open. Click a call to see the tool, the server, the client,
+  when it ran, how long it took, and whether it worked. A failed call says
+  why, in the error's own words, and what to do next. The reason is kept for
+  calls made after this update, cut to 240 characters.
 - Add Server starts from a list. Pick Notion, Linear, Atlassian, Asana,
   Sentry, Stripe, Vercel, Cloudflare, Canva, Intercom, or Context7 and Plug
   fills in the rest and asks you to sign in; a server Plug already has is not
@@ -183,6 +187,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- A problem says what happened and what to do. A press that fails now reads
+  "Could not restart notion.", then the reason, then the next step, and it
+  stays until you dismiss it; it used to be the raw error and leave after 8
+  seconds. The window, the menu bar panel, and every sheet show a problem the
+  same way.
+- An import that adds some servers and not others names the ones it could not
+  add, with the reason under each, and leaves only those ticked so trying
+  again retries only what failed.
+- A call's duration reads the same in Activity, the menu bar panel, and a
+  server's recent calls. A caller Plug cannot name is "Unknown client".
 - Adding and editing a server are one form. After a pick or a paste, Add
   Server shows the same fields Edit does, filled in, so what Plug understood
   can be read and corrected before it is saved. The fields are Address and
