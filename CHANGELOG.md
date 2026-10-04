@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Add Server starts from a list. Pick Notion, Linear, Atlassian, Asana,
+  Sentry, Stripe, Vercel, Cloudflare, Canva, Intercom, or Context7 and Plug
+  fills in the rest and asks you to sign in; a server Plug already has is not
+  offered again. Pasting a setup block, a command, or an address still works,
+  one step below the list.
 - A server's key can live in the Keychain instead of in `config.toml`.
   `plug secret set <name>` asks for the value without showing it, or takes it
   from a pipe, and stores it; the server then says `keychain:<name>` where the
@@ -178,6 +183,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Adding and editing a server are one form. After a pick or a paste, Add
+  Server shows the same fields Edit does, filled in, so what Plug understood
+  can be read and corrected before it is saved. The fields are Address and
+  Key, or Command and Arguments, and Settings; the form says a key is kept in
+  the Keychain. When Edit cannot read a server's settings it says why and
+  offers Try Again, where it used to show an empty sheet.
 - The command line uses the app's words. `plug status` leads with whether
   Plug is running, how many clients are connected, and one line per server
   (Running, Unsteady, Down, Sign-in needed; On this Mac or Over the network);

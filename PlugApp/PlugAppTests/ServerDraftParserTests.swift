@@ -174,3 +174,78 @@ final class ServerDraftParserTests: XCTestCase {
         XCTAssertEqual(draft.facts.map(\.label), ["Runs", "Kind"])
     }
 }
+
+/// Add Server and Edit are one form. It starts from a whole server and gives
+/// one back.
+final class ServerFormTests: XCTestCase {
+    func testAnUntouchedFormGivesBackTheServerItStartedFrom() {
+        var config = ServerConfig.command("npx", args: ["-y", "linear mcp"])
+        config.env = ["API_KEY": "abc", "REGION": "us"]
+        config.callTimeoutSecs = 45
+        XCTAssertEqual(ServerForm(config: config).config, config)
+
+        var remote = ServerConfig.remote("https://example.com/mcp")
+        remote.auth = "oauth"
+        remote.transport = "sse"
+        XCTAssertEqual(ServerForm(config: remote).config, remote)
+    }
+
+    func testAnEmptyKeyFieldKeepsTheKeyTheServerHas() {
+        var config = ServerConfig.remote("https://example.com/mcp")
+        config.authToken = "keychain:example"
+        var form = ServerForm(config: config)
+        XCTAssertTrue(form.hasKey)
+        XCTAssertEqual(form.config.authToken, "keychain:example")
+
+        form.key = " new "
+        XCTAssertEqual(form.config.authToken, "new")
+
+        form.key = ""
+        form.removeKey = true
+        XCTAssertNil(form.config.authToken)
+    }
+
+    func testMovingAServerToThisMacDropsWhatOnlyANetworkServerHas() {
+        var config = ServerConfig.remote("https://example.com/mcp")
+        config.auth = "oauth"
+        config.authToken = "t"
+        var form = ServerForm(config: config)
+        form.isRemote = false
+        XCTAssertFalse(form.isComplete)
+        form.command = "npx"
+        form.arguments = "-y 'my server'"
+        let saved = form.config
+        XCTAssertEqual(saved.transport, "stdio")
+        XCTAssertEqual(saved.args, ["-y", "my server"])
+        XCTAssertNil(saved.url)
+        XCTAssertNil(saved.auth)
+        XCTAssertNil(saved.authToken)
+    }
+
+    func testAnAPIServerMayLeaveItsAddressToItsDocument() {
+        let form = ServerForm(config: .api("https://example.com/openapi.json"))
+        XCTAssertTrue(form.isAPI)
+        XCTAssertTrue(form.isComplete)
+        XCTAssertNil(form.config.url)
+        XCTAssertEqual(form.config.transport, "openapi")
+    }
+}
+
+/// The servers Add Server offers by name.
+final class KnownServerTests: XCTestCase {
+    func testEveryKnownServerIsASecureAddressWithItsOwnName() {
+        XCTAssertEqual(Set(KnownServer.all.map(\.id)).count, KnownServer.all.count)
+        for server in KnownServer.all {
+            XCTAssertEqual(URL(string: server.address)?.scheme, "https", server.id)
+            XCTAssertEqual(server.id, server.id.lowercased())
+            XCTAssertEqual(server.config.auth, server.needsSignIn ? "oauth" : nil, server.id)
+            XCTAssertEqual(server.draft.name, server.id)
+        }
+    }
+
+    func testAServerPlugAlreadyHasIsNotOfferedAgain() {
+        let offered = KnownServer.notYetAdded(names: ["Notion", "linear", "other"])
+        XCTAssertFalse(offered.contains { $0.id == "notion" || $0.id == "linear" })
+        XCTAssertEqual(offered.count, KnownServer.all.count - 2)
+    }
+}

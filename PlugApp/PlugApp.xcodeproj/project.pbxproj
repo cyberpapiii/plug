@@ -27,6 +27,7 @@
 		3A88F7B8DAA6D4AAF6FF0ED0 /* AuthFlowServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = FC27919600003A59354FBEF6 /* AuthFlowServiceTests.swift */; };
 		3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 907978AE95DA344593F3BCA3 /* AppModelTests.swift */; };
 		41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64E2869334004AD1B34ADA93 /* InstallationState.swift */; };
+		439BBF5F8CD4BD5A46937D60 /* SheetFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00F9BAFB363C8A2D0C0D4CEA /* SheetFrame.swift */; };
 		4CCD74568EADAD432672189D /* UpdateService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1B09D36EE0E0D152888537 /* UpdateService.swift */; };
 		52895501276459EDCBEB65D9 /* EventSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */; };
 		5BA8E9724BF22D7D0CB34DCB /* ToolCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E4992C088CE31961C6537D0 /* ToolCatalog.swift */; };
@@ -47,7 +48,9 @@
 		8D15AF8A80C7EF6C8C1372FD /* AddAccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6904150E3E88BB44913F2231 /* AddAccountView.swift */; };
 		9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */; };
 		9263B9DB0E85D3D9246BCB9C /* legacy_plug_programs.json in Resources */ = {isa = PBXBuildFile; fileRef = 4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */; };
+		93B4A8DCE0DC0EB78733EFAA /* ServerForm.swift in Sources */ = {isa = PBXBuildFile; fileRef = 454D77CEE12C1DA103BB4BCD /* ServerForm.swift */; };
 		9FE96CB92A8665949F5F034E /* agent-setup.md in Resources */ = {isa = PBXBuildFile; fileRef = D3386E4BD7635FC4E33D53AA /* agent-setup.md */; };
+		AA92F53E55B6633C403002EF /* KnownServers.swift in Sources */ = {isa = PBXBuildFile; fileRef = 04FCC5EE705088A52A34CD77 /* KnownServers.swift */; };
 		B2857C070B5C6292A2B38282 /* AppInstallationInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */; };
 		B2B2C2D12A16D745E320C8CE /* AddWatchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E643FDDD979E4B5A89F96D37 /* AddWatchView.swift */; };
 		B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */; };
@@ -88,6 +91,8 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXFileReference section */
+		00F9BAFB363C8A2D0C0D4CEA /* SheetFrame.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SheetFrame.swift; sourceTree = "<group>"; };
+		04FCC5EE705088A52A34CD77 /* KnownServers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KnownServers.swift; sourceTree = "<group>"; };
 		0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolDetailView.swift; sourceTree = "<group>"; };
 		0D96A945383702097BA4CCEA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		0F74CE97E0DF2E6BB479555A /* ClientsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientsView.swift; sourceTree = "<group>"; };
@@ -108,6 +113,7 @@
 		3C9504345828F0EF55E53933 /* ImportServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportServersView.swift; sourceTree = "<group>"; };
 		406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LaunchdJobInspectorTests.swift; sourceTree = "<group>"; };
 		44F0B51187F69FF68E1876F8 /* PlugApp.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = PlugApp.entitlements; sourceTree = "<group>"; };
+		454D77CEE12C1DA103BB4BCD /* ServerForm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerForm.swift; sourceTree = "<group>"; };
 		46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventSurfaceTests.swift; sourceTree = "<group>"; };
 		4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = legacy_plug_programs.json; sourceTree = "<group>"; };
 		588717CF2790EF93C4710EE6 /* EditServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerView.swift; sourceTree = "<group>"; };
@@ -189,6 +195,7 @@
 				1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */,
 				F7711E0CB2972E0B9D45D9D9 /* EventFacts.swift */,
 				AC08658F0B6AA141C8835368 /* FirstRunGuide.swift */,
+				04FCC5EE705088A52A34CD77 /* KnownServers.swift */,
 				D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */,
 				FBC2D67DE9038B09D240E689 /* PlugStatus.swift */,
 				8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */,
@@ -322,6 +329,7 @@
 				2BB10ED3645727B693E33897 /* AppChrome.swift */,
 				75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */,
 				E823B05501E7735EEA26993A /* RootView.swift */,
+				00F9BAFB363C8A2D0C0D4CEA /* SheetFrame.swift */,
 			);
 			path = Views;
 			sourceTree = "<group>";
@@ -408,6 +416,7 @@
 				588717CF2790EF93C4710EE6 /* EditServerView.swift */,
 				3C9504345828F0EF55E53933 /* ImportServersView.swift */,
 				8AF46523DEE1BB787D58EAEA /* ServerDetailView.swift */,
+				454D77CEE12C1DA103BB4BCD /* ServerForm.swift */,
 				2AFB9D205089F380BB49E9C6 /* ServersView.swift */,
 			);
 			path = Servers;
@@ -611,6 +620,7 @@
 				145CFE4F269BFCB5BAF368F6 /* ImportService.swift in Sources */,
 				F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */,
 				41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */,
+				AA92F53E55B6633C403002EF /* KnownServers.swift in Sources */,
 				9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */,
 				C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */,
 				B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */,
@@ -623,8 +633,10 @@
 				2C730DB265AF0C768DE18BAF /* Router.swift in Sources */,
 				3033A18407F2E2063809099D /* ServerDetailView.swift in Sources */,
 				6D02466341A5E96732383E80 /* ServerDraftParser.swift in Sources */,
+				93B4A8DCE0DC0EB78733EFAA /* ServerForm.swift in Sources */,
 				6C979F41AD0669EF1B229C11 /* ServersView.swift in Sources */,
 				62FB2A2B8196D3C86DAF8E9E /* SettingsView.swift in Sources */,
+				439BBF5F8CD4BD5A46937D60 /* SheetFrame.swift in Sources */,
 				5BA8E9724BF22D7D0CB34DCB /* ToolCatalog.swift in Sources */,
 				073040F588BBBE1EBFDC7858 /* ToolDetailView.swift in Sources */,
 				2262A73184055B0A85EBE4EE /* ToolRow.swift in Sources */,
