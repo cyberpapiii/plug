@@ -274,9 +274,29 @@ enum Commands {
         #[command(subcommand)]
         command: AuthCommands,
     },
+    #[command(display_order = 20)]
+    /// Keep a server's key in the Keychain instead of in the config file
+    Secret {
+        #[command(subcommand)]
+        command: SecretCommands,
+    },
     #[command(hide = true)]
     /// Internal: remove only installation artifacts proven to belong to Plug.app
     UninstallCleanup,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum SecretCommands {
+    /// Store a value under a name; the value is asked for, never an argument
+    Set {
+        /// The name a server refers to it by, as `keychain:<name>`
+        name: String,
+    },
+    /// Remove a stored value
+    Rm {
+        /// The name it was stored under
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -730,6 +750,7 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
+        Some(Commands::Secret { command }) => commands::secrets::cmd_secret(command)?,
         Some(Commands::UninstallCleanup) => commands::misc::cmd_uninstall_cleanup(&cli.output)?,
     }
 

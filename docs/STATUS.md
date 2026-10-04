@@ -43,8 +43,8 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   Settings is a separate window and should live in the main one; layout
   bugs and rough edges throughout; the three surfaces do not feel like one
   product. Audit and write the findings before changing anything.
-- Order agreed 2026-10-04: clients and their icons, the app icon, secret
-  providers (#264), skills pass-through (#262), the app redesign, then a
+- Order agreed 2026-10-04: clients and their icons (done), secret stores
+  (#264), skills pass-through (#262), the app redesign, the app icon, then a
   release. Skills is wanted now, small and clean, not held for a server
   that uses it.
 - CI has no job timeout. A hung `Test (Plug.app)` ran 65 minutes on #269
@@ -73,8 +73,11 @@ up to Open before starting it.
   API key, operations chosen in either.
 - Skills: carry the skills extension through Plug, with the server's name in
   each skill URI. Waits for a server and a client that use it (#262).
-- Secret providers: server credentials from a 1Password mount, read by the
-  service only and never hanging it (#264).
+- Secret stores (#264). Done: `keychain:<name>` references and
+  `plug secret set`. Next, in order: the app and `plug server add` put a
+  pasted key in the Keychain by default and `plug doctor` offers to move
+  plaintext keys; the `.env` file as a store read only by the service; any
+  other store as a command in config, then `op://`.
 - A code-execution tool surface in place of real tools. Current evidence is
   against it as a default; the opt-in search-then-load mode covers clients with
   hard tool caps.
