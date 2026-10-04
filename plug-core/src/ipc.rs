@@ -229,6 +229,15 @@ pub enum IpcRequest {
         key: String,
         name: String,
     },
+    /// Keep a client from a server or a tool, or let it back in, by editing
+    /// `clients`.
+    SetClientBlock {
+        auth_token: String,
+        key: String,
+        kind: crate::operator::ClientBlockKind,
+        target: String,
+        blocked: bool,
+    },
 
     /// Restart a specific upstream server.
     RestartServer {
@@ -415,6 +424,20 @@ impl fmt::Debug for IpcRequest {
                 .field("auth_token", &"[REDACTED]")
                 .field("key", key)
                 .field("name", name)
+                .finish(),
+            Self::SetClientBlock {
+                key,
+                kind,
+                target,
+                blocked,
+                ..
+            } => f
+                .debug_struct("SetClientBlock")
+                .field("auth_token", &"[REDACTED]")
+                .field("key", key)
+                .field("kind", kind)
+                .field("target", target)
+                .field("blocked", blocked)
                 .finish(),
             Self::SetServerEnabled { name, enabled, .. } => f
                 .debug_struct("SetServerEnabled")
@@ -1104,6 +1127,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::SetServerEnabled { .. }
             | IpcRequest::SetToolEnabled { .. }
             | IpcRequest::RenameClient { .. }
+            | IpcRequest::SetClientBlock { .. }
     )
 }
 
@@ -1123,7 +1147,8 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::RemoveServer { auth_token, .. }
         | IpcRequest::SetServerEnabled { auth_token, .. }
         | IpcRequest::SetToolEnabled { auth_token, .. }
-        | IpcRequest::RenameClient { auth_token, .. } => Some(auth_token.as_str()),
+        | IpcRequest::RenameClient { auth_token, .. }
+        | IpcRequest::SetClientBlock { auth_token, .. } => Some(auth_token.as_str()),
         _ => None,
     }
 }

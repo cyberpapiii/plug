@@ -70,6 +70,10 @@ pub(crate) struct LiveSessionView {
     /// The name the owner gave this client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
+    /// The key this session's requests carry, which blocks are stored under.
+    /// It is `key` for every session but a remote one with no grant.
+    #[serde(skip)]
+    pub(crate) access_key: Option<String>,
     pub(crate) connected_secs: u64,
     pub(crate) last_activity_secs: Option<u64>,
 }
@@ -109,6 +113,31 @@ pub(crate) enum ClientCommands {
         /// The new name
         name: String,
     },
+    /// Keep a client from a server or from single tools
+    Block {
+        /// The client: its key from `plug clients -v`, or the name it shows
+        /// under while connected
+        client: String,
+        /// A server to keep it from, by its name in `plug servers`
+        #[arg(long = "server", value_name = "SERVER")]
+        servers: Vec<String>,
+        /// A tool to keep it from, by the name in `plug tools`; `*` matches
+        /// any run of characters
+        #[arg(long = "tool", value_name = "TOOL")]
+        tools: Vec<String>,
+    },
+    /// Let a client back in to a server or a tool
+    Unblock {
+        /// The client: its key from `plug clients -v`, or the name it shows
+        /// under while connected
+        client: String,
+        /// A server to let it back in to
+        #[arg(long = "server", value_name = "SERVER")]
+        servers: Vec<String>,
+        /// A tool to let it back in to, written as it was blocked
+        #[arg(long = "tool", value_name = "TOOL")]
+        tools: Vec<String>,
+    },
 }
 
 /// Work out which client `plug clients rename` means.
@@ -120,14 +149,32 @@ pub(crate) fn resolve_client_key(
     wanted: &str,
     sessions: &[LiveSessionView],
 ) -> anyhow::Result<String> {
+    resolve_client_key_by(wanted, sessions, |session| session.key.clone())
+}
+
+/// Work out which client `plug clients block` means: the same search, but
+/// the answer is the key the client's requests carry.
+pub(crate) fn resolve_client_access_key(
+    wanted: &str,
+    sessions: &[LiveSessionView],
+) -> anyhow::Result<String> {
+    resolve_client_key_by(wanted, sessions, |session| session.access_key.clone())
+}
+
+fn resolve_client_key_by(
+    wanted: &str,
+    sessions: &[LiveSessionView],
+    key_of: impl Fn(&LiveSessionView) -> Option<String>,
+) -> anyhow::Result<String> {
     let mut keys = sessions
         .iter()
         .filter(|session| {
             session.label().eq_ignore_ascii_case(wanted)
                 || session.key.as_deref() == Some(wanted)
+                || session.access_key.as_deref() == Some(wanted)
                 || session.session_id.starts_with(wanted)
         })
-        .map(|session| session.key.clone())
+        .map(key_of)
         .collect::<Vec<_>>();
     keys.sort();
     keys.dedup();
@@ -172,6 +219,72 @@ pub(crate) async fn cmd_client_rename(
         print_info_line(format!("{key} is now called {name}."));
     }
     Ok(())
+}
+
+/// `plug clients block` and `unblock`: one mutation per server or tool named,
+/// then what the client is kept from now.
+pub(crate) async fn cmd_client_block(
+    config_path: Option<&PathBuf>,
+    client: String,
+    servers: Vec<String>,
+    tools: Vec<String>,
+    blocked: bool,
+) -> anyhow::Result<()> {
+    use plug_core::operator::ClientBlockKind;
+
+    if servers.is_empty() && tools.is_empty() {
+        anyhow::bail!("say what with --server <name> or --tool <name>");
+    }
+    let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
+    let config = plug_core::config::load_config(config_path).ok();
+    let key = resolve_client_access_key(&client, &live_session_views(&live, config.as_ref()))?;
+    let targets = servers
+        .into_iter()
+        .map(|server| (ClientBlockKind::Server, server))
+        .chain(tools.into_iter().map(|tool| (ClientBlockKind::Tool, tool)));
+    for (kind, target) in targets {
+        crate::commands::servers::apply_server_mutation(
+            config_path,
+            plug_core::operator::OperatorMutation::SetClientBlock {
+                key: key.clone(),
+                kind,
+                target,
+                blocked,
+            },
+        )
+        .await?;
+    }
+
+    let settings = plug_core::config::load_config(config_path)
+        .ok()
+        .and_then(|config| config.clients.get(&key).cloned())
+        .unwrap_or_default();
+    print_info_line(client_blocks_line(&key, &settings));
+    if !key.starts_with("oauth:") {
+        print_info_line(
+            style("This keeps the tool list tidy. It is not a security boundary: only a remote client's grant is verified.").dim(),
+        );
+    }
+    Ok(())
+}
+
+/// One line saying what a client is kept from.
+pub(crate) fn client_blocks_line(
+    key: &str,
+    settings: &plug_core::config::ClientSettings,
+) -> String {
+    let mut parts = Vec::new();
+    if !settings.blocked_servers.is_empty() {
+        parts.push(format!("servers {}", settings.blocked_servers.join(", ")));
+    }
+    if !settings.blocked_tools.is_empty() {
+        parts.push(format!("tools {}", settings.blocked_tools.join(", ")));
+    }
+    if parts.is_empty() {
+        format!("{key} is kept from nothing.")
+    } else {
+        format!("{key} is kept from {}.", parts.join("; "))
+    }
 }
 
 pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
@@ -613,6 +726,7 @@ pub(crate) fn live_session_views(
         .iter()
         .map(|session| (session, session.client_key()))
         .map(|(session, key)| LiveSessionView {
+            access_key: session.access_key(),
             name: key
                 .as_ref()
                 .and_then(|key| config?.clients.get(key)?.name.clone()),

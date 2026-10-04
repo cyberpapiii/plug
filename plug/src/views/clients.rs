@@ -464,6 +464,21 @@ pub(crate) async fn cmd_client_list(
             }
         }
 
+        let blocks = config
+            .iter()
+            .flat_map(|config| config.clients.iter())
+            .filter(|(_, settings)| {
+                !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
+            })
+            .collect::<Vec<_>>();
+        if !blocks.is_empty() {
+            println!();
+            print_heading("Blocked");
+            for (key, settings) in blocks {
+                print_info_line(crate::commands::clients::client_blocks_line(key, settings));
+            }
+        }
+
         println!();
         print_heading("Configured Clients");
         let linked_clients = clients.iter().filter(|client| client.linked);
@@ -544,6 +559,7 @@ mod tests {
             host: None,
             key: None,
             name: None,
+            access_key: None,
             connected_secs: 12,
             last_activity_secs: Some(3),
         }];
@@ -723,6 +739,7 @@ mod tests {
             host: None,
             key: None,
             name: None,
+            access_key: None,
             connected_secs,
             last_activity_secs: None,
         }
@@ -760,6 +777,42 @@ mod tests {
         assert_eq!(linked.label(), "Pi");
         linked.name = Some("Work Pi".to_string());
         assert_eq!(linked.label(), "Work Pi");
+    }
+
+    #[test]
+    fn a_block_goes_under_the_key_the_requests_carry() {
+        use crate::commands::clients::{resolve_client_access_key, resolve_client_key};
+
+        // A remote session on the shared token shows under what it reports,
+        // but its requests are the shared key's.
+        let mut shared = session("Cursor", "http", 30);
+        shared.key = Some("cursor".to_string());
+        shared.access_key = Some("remote:shared".to_string());
+        let mut local = session("Unknown", "daemon_proxy", 10);
+        local.key = Some("pi".to_string());
+        local.access_key = Some("pi".to_string());
+        let sessions = [shared, local];
+
+        assert_eq!(resolve_client_key("Cursor", &sessions).unwrap(), "cursor");
+        assert_eq!(
+            resolve_client_access_key("Cursor", &sessions).unwrap(),
+            "remote:shared"
+        );
+        assert_eq!(
+            resolve_client_access_key("remote:shared", &sessions).unwrap(),
+            "remote:shared"
+        );
+        assert_eq!(resolve_client_access_key("Pi", &sessions).unwrap(), "pi");
+        // Not connected: a key or a target is taken as written.
+        assert_eq!(
+            resolve_client_access_key("oauth:abc", &sessions).unwrap(),
+            "oauth:abc"
+        );
+        assert_eq!(
+            resolve_client_access_key("warp", &sessions).unwrap(),
+            "warp"
+        );
+        assert!(resolve_client_access_key("nobody", &sessions).is_err());
     }
 
     #[test]
