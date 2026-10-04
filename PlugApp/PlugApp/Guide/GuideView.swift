@@ -56,7 +56,7 @@ struct GuideView: View {
             }
         }
         .padding(Metric.roomy)
-        .frame(width: 540)
+        .frame(width: SheetFrame<EmptyView, EmptyView>.width)
         .task { await model.loadConnectableApps() }
     }
 

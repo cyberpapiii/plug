@@ -87,7 +87,9 @@ struct PlugPopover: View {
 
     // MARK: - Servers
 
-    private var servers: [ServerFacts] { situation.activeServers }
+    /// Every server, on or off, in the order the window lists them. A server
+    /// that is off is still a server someone may be looking for.
+    private var servers: [ServerFacts] { situation.listedServers }
 
     private var serverList: some View {
         VStack(alignment: .leading, spacing: Metric.tight) {
@@ -96,7 +98,7 @@ struct PlugPopover: View {
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
-                Text(Self.serversSummary(situation, stale: model.dataIsStale))
+                Text(situation.countsSummary(stale: model.dataIsStale))
                     .font(.caption.monospacedDigit())
                     .foregroundStyle(.tertiary)
                     .contentTransition(.numericText())
@@ -130,21 +132,6 @@ struct PlugPopover: View {
         let rows = min(servers.count, Metric.popoverVisibleRows)
         let partial: CGFloat = servers.count > Metric.popoverVisibleRows ? Metric.popoverRowHeight * 0.45 : 0
         return CGFloat(rows) * Metric.popoverRowHeight + partial + Metric.tight
-    }
-
-    /// Stale rows say so, the way the Servers page does, so a list read
-    /// before the daemon went away is not taken for the current state.
-    static func serversSummary(_ situation: PlugSituation, stale: Bool) -> String {
-        let working = situation.workingServers.count
-        let total = situation.activeServers.count
-        let summary: String
-        if working == total {
-            let tools = situation.totalTools
-            summary = tools == 1 ? "1 tool" : "\(tools) tools"
-        } else {
-            summary = "\(working) of \(total) running"
-        }
-        return stale ? "Last known · \(summary)" : summary
     }
 
     // MARK: - Connected clients
@@ -288,7 +275,7 @@ private struct PanelServerRow: View {
                 StatusGlyph(health: server.health)
                 Text(server.name)
                     .font(.callout)
-                    .foregroundStyle(.primary)
+                    .foregroundStyle(server.enabled ? .primary : .secondary)
                     .lineLimit(1)
                 Spacer(minLength: Metric.tight)
                 trailing
