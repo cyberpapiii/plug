@@ -64,6 +64,64 @@ pub fn reference(store: &str, name: &str) -> String {
     format!("{store}:{name}")
 }
 
+/// Whether an environment variable of this name usually holds a credential.
+/// A miss leaves the value in the config file, where it was going anyway.
+pub fn looks_secret(key: &str) -> bool {
+    let key = key.to_ascii_uppercase();
+    // A name that ends like this says where a credential is, or whose it is.
+    let points_elsewhere = [
+        "_ID", "_URL", "_URI", "_PATH", "_FILE", "_DIR", "_NAME", "_ACCOUNT", "_USER",
+    ]
+    .iter()
+    .any(|suffix| key.ends_with(suffix));
+    if points_elsewhere {
+        return false;
+    }
+    [
+        "TOKEN",
+        "SECRET",
+        "PASSWORD",
+        "PASSWD",
+        "CREDENTIAL",
+        "API_KEY",
+        "APIKEY",
+        "ACCESS_KEY",
+        "PRIVATE_KEY",
+    ]
+    .iter()
+    .any(|word| key.contains(word))
+        || key == "KEY"
+        || key.ends_with("_KEY")
+        || key.ends_with("_PAT")
+}
+
+/// The name Plug gives a secret it stores on a server's behalf: the server,
+/// a dot, and the field. Removing the server takes these with it.
+pub fn name_for(server: &str, field: &str) -> String {
+    let safe = |text: &str| -> String {
+        text.chars()
+            .map(|c| {
+                if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
+                    c
+                } else {
+                    '-'
+                }
+            })
+            .collect()
+    };
+    let mut name = format!("{}.{}", safe(server), safe(field));
+    name.truncate(64);
+    name
+}
+
+/// A value a person typed, as opposed to a `$VAR`, a redaction placeholder,
+/// or nothing.
+fn is_literal(value: &str) -> bool {
+    !value.is_empty()
+        && value != crate::config::REDACTED_SECRET
+        && crate::config::expand::extract_env_refs(value).is_empty()
+}
+
 /// The OS credential store, under the same service name as Plug's OAuth
 /// tokens.
 pub struct Keychain;
@@ -119,13 +177,15 @@ pub struct Stores {
 impl Stores {
     /// The stores every Plug has.
     ///
-    /// Under test the Keychain is a map in memory, so no unit test reads or
-    /// writes the Keychain of the person running it.
+    /// Where the isolated test credential backend is installed, the Keychain
+    /// is a map in memory, so no test reads or writes the Keychain of the
+    /// person running it.
     pub fn builtin() -> Self {
-        #[cfg(test)]
-        let keychain: Arc<dyn SecretStore> = testing::keychain();
-        #[cfg(not(test))]
-        let keychain: Arc<dyn SecretStore> = Arc::new(Keychain);
+        let keychain: Arc<dyn SecretStore> = if crate::oauth::uses_test_credentials() {
+            memory::keychain()
+        } else {
+            Arc::new(Keychain)
+        };
         Self::default().with(KEYCHAIN, keychain)
     }
 
@@ -148,6 +208,98 @@ impl Stores {
     pub fn parse<'a>(&self, value: &'a str) -> Option<(&'a str, &'a str)> {
         let (store, name) = value.split_once(':')?;
         (self.get(store).is_some() && valid_name(name)).then_some((store, name))
+    }
+
+    /// The fields of `server` that hold a credential in the clear: `token` for
+    /// the bearer token, and the names of the `env` entries that look like
+    /// credentials. `server` must be as the file has it, before `$VAR`
+    /// expansion.
+    pub fn plaintext(&self, server: &ServerConfig) -> Vec<String> {
+        let clear = |value: &str| is_literal(value) && self.parse(value).is_none();
+        let mut fields: Vec<String> = server
+            .env
+            .iter()
+            .filter(|(key, value)| looks_secret(key) && clear(value))
+            .map(|(key, _)| key.clone())
+            .collect();
+        fields.sort();
+        if server
+            .auth_token
+            .as_ref()
+            .is_some_and(|token| clear(token.as_str()))
+        {
+            fields.insert(0, "token".to_string());
+        }
+        fields
+    }
+
+    /// Move the credentials typed into `server` to the Keychain and leave
+    /// references in their place: the bearer token, and the `env` values whose
+    /// names say they are credentials. Returns the names stored.
+    ///
+    /// A value the store will not take stays where it is, so a machine with no
+    /// credential store keeps working the way it did.
+    pub fn keep(&self, server_name: &str, server: &mut ServerConfig) -> Vec<String> {
+        let Some(store) = self.get(KEYCHAIN) else {
+            return Vec::new();
+        };
+        let mut kept = Vec::new();
+        let mut put = |field: &str, value: &str| -> Option<String> {
+            if !is_literal(value) || self.parse(value).is_some() {
+                return None;
+            }
+            let name = name_for(server_name, field);
+            match store.set(&name, &value.to_string().into()) {
+                Ok(()) => {
+                    kept.push(name.clone());
+                    Some(reference(KEYCHAIN, &name))
+                }
+                Err(error) => {
+                    tracing::warn!(server = %server_name, %error, "secret stays in the config file");
+                    None
+                }
+            }
+        };
+        if let Some(token) = &server.auth_token
+            && let Some(reference) = put("token", token.as_str())
+        {
+            server.auth_token = Some(reference.into());
+        }
+        for (key, value) in &mut server.env {
+            if looks_secret(key)
+                && let Some(reference) = put(key, value)
+            {
+                *value = reference;
+            }
+        }
+        kept
+    }
+
+    /// Remove what [`Stores::keep`] stored for `server` and `now` no longer
+    /// refers to; `now` is `None` when the server is gone. A secret the
+    /// person named themselves may serve other servers, so it is left alone.
+    pub fn forget(&self, server_name: &str, server: &ServerConfig, now: Option<&ServerConfig>) {
+        fn values(server: &ServerConfig) -> impl Iterator<Item = &str> {
+            server
+                .auth_token
+                .iter()
+                .map(|token| token.as_str())
+                .chain(server.env.values().map(String::as_str))
+        }
+        let prefix = name_for(server_name, "");
+        for value in values(server) {
+            if now.is_some_and(|now| values(now).any(|kept| kept == value)) {
+                continue;
+            }
+            if let Some((id, name)) = self.parse(value)
+                && id == KEYCHAIN
+                && name.starts_with(&prefix)
+                && let Some(store) = self.get(id)
+                && let Err(error) = store.remove(name)
+            {
+                tracing::warn!(server = %server_name, %error, "could not remove a stored secret");
+            }
+        }
     }
 
     /// The value `value` refers to, or `None` when it is not a reference.
@@ -200,8 +352,8 @@ impl Stores {
     }
 }
 
-#[cfg(test)]
-pub(crate) mod testing {
+/// The stand-in for the Keychain under test.
+pub(crate) mod memory {
     use super::*;
     use std::collections::HashMap;
     use std::sync::{Mutex, OnceLock};
@@ -232,7 +384,7 @@ pub(crate) mod testing {
         }
     }
 
-    /// The store `Stores::builtin` uses as the Keychain under test.
+    /// The one store every `Stores::builtin` shares under test.
     pub(crate) fn keychain() -> Arc<Memory> {
         static KEYCHAIN: OnceLock<Arc<Memory>> = OnceLock::new();
         Arc::clone(KEYCHAIN.get_or_init(Arc::default))
@@ -241,7 +393,7 @@ pub(crate) mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::Memory;
+    use super::memory::Memory;
     use super::*;
 
     struct Locked;
@@ -333,6 +485,107 @@ LEVEL = "debug:verbose"
         let locked = server("command = \"server\"\n[env]\nKEY = \"vault:api\"\n");
         let error = stores().resolve_server(&locked).await.unwrap_err();
         assert_eq!(error.to_string(), "waiting for vault: it is locked");
+    }
+
+    #[test]
+    fn typed_credentials_move_to_the_keychain_and_leave_references() {
+        let memory = Arc::new(Memory::default());
+        let stores = Stores::default().with(KEYCHAIN, memory.clone());
+        let mut config = server(
+            r#"
+command = "server"
+auth_token = "typed-token"
+
+[env]
+GITHUB_TOKEN = "typed-env"
+LOG_LEVEL = "debug"
+FROM_ENV = "$HOME_TOKEN"
+OPENAI_API_KEY = "keychain:mine"
+"#,
+        );
+        assert_eq!(stores.plaintext(&config), ["token", "GITHUB_TOKEN"]);
+        let mut kept = stores.keep("my server", &mut config);
+        kept.sort();
+        assert_eq!(kept, ["my-server.GITHUB_TOKEN", "my-server.token"]);
+        assert_eq!(
+            config.auth_token.as_ref().unwrap().as_str(),
+            "keychain:my-server.token"
+        );
+        assert_eq!(
+            config.env["GITHUB_TOKEN"],
+            "keychain:my-server.GITHUB_TOKEN"
+        );
+        assert_eq!(config.env["LOG_LEVEL"], "debug");
+        assert_eq!(config.env["FROM_ENV"], "$HOME_TOKEN");
+        assert_eq!(config.env["OPENAI_API_KEY"], "keychain:mine");
+        assert_eq!(
+            memory.get("my-server.token").unwrap().unwrap().as_str(),
+            "typed-token"
+        );
+        assert!(stores.plaintext(&config).is_empty());
+        // A second pass has nothing left to move.
+        assert!(stores.keep("my server", &mut config).is_empty());
+
+        memory.set("mine", &"shared".to_string().into()).unwrap();
+        let mut edited = config.clone();
+        edited.auth_token = None;
+        stores.forget("my server", &config, Some(&edited));
+        assert!(memory.get("my-server.token").unwrap().is_none());
+        assert!(memory.get("my-server.GITHUB_TOKEN").unwrap().is_some());
+        stores.forget("my server", &config, None);
+        assert!(memory.get("my-server.GITHUB_TOKEN").unwrap().is_none());
+        assert!(memory.get("mine").unwrap().is_some());
+    }
+
+    #[test]
+    fn a_store_that_refuses_leaves_the_value_where_it_was() {
+        struct ReadOnly;
+        impl SecretStore for ReadOnly {
+            fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+                Ok(None)
+            }
+            fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+                Err(SecretError::Unavailable {
+                    store: KEYCHAIN.to_string(),
+                    reason: "no credential store".to_string(),
+                })
+            }
+            fn remove(&self, _: &str) -> Result<(), SecretError> {
+                Ok(())
+            }
+        }
+        let mut config = server("command = \"server\"\nauth_token = \"typed-token\"\n");
+        let kept = Stores::default()
+            .with(KEYCHAIN, Arc::new(ReadOnly))
+            .keep("s", &mut config);
+        assert!(kept.is_empty());
+        assert_eq!(config.auth_token.unwrap().as_str(), "typed-token");
+    }
+
+    #[test]
+    fn credential_names_are_told_from_ordinary_settings() {
+        for key in [
+            "GITHUB_TOKEN",
+            "api_key",
+            "OPENAI_API_KEY",
+            "DB_PASSWORD",
+            "KEY",
+        ] {
+            assert!(looks_secret(key), "{key}");
+        }
+        for key in [
+            "LOG_LEVEL",
+            "PATH",
+            "KEYBOARD",
+            "PORT",
+            "MONKEY_MODE",
+            "OAUTH_CLIENT_ID",
+            "OAUTH_KEYCHAIN_ACCOUNT",
+            "TOKEN_URL",
+            "SECRET_FILE",
+        ] {
+            assert!(!looks_secret(key), "{key}");
+        }
     }
 
     #[test]

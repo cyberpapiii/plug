@@ -73,11 +73,13 @@ up to Open before starting it.
   API key, operations chosen in either.
 - Skills: carry the skills extension through Plug, with the server's name in
   each skill URI. Waits for a server and a client that use it (#262).
-- Secret stores (#264). Done: `keychain:<name>` references and
-  `plug secret set`. Next, in order: the app and `plug server add` put a
-  pasted key in the Keychain by default and `plug doctor` offers to move
-  plaintext keys; the `.env` file as a store read only by the service; any
-  other store as a command in config, then `op://`.
+- Secret stores (#264). Done: `keychain:<name>` references,
+  `plug secret set`, typed keys going to the Keychain from the app and the
+  CLI, `plug secret move` for keys already in the file. Next, in order: the
+  `.env` file as a store read only by the service; any other store as a
+  command in config, then `op://`. Editing a server in the app without
+  retyping its key leaves an old plaintext key in the file until
+  `plug secret move`.
 - A code-execution tool surface in place of real tools. Current evidence is
   against it as a default; the opt-in search-then-load mode covers clients with
   hard tool caps.

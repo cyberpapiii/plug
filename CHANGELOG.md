@@ -16,6 +16,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   entries. Only the service reads the value, when it starts that server. A
   server whose secret is missing says so in `plug status` and the others start
   as usual. `plug secret rm <name>` removes one.
+- A key typed into Plug goes to the Keychain on its own. Adding or editing a
+  server in the app or with `plug server add` stores its token, and any `env`
+  entry whose name says it is a credential, in the Keychain and writes
+  `keychain:<server>.<field>` to `config.toml`. Removing the server, or the
+  token, removes the stored value. A machine with no credential store keeps
+  the key in the file as before.
+- `plug doctor` and the app's checkup name the keys still written in
+  `config.toml`, and `plug secret move` moves them all to the Keychain.
 - Plug can watch a tool and tell a client when its result changes. Add an
   `[[events.watch]]` entry naming a server, a tool, and how often to check, and
   the event `<server>.<name>` appears to remote clients that support MCP

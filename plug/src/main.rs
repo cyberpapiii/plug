@@ -297,6 +297,8 @@ pub(crate) enum SecretCommands {
         /// The name it was stored under
         name: String,
     },
+    /// Move the keys written in the config file to the Keychain
+    Move,
 }
 
 #[derive(Subcommand)]
@@ -750,7 +752,9 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
-        Some(Commands::Secret { command }) => commands::secrets::cmd_secret(command)?,
+        Some(Commands::Secret { command }) => {
+            commands::secrets::cmd_secret(cli.config.as_ref(), command).await?
+        }
         Some(Commands::UninstallCleanup) => commands::misc::cmd_uninstall_cleanup(&cli.output)?,
     }
 

@@ -86,6 +86,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
     let checks = vec![
         config_exists,
         config_perms,
+        check_keys_in_config(config_path),
         port,
         env_vars,
         binaries,
@@ -209,6 +210,43 @@ fn toml_parse(contents: &str) -> Result<(), String> {
     toml::from_str::<toml::Table>(contents)
         .map(|_| ())
         .map_err(|e| e.to_string())
+}
+
+/// Keys written in the config file, which the Keychain would keep better.
+/// Reads the file as written: after `$VAR` expansion every value looks typed.
+fn check_keys_in_config(config_path: &Path) -> CheckResult {
+    let name = "keys_in_config".to_string();
+    let stores = crate::secrets::Stores::builtin();
+    let mut found: Vec<String> = crate::operator::load_editable_config(config_path)
+        .map(|config| {
+            config
+                .servers
+                .iter()
+                .flat_map(|(server, config)| {
+                    stores
+                        .plaintext(config)
+                        .into_iter()
+                        .map(move |field| format!("{server}.{field}"))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    found.sort();
+    if found.is_empty() {
+        CheckResult {
+            name,
+            status: CheckStatus::Pass,
+            message: "No keys are written in the config file".to_string(),
+            fix_suggestion: None,
+        }
+    } else {
+        CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            message: format!("Keys written in the config file: {}", found.join(", ")),
+            fix_suggestion: Some("Run `plug secret move` to keep them in the Keychain".to_string()),
+        }
+    }
 }
 
 /// Check 2: config file permissions (Unix only).
@@ -1417,6 +1455,35 @@ mod tests {
 
     // -- check_config_exists --
 
+    #[test]
+    fn keys_in_the_config_file_are_named_and_references_are_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[servers.a]
+command = "a"
+[servers.a.env]
+API_KEY = "typed"
+MODE = "fast"
+OTHER_TOKEN = "$FROM_ENV"
+
+[servers.b]
+url = "https://example.com/mcp"
+transport = "http"
+auth_token = "keychain:b.token"
+"#,
+        )
+        .unwrap();
+        let result = check_keys_in_config(&path);
+        assert_eq!(result.status, CheckStatus::Warn);
+        assert_eq!(result.message, "Keys written in the config file: a.API_KEY");
+
+        std::fs::write(&path, "[servers.b]\ncommand = \"b\"\n").unwrap();
+        assert_eq!(check_keys_in_config(&path).status, CheckStatus::Pass);
+    }
+
     #[tokio::test]
     async fn config_exists_missing_file() {
         let result = check_config_exists(Path::new("/nonexistent/path/config.toml")).await;
@@ -2187,6 +2254,6 @@ command = "example-server"
     async fn run_doctor_returns_all_checks() {
         let config = test_config();
         let report = run_doctor(&config, Path::new("/nonexistent/config.toml")).await;
-        assert_eq!(report.checks.len(), 15);
+        assert_eq!(report.checks.len(), 16);
     }
 }

@@ -44,6 +44,7 @@ struct Check: Identifiable, Equatable, Sendable, Decodable {
         switch name {
         case "config_exists": "Settings file"
         case "config_permissions": "Settings file is private"
+        case "keys_in_config": "Keys kept in the Keychain"
         case "port_available": "Network port"
         case "env_vars": "Server passwords and keys"
         case "server_binaries": "Server programs"
