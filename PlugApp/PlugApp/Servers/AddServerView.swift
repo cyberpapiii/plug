@@ -14,6 +14,8 @@ struct AddServerView: View {
     @State private var nameEdited = false
     @State private var saving = false
     @State private var failure: String?
+    /// The person's answer to "is this address an API?", when they gave one.
+    @State private var addressIsAPI: Bool?
     @FocusState private var focus: Field?
 
     private enum Field { case paste, name }
@@ -22,7 +24,7 @@ struct AddServerView: View {
         VStack(alignment: .leading, spacing: Metric.regular) {
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text("Add a server").font(.title2.weight(.semibold))
-                Text("Paste the setup block from the server's instructions, a command, or a URL.")
+                Text("Paste the setup block from the server's instructions, a command, a URL, or the address of an API's OpenAPI document.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -69,6 +71,7 @@ struct AddServerView: View {
         .interactiveDismissDisabled(saving)
         .onChange(of: pasted) { _, _ in
             failure = nil
+            addressIsAPI = nil
             if !nameEdited, let draft { name = draft.name }
         }
     }
@@ -83,7 +86,9 @@ struct AddServerView: View {
 
     // MARK: - Understanding
 
-    private var parse: ServerDraftParse { ServerDraftParser.parse(pasted) }
+    private var parse: ServerDraftParse {
+        ServerDraftParser.parse(pasted, addressIsAPI: addressIsAPI)
+    }
 
     private var draft: ServerDraft? {
         if case let .draft(value) = parse { return value }
@@ -111,6 +116,17 @@ struct AddServerView: View {
                         .onChange(of: name) { _, _ in
                             if focus == .name { nameEdited = true }
                         }
+                }
+                if draft.fromAddress {
+                    Picker("This address is", selection: Binding(
+                        get: { draft.config.transport == "openapi" },
+                        set: { addressIsAPI = $0 }
+                    )) {
+                        Text("A server").tag(false)
+                        Text("An API's OpenAPI document").tag(true)
+                    }
+                    .pickerStyle(.segmented)
+                    .font(.callout)
                 }
                 ForEach(draft.facts) { fact in
                     HStack(alignment: .firstTextBaseline, spacing: Metric.snug) {

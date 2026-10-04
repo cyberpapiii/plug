@@ -418,6 +418,11 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public static func remote(_ url: String) -> Self {
         Self(transport: "http", url: url)
     }
+
+    /// An HTTP API, named by the URL or file path of its OpenAPI document.
+    public static func api(_ spec: String) -> Self {
+        Self(transport: "openapi", maxConcurrent: 4, spec: spec)
+    }
 }
 
 extension ServerConfig {

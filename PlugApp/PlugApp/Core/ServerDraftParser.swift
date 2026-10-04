@@ -13,6 +13,10 @@ struct ServerDraft: Equatable, Sendable {
     var name: String
     var config: ServerConfig
     var facts: [DraftFact]
+    /// True when the paste was only a web address. An address alone does not
+    /// say whether it is a server or the description of an API, so the form
+    /// lets the person correct the guess.
+    var fromAddress = false
 }
 
 enum ServerDraftParse: Equatable, Sendable {
@@ -25,10 +29,13 @@ enum ServerDraftParse: Equatable, Sendable {
 ///
 /// People acquire MCP servers by copying from a README, so the three things
 /// worth accepting are the JSON block those READMEs print, a bare URL, and the
-/// shell command they would otherwise have run. Anything else is refused with a
+/// shell command they would otherwise have run. A URL or file that names an
+/// OpenAPI document becomes an API server. Anything else is refused with a
 /// sentence that says what to paste instead.
 enum ServerDraftParser {
-    static func parse(_ raw: String) -> ServerDraftParse {
+    /// `addressIsAPI` overrides the guess about a bare web address: true reads
+    /// it as an API's OpenAPI document, false as a server.
+    static func parse(_ raw: String, addressIsAPI: Bool? = nil) -> ServerDraftParse {
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return .empty }
 
@@ -36,9 +43,47 @@ enum ServerDraftParser {
             return parseJSON(text)
         }
         if let url = remoteURL(in: text) {
-            return .draft(remoteDraft(name: suggestedName(forHost: url), url: url))
+            let name = suggestedName(forHost: url)
+            var draft = addressIsAPI ?? looksLikeAPIDocument(url)
+                ? apiDraft(name: name, spec: url)
+                : remoteDraft(name: name, url: url)
+            draft.fromAddress = true
+            return .draft(draft)
+        }
+        if let path = documentPath(in: text) {
+            let file = path.split(separator: "/").last.map(String.init) ?? path
+            let name = file.split(separator: ".").first.map(String.init) ?? "api"
+            return .draft(apiDraft(name: name, spec: path))
         }
         return parseCommand(text)
+    }
+
+    // MARK: - API document
+
+    private static let documentExtensions = [".json", ".yaml", ".yml"]
+
+    /// OpenAPI documents are published as a JSON or YAML file, or at a path
+    /// that says what it is. A server's address is neither.
+    private static func looksLikeAPIDocument(_ url: String) -> Bool {
+        guard let path = URL(string: url)?.path.lowercased() else { return false }
+        return documentExtensions.contains { path.hasSuffix($0) }
+            || path.contains("openapi") || path.contains("swagger")
+    }
+
+    /// A lone path to a JSON or YAML file on this Mac.
+    private static func documentPath(in text: String) -> String? {
+        guard text.hasPrefix("/") || text.hasPrefix("~/"),
+              !text.contains(where: \.isNewline)
+        else { return nil }
+        let path = tokenize(text).count == 1 ? tokenize(text)[0] : text
+        let lowered = path.lowercased()
+        guard documentExtensions.contains(where: { lowered.hasSuffix($0) }) else { return nil }
+        return path
+    }
+
+    private static func apiDraft(name: String, spec: String) -> ServerDraft {
+        let config = ServerConfig.api(spec)
+        return ServerDraft(name: name, config: config, facts: facts(for: config))
     }
 
     // MARK: - JSON
@@ -253,6 +298,9 @@ enum ServerDraftParser {
     private static func facts(for config: ServerConfig) -> [DraftFact] {
         var facts: [DraftFact] = []
         switch config.transport {
+        case "openapi":
+            facts.append(DraftFact(label: "Reads", value: config.spec ?? "—"))
+            facts.append(DraftFact(label: "Kind", value: "HTTP API, one tool for each operation"))
         case "http", "sse":
             facts.append(DraftFact(label: "Connects to", value: config.url ?? "—"))
             facts.append(DraftFact(label: "Kind", value: "Remote server"))
