@@ -55,6 +55,12 @@ pub struct Config {
     /// Events Plug makes itself, such as watching a tool for change.
     #[serde(default, skip_serializing_if = "crate::events::EventsConfig::is_empty")]
     pub events: crate::events::EventsConfig,
+    /// Secret stores beyond the built-in ones.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::secrets::SecretsConfig::is_empty"
+    )]
+    pub secrets: crate::secrets::SecretsConfig,
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -94,6 +100,7 @@ impl Default for Config {
             disabled_tools: Vec::new(),
             clients: std::collections::BTreeMap::new(),
             events: crate::events::EventsConfig::default(),
+            secrets: crate::secrets::SecretsConfig::default(),
             http: HttpConfig::default(),
             modern_upstream_enabled: false,
             daemon_grace_period_secs: 0,
@@ -687,6 +694,7 @@ pub fn sanitize_server_name_for_path(name: &str) -> Result<&str, String> {
 /// Returns an empty vec if the config is valid.
 pub fn validate_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
+    errors.extend(config.secrets.validate());
     if let Some(events) = &config.http.slack_events {
         errors.extend(events.validate());
         if !config.http.modern_downstream_enabled

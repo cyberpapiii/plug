@@ -16,6 +16,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   entries. Only the service reads the value, when it starts that server. A
   server whose secret is missing says so in `plug status` and the others start
   as usual. `plug secret rm <name>` removes one.
+- A server's key can also come from 1Password, from Plug's `.env` file, or
+  from any other password manager. `op://vault/item/field` asks the 1Password
+  command-line tool; `file:<name>` reads the `.env` file, and
+  `plug secret set --store file <name>` writes it. Any other tool is three
+  lines under `[secrets.stores.<id>]`: a `command` with `{name}` where the
+  secret's name goes, and `<id>:<name>` runs it. A store that locks after a
+  server started does not stop that server: Plug keeps the value it read, in
+  memory only, and uses it until the store answers again.
 - A key typed into Plug goes to the Keychain on its own. Adding or editing a
   server in the app or with `plug server add` stores its token, and any `env`
   entry whose name says it is a credential, in the Keychain and writes
@@ -181,6 +189,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug server add` with flags no longer stops to ask for arguments when the
+  command takes none.
 - MCP Apps work through Plug. Plug now tells each server it can show app
   pages, so servers that check before offering one offer it; the `ui` field
   that links a tool to its page and carries the page's sandbox settings is

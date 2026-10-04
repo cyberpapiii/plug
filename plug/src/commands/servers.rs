@@ -477,7 +477,7 @@ pub(crate) async fn cmd_server_add(
                     .with_prompt("Command")
                     .interact_text()?,
             };
-            let args = if args.is_empty() {
+            let args = if args.is_empty() && !non_interactive {
                 let value: String = Input::with_theme(&cli_prompt_theme())
                     .with_prompt("Args (space-separated, optional)")
                     .allow_empty(true)
