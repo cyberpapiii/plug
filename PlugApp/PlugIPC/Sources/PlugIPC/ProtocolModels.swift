@@ -47,6 +47,29 @@ public struct ServerStatus: Codable, Identifiable, Equatable, Sendable {
     public let health: String
     public let toolCount: Int
     public let error: String?
+    /// What the server said about itself when it connected.
+    public var upstream: UpstreamInfo?
+}
+
+/// The part of a server's own description the app shows: where its maker
+/// lives on the web, and the icons it offers for itself.
+public struct UpstreamInfo: Codable, Equatable, Sendable {
+    public var websiteUrl: String?
+    /// Absent in the polled snapshot, which leaves icons out to stay small.
+    public var icons: [ServerIcon]?
+}
+
+/// One icon a server offers for itself: a `data:` or `https:` address.
+public struct ServerIcon: Codable, Equatable, Sendable {
+    public let src: String
+    public var mimeType: String?
+    public var sizes: [String]?
+
+    public init(src: String, mimeType: String? = nil, sizes: [String]? = nil) {
+        self.src = src
+        self.mimeType = mimeType
+        self.sizes = sizes
+    }
 }
 
 public struct ConfiguredServer: Codable, Identifiable, Equatable, Sendable {
@@ -517,6 +540,8 @@ public struct APIOperation: Decodable, Equatable, Sendable, Identifiable {
 public enum IPCRequest: Encodable, Equatable, Sendable {
     case handshake(clientVersion: String, ipcMin: UInt16, ipcMax: UInt16)
     case snapshot(authToken: String)
+    /// Every server with what it said about itself, icons included.
+    case status
     case serverConfig(authToken: String, name: String)
     case activity(authToken: String, afterSequence: UInt64, limit: Int, failuresOnly: Bool)
     case validateServer(authToken: String, name: String, server: ServerConfig)
@@ -557,6 +582,8 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode(min, forKey: .ipcMin); try c.encode(max, forKey: .ipcMax)
         case let .snapshot(token):
             try c.encode("OperatorSnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
+        case .status:
+            try c.encode("Status", forKey: .type)
         case let .serverConfig(token, name):
             try c.encode("GetServerConfig", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name)
@@ -656,6 +683,7 @@ public struct ReloadSummary: Decodable, Equatable, Sendable {
 public enum IPCResponse: Decodable, Sendable {
     case handshake(OperatorHandshake)
     case snapshot(OperatorSnapshot)
+    case status([ServerStatus])
     case serverConfig(name: String, server: ServerConfig)
     case activity([ActivityEvent])
     case tools([ToolInfo])
@@ -670,7 +698,7 @@ public enum IPCResponse: Decodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, handshake, snapshot, events, tools, clientId, code, message, report, name, server
-        case api
+        case api, servers
     }
 
     public init(from decoder: Decoder) throws {
@@ -679,6 +707,7 @@ public enum IPCResponse: Decodable, Sendable {
         switch type {
         case "OperatorHandshake": self = .handshake(try c.decode(OperatorHandshake.self, forKey: .handshake))
         case "OperatorSnapshot": self = .snapshot(try c.decode(OperatorSnapshot.self, forKey: .snapshot))
+        case "Status": self = .status(try c.decode([ServerStatus].self, forKey: .servers))
         case "ServerConfig": self = .serverConfig(
             name: try c.decode(String.self, forKey: .name),
             server: try c.decode(ServerConfig.self, forKey: .server)

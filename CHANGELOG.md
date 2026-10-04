@@ -21,6 +21,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Anything else gets a tile with its first letter. A server's state shows as
   a dot on its icon, and in the list only when it needs attention.
 - The buttons at the bottom of the menu bar panel have icons again.
+- Servers and clients find their own icons. A server shows the icon it offers for itself, the app it runs inside, or the icon of its own web site, asked for only over HTTPS at the server's own address. Eight command line clients with no app, among them Gemini CLI, Copilot CLI, OpenCode, and Pi, show a logo that ships with Plug. Right-click any server or client and pick Choose Icon to use a picture of your own.
 - Each call in Activity shows two icons, the client and the server it
   called, and a failed call is marked beside its time.
 - Settings is its own window, on Command-comma and from the menu bar panel.

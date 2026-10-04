@@ -1,0 +1,12 @@
+{
+  "images" : [
+    {
+      "filename" : "client-gemini-cli.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

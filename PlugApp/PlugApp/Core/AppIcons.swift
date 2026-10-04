@@ -1,5 +1,7 @@
 import AppKit
+import PlugIPC
 import SwiftUI
+import UniformTypeIdentifiers
 
 /// Pictures of the apps people already recognize.
 ///
@@ -110,6 +112,15 @@ enum AppIcons {
     @MainActor
     static func image(forServer name: String) -> NSImage? {
         installedIcon(named: appName(forServer: name) { installedApps[$0] != nil })
+    }
+
+    /// The app a command lives inside, when it lives inside one: a server
+    /// started from `/Applications/Foo.app/Contents/MacOS/foo-mcp` is Foo.
+    ///
+    /// Pure, so the matching is testable.
+    static func appBundle(containing command: String) -> String? {
+        guard let end = command.range(of: ".app/") else { return nil }
+        return String(command[..<end.lowerBound]) + ".app"
     }
 
     /// Server names that are not their app's name.
@@ -257,7 +268,7 @@ struct AppGlyph: View {
 
     var body: some View {
         Group {
-            if let icon = AppIcons.image(target: target, name: name, appPath: appPath) {
+            if let icon = IconStore.shared.image(forClient: target, name: name, appPath: appPath) {
                 Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)
@@ -275,8 +286,8 @@ struct AppGlyph: View {
     }
 }
 
-/// One server, shown as the app it stands for when this Mac has that app,
-/// and as a tile with its first letter when it does not.
+/// One server, shown as the best picture Plug has for it, and as a tile
+/// with its first letter when it has none.
 struct ServerGlyph: View {
     let name: String
     var size: CGFloat = 18
@@ -286,7 +297,7 @@ struct ServerGlyph: View {
 
     var body: some View {
         Group {
-            if let icon = AppIcons.image(forServer: name) {
+            if let icon = IconStore.shared.image(forServer: name) {
                 Image(nsImage: icon)
                     .resizable()
                     .interpolation(.high)
@@ -352,5 +363,449 @@ struct MonogramTile: View {
                 }
             }
             .frame(width: size, height: size)
+    }
+}
+
+// MARK: - Found icons
+
+/// One server as the search for its icon sees it.
+struct IconSource: Equatable, Sendable {
+    let name: String
+    /// Where a remote server is reached.
+    var address: String?
+    /// What starts a local server.
+    var command: String?
+    /// The web page the server gave for itself.
+    var website: String?
+    /// The icons the server gave for itself.
+    var icons: [ServerIcon] = []
+}
+
+/// Every icon Plug found or was given, and the order they are trusted in.
+///
+/// A server's icon is, first to last: the one its owner chose, the one the
+/// server offers for itself, the app on this Mac with its name, the app its
+/// command lives in, and the icon of its own web site. A client's is the
+/// one its owner chose, its app on this Mac, then a logo that ships with
+/// Plug for the command line clients that have no app.
+///
+/// The web site is asked only when nothing earlier answered, only over
+/// HTTPS, and only at the server's own address or the page it named, so no
+/// third party learns which servers are here.
+@MainActor @Observable
+final class IconStore {
+    static let shared = IconStore()
+
+    private(set) var chosen: [String: NSImage] = [:]
+    private var advertised: [String: NSImage] = [:]
+    private var commandApps: [String: NSImage] = [:]
+    private var sites: [String: NSImage] = [:]
+
+    @ObservationIgnored private let chosenDirectory: URL
+    @ObservationIgnored private let cacheDirectory: URL
+    @ObservationIgnored private var signature = ""
+    @ObservationIgnored private var search: Task<Void, Never>?
+    /// What was already looked for since launch, found or not.
+    @ObservationIgnored private var searched: Set<String> = []
+
+    /// A found icon is kept this long before its site is asked again.
+    private static let keepFound: TimeInterval = 30 * 24 * 3600
+    /// A site with no icon is asked again after this long.
+    private static let keepMissing: TimeInterval = 24 * 3600
+
+    init(chosenDirectory: URL? = nil, cacheDirectory: URL? = nil) {
+        self.chosenDirectory = chosenDirectory
+            ?? PlugIPCClient.defaultSocketURL.deletingLastPathComponent().appending(path: "icons")
+        self.cacheDirectory = cacheDirectory
+            ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+            .appending(path: Bundle.main.bundleIdentifier ?? "com.cyberpapiii.plug")
+            .appending(path: "icons")
+        let files = (try? FileManager.default.contentsOfDirectory(atPath: self.chosenDirectory.path)) ?? []
+        for file in files where file.hasSuffix(".png") {
+            chosen[String(file.dropLast(4))] = NSImage(contentsOf: self.chosenDirectory.appending(path: file))
+        }
+    }
+
+    // MARK: Reading
+
+    func image(forServer name: String) -> NSImage? {
+        chosen[Self.key(server: name)]
+            ?? advertised[name]
+            ?? AppIcons.image(forServer: name)
+            ?? commandApps[name]
+            ?? sites[name]
+    }
+
+    func image(forClient target: String, name: String, appPath: String? = nil) -> NSImage? {
+        chosen[Self.key(client: target)]
+            ?? AppIcons.image(target: target, name: name, appPath: appPath)
+            ?? NSImage(named: "client-\(target.lowercased())")
+    }
+
+    /// The name a chosen icon is kept under.
+    nonisolated static func key(server name: String) -> String { "server-\(AppIcons.lookupKey(name))" }
+    nonisolated static func key(client target: String) -> String { "client-\(AppIcons.lookupKey(target))" }
+
+    // MARK: Choosing
+
+    /// Ask for a picture and use it as the icon kept under `key`.
+    func chooseIcon(for key: String) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a picture to use as the icon."
+        panel.prompt = "Choose"
+        guard panel.runModal() == .OK, let url = panel.url,
+              let data = try? Data(contentsOf: url) else { return }
+        setChosenIcon(data, for: key)
+    }
+
+    /// False when the data is not a picture.
+    @discardableResult
+    func setChosenIcon(_ data: Data, for key: String) -> Bool {
+        guard let png = IconTile.png(from: data), let image = NSImage(data: png) else { return false }
+        try? FileManager.default.createDirectory(at: chosenDirectory, withIntermediateDirectories: true)
+        try? png.write(to: chosenDirectory.appending(path: "\(key).png"), options: .atomic)
+        chosen[key] = image
+        return true
+    }
+
+    func removeChosenIcon(for key: String) {
+        try? FileManager.default.removeItem(at: chosenDirectory.appending(path: "\(key).png"))
+        chosen[key] = nil
+    }
+
+    // MARK: Finding
+
+    /// Look for icons whenever the set of servers, or their health, changes.
+    func attach(to model: AppModel) {
+        guard model.snapshotDidLoad == nil else { return }
+        model.snapshotDidLoad = { [weak self, weak model] snapshot in
+            guard let self, let model else { return }
+            self.observe(snapshot, model: model)
+        }
+    }
+
+    private func observe(_ snapshot: OperatorSnapshot, model: AppModel) {
+        let configured = snapshot.configuredServers.map { "\($0.name):\($0.enabled)" }
+        let running = snapshot.servers.map { "\($0.serverId)=\($0.health)" }
+        let next = (configured + ["|"] + running).joined(separator: ",")
+        guard next != signature else { return }
+        signature = next
+        search?.cancel()
+        search = Task { [weak self, weak model] in
+            guard let model else { return }
+            let described = (try? await model.serverDescriptions()) ?? []
+            var sources: [IconSource] = []
+            for server in snapshot.configuredServers {
+                let config = try? await model.serverConfig(name: server.name)
+                let upstream = described.first { $0.serverId == server.name }?.upstream
+                sources.append(IconSource(
+                    name: server.name,
+                    address: config?.url,
+                    command: config?.command,
+                    website: upstream?.websiteUrl,
+                    icons: upstream?.icons ?? []
+                ))
+            }
+            guard !Task.isCancelled else { return }
+            await self?.load(sources)
+        }
+    }
+
+    func load(_ sources: [IconSource]) async {
+        var wanted: [(name: String, key: String, hosts: [String])] = []
+        for source in sources {
+            if let command = source.command, let app = AppIcons.appBundle(containing: command),
+               commandApps[source.name] == nil, FileManager.default.fileExists(atPath: app) {
+                commandApps[source.name] = NSWorkspace.shared.icon(forFile: app)
+            }
+            if advertised[source.name] == nil, let icon = SiteIcon.best(of: source.icons) {
+                if let data = SiteIcon.data(fromDataURI: icon.src) {
+                    advertised[source.name] = IconTile.png(from: data).flatMap(NSImage.init(data:))
+                } else if let url = URL(string: icon.src), url.scheme == "https", let host = url.host {
+                    let key = "offered-\(AppIcons.lookupKey(host + url.path))"
+                    switch kept(key) {
+                    case let .found(image): advertised[source.name] = image
+                    case .missing: break
+                    case .unknown: advertised[source.name] = keep(await SiteIcon.image(at: url), as: key)
+                    }
+                }
+            }
+            guard image(forServer: source.name) == nil else { continue }
+            let hosts = SiteIcon.hosts(server: source.address, website: source.website)
+            if let first = hosts.first { wanted.append((source.name, "site-\(first)", hosts)) }
+        }
+        // Sites answer at their own pace; ask them side by side.
+        var asking: [(name: String, key: String, hosts: [String])] = []
+        for want in wanted {
+            switch kept(want.key) {
+            case let .found(image): sites[want.name] = image
+            case .missing: break
+            case .unknown: asking.append(want)
+            }
+        }
+        let answers = await withTaskGroup(of: (Int, Data?).self) { group in
+            for (index, want) in asking.enumerated() {
+                let hosts = want.hosts
+                group.addTask { (index, await SiteIcon.find(hosts: hosts)) }
+            }
+            var answers: [Int: Data] = [:]
+            for await (index, data) in group { answers[index] = data }
+            return answers
+        }
+        for (index, want) in asking.enumerated() {
+            if let image = keep(answers[index], as: want.key) { sites[want.name] = image }
+        }
+    }
+
+    private enum Kept {
+        case found(NSImage)
+        /// Looked for not long ago, and not there.
+        case missing
+        case unknown
+    }
+
+    /// What is already known about the picture kept under `key`. Each key
+    /// is unknown once per launch.
+    private func kept(_ key: String) -> Kept {
+        let file = cacheDirectory.appending(path: "\(key).png")
+        if let age = Self.age(of: file), age < Self.keepFound, let image = NSImage(contentsOf: file) {
+            return .found(image)
+        }
+        if let age = Self.age(of: cacheDirectory.appending(path: "\(key).none")), age < Self.keepMissing {
+            return .missing
+        }
+        return searched.insert(key).inserted ? .unknown : .missing
+    }
+
+    /// Remember what a search for `key` came back with.
+    private func keep(_ data: Data?, as key: String) -> NSImage? {
+        let file = cacheDirectory.appending(path: "\(key).png")
+        let missing = cacheDirectory.appending(path: "\(key).none")
+        try? FileManager.default.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+        guard let data, let image = NSImage(data: data) else {
+            try? Data().write(to: missing)
+            // An icon past its time is still better than none.
+            return NSImage(contentsOf: file)
+        }
+        try? data.write(to: file, options: .atomic)
+        try? FileManager.default.removeItem(at: missing)
+        return image
+    }
+
+    private static func age(of file: URL) -> TimeInterval? {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: file.path)
+        return (attributes?[.modificationDate] as? Date).map { -$0.timeIntervalSinceNow }
+    }
+}
+
+/// The two menu items that let a person pick an icon and take it back.
+struct IconMenu: View {
+    /// The name the chosen icon is kept under.
+    let key: String
+
+    var body: some View {
+        Button("Choose Icon…") { IconStore.shared.chooseIcon(for: key) }
+        if IconStore.shared.chosen[key] != nil {
+            Button("Use Default Icon") { IconStore.shared.removeChosenIcon(for: key) }
+        }
+    }
+}
+
+/// Finding the icon a server offers, or the one its web site carries.
+enum SiteIcon {
+    private static let maxPage = 2_000_000
+    private static let maxImage = 1_000_000
+
+    /// The icon to use out of the ones a server offers: the largest.
+    static func best(of icons: [ServerIcon]) -> ServerIcon? {
+        func side(_ icon: ServerIcon) -> Int {
+            (icon.sizes ?? []).map { size -> Int in
+                if size.lowercased() == "any" { return 4096 }
+                return Int(size.lowercased().split(separator: "x").first ?? "") ?? 0
+            }.max() ?? 0
+        }
+        var best: ServerIcon?
+        for icon in icons where best.map({ side(icon) > side($0) }) ?? true { best = icon }
+        return best
+    }
+
+    /// The bytes inside a base64 `data:` address.
+    static func data(fromDataURI source: String) -> Data? {
+        guard source.lowercased().hasPrefix("data:"), let comma = source.firstIndex(of: ","),
+              source[..<comma].lowercased().hasSuffix(";base64") else { return nil }
+        return Data(base64Encoded: String(source[source.index(after: comma)...]))
+    }
+
+    /// The hosts to ask for an icon, most likely first: the server's own,
+    /// the site above it, then the page the server named. HTTPS only, so a
+    /// server on this Mac or on the local network is never asked.
+    static func hosts(server: String?, website: String?) -> [String] {
+        var found: [String] = []
+        for address in [server, website] {
+            guard let address, let url = URL(string: address), url.scheme?.lowercased() == "https",
+                  let host = url.host?.lowercased(), !host.isEmpty else { continue }
+            for candidate in [host, parent(of: host)].compactMap({ $0 }) where !found.contains(candidate) {
+                found.append(candidate)
+            }
+        }
+        return found
+    }
+
+    /// The site one label up: `mcp.example.com` gives `example.com`. Nil
+    /// for an address made of numbers and for a name with nothing above it.
+    static func parent(of host: String) -> String? {
+        let labels = host.split(separator: ".")
+        guard labels.count >= 3, !host.contains(":"),
+              labels.contains(where: { $0.contains(where: \.isLetter) }) else { return nil }
+        return labels.dropFirst().joined(separator: ".")
+    }
+
+    /// The icons a page links to, best first, then the two addresses sites
+    /// keep an icon at by habit. HTTPS only.
+    static func candidates(inHTML html: String, base: URL) -> [URL] {
+        var scored: [(score: Int, url: URL)] = []
+        let range = NSRange(html.startIndex..., in: html)
+        let tags = (try? NSRegularExpression(pattern: "<link\\b[^>]*>", options: .caseInsensitive))?
+            .matches(in: html, range: range) ?? []
+        for match in tags {
+            guard let tagRange = Range(match.range, in: html) else { continue }
+            let tag = String(html[tagRange])
+            guard let rel = attribute("rel", in: tag)?.lowercased(), rel.contains("icon"), !rel.contains("mask"),
+                  let href = attribute("href", in: tag),
+                  let url = URL(string: href, relativeTo: base)?.absoluteURL else { continue }
+            let side = attribute("sizes", in: tag).flatMap { Int($0.lowercased().split(separator: "x").first ?? "") } ?? 0
+            scored.append(((rel.contains("apple-touch") ? 1000 : 0) + side, url))
+        }
+        var found = scored.enumerated()
+            .sorted { $0.element.score != $1.element.score ? $0.element.score > $1.element.score : $0.offset < $1.offset }
+            .map(\.element.url)
+        for path in ["/apple-touch-icon.png", "/favicon.ico"] {
+            if let url = URL(string: path, relativeTo: base)?.absoluteURL { found.append(url) }
+        }
+        var seen = Set<URL>()
+        return Array(found.filter { $0.scheme == "https" && seen.insert($0).inserted }.prefix(6))
+    }
+
+    private static func attribute(_ name: String, in tag: String) -> String? {
+        let pattern = "\\b\(name)\\s*=\\s*(?:\"([^\"]*)\"|'([^']*)'|([^\\s>]+))"
+        guard let expression = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+              let match = expression.firstMatch(in: tag, range: NSRange(tag.startIndex..., in: tag)) else { return nil }
+        for group in 1...3 {
+            if let range = Range(match.range(at: group), in: tag) { return String(tag[range]) }
+        }
+        return nil
+    }
+
+    /// The first icon any of `hosts` gives up, as PNG data.
+    static func find(hosts: [String]) async -> Data? {
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        for host in hosts {
+            guard let root = URL(string: "https://\(host)/") else { continue }
+            var html = ""
+            var base = root
+            if let (data, response) = try? await session.data(from: root), data.count <= maxPage,
+               (response as? HTTPURLResponse)?.statusCode == 200 {
+                html = String(decoding: data, as: UTF8.self)
+                base = response.url ?? root
+            }
+            for url in candidates(inHTML: html, base: base) {
+                if let data = await image(at: url, session: session) { return data }
+            }
+        }
+        return nil
+    }
+
+    /// The picture at `url`, as PNG data.
+    static func image(at url: URL) async -> Data? {
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        return await image(at: url, session: session)
+    }
+
+    private static func image(at url: URL, session: URLSession) async -> Data? {
+        guard url.scheme == "https", let (data, response) = try? await session.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200, data.count <= maxImage else { return nil }
+        return IconTile.png(from: data)
+    }
+
+    /// No cookies, no cache, no credentials: the request says nothing
+    /// about this Mac beyond its address.
+    private static func makeSession() -> URLSession {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 8
+        configuration.timeoutIntervalForResource = 15
+        configuration.httpShouldSetCookies = false
+        configuration.httpCookieAcceptPolicy = .never
+        configuration.urlCache = nil
+        configuration.httpAdditionalHeaders = ["User-Agent": "Mozilla/5.0 (Macintosh) Plug"]
+        return URLSession(configuration: configuration)
+    }
+}
+
+/// Any picture, made to sit beside app icons: the same size, the same
+/// rounded shape, and a tile behind a bare mark so it shows on any
+/// background.
+enum IconTile {
+    private static let side = 192
+
+    /// Nil when the data is not a picture or is too small to show.
+    static func png(from data: Data) -> Data? {
+        guard let image = NSImage(data: data) else { return nil }
+        var proposed = CGRect(x: 0, y: 0, width: side, height: side)
+        guard let source = image.cgImage(forProposedRect: &proposed, context: nil, hints: nil),
+              source.width >= 32, source.height >= 32 else { return nil }
+        let space = CGColorSpaceCreateDeviceRGB()
+        let info = CGImageAlphaInfo.premultipliedLast.rawValue
+
+        // Read a small copy to learn the picture's shape.
+        let probe = 64
+        guard let measure = CGContext(
+            data: nil, width: probe, height: probe, bitsPerComponent: 8,
+            bytesPerRow: probe * 4, space: space, bitmapInfo: info
+        ) else { return nil }
+        measure.draw(source, in: CGRect(x: 0, y: 0, width: probe, height: probe))
+        guard let pixels = measure.data?.assumingMemoryBound(to: UInt8.self) else { return nil }
+        var clear = 0
+        var light = 0.0
+        func alpha(_ x: Int, _ y: Int) -> Int { Int(pixels[(y * probe + x) * 4 + 3]) }
+        for index in 0..<(probe * probe) {
+            let a = Double(pixels[index * 4 + 3]) / 255
+            guard a >= 0.5 else { clear += 1; continue }
+            let red = Double(pixels[index * 4]), green = Double(pixels[index * 4 + 1]), blue = Double(pixels[index * 4 + 2])
+            light += (0.299 * red + 0.587 * green + 0.114 * blue) / 255 / a
+        }
+        let solid = probe * probe - clear
+        let clearShare = Double(clear) / Double(probe * probe)
+        let isLight = solid > 0 && light / Double(solid) > 0.8
+        let last = probe - 1
+        let cornersClear = [alpha(0, 0), alpha(last, 0), alpha(0, last), alpha(last, last)].allSatisfy { $0 < 128 }
+
+        guard let context = CGContext(
+            data: nil, width: side, height: side, bitsPerComponent: 8,
+            bytesPerRow: side * 4, space: space, bitmapInfo: info
+        ) else { return nil }
+        context.interpolationQuality = .high
+        let canvas = CGRect(x: 0, y: 0, width: side, height: side)
+        if cornersClear, clearShare < 0.3 {
+            // Already shaped like an icon. Leave it alone.
+            context.draw(source, in: canvas)
+        } else {
+            // App icons keep a margin inside their square; so does the tile.
+            let tile = canvas.insetBy(dx: canvas.width * 0.08, dy: canvas.width * 0.08)
+            let radius = tile.width * 0.24
+            context.addPath(CGPath(roundedRect: tile, cornerWidth: radius, cornerHeight: radius, transform: nil))
+            context.clip()
+            let bare = clearShare >= 0.3
+            let shade: CGFloat = bare && isLight ? 0.11 : 1
+            context.setFillColor(CGColor(red: shade, green: shade, blue: shade, alpha: 1))
+            context.fill(tile)
+            let margin = bare ? tile.width * 0.16 : 0
+            context.draw(source, in: tile.insetBy(dx: margin, dy: margin))
+        }
+        guard let result = context.makeImage() else { return nil }
+        return NSBitmapImageRep(cgImage: result).representation(using: .png, properties: [:])
     }
 }
