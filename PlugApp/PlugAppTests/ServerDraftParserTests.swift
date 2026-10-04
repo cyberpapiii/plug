@@ -80,6 +80,42 @@ final class ServerDraftParserTests: XCTestCase {
         XCTAssertEqual(draft.config.transport, "http")
     }
 
+    func testAnOpenAPIDocumentAddressBecomesAnAPIServer() throws {
+        let draft = try draft("https://petstore3.swagger.io/api/v3/openapi.json")
+        XCTAssertEqual(draft.name, "petstore3")
+        XCTAssertEqual(draft.config.transport, "openapi")
+        XCTAssertEqual(draft.config.spec, "https://petstore3.swagger.io/api/v3/openapi.json")
+        XCTAssertNil(draft.config.url)
+        XCTAssertTrue(draft.fromAddress)
+        XCTAssertTrue(draft.facts.contains { $0.label == "Kind" && $0.value.hasPrefix("HTTP API") })
+    }
+
+    func testThePersonCanCorrectTheGuessAboutAnAddress() throws {
+        guard case let .draft(api) = ServerDraftParser.parse(
+            "https://api.example.com/v1/spec", addressIsAPI: true
+        ) else { return XCTFail("expected a draft") }
+        XCTAssertEqual(api.config.transport, "openapi")
+        XCTAssertEqual(api.config.spec, "https://api.example.com/v1/spec")
+
+        guard case let .draft(server) = ServerDraftParser.parse(
+            "https://example.com/openapi.json", addressIsAPI: false
+        ) else { return XCTFail("expected a draft") }
+        XCTAssertEqual(server.config.transport, "http")
+        XCTAssertEqual(server.config.url, "https://example.com/openapi.json")
+        XCTAssertNil(server.config.spec)
+    }
+
+    func testAnOpenAPIFileOnThisMacBecomesAnAPIServer() throws {
+        let draft = try draft("~/Documents/billing.yaml")
+        XCTAssertEqual(draft.name, "billing")
+        XCTAssertEqual(draft.config.transport, "openapi")
+        XCTAssertEqual(draft.config.spec, "~/Documents/billing.yaml")
+        XCTAssertFalse(draft.fromAddress)
+
+        // A path to a program is still a command.
+        XCTAssertEqual(try self.draft("/usr/local/bin/server --flag").config.transport, "stdio")
+    }
+
     func testShellCommandKeepsArgumentsAndLiftsEnvironmentPrefixes() throws {
         let draft = try draft("GITHUB_TOKEN=abc npx -y @modelcontextprotocol/server-github")
         XCTAssertEqual(draft.config.command, "npx")

@@ -51,8 +51,10 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- Tools from plain HTTP APIs, the rest: adding an API server from the app,
-  and a recipe for GraphQL. The CLI and config half shipped (#263).
+- Tools from plain HTTP APIs, the rest: a recipe for GraphQL, credentials
+  other than a bearer token (an API key in a header or the query), and
+  choosing operations in the app. OpenAPI servers shipped in the CLI and the
+  app (#263).
 - Skills: carry the skills extension through Plug, with the server's name in
   each skill URI. Waits for a server and a client that use it (#262).
 - Secret providers: server credentials from a 1Password mount, read by the

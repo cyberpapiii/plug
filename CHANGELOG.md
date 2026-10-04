@@ -129,6 +129,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   GET and HEAD operations are marked read-only, a status of 400 or above is a
   tool error, and requests go only to the API's own address. In the config
   this is `transport = "openapi"` with `spec` and `operations`.
+- The app adds an HTTP API as a server. Paste the address or the file path of
+  an OpenAPI document into Add Server; Plug guesses whether an address is a
+  server or an API document, and a picker corrects the guess.
 
 ### Changed
 
