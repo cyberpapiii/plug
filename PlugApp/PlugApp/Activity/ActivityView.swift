@@ -156,20 +156,18 @@ private struct ActivityRow: View {
 
     var body: some View {
         HStack(spacing: Metric.tight) {
-            // The calling client's own icon, so a long list can be scanned
-            // by picture rather than read line by line. A failure replaces
-            // the icon, so it is visible at a glance. A call the client
-            // stopped is not a failure and keeps the icon.
-            Group {
-                if call.failed {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.red)
-                        .symbolRenderingMode(.hierarchical)
-                } else {
-                    AppGlyph(target: call.callerTarget, name: call.caller)
+            // Who called what, as two pictures: the client's icon, then
+            // the server's. A long list can be scanned without reading it.
+            HStack(spacing: Metric.hairline) {
+                AppGlyph(target: call.callerTarget, name: call.caller)
+                if let server = call.server {
+                    Image(systemName: "chevron.compact.right")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                    ServerGlyph(name: server)
                 }
             }
-            .frame(width: 18, height: 18)
+            .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(call.tool)
                     .lineLimit(1)
@@ -180,6 +178,13 @@ private struct ActivityRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
+            // A failure is marked beside the time, so it shows at a glance.
+            // A call the client stopped is not a failure.
+            if call.failed {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.red)
+                    .symbolRenderingMode(.hierarchical)
+            }
             Text(time)
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
@@ -232,10 +237,16 @@ private struct CallDetail: View {
                 }
             }
             Section("Details") {
-                LabeledContent("Client", value: call.caller)
+                LabeledContent("Client") {
+                    HStack(spacing: Metric.tight) {
+                        AppGlyph(target: call.callerTarget, name: call.caller, size: 16)
+                        Text(call.caller).textSelection(.enabled)
+                    }
+                }
                 if let server = call.server {
                     LabeledContent("Server") {
                         HStack(spacing: Metric.tight) {
+                            ServerGlyph(name: server, size: 16)
                             Text(server).textSelection(.enabled)
                             if canShowServer, let name = call.event.server {
                                 Button { run(.reveal(server: name)) } label: {

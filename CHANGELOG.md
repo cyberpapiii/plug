@@ -21,6 +21,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Anything else gets a tile with its first letter. A server's state shows as
   a dot on its icon, and in the list only when it needs attention.
 - The buttons at the bottom of the menu bar panel have icons again.
+- Each call in Activity shows two icons, the client and the server it
+  called, and a failed call is marked beside its time.
 - Settings is its own window, on Command-comma and from the menu bar panel.
   It is no longer a tab in the main window.
 - Lists and detail panes use the system's own list and form styles, so
