@@ -181,36 +181,36 @@ final class LinkableAppTests: XCTestCase {
 final class EditServerEnvironmentTests: XCTestCase {
     func testParsesOnePairPerLine() {
         XCTAssertEqual(
-            EditServerView.parseEnvironment("API_KEY=abc\nREGION=us-east-1"),
+            ServerForm.parseSettings("API_KEY=abc\nREGION=us-east-1"),
             ["API_KEY": "abc", "REGION": "us-east-1"]
         )
     }
 
     func testCommasStayInsideValues() {
         XCTAssertEqual(
-            EditServerView.parseEnvironment("A=1, B=2"),
+            ServerForm.parseSettings("A=1, B=2"),
             ["A": "1, B=2"]
         )
     }
 
     func testSpaceAroundTheNameAndValueIsTrimmed() {
-        XCTAssertEqual(EditServerView.parseEnvironment("  TOKEN = xyz  "), ["TOKEN": "xyz"])
+        XCTAssertEqual(ServerForm.parseSettings("  TOKEN = xyz  "), ["TOKEN": "xyz"])
     }
 
     func testValuesKeepTheirOwnEqualsSigns() {
-        XCTAssertEqual(EditServerView.parseEnvironment("URL=a=b=c"), ["URL": "a=b=c"])
+        XCTAssertEqual(ServerForm.parseSettings("URL=a=b=c"), ["URL": "a=b=c"])
     }
 
     func testAnEmptyValueIsKept() {
-        XCTAssertEqual(EditServerView.parseEnvironment("EMPTY="), ["EMPTY": ""])
+        XCTAssertEqual(ServerForm.parseSettings("EMPTY="), ["EMPTY": ""])
     }
 
     func testLinesWithoutAnEqualsOrANameAreSkipped() {
-        XCTAssertEqual(EditServerView.parseEnvironment("nonsense\n=value\n\nA=1"), ["A": "1"])
+        XCTAssertEqual(ServerForm.parseSettings("nonsense\n=value\n\nA=1"), ["A": "1"])
     }
 
     func testNothingTypedMeansNoEnvironment() {
-        XCTAssertTrue(EditServerView.parseEnvironment("   \n ").isEmpty)
+        XCTAssertTrue(ServerForm.parseSettings("   \n ").isEmpty)
     }
 
     func testSaveStaysDisabledWithoutServerConfigRead() {
@@ -242,7 +242,7 @@ final class EditServerEnvironmentTests: XCTestCase {
     func testArgumentsRoundTripThroughTheDisplayedCommandLine() {
         let arguments = ["-y", "a package", "", "it's-safe", #"a\"quote"#]
         XCTAssertEqual(
-            ServerDraftParser.tokenize(EditServerView.renderArguments(arguments)),
+            ServerDraftParser.tokenize(ServerForm.renderArguments(arguments)),
             arguments
         )
     }

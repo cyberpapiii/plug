@@ -1,17 +1,19 @@
 import PlugIPC
 import SwiftUI
 
-/// Adding a server is the one moment where Plug can be delightful, and the way
-/// people actually acquire servers is copying a block out of a README. So this
-/// asks for exactly that — paste anything — and shows what it understood before
-/// committing. No field-by-field transcription of something already on the
-/// clipboard.
+/// Adding a server, in two steps.
+///
+/// First, which server: pick one Plug already knows, or paste what the
+/// server's instructions give you. A person with nothing to paste still has a
+/// next step. Then the same form Edit shows, filled in, so what Plug understood
+/// can be read and corrected before it is saved.
 struct AddServerView: View {
     let model: AppModel
     @Environment(\.dismiss) private var dismiss
     @State private var pasted = ""
     @State private var name = ""
-    @State private var nameEdited = false
+    /// The filled-in form, once a server was picked or a paste was understood.
+    @State private var form: ServerForm?
     @State private var saving = false
     @State private var failure: String?
     /// The person's answer to "is this address an API?", when they gave one.
@@ -21,76 +23,113 @@ struct AddServerView: View {
     @State private var choice: APIOperationChoice?
     @State private var choiceFailure: String?
     @State private var showsOperations = false
-    @FocusState private var focus: Field?
-
-    private enum Field { case paste, name }
+    @FocusState private var pasteFocused: Bool
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("Add a server").font(.title2.weight(.semibold))
-                Text("Paste the setup block from the server's instructions, a command, a URL, or the address of an API's OpenAPI document.")
+        if form != nil {
+            details
+        } else {
+            choose
+        }
+    }
+
+    // MARK: - Step 1: which server
+
+    private var choose: some View {
+        SheetFrame(
+            title: "Add a server",
+            subtitle: "Pick one, or paste what the server's instructions give you.",
+            confirmTitle: "Continue",
+            confirmDisabled: draft == nil,
+            confirm: { if let draft { start(draft) } }
+        ) {
+            if !known.isEmpty {
+                VStack(alignment: .leading, spacing: Metric.tight) {
+                    SectionLabel(text: "Popular servers")
+                    LazyVGrid(
+                        columns: [GridItem(.flexible(), spacing: Metric.tight), GridItem(.flexible())],
+                        spacing: Metric.tight
+                    ) {
+                        ForEach(known) { server in
+                            Button { start(server.draft) } label: {
+                                VStack(alignment: .leading, spacing: 1) {
+                                    Text(server.title).font(.callout.weight(.medium))
+                                    Text(server.summary)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, Metric.snug)
+                                .padding(.vertical, Metric.tight)
+                                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 7))
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .hoverHighlight()
+                            .accessibilityLabel("\(server.title), \(server.summary)")
+                        }
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: Metric.tight) {
+                SectionLabel(text: known.isEmpty ? "Paste" : "Or paste")
+                TextEditor(text: $pasted)
+                    .font(.system(.callout, design: .monospaced))
+                    .scrollContentBackground(.hidden)
+                    .padding(Metric.snug)
+                    .frame(height: 96)
+                    .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Metric.corner))
+                    .overlay(alignment: .topLeading) {
+                        if pasted.isEmpty {
+                            Text("A setup block, a command, a web address, or the address of an API's OpenAPI document")
+                                .font(.callout)
+                                .foregroundStyle(.tertiary)
+                                .padding(Metric.snug + 4)
+                                .allowsHitTesting(false)
+                        }
+                    }
+                    .focused($pasteFocused)
+                    .accessibilityLabel("Paste a server")
+                understood
+            }
+        }
+        .onChange(of: pasted) { _, _ in addressIsAPI = nil }
+    }
+
+    /// One line saying what the paste is, or why it could not be read.
+    @ViewBuilder private var understood: some View {
+        switch parse {
+        case .empty:
+            EmptyView()
+        case let .unreadable(reason):
+            Label(reason, systemImage: "questionmark.circle")
+                .font(.callout)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        case let .draft(draft):
+            if draft.fromAddress {
+                Picker("This address is", selection: Binding(
+                    get: { draft.config.transport == "openapi" },
+                    set: { addressIsAPI = $0 }
+                )) {
+                    Text("A server").tag(false)
+                    Text("An API's OpenAPI document").tag(true)
+                }
+                .pickerStyle(.segmented)
+                .font(.callout)
+            } else {
+                Label("Plug can read this. Continue to check it.", systemImage: "checkmark.circle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
-
-            TextEditor(text: $pasted)
-                .font(.system(.callout, design: .monospaced))
-                .scrollContentBackground(.hidden)
-                .padding(Metric.snug)
-                .frame(height: 144)
-                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Metric.corner))
-                .overlay(alignment: .topLeading) {
-                    if pasted.isEmpty {
-                        Text(Self.placeholder)
-                            .font(.system(.callout, design: .monospaced))
-                            .foregroundStyle(.tertiary)
-                            .padding(Metric.snug + 4)
-                            .allowsHitTesting(false)
-                    }
-                }
-                .focused($focus, equals: .paste)
-                .accessibilityLabel("Server definition")
-
-            preview
-
-            HStack(spacing: Metric.snug) {
-                if let failure {
-                    Label(failure, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(2)
-                }
-                Spacer(minLength: 0)
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                Button(saving ? "Adding…" : "Add Server") { add() }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
-                    .disabled(draft == nil || trimmedName.isEmpty || saving || choice?.problem != nil)
-            }
         }
-        .padding(Metric.roomy)
-        .frame(width: 520)
-        .defaultFocus($focus, .paste)
-        .interactiveDismissDisabled(saving)
-        .onChange(of: pasted) { _, _ in
-            failure = nil
-            addressIsAPI = nil
-            if !nameEdited, let draft { name = draft.name }
-        }
-        .task(id: apiSpec) { await readOperations() }
     }
 
-    private static let placeholder = """
-    {
-      "mcpServers": {
-        "linear": { "command": "npx", "args": ["-y", "linear-mcp"] }
-      }
+    private var known: [KnownServer] {
+        KnownServer.notYetAdded(names: model.situation.servers.map(\.name))
     }
-    """
-
-    // MARK: - Understanding
 
     private var parse: ServerDraftParse {
         ServerDraftParser.parse(pasted, addressIsAPI: addressIsAPI)
@@ -101,20 +140,61 @@ struct AddServerView: View {
         return nil
     }
 
-    /// The document to read operations from, when the draft is an API.
-    private var apiSpec: String? {
-        guard let draft, draft.config.transport == "openapi" else { return nil }
-        return draft.config.spec
+    private func start(_ draft: ServerDraft) {
+        failure = nil
+        name = draft.name
+        form = ServerForm(config: draft.config)
     }
 
-    /// Waits for typing to settle, then asks the daemon what the API offers.
-    /// A failure here does not block adding: the server reports it later.
+    // MARK: - Step 2: the form
+
+    @ViewBuilder private var details: some View {
+        if let form {
+            SheetFrame(
+                title: "Add a server",
+                subtitle: form.base.auth == "oauth"
+                    ? "Plug asks you to sign in after you add it."
+                    : "Check what Plug understood, then add it.",
+                failure: failure,
+                busy: saving,
+                confirmTitle: saving ? "Adding…" : "Add Server",
+                confirmDisabled: !form.isComplete || trimmedName.isEmpty || choice?.problem != nil,
+                confirm: add,
+                extra: {
+                    Button("Back") {
+                        self.form = nil
+                        failure = nil
+                    }
+                    .disabled(saving)
+                }
+            ) {
+                HStack(spacing: Metric.snug) {
+                    Text("Name").font(.callout).foregroundStyle(.secondary)
+                    TextField("Name", text: $name)
+                        .textFieldStyle(.roundedBorder)
+                }
+                ServerFormFields(form: Binding(
+                    get: { self.form ?? form },
+                    set: { self.form = $0 }
+                ))
+                operations
+            }
+            .task(id: apiSpec) { await readOperations() }
+        }
+    }
+
+    /// The document to read operations from, when the server is an API.
+    private var apiSpec: String? {
+        guard let form, form.isAPI else { return nil }
+        return form.base.spec
+    }
+
+    /// Asks the daemon what the API offers. A failure here does not block
+    /// adding: the server reports it later.
     private func readOperations() async {
         choice = nil
         choiceFailure = nil
         guard let spec = apiSpec else { return }
-        try? await Task.sleep(for: .milliseconds(500))
-        guard !Task.isCancelled else { return }
         do {
             let api = try await model.describeAPI(spec)
             guard !Task.isCancelled else { return }
@@ -186,61 +266,6 @@ struct AddServerView: View {
         }
     }
 
-    @ViewBuilder private var preview: some View {
-        switch parse {
-        case .empty:
-            EmptyView()
-        case let .unreadable(reason):
-            Label(reason, systemImage: "questionmark.circle")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        case let .draft(draft):
-            VStack(alignment: .leading, spacing: Metric.snug) {
-                SectionLabel(text: "Detected server")
-                HStack(spacing: Metric.snug) {
-                    Text("Name").font(.callout).foregroundStyle(.secondary)
-                    TextField("Name", text: $name)
-                        .textFieldStyle(.roundedBorder)
-                        .focused($focus, equals: .name)
-                        .onChange(of: name) { _, _ in
-                            if focus == .name { nameEdited = true }
-                        }
-                }
-                if draft.fromAddress {
-                    Picker("This address is", selection: Binding(
-                        get: { draft.config.transport == "openapi" },
-                        set: { addressIsAPI = $0 }
-                    )) {
-                        Text("A server").tag(false)
-                        Text("An API's OpenAPI document").tag(true)
-                    }
-                    .pickerStyle(.segmented)
-                    .font(.callout)
-                }
-                ForEach(draft.facts) { fact in
-                    HStack(alignment: .firstTextBaseline, spacing: Metric.snug) {
-                        Text(fact.label)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .frame(width: 84, alignment: .leading)
-                        Text(fact.value)
-                            .font(.caption.monospaced())
-                            .lineLimit(2)
-                            .truncationMode(.middle)
-                            .textSelection(.enabled)
-                    }
-                }
-                operations
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(Metric.regular)
-            .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: Metric.corner))
-            .transition(.opacity)
-        }
-    }
-
     // MARK: - Saving
 
     private var trimmedName: String {
@@ -248,22 +273,21 @@ struct AddServerView: View {
     }
 
     private func add() {
-        guard var draft else { return }
-        if let choice { draft.config.operations = choice.setting }
+        guard let form else { return }
+        var config = form.config
+        if let choice { config.operations = choice.setting }
+        let finalName = trimmedName
+        guard !finalName.isEmpty else { return }
         saving = true
         failure = nil
-        let finalName = trimmedName
-        guard !finalName.isEmpty else {
-            saving = false
-            return
-        }
+        let saved = config
         Task {
             do {
                 try await model.performOperation {
-                    .validateServer(authToken: $0, name: finalName, server: draft.config)
+                    .validateServer(authToken: $0, name: finalName, server: saved)
                 }
                 try await model.performOperation {
-                    .addServer(authToken: $0, name: finalName, server: draft.config)
+                    .addServer(authToken: $0, name: finalName, server: saved)
                 }
                 saving = false
                 dismiss()
