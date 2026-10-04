@@ -579,6 +579,11 @@ impl Engine {
             .get(server_id)
             .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?
             .clone();
+        // A restart starts the server, and a server that is off stays off.
+        anyhow::ensure!(
+            server_config.enabled,
+            "{server_id} is off; turn it on to start it"
+        );
         let protocol_gate_state = self.server_manager.modern_upstream_gate_state();
 
         // Share the in-flight start with reconnect_server. A supervised or
@@ -861,6 +866,12 @@ impl Engine {
         // it was, so the reload saw nothing to restart.
         if let Some(name) = kept_for
             && report.unchanged.contains(&name)
+            && self
+                .config
+                .load()
+                .servers
+                .get(&name)
+                .is_some_and(|server| server.enabled)
             && let Err(error) = self.restart_server(&name).await
         {
             tracing::warn!(server = %name, %error, "new secret is used at the next restart");
@@ -1985,6 +1996,20 @@ mod tests {
                 .servers
                 .contains_key("fixture")
         );
+    }
+
+    #[tokio::test]
+    async fn restarting_a_server_that_is_off_leaves_it_off() {
+        let mut config = Config::default();
+        config.servers.insert(
+            "resting".into(),
+            serde_json::from_value(serde_json::json!({ "command": "echo", "enabled": false }))
+                .unwrap(),
+        );
+        let engine = Arc::new(Engine::new(config));
+        let error = engine.restart_server("resting").await.unwrap_err();
+        assert_eq!(error.to_string(), "resting is off; turn it on to start it");
+        assert!(engine.server_manager.get_upstream("resting").is_none());
     }
 
     #[tokio::test]

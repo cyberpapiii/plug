@@ -196,6 +196,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A server that is off stays off. Editing its settings, moving its key to
+  the Keychain, or turning it off used to start it again until the next
+  restart of the service, and Restart in the app started it too.
 - `plug server add` with flags no longer stops to ask for arguments when the
   command takes none.
 - MCP Apps work through Plug. Plug now tells each server it can show app
