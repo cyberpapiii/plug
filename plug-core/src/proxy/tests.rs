@@ -607,14 +607,14 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
 
     assert_eq!(
         router
-            .list_tools_for_client_session(ClientType::Devin, None)
+            .list_tools_for_client_session(ClientType::Devin, None, None)
             .len(),
         150,
         "Devin must still see the full catalog, not the empty pre-cached view"
     );
     assert_eq!(
         router
-            .list_tools_for_client_session(ClientType::VSCodeCopilot, None)
+            .list_tools_for_client_session(ClientType::VSCodeCopilot, None, None)
             .len(),
         150,
         "Copilot must still see the full catalog, not the empty pre-cached view"
@@ -684,7 +684,7 @@ fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy
     store_plain_tools_snapshot(&router, tools);
 
     let names = router
-        .list_tools_for_client_session(ClientType::ClaudeCode, None)
+        .list_tools_for_client_session(ClientType::ClaudeCode, None, None)
         .iter()
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
@@ -694,7 +694,7 @@ fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy
     );
     // The bridge client itself still gets the bridge surface.
     let bridge_names = router
-        .list_tools_for_client_session(ClientType::Unknown, None)
+        .list_tools_for_client_session(ClientType::Unknown, None, None)
         .iter()
         .map(|tool| tool.name.to_string())
         .collect::<Vec<_>>();
@@ -992,7 +992,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
     let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
     assert_eq!(
         router
-            .list_tools_for_client_session(ClientType::OpenCode, Some(&session_key))
+            .list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None)
             .len(),
         expected_meta_tool_names().len()
     );
@@ -1008,7 +1008,8 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
         .handle_search_tools(Some(args), Some(&downstream))
         .expect("search and load tool");
 
-    let visible = router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+    let visible =
+        router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
     let names = visible
         .iter()
         .map(|tool| tool.name.to_string())
@@ -1072,7 +1073,8 @@ fn bridge_search_keeps_session_working_set_bounded() {
     }
 
     let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
-    let visible = router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+    let visible =
+        router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
     let names = visible
         .iter()
         .map(|tool| tool.name.to_string())
@@ -1187,7 +1189,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
     ));
 
     let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
-    router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key));
+    router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
 
     let err = router
         .call_tool_with_context(
@@ -4756,4 +4758,278 @@ fn dropping_router_releases_subscription_registry() {
         registry.upgrade().is_none(),
         "the registry-owned post-confirm hook must not retain the registry itself"
     );
+}
+
+// ── Per-client blocks ───────────────────────────────────────────────────────
+
+fn plain_tool(name: &'static str) -> Tool {
+    Tool::new(
+        Cow::Borrowed(name),
+        Cow::Borrowed("fixture tool"),
+        Arc::new(serde_json::Map::new()),
+    )
+}
+
+/// Three tools on two servers. `cursor` is kept from the whole `git` server;
+/// `pi` is kept from every Slack tool by pattern.
+fn router_with_client_blocks(config: RouterConfig) -> ToolRouter {
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), config);
+    store_plain_tools_snapshot(
+        &router,
+        vec![
+            plain_tool("git__commit"),
+            plain_tool("git__push"),
+            plain_tool("slack__post"),
+        ],
+    );
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "cursor".to_string(),
+        crate::config::ClientSettings {
+            blocked_servers: vec!["git".to_string()],
+            ..Default::default()
+        },
+    );
+    clients.insert(
+        "pi".to_string(),
+        crate::config::ClientSettings {
+            blocked_tools: vec!["Slack__*".to_string()],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    router
+}
+
+fn context_for(client_key: Option<&str>) -> DownstreamCallContext {
+    DownstreamCallContext::stdio_for_client("client-a", RequestId::Number(1), ClientType::Unknown)
+        .with_client_key(client_key)
+}
+
+fn tool_names(tools: &[Tool]) -> Vec<String> {
+    let mut names: Vec<String> = tools.iter().map(|tool| tool.name.to_string()).collect();
+    names.sort();
+    names
+}
+
+fn result_text(result: &CallToolResult) -> String {
+    serde_json::to_string(result).expect("serialize tool result")
+}
+
+#[test]
+fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
+    let mut config = test_router_config();
+    config.tool_filter_enabled = false;
+    let router = router_with_client_blocks(config);
+    let listed = |client_key: Option<&str>| {
+        tool_names(&router.list_tools_for_client_session(ClientType::ClaudeCode, None, client_key))
+    };
+
+    assert_eq!(listed(Some("cursor")), ["slack__post"]);
+    assert_eq!(listed(Some("pi")), ["git__commit", "git__push"]);
+    // No entry, and no key at all, both get everything.
+    for unblocked in [Some("claude-code"), None] {
+        assert_eq!(
+            listed(unblocked),
+            ["git__commit", "git__push", "slack__post"]
+        );
+    }
+
+    let page = router.list_tools_page_for_client_session(
+        ClientType::ClaudeCode,
+        None,
+        Some("cursor"),
+        None,
+    );
+    assert_eq!(tool_names(&page.tools), ["slack__post"]);
+
+    assert!(
+        router
+            .get_tool_definition("git__commit", Some("cursor"))
+            .is_none()
+    );
+    assert!(
+        router
+            .get_tool_definition("git__commit", Some("pi"))
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn a_blocked_tool_answers_a_call_as_a_tool_that_does_not_exist() {
+    let mut config = test_router_config();
+    config.tool_filter_enabled = false;
+    let router = Arc::new(router_with_client_blocks(config));
+    let call = |tool: &'static str, client_key: Option<&'static str>| {
+        let router = Arc::clone(&router);
+        async move {
+            router
+                .call_tool_with_context(tool, None, None, Some(context_for(client_key)))
+                .await
+                .expect_err("no upstream is connected, so every call fails")
+                .to_string()
+        }
+    };
+
+    let missing = call("git__nope", Some("cursor")).await;
+    // The casing a model drifts into resolves to the same route, so it is
+    // blocked the same way.
+    for blocked in ["git__commit", "GIT__Commit"] {
+        assert_eq!(
+            call(blocked, Some("cursor")).await,
+            missing.replace("git__nope", blocked),
+            "a blocked call must be indistinguishable from an unknown tool"
+        );
+    }
+    assert_eq!(
+        call("slack__post", Some("pi")).await,
+        missing.replace("git__nope", "slack__post")
+    );
+
+    // The same tools get past the block for a client that is not kept from
+    // them: the call fails further on, for want of an upstream.
+    assert_ne!(
+        call("git__commit", Some("pi")).await,
+        missing.replace("git__nope", "git__commit")
+    );
+    assert_ne!(
+        call("slack__post", Some("cursor")).await,
+        missing.replace("git__nope", "slack__post")
+    );
+
+    let context = context_for(Some("cursor"));
+    assert!(
+        router
+            .ensure_tool_round_supported("git__commit", &context, false, false)
+            .is_err()
+    );
+
+    let task = router
+        .enqueue_tool_task(
+            "git__commit",
+            None,
+            None,
+            TaskOwner::new(Arc::<str>::from("stdio:client-a")),
+            None,
+            Some(context_for(Some("cursor"))),
+        )
+        .await
+        .expect_err("a task-wrapped call is a call");
+    assert_eq!(
+        task.to_string(),
+        missing.replace("git__nope", "git__commit")
+    );
+}
+
+#[tokio::test]
+async fn the_meta_tools_do_not_reach_around_a_block() {
+    let mut config = test_router_config();
+    config.meta_tool_mode = true;
+    let router = router_with_client_blocks(config);
+    let cursor = context_for(Some("cursor"));
+    let pi = context_for(Some("pi"));
+
+    let search = |context: &DownstreamCallContext, query: &str| {
+        let mut args = serde_json::Map::new();
+        args.insert("query".to_string(), serde_json::json!(query));
+        result_text(
+            &router
+                .handle_search_tools(Some(args), Some(context))
+                .expect("search"),
+        )
+    };
+    assert!(!search(&cursor, "commit").contains("git__commit"));
+    assert!(search(&pi, "commit").contains("git__commit"));
+    assert!(!search(&pi, "post").contains("slack__post"));
+
+    let listed = |context: &DownstreamCallContext| {
+        result_text(
+            &router
+                .handle_list_tools(None, Some(context))
+                .expect("list tools"),
+        )
+    };
+    assert!(!listed(&cursor).contains("git__"));
+    assert!(listed(&cursor).contains("slack__post"));
+    assert!(!listed(&pi).contains("slack__"));
+
+    let mut args = serde_json::Map::new();
+    args.insert("tool_name".to_string(), serde_json::json!("git__commit"));
+    let invoke = |context: DownstreamCallContext| {
+        let args = args.clone();
+        let router = &router;
+        async move {
+            router
+                .call_tool_with_context("plug__invoke_tool", Some(args), None, Some(context))
+                .await
+                .expect_err("no upstream is connected")
+                .to_string()
+        }
+    };
+    let blocked = invoke(cursor.clone()).await;
+    let allowed = invoke(pi.clone()).await;
+    assert!(blocked.contains("git__commit"), "{blocked}");
+    assert_ne!(
+        blocked, allowed,
+        "the wrapper must not carry a blocked call"
+    );
+
+    // A meta tool is a tool: its name can be blocked like any other.
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "cursor".to_string(),
+        crate::config::ClientSettings {
+            blocked_tools: vec!["plug__invoke_tool".to_string()],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    let names = tool_names(&router.list_tools_for_client_session(
+        ClientType::Unknown,
+        None,
+        Some("cursor"),
+    ));
+    assert!(
+        !names.contains(&"plug__invoke_tool".to_string()),
+        "{names:?}"
+    );
+    assert!(
+        names.contains(&"plug__search_tools".to_string()),
+        "{names:?}"
+    );
+}
+
+#[test]
+fn clients_hear_about_a_block_changing_and_about_nothing_else() {
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
+    let mut notifications = router.subscribe_notifications();
+    let mut clients = std::collections::BTreeMap::new();
+
+    // A rename is not a change in what anyone can reach.
+    clients.insert(
+        "cursor".to_string(),
+        crate::config::ClientSettings {
+            name: Some("Work Cursor".to_string()),
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    assert!(notifications.try_recv().is_err());
+
+    clients.get_mut("cursor").unwrap().blocked_servers = vec!["git".to_string()];
+    router.set_client_access(&clients);
+    assert_eq!(
+        notifications.try_recv().expect("block added"),
+        ProtocolNotification::ToolListChanged
+    );
+    router.set_client_access(&clients);
+    assert!(notifications.try_recv().is_err(), "same blocks, no news");
+
+    clients.clear();
+    router.set_client_access(&clients);
+    assert_eq!(
+        notifications.try_recv().expect("block removed"),
+        ProtocolNotification::ToolListChanged
+    );
+    assert!(router.client_may_use_tool(Some("cursor"), "git__commit"));
 }

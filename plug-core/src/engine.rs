@@ -115,6 +115,7 @@ impl Engine {
         let router_config = RouterConfig::from(&config);
         let tool_router = Arc::new(ToolRouter::new(server_manager.clone(), router_config));
         tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
+        tool_router.set_client_access(&config.clients);
         server_manager.set_tool_router(Arc::downgrade(&tool_router));
 
         Self {
@@ -471,6 +472,7 @@ impl Engine {
     pub fn store_config(&self, config: Config) {
         self.tool_router
             .set_modern_downstream_enabled(config.http.modern_downstream_enabled);
+        self.tool_router.set_client_access(&config.clients);
         self.server_manager
             .set_modern_upstream_enabled(config.modern_upstream_enabled);
         self.config.store(Arc::new(config));

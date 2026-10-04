@@ -194,6 +194,7 @@ pub(super) async fn dispatch_mcp_request(
             let result = tool_router.list_tools_page_for_client_session(
                 client_type,
                 Some(&lazy_session_key),
+                ctx.client_registry.client_key(session_id).as_deref(),
                 request,
             );
             ipc_ok!(result)

@@ -1748,6 +1748,7 @@ async fn handle_request(
             let result = state.router.list_tools_page_for_client_session(
                 client_type,
                 lazy_session_key.as_deref(),
+                policy_context.client_key.as_deref(),
                 list_req.params,
             );
             let response_msg =

@@ -594,16 +594,17 @@ impl super::ToolRouter {
         client_type: ClientType,
         request: Option<PaginatedRequestParams>,
     ) -> ListToolsResult {
-        self.list_tools_page_for_client_session(client_type, None, request)
+        self.list_tools_page_for_client_session(client_type, None, None, request)
     }
 
     pub fn list_tools_page_for_client_session(
         &self,
         client_type: ClientType,
         session_key: Option<&str>,
+        client_key: Option<&str>,
         request: Option<PaginatedRequestParams>,
     ) -> ListToolsResult {
-        let tools = self.list_tools_for_client_session(client_type, session_key);
+        let tools = self.list_tools_for_client_session(client_type, session_key, client_key);
         paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
             meta: None,
             next_cursor,
@@ -656,7 +657,10 @@ impl super::ToolRouter {
         self.cache.load().tools_all.len()
     }
 
-    pub fn get_tool_definition(&self, name: &str) -> Option<Tool> {
+    pub fn get_tool_definition(&self, name: &str, client_key: Option<&str>) -> Option<Tool> {
+        if !self.client_may_use_tool(client_key, name) {
+            return None;
+        }
         self.cache.load().tool_by_name(name).cloned()
     }
 
@@ -730,10 +734,34 @@ impl super::ToolRouter {
 
     /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
     pub fn list_tools_for_client(&self, client_type: ClientType) -> Arc<Vec<Tool>> {
-        self.list_tools_for_client_session(client_type, None)
+        self.list_tools_for_client_session(client_type, None, None)
     }
 
+    /// The tools one client sees. `client_key` says whose per-client blocks
+    /// apply; every caller has to say, so no listing path can forget them.
     pub fn list_tools_for_client_session(
+        &self,
+        client_type: ClientType,
+        session_key: Option<&str>,
+        client_key: Option<&str>,
+    ) -> Arc<Vec<Tool>> {
+        let tools = self.tools_for_surface(client_type, session_key);
+        let Some(client_key) = client_key else {
+            return tools;
+        };
+        if !self.client_access.load().contains_key(client_key) {
+            return tools;
+        }
+        Arc::new(
+            tools
+                .iter()
+                .filter(|tool| self.client_may_use_tool(Some(client_key), tool.name.as_ref()))
+                .cloned()
+                .collect(),
+        )
+    }
+
+    fn tools_for_surface(
         &self,
         client_type: ClientType,
         session_key: Option<&str>,
