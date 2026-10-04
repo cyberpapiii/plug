@@ -135,6 +135,48 @@ struct ClientNames: Equatable {
     }
 }
 
+/// What one client may reach, as its row offers it. A block belongs to a
+/// client, so it is looked up through the key its requests carry. Pure value
+/// so the lookup can be tested.
+struct ClientAccess: Equatable {
+    let key: String
+    let name: String
+    /// A remote client is held to its blocks. One on this Mac is not: it can
+    /// connect under another name.
+    let isRemote: Bool
+    let servers: [ConfiguredServer]
+    let blockedServers: Set<String>
+    /// Single tools the owner blocked from the command line.
+    let blockedToolCount: Int
+
+    init(key: String, name: String, servers: [ConfiguredServer], blocks: [ClientBlocks]) {
+        self.key = key
+        self.name = name
+        isRemote = key.hasPrefix("oauth:")
+        self.servers = servers
+        let blocks = blocks.first { $0.key == key }
+        // A block on a server that is gone does nothing and is not counted.
+        blockedServers = Set(blocks?.servers ?? []).intersection(servers.map(\.name))
+        blockedToolCount = blocks?.tools?.count ?? 0
+    }
+
+    var isLimited: Bool { !blockedServers.isEmpty || blockedToolCount > 0 }
+
+    /// What the row says when the client is kept from something.
+    var summary: String? {
+        guard isLimited else { return nil }
+        var parts: [String] = []
+        if !blockedServers.isEmpty {
+            let count = blockedServers.count
+            parts.append(count == 1 ? "1 server" : "\(count) servers")
+        }
+        if blockedToolCount > 0 {
+            parts.append(blockedToolCount == 1 ? "1 tool" : "\(blockedToolCount) tools")
+        }
+        return "kept from " + parts.joined(separator: " and ")
+    }
+}
+
 /// Who can use Plug. The old app split this in two — "Clients" listed apps and
 /// "Auth" listed the grants for the same apps — so the audit question ("who
 /// reaches my tools, and how do I cut them off?") could not be answered in one
@@ -185,12 +227,44 @@ struct ClientsView: View {
     @State private var expanded: Set<String> = []
     @State private var renaming: Renaming?
     @State private var newName = ""
+    /// The session whose server choices are open.
+    @State private var accessSession: String?
 
     /// The client being renamed.
     private struct Renaming {
         let key: String
         /// Set when the owner already named it, so the name can be taken back.
         let hasName: Bool
+    }
+
+    private func access(key: String, name: String) -> ClientAccess {
+        ClientAccess(
+            key: key,
+            name: name,
+            servers: model.snapshot.configuredServers,
+            blocks: model.snapshot.clientBlocks ?? []
+        )
+    }
+
+    /// Server choices for an app on this Mac, stored under the name its link
+    /// was written for. An app that reaches Plug over the network sends its
+    /// requests under its grant instead, and is offered them in its row under
+    /// Remote; a choice made here would not reach it.
+    private func access(to app: LinkableApp, sessions: [LiveSession]) -> ClientAccess? {
+        guard app.linked || !sessions.isEmpty else { return nil }
+        let overNetwork = app.transport?.lowercased() == "http"
+            || sessions.contains { accessKey(of: $0) != app.target }
+        guard !overNetwork else { return nil }
+        return access(key: app.target, name: names.name(forKey: app.target) ?? app.name)
+    }
+
+    /// The key a session's requests carry, when it is one a block can be
+    /// stored under. A remote session with no grant shares its key with every
+    /// other such session, so it is not offered server choices of its own.
+    private func accessKey(of session: LiveSession) -> String? {
+        guard let key = names.key(of: session) else { return nil }
+        let remote = ["http", "streamable_http", "sse"].contains(session.transport.lowercased())
+        return remote && !key.hasPrefix("oauth:") ? nil : key
     }
 
     private func rename(key: String, shown: String) {
@@ -255,6 +329,7 @@ struct ClientsView: View {
                                 AppLinkRow(
                                     app: entry.app,
                                     name: names.name(forKey: entry.app.target) ?? entry.app.name,
+                                    access: access(to: entry.app, sessions: entry.sessions),
                                     sessionCount: entry.sessions.count,
                                     isExpanded: expansion(entry.app.target),
                                     isBusy: model.busyApps.contains(entry.app.target),
@@ -279,6 +354,7 @@ struct ClientsView: View {
                                 AppLinkRow(
                                     app: app,
                                     name: names.name(forKey: app.target) ?? app.name,
+                                    access: access(to: app, sessions: []),
                                     sessionCount: 0,
                                     isExpanded: nil,
                                     isBusy: model.busyApps.contains(app.target),
@@ -298,6 +374,10 @@ struct ClientsView: View {
                                 GrantRow(
                                     grant: grant,
                                     name: names.name(forKey: grant.clientKey) ?? grant.clientName,
+                                    access: access(
+                                        key: grant.clientKey,
+                                        name: names.name(forKey: grant.clientKey) ?? grant.clientName
+                                    ),
                                     rename: { rename(key: grant.clientKey, shown: $0) },
                                     run: run
                                 )
@@ -343,6 +423,13 @@ struct ClientsView: View {
             .padding(.top, Metric.regular)
             .listRowSeparator(.hidden)
             .listRowBackground(Color.clear)
+    }
+
+    private func accessShown(_ sessionId: String) -> Binding<Bool> {
+        Binding(
+            get: { accessSession == sessionId },
+            set: { accessSession = $0 ? sessionId : nil }
+        )
     }
 
     private func expansion(_ target: String) -> Binding<Bool> {
@@ -405,6 +492,13 @@ struct ClientsView: View {
             Text(toolsText(session))
                 .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
+            if let key = accessKey(of: session) {
+                AccessButton(
+                    access: access(key: key, name: displayName(session)),
+                    isShown: accessShown(session.sessionId),
+                    run: run
+                )
+            }
             if let key = names.key(of: session) {
                 RenameButton { rename(key: key, shown: displayName(session)) }
             }
@@ -412,6 +506,9 @@ struct ClientsView: View {
         .padding(.vertical, Metric.tight)
         .accessibilityElement(children: .combine)
         .accessibilityActions {
+            if accessKey(of: session) != nil {
+                Button("Choose Servers") { accessSession = session.sessionId }
+            }
             if let key = names.key(of: session) {
                 Button("Rename") { rename(key: key, shown: displayName(session)) }
             }
@@ -475,11 +572,80 @@ private struct RenameButton: View {
     }
 }
 
+/// Opens the servers a client may use, for the row it sits in.
+private struct AccessButton: View {
+    let access: ClientAccess
+    @Binding var isShown: Bool
+    let run: (PlugIntent) -> Void
+
+    var body: some View {
+        Button { isShown = true } label: {
+            Image(systemName: "slider.horizontal.3")
+                .foregroundStyle(access.isLimited ? Color.accentColor : Color.secondary)
+                .frame(width: 24, height: 24)
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help(access.summary.map { "Choose servers (\($0))" } ?? "Choose servers")
+        .accessibilityLabel("Choose servers")
+        .popover(isPresented: $isShown, arrowEdge: .trailing) {
+            VStack(alignment: .leading, spacing: Metric.snug) {
+                Text("Servers \(access.name) can use")
+                    .font(.headline)
+                if access.servers.isEmpty {
+                    Text("No servers yet.").foregroundStyle(.secondary)
+                }
+                ForEach(access.servers) { server in
+                    Toggle(
+                        isOn: Binding(
+                            get: { !access.blockedServers.contains(server.name) },
+                            set: {
+                                run(.setClientServerBlocked(
+                                    key: access.key, server: server.name, blocked: !$0
+                                ))
+                            }
+                        )
+                    ) {
+                        Text(server.name)
+                            .foregroundStyle(server.enabled ? .primary : .secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                }
+                Text(note)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(Metric.regular)
+            .frame(width: 280)
+        }
+    }
+
+    private var note: String {
+        var lines = [
+            access.isRemote
+                ? "A remote client cannot get around this."
+                : "This keeps a client's list short. It is not a lock: a client on this Mac can connect under another name.",
+        ]
+        if access.blockedToolCount > 0 {
+            let count = access.blockedToolCount
+            lines.append(
+                "Also kept from \(count == 1 ? "1 tool" : "\(count) tools"), set with plug clients block."
+            )
+        }
+        return lines.joined(separator: " ")
+    }
+}
+
 /// A client on this Mac, and whether Plug is wired into it.
 private struct AppLinkRow: View {
     let app: LinkableApp
     /// The name to show: the owner's, else the app's own.
     let name: String
+    /// Nil when there are no server choices to offer for this row.
+    let access: ClientAccess?
     /// Open sessions counted from the live snapshot, which is fresher than
     /// the app scan.
     let sessionCount: Int
@@ -487,6 +653,7 @@ private struct AppLinkRow: View {
     let isExpanded: Binding<Bool>?
     let isBusy: Bool
     let run: (PlugIntent) -> Void
+    @State private var choosingServers = false
 
     var body: some View {
         HStack(spacing: Metric.snug) {
@@ -518,6 +685,9 @@ private struct AppLinkRow: View {
                 .help(isExpanded.wrappedValue ? "Hide sessions" : "Show sessions")
                 .accessibilityLabel(isExpanded.wrappedValue ? "Hide sessions" : "Show sessions")
             }
+            if let access {
+                AccessButton(access: access, isShown: $choosingServers, run: run)
+            }
             if isBusy {
                 ProgressView().controlSize(.small)
             } else if app.detected || app.linked {
@@ -544,6 +714,9 @@ private struct AppLinkRow: View {
                     isExpanded.wrappedValue.toggle()
                 }
             }
+            if access != nil {
+                Button("Choose Servers") { choosingServers = true }
+            }
             if !isBusy, app.detected || app.linked {
                 Button(app.linked ? "Stop Using Plug" : "Use Plug") {
                     run(app.linked ? .unlinkApp(app.target) : .linkApp(app.target))
@@ -563,6 +736,12 @@ private struct AppLinkRow: View {
     }
 
     private var status: String {
+        let state = state
+        guard let limit = access?.summary else { return state }
+        return "\(state) · \(limit)"
+    }
+
+    private var state: String {
         if isLive {
             let count = sessionCount
             return count == 1 ? "1 session" : "\(count) sessions"
@@ -577,10 +756,12 @@ private struct GrantRow: View {
     let grant: DownstreamClient
     /// The name to show: the owner's, else the one the client registered.
     let name: String
+    let access: ClientAccess
     /// Asks for a new name, starting from the one shown.
     let rename: (String) -> Void
     let run: (PlugIntent) -> Void
     @State private var confirming = false
+    @State private var choosingServers = false
 
     var body: some View {
         HStack(spacing: Metric.snug) {
@@ -599,6 +780,7 @@ private struct GrantRow: View {
             }
             .layoutPriority(1)
             Spacer(minLength: Metric.tight)
+            AccessButton(access: access, isShown: $choosingServers, run: run)
             RenameButton { rename(name) }
             Button("Revoke…", role: .destructive) { confirming = true }
                 .controlSize(.small)
@@ -620,8 +802,15 @@ private struct GrantRow: View {
         // A client that identifies itself by web address is named by that
         // site. One Plug registered gets a short id, since two can share a
         // name. The registration method is not shown: nobody can act on it.
-        if let host = URL(string: grant.clientId)?.host() { return host }
-        let id = grant.clientId.hasPrefix("plug_") ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
-        return "ID \(id.prefix(8))"
+        let id: String
+        if let host = URL(string: grant.clientId)?.host() {
+            id = host
+        } else {
+            let short = grant.clientId.hasPrefix("plug_")
+                ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
+            id = "ID \(short.prefix(8))"
+        }
+        guard let limit = access.summary else { return id }
+        return "\(id) · \(limit)"
     }
 }

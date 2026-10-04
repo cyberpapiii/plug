@@ -124,6 +124,16 @@ pub struct ClientName {
     pub name: String,
 }
 
+/// What the owner keeps a client from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientBlocks {
+    pub key: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub servers: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tools: Vec<String>,
+}
+
 /// The settings key of a remote client that holds a grant.
 pub fn grant_client_key(client_id: &str) -> String {
     format!("oauth:{client_id}")
@@ -152,6 +162,9 @@ pub struct OperatorSnapshot {
     /// paths and a reader may rewrite map keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_names: Vec<ClientName>,
+    /// What each client is kept from. Clients kept from nothing are left out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_blocks: Vec<ClientBlocks>,
     /// Why config.toml could not be read, when it could not. The daemon keeps
     /// running its last good config, and `configured_servers` then lists that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2512,6 +2525,7 @@ mod tests {
                         expires_at: 1_800_000_000,
                     }],
                     client_names: Vec::new(),
+                    client_blocks: Vec::new(),
                     config_error: None,
                 }),
             }

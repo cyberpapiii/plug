@@ -235,6 +235,7 @@ enum PlugIntent: Equatable, Sendable {
     case unlinkApp(String)
     case revokeClient(id: String)
     case renameClient(key: String, name: String)
+    case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case addServer
     case openWindow(AppSection)
     case openCurrentWindow
