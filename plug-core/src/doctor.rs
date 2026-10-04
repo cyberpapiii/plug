@@ -550,8 +550,12 @@ fn plug_entry_count(content: &str, extension: Option<&str>) -> usize {
             .lines()
             .filter(|l| l.trim() == "[mcp_servers.plug]")
             .count(),
-        // Goose keys its extensions by name.
-        Some("yaml") | Some("yml") => content.lines().filter(|l| l.trim() == "plug:").count(),
+        // Goose and Hermes Agent key their servers by name. A link written
+        // by hand in Hermes is often `Plug:`.
+        Some("yaml") | Some("yml") => content
+            .lines()
+            .filter(|l| l.trim().eq_ignore_ascii_case("plug:"))
+            .count(),
         _ => {
             let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
                 return 0;
@@ -888,6 +892,7 @@ async fn check_client_configs() -> CheckResult {
         "qwen-code",
         "antigravity",
         "goose",
+        "hermes",
     ];
 
     for target in all_targets {
@@ -1989,6 +1994,7 @@ command = "example-server"
             1
         );
         assert_eq!(plug_entry_count("extensions:\n  plug:\n", Some("yaml")), 1);
+        assert_eq!(plug_entry_count("mcp_servers:\n  Plug:\n", Some("yaml")), 1);
         assert_eq!(
             plug_entry_count(r#"{"mcpServers":{"plug":{}}}"#, Some("json")),
             1

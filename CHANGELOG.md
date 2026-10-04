@@ -117,6 +117,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   servers from it, and a Grok Build session is named in Clients. Grok Bot,
   which reaches Plug over the internet only, is recognised by name and shows
   its icon when the Grok Bot app is installed.
+- Plug links Hermes Agent. `plug link hermes` adds a `plug` entry under
+  `mcp_servers` in `~/.hermes/config.yaml` and changes no other line of the
+  file. A link written there by hand, `Plug` or `plug`, is recognised and
+  replaced. `plug import hermes` reads its servers.
+- The app shows Warp, Kiro, and Hermes Agent with their own icons, and names
+  Gemini, Perplexity, Le Chat, and Poke when they connect.
 - Plug links Kimi Code and Qwen Code. `plug link kimi-code` writes
   `~/.kimi-code/mcp.json` and `plug link qwen-code` writes
   `~/.qwen/settings.json`; both also import from those files and show in the

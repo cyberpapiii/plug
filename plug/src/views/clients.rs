@@ -845,7 +845,7 @@ mod tests {
         // Not connected: a key or a known client is taken as given.
         assert_eq!(key("cursor", &[]).unwrap(), "cursor");
         assert_eq!(key("oauth:abc", &[]).unwrap(), "oauth:abc");
-        assert!(key("hermes", &[]).unwrap_err().contains("plug clients -v"));
+        assert!(key("nobody", &[]).unwrap_err().contains("plug clients -v"));
         assert!(
             key("Unknown", &[nameless])
                 .unwrap_err()

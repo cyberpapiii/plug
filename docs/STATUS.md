@@ -19,15 +19,15 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   issue #255.
 - `plug clients` still lists a remote session Plug does not recognise as
   Unknown. The app names it after its grant.
-- Clients missing from the registry, most used first (surveyed 2026-10-03):
-  Hermes Agent, Muse Code, Amp, then OpenClaw. Check each config path against
-  the vendor's docs on the day before writing to it. Two are known and need
-  more than a new row: Amp keeps its servers under the key `amp.mcpServers` in
-  `~/.config/amp/settings.json`, and Hermes Agent under `mcp_servers` in
-  `~/.hermes/config.yaml`; linking, repair, and doctor look only for
-  `mcpServers`, `context_servers`, and `servers`.
-  Remote-only, name and icon at most: Claude web and mobile, Grok web
-  connectors, Perplexity, Gemini, Le Chat.
+- Clients missing from the registry (surveyed 2026-10-04): Muse Code, Amp,
+  OpenClaw, LM Studio. Check each config path against the vendor's docs on
+  the day before writing to it; on 2026-10-04 Amp's manual did not show its
+  settings path. Amp is said to keep its servers under the key
+  `amp.mcpServers`, OpenClaw under `mcp.servers` in a JSON5 file; linking,
+  repair, and doctor read neither.
+- Remote clients are named and pictured by guesswork: the app matches
+  Gemini, Perplexity, Le Chat, and Poke on the name a client reports, and
+  nobody has seen what each one reports. Correct the match when one connects.
 - Per-client access is in: a client can be kept from servers and from single
   tools. Left over: the app switches servers only, single tools go through
   `plug clients block`; there is no allow list (`only_servers`); every client
@@ -36,10 +36,8 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 - Plug needs a real app icon: minimal, distinct, and legible small, because
   it shows in the Dock, the menu bar, and inside every client Plug connects
   to. The current one is a placeholder.
-- The client list should cover what people use, each with its own icon:
-  the missing registry clients above, and agents that are not desktop apps,
-  such as the iMessage agents Instinct and Tomo. Survey first; the field
-  moves monthly.
+- Text-message agents: Poke takes a custom MCP server and can reach Plug as
+  a remote client. Instinct and Tomo document no way to add one (2026-10-04).
 - The app needs one audit and redesign, whole: every flow, the menu bar,
   and the CLI's wording, held to the grandma test. Known complaints:
   Settings is a separate window and should live in the main one; layout
@@ -51,9 +49,9 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   that uses it.
 - CI has no job timeout. A hung `Test (Plug.app)` ran 65 minutes on #269
   before it was cancelled by hand.
-- Warp and Kiro link but show no app icon: their bundle identifiers were not
-  read off an installed copy. A connected Pi, Warp, or Kiro is named from what
-  it reports, with no client type behind it.
+- A connected Pi, Warp, or Kiro is named from what it reports, with no client
+  type behind it. Warp's and Kiro's icons use identifiers read off Homebrew's
+  casks, not off an installed copy.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
 - App polish from daily use: copy, confusing states, recovery gaps. Fix as

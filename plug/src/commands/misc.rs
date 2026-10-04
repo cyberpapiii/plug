@@ -49,6 +49,7 @@ pub(crate) fn cmd_import(
                 "qwen-code" => Some(ClientSource::QwenCode),
                 "antigravity" => Some(ClientSource::Antigravity),
                 "goose" => Some(ClientSource::Goose),
+                "hermes" => Some(ClientSource::Hermes),
                 _ => None,
             })
             .collect(),

@@ -34,6 +34,7 @@ pub enum ExportTarget {
     QwenCode,
     Antigravity,
     Goose,
+    Hermes,
 }
 
 impl std::str::FromStr for ExportTarget {
@@ -68,6 +69,7 @@ impl std::str::FromStr for ExportTarget {
             "qwen" | "qwen-code" => Ok(Self::QwenCode),
             "antigravity" => Ok(Self::Antigravity),
             "goose" => Ok(Self::Goose),
+            "hermes" | "hermes-agent" => Ok(Self::Hermes),
             _ => Err(format!("unknown export target: {s}")),
         }
     }
@@ -103,6 +105,7 @@ impl ExportTarget {
             Self::QwenCode => "qwen-code",
             Self::Antigravity => "antigravity",
             Self::Goose => "goose",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -133,6 +136,7 @@ impl ExportTarget {
             Self::QwenCode => "Qwen Code",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
+            Self::Hermes => "Hermes Agent",
         }
     }
 
@@ -164,6 +168,7 @@ impl ExportTarget {
             "qwen-code",
             "antigravity",
             "goose",
+            "hermes",
         ]
     }
 }
@@ -250,6 +255,7 @@ pub fn export_config(options: &ExportOptions) -> String {
 
         // YAML clients
         ExportTarget::Goose => export_yaml_mcp_extensions(options, "extensions"),
+        ExportTarget::Hermes => export_hermes(options),
 
         // Nanobot uses tools.mcpServers
         ExportTarget::Nanobot => export_nanobot(options),
@@ -322,6 +328,26 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
     });
 
     serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate the Hermes Agent entry. Written as text in flow style, so the
+/// entry is the same few lines whichever file it is merged into.
+fn export_hermes(options: &ExportOptions) -> String {
+    let scalar = |value: &str| {
+        serde_norway::to_string(value)
+            .expect("serializing a YAML string cannot fail")
+            .trim_end()
+            .to_string()
+    };
+    let entry = match options.transport {
+        ExportTransport::Stdio => format!(
+            "    command: {}\n    args: [{}]\n",
+            scalar(&options.command),
+            connect_args(options).join(", ")
+        ),
+        ExportTransport::Http => format!("    url: {}\n", scalar(&resolved_http_url(options))),
+    };
+    format!("mcp_servers:\n  plug:\n{entry}")
 }
 
 /// Generate a YAML MCP config snippet.
@@ -642,6 +668,9 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
                 Some(home.join(".config/goose/config.yaml"))
             }
         }
+        // https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp
+        // Hermes Agent has one config file and no per-project one.
+        ExportTarget::Hermes => Some(home.join(".hermes/config.yaml")),
     }
 }
 
@@ -789,6 +818,7 @@ mod tests {
             ExportTarget::QwenCode,
             ExportTarget::Antigravity,
             ExportTarget::Goose,
+            ExportTarget::Hermes,
         ];
         for target in &targets {
             let options = ExportOptions {

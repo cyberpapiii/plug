@@ -315,6 +315,7 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Qwen Code", "qwen-code"),
         ("Google Antigravity", "antigravity"),
         ("Goose", "goose"),
+        ("Hermes Agent", "hermes"),
     ]
 }
 
@@ -385,9 +386,21 @@ pub(crate) fn linked_client_config_from_content(
             }
         }
         Some("yaml") | Some("yml") => {
-            let value = serde_norway::from_str::<serde_norway::Value>(&content).ok()?;
-            let plug = value.get("extensions")?.get("plug")?;
-            if let Some(uri) = plug.get("uri").and_then(|value| value.as_str()) {
+            let value = serde_norway::from_str::<serde_norway::Value>(content).ok()?;
+            let plug = value
+                .get(yaml_servers_key(target_enum))?
+                .as_mapping()?
+                .iter()
+                .find(|(name, _)| {
+                    name.as_str()
+                        .is_some_and(|name| name.eq_ignore_ascii_case("plug"))
+                })
+                .map(|(_, entry)| entry)?;
+            if let Some(uri) = plug
+                .get("uri")
+                .or_else(|| plug.get("url"))
+                .and_then(|value| value.as_str())
+            {
                 Some(LinkedClientConfig {
                     transport: ExportTransport::Http,
                     endpoint: Some(uri.to_string()),
@@ -452,6 +465,74 @@ fn toml_string_args(value: &toml::Value) -> Option<Vec<String>> {
         .iter()
         .map(|value| value.as_str().map(str::to_owned))
         .collect()
+}
+
+/// The top-level key a YAML client keeps its servers under.
+fn yaml_servers_key(target: ExportTarget) -> &'static str {
+    match target {
+        ExportTarget::Hermes => "mcp_servers",
+        _ => "extensions",
+    }
+}
+
+/// The lines of the Plug entry under `key`: the `plug:` line and one past the
+/// entry's last line. Hermes Agent links written by hand are often `Plug:`.
+fn yaml_plug_block(lines: &[String], key: &str) -> Option<(usize, usize)> {
+    let heading = format!("{key}:");
+    let parent = lines.iter().position(|line| line.trim_end() == heading)?;
+    let section_end = lines[parent + 1..]
+        .iter()
+        .position(|line| !line.trim().is_empty() && indentation(line) == 0)
+        .map(|offset| parent + 1 + offset)
+        .unwrap_or(lines.len());
+    let plug = (parent + 1..section_end)
+        .find(|&index| lines[index].trim().eq_ignore_ascii_case("plug:"))?;
+    let plug_indent = indentation(&lines[plug]);
+    let end = (plug + 1..section_end)
+        .find(|&index| !lines[index].trim().is_empty() && indentation(&lines[index]) <= plug_indent)
+        .unwrap_or(section_end);
+    Some((plug, end))
+}
+
+/// Put `snippet`'s Plug entry into a YAML file as text, so comments, key
+/// order, and every other line of the file stay exactly as they were.
+///
+/// `snippet` is a heading line, `<key>:`, followed by the entry indented two
+/// spaces.
+fn link_yaml_text(existing: &str, snippet: &str) -> anyhow::Result<String> {
+    let (heading, entry) = snippet
+        .split_once('\n')
+        .ok_or_else(|| anyhow::anyhow!("empty YAML entry"))?;
+    let key = heading.trim_end().trim_end_matches(':');
+    let mut lines = unlink_yaml(existing, key)
+        .lines()
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    match lines.iter().position(|line| line.trim_end() == heading) {
+        Some(parent) => {
+            // Match the indentation the file's other servers already use.
+            let indent = lines[parent + 1..]
+                .iter()
+                .find(|line| !line.trim().is_empty())
+                .map(|line| indentation(line))
+                .filter(|indent| *indent > 0)
+                .unwrap_or(2);
+            let pad = " ".repeat(indent.saturating_sub(2));
+            let entry = entry.lines().map(|line| format!("{pad}{line}"));
+            lines.splice(parent + 1..parent + 1, entry);
+        }
+        None if lines
+            .iter()
+            .any(|line| indentation(line) == 0 && line.starts_with(heading)) =>
+        {
+            anyhow::bail!("`{heading}` is written on one line; add Plug to it by hand");
+        }
+        None => lines.extend(snippet.lines().map(str::to_string)),
+    }
+    let updated = lines.join("\n") + "\n";
+    serde_norway::from_str::<serde_norway::Value>(&updated)
+        .map_err(|error| anyhow::anyhow!("the file would not be valid YAML: {error}"))?;
+    Ok(updated)
 }
 
 fn yaml_string_args(value: &serde_norway::Value) -> Option<Vec<String>> {
@@ -1110,7 +1191,7 @@ pub(crate) fn cmd_link(
             un.push_str(&snippet);
             un
         } else if is_yaml {
-            let mut un = unlink_yaml(&existing);
+            let mut un = unlink_yaml(&existing, "extensions");
             if !un.ends_with('\n') {
                 un.push('\n');
             }
@@ -1195,7 +1276,7 @@ pub(crate) fn execute_unlink(target: &str, project: bool) -> anyhow::Result<()> 
     let ext = path.extension().and_then(|e| e.to_str());
     let unlinked = match ext {
         Some("toml") => plug_core::import::unlink_toml(&existing),
-        Some("yaml") | Some("yml") => unlink_yaml(&existing),
+        Some("yaml") | Some("yml") => unlink_yaml(&existing, yaml_servers_key(target_enum)),
         _ => unmerge_json_config(&existing)?,
     };
     std::fs::write(&path, unlinked)?;
@@ -1361,7 +1442,9 @@ fn replace_stdio_command(
     let command = canonical.to_string_lossy().to_string();
     match path.extension().and_then(|extension| extension.to_str()) {
         Some("toml") => replace_toml_stdio_command(content, &command),
-        Some("yaml") | Some("yml") => replace_yaml_stdio_command(content, &command),
+        Some("yaml") | Some("yml") => {
+            replace_yaml_stdio_command(content, yaml_servers_key(target), &command)
+        }
         _ => replace_json_stdio_command(target, content, command),
     }
 }
@@ -1402,24 +1485,10 @@ fn replace_toml_stdio_command(content: &str, command: &str) -> anyhow::Result<St
     Ok(join_lines(content, lines))
 }
 
-fn replace_yaml_stdio_command(content: &str, command: &str) -> anyhow::Result<String> {
+fn replace_yaml_stdio_command(content: &str, key: &str, command: &str) -> anyhow::Result<String> {
     let mut lines = content.lines().map(str::to_string).collect::<Vec<_>>();
-    let extensions = lines
-        .iter()
-        .position(|line| line.trim() == "extensions:")
-        .ok_or_else(|| anyhow::anyhow!("missing Goose extensions"))?;
-    let extensions_indent = indentation(&lines[extensions]);
-    let plug = lines[extensions + 1..]
-        .iter()
-        .position(|line| indentation(line) > extensions_indent && line.trim() == "plug:")
-        .map(|offset| extensions + 1 + offset)
-        .ok_or_else(|| anyhow::anyhow!("missing Goose Plug entry"))?;
-    let plug_indent = indentation(&lines[plug]);
-    let end = lines[plug + 1..]
-        .iter()
-        .position(|line| !line.trim().is_empty() && indentation(line) <= plug_indent)
-        .map(|offset| plug + 1 + offset)
-        .unwrap_or(lines.len());
+    let (plug, end) = yaml_plug_block(&lines, key)
+        .ok_or_else(|| anyhow::anyhow!("missing Plug entry under {key}"))?;
     replace_assignments(
         &mut lines,
         plug + 1,
@@ -1647,30 +1716,18 @@ fn replace_json_stdio_command(
     Ok(serde_json::to_string_pretty(&value)?)
 }
 
-pub(crate) fn unlink_yaml(existing: &str) -> String {
-    let mut output = Vec::new();
-    let mut skipping = false;
-    for line in existing.lines() {
-        let trimmed = line.trim();
-        if trimmed == "plug:"
-            || (skipping
-                && (trimmed.starts_with("type:")
-                    || trimmed.starts_with("command:")
-                    || trimmed.starts_with("args:")
-                    || trimmed.starts_with("enabled:")
-                    || trimmed.starts_with("- ")))
-        {
-            skipping = true;
-            continue;
-        }
-        if skipping && !line.starts_with(' ') && !trimmed.is_empty() {
-            skipping = false;
-        }
-        if !skipping {
-            output.push(line);
-        }
+/// Remove the Plug entry under `key`, and nothing else.
+pub(crate) fn unlink_yaml(existing: &str, key: &str) -> String {
+    let mut lines = existing.lines().map(str::to_string).collect::<Vec<_>>();
+    let Some((plug, mut end)) = yaml_plug_block(&lines, key) else {
+        return existing.to_string();
+    };
+    // Blank lines after the entry belong to whatever follows it.
+    while end > plug + 1 && lines[end - 1].trim().is_empty() {
+        end -= 1;
     }
-    output.join("\n")
+    lines.drain(plug..end);
+    join_lines(existing, lines)
 }
 
 pub(crate) fn execute_export(
@@ -1724,6 +1781,11 @@ pub(crate) fn execute_export(
                 }
                 un.push_str(&snippet);
                 un
+            }
+            // Hermes Agent's file is long, commented, and the person's own;
+            // parsing and re-emitting it would rewrite every line.
+            Some("yaml") | Some("yml") if target_enum == ExportTarget::Hermes => {
+                link_yaml_text(&existing, &snippet)?
             }
             Some("yaml") | Some("yml") => merge_yaml_config(&existing, &snippet)?,
             _ => merge_json_config(&existing, &snippet)?,
@@ -1958,6 +2020,81 @@ port = 4444
         assert_eq!(
             linked.endpoint.as_deref(),
             Some("https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn hermes_link_changes_only_the_plug_entry() {
+        use plug_core::export::{ExportOptions, ExportTarget, ExportTransport, export_config};
+        let path = std::path::Path::new("config.yaml");
+        let existing = "# my notes\nmodel:\n  plug: not a server\nmcp_servers:\n    other:\n        command: other # keep\n\nplatforms:\n  webhook:\n    enabled: true\n";
+        let snippet = export_config(&ExportOptions {
+            target: ExportTarget::Hermes,
+            transport: ExportTransport::Stdio,
+            port: 3282,
+            http_url: None,
+            command: "/Applications/Plug.app/Contents/Resources/plug".to_string(),
+        });
+
+        let linked = link_yaml_text(existing, &snippet).expect("link");
+        let config =
+            linked_client_config_from_content(path, ExportTarget::Hermes, &linked).expect("linked");
+        assert_eq!(config.transport, ExportTransport::Stdio);
+        assert_eq!(
+            config.args.as_deref(),
+            Some(
+                &[
+                    "connect".to_string(),
+                    "--client".to_string(),
+                    "hermes".to_string()
+                ][..]
+            )
+        );
+        // Linking twice leaves one entry, and unlinking gives the file back.
+        assert_eq!(link_yaml_text(&linked, &snippet).expect("relink"), linked);
+        assert_eq!(unlink_yaml(&linked, "mcp_servers"), existing);
+
+        // A file with no servers yet gains the section at its end.
+        let fresh = link_yaml_text("model:\n  default: x\n", &snippet).expect("link");
+        assert!(fresh.starts_with("model:\n  default: x\nmcp_servers:\n  plug:\n"));
+        assert!(link_yaml_text("mcp_servers: {}\n", &snippet).is_err());
+    }
+
+    #[test]
+    fn hermes_link_written_by_hand_is_read_and_replaced() {
+        use plug_core::export::{ExportOptions, ExportTarget, ExportTransport, export_config};
+        let path = std::path::Path::new("config.yaml");
+        let existing = "mcp_servers:\n  Plug:\n    command: /Users/rob/.local/bin/plug\n    args:\n      - connect\n    env: {}\nknown:\n  cli:\n    - spotify\n";
+        let config = linked_client_config_from_content(path, ExportTarget::Hermes, existing)
+            .expect("linked");
+        assert_eq!(config.args.as_deref(), Some(&["connect".to_string()][..]));
+
+        let snippet = export_config(&ExportOptions {
+            target: ExportTarget::Hermes,
+            transport: ExportTransport::Http,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "plug".to_string(),
+        });
+        let linked = link_yaml_text(existing, &snippet).expect("link");
+        assert_eq!(
+            linked,
+            "mcp_servers:\n  plug:\n    url: https://plug.example.com/mcp\nknown:\n  cli:\n    - spotify\n"
+        );
+        let config =
+            linked_client_config_from_content(path, ExportTarget::Hermes, &linked).expect("linked");
+        assert_eq!(
+            config.endpoint.as_deref(),
+            Some("https://plug.example.com/mcp")
+        );
+    }
+
+    #[test]
+    fn unlink_yaml_keeps_the_servers_after_plug() {
+        let existing = "extensions:\n  plug:\n    type: sse\n    uri: https://plug.example.com/mcp\n    enabled: true\n  other:\n    type: stdio\n    command: other\n";
+        assert_eq!(
+            unlink_yaml(existing, "extensions"),
+            "extensions:\n  other:\n    type: stdio\n    command: other\n"
         );
     }
 
