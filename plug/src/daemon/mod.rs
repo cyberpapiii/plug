@@ -1558,6 +1558,18 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     })
                 })
                 .collect();
+            let client_blocks = config
+                .clients
+                .iter()
+                .filter(|(_, settings)| {
+                    !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
+                })
+                .map(|(key, settings)| plug_core::ipc::ClientBlocks {
+                    key: key.clone(),
+                    servers: settings.blocked_servers.clone(),
+                    tools: settings.blocked_tools.clone(),
+                })
+                .collect();
             let mut server_statuses = ctx.server_manager.server_statuses();
             strip_upstream_icons(&mut server_statuses);
             let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
@@ -1578,6 +1590,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     upstream_auth,
                     downstream_clients,
                     client_names,
+                    client_blocks,
                     config_error,
                 }),
             }

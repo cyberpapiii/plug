@@ -70,6 +70,8 @@ struct PlugIntentRunner {
             perform { .revokeClient(authToken: $0, clientID: id) }
         case let .renameClient(key, name):
             perform { .renameClient(authToken: $0, key: key, name: name) }
+        case let .setClientServerBlocked(key, server, blocked):
+            perform { .setClientServerBlocked(authToken: $0, key: key, server: server, blocked: blocked) }
         case .addServer:
             router.section = .servers
             router.isAddingServer = true

@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- The Clients tab chooses which servers each client can use. Every client that
+  uses Plug has a button that opens its servers with a switch each, and a
+  client kept from something says so in its row. The popover says plainly that
+  for a client on this Mac this keeps the list short and is not a lock, while a
+  remote client is held to it.
 - A client kept from a server is kept from all of it. Its resources, resource
   templates, and prompts leave that client's lists, and reading one, getting
   one, completing against one, or subscribing to one answers as if it did not

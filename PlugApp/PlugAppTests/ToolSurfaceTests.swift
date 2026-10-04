@@ -346,6 +346,41 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(names.name(forKey: "oauth:other"))
     }
 
+    func testAClientIsKeptFromWhatItsOwnKeyNamesAndNothingElse() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let servers = try decoder.decode(
+            [ConfiguredServer].self,
+            from: Data(
+                """
+                [{"name":"git","enabled":true,"transport":"stdio","oauth":false},
+                 {"name":"slack","enabled":true,"transport":"http","oauth":true}]
+                """.utf8
+            )
+        )
+        let blocks = try decoder.decode(
+            [ClientBlocks].self,
+            from: Data(
+                """
+                [{"key":"cursor","servers":["git","gone"],"tools":["slack__post"]},
+                 {"key":"oauth:abc","servers":["slack"]},
+                 {"key":"pi","tools":["git__*","slack__dm"]}]
+                """.utf8
+            )
+        )
+        let access = { ClientAccess(key: $0, name: "Client", servers: servers, blocks: blocks) }
+
+        // A block on a server that is gone is not counted.
+        XCTAssertEqual(access("cursor").blockedServers, ["git"])
+        XCTAssertEqual(access("cursor").summary, "kept from 1 server and 1 tool")
+        XCTAssertFalse(access("cursor").isRemote)
+        XCTAssertEqual(access("oauth:abc").summary, "kept from 1 server")
+        XCTAssertTrue(access("oauth:abc").isRemote)
+        XCTAssertEqual(access("pi").summary, "kept from 2 tools")
+        XCTAssertNil(access("claude-code").summary)
+        XCTAssertFalse(access("claude-code").isLimited)
+    }
+
     func testARemoteSessionIsNamedAfterItsGrantUnlessPlugKnowsTheProduct() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase

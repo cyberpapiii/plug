@@ -138,6 +138,22 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(offer?["ipc_min"] as? Int ?? offer?["ipcMin"] as? Int, Int(low))
     }
 
+    func testKeepingAClientFromAServerIsSentAsTheDaemonReadsIt() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let request = IPCRequest.setClientServerBlocked(
+            authToken: "secret", key: "pi", server: "notion", blocked: true
+        )
+        let frame = try FrameCodec.encode(request, encoder: encoder)
+        let sent = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
+        XCTAssertEqual(
+            sent,
+            [
+                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
+                "kind": "server", "target": "notion", "blocked": true,
+            ] as NSDictionary
+        )
+    }
+
     func testServerConfigRequestAndResponseRoundTripAdvancedFields() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let request = IPCRequest.serverConfig(authToken: "secret", name: "workspace")

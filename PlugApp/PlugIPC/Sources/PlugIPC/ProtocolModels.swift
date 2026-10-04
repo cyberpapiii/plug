@@ -94,6 +94,13 @@ public struct ClientName: Codable, Equatable, Sendable {
     public let name: String
 }
 
+/// What the owner keeps a client from. A list the daemon left out is empty.
+public struct ClientBlocks: Codable, Equatable, Sendable {
+    public let key: String
+    public var servers: [String]?
+    public var tools: [String]?
+}
+
 public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
     public var id: String { name }
     public let name: String
@@ -133,6 +140,8 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let downstreamClients: [DownstreamClient]
     /// Names the owner gave clients. Absent when there are none.
     public var clientNames: [ClientName]?
+    /// What each client is kept from. Absent when nobody is kept from anything.
+    public var clientBlocks: [ClientBlocks]?
 
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",
@@ -319,11 +328,13 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case revokeClient(authToken: String, clientID: String)
     /// An empty name goes back to the name Plug works out.
     case renameClient(authToken: String, key: String, name: String)
+    /// Keep a client from a server, or let it back in.
+    case setClientServerBlocked(authToken: String, key: String, server: String, blocked: Bool)
     case shutdown(authToken: String)
 
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
-        case name, server, enabled, serverID, clientID, tool, key
+        case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -371,6 +382,10 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .renameClient(token, key, name):
             try c.encode("RenameClient", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode(name, forKey: .name)
+        case let .setClientServerBlocked(token, key, server, blocked):
+            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode("server", forKey: .kind)
+            try c.encode(server, forKey: .target); try c.encode(blocked, forKey: .blocked)
         case let .shutdown(token):
             try c.encode("Shutdown", forKey: .type); try c.encode(token, forKey: .authToken)
         }
