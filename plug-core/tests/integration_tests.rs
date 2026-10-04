@@ -2799,6 +2799,87 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
     engine.shutdown().await;
 }
 
+/// MCP Apps (SEP-1865) is pass-through for Plug: the server links a tool to a
+/// `ui://` resource and the client renders it. Plug has to say it supports the
+/// extension, or the server leaves the link out, and then carry the link, the
+/// resource, and the resource's security metadata through untouched.
+#[tokio::test]
+async fn an_mcp_app_reaches_the_client_whole() {
+    let mut config = Config::default();
+    let mut mock = mock_server_config("widget");
+    mock.args.push("--resources".to_string());
+    config.servers.insert("mock".to_string(), mock);
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let tools = client.peer().list_all_tools().await.expect("list tools");
+    let widget = tools
+        .iter()
+        .find(|tool| tool.name == "Mock__widget")
+        .expect("widget tool");
+    assert_eq!(
+        widget.meta.as_ref().and_then(|meta| meta.get("ui")),
+        Some(&serde_json::json!({
+            "resourceUri": "ui://mock/widget.html",
+            "visibility": ["model", "app"]
+        })),
+        "the server only links the tool to its UI for a client that supports MCP Apps"
+    );
+
+    let resources = client
+        .peer()
+        .list_all_resources()
+        .await
+        .expect("list resources");
+    let page = resources
+        .iter()
+        .find(|resource| resource.uri == "ui://mock/widget.html")
+        .expect("ui resource is listed under its own URI");
+    assert_eq!(page.mime_type.as_deref(), Some("text/html;profile=mcp-app"));
+
+    let read = client
+        .peer()
+        .read_resource(ReadResourceRequestParams::new("ui://mock/widget.html"))
+        .await
+        .expect("read ui resource");
+    let rmcp::model::ResourceContents::TextResourceContents {
+        mime_type, meta, ..
+    } = &read.contents[0]
+    else {
+        panic!("ui resource is text");
+    };
+    assert_eq!(mime_type.as_deref(), Some("text/html;profile=mcp-app"));
+    assert_eq!(
+        meta.as_ref().and_then(|meta| meta.get("ui")),
+        Some(&serde_json::json!({
+            "csp": {"connectDomains": ["https://api.example.test"]},
+            "prefersBorder": true
+        })),
+        "the client builds its sandbox from this"
+    );
+
+    // The page calls the tool by the name its server gave it.
+    let called = engine.tool_router().call_tool("widget", None).await;
+    assert!(called.is_ok(), "an app's own tool call routes: {called:?}");
+
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
     let mut config = Config::default();

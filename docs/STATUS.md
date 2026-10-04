@@ -47,11 +47,12 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- Tools from plain HTTP APIs (OpenAPI, GraphQL) with no MCP server.
-- Skills: namespace `skill://` resources per upstream server.
-- MCP Apps: confirm the UI capability and `ui://` resources survive
-  pass-through in both protocol eras.
-- Secret providers such as 1Password for server credentials.
+- Tools from plain HTTP APIs: an OpenAPI document as a server, and a recipe
+  for GraphQL (#263).
+- Skills: carry the skills extension through Plug, with the server's name in
+  each skill URI. Waits for a server and a client that use it (#262).
+- Secret providers: server credentials from a 1Password mount, read by the
+  service only and never hanging it (#264).
 - A code-execution tool surface in place of real tools. Current evidence is
   against it as a default; the opt-in search-then-load mode covers clients with
   hard tool caps.
