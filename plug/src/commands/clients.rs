@@ -311,6 +311,8 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Pi", "pi"),
         ("Warp", "warp"),
         ("Kiro", "kiro"),
+        ("Kimi Code", "kimi-code"),
+        ("Qwen Code", "qwen-code"),
         ("Google Antigravity", "antigravity"),
         ("Goose", "goose"),
     ]
@@ -2164,7 +2166,13 @@ extensions:
         assert!(clients.contains(&("Devin", "devin")));
         assert!(clients.contains(&("Grok Build", "grok-build")));
         assert!(clients.contains(&("GitHub Copilot CLI", "copilot-cli")));
-        for client in [("Pi", "pi"), ("Warp", "warp"), ("Kiro", "kiro")] {
+        for client in [
+            ("Pi", "pi"),
+            ("Warp", "warp"),
+            ("Kiro", "kiro"),
+            ("Kimi Code", "kimi-code"),
+            ("Qwen Code", "qwen-code"),
+        ] {
             assert!(clients.contains(&client));
         }
         assert!(!clients.iter().any(|(name, _)| name.contains("Windsurf")));

@@ -40,7 +40,7 @@ enum AppIcons {
     /// terminal glyph says more about them than a generic app square would.
     private static let commandLineTargets: Set<String> = [
         "cline-cli", "gemini-cli", "grok-build", "copilot-cli", "pi",
-        "goose", "opencode", "nanobot", "crush",
+        "goose", "opencode", "nanobot", "crush", "kimi-code", "qwen-code",
     ]
 
     /// The symbol that stands in for an app with no icon on this Mac.

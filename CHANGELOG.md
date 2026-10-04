@@ -117,6 +117,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   servers from it, and a Grok Build session is named in Clients. Grok Bot,
   which reaches Plug over the internet only, is recognised by name and shows
   its icon when the Grok Bot app is installed.
+- Plug links Kimi Code and Qwen Code. `plug link kimi-code` writes
+  `~/.kimi-code/mcp.json` and `plug link qwen-code` writes
+  `~/.qwen/settings.json`; both also import from those files and show in the
+  app's client list.
 
 ### Changed
 

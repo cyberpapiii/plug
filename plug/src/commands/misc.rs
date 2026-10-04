@@ -45,6 +45,8 @@ pub(crate) fn cmd_import(
                 "pi" => Some(ClientSource::Pi),
                 "warp" => Some(ClientSource::Warp),
                 "kiro" => Some(ClientSource::Kiro),
+                "kimi-code" => Some(ClientSource::KimiCode),
+                "qwen-code" => Some(ClientSource::QwenCode),
                 "antigravity" => Some(ClientSource::Antigravity),
                 "goose" => Some(ClientSource::Goose),
                 _ => None,

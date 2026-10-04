@@ -20,8 +20,12 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 - `plug clients` still lists a remote session Plug does not recognise as
   Unknown. The app names it after its grant.
 - Clients missing from the registry, most used first (surveyed 2026-10-03):
-  Hermes Agent, Muse Code, Kimi Code, Amp, then Qwen Code and OpenClaw. Check
-  each config path against the vendor's docs on the day before writing to it.
+  Hermes Agent, Muse Code, Amp, then OpenClaw. Check each config path against
+  the vendor's docs on the day before writing to it. Two are known and need
+  more than a new row: Amp keeps its servers under the key `amp.mcpServers` in
+  `~/.config/amp/settings.json`, and Hermes Agent under `mcp_servers` in
+  `~/.hermes/config.yaml`; linking, repair, and doctor look only for
+  `mcpServers`, `context_servers`, and `servers`.
   Remote-only, name and icon at most: Claude web and mobile, Grok web
   connectors, Perplexity, Gemini, Le Chat.
 - Per-client access is in: a client can be kept from servers and from single
