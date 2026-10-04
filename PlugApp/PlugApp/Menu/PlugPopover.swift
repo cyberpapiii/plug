@@ -10,11 +10,10 @@ import SwiftUI
 /// adding a server, auditing connections, reading history — and nothing that
 /// belongs here has been moved there.
 ///
-/// Shape of the panel, top to bottom: one headline with its fix, a thin
-/// progress line while servers settle, the server list with trouble pinned to
-/// the top and its fix inline, who is connected, the last few tool calls, and
-/// the controls. Servers never leave the list when they break, so rows do not
-/// jump around.
+/// Shape of the panel, top to bottom: one headline with its fix, the server
+/// list with each fix beside its row, who is connected, the last few tool
+/// calls, and the controls. Servers never leave the list when they break, so
+/// rows do not jump around.
 struct PlugPopover: View {
     let model: AppModel
     let run: (PlugIntent) -> Void
@@ -27,18 +26,18 @@ struct PlugPopover: View {
         VStack(alignment: .leading, spacing: 0) {
             header
             if model.serviceEnabled, !servers.isEmpty {
-                PanelDivider()
+                Divider()
                 serverList
             }
             if model.serviceEnabled, situation.connectedApps > 0 {
-                PanelDivider()
+                Divider()
                 connectedAppsRow
             }
             if model.serviceEnabled, !recentCalls.isEmpty {
-                PanelDivider()
+                Divider()
                 recent
             }
-            PanelDivider()
+            Divider()
             footer
         }
         .frame(width: Metric.popoverWidth)
@@ -56,33 +55,32 @@ struct PlugPopover: View {
                 Text("Plug").font(.headline)
                 Spacer()
                 ServicePowerToggle(model: model, run: run)
-                .labelsHidden()
-                .controlSize(.small)
+                    .labelsHidden()
+                    .controlSize(.small)
             }
-            VerdictView(verdict: model.verdict, style: .hero, run: send)
+            VerdictView(verdict: heroVerdict, style: .hero, run: send)
             if let error = model.actionError {
                 ProblemNote(error) { send(.dismissActionError) }
             }
-            if let progress = settlingProgress {
-                ProgressView(value: progress)
-                    .progressViewStyle(.linear)
-                    .controlSize(.small)
-                    .tint(.secondary)
-                    .animation(reduceMotion ? nil : .smooth(duration: 0.4), value: progress)
-                    .accessibilityLabel("Servers starting")
-            }
         }
-        .popoverInset()
+        .padding(.horizontal, Metric.panelInset)
         .padding(.top, Metric.regular)
         .padding(.bottom, Metric.regular)
     }
 
-    /// Fraction of enabled servers that are up, only while some are still
-    /// starting. Nothing else earns a progress bar.
-    private var settlingProgress: Double? {
-        let active = situation.activeServers
-        guard active.contains(where: \.health.isSettling), !active.isEmpty else { return nil }
-        return Double(situation.workingServers.count) / Double(active.count)
+    /// The headline without "Turn On" when Plug is off: the switch that does
+    /// it is right above.
+    private var heroVerdict: Verdict {
+        let verdict = model.verdict
+        guard verdict.primary?.intent == .setServiceEnabled(true) else { return verdict }
+        return Verdict(
+            tone: verdict.tone,
+            symbol: verdict.symbol,
+            title: verdict.title,
+            detail: verdict.detail,
+            primary: nil,
+            secondary: verdict.secondary
+        )
     }
 
     // MARK: - Servers
@@ -93,41 +91,34 @@ struct PlugPopover: View {
 
     private var serverList: some View {
         VStack(alignment: .leading, spacing: Metric.tight) {
-            HStack(spacing: Metric.tight) {
-                Text("Servers")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
-                Spacer(minLength: 0)
-                Text(situation.countsSummary(stale: model.dataIsStale))
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
-                    .contentTransition(.numericText())
-            }
-            .padding(.horizontal, Metric.snug)
-            .padding(.top, Metric.snug)
-            .accessibilityAddTraits(.isHeader)
+            SectionLabel(text: "Servers", trailing: model.dataIsStale ? "Last known" : nil)
+                .padding(.horizontal, Metric.snug)
+                .padding(.top, Metric.snug)
 
             ScrollView {
                 LazyVStack(spacing: 0) {
                     ForEach(servers) { server in
-                        PanelServerRow(server: server, run: send)
-                            .frame(height: Metric.popoverRowHeight)
+                        PanelServerRow(
+                            server: server,
+                            showsFix: situation.troubledServers.count != 1,
+                            canFix: model.canMutate,
+                            run: send
+                        )
+                        .frame(height: Metric.popoverRowHeight)
                     }
                 }
-                .padding(.horizontal, Metric.tight)
                 .padding(.bottom, Metric.tight)
             }
             // The rows are what the daemon said last, not what it says now.
             .opacity(model.dataIsStale ? 0.55 : 1)
             .frame(height: listHeight)
             .scrollBounceBehavior(.basedOnSize)
-            .scrollFade(enabled: servers.count > Metric.popoverVisibleRows)
         }
         .padding(.horizontal, Metric.tight)
     }
 
-    /// Whole rows only. A row cut in half reads as a rendering bug, so the
-    /// list is as tall as its rows up to a fixed count and then scrolls.
+    /// As tall as its rows up to a fixed count. Past that the list scrolls,
+    /// and part of the next row shows so the cut reads as more below.
     private var listHeight: CGFloat {
         let rows = min(servers.count, Metric.popoverVisibleRows)
         let partial: CGFloat = servers.count > Metric.popoverVisibleRows ? Metric.popoverRowHeight * 0.45 : 0
@@ -153,7 +144,7 @@ struct PlugPopover: View {
         .buttonStyle(QuietRowButtonStyle())
         .padding(.horizontal, Metric.tight)
         .padding(.vertical, Metric.tight)
-        .help("See connected clients")
+        .help("Show Clients")
     }
 
     private var connectedAppsText: String {
@@ -181,66 +172,43 @@ struct PlugPopover: View {
     }
 
     private var recent: some View {
-        Button { send(.openWindow(.activity)) } label: {
-            VStack(alignment: .leading, spacing: Metric.tight) {
+        VStack(alignment: .leading, spacing: Metric.rowGap) {
+            Button { send(.openWindow(.activity)) } label: {
                 HStack(spacing: Metric.tight) {
-                    Text("Recent calls")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                    Spacer(minLength: 0)
+                    SectionLabel(text: "Recent Activity")
                     Image(systemName: "chevron.right")
                         .font(.caption2.weight(.semibold))
                         .foregroundStyle(.tertiary)
                 }
-                ForEach(recentCalls) { event in
-                    RecentCallRow(call: CallFacts(event))
-                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
+            .buttonStyle(QuietRowButtonStyle())
+            .padding(.horizontal, Metric.tight)
+            .help("Show All Activity")
+
+            ForEach(recentCalls) { event in
+                RecentCallRow(call: CallFacts(event))
+                    .padding(.horizontal, Metric.panelInset)
+            }
         }
-        .buttonStyle(QuietRowButtonStyle())
-        .padding(.horizontal, Metric.tight)
-        .padding(.vertical, Metric.tight)
-        .help("See all activity")
+        .padding(.top, Metric.tight)
+        .padding(.bottom, Metric.snug)
     }
 
     // MARK: - Footer
 
     private var footer: some View {
         HStack(spacing: Metric.tight) {
-            Button { send(.addServer) } label: {
-                Label("Add Server", systemImage: "plus")
-            }
-            .buttonStyle(QuietControlButtonStyle())
-            .help("Add a server")
-
-            Button { send(.openCurrentWindow) } label: {
-                Label("Open Plug", systemImage: "macwindow")
-            }
-            .buttonStyle(QuietControlButtonStyle())
-            .help("Open the Plug window")
-
+            Button("Open Plug") { send(.openCurrentWindow) }
+            Button("Settings…") { send(.openSettings) }
+                .keyboardShortcut(",", modifiers: .command)
             Spacer(minLength: 0)
-
-            // Settings and Quit are what people look for in a menu bar app, so
-            // they are visible controls rather than entries inside a menu. Both
-            // are icon-only: the picture is the label, and the tooltip and the
-            // accessibility label carry the words.
-            Button { send(.openSettings) } label: {
-                Image(systemName: "gearshape")
-            }
-            .buttonStyle(QuietControlButtonStyle(iconOnly: true))
-            .help("Settings")
-            .accessibilityLabel("Settings")
-
-            Button { run(.quit) } label: {
-                Text("Quit")
-            }
-            .buttonStyle(QuietControlButtonStyle())
-            .help("Quit the menu bar app. Plug keeps serving your clients until you switch it off.")
-            .accessibilityLabel("Quit Plug")
+            Button("Quit Plug") { run(.quit) }
+                .keyboardShortcut("q", modifiers: .command)
+                .help("Quit the menu bar app. Plug keeps serving your clients until you turn it off.")
         }
-        .padding(.horizontal, Metric.snug)
+        .buttonStyle(.accessoryBar)
+        .padding(.horizontal, Metric.tight)
         .padding(.vertical, Metric.tight)
     }
 
@@ -261,69 +229,59 @@ struct PlugPopover: View {
 // MARK: - Rows
 
 /// One server in the panel. Healthy rows are quiet and show their tool count;
-/// a troubled row keeps its place, turns its trailing text into the problem,
-/// and carries the button that fixes it. A chevron appears on hover so the
-/// row reads as something you can open.
+/// a troubled row keeps its place and says what is wrong. Its fix sits beside
+/// the row, except when it is the only trouble and the headline already
+/// offers the same button.
 private struct PanelServerRow: View {
     let server: ServerFacts
+    let showsFix: Bool
+    let canFix: Bool
     let run: (PlugIntent) -> Void
-    @State private var hovering = false
 
     var body: some View {
-        Button { run(.reveal(server: server.name)) } label: {
-            HStack(spacing: Metric.snug) {
-                StatusGlyph(health: server.health)
-                Text(server.name)
-                    .font(.callout)
-                    .foregroundStyle(server.enabled ? .primary : .secondary)
-                    .lineLimit(1)
-                Spacer(minLength: Metric.tight)
-                trailing
+        HStack(spacing: Metric.tight) {
+            Button { run(.reveal(server: server.name)) } label: {
+                HStack(spacing: Metric.snug) {
+                    StatusGlyph(health: server.health)
+                    Text(server.name)
+                        .font(.callout)
+                        .foregroundStyle(server.enabled ? .primary : .secondary)
+                        .lineLimit(1)
+                    Spacer(minLength: Metric.tight)
+                    if !offersFix {
+                        Text(trailingText)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                }
+                .contentShape(Rectangle())
             }
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(QuietRowButtonStyle())
-        .onHover { hovering = $0 }
-        .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(server.name), \(server.health.label)")
-        // Combining the row hides the button inside it from VoiceOver, so
-        // the same fix is offered as a named action on the row.
-        .accessibilityActions {
-            if let cancel = server.cancelSignIn {
-                Button(cancel.title) { run(cancel.intent) }
-            } else if server.health.needsAttention, let fix = server.fix {
-                Button(fix.title) { run(fix.intent) }
+            .buttonStyle(QuietRowButtonStyle())
+            .accessibilityElement(children: .combine)
+            .accessibilityLabel("\(server.name), \(server.health.label)")
+
+            if offersFix {
+                fixControl
+                    .padding(.trailing, Metric.snug)
             }
         }
     }
 
-    @ViewBuilder private var trailing: some View {
-        if server.health.needsAttention {
-            if let cancel = server.cancelSignIn {
-                HStack(spacing: Metric.tight) {
-                    ProgressView().controlSize(.mini)
-                    Button(cancel.title) { run(cancel.intent) }
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                }
-            } else if let fix = server.fix {
-                Button(fix.title) { run(fix.intent) }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
-                    .tint(server.health.color)
-            }
-        } else {
-            ZStack(alignment: .trailing) {
-                Text(trailingText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .opacity(hovering ? 0 : 1)
-                Image(systemName: "chevron.right")
-                    .font(.caption2.weight(.semibold))
-                    .foregroundStyle(.tertiary)
-                    .opacity(hovering ? 1 : 0)
-            }
-            .animation(.easeOut(duration: 0.12), value: hovering)
+    private var offersFix: Bool {
+        showsFix && server.health.needsAttention && (server.cancelSignIn != nil || server.fix != nil)
+    }
+
+    @ViewBuilder private var fixControl: some View {
+        if let cancel = server.cancelSignIn {
+            ProgressView().controlSize(.small)
+            Button(cancel.title) { run(cancel.intent) }
+                .controlSize(.small)
+                .accessibilityLabel("\(cancel.title), \(server.name)")
+        } else if let fix = server.fix {
+            Button(fix.title) { run(fix.intent) }
+                .controlSize(.small)
+                .disabled(!canFix)
+                .accessibilityLabel("\(fix.title), \(server.name)")
         }
     }
 
@@ -341,12 +299,12 @@ private struct RecentCallRow: View {
 
     var body: some View {
         HStack(spacing: Metric.tight) {
-            Image(systemName: call.succeeded ? "checkmark" : "exclamationmark.triangle.fill")
+            Image(systemName: symbol)
                 .font(.caption2)
-                .foregroundStyle(call.succeeded ? Color.secondary : .orange)
+                .foregroundStyle(call.failed ? Color.red : .secondary)
                 .frame(width: 12)
             Text(call.tool)
-                .font(.caption.monospaced())
+                .font(.caption)
                 .foregroundStyle(.primary)
                 .lineLimit(1)
                 .truncationMode(.middle)
@@ -356,9 +314,8 @@ private struct RecentCallRow: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .frame(width: 58, alignment: .leading)
+                    .layoutPriority(1)
             }
-            Spacer(minLength: Metric.tight)
             Text(call.duration)
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.tertiary)
@@ -369,83 +326,27 @@ private struct RecentCallRow: View {
             "\(call.tool)\(call.server.map { ", \($0)" } ?? ""), \(call.result), \(call.spokenDuration)"
         )
     }
+
+    private var symbol: String {
+        if call.failed { return "xmark.circle.fill" }
+        return call.cancelled ? "minus.circle.fill" : "checkmark"
+    }
 }
 
-/// Up to three connected app icons, overlapped like a short stack, so the row
-/// says who is connected before the words do.
+/// Up to three connected app icons, so the row says who is connected before
+/// the words do.
 private struct AppIconStack: View {
     let targets: [String]
 
     var body: some View {
-        HStack(spacing: -6) {
-            ForEach(Array(targets.prefix(3).enumerated()), id: \.offset) { index, target in
+        HStack(spacing: Metric.rowGap) {
+            ForEach(Array(targets.prefix(3).enumerated()), id: \.offset) { _, target in
                 AppGlyph(
                     target: target,
-                    name: AppIcons.displayName(forTarget: target) ?? "",
-                    size: 18
+                    name: AppIcons.displayName(forTarget: target) ?? ""
                 )
-                .background(
-                    Circle().fill(.background).padding(-1.5)
-                )
-                .zIndex(Double(3 - index))
             }
         }
-        .frame(minWidth: 18)
         .accessibilityHidden(true)
-    }
-}
-
-/// A hairline that separates the panel's blocks without boxing them.
-private struct PanelDivider: View {
-    var body: some View {
-        Rectangle()
-            .fill(.separator)
-            .frame(height: 1)
-            .opacity(0.6)
-    }
-}
-
-/// A text-or-icon control that sits flat until hovered. The panel's footer
-/// needs four controls to be obvious without four separate pills.
-private struct QuietControlButtonStyle: ButtonStyle {
-    var iconOnly = false
-    @State private var hovering = false
-
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .font(.callout)
-            .labelStyle(.titleAndIcon)
-            .foregroundStyle(configuration.isPressed ? .primary : .secondary)
-            .padding(.horizontal, iconOnly ? Metric.tight : Metric.snug)
-            .frame(height: 28)
-            .frame(minWidth: iconOnly ? 28 : 0)
-            .background(
-                RoundedRectangle(cornerRadius: 7, style: .continuous)
-                    .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : (hovering ? 0.07 : 0)))
-            )
-            .contentShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
-            .scaleEffect(configuration.isPressed ? 0.96 : 1)
-            .animation(.easeOut(duration: 0.12), value: configuration.isPressed)
-            .animation(.easeOut(duration: 0.12), value: hovering)
-            .onHover { hovering = $0 }
-    }
-}
-
-private extension View {
-    /// Fades the last rows of a scrolling list so the cut-off reads as
-    /// "more below" instead of a clipped row.
-    @ViewBuilder
-    func scrollFade(enabled: Bool) -> some View {
-        if enabled {
-            mask(
-                VStack(spacing: 0) {
-                    Color.black
-                    LinearGradient(colors: [.black, .clear], startPoint: .top, endPoint: .bottom)
-                        .frame(height: 22)
-                }
-            )
-        } else {
-            self
-        }
     }
 }

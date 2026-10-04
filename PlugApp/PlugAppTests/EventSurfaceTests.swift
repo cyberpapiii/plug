@@ -11,8 +11,8 @@ final class EventSurfaceTests: XCTestCase {
             state: "watching", lastChecked: 1_000, lastChanged: 400, subscribers: 1
         ))
         XCTAssertEqual(event.source, "search_messages on gmail, every 5 minutes")
-        XCTAssertEqual(event.healthLine(now: 1_030), "Checked just now; last change 10 min ago.")
-        XCTAssertEqual(event.listenerLine, "1 client is listening")
+        XCTAssertEqual(event.healthLine(now: 1_030), "Checked just now. Last changed 10 min ago.")
+        XCTAssertEqual(event.listenerLine, "1 client")
         XCTAssertFalse(event.health.needsAttention)
         XCTAssertTrue(event.canRemove)
     }
@@ -20,7 +20,7 @@ final class EventSurfaceTests: XCTestCase {
     func testAWatchInTroubleSaysWhy() {
         let missing = EventFacts(EventStatus(name: "a.b", server: "a", tool: "t", state: "tool_missing"))
         XCTAssertTrue(missing.health.needsAttention)
-        XCTAssertEqual(missing.healthLine(now: 0), "The tool is not there right now. Is the server running?")
+        XCTAssertEqual(missing.healthLine(now: 0), "Plug cannot find this tool. Check that the server is running.")
         let failed = EventFacts(EventStatus(name: "a.b", server: "a", tool: "t", state: "call_failed", lastChecked: 0))
         XCTAssertEqual(failed.healthLine(now: 7_200), "The last check failed (2 hr ago). Plug keeps trying.")
         // A state this build has not heard of reads as a watch still waiting.
@@ -31,7 +31,7 @@ final class EventSurfaceTests: XCTestCase {
         let event = EventFacts(EventStatus(name: "slack.ditto_message", server: "slack"))
         XCTAssertFalse(event.canRemove)
         XCTAssertEqual(event.source, "Sent by slack")
-        XCTAssertEqual(event.listenerLine, "Nobody is listening")
+        XCTAssertEqual(event.listenerLine, "Nobody")
     }
 
     func testIntervalsAndAgesReadAsWords() {

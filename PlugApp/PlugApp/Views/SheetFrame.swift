@@ -1,13 +1,17 @@
 import SwiftUI
 
 /// The one frame every sheet in Plug uses: a title, a sentence under it, the
-/// content, and a footer that shows what went wrong beside Cancel and the one
-/// button that finishes the sheet.
+/// content, what went wrong, and a footer with Cancel and the one button that
+/// finishes the sheet. A sheet with nothing to confirm shows only Done.
+///
+/// The frame insets its header and footer and leaves the content's sides
+/// alone, so a grouped form in the content runs on its own margins. Content
+/// that is not a form adds `Metric.roomy` at its sides.
 ///
 /// Each sheet used to retype this, and they drifted: four widths, and an error
 /// that was orange in one sheet and missing in another.
 struct SheetFrame<Content: View, Extra: View>: View {
-    static var width: CGFloat { 520 }
+    static var width: CGFloat { Metric.sheetWidth }
 
     let title: String
     var subtitle: String?
@@ -21,7 +25,7 @@ struct SheetFrame<Content: View, Extra: View>: View {
     var confirmTitle: String?
     var confirmDisabled = false
     var confirm: () -> Void = {}
-    /// A quieter button left of Cancel, such as Back.
+    /// A quieter button at the leading edge of the footer, such as Back.
     @ViewBuilder var extra: Extra
     @ViewBuilder var content: Content
     @Environment(\.dismiss) private var dismiss
@@ -39,30 +43,43 @@ struct SheetFrame<Content: View, Extra: View>: View {
                         .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .padding(.horizontal, Metric.roomy)
 
             content
 
             if let failure {
                 ProblemNote(reason: failure)
+                    .padding(.horizontal, Metric.roomy)
             }
 
             HStack(spacing: Metric.snug) {
-                Spacer(minLength: 0)
                 extra
-                Button(cancelTitle) { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                    .disabled(busy)
+                Spacer(minLength: 0)
+                if busy {
+                    ProgressView().controlSize(.small)
+                }
                 if let confirmTitle {
+                    Button(cancelTitle) { dismiss() }
+                        .keyboardShortcut(.cancelAction)
+                        .disabled(busy)
                     Button(confirmTitle, action: confirm)
                         .buttonStyle(.borderedProminent)
                         .keyboardShortcut(.defaultAction)
                         .disabled(confirmDisabled || busy)
+                } else {
+                    Button("Done") { dismiss() }
+                        .keyboardShortcut(.defaultAction)
+                        .disabled(busy)
                 }
             }
+            .padding(.horizontal, Metric.roomy)
         }
-        .padding(Metric.roomy)
+        .padding(.vertical, Metric.roomy)
         .frame(width: Self.width)
         .interactiveDismissDisabled(busy)
+        .onExitCommand {
+            if confirmTitle == nil, !busy { dismiss() }
+        }
     }
 }
 

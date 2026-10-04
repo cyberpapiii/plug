@@ -30,7 +30,7 @@ enum ImportError: Error, LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .missingExecutable: "The bundled Plug service is missing."
+        case .missingExecutable: "Plug is damaged. Download it again and replace this copy."
         case let .failed(message): message
         }
     }
@@ -84,7 +84,7 @@ extension ImportScan {
     /// it can actually show and re-create.
     init(json data: Data) throws {
         guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ImportError.failed("Plug's answer could not be read.")
+            throw ImportError.failed("Plug gave an answer it could not read. Try again.")
         }
 
         var unreadable: [String] = []

@@ -44,9 +44,9 @@ enum AppLinkError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .serviceMissing: "The bundled Plug service is missing."
+        case .serviceMissing: "Plug is damaged. Download it again and replace this copy."
         case let .commandFailed(detail): detail
-        case .malformedOutput: "Plug returned a client list it could not read."
+        case .malformedOutput: "Plug gave an answer it could not read. Try again."
         }
     }
 }

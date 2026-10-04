@@ -54,11 +54,11 @@ final class NotificationService {
         center.delegate = responder
     }
 
-    func requestAuthorization() {
-        Task {
-            _ = try? await UNUserNotificationCenter.current()
-                .requestAuthorization(options: [.alert, .sound])
-        }
+    /// Asks macOS for permission. False when the person has said no, in which
+    /// case only System Settings can change it.
+    func requestAuthorization() async -> Bool {
+        (try? await UNUserNotificationCenter.current()
+            .requestAuthorization(options: [.alert, .sound])) ?? false
     }
 
     func observe(_ snapshot: OperatorSnapshot) {

@@ -11,6 +11,9 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
 
     var id: Self { self }
 
+    /// Plug itself, where a picture puts it between servers and clients.
+    static let plugSymbol = "bolt"
+
     var symbol: String {
         switch self {
         case .servers: "shippingbox"
@@ -57,66 +60,72 @@ struct RootView: View {
                     ActivityView(model: model, router: router, search: $search, run: run)
                 }
             }
-            .safeAreaInset(edge: .top, spacing: 0) {
-                if model.verdict.tone != .good {
-                    VStack(spacing: 0) {
-                        VerdictView(verdict: model.verdict, style: .compact, run: run)
-                            .padding(.horizontal, Metric.roomy)
-                            .padding(.vertical, Metric.snug)
-                        Divider()
-                    }
-                    .background(.bar)
-                    .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+            .topBanner(
+                isShown: showsBanner,
+                transition: reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity)
+            ) {
+                VerdictView(verdict: model.verdict, style: .compact, run: run)
+                    .padding(.horizontal, Metric.roomy)
+                    .padding(.vertical, Metric.snug)
+            }
+            .overlay(alignment: .bottom) {
+                // Any verdict: a press that failed while Plug is unwell still
+                // deserves its own sentence, and the verdict never says it.
+                if let error = model.actionError {
+                    ErrorToast(error: error) { run(.dismissActionError) }
+                        .id(error.id)
+                        .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: showsBanner)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actionError?.id)
             .navigationTitle(router.section.rawValue)
             .searchable(text: $search, placement: .toolbar, prompt: searchPrompt)
         }
-        .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.verdict)
         .onChange(of: router.section) {
             search = ""
         }
-        .sheet(isPresented: $router.isShowingGuide, onDismiss: { guideSeen = true }) {
-            GuideView(model: model) { intent in
-                router.isShowingGuide = false
-                guard let intent else { return }
-                // The window shows one sheet at a time, so the next one waits
-                // for this one to finish closing.
-                Task {
-                    try? await Task.sleep(for: .milliseconds(400))
-                    run(intent)
+        // The window shows one sheet at a time. Setting another replaces it.
+        .sheet(item: $router.sheet) { sheet in
+            switch sheet {
+            case .guide:
+                GuideView(model: model) { intent in
+                    guideSeen = true
+                    if let intent { run(intent) }
+                    // An intent that opens a sheet has already replaced the guide.
+                    if router.sheet == .guide { router.sheet = nil }
                 }
+            case .addServer:
+                AddServerView(model: model, router: router)
+            case .importServers:
+                ImportServersView(model: model, router: router)
+            case .addWatch:
+                AddWatchView(model: model)
+            case let .editServer(name):
+                EditServerView(model: model, name: name)
+            case let .addAccount(server):
+                AddAccountView(model: model, router: router, server: server)
             }
         }
-        .sheet(isPresented: $router.isAddingServer) {
-            AddServerView(model: model)
-        }
-        .sheet(isPresented: $router.isImportingServers) {
-            ImportServersView(model: model)
-        }
-        .sheet(item: $router.editingServer) { target in
-            EditServerView(model: model, name: target.id)
-        }
-        .sheet(item: $router.addingAccountTo) { target in
-            AddAccountView(model: model, router: router, server: target.id)
-        }
-        .sheet(isPresented: $router.isAddingWatch) {
-            AddWatchView(model: model)
+        .onChange(of: router.sheet) { old, _ in
+            // However the guide was closed, it has been seen.
+            if old == .guide { guideSeen = true }
         }
         .onChange(of: guideOpensByItself, initial: true) {
-            if guideOpensByItself { router.isShowingGuide = true }
+            if guideOpensByItself, router.sheet == nil { router.sheet = .guide }
         }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
-        .overlay(alignment: .bottom) {
-            // Any verdict: a press that failed while Plug is unwell still
-            // deserves its own sentence, and the verdict never says it.
-            if let error = model.actionError {
-                ErrorToast(error: error) { run(.dismissActionError) }
-                    .id(error.id)
-                    .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
-            }
-        }
+    }
+
+    /// The banner keeps quiet while the page itself is saying the same thing:
+    /// a page that is loading or unavailable shows the verdict, and an empty
+    /// page already offers Add Server.
+    private var showsBanner: Bool {
+        if model.isLoadingInitialData || model.initialDataUnavailable { return false }
+        let verdict = model.verdict
+        if verdict.tone == .good || verdict.tone == .busy { return false }
+        return verdict.primary?.intent != .addServer
     }
 
     /// The sidebar always has one section selected.
@@ -141,10 +150,51 @@ struct RootView: View {
     /// Tools are searched from Servers, so its field says so.
     private var searchPrompt: String {
         switch router.section {
-        case .servers: "Servers and tools"
+        case .servers: "Search servers and tools"
         case .clients: "Search clients"
         case .events: "Search events"
         case .activity: "Search activity"
+        }
+    }
+}
+
+private extension View {
+    /// The verdict banner above a section. On macOS 26 it is a safe area bar,
+    /// so the toolbar's scroll edge effect carries on under it; before that it
+    /// is an inset on the bar material with its own divider.
+    @ViewBuilder
+    func topBanner<Banner: View>(
+        isShown: Bool,
+        transition: AnyTransition,
+        @ViewBuilder _ banner: () -> Banner
+    ) -> some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            safeAreaBar(edge: .top, spacing: 0) {
+                if isShown { banner().transition(transition) }
+            }
+        } else {
+            legacyTopBanner(isShown: isShown, transition: transition, banner)
+        }
+#else
+        legacyTopBanner(isShown: isShown, transition: transition, banner)
+#endif
+    }
+
+    func legacyTopBanner<Banner: View>(
+        isShown: Bool,
+        transition: AnyTransition,
+        @ViewBuilder _ banner: () -> Banner
+    ) -> some View {
+        safeAreaInset(edge: .top, spacing: 0) {
+            if isShown {
+                VStack(spacing: 0) {
+                    banner()
+                    Divider()
+                }
+                .background(.bar)
+                .transition(transition)
+            }
         }
     }
 }

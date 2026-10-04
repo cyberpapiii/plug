@@ -62,24 +62,35 @@ struct EventFacts: Identifiable, Equatable, Sendable {
 
     var listenerLine: String {
         switch listeners {
-        case 0: "Nobody is listening"
-        case 1: "1 client is listening"
-        default: "\(listeners) clients are listening"
+        case 0: "Nobody"
+        case 1: "1 client"
+        default: "\(listeners) clients"
         }
     }
 
-    /// One plain sentence for how the watch is doing. The same words the
-    /// command line uses.
+    /// How the watch is doing, in a word or two for a row.
+    var stateWord: String {
+        guard tool != nil else { return "Sent by \(server)" }
+        switch health {
+        case .watching: return "Watching"
+        case .waiting: return "Waiting for the first check"
+        case .toolMissing, .notReadOnly, .callFailed, .tooLarge: return "Needs attention"
+        }
+    }
+
+    /// One plain sentence for how the watch is doing.
     func healthLine(now: UInt64) -> String {
         switch health {
         case .waiting:
             "Waiting for the first check."
         case .watching:
-            "Checked \(Self.ago(lastChecked, now: now)); last change \(Self.ago(lastChanged, now: now))."
+            lastChanged == nil
+                ? "Checked \(Self.ago(lastChecked, now: now)). No change yet."
+                : "Checked \(Self.ago(lastChecked, now: now)). Last changed \(Self.ago(lastChanged, now: now))."
         case .toolMissing:
-            "The tool is not there right now. Is the server running?"
+            "Plug cannot find this tool. Check that the server is running."
         case .notReadOnly:
-            "Not watched: the tool is not marked read-only."
+            "Not watching. This tool can change things."
         case .callFailed:
             "The last check failed (\(Self.ago(lastChecked, now: now))). Plug keeps trying."
         case .tooLarge:
@@ -146,4 +157,10 @@ struct WatchDraft: Equatable, Sendable {
         else { return .failure(.notAnObject) }
         return .success(values)
     }
+}
+
+extension String {
+    /// A sentence fragment such as "every 5 minutes", made fit to stand alone
+    /// as a value.
+    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }

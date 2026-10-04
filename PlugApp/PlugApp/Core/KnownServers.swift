@@ -31,7 +31,7 @@ struct KnownServer: Equatable, Sendable, Identifiable {
                 DraftFact(label: "Connects to", value: address),
                 DraftFact(
                     label: "Sign-in",
-                    value: needsSignIn ? "Plug asks you to sign in after you add it" : "None needed"
+                    value: needsSignIn ? "Required" : "Not needed"
                 ),
             ]
         )

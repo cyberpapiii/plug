@@ -9,6 +9,7 @@ import SwiftUI
 /// can be read and corrected before it is saved.
 struct AddServerView: View {
     let model: AppModel
+    let router: Router
     @Environment(\.dismiss) private var dismiss
     @State private var pasted = ""
     @State private var name = ""
@@ -23,7 +24,10 @@ struct AddServerView: View {
     @State private var choice: APIOperationChoice?
     @State private var choiceFailure: String?
     @State private var showsOperations = false
-    @FocusState private var pasteFocused: Bool
+
+    /// The room kept under the paste box for the line about it, so the sheet
+    /// does not jump when the line appears.
+    private static let understoodHeight: CGFloat = 32
 
     var body: some View {
         if form != nil {
@@ -37,63 +41,56 @@ struct AddServerView: View {
 
     private var choose: some View {
         SheetFrame(
-            title: "Add a server",
-            subtitle: "Pick one, or paste what the server's instructions give you.",
+            title: "Add Server",
+            subtitle: known.isEmpty
+                ? "Paste what the server's instructions give you."
+                : "Pick one, or paste what the server's instructions give you.",
             confirmTitle: "Continue",
             confirmDisabled: draft == nil,
             confirm: { if let draft { start(draft) } }
         ) {
-            if !known.isEmpty {
-                VStack(alignment: .leading, spacing: Metric.tight) {
-                    SectionLabel(text: "Popular servers")
-                    LazyVGrid(
-                        columns: [GridItem(.flexible(), spacing: Metric.tight), GridItem(.flexible())],
-                        spacing: Metric.tight
-                    ) {
-                        ForEach(known) { server in
-                            Button { start(server.draft) } label: {
-                                VStack(alignment: .leading, spacing: 1) {
-                                    Text(server.title).font(.callout.weight(.medium))
-                                    Text(server.summary)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                        .lineLimit(1)
+            Group {
+                if !known.isEmpty {
+                    VStack(alignment: .leading, spacing: Metric.tight) {
+                        SectionLabel(text: "Popular Servers")
+                        LazyVGrid(
+                            columns: [GridItem(.flexible(), spacing: Metric.tight), GridItem(.flexible())],
+                            spacing: Metric.tight
+                        ) {
+                            ForEach(known) { server in
+                                Button { start(server.draft) } label: {
+                                    VStack(alignment: .leading, spacing: Metric.hairline) {
+                                        Text(server.title).font(.body)
+                                        Text(server.summary)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                            .lineLimit(1)
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .padding(.horizontal, Metric.snug)
-                                .padding(.vertical, Metric.tight)
-                                .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 7))
-                                .contentShape(Rectangle())
+                                .buttonStyle(.bordered)
+                                .controlSize(.large)
+                                .buttonBorderShape(.roundedRectangle(radius: Metric.corner))
                             }
-                            .buttonStyle(.plain)
-                            .hoverHighlight()
-                            .accessibilityLabel("\(server.title), \(server.summary)")
                         }
                     }
                 }
-            }
 
-            VStack(alignment: .leading, spacing: Metric.tight) {
-                SectionLabel(text: known.isEmpty ? "Paste" : "Or paste")
-                TextEditor(text: $pasted)
-                    .font(.system(.callout, design: .monospaced))
-                    .scrollContentBackground(.hidden)
-                    .padding(Metric.snug)
-                    .frame(height: 96)
-                    .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Metric.corner))
-                    .overlay(alignment: .topLeading) {
-                        if pasted.isEmpty {
-                            Text("A setup block, a command, a web address, or the address of an API's OpenAPI document")
-                                .font(.callout)
-                                .foregroundStyle(.tertiary)
-                                .padding(Metric.snug + 4)
-                                .allowsHitTesting(false)
-                        }
-                    }
-                    .focused($pasteFocused)
-                    .accessibilityLabel("Paste a server")
-                understood
+                VStack(alignment: .leading, spacing: Metric.tight) {
+                    SectionLabel(text: known.isEmpty ? "Paste" : "Or Paste")
+                    TextField(
+                        "Paste a server",
+                        text: $pasted,
+                        prompt: Text("A setup block, a command, or a web address"),
+                        axis: .vertical
+                    )
+                    .lineLimit(4...4)
+                    .font(.body.monospaced())
+                    understood
+                        .frame(maxWidth: .infinity, minHeight: Self.understoodHeight, alignment: .topLeading)
+                }
             }
+            .padding(.horizontal, Metric.roomy)
         }
         .onChange(of: pasted) { _, _ in addressIsAPI = nil }
     }
@@ -102,27 +99,34 @@ struct AddServerView: View {
     @ViewBuilder private var understood: some View {
         switch parse {
         case .empty:
-            EmptyView()
+            Color.clear
         case let .unreadable(reason):
-            Label(reason, systemImage: "questionmark.circle")
+            InlineWarning(reason)
                 .font(.callout)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         case let .draft(draft):
             if draft.fromAddress {
                 Picker("This address is", selection: Binding(
                     get: { draft.config.transport == "openapi" },
                     set: { addressIsAPI = $0 }
                 )) {
-                    Text("A server").tag(false)
-                    Text("An API's OpenAPI document").tag(true)
+                    Text("A Server").tag(false)
+                    Text("A Web API").tag(true)
                 }
                 .pickerStyle(.segmented)
-                .font(.callout)
             } else {
-                Label("Plug can read this. Continue to check it.", systemImage: "checkmark.circle")
-                    .font(.callout)
+                Label {
+                    Text(
+                        draft.name.isEmpty
+                            ? "Plug read this. Continue to name it and check it."
+                            : "Plug read this as \(draft.name). Continue to check it."
+                    )
                     .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                } icon: {
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                }
+                .font(.callout)
             }
         }
     }
@@ -151,13 +155,13 @@ struct AddServerView: View {
     @ViewBuilder private var details: some View {
         if let form {
             SheetFrame(
-                title: "Add a server",
+                title: "Add Server",
                 subtitle: form.base.auth == "oauth"
                     ? "Plug asks you to sign in after you add it."
                     : "Check what Plug understood, then add it.",
                 failure: failure,
                 busy: saving,
-                confirmTitle: saving ? "Adding…" : "Add Server",
+                confirmTitle: "Add",
                 confirmDisabled: !form.isComplete || trimmedName.isEmpty || choice?.problem != nil,
                 confirm: add,
                 extra: {
@@ -168,16 +172,15 @@ struct AddServerView: View {
                     .disabled(saving)
                 }
             ) {
-                HStack(spacing: Metric.snug) {
-                    Text("Name").font(.callout).foregroundStyle(.secondary)
-                    TextField("Name", text: $name)
-                        .textFieldStyle(.roundedBorder)
+                ServerFormFields(
+                    form: Binding(
+                        get: { self.form ?? form },
+                        set: { self.form = $0 }
+                    ),
+                    name: $name
+                ) {
+                    operations
                 }
-                ServerFormFields(form: Binding(
-                    get: { self.form ?? form },
-                    set: { self.form = $0 }
-                ))
-                operations
             }
             .task(id: apiSpec) { await readOperations() }
         }
@@ -207,61 +210,59 @@ struct AddServerView: View {
         }
     }
 
+    /// The form's last section when the server is an API: which of its
+    /// operations become tools.
     @ViewBuilder private var operations: some View {
-        if let choice {
-            DisclosureGroup(isExpanded: $showsOperations) {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: Metric.hairline) {
-                        ForEach(choice.groups, id: \.tag) { group in
-                            Text(group.tag)
-                                .font(.caption.weight(.semibold))
-                                .foregroundStyle(.secondary)
-                                .padding(.top, Metric.hairline)
-                            ForEach(group.operations) { operation in
-                                Toggle(isOn: Binding(
-                                    get: { choice.chosen.contains(operation.name) },
-                                    set: { on in
-                                        if on {
-                                            self.choice?.chosen.insert(operation.name)
-                                        } else {
-                                            self.choice?.chosen.remove(operation.name)
+        if apiSpec != nil {
+            Section {
+                if let choice {
+                    DisclosureGroup(isExpanded: $showsOperations) {
+                        VStack(alignment: .leading, spacing: Metric.rowGap) {
+                            ForEach(choice.groups, id: \.tag) { group in
+                                Text(group.tag)
+                                    .font(.caption.weight(.semibold))
+                                    .foregroundStyle(.secondary)
+                                    .padding(.top, Metric.hairline)
+                                ForEach(group.operations) { operation in
+                                    Toggle(isOn: Binding(
+                                        get: { choice.chosen.contains(operation.name) },
+                                        set: { on in
+                                            if on {
+                                                self.choice?.chosen.insert(operation.name)
+                                            } else {
+                                                self.choice?.chosen.remove(operation.name)
+                                            }
                                         }
+                                    )) {
+                                        Text(operation.name).font(.callout)
+                                            + Text("  \(operation.method) \(operation.path)")
+                                            .font(.callout)
+                                            .foregroundStyle(.secondary)
                                     }
-                                )) {
-                                    Text(operation.name).font(.caption.monospaced())
-                                        + Text("  \(operation.method) \(operation.path)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                                    .toggleStyle(.checkbox)
+                                    .lineLimit(1)
+                                    .truncationMode(.middle)
+                                    .help(operation.summary)
+                                    .accessibilityLabel("\(operation.name), \(operation.method) \(operation.path)")
                                 }
-                                .toggleStyle(.checkbox)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
-                                .help(operation.summary)
-                                .accessibilityLabel("\(operation.name), \(operation.method) \(operation.path)")
                             }
                         }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    } label: {
+                        Text("\(choice.chosen.count) of \(choice.api.operations.count) operations")
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                } else if let choiceFailure {
+                    InlineWarning(choiceFailure)
+                        .font(.callout)
+                } else {
+                    SheetLoading(label: "Reading the document", height: Self.understoodHeight)
                 }
-                .frame(maxHeight: 160)
-            } label: {
-                HStack(spacing: Metric.snug) {
-                    Text("\(choice.chosen.count) of \(choice.api.operations.count) operations")
-                        .font(.caption)
-                    if let problem = choice.problem {
-                        Text(problem).font(.caption).foregroundStyle(.orange)
-                    }
+            } header: {
+                Text("Tools")
+            } footer: {
+                if let problem = choice?.problem {
+                    InlineWarning(problem)
                 }
-            }
-        } else if let choiceFailure {
-            Label(choiceFailure, systemImage: "exclamationmark.triangle")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .lineLimit(2)
-        } else if apiSpec != nil {
-            HStack(spacing: Metric.snug) {
-                ProgressView().controlSize(.small)
-                Text("Reading the document…").font(.caption).foregroundStyle(.secondary)
             }
         }
     }
@@ -290,6 +291,7 @@ struct AddServerView: View {
                     .addServer(authToken: $0, name: finalName, server: saved)
                 }
                 saving = false
+                router.reveal(server: finalName)
                 dismiss()
             } catch {
                 failure = error.localizedDescription

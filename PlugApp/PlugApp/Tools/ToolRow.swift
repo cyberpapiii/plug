@@ -10,47 +10,41 @@ struct ToolRow: View {
 
     var body: some View {
         HStack(spacing: Metric.snug) {
-            Button(action: onSelect) {
-                VStack(alignment: .leading, spacing: 1) {
-                    Text(tool.shortName)
-                        .font(.callout.monospaced())
-                        .foregroundStyle(tool.isOn ? .primary : .secondary)
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(tool.shortName)
+                    .font(.body)
+                    .foregroundStyle(tool.isOn ? .primary : .secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let summary = tool.summary, !summary.isEmpty {
+                    Text(summary)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let summary = tool.summary, !summary.isEmpty {
-                        Text(summary)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(1)
-                            .truncationMode(.tail)
-                    }
+                        .truncationMode(.tail)
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
-            .accessibilityLabel("Show details for \(tool.shortName)")
+            .frame(maxWidth: .infinity, alignment: .leading)
+            Button(action: onSelect) {
+                Label("Show Details", systemImage: "info.circle")
+            }
+            .labelStyle(.iconOnly)
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Show Details")
             trailing
         }
-        .help(tool.summary ?? tool.name)
         .accessibilityElement(children: .contain)
     }
 
+    /// The switch stays in place while a change is under way, so the row does
+    /// not shift.
     @ViewBuilder private var trailing: some View {
-        if isBusy {
-            ProgressView()
-                .controlSize(.mini)
-                .frame(width: 28)
-                .accessibilityLabel("Updating \(tool.shortName)")
-        } else if !canManage {
-            Text(tool.isOn ? "On" : "Off")
+        if let pattern = tool.lockedByPattern {
+            Label("Off by Rule", systemImage: "lock.fill")
                 .font(.callout)
                 .foregroundStyle(.secondary)
-        } else if let pattern = tool.lockedByPattern {
-            Label("Off by rule", systemImage: "lock.fill")
-                .font(.callout)
-                .foregroundStyle(.secondary)
-                .help("The pattern \(pattern) covers this tool. Remove it to switch this tool back on.")
+                .help("A rule in the settings file (\(pattern)) keeps this tool off. Remove the rule to turn it back on.")
         } else {
             Toggle(
                 "On",
@@ -61,7 +55,8 @@ struct ToolRow: View {
             )
             .labelsHidden()
             .toggleStyle(.switch)
-            .controlSize(.small)
+            .controlSize(.mini)
+            .disabled(isBusy || !canManage)
             .accessibilityLabel(tool.shortName)
         }
     }

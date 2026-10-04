@@ -73,12 +73,12 @@ enum AppIcons {
         // The installed Codex app supplies the official artwork; this is the
         // stable system fallback when that app is absent.
         if key == "codex" || key == "codex-cli" || text.contains("codex") {
-            return "app.dashed"
+            return "app"
         }
         // Goose is optional and often CLI-only. A bird is clearer than a
         // terminal glyph while still remaining a system-provided fallback.
         if key == "goose" || text.contains("goose") {
-            return "bird.fill"
+            return "bird"
         }
         if commandLineTargets.contains(key) || text.contains("cli") { return "terminal" }
         // An agent reached by text message has no app to show.
@@ -87,7 +87,7 @@ enum AppIcons {
         if text.contains("code") || text.contains("cursor") || text.contains("zed") {
             return "chevron.left.forwardslash.chevron.right"
         }
-        return "app.dashed"
+        return "app"
     }
 
     /// The app's real icon, when this Mac has the app.
@@ -195,7 +195,7 @@ struct AppGlyph: View {
     let name: String
     /// The app bundle behind a client with no entry of its own.
     var appPath: String? = nil
-    var size: CGFloat = 22
+    var size: CGFloat = 18
 
     var body: some View {
         Group {
@@ -205,9 +205,8 @@ struct AppGlyph: View {
                     .interpolation(.high)
             } else {
                 Image(systemName: AppIcons.symbol(target: target, name: name))
-                    .font(.system(size: size * 0.62))
+                    .font(size > 24 ? .title2 : .body)
                     .foregroundStyle(.secondary)
-                    .frame(width: size, height: size)
             }
         }
         .frame(width: size, height: size)

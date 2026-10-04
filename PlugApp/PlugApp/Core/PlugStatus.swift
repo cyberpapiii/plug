@@ -46,7 +46,7 @@ enum ServerHealth: Equatable, Sendable {
         case .down: "Down"
         case .notLoaded: "Not loaded"
         case .off: "Off"
-        case .unknown: "Unknown"
+        case .unknown: "Not responding"
         }
     }
 
@@ -101,24 +101,6 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         self.authWarnings = authWarnings
     }
 
-    /// Where the server runs, as a picture. A person recognizes the difference
-    /// between "on this Mac" and "somewhere on the internet" faster from a
-    /// screen and a globe than from either sentence.
-    var transportSymbol: String {
-        switch transport.lowercased() {
-        case "stdio": "desktopcomputer"
-        case "http", "sse", "streamable_http", "openapi": "globe"
-        default: "questionmark.square.dashed"
-        }
-    }
-
-    /// What the row's second line is about, so the icon matches the words.
-    var subtitleSymbol: String {
-        if health.needsAttention, let error, !error.isEmpty { return "exclamationmark.triangle" }
-        if !enabled { return "circle.slash" }
-        return transportSymbol
-    }
-
     /// The one button that fixes this server, or nil when nothing needs
     /// fixing. Every surface that offers a fix asks this, so the verb never
     /// differs between them. A sign-in already open offers Try Again, because
@@ -128,7 +110,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         switch health {
         case .signInNeeded: .init(isSigningIn ? "Try Again" : "Sign In", .signIn(server: name))
         case .down, .unknown: .init("Restart", .restartServer(name))
-        case .notLoaded: .init("Load It", .reloadConfiguration)
+        case .notLoaded: .init("Reload", .reloadConfiguration)
         case .working, .starting, .off: nil
         }
     }
@@ -136,8 +118,8 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     /// What is wrong, for a server whose fix is not a sign-in.
     var problem: String {
         health == .notLoaded
-            ? "Plug has not loaded this server yet. It is in the settings file but not running."
-            : "Plug couldn't reach this server."
+            ? "This server is in the settings file, but Plug has not loaded it yet."
+            : "Plug could not reach this server."
     }
 
     /// Stops a sign-in that is open in the browser.
@@ -153,7 +135,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         switch transport.lowercased() {
         case "stdio": "On this Mac"
         case "http", "sse", "streamable_http": "Over the network"
-        case "openapi": "HTTP API"
+        case "openapi": "Web API"
         default: transport.capitalized
         }
     }
@@ -219,10 +201,10 @@ struct PlugSituation: Equatable, Sendable {
     /// the ones that are off.
     var listedServers: [ServerFacts] { activeServers + servers.filter { !$0.enabled } }
 
-    /// The one count line the window and the menu bar panel both show, so
-    /// they cannot disagree. Rows read before the daemon went away say so.
+    /// The count line under the Servers title. Rows read before the daemon
+    /// went away say so.
     func countsSummary(stale: Bool) -> String {
-        let count = servers.count
+        let count = activeServers.count
         let tools = totalTools
         let summary = "\(count) \(count == 1 ? "server" : "servers") · \(tools) \(tools == 1 ? "tool" : "tools")"
         return stale ? "Last known · \(summary)" : summary
@@ -359,15 +341,15 @@ enum PlugVerdict {
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.badge.checkmark",
-                title: "Background running is off",
-                detail: "Plug serves connected clients only while it runs in the background.",
-                primary: .init("Turn On", .allowBackgroundRunning)
+                title: "Plug needs permission to run in the background",
+                detail: "Without it, your clients cannot reach any servers.",
+                primary: .init("Allow", .allowBackgroundRunning)
             )
         case let .needsRepair(detail):
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.trianglebadge.exclamationmark",
-                title: "Plug needs a repair",
+                title: "Plug needs repair",
                 detail: detail,
                 primary: .init("Repair", .repairInstallation)
             )
@@ -378,7 +360,7 @@ enum PlugVerdict {
                 title: "Setup incomplete",
                 detail: detail,
                 primary: .init("Try Again", .repairInstallation),
-                secondary: hasLog ? .init("Show Log", .showRepairLog) : nil
+                secondary: hasLog ? .init("Show Logs", .showRepairLog) : nil
             )
         }
     }
@@ -399,7 +381,7 @@ enum PlugVerdict {
                 tone: .busy,
                 symbol: "bolt.horizontal.circle",
                 title: "Reconnecting…",
-                detail: "Waiting for the background service."
+                detail: "Waiting for Plug to start."
             )
         case .restarting:
             return Verdict(
@@ -413,23 +395,23 @@ enum PlugVerdict {
                 tone: .blocked,
                 symbol: "bolt.slash",
                 title: "Plug is not running",
-                detail: "Plug is on but stopped. Connected clients cannot reach any servers.",
+                detail: "Your clients cannot reach any servers until Plug starts.",
                 primary: .init("Start Plug", .reconnect),
-                secondary: .init("Checkup", .checkup)
+                secondary: .init("Run Checkup", .checkup)
             )
         case .off:
             return Verdict(
                 tone: .quiet,
                 symbol: "bolt.slash",
                 title: "Plug is off",
-                detail: "Turn on to make tools available to your clients.",
+                detail: "Turn Plug on to make tools available to your clients.",
                 primary: .init("Turn On", .setServiceEnabled(true))
             )
         case .versionMismatch:
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.badge.clock",
-                title: "Restart required to finish update",
+                title: "Restart Plug to finish updating",
                 detail: "The new version is installed.",
                 primary: .init("Restart Plug", .reconnect)
             )
@@ -446,7 +428,7 @@ enum PlugVerdict {
                 symbol: "bolt.horizontal.circle",
                 title: "No servers yet",
                 detail: "Add a server to make tools available.",
-                primary: .init("Add Server", .addServer)
+                primary: .init("Add Server…", .addServer)
             )
         }
 
@@ -458,7 +440,7 @@ enum PlugVerdict {
                     symbol: "bolt.badge.checkmark",
                     title: "\(only.name) needs sign-in",
                     detail: only.isSigningIn
-                        ? "Sign-in is open in the browser."
+                        ? "Finish signing in with your browser."
                         : "All other servers are running.",
                     primary: only.fix,
                     secondary: only.cancelSignIn
@@ -486,7 +468,7 @@ enum PlugVerdict {
                 symbol: "bolt.trianglebadge.exclamationmark",
                 title: "\(troubled.count) servers need attention",
                 detail: detail,
-                secondary: .init("Checkup", .checkup)
+                secondary: .init("Run Checkup", .checkup)
             )
         }
 

@@ -83,8 +83,8 @@ enum CheckupError: LocalizedError, Equatable {
 
     var errorDescription: String? {
         switch self {
-        case .serviceMissing: "The bundled Plug service is missing."
-        case .unreadable: "Plug returned a checkup it could not read."
+        case .serviceMissing: "Plug is damaged. Download it again and replace this copy."
+        case .unreadable: "Plug gave an answer it could not read. Try again."
         }
     }
 }

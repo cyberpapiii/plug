@@ -27,48 +27,45 @@ struct AddAccountView: View {
 
     var body: some View {
         SheetFrame(
-            title: "Add another account",
-            subtitle: "Plug adds \(server) a second time under its own name. Both accounts stay available, each with its own tools.",
+            title: "Add Another Account",
+            subtitle: "Plug adds \(server) again under its own name.",
             failure: failure,
             busy: saving,
-            confirmTitle: saving ? "Adding…" : "Add Account",
+            confirmTitle: "Add",
             confirmDisabled: !canSave,
             confirm: add
         ) {
-            VStack(alignment: .leading, spacing: Metric.rowGap) {
-                TextField("Account name, like personal or work", text: $typed)
-                    .textFieldStyle(.roundedBorder)
-                    .onSubmit { if canSave { add() } }
-                Text(hint)
-                    .font(.caption)
-                    .foregroundStyle(hintIsWarning ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
-                    .fixedSize(horizontal: false, vertical: true)
+            Form {
+                Section {
+                    TextField("Account", text: $typed, prompt: Text("work"))
+                } footer: {
+                    hint
+                }
             }
-
-            Label(
-                usesOAuth
-                    ? "The new server starts signed out. Sign in with the other account."
-                    : "The new server starts with the same credentials. Edit it to use the other account.",
-                systemImage: "person.2"
-            )
-            .font(.callout)
-            .foregroundStyle(.secondary)
-            .fixedSize(horizontal: false, vertical: true)
+            .formStyle(.grouped)
         }
     }
 
     private var canSave: Bool { label != nil && !taken && !saving }
 
-    private var hintIsWarning: Bool { taken || (label == nil && !typed.isEmpty) }
-
-    private var hint: String {
-        guard let label else {
-            return typed.isEmpty
-                ? "Lowercase letters and digits."
-                : "Use lowercase letters and digits, starting with a letter, at most \(AccountDraft.longest)."
+    /// What the new server will be called, or why the name will not do.
+    @ViewBuilder private var hint: some View {
+        if let label {
+            let name = AccountDraft.serverName(server: server, label: label)
+            if taken {
+                InlineWarning("\(name) already exists.")
+            } else {
+                Text(
+                    usesOAuth
+                        ? "The new server is named \(name). It starts signed out."
+                        : "The new server is named \(name). It starts with the same key; edit it to use the other account."
+                )
+            }
+        } else if typed.isEmpty {
+            Text("Lowercase letters and digits.")
+        } else {
+            InlineWarning("Use lowercase letters and digits, starting with a letter, at most \(AccountDraft.longest).")
         }
-        let name = AccountDraft.serverName(server: server, label: label)
-        return taken ? "\(name) already exists." : "The new server is named \(name)."
     }
 
     private func add() {

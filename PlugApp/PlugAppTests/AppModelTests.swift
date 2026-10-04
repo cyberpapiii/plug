@@ -484,7 +484,7 @@ final class AppModelTests: XCTestCase {
 
         XCTAssertTrue(events.values.contains("coordinator.retry"))
         XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertEqual(model.verdict.title, "Restart required to finish update")
+        XCTAssertEqual(model.verdict.title, "Restart Plug to finish updating")
     }
 
     @MainActor

@@ -11,7 +11,8 @@ struct ServerDetailView: View {
     let query: String
     @Bindable var router: Router
     let run: (PlugIntent) -> Void
-    @State private var confirmRemoval = false
+    /// Asks the list to confirm removing this server; the list owns the question.
+    let onRemove: () -> Void
     @State private var confirmSignOut = false
     @State private var showsOffOnly = false
 
@@ -20,17 +21,19 @@ struct ServerDetailView: View {
             Section {
                 header
                 if server.health == .signInNeeded {
-                    signInCard
+                    signInNote
                 } else if let fix = server.fix {
-                    problemCard(fix)
+                    ProblemNote(
+                        title: server.problem,
+                        reason: server.error,
+                        actionTitle: fix.title,
+                        action: { run(fix.intent) }
+                    )
                 }
             }
             details
             if !recentCalls.isEmpty { recent }
             tools
-        }
-        .onChange(of: offCount) { _, count in
-            if count == 0 { showsOffOnly = false }
         }
         .confirmationDialog(
             "Sign out of \(server.name)?",
@@ -38,19 +41,9 @@ struct ServerDetailView: View {
             titleVisibility: .visible
         ) {
             Button("Sign Out", role: .destructive) { run(.signOut(server: server.name)) }
-            Button("Cancel", role: .cancel) { }
+            Button("Cancel", role: .cancel) {}
         } message: {
             Text("Plug forgets the stored account. The server stops working until you sign in again.")
-        }
-        .confirmationDialog(
-            "Remove \(server.name)?",
-            isPresented: $confirmRemoval,
-            titleVisibility: .visible
-        ) {
-            Button("Remove Server", role: .destructive) { run(.removeServer(server.name)) }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("Clients connected to Plug will stop seeing its tools. Your settings file keeps everything else.")
         }
     }
 
@@ -58,30 +51,27 @@ struct ServerDetailView: View {
 
     private var header: some View {
         DetailHeader(title: server.name, subtitle: statusLine) {
-            StatusGlyph(health: server.health, size: .title2)
+            StatusGlyph(health: server.health, large: true)
         } controls: {
-            ControlGroup {
+            Button("Edit…") { run(.editServer(server.name)) }
+            Menu {
                 if server.enabled {
                     Button("Restart") { run(.restartServer(server.name)) }
+                    Divider()
                 }
-                Button("Edit…") { run(.editServer(server.name)) }
-            }
-            .fixedSize()
-            Menu {
                 Button("Add Another Account…") { run(.addAccount(server: server.name)) }
                 if server.usesOAuth, server.health != .signInNeeded {
                     Button("Sign Out…") { confirmSignOut = true }
                 }
                 Divider()
-                Button("Remove Server…", role: .destructive) { confirmRemoval = true }
+                Button("Remove Server…", role: .destructive, action: onRemove)
             } label: {
-                Image(systemName: "ellipsis.circle")
+                Label("More", systemImage: "ellipsis")
             }
-            .menuStyle(.borderlessButton)
+            .labelStyle(.iconOnly)
             .menuIndicator(.hidden)
             .fixedSize()
             .help("More")
-            .accessibilityLabel("More")
             Toggle(
                 "On",
                 isOn: Binding(
@@ -92,7 +82,7 @@ struct ServerDetailView: View {
             .labelsHidden()
             .toggleStyle(.switch)
             .help(server.enabled ? "Turn off \(server.name)" : "Turn on \(server.name)")
-            .accessibilityLabel("\(server.name) on")
+            .accessibilityLabel(server.name)
         }
         .disabled(!model.canMutate)
     }
@@ -106,78 +96,52 @@ struct ServerDetailView: View {
 
     // MARK: - Problem
 
-    private var signInCard: some View {
-        VStack(alignment: .leading, spacing: Metric.snug) {
-            Label("This server needs you to sign in to your account.", systemImage: "exclamationmark.triangle.fill")
-                .symbolRenderingMode(.multicolor)
-                .font(.callout.weight(.medium))
-            if server.isSigningIn {
-                HStack(spacing: Metric.tight) {
-                    ProgressView().controlSize(.small)
-                    Text("Finish signing in in your browser.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+    @ViewBuilder private var signInNote: some View {
+        if server.isSigningIn {
+            VStack(alignment: .leading, spacing: Metric.snug) {
+                ProblemNote(title: "Finish signing in with your browser.")
                 HStack(spacing: Metric.tight) {
                     Button("Try Again") { run(.signIn(server: server.name)) }
                     Button("Cancel") { run(.cancelSignIn(server: server.name)) }
                 }
-                .controlSize(.small)
-            } else {
-                Button("Sign In") { run(.signIn(server: server.name)) }
-                    .buttonStyle(.borderedProminent)
             }
+        } else {
+            ProblemNote(
+                title: "Sign in to your account to use this server.",
+                actionTitle: "Sign In",
+                action: { run(.signIn(server: server.name)) }
+            )
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, Metric.rowGap)
-    }
-
-    private func problemCard(_ button: Verdict.Button) -> some View {
-        VStack(alignment: .leading, spacing: Metric.snug) {
-            Label(server.problem, systemImage: "exclamationmark.triangle.fill")
-                .symbolRenderingMode(.multicolor)
-                .font(.callout.weight(.medium))
-            if let error = server.error, !error.isEmpty {
-                Text(error)
-                    .font(.caption.monospaced())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(6)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            Button(button.title) { run(button.intent) }
-                .buttonStyle(.borderedProminent)
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.vertical, Metric.rowGap)
     }
 
     // MARK: - Details
 
     private var details: some View {
         Section("Details") {
-            LabeledContent("Kind", value: server.transportLabel)
-            if server.usesOAuth {
+            LabeledContent("Runs", value: server.transportLabel)
+            if server.usesOAuth, server.health != .signInNeeded {
                 LabeledContent("Account", value: accountLabel)
             }
             ForEach(server.authWarnings, id: \.self) { warning in
-                Label(warning, systemImage: "exclamationmark.circle")
-                    .font(.callout)
-                    .foregroundStyle(.orange)
-                    .fixedSize(horizontal: false, vertical: true)
+                Label {
+                    Text(warning)
+                } icon: {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                }
+                .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
     private var accountLabel: String {
-        switch server.health {
-        case .signInNeeded: return "Sign-in needed"
-        default: break
-        }
         guard let seconds = server.tokenExpiresInSecs else { return "Signed in" }
-        if seconds >= 86_400 { return "Signed in · renews in \(seconds / 86_400)d" }
-        if seconds >= 3_600 { return "Signed in · renews in \(seconds / 3_600)h" }
-        return "Signed in · renews shortly"
+        if seconds >= 86_400 {
+            let days = seconds / 86_400
+            return "Signed in · renews in \(days) \(days == 1 ? "day" : "days")"
+        }
+        if seconds >= 3_600 { return "Signed in · renews in \(seconds / 3_600) hr" }
+        return "Signed in · renews soon"
     }
 
     // MARK: - Recent
@@ -187,23 +151,26 @@ struct ServerDetailView: View {
     }
 
     private var recent: some View {
-        Section("Recent Calls") {
+        Section("Recent Activity") {
             ForEach(recentCalls) { event in
                 let call = CallFacts(event)
                 HStack(spacing: Metric.tight) {
                     Text(call.tool)
-                        .font(.callout.monospaced())
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: Metric.tight)
                     if !call.succeeded {
-                        Label(call.result, systemImage: "exclamationmark.triangle.fill")
-                            .font(.callout)
-                            .foregroundStyle(.orange)
-                            .lineLimit(1)
+                        Label {
+                            Text(call.result).foregroundStyle(.secondary)
+                        } icon: {
+                            Image(systemName: call.failed ? "xmark.circle.fill" : "minus.circle.fill")
+                                .foregroundStyle(call.failed ? Color.red : Color.secondary)
+                        }
+                        .font(.callout)
+                        .lineLimit(1)
                     }
                     Text(call.duration)
-                        .font(.callout.monospacedDigit())
+                        .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 .help(call.reason ?? call.result)
@@ -233,13 +200,20 @@ struct ServerDetailView: View {
         return nil
     }
 
+    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespaces) }
+
+    private var noToolsShown: String {
+        if !showsOffOnly { return "No tools match “\(trimmedQuery)”." }
+        return trimmedQuery.isEmpty ? "No tools are off." : "No tools that are off match this search."
+    }
+
     private var tools: some View {
         Section {
             if allTools.isEmpty {
                 Text(server.health == .working ? "This server offers no tools." : "Tools appear once the server is running.")
                     .foregroundStyle(.secondary)
             } else if shownTools.isEmpty {
-                Text("No tool matches “\(query.trimmingCharacters(in: .whitespaces))”.")
+                Text(noToolsShown)
                     .foregroundStyle(.secondary)
             } else {
                 ForEach(shownTools) { tool in
@@ -251,14 +225,13 @@ struct ServerDetailView: View {
                 Text("Tools")
                 if let toolsSummary {
                     Text(toolsSummary)
-                        .font(.callout.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
                 }
                 Spacer(minLength: 0)
-                if offCount > 0 {
+                if !allTools.isEmpty {
                     Picker("Show", selection: $showsOffOnly) {
                         Text("All").tag(false)
-                        Text("Off (\(offCount))").tag(true)
+                        Text("Off").tag(true)
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
@@ -279,7 +252,7 @@ struct ServerDetailView: View {
             onSelect: { router.selectedTool = tool.name },
             run: run
         )
-        .accessibilityAction(named: "Show details") { router.selectedTool = tool.name }
+        .accessibilityAction(named: "Show Details") { router.selectedTool = tool.name }
         .popover(
             isPresented: Binding(
                 get: { router.selectedTool == tool.name },
@@ -292,11 +265,9 @@ struct ServerDetailView: View {
                 catalog: model.toolCatalog,
                 canManage: canManage,
                 isBusy: isBusy,
-                router: router,
                 run: run
             )
             .frame(width: 320)
-            .frame(maxHeight: 420)
         }
     }
 }

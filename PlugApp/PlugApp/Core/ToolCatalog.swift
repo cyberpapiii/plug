@@ -99,7 +99,7 @@ struct ToolCatalog: Equatable, Sendable {
         let matched = needle.isEmpty ? tools : tools.filter { $0.matches(needle) }
         return Dictionary(grouping: matched, by: \.server)
             .map { server, tools in
-                ToolGroup(server: server, tools: tools.sorted { $0.shortName < $1.shortName })
+                ToolGroup(server: server, tools: tools.sorted { $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending })
             }
             .sorted { $0.server.localizedStandardCompare($1.server) == .orderedAscending }
     }
@@ -108,11 +108,11 @@ struct ToolCatalog: Equatable, Sendable {
     /// off without being named, so the panel that explains one has to be able
     /// to list what else it took.
     func tools(coveredBy pattern: String) -> [ToolFacts] {
-        tools.filter { $0.lockedByPattern == pattern }.sorted { $0.shortName < $1.shortName }
+        tools.filter { $0.lockedByPattern == pattern }.sorted { $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending }
     }
 
     func tools(for server: String) -> [ToolFacts] {
-        tools.filter { $0.server == server }.sorted { $0.shortName < $1.shortName }
+        tools.filter { $0.server == server }.sorted { $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending }
     }
 
     /// One server's tools that match a query, by the same rule as `groups`:

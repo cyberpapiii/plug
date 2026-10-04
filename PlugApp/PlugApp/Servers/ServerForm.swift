@@ -32,7 +32,20 @@ struct ServerForm: Equatable, Sendable {
     var hasKey: Bool { base.authToken != nil }
     var isAPI: Bool { base.transport == "openapi" }
 
+    /// Why the variables cannot be saved as typed, if they cannot.
+    var settingsProblem: String? {
+        let lines = settings.split(whereSeparator: { $0 == "\n" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        let malformed = lines.contains { line in
+            guard let split = line.firstIndex(of: "=") else { return true }
+            return line[line.startIndex..<split].trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        return malformed ? "Each line needs NAME=value." : nil
+    }
+
     var isComplete: Bool {
+        guard settingsProblem == nil else { return false }
         // An API server may leave the address to its document.
         if isAPI, isRemote { return true }
         return isRemote
@@ -95,75 +108,126 @@ struct ServerForm: Equatable, Sendable {
     }
 }
 
-/// The form itself, shared by Add Server and Edit.
-struct ServerFormFields: View {
+/// The form itself, shared by Add Server and Edit: one grouped form. Add
+/// Server passes the name, and its own sections go last.
+struct ServerFormFields<Extra: View>: View {
     @Binding var form: ServerForm
+    /// The server's name, when the sheet lets it be chosen.
+    var name: Binding<String>?
+    @ViewBuilder var extra: Extra
+
+    /// A server you sign in to has no key to type.
+    private var signsIn: Bool { form.base.auth == "oauth" }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.snug) {
+        Form {
             // An API is described by a document; it has no "where".
-            if !form.isAPI {
-                Picker("Where it runs", selection: $form.isRemote) {
-                    Label("On this Mac", systemImage: "desktopcomputer").tag(false)
-                    Label("Over the network", systemImage: "globe").tag(true)
+            if name != nil || !form.isAPI {
+                Section {
+                    if let name {
+                        TextField("Name", text: name)
+                    }
+                    if !form.isAPI {
+                        Picker("Where It Runs", selection: $form.isRemote) {
+                            Text("On This Mac").tag(false)
+                            Text("Over the Network").tag(true)
+                        }
+                        .pickerStyle(.segmented)
+                    }
                 }
-                .pickerStyle(.segmented)
-                .labelsHidden()
             }
 
-            Form {
-                Section {
-                    if form.isRemote {
-                        if form.isAPI, let document = form.base.spec {
-                            LabeledContent("Document") {
-                                Text(document)
-                                    .lineLimit(1)
-                                    .truncationMode(.middle)
-                                    .textSelection(.enabled)
-                            }
+            Section {
+                if form.isRemote {
+                    if form.isAPI, let document = form.base.spec {
+                        LabeledContent("Document") {
+                            Text(document)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .textSelection(.enabled)
                         }
-                        TextField(
-                            "Address",
-                            text: $form.address,
-                            prompt: Text(form.isAPI ? "The one the document names" : "https://example.com/mcp")
-                        )
+                    }
+                    TextField(
+                        "Address",
+                        text: $form.address,
+                        prompt: Text(form.isAPI ? "The one the document names" : "https://example.com/mcp")
+                    )
+                    if !signsIn {
                         SecureField(
                             "Key",
                             text: $form.key,
-                            prompt: Text(form.hasKey ? "Keep the key it has" : "None")
+                            prompt: Text(form.hasKey && !form.removeKey ? "Keep the key it has" : "None")
                         )
                         .onChange(of: form.key) { _, value in
                             if !value.isEmpty { form.removeKey = false }
                         }
                         if form.hasKey {
-                            Toggle("Remove the key", isOn: $form.removeKey)
+                            Toggle("Remove the saved key", isOn: $form.removeKey)
+                                .toggleStyle(.checkbox)
                                 .disabled(!form.key.isEmpty)
                         }
-                    } else {
-                        TextField("Command", text: $form.command, prompt: Text("npx"))
-                        TextField("Arguments", text: $form.arguments, prompt: Text("-y linear-mcp"))
                     }
-                } footer: {
-                    if form.isRemote {
-                        Text("A key is kept in the Keychain, not in the settings file. Leave it empty for a server you sign in to.")
-                    }
+                } else {
+                    TextField("Command", text: $form.command, prompt: Text("npx"))
+                    TextField("Arguments", text: $form.arguments, prompt: Text("-y linear-mcp"))
                 }
-
-                Section {
-                    TextField(
-                        "Settings",
-                        text: $form.settings,
-                        prompt: Text("NAME=value, one per line"),
-                        axis: .vertical
-                    )
-                    .lineLimit(2...5)
-                } footer: {
-                    Text("Values the server's instructions ask for, such as API_KEY. One whose name says it is a key is kept in the Keychain.")
+            } footer: {
+                if form.isRemote {
+                    if !signsIn {
+                        Text("A key is kept in the Keychain, not in the settings file.")
+                    } else if name != nil {
+                        Text("Plug asks you to sign in after you add it.")
+                    } else {
+                        Text("You sign in to this server, so it has no key.")
+                    }
                 }
             }
-            .formStyle(.grouped)
-            .scrollContentBackground(.hidden)
-            .frame(height: 280)
+
+            Section {
+                TextField(
+                    "Variables",
+                    text: $form.settings,
+                    prompt: Text("NAME=value, one per line"),
+                    axis: .vertical
+                )
+                .lineLimit(2...5)
+            } footer: {
+                if let problem = form.settingsProblem {
+                    InlineWarning(problem)
+                } else {
+                    Text("Values the server's instructions ask for, such as API_KEY. Keys are kept in the Keychain.")
+                }
+            }
+
+            extra
+        }
+        .formStyle(.grouped)
+    }
+}
+
+extension ServerFormFields where Extra == EmptyView {
+    init(form: Binding<ServerForm>, name: Binding<String>? = nil) {
+        self.init(form: form, name: name, extra: { EmptyView() })
+    }
+}
+
+/// A small warning beside a field or a row in a sheet: the orange triangle
+/// and a sentence. The words stay grey; only the symbol carries the colour.
+struct InlineWarning: View {
+    let text: String
+
+    init(_ text: String) {
+        self.text = text
+    }
+
+    var body: some View {
+        Label {
+            Text(text)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        } icon: {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
         }
     }
 }

@@ -22,7 +22,7 @@ enum Explain {
             codes.contains { text.range(of: "\\b\($0)\\b", options: .regularExpression) != nil }
         }
 
-        if has("reconnecting", "plug is not running", "background service") {
+        if has("reconnecting", "plug is not running", "plug is starting", "background service") {
             return "Plug is starting. Wait a moment, then try again."
         }
         if code(401) || has("unauthorized", "invalid_token", "invalid token", "sign-in", "sign in", "authorization", "expired") {

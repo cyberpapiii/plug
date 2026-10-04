@@ -21,7 +21,7 @@ enum ProcessRunnerError: Error, Equatable, LocalizedError {
     /// the synthesized one for a bare enum reads as "error 0".
     var errorDescription: String? {
         switch self {
-        case .timedOut: "The command did not finish in time and was stopped."
+        case .timedOut: "Plug took too long to answer. Try again."
         }
     }
 }

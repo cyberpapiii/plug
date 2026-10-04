@@ -19,19 +19,11 @@ struct FirstRunGuide: Equatable, Sendable {
         var detail: String {
             switch self {
             case .server:
-                "A server provides tools. Import the ones your other clients already use, or paste a new one."
+                "Import the ones your other apps already use, or add a new one."
             case .client:
-                "A client uses tools: Claude, Codex, Cursor. Connect one and it gets every server at once."
+                "Connect Claude, Codex, or Cursor and it gets every server at once."
             case .activity:
-                "Ask your client to do something with a tool. The call shows up in Activity."
-            }
-        }
-
-        var symbol: String {
-            switch self {
-            case .server: "shippingbox"
-            case .client: "app.connected.to.app.below.fill"
-            case .activity: "list.bullet.rectangle"
+                "Ask your client to do something. The call shows up in Activity."
             }
         }
     }

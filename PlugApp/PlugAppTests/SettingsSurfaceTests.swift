@@ -91,7 +91,7 @@ final class AppIconTests: XCTestCase {
             AppIcons.symbol(target: "codex-cli", name: "Codex CLI"),
             AppIcons.symbol(target: "codex", name: "Codex")
         )
-        XCTAssertEqual(AppIcons.symbol(target: "goose", name: "Goose"), "bird.fill")
+        XCTAssertEqual(AppIcons.symbol(target: "goose", name: "Goose"), "bird")
     }
 
     func testEditorsGetAnEditorGlyph() {
@@ -114,7 +114,7 @@ final class AppIconTests: XCTestCase {
     }
 
     func testAnUnknownAppStillGetsSomethingAppShaped() {
-        XCTAssertEqual(AppIcons.symbol(target: "brand-new-thing", name: "Brand New Thing"), "app.dashed")
+        XCTAssertEqual(AppIcons.symbol(target: "brand-new-thing", name: "Brand New Thing"), "app")
     }
 
     func testLiveSessionsAreMatchedToTheAppTheyBelongTo() {
@@ -162,24 +162,15 @@ final class ReloadSummaryTests: XCTestCase {
     }
 }
 
-/// A server row says where the server runs before it says it in words.
-final class ServerGlyphTests: XCTestCase {
-    private func server(transport: String, enabled: Bool = true, health: ServerHealth = .working, error: String? = nil) -> ServerFacts {
-        ServerFacts(name: "s", enabled: enabled, transport: transport, health: health, error: error)
+/// A server says where it runs in words.
+final class ServerPlaceTests: XCTestCase {
+    private func server(transport: String) -> ServerFacts {
+        ServerFacts(name: "s", enabled: true, transport: transport, health: .working)
     }
 
-    func testLocalAndRemoteLookDifferent() {
-        XCTAssertEqual(server(transport: "stdio").transportSymbol, "desktopcomputer")
-        XCTAssertEqual(server(transport: "streamable_http").transportSymbol, "globe")
+    func testLocalAndRemoteReadDifferently() {
+        XCTAssertEqual(server(transport: "stdio").transportLabel, "On this Mac")
+        XCTAssertEqual(server(transport: "streamable_http").transportLabel, "Over the network")
         XCTAssertEqual(server(transport: "sse").transportLabel, "Over the network")
-    }
-
-    func testASwitchedOffServerSaysSoWithItsOwnGlyph() {
-        XCTAssertEqual(server(transport: "stdio", enabled: false).subtitleSymbol, "circle.slash")
-    }
-
-    func testAFailingServerShowsTroubleRatherThanItsTransport() {
-        let failing = server(transport: "stdio", health: .down, error: "connection refused")
-        XCTAssertEqual(failing.subtitleSymbol, "exclamationmark.triangle")
     }
 }
