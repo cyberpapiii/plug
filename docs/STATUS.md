@@ -44,9 +44,8 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   bugs and rough edges throughout; the three surfaces do not feel like one
   product. Audit and write the findings before changing anything.
 - Order agreed 2026-10-04: clients and their icons (done), secret stores
-  (#264), skills pass-through (#262), the app redesign, the app icon, then a
-  release. Skills is wanted now, small and clean, not held for a server
-  that uses it.
+  (done), skills pass-through (first step done), then the app redesign, the
+  app icon, and a release.
 - CI has no job timeout. A hung `Test (Plug.app)` ran 65 minutes on #269
   before it was cancelled by hand.
 - A connected Pi, Warp, or Kiro is named from what it reports, with no client
@@ -71,8 +70,10 @@ up to Open before starting it.
   built-in form described on #263 on the day a GraphQL API with no MCP
   server is needed. OpenAPI servers are done: CLI and app, bearer token or
   API key, operations chosen in either.
-- Skills: carry the skills extension through Plug, with the server's name in
-  each skill URI. Waits for a server and a client that use it (#262).
+- Skills (#262). Done: `skill://` resources carry their server's name
+  everywhere a URI crosses Plug. Left, when a client Plug's owner uses calls
+  them: `skills/list` and `skills/get` on the 2026-07-28 path with the
+  extension's capability, then `resources/directory/read`.
 - Secret stores (#264). Done: the Keychain, the `.env` file, 1Password, and
   any command as stores; `plug secret set`, typed keys going to the Keychain,
   `plug secret move`. Left: choosing a store in the app's server form;

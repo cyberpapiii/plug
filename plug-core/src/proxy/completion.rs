@@ -12,6 +12,14 @@ impl super::ToolRouter {
 
         let snapshot = self.cache.load();
         let server_id = resolve_resource_route(&snapshot.resource_routes, uri)
+            .or_else(|| {
+                // A skill's files need not be listed: its server's name in
+                // the URI is the route.
+                skills::named_server(uri)
+                    .filter(|server| self.server_manager.get_upstream(server).is_some())
+                    .map(str::to_string)
+            })
+            .or_else(|| skills::only_server(&snapshot.resource_routes, uri))
             .filter(|server_id| self.client_may_use_server(client_key, server_id))
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
@@ -32,7 +40,9 @@ impl super::ToolRouter {
         let mut result = upstream
             .client
             .peer()
-            .read_resource(ReadResourceRequestParams::new(uri))
+            .read_resource(ReadResourceRequestParams::new(
+                skills::inward(&server_id, uri).into_owned(),
+            ))
             .await
             .map_err(|error| match error {
                 rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
@@ -40,6 +50,7 @@ impl super::ToolRouter {
             })?;
         admit_catalog_meta(&mut result.meta, "resource-read-result");
         for contents in &mut result.contents {
+            skills::outward_contents(&server_id, contents);
             admit_resource_contents_meta(contents);
         }
         Ok(result)
@@ -118,17 +129,25 @@ impl super::ToolRouter {
                 params.r#ref = Reference::for_prompt(original_name);
                 sid
             }
-            Reference::Resource(resource_ref) => snapshot
-                .resource_routes
-                .get(&resource_ref.uri)
-                .cloned()
-                .or_else(|| resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri))
-                .filter(|server_id| self.client_may_use_server(client_key, server_id))
-                .ok_or_else(|| {
-                    McpError::from(ProtocolError::InvalidRequest {
-                        detail: format!("resource not found: {}", resource_ref.uri),
+            Reference::Resource(resource_ref) => {
+                let sid = snapshot
+                    .resource_routes
+                    .get(&resource_ref.uri)
+                    .cloned()
+                    .or_else(|| {
+                        resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri)
                     })
-                })?,
+                    .filter(|server_id| self.client_may_use_server(client_key, server_id))
+                    .ok_or_else(|| {
+                        McpError::from(ProtocolError::InvalidRequest {
+                            detail: format!("resource not found: {}", resource_ref.uri),
+                        })
+                    })?;
+                if let std::borrow::Cow::Owned(known) = skills::inward(&sid, &resource_ref.uri) {
+                    params.r#ref = Reference::for_resource(known);
+                }
+                sid
+            }
             _ => {
                 return Err(McpError::invalid_params(
                     "unsupported completion reference type",

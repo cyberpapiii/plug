@@ -1011,12 +1011,14 @@ impl ClientHandler for UpstreamClientHandler {
 
     fn on_resource_updated(
         &self,
-        params: ResourceUpdatedNotificationParam,
+        mut params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
         let router = self.router.clone();
+        let server_id = Arc::clone(&self.server_id);
         async move {
             if let Some(router) = router.upgrade() {
+                router.name_skill_server(&server_id, &mut params.uri);
                 router.route_upstream_resource_updated(params);
             }
         }
@@ -4248,6 +4250,7 @@ mod tests {
         {
             std::future::ready(Ok(ListResourcesResult::with_all_items(vec![
                 Resource::new("memory://notes", "notes"),
+                Resource::new("skill://refunds/SKILL.md", "refunds"),
             ])))
         }
 
@@ -4268,11 +4271,16 @@ mod tests {
             _context: RequestContext<RoleServer>,
         ) -> impl Future<Output = Result<ReadResourceResponse, rmcp::ErrorData>> + Send + '_
         {
-            std::future::ready(Ok(ReadResourceResult::new(vec![ResourceContents::text(
-                "hello",
-                request.uri,
-            )])
-            .into()))
+            // This server knows its skills by their own URIs, never by the
+            // name Plug gives it.
+            std::future::ready(if request.uri.starts_with("skill://catalog/") {
+                Err(rmcp::ErrorData::invalid_params("unknown resource", None))
+            } else {
+                Ok(
+                    ReadResourceResult::new(vec![ResourceContents::text("hello", request.uri)])
+                        .into(),
+                )
+            })
         }
 
         fn list_prompts(
@@ -5637,7 +5645,45 @@ mod tests {
 
         router.refresh_tools().await;
 
-        assert_eq!(router.list_resources().len(), 1);
+        // A skill carries its server's name; any other resource is as sent.
+        let mut listed: Vec<String> = router
+            .list_resources()
+            .iter()
+            .map(|resource| resource.uri.clone())
+            .collect();
+        listed.sort();
+        assert_eq!(
+            listed,
+            ["memory://notes", "skill://catalog/refunds/SKILL.md"]
+        );
+        // Listed, unlisted, and written without the server's name: each
+        // reaches the server as its own URI and comes back named.
+        for (asked, answered) in [
+            (
+                "skill://catalog/refunds/SKILL.md",
+                "skill://catalog/refunds/SKILL.md",
+            ),
+            (
+                "skill://catalog/refunds/notes.md",
+                "skill://catalog/refunds/notes.md",
+            ),
+            (
+                "skill://refunds/SKILL.md",
+                "skill://catalog/refunds/SKILL.md",
+            ),
+        ] {
+            let read = router.read_resource(asked, None).await.expect(asked);
+            match &read.contents[0] {
+                ResourceContents::TextResourceContents { uri, .. } => assert_eq!(uri, answered),
+                other => panic!("unexpected contents: {other:?}"),
+            }
+        }
+        assert!(
+            router
+                .read_resource("skill://nobody/refunds/SKILL.md", None)
+                .await
+                .is_err()
+        );
         assert_eq!(router.list_resource_templates().len(), 1);
         assert_eq!(router.list_prompts().len(), 1);
 
