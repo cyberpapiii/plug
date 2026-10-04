@@ -1364,6 +1364,10 @@ impl SubscriptionRegistry {
     /// (`route_upstream_resource_updated`) without a real upstream call.
     #[cfg(test)]
     pub(super) fn insert_active_for_test(&self, uri: &str, target: NotificationTarget) {
+        if let Some(mut entry) = self.entries.get_mut(uri) {
+            entry.members.insert(target);
+            return;
+        }
         let generation = self.next_generation.fetch_add(1, Ordering::Relaxed);
         let mut members = HashSet::new();
         members.insert(target);
@@ -1480,6 +1484,10 @@ impl super::ToolRouter {
             None => self.resource_subscriptions.member_is_active(uri, &target),
         };
         if confirmed {
+            if let Some(client_key) = client_key {
+                self.subscriber_client_keys
+                    .insert(target, client_key.to_string());
+            }
             return Ok(());
         }
         if tracks_member
@@ -1554,6 +1562,7 @@ impl super::ToolRouter {
                     .map(as_upstream_ops)
             })
             .await;
+        self.subscriber_client_keys.remove(target);
     }
 
     /// Route an upstream resource-updated notification to subscribed downstream clients.
@@ -1562,7 +1571,22 @@ impl super::ToolRouter {
             return;
         };
 
+        // A client kept from this server after it subscribed hears nothing
+        // more from it. The subscription itself stays, so lifting the block
+        // brings the updates back without the client subscribing again.
+        let server_id = self
+            .resource_subscriptions
+            .owner_snapshot(&params.uri)
+            .flatten()
+            .or_else(|| self.cache.load().resource_routes.get(&params.uri).cloned());
+
         for target in subscribers {
+            if let Some(server_id) = &server_id
+                && let Some(client_key) = self.subscriber_client_keys.get(&target)
+                && !self.client_may_use_server(Some(client_key.as_str()), server_id)
+            {
+                continue;
+            }
             self.publish_protocol_notification(ProtocolNotification::ResourceUpdated {
                 target,
                 params: params.clone(),

@@ -14,6 +14,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   client kept from something says so in its row. The popover says plainly that
   for a client on this Mac this keeps the list short and is not a lock, while a
   remote client is held to it.
+- A client kept from a server stops hearing that server's resource updates,
+  even for a subscription it made before the block. Lifting the block brings
+  them back.
 - A client kept from a server is kept from all of it. Its resources, resource
   templates, and prompts leave that client's lists, and reading one, getting
   one, completing against one, or subscribing to one answers as if it did not

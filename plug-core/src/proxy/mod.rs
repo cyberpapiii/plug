@@ -279,6 +279,9 @@ pub struct ToolRouter {
     /// Owns the atomic subscribe/unsubscribe state machine — see
     /// `subscriptions::SubscriptionRegistry` for the invariants.
     resource_subscriptions: Arc<subscriptions::SubscriptionRegistry>,
+    /// The client key each subscribed target subscribed under, so an update
+    /// from a server that client has since been kept from is not sent to it.
+    subscriber_client_keys: DashMap<NotificationTarget, String>,
     /// Cached downstream roots per client. Upstream servers see the union via `list_roots_union()`.
     client_roots: DashMap<NotificationTarget, Vec<Root>>,
     /// Per-client bridge for forwarding reverse requests (elicitation, sampling).
@@ -935,6 +938,7 @@ impl ToolRouter {
             engine: std::sync::RwLock::new(None),
             artifact_store: ArtifactStore::new(),
             resource_subscriptions,
+            subscriber_client_keys: DashMap::new(),
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
