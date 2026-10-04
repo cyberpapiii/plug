@@ -6,7 +6,7 @@
 
 use std::io::{IsTerminal, Read};
 
-use plug_core::secrets::{self, KEYCHAIN, SecretError, Stores};
+use plug_core::secrets::{self, FILE, KEYCHAIN, SecretError, Stores};
 use plug_core::types::SecretString;
 
 use crate::ui;
@@ -15,30 +15,51 @@ pub(crate) async fn cmd_secret(
     config_path: Option<&std::path::PathBuf>,
     command: crate::SecretCommands,
 ) -> anyhow::Result<()> {
-    let stores = Stores::builtin();
-    let keychain = stores
-        .get(KEYCHAIN)
-        .expect("the Keychain store is built in");
+    let stores = match super::config::load_editable_config(config_path) {
+        Ok((_, config)) => Stores::from_config(&config.secrets),
+        Err(_) => Stores::builtin(),
+    };
     match command {
-        crate::SecretCommands::Set { name } => {
+        crate::SecretCommands::Set { name, store } => {
             let name = checked(name)?;
+            let found = writable(&stores, &store)?;
             let value = read_value(&name)?;
-            keychain.set(&name, &value)?;
+            found.set(&name, &value)?;
             ui::print_success_line(format!(
-                "Stored `{name}` in the Keychain. Use it in a server as `{}`.",
-                secrets::reference(KEYCHAIN, &name)
+                "Stored `{name}` in {}. Use it in a server as `{}`.",
+                place(&store),
+                secrets::reference(&store, &name)
             ));
         }
-        crate::SecretCommands::Rm { name } => {
+        crate::SecretCommands::Rm { name, store } => {
             let name = checked(name)?;
-            keychain.remove(&name)?;
+            writable(&stores, &store)?.remove(&name)?;
             ui::print_success_line(format!(
-                "Removed `{name}` from the Keychain. A running server keeps the value until it restarts."
+                "Removed `{name}` from {}. A running server keeps the value until it restarts.",
+                place(&store)
             ));
         }
         crate::SecretCommands::Move => move_keys(config_path, &stores).await?,
     }
     Ok(())
+}
+
+/// The store named `id`, if Plug can write to it. A command store only reads:
+/// its own tool is where a value is put.
+fn writable(stores: &Stores, id: &str) -> anyhow::Result<std::sync::Arc<dyn secrets::SecretStore>> {
+    match stores.get(id) {
+        Some(store) if [KEYCHAIN, FILE].contains(&id) => Ok(std::sync::Arc::clone(store)),
+        Some(_) => anyhow::bail!("Plug only reads from `{id}`; store the value with its own tool"),
+        None => anyhow::bail!("no store named `{id}`; use `{KEYCHAIN}` or `{FILE}`"),
+    }
+}
+
+fn place(store: &str) -> &'static str {
+    if store == FILE {
+        "Plug's .env file"
+    } else {
+        "the Keychain"
+    }
 }
 
 /// Hand each server that has a key in the clear back to the service, which

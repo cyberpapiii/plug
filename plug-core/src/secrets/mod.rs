@@ -5,12 +5,20 @@
 //! server it is about to start, so a store that cannot answer holds up that one
 //! server and nothing else.
 //!
-//! A store is anything that turns a name into a value. The Keychain is built
-//! in and is the default; it does not lock while the person is logged in.
+//! A store is anything that turns a name into a value. Three are built in:
+//! the Keychain, which is the default and does not lock while the person is
+//! logged in; the `.env` file; and 1Password, as `op://vault/item/field`. Any
+//! other is a command the person names in `[secrets.stores]`.
+
+pub mod command;
+pub mod file;
 
 use std::borrow::Cow;
-use std::sync::Arc;
+use std::collections::{BTreeMap, HashMap};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
+
+use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_os = "linux"))]
 use keyring as platform_keyring;
@@ -23,15 +31,116 @@ use crate::types::SecretString;
 /// The store a pasted key goes to unless the person chooses another.
 pub const KEYCHAIN: &str = "keychain";
 
-/// How long one read may take. A store that asks a person for approval can
-/// wait forever; a server start cannot.
+pub use command::OP;
+pub use file::FILE;
+
+/// How long one read may take unless the store says otherwise. A store that
+/// asks a person for approval can wait forever; a server start cannot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The stores a person adds, under `[secrets]` in `config.toml`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretsConfig {
+    /// `[secrets.stores.<id>]`: a reference `<id>:<name>` runs the command.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub stores: BTreeMap<String, CommandStoreConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CommandStoreConfig {
+    /// The program and its arguments. `{name}` is replaced by the secret's
+    /// name; what the command prints is the value. No shell is involved.
+    pub command: Vec<String>,
+    /// Seconds the command may take, for a tool that asks for approval.
+    #[serde(default = "default_command_timeout")]
+    pub timeout_secs: u64,
+}
+
+fn default_command_timeout() -> u64 {
+    15
+}
+
+impl SecretsConfig {
+    pub fn is_empty(&self) -> bool {
+        self.stores.is_empty()
+    }
+
+    /// What is wrong with the stores as written, for config validation.
+    pub fn validate(&self) -> Vec<String> {
+        let mut errors = Vec::new();
+        for (id, store) in &self.stores {
+            let at = format!("secrets.stores.{id}");
+            let plain = !id.is_empty()
+                && id.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
+                });
+            if !plain {
+                errors.push(format!(
+                    "{at}: a store's name is lowercase letters, digits, `_`, and `-`"
+                ));
+            }
+            if [KEYCHAIN, FILE, OP, "http", "https"].contains(&id.as_str()) {
+                errors.push(format!("{at}: `{id}` is taken; choose another name"));
+            }
+            if store.command.first().is_none_or(String::is_empty) {
+                errors.push(format!("{at}: `command` needs a program to run"));
+            } else if !store
+                .command
+                .iter()
+                .skip(1)
+                .any(|arg| arg.contains(command::NAME))
+            {
+                errors.push(format!(
+                    "{at}: `command` needs `{}` where the secret's name goes",
+                    command::NAME
+                ));
+            }
+            if !(1..=120).contains(&store.timeout_secs) {
+                errors.push(format!("{at}: `timeout_secs` is between 1 and 120"));
+            }
+        }
+        errors
+    }
+}
+
+/// The stores the running service follows references with. Set from the
+/// config when it loads; the built-in ones until then.
+static CURRENT: RwLock<Option<Stores>> = RwLock::new(None);
+
+/// The last value each reference gave, so a store that locks after the
+/// service started does not take down a server that restarts. Memory only.
+static LAST: Mutex<Option<HashMap<String, SecretString>>> = Mutex::new(None);
+
+fn last(reference: &str) -> Option<SecretString> {
+    LAST.lock().ok()?.as_ref()?.get(reference).cloned()
+}
+
+fn remember(reference: &str, value: Option<&SecretString>) {
+    if let Ok(mut last) = LAST.lock() {
+        let last = last.get_or_insert_with(HashMap::new);
+        match value {
+            Some(value) => last.insert(reference.to_string(), value.clone()),
+            None => last.remove(reference),
+        };
+    }
+}
+
+/// What to do about a missing secret, for the stores Plug can write.
+fn set_hint(store: &str, name: &str) -> String {
+    match store {
+        KEYCHAIN => format!("; run `plug secret set {name}`"),
+        FILE => format!("; run `plug secret set --store file {name}`"),
+        _ => String::new(),
+    }
+}
 
 /// Why a reference did not become a value. The messages name the store and
 /// the secret, never a value.
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum SecretError {
-    #[error("no secret named `{name}` in {store}; run `plug secret set {name}`")]
+    #[error("no secret named `{name}` in {store}{}", set_hint(.store, .name))]
     Missing { store: String, name: String },
     #[error("waiting for {store}: it did not answer in time")]
     TimedOut { store: String },
@@ -48,6 +157,16 @@ pub trait SecretStore: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<SecretString>, SecretError>;
     fn set(&self, name: &str, value: &SecretString) -> Result<(), SecretError>;
     fn remove(&self, name: &str) -> Result<(), SecretError>;
+
+    /// How long a read may take.
+    fn timeout(&self) -> Duration {
+        READ_TIMEOUT
+    }
+
+    /// Whether `name` is one this store can be asked for.
+    fn accepts(&self, name: &str) -> bool {
+        valid_name(name)
+    }
 }
 
 /// A secret name is safe to print, to pass to a command, and to use as a
@@ -178,15 +297,72 @@ impl Stores {
     /// The stores every Plug has.
     ///
     /// Where the isolated test credential backend is installed, the Keychain
-    /// is a map in memory, so no test reads or writes the Keychain of the
-    /// person running it.
+    /// is a map in memory and the file is a temporary one, so no test reads
+    /// or writes the secrets of the person running it.
     pub fn builtin() -> Self {
-        let keychain: Arc<dyn SecretStore> = if crate::oauth::uses_test_credentials() {
-            memory::keychain()
+        let (keychain, file): (Arc<dyn SecretStore>, _) = if crate::oauth::uses_test_credentials() {
+            let path =
+                std::env::temp_dir().join(format!("plug-test-secrets-{}", std::process::id()));
+            (memory::keychain(), file::File::new(path.join(".env")))
         } else {
-            Arc::new(Keychain)
+            (
+                Arc::new(Keychain),
+                file::File::new(crate::dotenv::env_file_path()),
+            )
         };
-        Self::default().with(KEYCHAIN, keychain)
+        Self::default()
+            .with(KEYCHAIN, keychain)
+            .with(FILE, Arc::new(file))
+            .with(OP, Arc::new(command::Command::one_password()))
+    }
+
+    /// The built-in stores and the ones `config` adds.
+    pub fn from_config(config: &SecretsConfig) -> Self {
+        config
+            .stores
+            .iter()
+            .fold(Self::builtin(), |stores, (id, store)| {
+                stores.with(
+                    id,
+                    Arc::new(command::Command::new(
+                        id,
+                        store.command.clone(),
+                        Duration::from_secs(store.timeout_secs),
+                    )),
+                )
+            })
+    }
+
+    /// Make `config`'s stores the ones the service follows references with.
+    pub fn configure(config: &SecretsConfig) {
+        if let Ok(mut current) = CURRENT.write() {
+            *current = Some(Self::from_config(config));
+        }
+    }
+
+    /// The stores the service follows references with.
+    pub fn current() -> Self {
+        CURRENT
+            .read()
+            .ok()
+            .and_then(|current| current.clone())
+            .unwrap_or_else(Self::builtin)
+    }
+
+    /// The stores a value can be put in, for a command's help and errors.
+    pub fn ids(&self) -> Vec<&str> {
+        self.stores.iter().map(|(id, _)| id.as_str()).collect()
+    }
+
+    /// Whether `server` refers to any store, so the caller can prepare what
+    /// a store needs before the first read.
+    pub fn refers(&self, server: &ServerConfig) -> bool {
+        server
+            .auth_token
+            .iter()
+            .map(|token| token.as_str())
+            .chain(server.env.values().map(String::as_str))
+            .any(|value| self.parse(value).is_some())
     }
 
     pub fn with(mut self, id: &str, store: Arc<dyn SecretStore>) -> Self {
@@ -207,7 +383,9 @@ impl Stores {
     /// value with a colon in it, is not a reference.
     pub fn parse<'a>(&self, value: &'a str) -> Option<(&'a str, &'a str)> {
         let (store, name) = value.split_once(':')?;
-        (self.get(store).is_some() && valid_name(name)).then_some((store, name))
+        self.get(store)
+            .is_some_and(|found| found.accepts(name))
+            .then_some((store, name))
     }
 
     /// The fields of `server` that hold a credential in the clear: `token` for
@@ -308,9 +486,11 @@ impl Stores {
             return Ok(None);
         };
         let store = Arc::clone(self.get(id).expect("parse checked the store"));
+        // The store stops itself at its own limit; this is the backstop.
+        let limit = store.timeout() + Duration::from_secs(2);
         let owned = name.to_string();
         let read = tokio::task::spawn_blocking(move || store.get(&owned));
-        match tokio::time::timeout(READ_TIMEOUT, read).await {
+        let outcome = match tokio::time::timeout(limit, read).await {
             Err(_) => Err(SecretError::TimedOut {
                 store: id.to_string(),
             }),
@@ -323,7 +503,26 @@ impl Stores {
                 store: id.to_string(),
                 name: name.to_string(),
             }),
-            Ok(Ok(Ok(Some(secret)))) => Ok(Some(secret)),
+            Ok(Ok(Ok(Some(secret)))) => Ok(secret),
+        };
+        match outcome {
+            Ok(secret) => {
+                remember(value, Some(&secret));
+                Ok(Some(secret))
+            }
+            // The store answered: the secret is gone, and so is the copy.
+            Err(error @ (SecretError::Missing { .. } | SecretError::InvalidName(_))) => {
+                remember(value, None);
+                Err(error)
+            }
+            // The store did not answer. A value it gave earlier still works.
+            Err(error) => match last(value) {
+                Some(secret) => {
+                    tracing::warn!(store = %id, %error, "using the value read earlier");
+                    Ok(Some(secret))
+                }
+                None => Err(error),
+            },
         }
     }
 
@@ -485,6 +684,62 @@ LEVEL = "debug:verbose"
         let locked = server("command = \"server\"\n[env]\nKEY = \"vault:api\"\n");
         let error = stores().resolve_server(&locked).await.unwrap_err();
         assert_eq!(error.to_string(), "waiting for vault: it is locked");
+    }
+
+    #[tokio::test]
+    async fn a_store_that_stops_answering_still_gives_the_value_it_gave() {
+        struct Flaky(std::sync::atomic::AtomicBool);
+        impl SecretStore for Flaky {
+            fn get(&self, _: &str) -> Result<Option<SecretString>, SecretError> {
+                if self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    Err(SecretError::Unavailable {
+                        store: "flaky".to_string(),
+                        reason: "it is locked".to_string(),
+                    })
+                } else {
+                    Ok(Some("first-read".to_string().into()))
+                }
+            }
+            fn set(&self, _: &str, _: &SecretString) -> Result<(), SecretError> {
+                unreachable!()
+            }
+            fn remove(&self, _: &str) -> Result<(), SecretError> {
+                unreachable!()
+            }
+        }
+        let stores = Stores::default().with("flaky", Arc::new(Flaky(Default::default())));
+        let config = server("command = \"server\"\nauth_token = \"flaky:kept-across-lock\"\n");
+        for _ in 0..2 {
+            let resolved = stores.resolve_server(&config).await.unwrap();
+            assert_eq!(resolved.auth_token.as_ref().unwrap().as_str(), "first-read");
+        }
+    }
+
+    #[test]
+    fn a_command_in_config_is_a_store_and_one_password_references_are_whole() {
+        let config: SecretsConfig =
+            toml::from_str("[stores.bw]\ncommand = [\"bw\", \"get\", \"password\", \"{name}\"]\n")
+                .unwrap();
+        assert!(config.validate().is_empty());
+        assert_eq!(config.stores["bw"].timeout_secs, 15);
+        let stores = Stores::from_config(&config);
+        assert_eq!(stores.parse("bw:github"), Some(("bw", "github")));
+        assert_eq!(stores.parse("file:API_KEY"), Some(("file", "API_KEY")));
+        assert_eq!(
+            stores.parse("op://Private/My Item/password"),
+            Some(("op", "//Private/My Item/password"))
+        );
+        assert_eq!(stores.parse("https://example.com/mcp"), None);
+
+        let bad: SecretsConfig = toml::from_str(
+            "[stores.keychain]\ncommand = [\"x\", \"{name}\"]\n[stores.Bad]\ncommand = [\"x\"]\ntimeout_secs = 0\n",
+        )
+        .unwrap();
+        let errors = bad.validate().join("\n");
+        assert!(errors.contains("`keychain` is taken"), "{errors}");
+        assert!(errors.contains("lowercase letters"), "{errors}");
+        assert!(errors.contains("where the secret's name goes"), "{errors}");
+        assert!(errors.contains("between 1 and 120"), "{errors}");
     }
 
     #[test]

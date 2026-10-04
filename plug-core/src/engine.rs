@@ -113,6 +113,7 @@ impl Engine {
     ///
     /// Does NOT start any servers — call `start()` to begin.
     pub fn new(config: Config) -> Self {
+        crate::secrets::Stores::configure(&config.secrets);
         let server_manager = Arc::new(ServerManager::new());
         let router_config = RouterConfig::from(&config);
         let tool_router = Arc::new(ToolRouter::new(server_manager.clone(), router_config));
@@ -478,6 +479,7 @@ impl Engine {
         self.tool_router.set_client_access(&config.clients);
         self.server_manager
             .set_modern_upstream_enabled(config.modern_upstream_enabled);
+        crate::secrets::Stores::configure(&config.secrets);
         self.config.store(Arc::new(config));
     }
 
@@ -851,7 +853,7 @@ impl Engine {
         if let Some((name, server)) = before {
             let now = self.config.load().servers.get(&name).cloned();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::secrets::Stores::builtin().forget(&name, &server, now.as_ref());
+                crate::secrets::Stores::current().forget(&name, &server, now.as_ref());
             })
             .await;
         }
@@ -884,7 +886,7 @@ impl Engine {
         let keep = |name: String, mut server: ServerConfig| async move {
             let owner = name.clone();
             match tokio::task::spawn_blocking(move || {
-                let kept = crate::secrets::Stores::builtin().keep(&owner, &mut server);
+                let kept = crate::secrets::Stores::current().keep(&owner, &mut server);
                 (server, !kept.is_empty())
             })
             .await

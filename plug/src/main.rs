@@ -289,13 +289,19 @@ enum Commands {
 pub(crate) enum SecretCommands {
     /// Store a value under a name; the value is asked for, never an argument
     Set {
-        /// The name a server refers to it by, as `keychain:<name>`
+        /// The name a server refers to it by, as `<store>:<name>`
         name: String,
+        /// Where to keep it: `keychain`, or `file` for Plug's `.env` file
+        #[arg(long, default_value = plug_core::secrets::KEYCHAIN)]
+        store: String,
     },
     /// Remove a stored value
     Rm {
         /// The name it was stored under
         name: String,
+        /// Where it is kept: `keychain` or `file`
+        #[arg(long, default_value = plug_core::secrets::KEYCHAIN)]
+        store: String,
     },
     /// Move the keys written in the config file to the Keychain
     Move,

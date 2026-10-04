@@ -1692,9 +1692,13 @@ impl ServerManager {
         tool_router: std::sync::Weak<ToolRouter>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        let resolved = crate::secrets::Stores::builtin()
-            .resolve_server(config)
-            .await?;
+        let stores = crate::secrets::Stores::current();
+        if stores.refers(config)
+            && let (Some(path), _) = stdio_path().await
+        {
+            crate::secrets::command::use_login_path(path.to_os_string());
+        }
+        let resolved = stores.resolve_server(config).await?;
         let result =
             Self::start_resolved(name, &resolved, tool_router, modern_upstream_gate_state).await;
         if matches!(resolved, std::borrow::Cow::Borrowed(_)) {

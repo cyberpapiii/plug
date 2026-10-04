@@ -216,9 +216,9 @@ fn toml_parse(contents: &str) -> Result<(), String> {
 /// Reads the file as written: after `$VAR` expansion every value looks typed.
 fn check_keys_in_config(config_path: &Path) -> CheckResult {
     let name = "keys_in_config".to_string();
-    let stores = crate::secrets::Stores::builtin();
     let mut found: Vec<String> = crate::operator::load_editable_config(config_path)
         .map(|config| {
+            let stores = crate::secrets::Stores::from_config(&config.secrets);
             config
                 .servers
                 .iter()
