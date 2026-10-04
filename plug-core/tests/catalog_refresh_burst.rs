@@ -47,6 +47,8 @@ fn mock_server_config(request_log: &std::path::Path) -> ServerConfig {
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     }
 }
 

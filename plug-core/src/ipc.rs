@@ -743,6 +743,7 @@ impl IpcServerSourceInfo {
                 crate::config::TransportType::Stdio => "stdio",
                 crate::config::TransportType::Http => "http",
                 crate::config::TransportType::Sse => "sse",
+                crate::config::TransportType::OpenApi => "openapi",
             }
             .to_string(),
             enabled: config.enabled,
@@ -787,7 +788,11 @@ impl IpcTrustInfo {
                 source: "local_config".to_string(),
                 boundary: "local_process".to_string(),
             },
-            Some(crate::config::TransportType::Http | crate::config::TransportType::Sse) => Self {
+            Some(
+                crate::config::TransportType::Http
+                | crate::config::TransportType::Sse
+                | crate::config::TransportType::OpenApi,
+            ) => Self {
                 tier: "configured_remote_server".to_string(),
                 source: "local_config".to_string(),
                 boundary: "network".to_string(),
@@ -1877,6 +1882,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
 
         let source = IpcServerSourceInfo::from_config(&config);
@@ -2376,6 +2383,8 @@ mod tests {
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             }
         }
 

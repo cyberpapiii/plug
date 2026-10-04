@@ -1222,6 +1222,8 @@ fn mock_server_config(tools: &str) -> ServerConfig {
         tool_groups: Vec::new(),
 
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     }
 }
 
@@ -1989,6 +1991,8 @@ fn test_config_validation_valid() {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         },
     );
     let errors = validate_config(&cfg);
@@ -2022,6 +2026,8 @@ fn test_config_validation_catches_missing_command() {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         },
     );
     let errors = validate_config(&cfg);
@@ -2089,6 +2095,8 @@ async fn test_stdio_timeout_reconnects_cleanly() {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         },
     );
 
@@ -2171,6 +2179,8 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         },
     );
 
@@ -2436,6 +2446,8 @@ async fn run_http_upstream_crash_restart_scenario(
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         },
     );
 
@@ -3702,6 +3714,8 @@ async fn test_upstream_http_sends_protocol_version_header() {
         tool_groups: Vec::new(),
 
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     };
 
     let upstream = sm
@@ -3906,6 +3920,8 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4043,6 +4059,8 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         config.servers.insert(
@@ -4069,6 +4087,8 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         config.servers.insert(
@@ -4095,6 +4115,8 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4231,6 +4253,8 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4330,6 +4354,8 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4421,6 +4447,8 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4527,6 +4555,8 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4624,6 +4654,8 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -4968,6 +5000,8 @@ fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -
         tool_groups: Vec::new(),
 
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     }
 }
 
@@ -5722,6 +5756,8 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -5805,4 +5841,129 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
     if let Err(payload) = result {
         std::panic::resume_unwind(payload);
     }
+}
+
+/// An HTTP API named by an OpenAPI document is a server like any other: its
+/// operations are listed as tools, a call makes the request with the server's
+/// bearer token, and an HTTP failure comes back as a tool error.
+#[tokio::test]
+async fn an_openapi_document_becomes_a_server() {
+    let listener = tokio::net::TcpListener::bind(SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("bind api fixture");
+    let address = listener.local_addr().expect("fixture address");
+
+    async fn get_pet(
+        axum::extract::Path(id): axum::extract::Path<String>,
+        Query(query): Query<HashMap<String, String>>,
+        headers: HeaderMap,
+    ) -> Response {
+        if id == "missing" {
+            return (StatusCode::NOT_FOUND, "no such pet").into_response();
+        }
+        let authorization = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default();
+        axum::Json(serde_json::json!({
+            "id": id,
+            "verbose": query.get("verbose"),
+            "authorization": authorization,
+        }))
+        .into_response()
+    }
+    async fn create_pet(axum::Json(body): axum::Json<serde_json::Value>) -> Response {
+        (StatusCode::CREATED, axum::Json(body)).into_response()
+    }
+    let app = axum::Router::new()
+        .route("/v1/pets/{id}", axum::routing::get(get_pet))
+        .route("/v1/pets", axum::routing::post(create_pet));
+    let fixture = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let directory = tempfile::tempdir().expect("tempdir");
+    let spec_path = directory.path().join("pets.json");
+    std::fs::write(
+        &spec_path,
+        serde_json::json!({
+            "openapi": "3.0.3",
+            "info": { "title": "Pets", "version": "1.0.0" },
+            "servers": [{ "url": format!("http://{address}/v1") }],
+            "paths": {
+                "/pets/{id}": {
+                    "get": {
+                        "operationId": "getPet",
+                        "parameters": [
+                            { "name": "id", "in": "path", "required": true, "schema": { "type": "string" } },
+                            { "name": "verbose", "in": "query", "schema": { "type": "boolean" } }
+                        ]
+                    }
+                },
+                "/pets": {
+                    "post": {
+                        "operationId": "createPet",
+                        "requestBody": {
+                            "required": true,
+                            "content": { "application/json": { "schema": { "type": "object" } } }
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .expect("write document");
+
+    let mut api = mock_server_config("unused");
+    api.command = None;
+    api.args = Vec::new();
+    api.transport = TransportType::OpenApi;
+    api.spec = Some(spec_path.to_string_lossy().into_owned());
+    api.auth_token = Some("api-token".to_string().into());
+    let mut config = Config::default();
+    config.servers.insert("pets".to_string(), api);
+    assert!(validate_config(&config).is_empty());
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+    let router = engine.tool_router();
+
+    let text = |result: &rmcp::model::CallToolResult| -> String {
+        result.content[0]
+            .as_text()
+            .map(|text| text.text.clone())
+            .expect("text content")
+    };
+
+    let arguments = serde_json::json!({ "id": "rex", "verbose": true });
+    let found = router
+        .call_tool("getPet", arguments.as_object().cloned())
+        .await
+        .expect("call getPet");
+    assert_ne!(found.is_error, Some(true));
+    let body: serde_json::Value = serde_json::from_str(&text(&found)).expect("json body");
+    assert_eq!(body["id"], "rex");
+    assert_eq!(body["verbose"], "true");
+    assert_eq!(body["authorization"], "Bearer api-token");
+
+    let arguments = serde_json::json!({ "body": { "name": "Rex" } });
+    let created = router
+        .call_tool("createPet", arguments.as_object().cloned())
+        .await
+        .expect("call createPet");
+    assert_ne!(created.is_error, Some(true));
+    let body: serde_json::Value = serde_json::from_str(&text(&created)).expect("json body");
+    assert_eq!(body["name"], "Rex");
+
+    let arguments = serde_json::json!({ "id": "missing" });
+    let missing = router
+        .call_tool("getPet", arguments.as_object().cloned())
+        .await
+        .expect("call getPet for a missing pet");
+    assert_eq!(missing.is_error, Some(true));
+    assert!(text(&missing).contains("404"), "{}", text(&missing));
+
+    engine.shutdown().await;
+    fixture.abort();
 }

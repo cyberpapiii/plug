@@ -107,7 +107,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     var transportSymbol: String {
         switch transport.lowercased() {
         case "stdio": "desktopcomputer"
-        case "http", "sse", "streamable_http": "globe"
+        case "http", "sse", "streamable_http", "openapi": "globe"
         default: "questionmark.square.dashed"
         }
     }
@@ -153,6 +153,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         switch transport.lowercased() {
         case "stdio": "Runs on this Mac"
         case "http", "sse", "streamable_http": "Remote server"
+        case "openapi": "HTTP API"
         default: transport.capitalized
         }
     }

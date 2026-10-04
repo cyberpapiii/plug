@@ -325,6 +325,14 @@ pub(crate) enum ServerCommands {
         /// Add the server switched off
         #[arg(long)]
         disabled: bool,
+        /// Turn an HTTP API into a server: the URL or file of its OpenAPI
+        /// document. --url overrides where the API lives
+        #[arg(long, value_name = "URL_OR_FILE")]
+        openapi: Option<String>,
+        /// Comma-separated operations of the API to expose (with --openapi);
+        /// `*` is a wildcard
+        #[arg(long, value_delimiter = ',')]
+        operations: Vec<String>,
     },
     /// Remove a server from the config
     Remove {

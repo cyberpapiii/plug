@@ -277,7 +277,8 @@ pub(crate) async fn cmd_overview(
             .fold((0usize, 0usize, 0usize), |mut acc, server| {
                 match server.transport {
                     plug_core::config::TransportType::Stdio => acc.0 += 1,
-                    plug_core::config::TransportType::Http => acc.1 += 1,
+                    plug_core::config::TransportType::Http
+                    | plug_core::config::TransportType::OpenApi => acc.1 += 1,
                     plug_core::config::TransportType::Sse => acc.2 += 1,
                 }
                 acc

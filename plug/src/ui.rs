@@ -280,6 +280,11 @@ pub(crate) fn summarize_server_target(
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
             server.url.clone().unwrap_or_else(|| "-".to_string())
         }
+        plug_core::config::TransportType::OpenApi => server
+            .url
+            .clone()
+            .or_else(|| server.spec.clone())
+            .unwrap_or_else(|| "-".to_string()),
     };
 
     truncate_tail(&raw, max_width)
@@ -292,6 +297,7 @@ pub(crate) fn summarize_server_transport(
         Some(plug_core::config::TransportType::Stdio) => "stdio",
         Some(plug_core::config::TransportType::Http) => "http",
         Some(plug_core::config::TransportType::Sse) => "sse",
+        Some(plug_core::config::TransportType::OpenApi) => "openapi",
         None => "unknown",
     }
 }
@@ -352,6 +358,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 

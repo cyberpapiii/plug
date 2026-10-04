@@ -476,6 +476,13 @@ pub struct ServerConfig {
     /// Optional sandbox policy for stdio upstream processes.
     #[serde(default)]
     pub sandbox: Option<StdioSandboxConfig>,
+    /// OpenAPI document for the openapi transport: a URL or a file path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    /// Operations of the OpenAPI document to expose, by tool name or
+    /// `operationId`; `*` is a wildcard. Empty means all of them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operations: Vec<String>,
 }
 
 /// Stand-in the daemon sends in place of a stored secret. Operator clients hand
@@ -601,6 +608,8 @@ pub enum TransportType {
     Stdio,
     Http,
     Sse,
+    /// An HTTP API described by an OpenAPI document; see [`crate::openapi`].
+    OpenApi,
 }
 
 /// MCP lifecycle negotiation policy for one upstream server.
@@ -948,6 +957,18 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                 if server.url.is_none() {
                     errors.push(format!(
                         "server '{name}': sse transport requires 'url' to be set"
+                    ));
+                }
+            }
+            TransportType::OpenApi => {
+                if server.spec.is_none() {
+                    errors.push(format!(
+                        "server '{name}': openapi transport requires 'spec' to be set"
+                    ));
+                }
+                if server.auth.as_deref() == Some("oauth") {
+                    errors.push(format!(
+                        "server '{name}': openapi transport takes auth_token, not auth = \"oauth\""
                     ));
                 }
             }
@@ -1780,6 +1801,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -1837,6 +1860,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -1874,6 +1899,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -1911,6 +1938,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2250,6 +2279,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2287,6 +2318,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2321,6 +2354,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2354,6 +2389,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2387,6 +2424,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2420,6 +2459,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);
@@ -2457,6 +2498,8 @@ LOG_LEVEL = "debug"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         let errors = validate_config(&cfg);

@@ -3616,6 +3616,8 @@ mod tests {
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 
