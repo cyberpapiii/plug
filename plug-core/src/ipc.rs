@@ -1884,6 +1884,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
 
         let source = IpcServerSourceInfo::from_config(&config);
@@ -2385,6 +2386,7 @@ mod tests {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             }
         }
 

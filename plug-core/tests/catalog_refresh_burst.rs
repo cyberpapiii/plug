@@ -49,6 +49,7 @@ fn mock_server_config(request_log: &std::path::Path) -> ServerConfig {
         sandbox: None,
         spec: None,
         operations: Vec::new(),
+        token_in: None,
     }
 }
 

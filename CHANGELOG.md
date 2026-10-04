@@ -132,6 +132,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - The app adds an HTTP API as a server. Paste the address or the file path of
   an OpenAPI document into Add Server; Plug guesses whether an address is a
   server or an API document, and a picker corrects the guess.
+- An API server can sign in with an API key. When the OpenAPI document says
+  the key goes in a header or a query parameter, the token from
+  `--bearer-token` is sent there; `--token-in header:<name>`, `query:<name>`,
+  or `bearer` (`token_in` in the config) says so when the document does not.
 
 ### Changed
 

@@ -3173,6 +3173,7 @@ fn subscribable_test_server_config() -> crate::config::ServerConfig {
         sandbox: None,
         spec: None,
         operations: Vec::new(),
+        token_in: None,
     }
 }
 

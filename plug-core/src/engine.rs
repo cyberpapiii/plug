@@ -1209,6 +1209,7 @@ mod tests {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         config
@@ -1249,6 +1250,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 
@@ -1620,6 +1622,7 @@ mod tests {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -1801,6 +1804,7 @@ mod tests {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -1842,6 +1846,7 @@ mod tests {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -1971,6 +1976,7 @@ HOME_DIR = "$HOME"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -2290,6 +2296,7 @@ HOME_DIR = "$HOME"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 

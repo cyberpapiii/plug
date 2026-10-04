@@ -333,6 +333,11 @@ pub(crate) enum ServerCommands {
         /// `*` is a wildcard
         #[arg(long, value_delimiter = ',')]
         operations: Vec<String>,
+        /// Where the API wants the token from --bearer-token (with
+        /// --openapi): `bearer`, `header:<name>`, or `query:<name>`. Left
+        /// out, the OpenAPI document decides
+        #[arg(long, value_name = "PLACE")]
+        token_in: Option<String>,
     },
     /// Remove a server from the config
     Remove {
