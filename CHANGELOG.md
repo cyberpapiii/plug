@@ -24,6 +24,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   sentence and how many clients listen. Watch a Tool asks for a server, a
   tool, and how often to check; it offers only the tools the server marks
   read-only unless you ask for the rest, and Stop Watching removes a watch.
+- The app has a first-run guide. On a Mac with no servers it opens by itself
+  once; after that the question mark in the toolbar opens it. It shows Plug's
+  two sides in one picture and walks three steps, add a server, connect a
+  client, use a tool, each with the button that does it and a tick when it is
+  done. Copy Setup Prompt puts instructions on the clipboard that an agent can
+  follow to set Plug up; the same text is `docs/guides/agent-setup.md`.
 - The Clients tab chooses which servers each client can use. Every client that
   uses Plug has a button that opens its servers with a switch each, and a
   client kept from something says so in its row. The popover says plainly that

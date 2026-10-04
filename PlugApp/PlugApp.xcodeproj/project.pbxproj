@@ -32,16 +32,20 @@
 		62A674116B71E58C151041D4 /* EditServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 588717CF2790EF93C4710EE6 /* EditServerView.swift */; };
 		62FB2A2B8196D3C86DAF8E9E /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */; };
 		6467183EF2D0B0C1FB4A3500 /* ActivityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85E7D46276FEA5FFCB9BB8F2 /* ActivityView.swift */; };
+		667266B29E20821D05DE3B64 /* FirstRunGuide.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC08658F0B6AA141C8835368 /* FirstRunGuide.swift */; };
 		6BD4B241EB8557471C018CB5 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8B2BC9F43EB4287115C47DA /* AppModel.swift */; };
 		6C3A2ACAD67159A496C5DC58 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E823B05501E7735EEA26993A /* RootView.swift */; };
 		6C979F41AD0669EF1B229C11 /* ServersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2AFB9D205089F380BB49E9C6 /* ServersView.swift */; };
 		6D02466341A5E96732383E80 /* ServerDraftParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */; };
+		6F155AD4540ABBC83F8C439A /* GuideView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 254684F51DCF8AD6A1E18C54 /* GuideView.swift */; };
 		711532F652CB8274D9C13EF3 /* AddServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = BB031695DA969096D2B34BD3 /* AddServerView.swift */; };
 		75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */; };
 		8027D89CBD75B1FB2D466C56 /* EventFacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7711E0CB2972E0B9D45D9D9 /* EventFacts.swift */; };
 		8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */; };
+		8C15CA89C310137DC8DACB7E /* FirstRunGuideTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA30E8D16DB931FB22189B76 /* FirstRunGuideTests.swift */; };
 		9228ED25AFF9DF11E40DB9A5 /* LaunchdJobInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8CAB42C1F360F1A84DAA29ED /* LaunchdJobInspector.swift */; };
 		9263B9DB0E85D3D9246BCB9C /* legacy_plug_programs.json in Resources */ = {isa = PBXBuildFile; fileRef = 4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */; };
+		9FE96CB92A8665949F5F034E /* agent-setup.md in Resources */ = {isa = PBXBuildFile; fileRef = D3386E4BD7635FC4E33D53AA /* agent-setup.md */; };
 		B2857C070B5C6292A2B38282 /* AppInstallationInspector.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */; };
 		B2B2C2D12A16D745E320C8CE /* AddWatchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E643FDDD979E4B5A89F96D37 /* AddWatchView.swift */; };
 		B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */; };
@@ -89,6 +93,7 @@
 		1EECB5A101BC8CAF84B2DA4D /* AppLinkService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppLinkService.swift; sourceTree = "<group>"; };
 		1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = LegacyInstallMigratorTests.swift; sourceTree = "<group>"; };
 		246CCC51D3BBEE0246E4E96F /* Router.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Router.swift; sourceTree = "<group>"; };
+		254684F51DCF8AD6A1E18C54 /* GuideView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GuideView.swift; sourceTree = "<group>"; };
 		28E1C65673D42038754E140C /* ProcessRunnerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRunnerTests.swift; sourceTree = "<group>"; };
 		2AFB9D205089F380BB49E9C6 /* ServersView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServersView.swift; sourceTree = "<group>"; };
 		2BB10ED3645727B693E33897 /* AppChrome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppChrome.swift; sourceTree = "<group>"; };
@@ -126,17 +131,20 @@
 		A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspector.swift; sourceTree = "<group>"; };
 		A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationCoordinator.swift; sourceTree = "<group>"; };
 		AB8DE5660E3B959F5F4AD7FD /* AuthFlowService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthFlowService.swift; sourceTree = "<group>"; };
+		AC08658F0B6AA141C8835368 /* FirstRunGuide.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstRunGuide.swift; sourceTree = "<group>"; };
 		B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProcessRunner.swift; sourceTree = "<group>"; };
 		B8B2BC9F43EB4287115C47DA /* AppModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppModel.swift; sourceTree = "<group>"; };
 		BB031695DA969096D2B34BD3 /* AddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddServerView.swift; sourceTree = "<group>"; };
 		C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspectorTests.swift; sourceTree = "<group>"; };
 		CC541E7062C47E08EF5F5B4B /* PlugAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PlugAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
+		D3386E4BD7635FC4E33D53AA /* agent-setup.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "agent-setup.md"; sourceTree = "<group>"; };
 		D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugPaths.swift; sourceTree = "<group>"; };
 		D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugVerdictTests.swift; sourceTree = "<group>"; };
 		E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSurfaceTests.swift; sourceTree = "<group>"; };
 		E5046B427725A1A125529AF2 /* ToolRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolRow.swift; sourceTree = "<group>"; };
 		E643FDDD979E4B5A89F96D37 /* AddWatchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddWatchView.swift; sourceTree = "<group>"; };
 		E823B05501E7735EEA26993A /* RootView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootView.swift; sourceTree = "<group>"; };
+		EA30E8D16DB931FB22189B76 /* FirstRunGuideTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = FirstRunGuideTests.swift; sourceTree = "<group>"; };
 		EC1CDCB2E539B73277AFE537 /* CheckupService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheckupService.swift; sourceTree = "<group>"; };
 		F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerDraftParserTests.swift; sourceTree = "<group>"; };
 		F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManagerTests.swift; sourceTree = "<group>"; };
@@ -173,6 +181,7 @@
 			children = (
 				1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */,
 				F7711E0CB2972E0B9D45D9D9 /* EventFacts.swift */,
+				AC08658F0B6AA141C8835368 /* FirstRunGuide.swift */,
 				D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */,
 				FBC2D67DE9038B09D240E689 /* PlugStatus.swift */,
 				8C6821515ABD49E1CF6DD496 /* ServerDraftParser.swift */,
@@ -198,6 +207,15 @@
 			path = Activity;
 			sourceTree = "<group>";
 		};
+		36FB6D41F7FB050A2357574B /* guides */ = {
+			isa = PBXGroup;
+			children = (
+				D3386E4BD7635FC4E33D53AA /* agent-setup.md */,
+			);
+			name = guides;
+			path = ../docs/guides;
+			sourceTree = "<group>";
+		};
 		3A6C0F880F7E22F45D385900 /* Settings */ = {
 			isa = PBXGroup;
 			children = (
@@ -215,6 +233,7 @@
 				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
 				46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */,
+				EA30E8D16DB931FB22189B76 /* FirstRunGuideTests.swift */,
 				39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */,
 				317CBBF6A53104ACC4C7B945 /* InstallationCoordinatorTests.swift */,
 				406939A4256DFDF320508414 /* LaunchdJobInspectorTests.swift */,
@@ -237,6 +256,14 @@
 			);
 			name = testdata;
 			path = ../testdata;
+			sourceTree = "<group>";
+		};
+		67D9B4D725109C7211EDF4C5 /* Guide */ = {
+			isa = PBXGroup;
+			children = (
+				254684F51DCF8AD6A1E18C54 /* GuideView.swift */,
+			);
+			path = Guide;
 			sourceTree = "<group>";
 		};
 		6B86EBCEF490E4D63DAFD1A6 /* Tools */ = {
@@ -294,6 +321,7 @@
 		9FB6D7ED8FA1C9DC1B0E2AA9 = {
 			isa = PBXGroup;
 			children = (
+				36FB6D41F7FB050A2357574B /* guides */,
 				04A36C8D6B6A4C24BB4D517B /* Packages */,
 				CE4F4A93CF523388BD54586E /* PlugApp */,
 				4D7C2B22591EE4E275C9260F /* PlugAppTests */,
@@ -341,6 +369,7 @@
 				7340EA9AE1731128CEABBF9F /* Clients */,
 				14BE9CF6FE76C465735ECD02 /* Core */,
 				1C514A1C27521BC6B9BDC033 /* Events */,
+				67D9B4D725109C7211EDF4C5 /* Guide */,
 				82BB641BEEA138358B0DB072 /* Menu */,
 				8AF1048C1BBFBA43CABAA2C0 /* Models */,
 				C40F14F0E853E9D3057DDC64 /* Resources */,
@@ -488,6 +517,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				2089DA66D395D3CB66FC5A26 /* Assets.xcassets in Resources */,
+				9FE96CB92A8665949F5F034E /* agent-setup.md in Resources */,
 				D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -527,6 +557,7 @@
 				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
 				52895501276459EDCBEB65D9 /* EventSurfaceTests.swift in Sources */,
+				8C15CA89C310137DC8DACB7E /* FirstRunGuideTests.swift in Sources */,
 				FD7472A76A6E545F5CAE7D78 /* ImportSurfaceTests.swift in Sources */,
 				CAE0A7C58194808516DC87E1 /* InstallationCoordinatorTests.swift in Sources */,
 				D00C8B8F99A2E1F5748A36B9 /* LaunchdJobInspectorTests.swift in Sources */,
@@ -562,6 +593,8 @@
 				62A674116B71E58C151041D4 /* EditServerView.swift in Sources */,
 				8027D89CBD75B1FB2D466C56 /* EventFacts.swift in Sources */,
 				E538CFC19E21EE6A14E0ED74 /* EventsView.swift in Sources */,
+				667266B29E20821D05DE3B64 /* FirstRunGuide.swift in Sources */,
+				6F155AD4540ABBC83F8C439A /* GuideView.swift in Sources */,
 				09CDEA0A92446FF939334D26 /* ImportServersView.swift in Sources */,
 				145CFE4F269BFCB5BAF368F6 /* ImportService.swift in Sources */,
 				F57254362EEFEBCAC2EF485F /* InstallationCoordinator.swift in Sources */,
