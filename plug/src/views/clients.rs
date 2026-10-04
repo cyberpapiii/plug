@@ -747,6 +747,22 @@ mod tests {
     }
 
     #[test]
+    fn a_session_whose_link_names_its_client_shows_under_that_client() {
+        let mut linked = session("Unknown", "daemon_proxy", 30);
+        linked.host = Some(plug_core::ipc::ClientHost {
+            name: "node".to_string(),
+            executable: "/opt/homebrew/bin/node".to_string(),
+            app: None,
+            script: None,
+        });
+        assert_eq!(linked.label(), "node");
+        linked.key = Some("pi".to_string());
+        assert_eq!(linked.label(), "Pi");
+        linked.name = Some("Work Pi".to_string());
+        assert_eq!(linked.label(), "Work Pi");
+    }
+
+    #[test]
     fn a_client_to_rename_is_found_by_the_name_it_shows_under() {
         use crate::commands::clients::resolve_client_key;
         let mut hermes = session("Unknown", "daemon_proxy", 30);

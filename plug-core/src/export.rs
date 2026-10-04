@@ -70,6 +70,36 @@ impl std::str::FromStr for ExportTarget {
 }
 
 impl ExportTarget {
+    /// The one name this target goes by in config, in `plug link`, and in the
+    /// `--client` argument a link carries.
+    pub fn target_name(&self) -> &'static str {
+        match self {
+            Self::ClaudeDesktop => "claude-desktop",
+            Self::ClaudeCode => "claude-code",
+            Self::Cursor => "cursor",
+            Self::Devin => "devin",
+            Self::VSCodeCopilot => "vscode",
+            Self::CopilotCli => "copilot-cli",
+            Self::GeminiCli => "gemini-cli",
+            Self::CodexCli => "codex-cli",
+            Self::GrokBuild => "grok-build",
+            Self::OpenCode => "opencode",
+            Self::Zed => "zed",
+            Self::Cline => "cline",
+            Self::ClineCli => "cline-cli",
+            Self::RooCode => "roocode",
+            Self::Factory => "factory",
+            Self::Nanobot => "nanobot",
+            Self::Junie => "junie",
+            Self::Kilo => "kilo",
+            Self::Pi => "pi",
+            Self::Warp => "warp",
+            Self::Kiro => "kiro",
+            Self::Antigravity => "antigravity",
+            Self::Goose => "goose",
+        }
+    }
+
     pub fn display_name(&self) -> &'static str {
         match self {
             Self::ClaudeDesktop => "Claude Desktop",
@@ -155,6 +185,23 @@ fn resolved_http_url(options: &ExportOptions) -> String {
         .unwrap_or_else(|| format!("http://localhost:{}/mcp", options.port))
 }
 
+/// The arguments a stdio link runs Plug with. `--client` names the target the
+/// link was written for, so the daemon knows which client a connector serves
+/// without trusting the name the client reports.
+pub fn connect_args(options: &ExportOptions) -> [&'static str; 3] {
+    ["connect", "--client", options.target.target_name()]
+}
+
+/// Whether `args` is how a link runs the connector: `connect`, alone as older
+/// links wrote it or followed by `--client <target>`.
+pub fn is_connect_args<S: AsRef<str>>(args: &[S]) -> bool {
+    match args {
+        [connect] => connect.as_ref() == "connect",
+        [connect, flag, _target] => connect.as_ref() == "connect" && flag.as_ref() == "--client",
+        _ => false,
+    }
+}
+
 // ── Export ───────────────────────────────────────────────────────────────────
 
 /// Generate the config snippet for a target client.
@@ -203,7 +250,7 @@ fn export_nanobot(options: &ExportOptions) -> String {
     let server_entry = match options.transport {
         ExportTransport::Stdio => serde_json::json!({
             "command": options.command,
-            "args": ["connect"]
+            "args": connect_args(options)
         }),
         ExportTransport::Http => serde_json::json!({
             "url": resolved_http_url(options)
@@ -226,7 +273,7 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
     let server_entry = match options.transport {
         ExportTransport::Stdio => serde_json::json!({
             "command": options.command,
-            "args": ["connect"]
+            "args": connect_args(options)
         }),
         ExportTransport::Http => serde_json::json!({
             "url": resolved_http_url(options)
@@ -256,7 +303,10 @@ fn export_yaml_mcp_extensions(options: &ExportOptions, key: &str) -> String {
                 serde_norway::Value::from("command"),
                 serde_norway::Value::from(options.command.clone()),
             );
-            let args = vec![serde_norway::Value::from("connect")];
+            let args: Vec<_> = connect_args(options)
+                .into_iter()
+                .map(serde_norway::Value::from)
+                .collect();
             plug.insert(
                 serde_norway::Value::from("args"),
                 serde_norway::Value::from(args),
@@ -301,7 +351,7 @@ fn export_vscode(options: &ExportOptions) -> String {
         ExportTransport::Stdio => serde_json::json!({
             "type": "stdio",
             "command": options.command,
-            "args": ["connect"]
+            "args": connect_args(options)
         }),
         ExportTransport::Http => serde_json::json!({
             "type": "http",
@@ -326,7 +376,7 @@ fn export_copilot_cli(options: &ExportOptions) -> String {
         ExportTransport::Stdio => serde_json::json!({
             "type": "local",
             "command": options.command,
-            "args": ["connect"],
+            "args": connect_args(options),
             "tools": ["*"]
         }),
         ExportTransport::Http => serde_json::json!({
@@ -352,9 +402,10 @@ fn export_toml(options: &ExportOptions) -> String {
         ExportTransport::Stdio => format!(
             r#"[mcp_servers.plug]
 command = "{}"
-args = ["connect"]
+args = ["connect", "--client", "{}"]
 "#,
-            options.command
+            options.command,
+            options.target.target_name()
         ),
         ExportTransport::Http => {
             format!(
@@ -653,6 +704,67 @@ mod tests {
         let output = export_config(&options);
         assert!(output.contains("[mcp_servers.plug]"));
         assert!(output.contains("command = \"plug\""));
+    }
+
+    /// Every stdio link says which target it was written for, in the name
+    /// `plug connect --client` and the config both accept.
+    #[test]
+    fn every_stdio_link_names_its_target() {
+        let targets = [
+            ExportTarget::ClaudeDesktop,
+            ExportTarget::ClaudeCode,
+            ExportTarget::Cursor,
+            ExportTarget::Devin,
+            ExportTarget::VSCodeCopilot,
+            ExportTarget::CopilotCli,
+            ExportTarget::GeminiCli,
+            ExportTarget::CodexCli,
+            ExportTarget::GrokBuild,
+            ExportTarget::OpenCode,
+            ExportTarget::Zed,
+            ExportTarget::Cline,
+            ExportTarget::ClineCli,
+            ExportTarget::RooCode,
+            ExportTarget::Factory,
+            ExportTarget::Nanobot,
+            ExportTarget::Junie,
+            ExportTarget::Kilo,
+            ExportTarget::Pi,
+            ExportTarget::Warp,
+            ExportTarget::Kiro,
+            ExportTarget::Antigravity,
+            ExportTarget::Goose,
+        ];
+        for target in &targets {
+            let options = ExportOptions {
+                target: *target,
+                transport: ExportTransport::Stdio,
+                port: 3282,
+                http_url: None,
+                command: "plug".to_string(),
+            };
+            let name = target.target_name();
+            assert_eq!(name.parse::<ExportTarget>(), Ok(*target));
+            assert_eq!(connect_args(&options), ["connect", "--client", name]);
+            let output = export_config(&options);
+            let position = |needle: &str| {
+                output
+                    .find(needle)
+                    .unwrap_or_else(|| panic!("{name} link lacks {needle}: {output}"))
+            };
+            assert!(position("connect") < position("--client"));
+            assert!(position("--client") < position(name));
+        }
+    }
+
+    #[test]
+    fn connect_args_are_recognised_with_and_without_a_target() {
+        assert!(is_connect_args(&["connect"]));
+        assert!(is_connect_args(&["connect", "--client", "cursor"]));
+        assert!(!is_connect_args(&["serve"]));
+        assert!(!is_connect_args(&["connect", "--client"]));
+        assert!(!is_connect_args(&["connect", "--config", "/tmp/x.toml"]));
+        assert!(!is_connect_args::<&str>(&[]));
     }
 
     #[test]

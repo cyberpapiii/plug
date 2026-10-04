@@ -20,6 +20,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   linked rather than by the name it reports; a remote request is placed by its
   grant, and requests on the shared token share one key. Nothing acts on the
   key yet: it is the ground per-client access stands on.
+- `plug link` and the Clients tab write `connect --client <target>` into a
+  local link, so a client whose own name Plug does not recognise (Pi, Warp,
+  Kiro, Kilo Code) shows under its real name and icon. Links written before
+  this keep working unchanged; link the client again to pick it up.
 - An unknown local client started by an interpreter is told apart by the script
   it runs. Two tools that both run under `python3` or `node` are now two
   clients, each with its own name. A name given to such a client before this
