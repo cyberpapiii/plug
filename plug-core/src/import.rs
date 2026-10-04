@@ -46,6 +46,8 @@ pub enum ClientSource {
     Pi,
     Warp,
     Kiro,
+    KimiCode,
+    QwenCode,
     Antigravity,
     Goose,
 }
@@ -75,6 +77,8 @@ impl ClientSource {
             Self::Pi => "Pi",
             Self::Warp => "Warp",
             Self::Kiro => "Kiro",
+            Self::KimiCode => "Kimi Code",
+            Self::QwenCode => "Qwen Code",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
         }
@@ -104,6 +108,8 @@ impl ClientSource {
             Self::Pi,
             Self::Warp,
             Self::Kiro,
+            Self::KimiCode,
+            Self::QwenCode,
             Self::Antigravity,
             Self::Goose,
         ]
@@ -318,6 +324,18 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
                 PathBuf::from(".kiro/settings/mcp.json"),
             ]
         }
+        ClientSource::KimiCode => {
+            vec![
+                home.join(".kimi-code/mcp.json"),
+                PathBuf::from(".kimi-code/mcp.json"),
+            ]
+        }
+        ClientSource::QwenCode => {
+            vec![
+                home.join(".qwen/settings.json"),
+                PathBuf::from(".qwen/settings.json"),
+            ]
+        }
         ClientSource::Antigravity => antigravity_paths(&home),
         ClientSource::Goose => goose_paths(&home),
     }
@@ -413,6 +431,8 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         | ClientSource::Pi
         | ClientSource::Warp
         | ClientSource::Kiro
+        | ClientSource::KimiCode
+        | ClientSource::QwenCode
         | ClientSource::Antigravity => parse_json_mcp_servers(&content, source, "mcpServers"),
 
         // Nanobot uses tools.mcpServers
@@ -916,6 +936,8 @@ fn resolve_name_against_set(
         ClientSource::Pi => "pi",
         ClientSource::Warp => "warp",
         ClientSource::Kiro => "kiro",
+        ClientSource::KimiCode => "kimi",
+        ClientSource::QwenCode => "qwen",
         ClientSource::Antigravity => "antigravity",
         ClientSource::Goose => "goose",
     };

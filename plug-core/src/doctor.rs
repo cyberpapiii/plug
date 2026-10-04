@@ -884,6 +884,8 @@ async fn check_client_configs() -> CheckResult {
         "pi",
         "warp",
         "kiro",
+        "kimi-code",
+        "qwen-code",
         "antigravity",
         "goose",
     ];

@@ -30,6 +30,8 @@ pub enum ExportTarget {
     Pi,
     Warp,
     Kiro,
+    KimiCode,
+    QwenCode,
     Antigravity,
     Goose,
 }
@@ -62,6 +64,8 @@ impl std::str::FromStr for ExportTarget {
             "pi" => Ok(Self::Pi),
             "warp" => Ok(Self::Warp),
             "kiro" => Ok(Self::Kiro),
+            "kimi" | "kimi-code" => Ok(Self::KimiCode),
+            "qwen" | "qwen-code" => Ok(Self::QwenCode),
             "antigravity" => Ok(Self::Antigravity),
             "goose" => Ok(Self::Goose),
             _ => Err(format!("unknown export target: {s}")),
@@ -95,6 +99,8 @@ impl ExportTarget {
             Self::Pi => "pi",
             Self::Warp => "warp",
             Self::Kiro => "kiro",
+            Self::KimiCode => "kimi-code",
+            Self::QwenCode => "qwen-code",
             Self::Antigravity => "antigravity",
             Self::Goose => "goose",
         }
@@ -123,6 +129,8 @@ impl ExportTarget {
             Self::Pi => "Pi",
             Self::Warp => "Warp",
             Self::Kiro => "Kiro",
+            Self::KimiCode => "Kimi Code",
+            Self::QwenCode => "Qwen Code",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
         }
@@ -152,6 +160,8 @@ impl ExportTarget {
             "pi",
             "warp",
             "kiro",
+            "kimi-code",
+            "qwen-code",
             "antigravity",
             "goose",
         ]
@@ -223,7 +233,11 @@ pub fn export_config(options: &ExportOptions) -> String {
         | ExportTarget::Pi
         | ExportTarget::Warp
         | ExportTarget::Kiro
+        | ExportTarget::KimiCode
         | ExportTarget::Antigravity => export_json_mcp_servers(options, "mcpServers"),
+
+        // Qwen Code reads `url` as the older SSE transport
+        ExportTarget::QwenCode => export_qwen_code(options),
 
         // VS Code's own files use a top-level "servers"
         ExportTarget::VSCodeCopilot => export_vscode(options),
@@ -262,6 +276,27 @@ fn export_nanobot(options: &ExportOptions) -> String {
             "mcpServers": {
                 "plug": server_entry
             }
+        }
+    });
+
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate Qwen Code config, which names an HTTP server's address `httpUrl`.
+fn export_qwen_code(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => serde_json::json!({
+            "command": options.command,
+            "args": connect_args(options)
+        }),
+        ExportTransport::Http => serde_json::json!({
+            "httpUrl": resolved_http_url(options)
+        }),
+    };
+
+    let config = serde_json::json!({
+        "mcpServers": {
+            "plug": server_entry
         }
     });
 
@@ -559,6 +594,22 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
                 Some(home.join(".kiro/settings/mcp.json"))
             }
         }
+        // https://moonshotai.github.io/kimi-code/en/customization/mcp.html
+        ExportTarget::KimiCode => {
+            if project {
+                Some(std::path::PathBuf::from(".kimi-code/mcp.json"))
+            } else {
+                Some(home.join(".kimi-code/mcp.json"))
+            }
+        }
+        // https://qwenlm.github.io/qwen-code-docs/en/users/features/mcp/
+        ExportTarget::QwenCode => {
+            if project {
+                Some(std::path::PathBuf::from(".qwen/settings.json"))
+            } else {
+                Some(home.join(".qwen/settings.json"))
+            }
+        }
         ExportTarget::Antigravity => {
             #[cfg(target_os = "macos")]
             {
@@ -677,6 +728,8 @@ mod tests {
             ("pi", ".pi/agent/mcp.json", ".pi/mcp.json"),
             ("warp", ".warp/.mcp.json", ".warp/.mcp.json"),
             ("kiro", ".kiro/settings/mcp.json", ".kiro/settings/mcp.json"),
+            ("kimi-code", ".kimi-code/mcp.json", ".kimi-code/mcp.json"),
+            ("qwen-code", ".qwen/settings.json", ".qwen/settings.json"),
         ] {
             let target: ExportTarget = name.parse().unwrap();
             assert!(default_config_path(target, false).unwrap().ends_with(user));
@@ -732,6 +785,8 @@ mod tests {
             ExportTarget::Pi,
             ExportTarget::Warp,
             ExportTarget::Kiro,
+            ExportTarget::KimiCode,
+            ExportTarget::QwenCode,
             ExportTarget::Antigravity,
             ExportTarget::Goose,
         ];
