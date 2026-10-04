@@ -203,14 +203,20 @@ pub(super) async fn dispatch_mcp_request(
         "resources/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let result = tool_router.list_resources_page(request);
+            let result = tool_router.list_resources_page(
+                request,
+                ctx.client_registry.client_key(session_id).as_deref(),
+            );
             ipc_ok!(result)
         }
 
         "resources/templates/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let result = tool_router.list_resource_templates_page(request);
+            let result = tool_router.list_resource_templates_page(
+                request,
+                ctx.client_registry.client_key(session_id).as_deref(),
+            );
             ipc_ok!(result)
         }
 
@@ -225,13 +231,20 @@ pub(super) async fn dispatch_mcp_request(
                 }
             };
 
-            ipc_result!(tool_router.read_resource(uri).await)
+            ipc_result!(
+                tool_router
+                    .read_resource(uri, ctx.client_registry.client_key(session_id).as_deref())
+                    .await
+            )
         }
 
         "prompts/list" => {
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let result = tool_router.list_prompts_page(request);
+            let result = tool_router.list_prompts_page(
+                request,
+                ctx.client_registry.client_key(session_id).as_deref(),
+            );
             ipc_ok!(result)
         }
 
@@ -250,7 +263,15 @@ pub(super) async fn dispatch_mcp_request(
                 .and_then(|v| v.as_object())
                 .cloned();
 
-            ipc_result!(tool_router.get_prompt(name, arguments).await)
+            ipc_result!(
+                tool_router
+                    .get_prompt(
+                        name,
+                        arguments,
+                        ctx.client_registry.client_key(session_id).as_deref(),
+                    )
+                    .await
+            )
         }
 
         "completion/complete" => {
@@ -272,7 +293,14 @@ pub(super) async fn dispatch_mcp_request(
                 }
             };
 
-            ipc_result!(tool_router.complete_request(params).await)
+            ipc_result!(
+                tool_router
+                    .complete_request(
+                        params,
+                        ctx.client_registry.client_key(session_id).as_deref()
+                    )
+                    .await
+            )
         }
 
         "logging/setLevel" => {
@@ -555,7 +583,11 @@ pub(super) async fn dispatch_mcp_request(
             // Empty success encodes as `{}` (not `null`) to match stdio/HTTP.
             ipc_result!(
                 tool_router
-                    .subscribe_resource(&request.uri, target)
+                    .subscribe_resource(
+                        &request.uri,
+                        target,
+                        ctx.client_registry.client_key(session_id).as_deref(),
+                    )
                     .await
                     .map(|()| serde_json::json!({})),
             )

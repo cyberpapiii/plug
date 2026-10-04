@@ -1007,11 +1007,26 @@ impl ToolRouter {
                 )
             })
             .collect();
-        if **self.client_access.load() == next {
+        let current = self.client_access.load_full();
+        if *current == next {
             return;
         }
+        // A tool block touches the tool list only; a server block also moves
+        // that server's resources and prompts in or out of reach.
+        let server_blocks = |table: &HashMap<String, ClientAccess>| {
+            table
+                .iter()
+                .filter(|(_, access)| !access.blocked_servers.is_empty())
+                .map(|(key, access)| (key.clone(), access.blocked_servers.clone()))
+                .collect::<HashMap<_, _>>()
+        };
+        let servers_changed = server_blocks(&current) != server_blocks(&next);
         self.client_access.store(Arc::new(next));
         self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        if servers_changed {
+            self.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
+            self.publish_protocol_notification(ProtocolNotification::PromptListChanged);
+        }
     }
 
     /// Whether the client behind `client_key` may see and call `tool_name`.
@@ -1045,6 +1060,17 @@ impl ToolRouter {
             .load()
             .get(client_key)
             .is_none_or(|access| !access.blocked_servers.contains(server_id))
+    }
+
+    /// Whether the client behind `client_key` is kept from any server, so the
+    /// lists it is served need filtering at all.
+    pub(crate) fn client_has_blocked_servers(&self, client_key: Option<&str>) -> bool {
+        client_key.is_some_and(|client_key| {
+            self.client_access
+                .load()
+                .get(client_key)
+                .is_some_and(|access| !access.blocked_servers.is_empty())
+        })
     }
 
     fn ensure_client_may_use_tool(

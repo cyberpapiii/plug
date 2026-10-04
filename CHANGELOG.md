@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A client kept from a server is kept from all of it. Its resources, resource
+  templates, and prompts leave that client's lists, and reading one, getting
+  one, completing against one, or subscribing to one answers as if it did not
+  exist. Before, a block covered the server's tools only.
 - Pi, Warp, and Kiro are clients. `plug link pi`, `plug link warp`, and
   `plug link kiro` write each one's own MCP file, the Clients tab lists them,
   and `plug import` reads servers from them.

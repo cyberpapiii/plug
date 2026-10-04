@@ -1697,7 +1697,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     // delivers end-to-end, not just that a registry entry exists.
     let mut notifications = router.subscribe_notifications();
     router
-        .subscribe_resource(uri, target.clone())
+        .subscribe_resource(uri, target.clone(), None)
         .await
         .expect("subscribe to mock resource");
     assert_eq!(router.active_subscription_count(), 1);

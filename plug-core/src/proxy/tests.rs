@@ -4091,11 +4091,11 @@ async fn refresh_rebind_with_racing_last_unsubscribe_leaves_no_orphan() {
     );
 
     router
-        .subscribe_resource("memory://x", sub_target("a"))
+        .subscribe_resource("memory://x", sub_target("a"), None)
         .await
         .unwrap();
     router
-        .subscribe_resource("memory://y", sub_target("c"))
+        .subscribe_resource("memory://y", sub_target("c"), None)
         .await
         .unwrap();
     assert_eq!(old_state.subscribe_count("memory://x"), 1);
@@ -4181,7 +4181,7 @@ async fn setup_subscribe_racing_prune() -> (
 
     router.refresh_tools().await;
     router
-        .subscribe_resource("memory://x", sub_target("a"))
+        .subscribe_resource("memory://x", sub_target("a"), None)
         .await
         .unwrap();
 
@@ -4200,7 +4200,7 @@ async fn setup_subscribe_racing_prune() -> (
     let subscribe_router = Arc::clone(&router);
     let b = tokio::spawn(async move {
         subscribe_router
-            .subscribe_resource("memory://x", sub_target("b"))
+            .subscribe_resource("memory://x", sub_target("b"), None)
             .await
     });
     for _ in 0..5 {
@@ -4323,7 +4323,7 @@ async fn setup_refresh_parked_pre_publish() -> (
     // Give the refresh a second URI to prune so the pass can be parked
     // pre-publish. No subscription for x exists yet.
     router
-        .subscribe_resource("memory://y", sub_target("c"))
+        .subscribe_resource("memory://y", sub_target("c"), None)
         .await
         .unwrap();
 
@@ -4360,7 +4360,7 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     // First subscriber for x arrives inside the window and completes fully
     // pre-publish: it binds to the old owner (the still-published route).
     router
-        .subscribe_resource("memory://x", sub_target("a"))
+        .subscribe_resource("memory://x", sub_target("a"), None)
         .await
         .unwrap();
     assert_eq!(old_state.subscribe_count("memory://x"), 1);
@@ -4440,7 +4440,7 @@ async fn first_subscribe_straddling_publish_rebinds_via_self_check() {
     let subscribe_router = Arc::clone(&router);
     let a = tokio::spawn(async move {
         subscribe_router
-            .subscribe_resource("memory://x", sub_target("a"))
+            .subscribe_resource("memory://x", sub_target("a"), None)
             .await
     });
     entered_sub_x.await;
@@ -4577,7 +4577,7 @@ async fn caller_cancelled_subscribe_still_heals_via_post_confirm_hook() {
     let subscribe_router = Arc::clone(&router);
     let a = tokio::spawn(async move {
         subscribe_router
-            .subscribe_resource("memory://x", sub_target("a"))
+            .subscribe_resource("memory://x", sub_target("a"), None)
             .await
     });
     entered_sub_x.await;
@@ -4641,7 +4641,7 @@ async fn retry_subscribe_heals_stale_recorded_owner() {
     let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
 
     router
-        .subscribe_resource("memory://x", sub_target("a"))
+        .subscribe_resource("memory://x", sub_target("a"), None)
         .await
         .unwrap();
     assert_eq!(old_state.subscribe_count("memory://x"), 1);
@@ -4658,7 +4658,7 @@ async fn retry_subscribe_heals_stale_recorded_owner() {
     // transition, so no post-confirm hook fires). Its self-check must
     // detect owner != route via the RECORDED owner and heal before Ok.
     router
-        .subscribe_resource("memory://x", sub_target("b"))
+        .subscribe_resource("memory://x", sub_target("b"), None)
         .await
         .expect("retry against a skewed entry must succeed after healing");
 
@@ -4697,7 +4697,7 @@ async fn failed_heal_migration_propagates_error_to_subscriber() {
     let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
 
     router
-        .subscribe_resource("memory://x", sub_target("a"))
+        .subscribe_resource("memory://x", sub_target("a"), None)
         .await
         .unwrap();
 
@@ -4707,7 +4707,7 @@ async fn failed_heal_migration_propagates_error_to_subscriber() {
     new_state.fail_subscribe("memory://x");
 
     let err = router
-        .subscribe_resource("memory://x", sub_target("b"))
+        .subscribe_resource("memory://x", sub_target("b"), None)
         .await
         .expect_err("a failed migration must not be reported as success");
     assert!(
@@ -4729,7 +4729,7 @@ async fn failed_heal_migration_propagates_error_to_subscriber() {
     // A retry after the failure heals cleanly against the current owner.
     new_state.clear_subscribe_failure("memory://x");
     router
-        .subscribe_resource("memory://x", sub_target("b"))
+        .subscribe_resource("memory://x", sub_target("b"), None)
         .await
         .expect("a fresh subscribe after the failed migration must succeed");
     assert_eq!(new_state.subscribe_count("memory://x"), 2);
@@ -5016,20 +5016,201 @@ fn clients_hear_about_a_block_changing_and_about_nothing_else() {
     router.set_client_access(&clients);
     assert!(notifications.try_recv().is_err());
 
-    clients.get_mut("cursor").unwrap().blocked_servers = vec!["git".to_string()];
+    // A tool block changes the tool list and nothing else.
+    clients.get_mut("cursor").unwrap().blocked_tools = vec!["git__push".to_string()];
     router.set_client_access(&clients);
     assert_eq!(
-        notifications.try_recv().expect("block added"),
+        notifications.try_recv().expect("tool block added"),
         ProtocolNotification::ToolListChanged
     );
-    router.set_client_access(&clients);
-    assert!(notifications.try_recv().is_err(), "same blocks, no news");
+    assert!(notifications.try_recv().is_err());
 
+    // A server block also moves that server's resources and prompts.
+    let mut whole_server_change = |clients: &std::collections::BTreeMap<_, _>, what: &str| {
+        router.set_client_access(clients);
+        for expected in [
+            ProtocolNotification::ToolListChanged,
+            ProtocolNotification::ResourceListChanged,
+            ProtocolNotification::PromptListChanged,
+        ] {
+            assert_eq!(notifications.try_recv().expect(what), expected);
+        }
+        router.set_client_access(clients);
+        assert!(notifications.try_recv().is_err(), "same blocks, no news");
+    };
+    clients.get_mut("cursor").unwrap().blocked_servers = vec!["git".to_string()];
+    whole_server_change(&clients, "server block added");
     clients.clear();
-    router.set_client_access(&clients);
-    assert_eq!(
-        notifications.try_recv().expect("block removed"),
-        ProtocolNotification::ToolListChanged
-    );
+    whole_server_change(&clients, "blocks removed");
     assert!(router.client_may_use_tool(Some("cursor"), "git__commit"));
+}
+
+/// Two servers, each with a resource, a resource template, and a prompt.
+/// `cursor` is kept from `git`.
+fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
+    router.replace_snapshot(RouterSnapshot {
+        routes: HashMap::new(),
+        routes_lower: HashMap::new(),
+        tools_by_name: HashMap::new(),
+        tools_by_name_lower: HashMap::new(),
+        tools_all: Arc::new(Vec::new()),
+        meta_tools_all: Arc::new(build_meta_tools()),
+        tools_devin: Arc::new(Vec::new()),
+        tools_copilot: Arc::new(Vec::new()),
+        resources_all: Arc::new(vec![
+            Resource::new("git://log", "git__log"),
+            Resource::new("slack://inbox", "slack__inbox"),
+        ]),
+        resource_templates_all: Arc::new(vec![
+            ResourceTemplate::new("git://commit/{id}", "git__commit"),
+            ResourceTemplate::new("slack://channel/{id}", "slack__channel"),
+        ]),
+        prompts_all: Arc::new(vec![
+            Prompt::new("git__review", Some("Review a change"), None),
+            Prompt::new("slack__digest", Some("Digest a channel"), None),
+        ]),
+        resource_routes: HashMap::from([
+            ("git://log".to_string(), "git".to_string()),
+            ("git://commit/{id}".to_string(), "git".to_string()),
+            ("slack://inbox".to_string(), "slack".to_string()),
+            ("slack://channel/{id}".to_string(), "slack".to_string()),
+        ]),
+        prompt_routes: HashMap::from([
+            (
+                "git__review".to_string(),
+                ("git".to_string(), "review".to_string()),
+            ),
+            (
+                "slack__digest".to_string(),
+                ("slack".to_string(), "digest".to_string()),
+            ),
+        ]),
+        tool_definition_fingerprints: HashMap::new(),
+        tool_risk_inventory: HashMap::new(),
+    });
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "cursor".to_string(),
+        crate::config::ClientSettings {
+            blocked_servers: vec!["git".to_string()],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    Arc::new(router)
+}
+
+#[test]
+fn a_blocked_client_is_not_listed_the_resources_and_prompts_of_that_server() {
+    let router = router_with_blocked_resources_and_prompts();
+
+    let blocked = Some("cursor");
+    let resources = router.list_resources_page(None, blocked).resources;
+    assert_eq!(resources.len(), 1);
+    assert_eq!(resources[0].uri, "slack://inbox");
+    let templates = router
+        .list_resource_templates_page(None, blocked)
+        .resource_templates;
+    assert_eq!(templates.len(), 1);
+    assert_eq!(templates[0].uri_template, "slack://channel/{id}");
+    let prompts = router.list_prompts_page(None, blocked).prompts;
+    assert_eq!(prompts.len(), 1);
+    assert_eq!(prompts[0].name, "slack__digest");
+
+    // No entry, and no key at all, both get everything.
+    for unblocked in [Some("claude-code"), None] {
+        assert_eq!(
+            router.list_resources_page(None, unblocked).resources.len(),
+            2
+        );
+        assert_eq!(
+            router
+                .list_resource_templates_page(None, unblocked)
+                .resource_templates
+                .len(),
+            2
+        );
+        assert_eq!(router.list_prompts_page(None, unblocked).prompts.len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn a_blocked_resource_or_prompt_answers_as_one_that_does_not_exist() {
+    let router = router_with_blocked_resources_and_prompts();
+    let blocked = Some("cursor");
+    let complete = |reference: Reference| {
+        CompleteRequestParams::new(reference, ArgumentInfo::new("arg", "par"))
+    };
+
+    // An exact resource, and one a template expands to.
+    for (uri, missing) in [
+        ("git://log", "git://nope"),
+        ("git://commit/abc", "nope://commit/abc"),
+    ] {
+        let unknown = router
+            .read_resource(missing, blocked)
+            .await
+            .expect_err("no such resource")
+            .to_string();
+        let kept = router
+            .read_resource(uri, blocked)
+            .await
+            .expect_err("kept from the server")
+            .to_string();
+        assert_eq!(kept, unknown.replace(missing, uri));
+        // Anyone else gets as far as the server, which is not connected here.
+        let allowed = router
+            .read_resource(uri, None)
+            .await
+            .expect_err("no upstream is connected")
+            .to_string();
+        assert_ne!(allowed, kept);
+
+        let kept = router
+            .complete_request(complete(Reference::for_resource(uri)), blocked)
+            .await
+            .expect_err("kept from the server")
+            .to_string();
+        assert_eq!(kept, unknown.replace(missing, uri));
+    }
+
+    let unknown = router
+        .get_prompt("git__nope", None, blocked)
+        .await
+        .expect_err("no such prompt")
+        .to_string();
+    let kept = router
+        .get_prompt("git__review", None, blocked)
+        .await
+        .expect_err("kept from the server")
+        .to_string();
+    assert_eq!(kept, unknown.replace("git__nope", "git__review"));
+    let kept = router
+        .complete_request(complete(Reference::for_prompt("git__review")), blocked)
+        .await
+        .expect_err("kept from the server")
+        .to_string();
+    assert_eq!(kept, unknown.replace("git__nope", "git__review"));
+    assert_ne!(
+        router
+            .get_prompt("git__review", None, None)
+            .await
+            .expect_err("no upstream is connected")
+            .to_string(),
+        kept
+    );
+
+    let unknown = router
+        .subscribe_resource("git://nope", sub_target("a"), blocked)
+        .await
+        .expect_err("no such resource")
+        .to_string();
+    let kept = router
+        .subscribe_resource("git://log", sub_target("a"), blocked)
+        .await
+        .expect_err("kept from the server")
+        .to_string();
+    assert_eq!(kept, unknown.replace("git://nope", "git://log"));
+    assert_eq!(router.active_subscription_count(), 0);
 }

@@ -1395,13 +1395,19 @@ impl super::ToolRouter {
         &self,
         uri: &str,
         target: NotificationTarget,
+        client_key: Option<&str>,
     ) -> Result<(), McpError> {
         let snapshot = self.cache.load();
-        let server_id = snapshot.resource_routes.get(uri).cloned().ok_or_else(|| {
-            McpError::from(ProtocolError::InvalidRequest {
-                detail: format!("resource not found: {uri}"),
-            })
-        })?;
+        let server_id = snapshot
+            .resource_routes
+            .get(uri)
+            .filter(|server_id| self.client_may_use_server(client_key, server_id))
+            .cloned()
+            .ok_or_else(|| {
+                McpError::from(ProtocolError::InvalidRequest {
+                    detail: format!("resource not found: {uri}"),
+                })
+            })?;
         drop(snapshot);
 
         let upstream = self

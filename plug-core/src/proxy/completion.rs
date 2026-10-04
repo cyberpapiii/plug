@@ -1,14 +1,19 @@
 use super::*;
 
 impl super::ToolRouter {
-    pub async fn read_resource(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
+    pub async fn read_resource(
+        &self,
+        uri: &str,
+        client_key: Option<&str>,
+    ) -> Result<ReadResourceResult, McpError> {
         if uri.starts_with("plug://artifact/") {
             return self.artifact_store.read(uri);
         }
 
         let snapshot = self.cache.load();
-        let server_id =
-            resolve_resource_route(&snapshot.resource_routes, uri).ok_or_else(|| {
+        let server_id = resolve_resource_route(&snapshot.resource_routes, uri)
+            .filter(|server_id| self.client_may_use_server(client_key, server_id))
+            .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
                     detail: format!("resource not found: {uri}"),
                 })
@@ -44,10 +49,15 @@ impl super::ToolRouter {
         &self,
         name: &str,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        client_key: Option<&str>,
     ) -> Result<GetPromptResult, McpError> {
         let snapshot = self.cache.load();
-        let (server_id, prompt_name) =
-            snapshot.prompt_routes.get(name).cloned().ok_or_else(|| {
+        let (server_id, prompt_name) = snapshot
+            .prompt_routes
+            .get(name)
+            .filter(|(server_id, _)| self.client_may_use_server(client_key, server_id))
+            .cloned()
+            .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
                     detail: format!("prompt not found: {name}"),
                 })
@@ -89,6 +99,7 @@ impl super::ToolRouter {
     pub async fn complete_request(
         &self,
         mut params: CompleteRequestParams,
+        client_key: Option<&str>,
     ) -> Result<CompleteResult, McpError> {
         let snapshot = self.cache.load();
         let server_id = match &params.r#ref {
@@ -96,6 +107,7 @@ impl super::ToolRouter {
                 let (sid, original_name) = snapshot
                     .prompt_routes
                     .get(&prompt_ref.name)
+                    .filter(|(server_id, _)| self.client_may_use_server(client_key, server_id))
                     .cloned()
                     .ok_or_else(|| {
                         McpError::from(ProtocolError::InvalidRequest {
@@ -111,6 +123,7 @@ impl super::ToolRouter {
                 .get(&resource_ref.uri)
                 .cloned()
                 .or_else(|| resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri))
+                .filter(|server_id| self.client_may_use_server(client_key, server_id))
                 .ok_or_else(|| {
                     McpError::from(ProtocolError::InvalidRequest {
                         detail: format!("resource not found: {}", resource_ref.uri),

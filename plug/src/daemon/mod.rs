@@ -2085,6 +2085,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 client_id: Arc::from(session_id.as_str()),
             };
             let tool_router = Arc::clone(ctx.engine.tool_router());
+            let client_key = ctx.client_registry.client_key(session_id);
             let uris = uris.clone();
             const MAX_RESTORE_URIS: usize = 256;
             const MAX_RESTORE_IN_FLIGHT: usize = 8;
@@ -2111,9 +2112,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 }
                 let tool_router = Arc::clone(&tool_router);
                 let target = target.clone();
+                let client_key = client_key.clone();
                 join_set.spawn(async move {
                     tool_router
-                        .subscribe_resource(&uri, target)
+                        .subscribe_resource(&uri, target, client_key.as_deref())
                         .await
                         .map_err(|error| format!("{uri}: {error}"))
                 });
