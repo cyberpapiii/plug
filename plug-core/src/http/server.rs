@@ -2178,7 +2178,9 @@ async fn handle_request(
             if !modern {
                 validate_session_header(headers, state.sessions.as_ref())?;
             }
-            let result = state.router.list_resources_page(list_req.params);
+            let result = state
+                .router
+                .list_resources_page(list_req.params, policy_context.client_key.as_deref());
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourcesResult(result),
                 request_id,
@@ -2198,7 +2200,10 @@ async fn handle_request(
             if !modern {
                 validate_session_header(headers, state.sessions.as_ref())?;
             }
-            let result = state.router.list_resource_templates_page(list_req.params);
+            let result = state.router.list_resource_templates_page(
+                list_req.params,
+                policy_context.client_key.as_deref(),
+            );
             let response_msg = ServerJsonRpcMessage::response(
                 ServerResult::ListResourceTemplatesResult(result),
                 request_id,
@@ -2218,7 +2223,11 @@ async fn handle_request(
             if !modern {
                 validate_session_header(headers, state.sessions.as_ref())?;
             }
-            match state.router.read_resource(&read_req.params.uri).await {
+            match state
+                .router
+                .read_resource(&read_req.params.uri, policy_context.client_key.as_deref())
+                .await
+            {
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
                         ServerResult::ReadResourceResult(result),
@@ -2244,7 +2253,9 @@ async fn handle_request(
             if !modern {
                 validate_session_header(headers, state.sessions.as_ref())?;
             }
-            let result = state.router.list_prompts_page(list_req.params);
+            let result = state
+                .router
+                .list_prompts_page(list_req.params, policy_context.client_key.as_deref());
             let response_msg =
                 ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
             json_response_for_era(&response_msg, era)
@@ -2263,7 +2274,11 @@ async fn handle_request(
             }
             match state
                 .router
-                .get_prompt(&prompt_req.params.name, prompt_req.params.arguments)
+                .get_prompt(
+                    &prompt_req.params.name,
+                    prompt_req.params.arguments,
+                    policy_context.client_key.as_deref(),
+                )
                 .await
             {
                 Ok(result) => {
@@ -2302,7 +2317,11 @@ async fn handle_request(
             };
             match state
                 .router
-                .subscribe_resource(&sub_req.params.uri, target)
+                .subscribe_resource(
+                    &sub_req.params.uri,
+                    target,
+                    policy_context.client_key.as_deref(),
+                )
                 .await
             {
                 Ok(()) => {
@@ -2369,7 +2388,11 @@ async fn handle_request(
             if !modern {
                 validate_session_header(headers, state.sessions.as_ref())?;
             }
-            match state.router.complete_request(complete_req.params).await {
+            match state
+                .router
+                .complete_request(complete_req.params, policy_context.client_key.as_deref())
+                .await
+            {
                 Ok(result) => {
                     let response_msg = ServerJsonRpcMessage::response(
                         ServerResult::CompleteResult(result),

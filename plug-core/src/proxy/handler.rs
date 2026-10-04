@@ -235,6 +235,18 @@ impl ProxyHandler {
         self.router.modern_downstream_enabled()
     }
 
+    /// The key this server's one client goes by. A foreground stdio server has
+    /// no connector to say how it was linked, so the name it reports is all
+    /// there is.
+    fn client_key(&self) -> Option<String> {
+        let client_type = self
+            .client_type
+            .read()
+            .map(|ct| *ct)
+            .unwrap_or(ClientType::Unknown);
+        crate::ipc::local_client_key(None, client_type, None)
+    }
+
     fn downstream_context_for_call(
         &self,
         request_id: RequestId,
@@ -927,7 +939,8 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<ListResourcesResult, McpError>> + Send + '_ {
         async move {
             Ok(strip_legacy_catalog_cache(
-                self.router.list_resources_page(request),
+                self.router
+                    .list_resources_page(request, self.client_key().as_deref()),
                 is_modern_protocol(&context),
             ))
         }
@@ -940,7 +953,8 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
         async move {
             Ok(strip_legacy_catalog_cache(
-                self.router.list_resource_templates_page(request),
+                self.router
+                    .list_resource_templates_page(request, self.client_key().as_deref()),
                 is_modern_protocol(&context),
             ))
         }
@@ -953,7 +967,7 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
             self.router
-                .read_resource(&request.uri)
+                .read_resource(&request.uri, self.client_key().as_deref())
                 .await
                 .map(Into::into)
         }
@@ -966,7 +980,8 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<ListPromptsResult, McpError>> + Send + '_ {
         async move {
             Ok(strip_legacy_catalog_cache(
-                self.router.list_prompts_page(request),
+                self.router
+                    .list_prompts_page(request, self.client_key().as_deref()),
                 is_modern_protocol(&context),
             ))
         }
@@ -979,7 +994,11 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<GetPromptResponse, McpError>> + Send + '_ {
         async move {
             self.router
-                .get_prompt(&request.name, request.arguments)
+                .get_prompt(
+                    &request.name,
+                    request.arguments,
+                    self.client_key().as_deref(),
+                )
                 .await
                 .map(Into::into)
         }
@@ -993,7 +1012,11 @@ impl ServerHandler for ProxyHandler {
         let target = NotificationTarget::Stdio {
             client_id: Arc::clone(&self.client_id),
         };
-        async move { self.router.subscribe_resource(&request.uri, target).await }
+        async move {
+            self.router
+                .subscribe_resource(&request.uri, target, self.client_key().as_deref())
+                .await
+        }
     }
 
     fn unsubscribe(
@@ -1016,7 +1039,11 @@ impl ServerHandler for ProxyHandler {
         request: CompleteRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
-        async move { self.router.complete_request(request).await }
+        async move {
+            self.router
+                .complete_request(request, self.client_key().as_deref())
+                .await
+        }
     }
 }
 

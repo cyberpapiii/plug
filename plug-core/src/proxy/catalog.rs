@@ -842,11 +842,34 @@ impl super::ToolRouter {
         self.resource_subscriptions.len()
     }
 
+    /// The resources the client behind `client_key` may see: everything but
+    /// what belongs to a server it is kept from.
+    pub fn list_resources_for_client(&self, client_key: Option<&str>) -> Arc<Vec<Resource>> {
+        let snapshot = self.cache.load();
+        if !self.client_has_blocked_servers(client_key) {
+            return Arc::clone(&snapshot.resources_all);
+        }
+        Arc::new(
+            snapshot
+                .resources_all
+                .iter()
+                .filter(|resource| {
+                    snapshot
+                        .resource_routes
+                        .get(&resource.uri)
+                        .is_none_or(|server_id| self.client_may_use_server(client_key, server_id))
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn list_resources_page(
         &self,
         request: Option<PaginatedRequestParams>,
+        client_key: Option<&str>,
     ) -> ListResourcesResult {
-        let resources = self.list_resources();
+        let resources = self.list_resources_for_client(client_key);
         paginated_result(&resources, request, |resources, next_cursor| {
             ListResourcesResult {
                 meta: None,
@@ -863,11 +886,35 @@ impl super::ToolRouter {
         Arc::clone(&self.cache.load().resource_templates_all)
     }
 
+    pub fn list_resource_templates_for_client(
+        &self,
+        client_key: Option<&str>,
+    ) -> Arc<Vec<ResourceTemplate>> {
+        let snapshot = self.cache.load();
+        if !self.client_has_blocked_servers(client_key) {
+            return Arc::clone(&snapshot.resource_templates_all);
+        }
+        Arc::new(
+            snapshot
+                .resource_templates_all
+                .iter()
+                .filter(|template| {
+                    snapshot
+                        .resource_routes
+                        .get(&template.uri_template)
+                        .is_none_or(|server_id| self.client_may_use_server(client_key, server_id))
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
     pub fn list_resource_templates_page(
         &self,
         request: Option<PaginatedRequestParams>,
+        client_key: Option<&str>,
     ) -> ListResourceTemplatesResult {
-        let resource_templates = self.list_resource_templates();
+        let resource_templates = self.list_resource_templates_for_client(client_key);
         paginated_result(
             &resource_templates,
             request,
@@ -886,8 +933,34 @@ impl super::ToolRouter {
         Arc::clone(&self.cache.load().prompts_all)
     }
 
-    pub fn list_prompts_page(&self, request: Option<PaginatedRequestParams>) -> ListPromptsResult {
-        let prompts = self.list_prompts();
+    pub fn list_prompts_for_client(&self, client_key: Option<&str>) -> Arc<Vec<Prompt>> {
+        let snapshot = self.cache.load();
+        if !self.client_has_blocked_servers(client_key) {
+            return Arc::clone(&snapshot.prompts_all);
+        }
+        Arc::new(
+            snapshot
+                .prompts_all
+                .iter()
+                .filter(|prompt| {
+                    snapshot
+                        .prompt_routes
+                        .get(prompt.name.as_str())
+                        .is_none_or(|(server_id, _)| {
+                            self.client_may_use_server(client_key, server_id)
+                        })
+                })
+                .cloned()
+                .collect(),
+        )
+    }
+
+    pub fn list_prompts_page(
+        &self,
+        request: Option<PaginatedRequestParams>,
+        client_key: Option<&str>,
+    ) -> ListPromptsResult {
+        let prompts = self.list_prompts_for_client(client_key);
         paginated_result(&prompts, request, |prompts, next_cursor| {
             ListPromptsResult {
                 meta: None,

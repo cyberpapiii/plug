@@ -5472,14 +5472,14 @@ mod tests {
         assert!(capabilities.prompts.is_some());
 
         let read = router
-            .read_resource("memory://notes")
+            .read_resource("memory://notes", None)
             .await
             .expect("read resource");
         assert_eq!(read.contents.len(), 1);
 
         let prompt_name = router.list_prompts()[0].name.clone();
         let prompt = router
-            .get_prompt(prompt_name.as_str(), None)
+            .get_prompt(prompt_name.as_str(), None, None)
             .await
             .expect("get prompt");
         assert_eq!(prompt.messages.len(), 1);
