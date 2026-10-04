@@ -1224,6 +1224,7 @@ fn mock_server_config(tools: &str) -> ServerConfig {
         sandbox: None,
         spec: None,
         operations: Vec::new(),
+        token_in: None,
     }
 }
 
@@ -1993,6 +1994,7 @@ fn test_config_validation_valid() {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         },
     );
     let errors = validate_config(&cfg);
@@ -2028,6 +2030,7 @@ fn test_config_validation_catches_missing_command() {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         },
     );
     let errors = validate_config(&cfg);
@@ -2097,6 +2100,7 @@ async fn test_stdio_timeout_reconnects_cleanly() {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         },
     );
 
@@ -2181,6 +2185,7 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         },
     );
 
@@ -2448,6 +2453,7 @@ async fn run_http_upstream_crash_restart_scenario(
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         },
     );
 
@@ -3716,6 +3722,7 @@ async fn test_upstream_http_sends_protocol_version_header() {
         sandbox: None,
         spec: None,
         operations: Vec::new(),
+        token_in: None,
     };
 
     let upstream = sm
@@ -3922,6 +3929,7 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -4061,6 +4069,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         config.servers.insert(
@@ -4089,6 +4098,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         config.servers.insert(
@@ -4117,6 +4127,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -4255,6 +4266,7 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -4356,6 +4368,7 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -4449,6 +4462,7 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -4557,6 +4571,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -4656,6 +4671,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -5002,6 +5018,7 @@ fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -
         sandbox: None,
         spec: None,
         operations: Vec::new(),
+        token_in: None,
     }
 }
 
@@ -5758,6 +5775,7 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
 
@@ -5869,6 +5887,7 @@ async fn an_openapi_document_becomes_a_server() {
             "id": id,
             "verbose": query.get("verbose"),
             "authorization": authorization,
+            "key": headers.get("x-api-key").and_then(|value| value.to_str().ok()),
         }))
         .into_response()
     }
@@ -5922,7 +5941,7 @@ async fn an_openapi_document_becomes_a_server() {
     api.spec = Some(spec_path.to_string_lossy().into_owned());
     api.auth_token = Some("api-token".to_string().into());
     let mut config = Config::default();
-    config.servers.insert("pets".to_string(), api);
+    config.servers.insert("pets".to_string(), api.clone());
     assert!(validate_config(&config).is_empty());
 
     let engine = Arc::new(Engine::new(config));
@@ -5963,6 +5982,25 @@ async fn an_openapi_document_becomes_a_server() {
         .expect("call getPet for a missing pet");
     assert_eq!(missing.is_error, Some(true));
     assert!(text(&missing).contains("404"), "{}", text(&missing));
+
+    engine.shutdown().await;
+
+    // The same API, told that its key belongs in a header of its own.
+    api.token_in = Some("header:X-API-Key".to_string());
+    let mut config = Config::default();
+    config.servers.insert("pets".to_string(), api);
+    assert!(validate_config(&config).is_empty());
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+    let arguments = serde_json::json!({ "id": "rex" });
+    let found = engine
+        .tool_router()
+        .call_tool("getPet", arguments.as_object().cloned())
+        .await
+        .expect("call getPet with a key");
+    let body: serde_json::Value = serde_json::from_str(&text(&found)).expect("json body");
+    assert_eq!(body["key"], "api-token");
+    assert_eq!(body["authorization"], "");
 
     engine.shutdown().await;
     fixture.abort();

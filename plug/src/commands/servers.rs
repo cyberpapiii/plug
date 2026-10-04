@@ -250,6 +250,7 @@ pub(crate) async fn cmd_server_command(
             disabled,
             openapi,
             operations,
+            token_in,
         } => {
             cmd_server_add(
                 config_path,
@@ -266,6 +267,7 @@ pub(crate) async fn cmd_server_command(
                 disabled,
                 openapi,
                 operations,
+                token_in,
             )
             .await
         }
@@ -408,6 +410,7 @@ pub(crate) async fn cmd_server_add(
     disabled: bool,
     openapi: Option<String>,
     operations: Vec<String>,
+    token_in: Option<String>,
 ) -> anyhow::Result<()> {
     let (_path, config) = load_editable_config(config_path)?;
     let name = match name {
@@ -438,6 +441,9 @@ pub(crate) async fn cmd_server_add(
     }
     if !operations.is_empty() && openapi.is_none() {
         anyhow::bail!("`--operations` only applies with `--openapi`");
+    }
+    if token_in.is_some() && openapi.is_none() {
+        anyhow::bail!("`--token-in` only applies with `--openapi`");
     }
     let transport = match transport {
         None if openapi.is_some() => plug_core::config::TransportType::OpenApi,
@@ -510,6 +516,7 @@ pub(crate) async fn cmd_server_add(
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             }
         }
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
@@ -555,6 +562,7 @@ pub(crate) async fn cmd_server_add(
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             };
             if let Some(selection) = noninteractive_remote_auth_selection(
                 auth,
@@ -618,6 +626,7 @@ pub(crate) async fn cmd_server_add(
                 sandbox: None,
                 spec: Some(spec),
                 operations,
+                token_in,
             };
             // Read the document now, so a bad address or an API too large to
             // add whole is reported here and not later in a log.
@@ -628,6 +637,9 @@ pub(crate) async fn cmd_server_add(
                 document.operations.len(),
                 document.base_url
             ));
+            if server.auth_token.is_some() {
+                print_info_line(format!("The token goes {}", document.token_place));
+            }
             server
         }
     };
@@ -925,7 +937,7 @@ pub(crate) async fn cmd_server_edit(
                 if !non_interactive {
                     anyhow::bail!(
                         "edit an API server with `--url` or `--bearer-token`, or change \
-                         `spec` and `operations` in the config file"
+                         `spec`, `operations`, and `token_in` in the config file"
                     );
                 }
                 if let Some(url) = url {
@@ -1064,6 +1076,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 
@@ -1092,6 +1105,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 
@@ -1364,6 +1378,7 @@ mod tests {
             false,
             None,
             Vec::new(),
+            None,
         )
         .await
         .unwrap();

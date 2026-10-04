@@ -218,6 +218,7 @@ pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> b
         || old.health_check_interval_secs != new.health_check_interval_secs
         || old.spec != new.spec
         || old.operations != new.operations
+        || old.token_in != new.token_in
 }
 
 /// Apply a config diff to the running engine.
@@ -394,6 +395,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 

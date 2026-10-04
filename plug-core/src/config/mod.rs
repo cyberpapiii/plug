@@ -483,6 +483,11 @@ pub struct ServerConfig {
     /// `operationId`; `*` is a wildcard. Empty means all of them.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<String>,
+    /// Where an openapi server sends `auth_token`: `bearer`,
+    /// `header:<name>`, or `query:<name>`. Omitted, the OpenAPI document
+    /// decides, and a bearer token is the fallback.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_in: Option<String>,
 }
 
 /// Stand-in the daemon sends in place of a stored secret. Operator clients hand
@@ -970,6 +975,11 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                     errors.push(format!(
                         "server '{name}': openapi transport takes auth_token, not auth = \"oauth\""
                     ));
+                }
+                if let Some(token_in) = &server.token_in
+                    && let Err(error) = crate::openapi::TokenPlace::parse(token_in)
+                {
+                    errors.push(format!("server '{name}': {error}"));
                 }
             }
         }
@@ -1803,6 +1813,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1862,6 +1873,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1901,6 +1913,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -1940,6 +1953,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2281,6 +2295,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2320,6 +2335,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2356,6 +2372,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2391,6 +2408,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2426,6 +2444,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2461,6 +2480,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);
@@ -2500,6 +2520,7 @@ LOG_LEVEL = "debug"
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         let errors = validate_config(&cfg);

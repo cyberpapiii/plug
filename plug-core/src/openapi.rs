@@ -74,6 +74,125 @@ pub struct ApiDocument {
     pub version: String,
     pub base_url: Url,
     pub operations: Vec<Operation>,
+    /// Where the API wants the server's token.
+    pub token_place: TokenPlace,
+}
+
+/// Where a request carries the server's `auth_token`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenPlace {
+    /// `Authorization: Bearer <token>`.
+    Bearer,
+    /// A header of this name holding the token alone.
+    Header(String),
+    /// A query parameter of this name.
+    Query(String),
+}
+
+impl TokenPlace {
+    /// Read the `token_in` setting: `bearer`, `header:<name>`, or
+    /// `query:<name>`.
+    pub fn parse(setting: &str) -> anyhow::Result<Self> {
+        let place = match setting.split_once(':') {
+            None if setting.eq_ignore_ascii_case("bearer") => Some(Self::Bearer),
+            Some(("header", name)) => Self::header(name),
+            Some(("query", name)) if !name.is_empty() => Some(Self::Query(name.to_string())),
+            _ => None,
+        };
+        place.ok_or_else(|| {
+            anyhow::anyhow!(
+                "token_in '{setting}' is not 'bearer', 'header:<name>', or 'query:<name>'"
+            )
+        })
+    }
+
+    /// A header place, unless the name cannot be a header or is one the
+    /// HTTP client owns.
+    fn header(name: &str) -> Option<Self> {
+        let parsed = http::HeaderName::from_bytes(name.as_bytes()).ok()?;
+        let owned = [
+            http::header::HOST,
+            http::header::CONTENT_LENGTH,
+            http::header::CONTENT_TYPE,
+            http::header::TRANSFER_ENCODING,
+            http::header::CONNECTION,
+        ];
+        (!owned.contains(&parsed)).then(|| Self::Header(name.to_string()))
+    }
+
+    /// The place the document asks for. Only a document whose security
+    /// schemes agree decides; otherwise a bearer token is assumed and
+    /// `token_in` can say different.
+    fn from_document(root: &Value) -> Self {
+        let mut places = Vec::new();
+        let schemes = root
+            .pointer("/components/securitySchemes")
+            .and_then(Value::as_object);
+        for scheme in schemes.into_iter().flat_map(|schemes| schemes.values()) {
+            let scheme = resolve(root, scheme);
+            let field = |key: &str| scheme.get(key).and_then(Value::as_str).unwrap_or_default();
+            let place = match field("type") {
+                "apiKey" => match field("in") {
+                    "header" => Self::header(field("name")),
+                    "query" if !field("name").is_empty() => {
+                        Some(Self::Query(field("name").to_string()))
+                    }
+                    _ => None,
+                },
+                "http" if field("scheme").eq_ignore_ascii_case("bearer") => Some(Self::Bearer),
+                "oauth2" | "openIdConnect" => Some(Self::Bearer),
+                _ => None,
+            };
+            if let Some(place) = place
+                && !places.contains(&place)
+            {
+                places.push(place);
+            }
+        }
+        match places.len() {
+            1 => places.remove(0),
+            _ => Self::Bearer,
+        }
+    }
+
+    /// Put `token` on `request`. A tool argument never fills the same place.
+    fn apply(&self, token: &str, request: &mut PlannedRequest) {
+        match self {
+            Self::Bearer => request
+                .headers
+                .push(("authorization".to_string(), format!("Bearer {token}"))),
+            Self::Header(name) => {
+                request
+                    .headers
+                    .retain(|(header, _)| !header.eq_ignore_ascii_case(name));
+                request.headers.push((name.clone(), token.to_string()));
+            }
+            Self::Query(name) => {
+                let kept: Vec<(String, String)> = request
+                    .url
+                    .query_pairs()
+                    .filter(|(key, _)| key != name)
+                    .map(|(key, value)| (key.into_owned(), value.into_owned()))
+                    .collect();
+                request
+                    .url
+                    .query_pairs_mut()
+                    .clear()
+                    .extend_pairs(kept)
+                    .append_pair(name, token);
+            }
+        }
+    }
+}
+
+impl std::fmt::Display for TokenPlace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Bearer => f.write_str("in the Authorization header as a bearer token"),
+            Self::Header(name) => write!(f, "in the {name} header"),
+            Self::Query(name) => write!(f, "in the {name} query parameter"),
+        }
+    }
 }
 
 /// Read and parse the document `config` names.
@@ -83,7 +202,10 @@ pub async fn load(name: &str, config: &ServerConfig) -> anyhow::Result<ApiDocume
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("openapi transport requires 'spec' to be set"))?;
     let text = read_document(spec, Duration::from_secs(config.timeout_secs)).await?;
-    let document = parse_document(&text, spec, config.url.as_deref(), &config.operations)?;
+    let mut document = parse_document(&text, spec, config.url.as_deref(), &config.operations)?;
+    if let Some(token_in) = &config.token_in {
+        document.token_place = TokenPlace::parse(token_in)?;
+    }
     tracing::info!(
         server = %name,
         api = %document.title,
@@ -271,6 +393,7 @@ pub fn parse_document(
         version,
         base_url,
         operations,
+        token_place: TokenPlace::from_document(&root),
     })
 }
 
@@ -649,8 +772,8 @@ impl Operation {
     }
 }
 
-/// The HTTP request one tool call turns into.
-#[derive(Debug)]
+/// The HTTP request one tool call turns into. It can hold the token, so it
+/// has no `Debug`.
 struct PlannedRequest {
     url: Url,
     headers: Vec<(String, String)>,
@@ -684,11 +807,16 @@ impl OpenApiServer {
     }
 
     async fn call(&self, operation: &Operation, arguments: &Map<String, Value>) -> CallToolResult {
-        let PlannedRequest { url, headers, body } =
-            match operation.request(&self.document.base_url, arguments) {
-                Ok(request) => request,
-                Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
-            };
+        let mut planned = match operation.request(&self.document.base_url, arguments) {
+            Ok(request) => request,
+            Err(message) => return CallToolResult::error(vec![ContentBlock::text(message)]),
+        };
+        if let Some(token) = &self.auth_token {
+            self.document
+                .token_place
+                .apply(token.as_str(), &mut planned);
+        }
+        let PlannedRequest { url, headers, body } = planned;
 
         let mut request = self
             .client
@@ -697,9 +825,6 @@ impl OpenApiServer {
             .header(http::header::ACCEPT, "application/json, */*;q=0.8");
         for (name, value) in headers {
             request = request.header(name, value);
-        }
-        if let Some(token) = &self.auth_token {
-            request = request.bearer_auth(token.as_str());
         }
         if let Some(body) = body {
             request = request
@@ -1054,7 +1179,92 @@ mod tests {
             .unwrap();
         assert!(url.path().starts_with("/v1/pets"), "{url}");
 
-        let error = get.request(&document.base_url, &Map::new()).unwrap_err();
+        let error = get
+            .request(&document.base_url, &Map::new())
+            .err()
+            .expect("an error");
         assert!(error.contains("petId"), "{error}");
+    }
+
+    fn with_schemes(schemes: &str) -> Value {
+        serde_json::from_str(&format!(
+            r#"{{"components":{{"securitySchemes":{schemes}}}}}"#
+        ))
+        .expect("json")
+    }
+
+    #[test]
+    fn the_document_says_where_the_token_goes() {
+        let header = with_schemes(r#"{"key":{"type":"apiKey","in":"header","name":"X-API-Key"}}"#);
+        assert_eq!(
+            TokenPlace::from_document(&header),
+            TokenPlace::Header("X-API-Key".into())
+        );
+        let query = with_schemes(r#"{"key":{"type":"apiKey","in":"query","name":"api_key"}}"#);
+        assert_eq!(
+            TokenPlace::from_document(&query),
+            TokenPlace::Query("api_key".into())
+        );
+        // Schemes that disagree, a cookie, and no schemes all fall back.
+        let mixed = with_schemes(
+            r#"{"key":{"type":"apiKey","in":"header","name":"X-API-Key"},"oauth":{"type":"oauth2"}}"#,
+        );
+        assert_eq!(TokenPlace::from_document(&mixed), TokenPlace::Bearer);
+        let cookie = with_schemes(r#"{"key":{"type":"apiKey","in":"cookie","name":"sid"}}"#);
+        assert_eq!(TokenPlace::from_document(&cookie), TokenPlace::Bearer);
+        assert_eq!(petstore().token_place, TokenPlace::Bearer);
+    }
+
+    #[test]
+    fn the_setting_names_a_place_or_is_refused() {
+        assert_eq!(
+            TokenPlace::parse("bearer").expect("bearer"),
+            TokenPlace::Bearer
+        );
+        assert_eq!(
+            TokenPlace::parse("header:X-API-Key").expect("header"),
+            TokenPlace::Header("X-API-Key".into())
+        );
+        assert_eq!(
+            TokenPlace::parse("query:key").expect("query"),
+            TokenPlace::Query("key".into())
+        );
+        for bad in [
+            "cookie:sid",
+            "header:",
+            "header:Host",
+            "header:bad name",
+            "query:",
+            "x",
+        ] {
+            assert!(TokenPlace::parse(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_token_replaces_an_argument_in_the_same_place() {
+        let plan = || PlannedRequest {
+            url: Url::parse("https://api.example.com/v1/pets?key=mine&limit=2").expect("url"),
+            headers: vec![("x-api-key".to_string(), "mine".to_string())],
+            body: None,
+        };
+
+        let mut request = plan();
+        TokenPlace::Query("key".into()).apply("secret", &mut request);
+        assert_eq!(request.url.query(), Some("limit=2&key=secret"));
+
+        let mut request = plan();
+        TokenPlace::Header("X-API-Key".into()).apply("secret", &mut request);
+        assert_eq!(
+            request.headers,
+            vec![("X-API-Key".to_string(), "secret".to_string())]
+        );
+
+        let mut request = plan();
+        TokenPlace::Bearer.apply("secret", &mut request);
+        assert_eq!(
+            request.headers.last(),
+            Some(&("authorization".to_string(), "Bearer secret".to_string()))
+        );
     }
 }

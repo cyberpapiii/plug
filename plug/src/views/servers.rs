@@ -47,6 +47,7 @@ async fn prompt_server_actions(
                 false,
                 None,
                 Vec::new(),
+                None,
             )
             .await?;
             Ok(true)

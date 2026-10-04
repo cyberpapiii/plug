@@ -1638,6 +1638,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
 
         assert!(
@@ -1675,6 +1676,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
 
         let store = oauth::get_or_create_store(&server_name);
@@ -1731,6 +1733,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -1778,6 +1781,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -2089,6 +2093,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
         let store = oauth::get_or_create_store(&server_name);
         store.clear().await.unwrap();

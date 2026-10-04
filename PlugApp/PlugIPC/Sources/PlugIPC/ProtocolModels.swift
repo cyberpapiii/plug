@@ -410,6 +410,8 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     /// The app has no fields for these; it carries them so a save keeps them.
     public var spec: String?
     public var operations: [String] = []
+    /// Where an API server sends its token; the app carries it unchanged.
+    public var tokenIn: String?
 
     public static func command(_ command: String, args: [String]) -> Self {
         Self(command: command, args: args, transport: "stdio")
@@ -430,7 +432,7 @@ extension ServerConfig {
         case command, args, env, enabled, transport, protocolMode = "protocol", url, authToken
         case auth, oauthClientID, oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
         case healthCheckIntervalSecs, circuitBreakerEnabled, enrichment, toolRenames, toolGroups
-        case sandbox, spec, operations
+        case sandbox, spec, operations, tokenIn
     }
 
     public init(from decoder: Decoder) throws {
@@ -457,6 +459,7 @@ extension ServerConfig {
         sandbox = try c.decodeIfPresent(StdioSandboxConfig.self, forKey: .sandbox)
         spec = try c.decodeIfPresent(String.self, forKey: .spec)
         operations = try c.decodeIfPresent([String].self, forKey: .operations) ?? []
+        tokenIn = try c.decodeIfPresent(String.self, forKey: .tokenIn)
     }
 }
 

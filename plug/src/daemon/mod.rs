@@ -2755,6 +2755,7 @@ mod tests {
                     sandbox: None,
                     spec: None,
                     operations: Vec::new(),
+                    token_in: None,
                 },
             );
         }
@@ -3149,6 +3150,7 @@ mod tests {
                 sandbox: None,
                 spec: None,
                 operations: Vec::new(),
+                token_in: None,
             },
         );
         std::fs::write(
@@ -3565,6 +3567,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 

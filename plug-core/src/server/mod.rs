@@ -2937,6 +2937,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 
@@ -3512,6 +3513,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 
@@ -4718,6 +4720,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         };
 
         let err = anyhow::anyhow!(
@@ -6251,6 +6254,7 @@ mod tests {
             sandbox: None,
             spec: None,
             operations: Vec::new(),
+            token_in: None,
         }
     }
 
