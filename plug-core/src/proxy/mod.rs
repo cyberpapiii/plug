@@ -2475,6 +2475,9 @@ impl ToolRouter {
         let mut resources_vec = Vec::new();
         for (server_name, mut resource) in upstream_resources {
             catalog_metadata_budget.admit(&server_name, &mut resource.meta, "resource");
+            if let std::borrow::Cow::Owned(named) = skills::outward(&server_name, &resource.uri) {
+                resource.uri = named;
+            }
             if let Some(existing_server) = resource_routes.get(&resource.uri)
                 && existing_server != &server_name
             {
@@ -2516,6 +2519,11 @@ impl ToolRouter {
         let mut resource_templates_vec = Vec::new();
         for (server_name, mut template) in upstream_resource_templates {
             catalog_metadata_budget.admit(&server_name, &mut template.meta, "resource-template");
+            if let std::borrow::Cow::Owned(named) =
+                skills::outward(&server_name, &template.uri_template)
+            {
+                template.uri_template = named;
+            }
             let prefix = crate::tool_naming::format_server_prefix(&server_name);
             let original_name = template.name.clone();
             let routed_name = if self.config.enable_prefix {
@@ -3494,6 +3502,7 @@ impl ToolRouter {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
                     admit_tool_result_meta(&mut response);
+                    skills::outward_tool_result(&server_id, &mut response);
                     finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
@@ -4294,6 +4303,7 @@ mod catalog;
 mod completion;
 pub mod continuations;
 mod handler;
+mod skills;
 mod subscriptions;
 mod tasks;
 pub(crate) use catalog::*;

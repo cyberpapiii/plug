@@ -199,7 +199,9 @@ impl UpstreamResourceOps for crate::server::UpstreamServer {
         Box::pin(async move {
             self.client
                 .peer()
-                .subscribe(SubscribeRequestParams::new(uri))
+                .subscribe(SubscribeRequestParams::new(
+                    skills::inward(&self.name, uri).into_owned(),
+                ))
                 .await
                 .map_err(map_service_error)
         })
@@ -212,7 +214,7 @@ impl UpstreamResourceOps for crate::server::UpstreamServer {
         Box::pin(async move {
             self.client
                 .peer()
-                .unsubscribe(make_unsubscribe_params(uri))
+                .unsubscribe(make_unsubscribe_params(&skills::inward(&self.name, uri)))
                 .await
                 .map_err(map_service_error)
         })
@@ -1563,6 +1565,13 @@ impl super::ToolRouter {
             })
             .await;
         self.subscriber_client_keys.remove(target);
+    }
+
+    /// Write `uri`, as `server` sent it, the way clients know it.
+    pub(crate) fn name_skill_server(&self, server: &str, uri: &mut String) {
+        if let std::borrow::Cow::Owned(named) = skills::outward(server, uri) {
+            *uri = named;
+        }
     }
 
     /// Route an upstream resource-updated notification to subscribed downstream clients.

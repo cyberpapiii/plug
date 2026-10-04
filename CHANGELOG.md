@@ -24,6 +24,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   secret's name goes, and `<id>:<name>` runs it. A store that locks after a
   server started does not stop that server: Plug keeps the value it read, in
   memory only, and uses it until the store answers again.
+- Skills served over MCP keep their server's name. A `skill://` resource
+  from a server reaches every client as `skill://<server>/…`, in the
+  resource list, in reads, in update notices, and in tool results, so two
+  servers with a skill of the same name no longer collide and a client can
+  tell where a skill came from. A skill file that is not listed is read
+  through its server's name, and a URI written without the name still works
+  when one server serves it.
 - A key typed into Plug goes to the Keychain on its own. Adding or editing a
   server in the app or with `plug server add` stores its token, and any `env`
   entry whose name says it is a credential, in the Keychain and writes
