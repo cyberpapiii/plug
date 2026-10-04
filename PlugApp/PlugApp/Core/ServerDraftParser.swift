@@ -92,7 +92,7 @@ enum ServerDraftParser {
         guard let data = text.data(using: .utf8),
               let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
         else {
-            return .unreadable("That looks like JSON, but it isn't complete. Copy the whole block, including both braces.")
+            return .unreadable("That setup block is not complete. Copy the whole block, including both braces.")
         }
 
         // Editors' config files wrap entries in "mcpServers" (or "servers").
@@ -101,9 +101,9 @@ enum ServerDraftParser {
             ?? root
 
         if looksLikeServerBody(container) {
-            let name = (container["name"] as? String) ?? "New server"
+            let name = (container["name"] as? String) ?? ""
             guard let draft = draft(named: name, from: container) else {
-                return .unreadable("That entry has no command or url, so there's nothing to connect to.")
+                return .unreadable("That block has no command or address, so there is nothing to connect to.")
             }
             return .draft(draft)
         }
@@ -115,7 +115,7 @@ enum ServerDraftParser {
         .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
 
         guard let first = entries.first else {
-            return .unreadable("No server entries in there. Paste the block that has a command or url inside it.")
+            return .unreadable("That block has no server in it. Paste the one with a command or address inside.")
         }
         return .draft(first)
     }
@@ -183,10 +183,14 @@ enum ServerDraftParser {
     }
 
     private static func suggestedName(forHost url: String) -> String {
-        guard let host = URL(string: url)?.host else { return "New server" }
-        let stripped = host.hasPrefix("www.") ? String(host.dropFirst(4)) : host
-        let label = stripped.split(separator: ".").first.map(String.init) ?? stripped
-        return label.isEmpty ? "New server" : label
+        guard let host = URL(string: url)?.host else { return "" }
+        // "mcp.notion.com" is Notion's server, not one called "mcp". The last
+        // two labels are left alone, so "mcp.com" does not become "com".
+        var labels = host.split(separator: ".").map(String.init)
+        while labels.count > 2, ["www", "mcp", "api"].contains(labels[0].lowercased()) {
+            labels.removeFirst()
+        }
+        return labels.first ?? ""
     }
 
     // MARK: - Shell command
@@ -194,7 +198,7 @@ enum ServerDraftParser {
     private static func parseCommand(_ text: String) -> ServerDraftParse {
         var tokens = tokenize(text)
         guard !tokens.isEmpty else {
-            return .unreadable("Paste a command, a URL, or the JSON block from the server's instructions.")
+            return .unreadable("Paste a setup block, a command, or a web address from the server's instructions.")
         }
 
         var env: [String: String] = [:]
@@ -204,7 +208,7 @@ enum ServerDraftParser {
         }
 
         guard let command = tokens.first else {
-            return .unreadable("That's only environment variables. Add the command that starts the server.")
+            return .unreadable("Those are only variables. Add the command that starts the server.")
         }
 
         var config = ServerConfig.command(command, args: Array(tokens.dropFirst()))
@@ -300,20 +304,20 @@ enum ServerDraftParser {
         switch config.transport {
         case "openapi":
             facts.append(DraftFact(label: "Reads", value: config.spec ?? "—"))
-            facts.append(DraftFact(label: "Kind", value: "HTTP API, one tool for each operation"))
+            facts.append(DraftFact(label: "Kind", value: "Web API · one tool per operation"))
         case "http", "sse":
             facts.append(DraftFact(label: "Connects to", value: config.url ?? "—"))
-            facts.append(DraftFact(label: "Kind", value: "Over the network"))
+            facts.append(DraftFact(label: "Where", value: "Over the network"))
             if config.authToken != nil {
-                facts.append(DraftFact(label: "Authorization", value: "Token included"))
+                facts.append(DraftFact(label: "Key", value: "Included"))
             }
         default:
             let invocation = ([config.command ?? ""] + config.args).joined(separator: " ")
             facts.append(DraftFact(label: "Runs", value: invocation.trimmingCharacters(in: .whitespaces)))
-            facts.append(DraftFact(label: "Kind", value: "On this Mac"))
+            facts.append(DraftFact(label: "Where", value: "On this Mac"))
             if !config.env.isEmpty {
                 let names = config.env.keys.sorted().joined(separator: ", ")
-                facts.append(DraftFact(label: "Environment", value: names))
+                facts.append(DraftFact(label: "Variables", value: names))
             }
         }
         return facts

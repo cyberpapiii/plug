@@ -79,8 +79,7 @@ extension LiveSession {
         }
         guard isUnknown else { return type }
         if let host, !host.name.isEmpty { return host.name }
-        let remote = ["http", "streamable_http", "sse"].contains(transport.lowercased())
-        return "Unidentified \(remote ? "remote" : "local") client \(sessionId.prefix(4))"
+        return "Unknown client \(sessionId.prefix(4))"
     }
 }
 
@@ -124,9 +123,13 @@ struct ClientNames: Equatable {
     /// Plug does not know takes the name on its grant, which the owner
     /// approved, ahead of whatever the session says about itself.
     func displayName(_ session: LiveSession) -> String {
+        name(forKey: key(of: session)) ?? originalName(session)
+    }
+
+    /// What a session is called before the owner names it.
+    func originalName(_ session: LiveSession) -> String {
         let key = key(of: session)
-        return name(forKey: key)
-            ?? session.knownName
+        return session.knownName
             // A link says which client it was written for; that outranks
             // the program that happened to start the connector.
             ?? key.flatMap(AppIcons.displayName(forTarget:))
@@ -162,7 +165,7 @@ struct ClientAccess: Equatable {
 
     var isLimited: Bool { !blockedServers.isEmpty || blockedToolCount > 0 }
 
-    /// What the row says when the client is kept from something.
+    /// What the status line says when something is off for the client.
     var summary: String? {
         guard isLimited else { return nil }
         var parts: [String] = []
@@ -173,7 +176,7 @@ struct ClientAccess: Equatable {
         if blockedToolCount > 0 {
             parts.append(blockedToolCount == 1 ? "1 tool" : "\(blockedToolCount) tools")
         }
-        return "kept from " + parts.joined(separator: " and ")
+        return parts.joined(separator: " and ") + " off"
     }
 }
 
@@ -201,11 +204,8 @@ struct ClientsView: View {
             return !isSecondary || app.linked || app.live
         }
     }
-    private var apps: [LinkableApp] {
-        allApps.filter { matches($0.name) || matches($0.target) }
-    }
     /// Every app is placed against all sessions, then search narrows what
-    /// shows, so a session never moves to "Other" because its app was
+    /// shows, so a session never leaves its app's row because the app was
     /// filtered out.
     private var roster: AppRoster { AppRoster(apps: allApps, sessions: sessions) }
     private var connectedApps: [AppRoster.Connected] {
@@ -221,21 +221,45 @@ struct ClientsView: View {
                 || matches($0.source) || matches($0.clientId)
         }
     }
-    private var unmatchedSessions: [LiveSession] {
-        roster.other.filter {
-            matches(displayName($0)) || matches($0.transport) || matches($0.sessionId)
-        }
-    }
-    @State private var renaming: Renaming?
-    @State private var newName = ""
-    /// The network client being turned off, while the app asks first.
-    @State private var revoking: Entry?
 
-    /// The client being renamed.
-    private struct Renaming {
-        let key: String
-        /// Set when the owner already named it, so the name can be taken back.
-        let hasName: Bool
+    /// The open sessions no app claimed, sorted into the clients they belong
+    /// to, so one client is one row however many connections it has open.
+    private struct Unclaimed {
+        /// Sessions of a client allowed in over the network, by its key.
+        var byGrant: [String: [LiveSession]] = [:]
+        /// Every other client, with all of its sessions.
+        var clients: [(id: String, sessions: [LiveSession])] = []
+    }
+
+    private var unclaimed: Unclaimed {
+        let grantKeys = Set(model.snapshot.downstreamClients.map(\.clientKey))
+        var result = Unclaimed()
+        var index: [String: Int] = [:]
+        for session in roster.other {
+            if let key = names.key(of: session), grantKeys.contains(key) {
+                result.byGrant[key, default: []].append(session)
+                continue
+            }
+            // A session whose key is shared with other clients stays a row of
+            // its own.
+            let id = "session:\(accessKey(of: session) ?? session.sessionId)"
+            if let at = index[id] {
+                result.clients[at].sessions.append(session)
+            } else {
+                index[id] = result.clients.count
+                result.clients.append((id: id, sessions: [session]))
+            }
+        }
+        return result
+    }
+
+    /// The network client whose access is being removed, while the app asks
+    /// first.
+    @State private var revoking: Revoking?
+
+    private struct Revoking {
+        let id: String
+        let name: String
     }
 
     private func access(key: String, name: String) -> ClientAccess {
@@ -250,7 +274,7 @@ struct ClientsView: View {
     /// Server choices for an app on this Mac, stored under the name its link
     /// was written for. An app that reaches Plug over the network sends its
     /// requests under its grant instead, and is offered them in its row under
-    /// Over the network; a choice made here would not reach it.
+    /// Over the Network; a choice made here would not reach it.
     private func access(to app: LinkableApp, sessions: [LiveSession]) -> ClientAccess? {
         guard app.linked || !sessions.isEmpty else { return nil }
         let overNetwork = app.transport?.lowercased() == "http"
@@ -259,43 +283,43 @@ struct ClientsView: View {
         return access(key: app.target, name: names.name(forKey: app.target) ?? app.name)
     }
 
+    private static func isRemote(_ session: LiveSession) -> Bool {
+        ["http", "streamable_http", "sse"].contains(session.transport.lowercased())
+    }
+
     /// The key a session's requests carry, when it is one a block can be
     /// stored under. A remote session with no grant shares its key with every
     /// other such session, so it is not offered server choices of its own.
     private func accessKey(of session: LiveSession) -> String? {
         guard let key = names.key(of: session) else { return nil }
-        let remote = ["http", "streamable_http", "sse"].contains(session.transport.lowercased())
-        return remote && !key.hasPrefix("oauth:") ? nil : key
-    }
-
-    private func rename(key: String, shown: String) {
-        newName = shown
-        renaming = Renaming(key: key, hasName: names.name(forKey: key) != nil)
+        return Self.isRemote(session) && !key.hasPrefix("oauth:") ? nil : key
     }
 
     var body: some View {
-        Group {
+        let entries = self.entries
+        return Group {
             if model.isLoadingInitialData {
-                LoadingPage(message: "Loading clients…")
+                LoadingPage(message: "Loading clients")
             } else if model.initialDataUnavailable {
-                UnavailablePage(item: "Clients") { run(.reconnect) }
+                UnavailablePage(verdict: model.verdict, run: run)
             } else if model.isLoadingConnectableApps && entries.isEmpty {
-                LoadingPage(message: "Looking for clients…")
+                LoadingPage(message: "Loading clients")
             } else if entries.isEmpty {
                 if let error = model.connectableAppsError {
                     ContentUnavailableView {
-                        Label("Plug could not look for clients", systemImage: "exclamationmark.triangle")
+                        Label("Clients Unavailable", systemImage: "bolt.slash")
                     } description: {
                         Text(error)
                     } actions: {
                         Button("Try Again") { Task { await model.loadConnectableApps() } }
+                            .buttonStyle(.borderedProminent)
                     }
                 } else if search.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyPage(
-                        title: "No clients yet",
+                        title: "No Clients",
                         message: "A client is an app that uses your servers, such as Claude or Cursor. When Plug finds one on this Mac, it shows here with a switch.",
-                        symbol: "macwindow.on.rectangle",
-                        actionTitle: "How Plug works",
+                        symbol: AppSection.clients.symbol,
+                        actionTitle: "How Plug Works",
                         actionIntent: .showGuide,
                         run: run
                     )
@@ -305,20 +329,19 @@ struct ClientsView: View {
             } else {
                 ListDetail {
                     List(selection: $router.selectedClient) {
-                        group(.connected)
-                        group(.onThisMac)
-                        group(.network)
+                        if let error = model.connectableAppsError {
+                            ProblemNote(title: "Plug could not look for clients on this Mac", reason: error)
+                                .selectionDisabled()
+                        }
+                        group(.onThisMac, in: entries)
+                        group(.network, in: entries)
                     }
                 } detail: {
-                    if let selected {
-                        ClientDetail(
-                            entry: selected,
-                            rename: selected.renameKey.map { key in { rename(key: key, shown: selected.name) } },
-                            run: run
-                        )
-                        .id(selected.id)
+                    if let selected = entries.first(where: { $0.id == router.selectedClient }) {
+                        ClientDetail(entry: selected, canMutate: model.canMutate, run: run)
+                            .id(selected.id)
                     } else {
-                        NoSelection(item: "Client")
+                        NoSelection(item: "Client", symbol: AppSection.clients.symbol)
                     }
                 }
             }
@@ -326,36 +349,18 @@ struct ClientsView: View {
         .navigationSubtitle(connectionSummary ?? "")
         .onChange(of: entries.map(\.id), initial: true) { keepSelectionVisible() }
         .confirmationDialog(
-            "Turn off \(revoking?.name ?? "")?",
+            "Remove \(revoking?.name ?? "")'s access?",
             isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } }),
             titleVisibility: .visible,
             presenting: revoking
-        ) { entry in
-            Button("Turn Off", role: .destructive) {
-                if let id = entry.grantID { run(.revokeClient(id: id)) }
-            }
+        ) { client in
+            Button("Remove Access", role: .destructive) { run(.revokeClient(id: client.id)) }
             Button("Cancel", role: .cancel) { }
         } message: { _ in
-            Text("It stops being able to use Plug right away, and leaves this list. To come back it has to ask you again.")
+            Text("It can no longer use Plug and leaves this list. To come back, it has to ask you again.")
         }
         .task { await model.loadConnectableApps() }
-        .alert(
-            "Rename Client",
-            isPresented: Binding(get: { renaming != nil }, set: { if !$0 { renaming = nil } }),
-            presenting: renaming
-        ) { target in
-            TextField("Name", text: $newName)
-            Button("Rename") { run(.renameClient(key: target.key, name: newName)) }
-            if target.hasName {
-                Button("Use Original Name") { run(.renameClient(key: target.key, name: "")) }
-            }
-            Button("Cancel", role: .cancel) { }
-        } message: { _ in
-            Text("Only Plug shows this name. The client itself is not changed.")
-        }
     }
-
-    private var selected: Entry? { entries.first { $0.id == router.selectedClient } }
 
     /// NSTableView is still finishing its own update when the list changes, so
     /// the selection moves on the next main-actor turn.
@@ -369,12 +374,12 @@ struct ClientsView: View {
     }
 
     @ViewBuilder
-    private func group(_ group: Entry.Group) -> some View {
+    private func group(_ group: Entry.Group, in entries: [Entry]) -> some View {
         let rows = entries.filter { $0.group == group }
         if !rows.isEmpty {
             Section(group.rawValue) {
                 ForEach(rows) { entry in
-                    ClientRow(entry: entry).tag(entry.id)
+                    ClientRow(entry: entry, canMutate: model.canMutate).tag(entry.id)
                 }
             }
         }
@@ -385,10 +390,27 @@ struct ClientsView: View {
     /// Every client the list shows, in the order it shows them. The list and
     /// the detail beside it both read from here, so they cannot disagree.
     private var entries: [Entry] {
-        connectedApps.map { appEntry($0.app, sessions: $0.sessions) }
-            + unmatchedSessions.map(sessionEntry)
+        let unclaimed = self.unclaimed
+        let others = unclaimed.clients
+            .filter { client in
+                client.sessions.contains {
+                    matches(displayName($0)) || matches($0.transport) || matches($0.sessionId)
+                }
+            }
+            .map { sessionEntry(id: $0.id, sessions: $0.sessions) }
+        let all = connectedApps.map { appEntry($0.app, sessions: $0.sessions) }
+            + others.filter { $0.group == .onThisMac }
             + idleApps.map { appEntry($0, sessions: []) }
-            + grants.map(grantEntry)
+            + others.filter { $0.group == .network }
+            + grants.map { grantEntry($0, sessions: unclaimed.byGrant[$0.clientKey] ?? []) }
+        // Only clients that share a name need telling apart.
+        let shared = Dictionary(grouping: all, by: \.name).filter { $0.value.count > 1 }
+        return all.map { entry in
+            guard shared[entry.name] == nil else { return entry }
+            var entry = entry
+            entry.disambiguator = nil
+            return entry
+        }
     }
 
     /// A client on this Mac. Its switch adds Plug to the client's settings or
@@ -397,10 +419,18 @@ struct ClientsView: View {
         let name = names.name(forKey: app.target) ?? app.name
         let access = access(to: app, sessions: sessions)
         let known = app.detected || app.linked
+        let about = if !app.detected {
+            "Plug cannot find this client on this Mac."
+        } else if app.linked {
+            "Plug is in this client's settings. Restart the client after changing this."
+        } else {
+            "Turn this on to add Plug to the client's settings, then restart the client."
+        }
         return Entry(
             id: "app:\(app.target)",
-            group: sessions.isEmpty ? .onThisMac : .connected,
+            group: .onThisMac,
             name: name,
+            originalName: app.name,
             status: ClientStatus.app(app, connections: sessions.count, limit: access?.summary),
             isLive: !sessions.isEmpty,
             dimmed: !known && sessions.isEmpty,
@@ -409,74 +439,82 @@ struct ClientsView: View {
             switchLabel: "Use Plug",
             isOn: known ? app.linked : nil,
             setOn: { run($0 ? .linkApp(app.target) : .unlinkApp(app.target)) },
-            about: app.linked
-                ? "Plug is in this client's settings. Restart the client after you change this."
-                : "Plug is not in this client's settings. Turn it on to add it, then restart the client.",
+            about: about,
             access: access,
             connections: sessions.map(connection),
             renameKey: access?.key
         )
     }
 
-    /// Something connected that Plug has no client entry for. There is nothing
-    /// to switch: it is here because it is connected.
-    private func sessionEntry(_ session: LiveSession) -> Entry {
-        let name = displayName(session)
+    /// Something connected that Plug has no client entry for, with every
+    /// session it has open. There is nothing to switch: it is here because it
+    /// is connected.
+    private func sessionEntry(id: String, sessions: [LiveSession]) -> Entry {
+        let first = sessions[0]
+        let name = displayName(first)
+        let choices = accessKey(of: first).map { access(key: $0, name: name) }
         return Entry(
-            id: "session:\(session.sessionId)",
-            group: .connected,
+            id: id,
+            group: Self.isRemote(first) ? .network : .onThisMac,
             name: name,
-            status: ClientStatus(text: connectionDescription(session), symbol: "bolt.fill"),
+            originalName: names.originalName(first),
+            status: ClientStatus(
+                state: ClientStatus.connected(sessions.count),
+                limit: choices?.summary
+            ),
             isLive: true,
             dimmed: false,
-            glyph: .app(target: sessionTarget(session), name: name, appPath: session.host?.app),
+            glyph: .app(target: sessionTarget(first), name: name, appPath: first.host?.app),
             isBusy: false,
             switchLabel: "",
             isOn: nil,
             setOn: { _ in },
-            about: "Plug does not know this client by name, so it has no switch. It shows here while it is connected.",
-            access: accessKey(of: session).map { access(key: $0, name: name) },
-            connections: [connection(session)],
-            renameKey: names.key(of: session)
+            about: "Plug does not recognize this client, so it has no switch. It shows here while it is connected.",
+            access: choices,
+            connections: sessions.map(connection),
+            renameKey: names.key(of: first),
+            disambiguator: String(first.sessionId.prefix(4))
         )
     }
 
-    /// A client allowed in over the network. Its switch is its permission:
-    /// off takes the permission away, and the client has to ask again, so the
-    /// app asks first.
-    private func grantEntry(_ grant: DownstreamClient) -> Entry {
+    /// A client allowed in over the network, with the sessions it has open.
+    /// Its switch is its permission: off takes the permission away, and the
+    /// client has to ask again, so the app asks first.
+    private func grantEntry(_ grant: DownstreamClient, sessions: [LiveSession]) -> Entry {
         let name = names.name(forKey: grant.clientKey) ?? grant.clientName
         let access = access(key: grant.clientKey, name: name)
         let host = URL(string: grant.clientId)?.host()
-        let origin = host ?? "Allowed"
         // A client Plug registered gets a short id, since two can share a
-        // name. It is in the detail, not the row, for the rare time two need
-        // telling apart.
+        // name.
         let short = grant.clientId.hasPrefix("plug_")
             ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
-        let id = "grant:\(grant.clientId)"
+        let shortID = String(short.prefix(8))
         return Entry(
-            id: id,
+            id: "grant:\(grant.clientId)",
             group: .network,
             name: name,
+            originalName: grant.clientName,
             status: ClientStatus(
-                text: access.summary.map { "\(origin) · \($0)" } ?? origin,
-                symbol: "network"
+                state: sessions.isEmpty
+                    ? "Allowed over the network" : ClientStatus.connected(sessions.count),
+                limit: access.summary
             ),
-            isLive: false,
+            isLive: !sessions.isEmpty,
             dimmed: false,
             glyph: .grant,
             isBusy: false,
-            switchLabel: "Allowed",
+            switchLabel: "Access",
             isOn: true,
             setOn: { allowed in
-                if !allowed { revoking = entries.first { $0.id == id } }
+                if !allowed { revoking = Revoking(id: grant.clientId, name: name) }
             },
-            about: "You allowed this client to use Plug over the network. Turn it off to take that back.",
+            about: "You allowed this client to use Plug over the network. Turn this off to remove its access.",
             access: access,
-            connections: [],
+            connections: sessions.map(connection),
             renameKey: grant.clientKey,
-            identity: host.map { "From \($0)" } ?? "ID \(short.prefix(8))",
+            disambiguator: host ?? shortID,
+            website: host,
+            shortID: host == nil ? shortID : nil,
             grantID: grant.clientId
         )
     }
@@ -484,8 +522,10 @@ struct ClientsView: View {
     private func connection(_ session: LiveSession) -> Entry.Connection {
         Entry.Connection(
             id: session.sessionId,
-            how: connectionDescription(session),
-            tools: toolsText(session)
+            place: place(session),
+            detail: [duration(session.connectedSecs), toolsText(session)]
+                .filter { !$0.isEmpty }
+                .joined(separator: " · ")
         )
     }
 
@@ -496,8 +536,9 @@ struct ClientsView: View {
 
     private var connectionSummary: String? {
         guard model.hasLoadedSnapshot else { return nil }
-        let count = roster.connected.count + roster.other.count
-        let summary = count == 1 ? "1 client connected" : "\(count) clients connected"
+        let unclaimed = self.unclaimed
+        let count = roster.connected.count + unclaimed.clients.count + unclaimed.byGrant.count
+        let summary = count == 0 ? "None connected" : "\(count) connected"
         return model.dataIsStale ? "Last known · \(summary)" : summary
     }
 
@@ -515,21 +556,21 @@ struct ClientsView: View {
     }
 
     /// Says how it reached Plug in words, not transport identifiers.
-    private func connectionDescription(_ session: LiveSession) -> String {
-        let how: String
+    private func place(_ session: LiveSession) -> String {
         switch session.transport.lowercased() {
-        case "stdio", "ipc", "daemon_proxy": how = "On this Mac"
-        case "http", "streamable_http", "sse": how = "Over the network"
-        default: how = session.transport.replacingOccurrences(of: "_", with: " ").capitalized
+        case "stdio", "ipc", "daemon_proxy": Entry.Group.onThisMac.rawValue
+        case "http", "streamable_http", "sse": Entry.Group.network.rawValue
+        default: session.transport.replacingOccurrences(of: "_", with: " ").capitalized
         }
-        return "\(how) · \(duration(session.connectedSecs))"
     }
 
+    /// How long a session has been connected.
     private func duration(_ seconds: UInt64) -> String {
-        if seconds < 60 { return "just connected" }
-        if seconds < 3_600 { return "connected \(seconds / 60)m" }
-        if seconds < 86_400 { return "connected \(seconds / 3_600)h" }
-        return "connected \(seconds / 86_400)d"
+        if seconds < 60 { return "just now" }
+        if seconds < 3_600 { return "\(seconds / 60) min" }
+        if seconds < 86_400 { return "\(seconds / 3_600) hr" }
+        let days = seconds / 86_400
+        return days == 1 ? "1 day" : "\(days) days"
     }
 
     private func toolsText(_ session: LiveSession) -> String {
@@ -541,42 +582,41 @@ struct ClientsView: View {
     }
 }
 
-/// The one line under a client's name, with a glyph so the state is told
-/// before the sentence is read. Pure value so the wording can be tested.
+/// The one line under a client's name in its detail. Pure value so the
+/// wording can be tested.
 struct ClientStatus: Equatable {
     let text: String
-    let symbol: String
 
-    init(text: String, symbol: String) {
-        self.text = text
-        self.symbol = symbol
+    /// A state, followed by what is off for the client when something is.
+    init(state: String, limit: String?) {
+        text = limit.map { "\(state) · \($0)" } ?? state
+    }
+
+    /// The state of a client with this many open connections.
+    static func connected(_ connections: Int) -> String {
+        connections == 1 ? "Connected" : "\(connections) connections"
     }
 
     /// A client on this Mac: connected, ready, or not using Plug.
     static func app(_ app: LinkableApp, connections: Int, limit: String?) -> ClientStatus {
         let state: String
-        let symbol: String
         if connections > 0 {
-            state = connections == 1 ? "Connected" : "Connected · \(connections) connections"
-            symbol = "bolt.fill"
-        } else if !app.linked {
-            state = app.detected ? "Off" : "Not installed"
-            symbol = app.detected ? "circle" : "questionmark.app.dashed"
+            state = connected(connections)
         } else if !app.detected {
-            state = "On · client not found on this Mac"
-            symbol = "checkmark.circle"
+            state = "Not found on this Mac"
+        } else if !app.linked {
+            state = "Not using Plug"
         } else {
-            state = app.transport?.lowercased() == "http" ? "On · over the network" : "On · not open right now"
-            symbol = "checkmark.circle"
+            state = app.transport?.lowercased() == "http" ? "Uses Plug over the network" : "Not open"
         }
-        return ClientStatus(text: limit.map { "\(state) · \($0)" } ?? state, symbol: symbol)
+        return ClientStatus(state: state, limit: limit)
     }
 }
 
 /// One client as the list and the detail show it.
 struct ClientEntry: Identifiable {
+    /// Where a client is. The title is also what a connection row says.
     enum Group: String {
-        case connected = "Connected Now"
         case onThisMac = "On This Mac"
         case network = "Over the Network"
     }
@@ -589,13 +629,17 @@ struct ClientEntry: Identifiable {
     /// One open connection of a client.
     struct Connection: Identifiable {
         let id: String
-        let how: String
-        let tools: String
+        /// On this Mac, or over the network.
+        let place: String
+        /// How long it has been open and how many tools it sees.
+        let detail: String
     }
 
     let id: String
     let group: Group
     let name: String
+    /// What the client is called when the owner has not named it.
+    let originalName: String
     let status: ClientStatus
     let isLive: Bool
     let dimmed: Bool
@@ -611,9 +655,13 @@ struct ClientEntry: Identifiable {
     let connections: [Connection]
     /// Nil when Plug has nothing to store a name under.
     let renameKey: String?
-    /// A line that identifies the client to someone checking it, such as the
-    /// site it came from.
-    var identity: String?
+    /// A few words that tell this client from another with the same name.
+    /// Nil when its name is the only one like it.
+    var disambiguator: String?
+    /// The site a client allowed in over the network came from.
+    var website: String?
+    /// The start of a network client's id, when it has no site to show.
+    var shortID: String?
     /// Set for a client allowed in over the network.
     var grantID: String?
 }
@@ -622,17 +670,22 @@ private typealias Entry = ClientEntry
 
 private struct ClientGlyph: View {
     let glyph: ClientEntry.Glyph
-    var size: CGFloat = 20
+    /// The large one fills a detail header's glyph slot.
+    var large = false
 
     var body: some View {
         switch glyph {
         case let .app(target, name, appPath):
-            AppGlyph(target: target, name: name, appPath: appPath, size: size)
+            if large {
+                AppGlyph(target: target, name: name, appPath: appPath, size: Metric.glyphSlot)
+            } else {
+                AppGlyph(target: target, name: name, appPath: appPath)
+            }
         case .grant:
-            Image(systemName: "key.horizontal")
-                .font(.system(size: size * 0.62))
+            Image(systemName: "globe")
+                .font(large ? .title2 : .body)
                 .foregroundStyle(.secondary)
-                .frame(width: size, height: size)
+                .frame(width: large ? Metric.glyphSlot : 18, height: large ? Metric.glyphSlot : 18)
                 .accessibilityHidden(true)
         }
     }
@@ -642,6 +695,9 @@ private struct ClientGlyph: View {
 /// selecting the row.
 private struct ClientRow: View {
     let entry: ClientEntry
+    let canMutate: Bool
+
+    private static let liveDot: CGFloat = 7
 
     var body: some View {
         HStack(spacing: Metric.tight) {
@@ -651,25 +707,52 @@ private struct ClientRow: View {
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .foregroundStyle(entry.dimmed ? .secondary : .primary)
+                .layoutPriority(1)
                 .accessibilityLabel("\(entry.name), \(entry.status.text)")
+            if let disambiguator = entry.disambiguator {
+                Text(disambiguator)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             Spacer(minLength: Metric.tight)
-            ClientSwitch(entry: entry, size: .mini)
+            if entry.isLive {
+                Circle()
+                    .fill(.green)
+                    .frame(width: Self.liveDot, height: Self.liveDot)
+                    .accessibilityLabel("Connected")
+            }
+            ClientSwitch(entry: entry, canMutate: canMutate, size: .mini)
+        }
+        .contextMenu {
+            if entry.grantID != nil {
+                if canMutate {
+                    Button("Remove Access…", role: .destructive) { entry.setOn(false) }
+                }
+            } else if let isOn = entry.isOn, !entry.isBusy {
+                Button(isOn ? "Turn Off" : "Turn On") { entry.setOn(!isOn) }
+            }
         }
     }
 }
 
+/// A client's one switch. A switch that adds Plug to another app's settings
+/// works while Plug is off; one that takes away access needs Plug running.
 private struct ClientSwitch: View {
     let entry: ClientEntry
+    let canMutate: Bool
     var size: ControlSize = .regular
 
+    private var isGrant: Bool { entry.grantID != nil }
+
     var body: some View {
-        if entry.isBusy {
-            ProgressView().controlSize(.small)
-        } else if let isOn = entry.isOn {
+        if let isOn = entry.isOn {
             Toggle(entry.switchLabel, isOn: Binding(get: { isOn }, set: entry.setOn))
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(size)
+                .disabled(entry.isBusy || (isGrant && !canMutate))
+                .help(isGrant ? "Remove Access…" : "")
                 .accessibilityLabel("\(entry.switchLabel), \(entry.name)")
         }
     }
@@ -679,16 +762,25 @@ private struct ClientSwitch: View {
 /// has open, and its name.
 private struct ClientDetail: View {
     let entry: ClientEntry
-    let rename: (() -> Void)?
+    let canMutate: Bool
     let run: (PlugIntent) -> Void
+    /// The name being typed. Empty means the client's own name.
+    @State private var draft: String
+
+    init(entry: ClientEntry, canMutate: Bool, run: @escaping (PlugIntent) -> Void) {
+        self.entry = entry
+        self.canMutate = canMutate
+        self.run = run
+        _draft = State(initialValue: entry.name == entry.originalName ? "" : entry.name)
+    }
 
     var body: some View {
         DetailForm {
             Section {
                 DetailHeader(title: entry.name, subtitle: entry.status.text) {
-                    ClientGlyph(glyph: entry.glyph, size: 32)
+                    ClientGlyph(glyph: entry.glyph, large: true)
                 } controls: {
-                    ClientSwitch(entry: entry)
+                    ClientSwitch(entry: entry, canMutate: canMutate)
                 }
             } footer: {
                 Text(entry.about)
@@ -697,7 +789,7 @@ private struct ClientDetail: View {
             if let access = entry.access {
                 Section {
                     if access.servers.isEmpty {
-                        Text("No servers yet.").foregroundStyle(.secondary)
+                        Text("No servers yet").foregroundStyle(.secondary)
                     } else {
                         ForEach(access.servers) { server in
                             Toggle(
@@ -710,13 +802,24 @@ private struct ClientDetail: View {
                                     }
                                 )
                             ) {
-                                Text(server.name)
-                                    .foregroundStyle(server.enabled ? .primary : .secondary)
+                                if server.enabled {
+                                    Text(server.name)
+                                } else {
+                                    // Off in Plug, so no client can use it.
+                                    HStack(spacing: Metric.tight) {
+                                        Text(server.name)
+                                        Spacer(minLength: Metric.tight)
+                                        Text("Off")
+                                    }
+                                    .foregroundStyle(.secondary)
+                                }
                             }
+                            .controlSize(.mini)
+                            .disabled(!canMutate || !server.enabled)
                         }
                     }
                 } header: {
-                    Text("Servers It Can Use")
+                    Text("Servers")
                 } footer: {
                     Text(Self.note(for: access))
                 }
@@ -725,23 +828,37 @@ private struct ClientDetail: View {
             if !entry.connections.isEmpty {
                 Section("Connected Now") {
                     ForEach(entry.connections) { connection in
-                        LabeledContent(connection.how, value: connection.tools)
+                        LabeledContent(connection.place, value: connection.detail)
                             .help("Connection \(connection.id.prefix(8))")
                     }
                 }
             }
 
-            if rename != nil || entry.identity != nil {
+            if entry.renameKey != nil || entry.website != nil || entry.shortID != nil {
                 Section {
-                    if let identity = entry.identity {
-                        LabeledContent("Identity") {
-                            Text(identity).textSelection(.enabled)
+                    if let key = entry.renameKey {
+                        TextField("Name", text: $draft, prompt: Text(entry.originalName))
+                            .onSubmit {
+                                run(.renameClient(
+                                    key: key, name: draft.trimmingCharacters(in: .whitespaces)
+                                ))
+                            }
+                            .disabled(!canMutate)
+                    }
+                    if let website = entry.website {
+                        LabeledContent("Website", value: website)
+                    } else if let shortID = entry.shortID {
+                        LabeledContent("ID") {
+                            Text(shortID)
+                                .font(.body.monospaced())
+                                .textSelection(.enabled)
                         }
                     }
-                    if let rename {
-                        LabeledContent("Name in Plug") {
-                            Button("Rename…", action: rename)
-                        }
+                } header: {
+                    Text("Details")
+                } footer: {
+                    if entry.renameKey != nil {
+                        Text("Only Plug shows this name. Leave it empty to use the client's own name.")
                     }
                 }
             }
@@ -751,12 +868,12 @@ private struct ClientDetail: View {
     static func note(for access: ClientAccess) -> String {
         var lines = [
             access.isRemote
-                ? "A client over the network cannot get around this."
-                : "This keeps a client's list short. It is not a lock: a client on this Mac can connect under another name.",
+                ? "Turn a server off to keep this client from using its tools."
+                : "Turn a server off to hide its tools from this client. This tidies the list; it is not a security lock.",
         ]
         if access.blockedToolCount > 0 {
             let count = access.blockedToolCount
-            lines.append("It is also kept from \(count == 1 ? "1 tool" : "\(count) tools").")
+            lines.append(count == 1 ? "1 tool is also off for this client." : "\(count) tools are also off for this client.")
         }
         return lines.joined(separator: " ")
     }

@@ -76,7 +76,7 @@ final class PlugVerdictTests: XCTestCase {
 
     func testVersionMismatchAsksForARestartInPlainWords() {
         let verdict = PlugVerdict.verdict(for: PlugSituation(runtime: .versionMismatch))
-        XCTAssertEqual(verdict.title, "Restart required to finish update")
+        XCTAssertEqual(verdict.title, "Restart Plug to finish updating")
         XCTAssertEqual(verdict.primary?.intent, .reconnect)
     }
 
@@ -102,7 +102,7 @@ final class PlugVerdictTests: XCTestCase {
         )
         XCTAssertEqual(verdict.primary, .init("Try Again", .signIn(server: "Notion")))
         XCTAssertEqual(verdict.secondary, .init("Cancel", .cancelSignIn(server: "Notion")))
-        XCTAssertEqual(verdict.detail, "Sign-in is open in the browser.")
+        XCTAssertEqual(verdict.detail, "Finish signing in with your browser.")
     }
 
     func testSingleDownServerOffersRestart() {
@@ -237,7 +237,7 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: false, daemonUptimeSecs: 600), .off)
 
         let missing = server("Linear", health: .notLoaded)
-        XCTAssertEqual(missing.fix, .init("Load It", .reloadConfiguration))
+        XCTAssertEqual(missing.fix, .init("Reload", .reloadConfiguration))
         let verdict = PlugVerdict.verdict(
             for: PlugSituation(runtime: .running, servers: [missing, server("ok")])
         )
@@ -246,13 +246,13 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(verdict.tone, .attention)
     }
 
-    /// The panel's rows used to look current after the daemon went away, and
-    /// the panel and the window used to count servers differently.
+    /// The panel's rows used to look current after the daemon went away. The
+    /// count line counts the servers that are on, as the verdict does.
     func testThePanelAndTheWindowShareOneCountLine() {
         let off = server("b", health: .off, enabled: false, tools: 9)
         let situation = PlugSituation(runtime: .reconnecting, servers: [off, server("a", tools: 3)])
-        XCTAssertEqual(situation.countsSummary(stale: false), "2 servers · 3 tools")
-        XCTAssertEqual(situation.countsSummary(stale: true), "Last known · 2 servers · 3 tools")
+        XCTAssertEqual(situation.countsSummary(stale: false), "1 server · 3 tools")
+        XCTAssertEqual(situation.countsSummary(stale: true), "Last known · 1 server · 3 tools")
         XCTAssertEqual(situation.listedServers.map(\.name), ["a", "b"])
         XCTAssertEqual(
             PlugSituation(servers: [server("a", tools: 1)]).countsSummary(stale: false),

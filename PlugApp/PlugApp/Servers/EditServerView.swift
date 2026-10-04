@@ -18,12 +18,11 @@ struct EditServerView: View {
     var body: some View {
         SheetFrame(
             title: "Edit \(name)",
-            subtitle: model.canReadServerConfig
-                ? "Changes take effect as soon as you save."
-                : AppModel.serverConfigReadRequiredCopy,
+            subtitle: form != nil ? "Changes take effect as soon as you save." : nil,
             failure: form == nil ? nil : failure,
             busy: saving,
-            confirmTitle: saving ? "Saving…" : "Save",
+            // With no settings to edit there is nothing to save, only Done.
+            confirmTitle: form == nil ? nil : "Save",
             confirmDisabled: !Self.canSave(
                 canReadServerConfig: model.canReadServerConfig,
                 loaded: form != nil,
@@ -39,26 +38,18 @@ struct EditServerView: View {
                 ))
             } else if let failure {
                 // The settings could not be read, so there is nothing to
-                // edit. Say why and offer the one thing that can help.
-                VStack(alignment: .leading, spacing: Metric.snug) {
-                    Label("Plug could not read this server's settings.", systemImage: "exclamationmark.triangle")
-                        .font(.callout)
-                    Text(failure)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                    if model.canReadServerConfig {
-                        Button("Try Again") { Task { await load() } }
-                    }
-                }
-                .frame(maxWidth: .infinity, minHeight: 160, alignment: .leading)
+                // edit. Say why and offer the one thing that can help. When
+                // Plug has to restart first, the reason is already the advice.
+                ProblemNote(
+                    title: "Plug could not read this server's settings.",
+                    reason: failure,
+                    advice: model.canReadServerConfig ? Explain.advice(forReason: failure) : nil,
+                    actionTitle: model.canReadServerConfig ? "Try Again" : nil,
+                    action: { Task { await load() } }
+                )
+                .padding(.horizontal, Metric.roomy)
             } else {
-                HStack(spacing: Metric.snug) {
-                    ProgressView().controlSize(.small)
-                    Text("Loading server settings…").foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, minHeight: 160, alignment: .center)
+                SheetLoading(label: "Loading server settings")
             }
         }
         .task { await load() }

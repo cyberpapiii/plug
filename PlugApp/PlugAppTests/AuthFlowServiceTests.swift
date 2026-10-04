@@ -76,7 +76,7 @@ final class AuthFlowServiceTests: XCTestCase {
         let runner = StubAuthRunner(error: ProcessRunnerError.timedOut)
         let service = AuthFlowService(runner: runner, executable: executable)
 
-        await assertFails(with: "The command did not finish in time and was stopped.") {
+        await assertFails(with: "Plug took too long to answer. Try again.") {
             try await service.signIn(server: "notion")
         }
     }
@@ -89,7 +89,7 @@ final class AuthFlowServiceTests: XCTestCase {
             try await service.signIn(server: "notion")
             XCTFail("Expected a failure")
         } catch {
-            XCTAssertTrue(error.localizedDescription.contains("bundled Plug service"))
+            XCTAssertTrue(error.localizedDescription.contains("Plug is damaged"))
         }
         let calls = await runner.calls
         XCTAssertTrue(calls.isEmpty)

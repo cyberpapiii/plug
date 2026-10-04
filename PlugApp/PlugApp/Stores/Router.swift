@@ -11,10 +11,8 @@ final class Router {
     var selectedServer: String?
     /// The tool whose details are open, by its merged name.
     var selectedTool: String?
-    var isAddingServer = false
-    var isImportingServers = false
-    var isAddingWatch = false
-    var isShowingGuide = false
+    /// The one sheet the window is showing, if any.
+    var sheet: Sheet?
     /// The selected row in each of the other sections.
     var selectedClient: String?
     var selectedEvent: String?
@@ -22,14 +20,29 @@ final class Router {
     /// Counts the times a checkup was asked for from outside Settings, so
     /// Settings runs one each time the number moves.
     var checkupRequests = 0
-    /// The server whose settings are open for editing, if any.
-    var editingServer: ServerName?
-    /// The server getting a second account, if any.
-    var addingAccountTo: ServerName?
 
-    /// A server name that a sheet can be presented from.
-    struct ServerName: Identifiable, Equatable, Sendable {
-        let id: String
+    /// Every sheet the window can show. The window shows one at a time, so
+    /// asking for another replaces the one that is up.
+    enum Sheet: Identifiable, Equatable, Sendable {
+        case guide
+        case addServer
+        case importServers
+        case addWatch
+        /// A server's settings, open for editing.
+        case editServer(String)
+        /// A server getting a second account.
+        case addAccount(String)
+
+        var id: String {
+            switch self {
+            case .guide: "guide"
+            case .addServer: "addServer"
+            case .importServers: "importServers"
+            case .addWatch: "addWatch"
+            case let .editServer(name): "editServer:\(name)"
+            case let .addAccount(server): "addAccount:\(server)"
+            }
+        }
     }
 
     func reveal(server: String) {
@@ -68,12 +81,12 @@ struct PlugIntentRunner {
                 .setServerEnabled(authToken: $0, name: name, enabled: enabled)
             }
         case let .editServer(name):
-            router.section = .servers
-            router.editingServer = Router.ServerName(id: name)
+            router.reveal(server: name)
+            router.sheet = .editServer(name)
             showWindow()
         case let .addAccount(server):
-            router.section = .servers
-            router.addingAccountTo = Router.ServerName(id: server)
+            router.reveal(server: server)
+            router.sheet = .addAccount(server)
             showWindow()
         case let .setToolEnabled(tool, enabled):
             Task { await model.setToolEnabled(tool, enabled) }
@@ -94,17 +107,17 @@ struct PlugIntentRunner {
             }
         case .addServer:
             router.section = .servers
-            router.isAddingServer = true
+            router.sheet = .addServer
             showWindow()
         case .addWatch:
             router.section = .events
-            router.isAddingWatch = true
+            router.sheet = .addWatch
             showWindow()
         case let .removeWatch(event):
             perform("stop watching \(event)") { .removeWatch(authToken: $0, event: event) }
         case .importServers:
             router.section = .servers
-            router.isImportingServers = true
+            router.sheet = .importServers
             showWindow()
         case let .signOut(server):
             Task { await model.signOut(server: server) }
@@ -112,7 +125,7 @@ struct PlugIntentRunner {
             router.section = section
             showWindow()
         case .showGuide:
-            router.isShowingGuide = true
+            router.sheet = .guide
             showWindow()
         case .openSettings:
             showSettings()
@@ -133,9 +146,9 @@ struct PlugIntentRunner {
         case .reloadConfiguration:
             perform("reload the settings file") { .reload(authToken: $0) }
         case .openLogs:
-            NSWorkspace.shared.open(
-                URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory)
-            )
+            NSWorkspace.shared.activateFileViewerSelecting([
+                URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory),
+            ])
         case .dismissActionError:
             model.dismissActionError()
         case .quit:

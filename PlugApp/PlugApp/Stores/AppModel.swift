@@ -74,6 +74,18 @@ final class AppModel {
     /// 200 events is not proof that a 201st event exists.
     private(set) var activityWasTruncated = false
     var activityIsCapped: Bool { activityWasTruncated }
+    /// The one line Activity shows about its list: how many calls, how many
+    /// of them failed, and whether older ones were dropped. Nil with no calls.
+    var activitySummary: String? {
+        guard hasLoadedSnapshot, !activities.isEmpty else { return nil }
+        let count = activities.count
+        let failed = activities.filter { CallFacts($0).failed }.count
+        var summary = activityIsCapped
+            ? "Latest \(Self.activityLimit) calls"
+            : "\(count) recent \(count == 1 ? "call" : "calls")"
+        if failed > 0 { summary += ", \(failed) failed" }
+        return dataIsStale ? "Last known · \(summary)" : summary
+    }
     /// Why the last read of the daemon failed. Polling owns this: the next
     /// good read clears it, and the verdict already says Plug is unreachable.
     private(set) var connectionError: String?
@@ -105,7 +117,7 @@ final class AppModel {
     /// Same restart/update sentence Edit Server shows when that capability is
     /// missing, so a Save that never fires is not mistaken for a parse error.
     nonisolated static let serverConfigReadRequiredCopy =
-        "Restart required to finish update. The app and its background service are running different versions."
+        "Restart Plug to finish updating, then edit this server."
     /// Someone is looking at Plug right now, so refresh briskly. Nothing is
     /// visible otherwise, and a background poll every few seconds is rude to
     /// a laptop battery for information no one is reading.
@@ -753,6 +765,6 @@ private struct ServerConfigReadRequiredError: LocalizedError {
 
 private struct RuntimeUnavailableError: LocalizedError {
     var errorDescription: String? {
-        "Plug is reconnecting. Try again when the background service is running."
+        "Plug is starting. Try again in a moment."
     }
 }

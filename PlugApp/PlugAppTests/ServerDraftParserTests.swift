@@ -33,7 +33,7 @@ final class ServerDraftParserTests: XCTestCase {
         XCTAssertEqual(draft.config.args, ["-y", "linear-mcp@latest"])
         XCTAssertEqual(draft.config.env, ["LINEAR_API_KEY": "secret"])
         XCTAssertEqual(draft.config.transport, "stdio")
-        XCTAssertTrue(draft.facts.contains { $0.label == "Environment" && $0.value == "LINEAR_API_KEY" })
+        XCTAssertTrue(draft.facts.contains { $0.label == "Variables" && $0.value == "LINEAR_API_KEY" })
     }
 
     func testBareEntryWithoutTheWrapper() throws {
@@ -76,9 +76,20 @@ final class ServerDraftParserTests: XCTestCase {
 
     func testPlainURLBecomesARemoteServerNamedForItsHost() throws {
         let draft = try draft("https://mcp.linear.app/sse")
-        XCTAssertEqual(draft.name, "mcp")
+        XCTAssertEqual(draft.name, "linear")
         XCTAssertEqual(draft.config.url, "https://mcp.linear.app/sse")
         XCTAssertEqual(draft.config.transport, "http")
+    }
+
+    func testAServerIsNamedForItsMakerNotForAGenericHostLabel() throws {
+        XCTAssertEqual(try draft("https://mcp.notion.com/mcp").name, "notion")
+        XCTAssertEqual(try draft("https://www.example.com/mcp").name, "example")
+        XCTAssertEqual(try draft("https://api.mcp.example.com/mcp").name, "example")
+        XCTAssertEqual(try draft("https://MCP.Example.com/mcp").name.lowercased(), "example")
+        // A label that is not generic stays, and the last two labels are
+        // never dropped.
+        XCTAssertEqual(try draft("https://tools.example.com/mcp").name, "tools")
+        XCTAssertEqual(try draft("https://mcp.com/mcp").name, "mcp")
     }
 
     func testAnOpenAPIDocumentAddressBecomesAnAPIServer() throws {
@@ -88,7 +99,7 @@ final class ServerDraftParserTests: XCTestCase {
         XCTAssertEqual(draft.config.spec, "https://petstore3.swagger.io/api/v3/openapi.json")
         XCTAssertNil(draft.config.url)
         XCTAssertTrue(draft.fromAddress)
-        XCTAssertTrue(draft.facts.contains { $0.label == "Kind" && $0.value.hasPrefix("HTTP API") })
+        XCTAssertTrue(draft.facts.contains { $0.label == "Kind" && $0.value.hasPrefix("Web API") })
     }
 
     func testThePersonCanCorrectTheGuessAboutAnAddress() throws {
@@ -171,7 +182,7 @@ final class ServerDraftParserTests: XCTestCase {
 
     func testPreviewNeverInventsFactsItDoesNotHave() throws {
         let draft = try draft("my-server")
-        XCTAssertEqual(draft.facts.map(\.label), ["Runs", "Kind"])
+        XCTAssertEqual(draft.facts.map(\.label), ["Runs", "Where"])
     }
 }
 
@@ -220,6 +231,23 @@ final class ServerFormTests: XCTestCase {
         XCTAssertNil(saved.url)
         XCTAssertNil(saved.auth)
         XCTAssertNil(saved.authToken)
+    }
+
+    func testVariablesMustBeNameEqualsValueLines() {
+        var form = ServerForm(config: .command("npx", args: []))
+        XCTAssertNil(form.settingsProblem)
+        XCTAssertTrue(form.isComplete)
+
+        for good in ["A=1\n\n B = 2 ", "EMPTY=", "URL=https://example.com/?a=b"] {
+            form.settings = good
+            XCTAssertNil(form.settingsProblem, good)
+            XCTAssertTrue(form.isComplete, good)
+        }
+        for bad in ["A=1\nnonsense", "=value", "  = value"] {
+            form.settings = bad
+            XCTAssertEqual(form.settingsProblem, "Each line needs NAME=value.", bad)
+            XCTAssertFalse(form.isComplete, bad)
+        }
     }
 
     func testAnAPIServerMayLeaveItsAddressToItsDocument() {

@@ -13,18 +13,34 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Clients, Events, and Activity. Every section is a list with the selected
   item's details beside it, where before each section had its own layout:
   cards, popovers, and rows that opened in place.
-- Settings is its own window, on Command-comma and from the gear in the menu
-  bar panel. It is no longer a tab in the main window.
+- Settings is its own window, on Command-comma and from the menu bar panel.
+  It is no longer a tab in the main window.
 - Lists and detail panes use the system's own list and form styles, so
   spacing, selection, and text sizes match the rest of macOS in light and
   dark.
+- The app uses the same words and the same buttons everywhere. A button
+  whose name ends in three dots asks before it does anything; the others act
+  at once. Titles, empty lists, and error messages follow one style.
+- Each client is one row, however many connections it has open. A green dot
+  marks the ones connected now, and the two groups are On This Mac and Over
+  the Network.
+- Empty lists and problems are clearer. An empty section says what belongs
+  there and offers the next step. A problem says what went wrong and what to
+  do, and a call the client stopped is no longer shown as a failure.
+- The menu bar panel is simpler: the headline, your servers with a fix beside
+  any that need one, who is connected, recent activity, and three plain
+  buttons for Open Plug, Settings, and Quit Plug.
+- Settings is shorter. Open at Login, Notifications, and automatic updates
+  are together at the top, and the checkup sits with the Plug switch.
+- Rename a client by typing in its Name field. Leave the field empty to go
+  back to the client's own name.
 
 ### Added
 
-- Menus and shortcuts. File has New Server (Command-N), Import Servers
+- Menus and shortcuts. File has Add Server (Command-N), Import Servers
   (Shift-Command-I), and Watch a Tool (Shift-Command-N). View has the four
   sections on Command-1 to Command-4, Refresh on Command-R, and the sidebar
-  toggle. Help has How Plug Works, Check Everything, and Show Logs. Check for
+  toggle. Help has How Plug Works, Run Checkup, and Show Logs in Finder. Check for
   Updates is in the Plug menu.
 - Delete removes the selected server, after asking. Remove Server is also in
   a server's right-click menu.

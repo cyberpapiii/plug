@@ -18,6 +18,7 @@ struct AddWatchView: View {
     @State private var saving = false
     @State private var failure: String?
     @FocusState private var nameFocused: Bool
+    @FocusState private var argumentsFocused: Bool
 
     /// Servers that have tools to watch right now.
     private var servers: [String] {
@@ -57,19 +58,20 @@ struct AddWatchView: View {
 
     var body: some View {
         SheetFrame(
-            title: "Watch a tool",
+            title: "Watch a Tool",
             subtitle: "Plug calls the tool on a timer and sends an event when its result changes.",
             failure: failure,
             busy: saving,
-            confirmTitle: saving ? "Starting…" : "Start Watching",
+            confirmTitle: servers.isEmpty ? nil : "Start Watching",
             confirmDisabled: !canSave,
             confirm: add
         ) {
             if servers.isEmpty {
-                Label("No server has tools right now. Add a server, or wait for one to start.", systemImage: "questionmark.circle")
+                Text("No server has tools right now. Add a server, or wait for one to start.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
+                    .padding(.horizontal, Metric.roomy)
             } else {
                 form
             }
@@ -90,17 +92,12 @@ struct AddWatchView: View {
         }
     }
 
-    @ViewBuilder private var form: some View {
-        Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Metric.snug, verticalSpacing: Metric.snug) {
-            GridRow {
-                label("Server")
+    private var form: some View {
+        Form {
+            Section {
                 Picker("Server", selection: $server) {
                     ForEach(servers, id: \.self) { Text($0).tag($0) }
                 }
-                .labelsHidden()
-            }
-            GridRow {
-                label("Tool")
                 VStack(alignment: .leading, spacing: Metric.rowGap) {
                     Picker("Tool", selection: $tool) {
                         Text(offered.isEmpty ? "No tools to choose" : "Choose a tool").tag("")
@@ -108,102 +105,83 @@ struct AddWatchView: View {
                             Text(item.isReadOnly ? own(item) : "\(own(item)) (can change things)").tag(own(item))
                         }
                     }
-                    .labelsHidden()
                     .disabled(offered.isEmpty)
                     // Some servers write a page about a tool. Its first line
                     // is enough to recognise it by.
                     if let summary = chosen?.summary?.split(whereSeparator: \.isNewline).first {
-                        Text(String(summary))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .lineLimit(2)
+                        caption(String(summary)).lineLimit(2)
                     } else if offered.isEmpty, !showsAllTools {
-                        Text("\(server) marks none of its tools read-only.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                        caption("Every \(server) tool can change things. Turn on the option below to pick one.")
                     }
                 }
-            }
-            GridRow {
-                label("Check")
+                // This decides what the Tool picker offers, so it sits right
+                // under it and not inside More Options.
+                VStack(alignment: .leading, spacing: Metric.rowGap) {
+                    Toggle("Show tools that can change things", isOn: $showsAllTools)
+                        .toggleStyle(.checkbox)
+                    if showsAllTools {
+                        caption("Plug calls a watched tool again and again. Only pick one that is safe to repeat.")
+                    }
+                }
                 Picker("Check", selection: $everySecs) {
                     ForEach(WatchDraft.intervals, id: \.self) { secs in
                         Text(EventFacts.interval(secs).capitalizedFirst).tag(secs)
                     }
                 }
-                .labelsHidden()
-                .fixedSize()
+                if chosen != nil, !trimmedName.isEmpty {
+                    LabeledContent("Clients listen for") {
+                        Text("\(server).\(trimmedName)")
+                            .font(.body.monospaced())
+                            .textSelection(.enabled)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                }
             }
-        }
-
-        if chosen != nil, !trimmedName.isEmpty {
-            HStack(spacing: Metric.tight) {
-                Text("Clients subscribe to").font(.caption).foregroundStyle(.secondary)
-                Text("\(server).\(trimmedName)")
-                    .font(.caption.monospaced())
-                    .textSelection(.enabled)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-        }
-
-        DisclosureGroup("More options", isExpanded: $showsOptions) {
-            VStack(alignment: .leading, spacing: Metric.snug) {
-                HStack(spacing: Metric.snug) {
-                    label("Name")
+            Section {
+                DisclosureGroup("More Options", isExpanded: $showsOptions) {
                     TextField("Name", text: $name)
-                        .textFieldStyle(.roundedBorder)
                         .focused($nameFocused)
                         .onChange(of: name) { _, _ in
                             if nameFocused { nameEdited = true }
                         }
-                }
-                VStack(alignment: .leading, spacing: Metric.rowGap) {
-                    Text("Arguments").font(.callout).foregroundStyle(.secondary)
-                    TextEditor(text: $arguments)
-                        .font(.system(.callout, design: .monospaced))
-                        .scrollContentBackground(.hidden)
-                        .padding(Metric.tight)
-                        .frame(height: 64)
-                        .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: Metric.corner))
-                        .overlay(alignment: .topLeading) {
-                            if arguments.isEmpty {
-                                Text(#"{ "query": "is:unread" }"#)
-                                    .font(.system(.callout, design: .monospaced))
-                                    .foregroundStyle(.tertiary)
-                                    .padding(Metric.tight + 4)
-                                    .allowsHitTesting(false)
+                    VStack(alignment: .leading, spacing: Metric.rowGap) {
+                        TextField(
+                            "Arguments",
+                            text: $arguments,
+                            prompt: Text(#"{ "query": "is:unread" }"#),
+                            axis: .vertical
+                        )
+                        .lineLimit(2...4)
+                        .font(.body.monospaced())
+                        .focused($argumentsFocused)
+                        // The text is not valid JSON while it is being typed,
+                        // so the complaint waits until the field is left.
+                        if !argumentsAreValid, !argumentsFocused {
+                            Label {
+                                Text(#"Arguments have to be one JSON object, like { "query": "is:unread" }."#)
+                                    .foregroundStyle(.secondary)
+                            } icon: {
+                                Image(systemName: "exclamationmark.triangle.fill")
+                                    .foregroundStyle(.orange)
                             }
+                            .font(.caption)
+                        } else {
+                            caption("What the tool is called with, as JSON. Leave empty for none.")
                         }
-                        .accessibilityLabel("Arguments")
-                    Text(
-                        argumentsAreValid
-                            ? "What the tool is called with, as JSON. Leave empty for none."
-                            : "Arguments have to be one JSON object, like { \"query\": \"is:unread\" }."
-                    )
-                    .font(.caption)
-                    .foregroundStyle(argumentsAreValid ? AnyShapeStyle(.tertiary) : AnyShapeStyle(.orange))
-                }
-                Toggle("Show tools that can change things", isOn: $showsAllTools)
-                    .toggleStyle(.switch)
-                    .controlSize(.small)
-                if showsAllTools {
-                    Text("Plug calls a watched tool again and again. Only pick one that is safe to repeat.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
-            .padding(.top, Metric.snug)
         }
-        .font(.callout)
+        .formStyle(.grouped)
+        .fixedSize(horizontal: false, vertical: true)
     }
 
-    private func label(_ text: String) -> some View {
+    private func caption(_ text: String) -> some View {
         Text(text)
-            .font(.callout)
+            .font(.caption)
             .foregroundStyle(.secondary)
-            .gridColumnAlignment(.trailing)
+            .fixedSize(horizontal: false, vertical: true)
     }
 
     private func add() {
@@ -229,8 +207,4 @@ struct AddWatchView: View {
             }
         }
     }
-}
-
-private extension String {
-    var capitalizedFirst: String { prefix(1).uppercased() + dropFirst() }
 }

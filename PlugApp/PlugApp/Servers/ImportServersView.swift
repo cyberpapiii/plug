@@ -10,6 +10,7 @@ import SwiftUI
 /// settings is changed.
 struct ImportServersView: View {
     let model: AppModel
+    let router: Router
     var scanner: ImportScanning = ImportService()
     @Environment(\.dismiss) private var dismiss
 
@@ -21,14 +22,18 @@ struct ImportServersView: View {
     /// Why each server that could not be added was refused, by server id.
     @State private var refused: [String: String] = [:]
 
+    /// The list scrolls once it is taller than this.
+    private static let listHeight: CGFloat = 240
+
     var body: some View {
         SheetFrame(
             title: "Import Servers",
             subtitle: "Servers already set up in other clients on this Mac. Their settings are left as they are.",
             failure: scanFailed ? nil : failure,
             busy: importing,
-            confirmTitle: scan?.isEmpty == false ? importTitle : nil,
-            confirmDisabled: chosen.isEmpty,
+            // With nothing to import there is nothing to confirm, only Done.
+            confirmTitle: (scan?.isEmpty == true || scanFailed) ? nil : importTitle,
+            confirmDisabled: chosen.isEmpty || scan == nil,
             confirm: importChosen
         ) {
             content
@@ -37,103 +42,95 @@ struct ImportServersView: View {
     }
 
     private var importTitle: String {
-        if importing { return "Importing…" }
-        return chosen.count == 1 ? "Import 1 Server" : "Import \(chosen.count) Servers"
+        switch chosen.count {
+        case 0: "Import Servers"
+        case 1: "Import 1 Server"
+        default: "Import \(chosen.count) Servers"
+        }
     }
 
     // MARK: - What was found
 
     @ViewBuilder private var content: some View {
         if scanFailed {
-            VStack(alignment: .leading, spacing: Metric.snug) {
-                Label(failure ?? "Plug could not read your other clients' settings.", systemImage: "exclamationmark.triangle")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                Button("Try Again") { Task { await load() } }
-            }
-            .frame(maxWidth: .infinity, minHeight: 120, alignment: .leading)
+            ProblemNote(
+                title: "Plug could not read your other clients' settings.",
+                reason: failure,
+                actionTitle: "Try Again",
+                action: { Task { await load() } }
+            )
+            .padding(.horizontal, Metric.roomy)
         } else if let scan {
             if scan.isEmpty {
-                VStack(alignment: .leading, spacing: Metric.tight) {
-                    Label("Nothing new to import", systemImage: "checkmark.circle")
-                        .font(.callout)
-                    Text("Every server your other clients use is already in Plug.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(Metric.regular)
-                .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: Metric.corner))
+                ContentUnavailableView(
+                    "Nothing New to Import",
+                    systemImage: "checkmark.circle",
+                    description: Text("Every server your other clients use is already in Plug.")
+                )
             } else {
                 found(scan)
             }
         } else {
-            HStack(spacing: Metric.snug) {
-                ProgressView().controlSize(.small)
-                Text("Looking through your other clients…")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-            .frame(maxWidth: .infinity, minHeight: 120, alignment: .leading)
+            SheetLoading(label: "Looking through your other clients", height: 120)
         }
     }
 
     private func found(_ scan: ImportScan) -> some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
-            SectionLabel(
-                text: "Found in other clients",
-                trailing: scan.servers.count == 1 ? "1 server" : "\(scan.servers.count) servers"
-            )
-            ScrollView {
-                VStack(spacing: 0) {
-                    ForEach(sources(of: scan), id: \.self) { source in
-                        SectionLabel(text: sourceName(source, in: scan))
-                            .padding(.top, Metric.regular)
-                            .padding(.bottom, Metric.hairline)
-                        ForEach(scan.servers.filter { $0.source == source }) { server in
-                            row(server)
-                        }
-                    }
-                }
+            // A short list takes only the room it needs; a long one scrolls.
+            ViewThatFits(in: .vertical) {
+                rows(scan)
+                ScrollView { rows(scan) }
             }
-            .frame(height: 240)
-            .scrollBounceBehavior(.basedOnSize)
+            .frame(maxHeight: Self.listHeight)
 
             if !scan.unreadable.isEmpty {
-                Label(
-                    "Plug couldn't read \(scan.unreadable.joined(separator: ", ")), so anything set up there isn't listed.",
-                    systemImage: "exclamationmark.circle"
+                InlineWarning(
+                    "Plug could not read \(scan.unreadable.joined(separator: ", ")), so anything set up there is not listed."
                 )
                 .font(.caption)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, Metric.roomy)
+    }
+
+    /// Every server found, under the client it came from.
+    private func rows(_ scan: ImportScan) -> some View {
+        let order = sources(of: scan)
+        return VStack(alignment: .leading, spacing: 0) {
+            ForEach(order, id: \.self) { source in
+                let name = sourceName(source, in: scan)
+                HStack(spacing: Metric.tight) {
+                    AppGlyph(target: source, name: name)
+                    SectionLabel(text: name)
+                }
+                .padding(.top, source == order.first ? 0 : Metric.regular)
+                .padding(.bottom, Metric.hairline)
+                ForEach(scan.servers.filter { $0.source == source }) { server in
+                    row(server)
+                }
             }
         }
     }
 
     private func row(_ server: DiscoveredServer) -> some View {
         Toggle(isOn: binding(for: server)) {
-            HStack(spacing: Metric.snug) {
-                AppGlyph(target: server.source, name: server.sourceName, size: 18)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text(server.name).font(.body)
-                    Text(serverDescription(server))
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(server.name).font(.body)
+                Text(serverDescription(server))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let reason = refused[server.id] {
+                    InlineWarning("Not added: \(reason)")
                         .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    if let reason = refused[server.id] {
-                        Text("Not added: \(reason)")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
                 }
-                Spacer(minLength: 0)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
         .toggleStyle(.checkbox)
-        .padding(.vertical, Metric.snug - 2)
+        .padding(.vertical, Metric.tight)
         .help(server.detail)
     }
 
@@ -211,6 +208,10 @@ struct ImportServersView: View {
             }
             importing = false
             guard !failed.isEmpty else {
+                // One server went in: show it. Several: the list shows them.
+                if wanted.count == 1, let only = wanted.first {
+                    router.reveal(server: only.name)
+                }
                 dismiss()
                 return
             }

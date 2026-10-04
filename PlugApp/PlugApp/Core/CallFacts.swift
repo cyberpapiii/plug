@@ -12,12 +12,15 @@ struct CallFacts: Equatable {
     init(_ event: ActivityEvent) { self.event = event }
 
     var succeeded: Bool { event.outcome == "success" }
+    /// The client stopped the call. Nothing went wrong, so it is not a problem.
+    var cancelled: Bool { event.outcome == "cancelled" }
+    var failed: Bool { !succeeded && !cancelled }
 
-    /// "Worked", "Failed", or "Cancelled".
+    /// "Worked", "Failed", or "Canceled".
     var result: String {
         switch event.outcome {
         case "success": "Worked"
-        case "cancelled": "Cancelled"
+        case "cancelled": "Canceled"
         default: "Failed"
         }
     }
@@ -67,8 +70,6 @@ struct CallFacts: Equatable {
             : "\(event.latencyMs) milliseconds"
     }
 
-    var slow: Bool { event.latencyMs >= 5_000 }
-
     /// Why it failed, when the service said. Nil for a call that worked.
     var reason: String? {
         guard !succeeded else { return nil }
@@ -79,10 +80,8 @@ struct CallFacts: Equatable {
     /// What to do about a failure. Nil for a call that worked.
     var advice: String? {
         guard !succeeded else { return nil }
-        if event.outcome == "cancelled" { return "The client stopped this call before it finished. Nothing needs fixing." }
-        guard let reason else {
-            return "Plug has no reason on record for this call. Try it again to see why it fails."
-        }
+        if cancelled { return "The client stopped this call before it finished." }
+        guard let reason else { return "Try the call again to see why it fails." }
         return Explain.advice(forReason: reason)
     }
 }

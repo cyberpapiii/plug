@@ -234,7 +234,7 @@ final class EditServerEnvironmentTests: XCTestCase {
 
     func testMissingCapabilityCopyIsRestartUpdateNotParseError() {
         XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("Restart"))
-        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("update"))
+        XCTAssertTrue(AppModel.serverConfigReadRequiredCopy.contains("updating"))
         XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("PARSE_ERROR"))
         XCTAssertFalse(AppModel.serverConfigReadRequiredCopy.contains("could not be loaded"))
     }
@@ -304,7 +304,7 @@ final class AppRosterTests: XCTestCase {
         )
         XCTAssertEqual(
             named.map(\.displayName),
-            ["Hermes", "ditto-history", "python3", "Cursor", "Unidentified local client abcd"]
+            ["Hermes", "ditto-history", "python3", "Cursor", "Unknown client abcd"]
         )
         XCTAssertEqual(named[0].host?.app, "/Applications/Hermes.app")
         XCTAssertNil(named[1].host?.app)
@@ -339,7 +339,7 @@ final class AppRosterTests: XCTestCase {
             """
         )
 
-        XCTAssertEqual(live.map(names.displayName), ["Hermes", "Hermes", "Unidentified local client h3"])
+        XCTAssertEqual(live.map(names.displayName), ["Hermes", "Hermes", "Unknown client h3"])
         XCTAssertEqual(names.key(of: live[0]), key)
         XCTAssertNil(names.key(of: live[2]), "a session with nothing to store a name under cannot be renamed")
         XCTAssertEqual(names.name(forKey: "oauth:abc"), "Phone")
@@ -372,11 +372,11 @@ final class AppRosterTests: XCTestCase {
 
         // A block on a server that is gone is not counted.
         XCTAssertEqual(access("cursor").blockedServers, ["git"])
-        XCTAssertEqual(access("cursor").summary, "kept from 1 server and 1 tool")
+        XCTAssertEqual(access("cursor").summary, "1 server and 1 tool off")
         XCTAssertFalse(access("cursor").isRemote)
-        XCTAssertEqual(access("oauth:abc").summary, "kept from 1 server")
+        XCTAssertEqual(access("oauth:abc").summary, "1 server off")
         XCTAssertTrue(access("oauth:abc").isRemote)
-        XCTAssertEqual(access("pi").summary, "kept from 2 tools")
+        XCTAssertEqual(access("pi").summary, "2 tools off")
         XCTAssertNil(access("claude-code").summary)
         XCTAssertFalse(access("claude-code").isLimited)
     }
@@ -414,7 +414,7 @@ final class AppRosterTests: XCTestCase {
         let names = ClientNames(visibility: visibility, names: [], grants: grants)
         XCTAssertEqual(
             live.map(names.displayName),
-            ["Perplexity", "Cursor", "Unidentified remote client r3"]
+            ["Perplexity", "Cursor", "Unknown client r3"]
         )
         XCTAssertEqual(names.key(of: live[0]), "oauth:abc", "a remote session is renamed through its grant")
 
@@ -451,11 +451,11 @@ final class AppRosterTests: XCTestCase {
          {"target":"codex-cli","detected":true},
          {"target":"goose","linked":true}]
         """#)
-        XCTAssertEqual(ClientStatus.app(list[0], connections: 2, limit: nil).text, "Connected · 2 connections")
-        XCTAssertEqual(ClientStatus.app(list[0], connections: 1, limit: "kept from 1 server").text, "Connected · kept from 1 server")
-        XCTAssertEqual(ClientStatus.app(list[0], connections: 0, limit: nil).text, "On · not open right now")
-        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "Off")
-        XCTAssertEqual(ClientStatus.app(list[2], connections: 0, limit: nil).text, "On · client not found on this Mac")
+        XCTAssertEqual(ClientStatus.app(list[0], connections: 2, limit: nil).text, "2 connections")
+        XCTAssertEqual(ClientStatus.app(list[0], connections: 1, limit: "1 server off").text, "Connected · 1 server off")
+        XCTAssertEqual(ClientStatus.app(list[0], connections: 0, limit: nil).text, "Not open")
+        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "Not using Plug")
+        XCTAssertEqual(ClientStatus.app(list[2], connections: 0, limit: nil).text, "Not found on this Mac")
     }
 }
 
@@ -525,6 +525,31 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertNil(old.reason)
         XCTAssertNotNil(old.advice, "a failure always has a next step")
         XCTAssertEqual(old.duration, "12 ms")
+    }
+
+    func testACancelledCallIsNotAFailure() {
+        func call(_ outcome: String) -> CallFacts {
+            CallFacts(ActivityEvent(
+                sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
+                latencyMs: 12, outcome: outcome
+            ))
+        }
+        let cancelled = call("cancelled")
+        XCTAssertTrue(cancelled.cancelled)
+        XCTAssertFalse(cancelled.failed)
+        XCTAssertFalse(cancelled.succeeded)
+        XCTAssertEqual(cancelled.result, "Canceled")
+        XCTAssertEqual(cancelled.advice, "The client stopped this call before it finished.")
+
+        let failed = call("error")
+        XCTAssertTrue(failed.failed)
+        XCTAssertFalse(failed.cancelled)
+        XCTAssertEqual(failed.result, "Failed")
+        XCTAssertEqual(failed.advice, "Try the call again to see why it fails.")
+
+        let worked = CallFacts(event(1, tool: "Figma__get_file"))
+        XCTAssertFalse(worked.failed)
+        XCTAssertFalse(worked.cancelled)
     }
 
     func testEveryFailureGetsANextStep() {

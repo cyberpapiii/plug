@@ -310,7 +310,7 @@ final class InstallationCoordinator {
                 state = .repairableDrift(
                     InstallationDrift(
                         summary: "A local Plug command conflict needs repair",
-                        detail: "An unrelated file or command occupies \(path.path)."
+                        detail: "Another file is in the way at \(path.path). Move it, then try again."
                     )
                 )
             } else {
@@ -453,8 +453,8 @@ final class InstallationCoordinator {
         }
     }
 
-    /// Names every final check that failed so the drift banner can say what
-    /// actually disagreed instead of listing every possible cause.
+    /// Names every final check that failed so the log can say what actually
+    /// disagreed instead of listing every possible cause.
     private func finalDisagreements(
         _ snapshot: InstallationSnapshot,
         expected canonical: VerifiedAppInstallation
@@ -686,8 +686,7 @@ final class InstallationCoordinator {
             state = .blocked(
                 InstallationFailure(
                     summary: "Plug installation reconciliation failed",
-                    detail: "Checking the installation timed out \(attempt) times in a row. "
-                        + "Commands can stay slow for a while after a restart. Try again in a minute.",
+                    detail: "Plug is taking too long to check itself. Try again in a minute.",
                     logURL: logURL
                 )
             )
@@ -719,14 +718,14 @@ final class InstallationCoordinator {
             state = .repairableDrift(
                 InstallationDrift(
                     summary: "A local Plug command conflict needs repair",
-                    detail: "An unrelated file or command occupies \(path.path)."
+                    detail: "Another file is in the way at \(path.path). Move it, then try again."
                 )
             )
         case let .unknownLocalState(paths):
             state = .repairableDrift(
                 InstallationDrift(
                     summary: "Unknown local Plug state needs review",
-                    detail: "Unknown installation paths were found: \(paths)."
+                    detail: "Plug found copies of itself it does not recognize: \(paths)."
                 )
             )
         case .adoptionRequired:
@@ -734,7 +733,7 @@ final class InstallationCoordinator {
             state = .blocked(
                 InstallationFailure(
                     summary: "Plug adoption is required",
-                    detail: "The existing daemon requires explicit adoption.",
+                    detail: "An older copy of Plug is still running and has to be replaced.",
                     logURL: logURL
                 )
             )
@@ -742,7 +741,7 @@ final class InstallationCoordinator {
             state = .blocked(
                 InstallationFailure(
                     summary: "Plug daemon ownership is unknown",
-                    detail: "Launchd evidence did not prove ownership of the daemon.",
+                    detail: "Plug could not confirm that the running copy belongs to this app.",
                     logURL: logURL
                 )
             )
@@ -750,7 +749,7 @@ final class InstallationCoordinator {
             state = .repairableDrift(
                 InstallationDrift(
                     summary: "Plug installation did not converge",
-                    detail: error.detail
+                    detail: "Plug's parts are out of step with each other. Repair puts them back in line."
                 )
             )
         }
@@ -818,6 +817,8 @@ private enum CoordinatorError: Error {
     case proofDisagreement
     case finalDisagreement(String)
 
+    /// The technical sentence for the log. What the person reads is written
+    /// where the state is published.
     var detail: String {
         switch self {
         case .adoptionRequired:

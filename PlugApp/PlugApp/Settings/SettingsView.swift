@@ -15,26 +15,33 @@ struct SettingsView: View {
     @State private var launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
     @AppStorage(NotificationService.preferenceKey) private var notify = false
     @State private var loginItemFailed = false
+    @State private var notificationsDenied = false
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
 
     @State private var checkup: Checkup?
     @State private var checking = false
     @State private var checkupError: String?
     @State private var showsPassingChecks = false
+    @State private var configURL: URL?
 
     var body: some View {
         Form {
+            general
             plug
-            checkupSection
-            behavior
             files
             about
         }
         .formStyle(.grouped)
         .frame(width: Metric.settingsWidth)
-        .frame(height: 620)
+        .frame(height: Metric.settingsHeight)
         .task {
-            launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
+            readLoginItem()
+            configURL = await checkups.configPath()
+        }
+        // Allowing the login item happens in System Settings, so look again
+        // when the person comes back.
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            readLoginItem()
         }
         // A problem elsewhere in the app can send a person here with the
         // checkup already asked for.
@@ -43,108 +50,113 @@ struct SettingsView: View {
         }
     }
 
+    // MARK: General
+
+    private var general: some View {
+        Section("General") {
+            Toggle("Open at Login", isOn: Binding(
+                get: { launchAtLogin },
+                set: { setLoginItem($0) }
+            ))
+            if loginItemFailed {
+                LabeledContent {
+                    Button("Open Login Items…") { DaemonServiceManager.shared.openLoginItemSettings() }
+                } label: {
+                    Text("macOS needs you to allow this in System Settings.")
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Toggle(isOn: $notify) {
+                Text("Notifications")
+                Text(notificationsDenied
+                    ? "Allow Plug in System Settings > Notifications."
+                    : "When a server needs sign-in or a new client connects.")
+            }
+            .onChange(of: notify) { _, enabled in
+                guard enabled else { return }
+                Task {
+                    let allowed = await NotificationService.shared.requestAuthorization()
+                    notificationsDenied = !allowed
+                    if !allowed { notify = false }
+                }
+            }
+            Toggle("Check for updates automatically", isOn: $automaticUpdates)
+                .onChange(of: automaticUpdates) { _, enabled in
+                    UpdateService.shared.checksAutomatically = enabled
+                }
+        }
+    }
+
     // MARK: Plug
 
     private var plug: some View {
         Section {
             ServicePowerToggle(model: model, run: run)
-            LabeledContent("Background service") {
-                HStack(spacing: Metric.tight) {
-                    Image(systemName: serviceSymbol)
-                        .foregroundStyle(serviceColor)
-                        .accessibilityHidden(true)
-                    Text(serviceStatus)
-                    if model.isRestartingService { ProgressView().controlSize(.small) }
-                    Button("Restart") { run(.restartService) }
-                        .disabled(model.isRestartingService || !model.serviceEnabled || model.isChangingService)
+            if model.serviceEnabled {
+                LabeledContent("Status") {
+                    HStack(spacing: Metric.tight) {
+                        if serviceIsSettling {
+                            ProgressView().controlSize(.small)
+                        } else {
+                            Image(systemName: serviceSymbol)
+                                .foregroundStyle(serviceColor)
+                                .accessibilityHidden(true)
+                        }
+                        Text(serviceStatus)
+                        Button("Restart") { run(.restartService) }
+                            .help("Reconnects every server. Clients pick Plug back up on their own.")
+                            .disabled(model.isRestartingService || model.isChangingService)
+                    }
                 }
             }
+            checkupRows
+        } header: {
+            Text("Plug")
         } footer: {
-            Text("Restarting reconnects every server. Connected clients pick Plug back up on their own.")
+            Text("Plug keeps serving your clients after you close the window or quit. To stop it, turn Plug off.")
         }
     }
 
     // MARK: Checkup
 
-    private var checkupSection: some View {
-        Section("Checkup") {
-            LabeledContent {
-                HStack(spacing: Metric.tight) {
-                    if checking { ProgressView().controlSize(.small) }
-                    Button("Check Everything") { Task { await runCheckup() } }
-                        .disabled(checking)
-                }
-            } label: {
-                if let checkup {
-                    Label(
-                        checkup.headline,
-                        systemImage: checkup.isClean
-                            ? "checkmark.circle.fill"
-                            : "exclamationmark.triangle.fill"
-                    )
-                    .foregroundStyle(checkup.isClean ? Color.green : Color.orange)
-                } else {
-                    Text("Look for anything wrong with Plug")
-                }
+    @ViewBuilder private var checkupRows: some View {
+        LabeledContent {
+            HStack(spacing: Metric.tight) {
+                if checking { ProgressView().controlSize(.small) }
+                Button("Run Checkup") { Task { await runCheckup() } }
+                    .disabled(checking)
             }
-
-            if let checkupError {
-                Label(checkupError, systemImage: "xmark.circle.fill")
-                    .font(.callout)
-                    .foregroundStyle(.red)
-            }
-
+        } label: {
             if let checkup {
-                ForEach(problemChecks(in: checkup)) { check in
-                    CheckRow(check: check)
+                Label {
+                    Text(checkup.headline)
+                } icon: {
+                    Image(systemName: headlineSymbol(for: checkup))
+                        .foregroundStyle(headlineColor(for: checkup))
                 }
-                if !passingChecks(in: checkup).isEmpty {
-                    DisclosureGroup(
-                        passingChecksTitle(in: checkup),
-                        isExpanded: $showsPassingChecks
-                    ) {
-                        ForEach(passingChecks(in: checkup)) { check in
-                            CheckRow(check: check)
-                        }
-                    }
-                }
+            } else {
+                Text("Checkup")
             }
         }
-    }
 
-    // MARK: Behavior
+        if let checkupError {
+            ProblemNote(title: "The checkup could not run", reason: checkupError)
+        }
 
-    private var behavior: some View {
-        Section {
-            Toggle("Open Plug at login", isOn: $launchAtLogin)
-                .onChange(of: launchAtLogin) { _, enabled in
-                    do {
-                        try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
-                        loginItemFailed = false
-                    } catch {
-                        loginItemFailed = true
-                        DaemonServiceManager.shared.openLoginItemSettings()
+        if let checkup {
+            ForEach(problemChecks(in: checkup)) { check in
+                CheckRow(check: check)
+            }
+            if !passingChecks(in: checkup).isEmpty {
+                DisclosureGroup(
+                    passingChecksTitle(in: checkup),
+                    isExpanded: $showsPassingChecks
+                ) {
+                    ForEach(passingChecks(in: checkup)) { check in
+                        CheckRow(check: check)
                     }
                 }
-            if loginItemFailed {
-                Label(
-                    "macOS wants to confirm this in System Settings.",
-                    systemImage: "exclamationmark.triangle"
-                )
-                .font(.callout)
-                .foregroundStyle(.secondary)
             }
-            Toggle(isOn: $notify) {
-                Text("Notifications")
-                Text("When a server needs sign-in or a new client connects.")
-            }
-            .onChange(of: notify) { _, enabled in
-                if enabled { NotificationService.shared.requestAuthorization() }
-            }
-        } header: {
-            Text("General")
-        } footer: {
-            Text("Plug and its servers keep running after you close its windows or quit the menu bar icon.")
         }
     }
 
@@ -154,16 +166,15 @@ struct SettingsView: View {
         Section {
             LabeledContent("Settings file") {
                 HStack(spacing: Metric.tight) {
-                    Button("Read Again") { run(.reloadConfiguration) }
-                        .help("Use this after you change the settings file by hand")
+                    Button("Reload") { run(.reloadConfiguration) }
+                        .help("Reload after you edit the settings file by hand")
                         .disabled(!model.canMutate)
                     Button("Show in Finder") {
-                        Task {
-                            if let path = await checkups.configPath() {
-                                NSWorkspace.shared.activateFileViewerSelecting([path])
-                            }
+                        if let configURL {
+                            NSWorkspace.shared.activateFileViewerSelecting([configURL])
                         }
                     }
+                    .disabled(configURL == nil)
                 }
             }
             LabeledContent("Logs") {
@@ -172,62 +183,93 @@ struct SettingsView: View {
         } header: {
             Text("Files")
         } footer: {
-            Text("Plug keeps every server and client choice in one settings file. Changes made in the app are saved there for you.")
+            Text("Plug saves your servers and clients here. Reload after editing the file by hand.")
         }
     }
 
     // MARK: About
 
     private var about: some View {
-        Section("Updates") {
-            Toggle("Check for updates automatically", isOn: $automaticUpdates)
-                .onChange(of: automaticUpdates) { _, enabled in
-                    UpdateService.shared.checksAutomatically = enabled
-                }
+        Section("About") {
             LabeledContent("Version") {
                 HStack(spacing: Metric.tight) {
                     Text(model.displayVersion)
-                        .monospacedDigit()
                         .textSelection(.enabled)
-                    Button("Check Now…") { run(.checkForUpdates) }
+                    Button("Check for Updates…") { run(.checkForUpdates) }
                         .disabled(!UpdateService.shared.canCheckForUpdates)
                 }
             }
         }
     }
 
+    // MARK: Login item
+
+    private func readLoginItem() {
+        launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
+        if launchAtLogin { loginItemFailed = false }
+    }
+
+    /// The switch only moves when macOS agrees. When it does not, the row
+    /// under it says where to allow it; System Settings is not opened for the
+    /// person.
+    private func setLoginItem(_ enabled: Bool) {
+        do {
+            try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
+            launchAtLogin = enabled
+            loginItemFailed = false
+        } catch {
+            loginItemFailed = true
+        }
+    }
+
+    // MARK: Status
+
+    /// Only read while Plug is on; the Status row is hidden when it is off.
+    private var serviceIsSettling: Bool {
+        if model.isRestartingService { return true }
+        switch model.connectionState {
+        case .connecting, .reconnecting: return true
+        case .ready, .incompatible, .disconnected: return false
+        }
+    }
+
     private var serviceStatus: String {
-        if !model.serviceEnabled { return "Off" }
         if model.isRestartingService { return "Restarting" }
         switch model.connectionState {
         case .ready: return "Running"
         case .connecting: return "Connecting"
         case .reconnecting: return "Reconnecting"
-        case .incompatible: return "Restart required to finish update"
+        case .incompatible: return "Restart needed"
         case .disconnected: return "Not running"
         }
     }
 
     private var serviceSymbol: String {
-        if !model.serviceEnabled { return "bolt.slash" }
-        if model.isRestartingService { return "circle.dotted" }
         switch model.connectionState {
-        case .ready: return "checkmark.circle.fill"
-        case .connecting, .reconnecting: return "circle.dotted"
-        case .incompatible: return "arrow.triangle.2.circlepath"
-        case .disconnected: return "xmark.circle.fill"
+        case .incompatible: "exclamationmark.triangle.fill"
+        case .disconnected: "xmark.circle.fill"
+        case .ready, .connecting, .reconnecting: "checkmark.circle.fill"
         }
     }
 
     private var serviceColor: Color {
-        if !model.serviceEnabled { return .secondary }
-        if model.isRestartingService { return .secondary }
         switch model.connectionState {
-        case .ready: return .green
-        case .connecting, .reconnecting: return .secondary
-        case .incompatible: return .orange
-        case .disconnected: return .red
+        case .incompatible: .orange
+        case .disconnected: .red
+        case .ready, .connecting, .reconnecting: .green
         }
+    }
+
+    // MARK: Checkup results
+
+    private func headlineSymbol(for checkup: Checkup) -> String {
+        if !checkup.problems.isEmpty { return "xmark.circle.fill" }
+        return checkup.isClean ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+    }
+
+    private func headlineColor(for checkup: Checkup) -> Color {
+        if !checkup.problems.isEmpty { return .red }
+        return checkup.isClean ? .green : .orange
     }
 
     private func runCheckup() async {
@@ -235,8 +277,12 @@ struct SettingsView: View {
         checkupError = nil
         showsPassingChecks = false
         do {
-            checkup = try await checkups.run()
+            let result = try await checkups.run()
+            // A checkup that checked nothing did not run.
+            if result.checks.isEmpty { throw CheckupError.unreadable }
+            checkup = result
         } catch {
+            checkup = nil
             checkupError = error.localizedDescription
         }
         checking = false
@@ -251,41 +297,44 @@ struct SettingsView: View {
     }
 
     private func passingChecksTitle(in checkup: Checkup) -> String {
-        let count = passingChecks(in: checkup).count
-        return checkup.isClean
-            ? "Show \(count) checked \(count == 1 ? "item" : "items")"
-            : "Show \(count) passed \(count == 1 ? "check" : "checks")"
+        checkup.isClean ? "Details" : "\(passingChecks(in: checkup).count) passed"
     }
 }
 
-/// One checked thing: a glyph for the outcome, a plain title, the detail.
+/// One checked thing: a glyph for the outcome, a plain title, the detail,
+/// and what to do when it did not pass.
 private struct CheckRow: View {
     let check: Check
 
     var body: some View {
-        HStack(alignment: .top, spacing: Metric.snug) {
+        Label {
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(check.title)
+                Text(check.message)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let fix {
+                    // The fix can carry a command in backticks.
+                    Text((try? AttributedString(markdown: fix)) ?? AttributedString(fix))
+                        .font(.callout)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+            }
+        } icon: {
             Image(systemName: symbol)
                 .foregroundStyle(color)
                 .symbolRenderingMode(.hierarchical)
-                .frame(width: 16)
                 .accessibilityHidden(true)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(check.title).font(.callout)
-                Text(check.message)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let fix = check.fix, check.result != .pass {
-                    Label(fix, systemImage: "wrench.adjustable")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            Spacer(minLength: 0)
         }
         .accessibilityElement(children: .combine)
-        .accessibilityLabel("\(check.title), \(spokenResult). \(check.message)")
+        .accessibilityLabel("\(check.title), \(spokenResult). \(check.message)\(fix.map { " \($0)" } ?? "")")
+    }
+
+    /// What to do about it, for a check that did not pass.
+    private var fix: String? {
+        check.result == .pass ? nil : check.fix
     }
 
     private var symbol: String {

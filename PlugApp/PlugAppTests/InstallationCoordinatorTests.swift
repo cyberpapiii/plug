@@ -579,7 +579,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected blocked state, got \(coordinator.state)")
         }
         XCTAssertEqual(failure.logURL, logURL)
-        XCTAssertTrue(failure.detail.contains("timed out 3 times"), failure.detail)
+        XCTAssertEqual(failure.detail, "Plug is taking too long to check itself. Try again in a minute.")
         XCTAssertFalse(failure.detail.contains("timedOut"), "raw case name must not reach the panel")
         let calls = await app.calls
         XCTAssertEqual(calls, 3)
@@ -761,6 +761,7 @@ final class InstallationCoordinatorTests: XCTestCase {
 
     func testRepairableShellLinkInRecognizedPathsRemainsShadowInstall() async {
         let events = EventLog()
+        let log = LogLines()
         let shellLink = URL(fileURLWithPath: "/Users/me/.local/bin/plug")
         let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
         let legacySnapshot = LegacyInstallSnapshot(
@@ -785,7 +786,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             clientRepairer: clients,
             daemonManager: daemon,
             openURL: { _ in },
-            logWriter: { _, _ in }
+            logWriter: { _, line in log.lines.append(line) }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -793,13 +794,16 @@ final class InstallationCoordinatorTests: XCTestCase {
         guard case let .repairableDrift(drift) = coordinator.state else {
             return XCTFail("Unrepaired shell link must not report healthy, got \(coordinator.state)")
         }
-        XCTAssertTrue(drift.detail.contains(shellLink.path), drift.detail)
+        // The person reads one plain sentence; the path goes to the log.
+        XCTAssertEqual(drift.detail, "Plug's parts are out of step with each other. Repair puts them back in line.")
+        XCTAssertTrue(log.text.contains(shellLink.path), log.text)
     }
 
-    func testFinalDisagreementDetailNamesTheFailedCheck() async {
+    func testFinalDisagreementLogNamesTheFailedCheck() async {
         // A client repair makes this pass change something, so the final
         // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
+        let log = LogLines()
         let current = healthyService()
         let staleRecord = LaunchdJobRecord(
             label: "com.plug.daemon",
@@ -827,7 +831,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             clientRepairer: clients,
             daemonManager: daemon,
             openURL: { _ in },
-            logWriter: { _, _ in }
+            logWriter: { _, line in log.lines.append(line) }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -835,9 +839,11 @@ final class InstallationCoordinatorTests: XCTestCase {
         guard case let .repairableDrift(drift) = coordinator.state else {
             return XCTFail("Expected repairable drift, got \(coordinator.state)")
         }
-        XCTAssertTrue(drift.detail.contains("not owned by this app build"), drift.detail)
-        XCTAssertTrue(drift.detail.contains("0.0.1"), drift.detail)
-        XCTAssertFalse(drift.detail.contains("shell command"), drift.detail)
+        // The person reads one plain sentence; the failed check goes to the log.
+        XCTAssertEqual(drift.detail, "Plug's parts are out of step with each other. Repair puts them back in line.")
+        XCTAssertTrue(log.text.contains("not owned by this app build"), log.text)
+        XCTAssertTrue(log.text.contains("0.0.1"), log.text)
+        XCTAssertFalse(log.text.contains("shell command"), log.text)
     }
 
     func testFinalHandshakeExecutableMismatchNeverReportsHealthy() async {
@@ -1277,6 +1283,13 @@ final class InstallationCoordinatorTests: XCTestCase {
         ])
         return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
     }
+}
+
+/// What the coordinator wrote to its log, for tests that check the technical
+/// detail stays there.
+private final class LogLines {
+    var lines: [String] = []
+    var text: String { lines.joined(separator: "\n") }
 }
 
 private actor EventLog {

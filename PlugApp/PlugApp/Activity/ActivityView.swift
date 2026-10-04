@@ -13,7 +13,7 @@ struct ActivityView: View {
     @State private var scope: Scope = .everything
 
     enum Scope: String, CaseIterable, Identifiable {
-        case everything = "Everything"
+        case everything = "All"
         case problems = "Problems"
         var id: Self { self }
     }
@@ -21,20 +21,20 @@ struct ActivityView: View {
     var body: some View {
         Group {
             if model.isLoadingInitialData {
-                LoadingPage(message: "Loading activity…")
+                LoadingPage(message: "Loading activity")
             } else if model.initialDataUnavailable {
-                UnavailablePage(item: "Activity") { run(.reconnect) }
+                UnavailablePage(verdict: model.verdict, run: run)
             } else if model.activities.isEmpty {
                 EmptyPage(
-                    title: "No activity yet",
+                    title: "No Activity",
                     message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked.",
-                    symbol: "clock"
+                    symbol: AppSection.activity.symbol
                 )
             } else if visible.isEmpty {
                 if scope == .problems, search.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyPage(
-                        title: "No problems",
-                        message: "Every recent call went through cleanly.",
+                        title: "No Problems",
+                        message: "No recent call failed.",
                         symbol: "checkmark.circle"
                     )
                 } else {
@@ -50,12 +50,6 @@ struct ActivityView: View {
                                 }
                             }
                         }
-                        if model.activityIsCapped {
-                            Text("This is the most recent \(AppModel.activityLimit) calls. Older ones are not kept.")
-                                .font(.caption)
-                                .foregroundStyle(.tertiary)
-                                .listRowSeparator(.hidden)
-                        }
                     }
                 } detail: {
                     if let selected {
@@ -66,22 +60,22 @@ struct ActivityView: View {
                         )
                         .id(selected.sequence)
                     } else {
-                        NoSelection(item: "Call")
+                        NoSelection(item: "Call", symbol: AppSection.activity.symbol)
                     }
                 }
             }
         }
-        .navigationSubtitle(activitySummary ?? "")
+        .navigationSubtitle(model.activitySummary ?? "")
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
                 Picker("Show", selection: $scope) {
                     ForEach(Scope.allCases) { scope in
-                        Text(scope == .problems ? problemsLabel : scope.rawValue).tag(scope)
+                        Text(scope.rawValue).tag(scope)
                     }
                 }
                 .pickerStyle(.segmented)
                 .disabled(model.activities.isEmpty)
-                .help("Show every call, or only the ones that went wrong")
+                .help("Show every call, or only the ones that failed")
             }
         }
         .onChange(of: visible.first?.sequence, initial: true) { keepSelectionVisible() }
@@ -102,25 +96,12 @@ struct ActivityView: View {
         }
     }
 
-    private var activitySummary: String? {
-        guard model.hasLoadedSnapshot else { return nil }
-        let count = model.activities.count
-        guard count > 0 else { return nil }
-        let summary = "\(count) recent \(count == 1 ? "call" : "calls")"
-        return model.dataIsStale ? "Last known · \(summary)" : summary
-    }
-
     private var serverNames: Set<String> { Set(model.situation.servers.map(\.name)) }
-
-    private var problemsLabel: String {
-        let count = model.activities.filter { $0.outcome != "success" }.count
-        return count == 0 ? "Problems" : "Problems (\(count))"
-    }
 
     private var visible: [ActivityEvent] {
         let query = search.trimmingCharacters(in: .whitespaces)
         return model.activities
-            .filter { scope == .everything || $0.outcome != "success" }
+            .filter { scope == .everything || CallFacts($0).failed }
             .filter { event in
                 guard !query.isEmpty else { return true }
                 return event.method.localizedCaseInsensitiveContains(query)
@@ -168,35 +149,34 @@ private struct ActivityRow: View {
     var body: some View {
         HStack(spacing: Metric.tight) {
             // The calling client's own icon, so a long list can be scanned
-            // by picture rather than read line by line. Trouble replaces
-            // the icon with a warning, so a failure is visible at a glance.
+            // by picture rather than read line by line. A failure replaces
+            // the icon, so it is visible at a glance. A call the client
+            // stopped is not a failure and keeps the icon.
             Group {
-                if call.succeeded {
-                    AppGlyph(target: call.callerTarget, name: call.caller, size: 20)
-                } else {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
+                if call.failed {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.red)
                         .symbolRenderingMode(.hierarchical)
+                } else {
+                    AppGlyph(target: call.callerTarget, name: call.caller)
                 }
             }
-            .frame(width: 20, height: 20)
-            VStack(alignment: .leading, spacing: 1) {
+            .frame(width: 18, height: 18)
+            VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(call.tool)
-                    .font(.callout.monospaced())
                     .lineLimit(1)
                     .truncationMode(.middle)
                 Text(context)
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
             Text(time)
-                .font(.caption.monospacedDigit())
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
                 .layoutPriority(1)
         }
-        .padding(.vertical, Metric.hairline)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
             "\(call.result). \(call.tool)\(call.server.map { ", \($0)" } ?? ""), \(call.caller), \(time), \(call.spokenDuration)"
@@ -223,42 +203,68 @@ private struct CallDetail: View {
     var body: some View {
         DetailForm {
             Section {
-                DetailHeader(title: call.tool, subtitle: call.result, monospaced: true) {
-                    Image(systemName: call.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                DetailHeader(title: call.tool, subtitle: call.result) {
+                    glyph
                         .font(.title2)
                         .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(call.succeeded ? Color.green : .orange)
                         .accessibilityHidden(true)
                 } controls: {
                     EmptyView()
                 }
-                if !call.succeeded {
+                if call.failed {
                     ProblemNote(
-                        title: call.reason ?? "This call \(call.result.lowercased()).",
+                        title: call.reason == nil ? "No reason was recorded" : "The server reported an error",
+                        reason: call.reason,
                         advice: call.advice
                     )
                 }
+            } footer: {
+                if call.cancelled, let advice = call.advice {
+                    Text(advice)
+                }
             }
-            Section {
+            Section("Details") {
+                LabeledContent("Client", value: call.caller)
                 if let server = call.server {
                     LabeledContent("Server") {
                         HStack(spacing: Metric.tight) {
                             Text(server).textSelection(.enabled)
                             if canShowServer, let name = call.event.server {
                                 Button { run(.reveal(server: name)) } label: {
-                                    Image(systemName: "arrow.right.circle.fill")
+                                    Image(systemName: "arrow.right.circle")
                                 }
                                 .buttonStyle(.borderless)
-                                .help("Show this server")
+                                .foregroundStyle(.secondary)
+                                .help("Show Server")
                                 .accessibilityLabel("Show Server")
                             }
                         }
                     }
                 }
-                LabeledContent("Client", value: call.caller)
-                LabeledContent("When", value: call.date.formatted(date: .abbreviated, time: .standard))
-                LabeledContent("Took", value: call.duration)
+                LabeledContent("Time", value: call.date.formatted(date: .abbreviated, time: .standard))
+                LabeledContent("Duration", value: call.duration)
+                LabeledContent("Full Name") {
+                    Text(fullName)
+                        .font(.body.monospaced())
+                        .textSelection(.enabled)
+                }
             }
+        }
+    }
+
+    /// The name as the client called it, server half included.
+    private var fullName: String {
+        if let tool = call.event.tool, !tool.isEmpty { return tool }
+        return call.event.method
+    }
+
+    @ViewBuilder private var glyph: some View {
+        if call.succeeded {
+            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+        } else if call.cancelled {
+            Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
+        } else {
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
         }
     }
 }

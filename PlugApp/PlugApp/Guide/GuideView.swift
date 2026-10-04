@@ -10,6 +10,11 @@ struct GuideView: View {
     let leave: (PlugIntent?) -> Void
     @State private var copied = false
 
+    /// The step number or the sparkle at the start of a row.
+    private static let markWidth: CGFloat = 24
+    /// Every row's buttons share one column, so the text beside them lines up.
+    private static let actionWidth: CGFloat = 140
+
     private var guide: FirstRunGuide {
         FirstRunGuide(
             serverCount: model.snapshot.configuredServers.count,
@@ -20,58 +25,39 @@ struct GuideView: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("How Plug works").font(.title2.weight(.semibold))
-                Text("One place on your Mac that holds every tool you have and gives it to every client you use.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
+        SheetFrame(
+            title: "How Plug Works",
+            subtitle: "One place on your Mac that holds every tool you have and gives it to every client you use."
+        ) {
+            VStack(alignment: .leading, spacing: Metric.regular) {
+                sides
 
-            sides
-
-            VStack(spacing: Metric.snug) {
-                ForEach(Array(FirstRunGuide.Step.allCases.enumerated()), id: \.element) { index, step in
-                    row(step, number: index + 1)
-                }
-            }
-
-            Divider()
-
-            HStack(spacing: Metric.snug) {
-                if FirstRunGuide.agentPrompt != nil {
-                    VStack(alignment: .leading, spacing: Metric.hairline) {
-                        Text("Would you like your agent to do this?").font(.callout)
-                        Text("Paste the prompt into Claude, Codex, or any agent with a terminal.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                VStack(spacing: Metric.snug) {
+                    ForEach(Array(FirstRunGuide.Step.allCases.enumerated()), id: \.element) { index, step in
+                        row(step, number: index + 1)
                     }
-                    Button(copied ? "Copied" : "Copy Setup Prompt") { copyPrompt() }
+                    if FirstRunGuide.agentPrompt != nil {
+                        setupOffer
+                    }
                 }
-                Spacer(minLength: 0)
-                Button("Done") { leave(nil) }
-                    .buttonStyle(.borderedProminent)
-                    .keyboardShortcut(.defaultAction)
             }
+            .padding(.horizontal, Metric.roomy)
         }
-        .padding(Metric.roomy)
-        .frame(width: SheetFrame<EmptyView, EmptyView>.width)
         .task { await model.loadConnectableApps() }
     }
 
     /// Plug's two sides, as the one picture a newcomer needs.
     private var sides: some View {
         HStack(spacing: Metric.snug) {
-            side("Servers", "provide tools", symbol: "shippingbox")
+            side("Servers", "provide tools", symbol: AppSection.servers.symbol)
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
-            side("Plug", "holds them all", symbol: "powerplug")
+            side("Plug", "holds them all", symbol: AppSection.plugSymbol)
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
-            side("Clients", "use tools", symbol: "app.connected.to.app.below.fill")
+            side("Clients", "use tools", symbol: AppSection.clients.symbol)
         }
         .frame(maxWidth: .infinity)
         .padding(Metric.regular)
-        .background(.quaternary.opacity(0.3), in: RoundedRectangle(cornerRadius: Metric.corner))
+        .nativeInsetSurface(.insetFill)
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Servers provide tools. Plug holds them all. Clients use tools.")
     }
@@ -90,46 +76,80 @@ struct GuideView: View {
 
     private func row(_ step: FirstRunGuide.Step, number: Int) -> some View {
         let done = guide.isDone(step)
-        let isNext = guide.next == step
         return HStack(alignment: .top, spacing: Metric.snug) {
             Image(systemName: done ? "checkmark.circle.fill" : "\(number).circle")
                 .font(.title3)
                 .foregroundStyle(done ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
-                .frame(width: 24)
+                .frame(width: Self.markWidth)
                 .accessibilityLabel(done ? "Done" : "Step \(number)")
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(step.title).font(.body.weight(.medium))
-                Text(step.detail)
+                Text(detail(for: step, done: done))
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }
             .layoutPriority(1)
             Spacer(minLength: Metric.snug)
-            actions(step, prominent: isNext)
+            // A done step keeps the column, so every row's text is one width.
+            Group {
+                if !done { actions(step) }
+            }
+            .frame(width: Self.actionWidth, alignment: .trailing)
         }
     }
 
-    @ViewBuilder private func actions(_ step: FirstRunGuide.Step, prominent: Bool) -> some View {
+    /// Adding a server needs Plug to be on, so the first step says so.
+    private func detail(for step: FirstRunGuide.Step, done: Bool) -> String {
+        if step == .server, !done, !model.canMutate { return "Turn Plug on to add servers." }
+        return step.detail
+    }
+
+    @ViewBuilder private func actions(_ step: FirstRunGuide.Step) -> some View {
         switch step {
         case .server:
-            VStack(alignment: .trailing, spacing: Metric.rowGap) {
-                action("Import Servers…", .importServers, prominent: prominent)
-                action("Add Server…", .addServer, prominent: false)
+            VStack(spacing: Metric.rowGap) {
+                action("Import Servers…", .importServers)
+                action("Add Server…", .addServer)
             }
             .disabled(!model.canMutate)
         case .client:
-            action("Show Clients", .openWindow(.clients), prominent: prominent)
+            action("Show Clients", .openWindow(.clients))
         case .activity:
-            action("Show Activity", .openWindow(.activity), prominent: prominent)
+            action("Show Activity", .openWindow(.activity))
         }
     }
 
-    @ViewBuilder private func action(_ title: String, _ intent: PlugIntent, prominent: Bool) -> some View {
-        if prominent {
-            Button(title) { leave(intent) }.buttonStyle(.borderedProminent)
-        } else {
-            Button(title) { leave(intent) }
+    /// One button, as wide as the action column. The sheet's Done is its one
+    /// prominent button, so these stay plain.
+    private func action(_ title: String, _ intent: PlugIntent) -> some View {
+        Button { leave(intent) } label: {
+            Text(title).frame(maxWidth: .infinity)
+        }
+    }
+
+    /// The other way to do all three steps: hand the prompt to a client.
+    private var setupOffer: some View {
+        HStack(alignment: .top, spacing: Metric.snug) {
+            Image(systemName: "sparkles")
+                .font(.title3)
+                .foregroundStyle(.secondary)
+                .frame(width: Self.markWidth)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text("Want a client to set this up for you?").font(.body.weight(.medium))
+                Text("Paste the prompt into Claude, Codex, or any client that can run commands.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .layoutPriority(1)
+            Spacer(minLength: Metric.snug)
+            Button { copyPrompt() } label: {
+                Label("Copy Setup Prompt", systemImage: copied ? "checkmark" : "doc.on.doc")
+            }
+            .contentTransition(.symbolEffect(.replace))
+            .fixedSize()
         }
     }
 

@@ -16,8 +16,9 @@ struct ServicePowerToggle: View {
         ))
         .toggleStyle(.switch)
         .disabled(model.isChangingService || model.isRestartingService)
-        .accessibilityLabel("Plug on")
-        .confirmationDialog("Turn off Plug?", isPresented: $confirmingOff) {
+        .accessibilityLabel("Plug")
+        .help(model.serviceEnabled ? "Turn Plug off" : "Turn Plug on")
+        .confirmationDialog("Turn off Plug?", isPresented: $confirmingOff, titleVisibility: .visible) {
             Button("Turn Off", role: .destructive) { run(.setServiceEnabled(false)) }
             Button("Cancel", role: .cancel) {}
         } message: {
@@ -37,9 +38,12 @@ enum Metric {
     static let regular: CGFloat = 14
     static let roomy: CGFloat = 20
     static let corner: CGFloat = 10
-    /// Rows in the window's lists. The default inset list adds its own air
-    /// around every row; this keeps rows readable without a gap between them.
-    static let listRowInsets = EdgeInsets(top: 2, leading: 12, bottom: 2, trailing: 12)
+    /// The hover field behind a quiet row.
+    static let smallCorner: CGFloat = 7
+    /// The one left edge every line of text in the menu bar panel shares.
+    static let panelInset: CGFloat = tight + snug
+    /// The picture at the start of a detail header.
+    static let glyphSlot: CGFloat = 32
     static let popoverWidth: CGFloat = 340
     static let popoverRowHeight: CGFloat = 34
     /// Whole rows shown before the list scrolls.
@@ -49,6 +53,8 @@ enum Metric {
     /// A detail reads best as a column, not stretched across a wide window.
     static let detailMaxWidth: CGFloat = 680
     static let settingsWidth: CGFloat = 520
+    static let settingsHeight: CGFloat = 520
+    static let sheetWidth: CGFloat = 520
 }
 
 // MARK: - Tone
@@ -98,9 +104,8 @@ extension ServerHealth {
         case .working: "circle.fill"
         case .starting: "circle.dotted"
         case .signInNeeded: "person.badge.key.fill"
-        case .down: "exclamationmark.circle.fill"
-        case .notLoaded: "circle.dashed"
-        case .unknown: "questionmark.circle.fill"
+        case .down, .unknown: "xmark.circle.fill"
+        case .notLoaded: "exclamationmark.triangle.fill"
         case .off: "circle.slash"
         }
     }
@@ -109,10 +114,11 @@ extension ServerHealth {
 // MARK: - Small parts
 
 /// A server's state as one glyph. Carries its own accessibility wording so the
-/// meaning never lives in colour alone.
+/// meaning never lives in colour alone. The large one fills a detail header's
+/// glyph slot.
 struct StatusGlyph: View {
     let health: ServerHealth
-    var size: Font = .body
+    var large = false
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
@@ -121,20 +127,20 @@ struct StatusGlyph: View {
                 ZStack {
                     Circle()
                         .fill(health.color.opacity(0.12))
-                        .frame(width: 14, height: 14)
+                        .frame(width: large ? 28 : 14, height: large ? 28 : 14)
                     Circle()
                         .fill(health.color)
-                        .frame(width: 7, height: 7)
+                        .frame(width: large ? 12 : 7, height: large ? 12 : 7)
                 }
             } else {
                 Image(systemName: health.symbol)
-                    .font(size)
+                    .font(large ? .title2 : .body)
                     .foregroundStyle(health.color)
                     .symbolRenderingMode(.hierarchical)
                     .symbolEffect(.pulse, options: .repeating, isActive: health.pulses && !reduceMotion)
             }
         }
-        .frame(width: 18, height: 18)
+        .frame(width: large ? Metric.glyphSlot : 18, height: large ? Metric.glyphSlot : 18)
         .accessibilityLabel(health.label)
     }
 }
@@ -147,13 +153,13 @@ struct SectionLabel: View {
     var body: some View {
         HStack(spacing: Metric.tight) {
             Text(text)
-                .font(.callout.weight(.semibold))
+                .font(.subheadline.weight(.semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
             if let trailing {
                 Text(trailing)
                     .font(.caption.monospacedDigit())
-                    .foregroundStyle(.tertiary)
+                    .foregroundStyle(.secondary)
             }
         }
         .accessibilityAddTraits(.isHeader)
@@ -172,27 +178,51 @@ struct VerdictView: View {
     private var compact: Bool { style == .compact }
 
     var body: some View {
-        HStack(alignment: .center, spacing: style == .hero ? Metric.regular : Metric.snug) {
-            icon
-            VStack(alignment: .leading, spacing: style == .hero ? 2 : 1) {
-                Text(verdict.title)
-                    .font(titleFont)
-                    .foregroundStyle(.primary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let detail = verdict.detail {
-                    Text(detail)
-                        .font(compact ? .caption : .subheadline)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
+        Group {
+            switch style {
+            case .hero:
+                // The buttons get their own line, so a long title is not
+                // squeezed in the narrow panel.
+                VStack(alignment: .leading, spacing: Metric.snug) {
+                    HStack(spacing: Metric.regular) {
+                        icon
+                        textColumn
+                        Spacer(minLength: 0)
+                    }
+                    if verdict.primary != nil || verdict.secondary != nil {
+                        buttons.padding(.leading, Self.heroIconSize + Metric.regular)
+                    }
+                }
+            case .compact:
+                HStack(spacing: Metric.snug) {
+                    icon
+                    textColumn
+                    Spacer(minLength: Metric.tight)
+                    buttons
                 }
             }
-            Spacer(minLength: Metric.tight)
-            buttons
         }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("\(verdict.title). \(verdict.detail ?? "")")
+    }
+
+    private static let heroIconSize: CGFloat = 40
+
+    private var textColumn: some View {
+        VStack(alignment: .leading, spacing: Metric.hairline) {
+            Text(verdict.title)
+                .font(titleFont)
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+            if let detail = verdict.detail {
+                Text(detail)
+                    .font(compact ? .caption : .subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(compact ? 2 : 3)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
     }
 
     private var titleFont: Font {
@@ -206,7 +236,7 @@ struct VerdictView: View {
         switch style {
         case .hero:
             ZStack {
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                RoundedRectangle(cornerRadius: Metric.corner, style: .continuous)
                     .fill(verdict.tone.tint)
                 if verdict.tone == .busy {
                     ProgressView().controlSize(.small)
@@ -218,7 +248,7 @@ struct VerdictView: View {
                         .contentTransition(.symbolEffect(.replace))
                 }
             }
-            .frame(width: 40, height: 40)
+            .frame(width: Self.heroIconSize, height: Self.heroIconSize)
             .accessibilityHidden(true)
         case .compact:
             if verdict.tone == .busy {
@@ -227,7 +257,7 @@ struct VerdictView: View {
                     .frame(width: 22, height: 22)
             } else {
                 Image(systemName: verdict.symbol)
-                    .font(compact ? .body : .title3)
+                    .font(.body)
                     .symbolRenderingMode(.hierarchical)
                     .foregroundStyle(verdict.tone.color)
                     .frame(width: 22, height: 22)
@@ -240,14 +270,22 @@ struct VerdictView: View {
         HStack(spacing: Metric.tight) {
             if let secondary = verdict.secondary {
                 Button(secondary.title) { run(secondary.intent) }
-                    .buttonStyle(.link)
             }
             if let primary = verdict.primary {
                 Button(primary.title) { run(primary.intent) }
                     .buttonStyle(.borderedProminent)
-                    .controlSize(compact ? .small : .regular)
             }
         }
+        .controlSize(compact ? .small : .regular)
+    }
+}
+
+// MARK: - Fills
+
+extension ShapeStyle where Self == AnyShapeStyle {
+    /// The quiet field behind inset content in sheets and the guide.
+    static var insetFill: AnyShapeStyle {
+        AnyShapeStyle(HierarchicalShapeStyle.quaternary.opacity(0.3))
     }
 }
 
@@ -263,41 +301,15 @@ struct QuietRowButtonStyle: ButtonStyle {
             .padding(.horizontal, Metric.snug)
             .padding(.vertical, Metric.tight)
             .background(
-                RoundedRectangle(cornerRadius: 7)
+                RoundedRectangle(cornerRadius: Metric.smallCorner, style: .continuous)
                     .fill(Color.primary.opacity(configuration.isPressed ? 0.12 : (hovering ? 0.07 : 0)))
             )
-            .contentShape(Rectangle())
-            .onHover { hovering = $0 }
-    }
-}
-
-/// A soft field that appears under the pointer, so rows in a plain scroll
-/// view feel as alive as rows in a list.
-private struct HoverHighlight: ViewModifier {
-    let cornerRadius: CGFloat
-    @State private var hovering = false
-
-    func body(content: Content) -> some View {
-        content
-            .background(
-                RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-                    .fill(Color.primary.opacity(hovering ? 0.05 : 0))
-            )
-            .animation(.easeOut(duration: 0.12), value: hovering)
+            .contentShape(RoundedRectangle(cornerRadius: Metric.smallCorner, style: .continuous))
             .onHover { hovering = $0 }
     }
 }
 
 extension View {
-    func hoverHighlight(cornerRadius: CGFloat = 7) -> some View {
-        modifier(HoverHighlight(cornerRadius: cornerRadius))
-    }
-
-    /// Standard inset for popover content blocks.
-    func popoverInset() -> some View {
-        padding(.horizontal, Metric.regular)
-    }
-
     /// Use the system's real Liquid Glass on macOS 26 while keeping the same
     /// readable material hierarchy on the app's macOS 14–15 floor.
     @ViewBuilder

@@ -10,19 +10,21 @@ struct ServersView: View {
     let run: (PlugIntent) -> Void
     /// The server being removed, while the app asks first.
     @State private var removing: String?
+    /// Its name, kept so the question still reads right while it closes.
+    @State private var removingName = ""
 
     var body: some View {
         Group {
             if model.isLoadingInitialData {
-                LoadingPage(message: "Loading servers…")
+                LoadingPage(message: "Loading servers")
             } else if model.initialDataUnavailable {
-                UnavailablePage(item: "Servers") { run(.reconnect) }
+                UnavailablePage(verdict: model.verdict, run: run)
             } else if model.situation.servers.isEmpty {
                 EmptyPage(
-                    title: "No servers yet",
+                    title: "No Servers",
                     message: "Add one and every client connected to Plug can use it right away.",
-                    symbol: "shippingbox",
-                    actionTitle: "Add Server",
+                    symbol: AppSection.servers.symbol,
+                    actionTitle: "Add Server…",
                     actionIntent: .addServer,
                     secondaryTitle: "Import Servers…",
                     secondaryIntent: .importServers,
@@ -36,30 +38,31 @@ struct ServersView: View {
         }
         .navigationSubtitle(serverSummary ?? "")
         .toolbar {
-            ToolbarItemGroup(placement: .primaryAction) {
+            ToolbarItem(placement: .primaryAction) {
                 Button { run(.addServer) } label: {
                     Label("Add Server", systemImage: "plus")
                 }
                 .help("Add a server")
-
-                Button { run(.importServers) } label: {
-                    Label("Import Servers", systemImage: "square.and.arrow.down")
-                }
-                .help("Import servers from other clients")
+                .disabled(!model.canMutate)
             }
         }
         .onChange(of: visibleNames, initial: true) { keepSelectionVisible() }
         .confirmationDialog(
-            "Remove \(removing ?? "")?",
+            "Remove \(removingName)?",
             isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
             titleVisibility: .visible,
             presenting: removing
         ) { name in
-            Button("Remove Server", role: .destructive) { run(.removeServer(name)) }
-            Button("Cancel", role: .cancel) { }
+            Button("Remove", role: .destructive) { run(.removeServer(name)) }
+            Button("Cancel", role: .cancel) {}
         } message: { _ in
-            Text("Clients connected to Plug will stop seeing its tools. Your settings file keeps everything else.")
+            Text("Your clients stop seeing its tools. To get it back, add the server again.")
         }
+    }
+
+    private func askToRemove(_ name: String) {
+        removingName = name
+        removing = name
     }
 
     private var selected: ServerFacts? {
@@ -77,7 +80,7 @@ struct ServersView: View {
                 group("Off", servers: matching(offServers))
             }
             .onDeleteCommand {
-                if model.canMutate { removing = router.selectedServer }
+                if model.canMutate, let name = router.selectedServer { askToRemove(name) }
             }
         } detail: {
             if let selected {
@@ -86,11 +89,12 @@ struct ServersView: View {
                     server: selected,
                     query: search,
                     router: router,
-                    run: run
+                    run: run,
+                    onRemove: { askToRemove(selected.name) }
                 )
                 .id(selected.name)
             } else {
-                NoSelection(item: "Server")
+                NoSelection(item: "Server", symbol: AppSection.servers.symbol)
             }
         }
     }
@@ -121,9 +125,11 @@ struct ServersView: View {
                     ServerListRow(server: server)
                         .tag(server.name)
                         .contextMenu {
-                            ServerActions(server: server, run: run)
-                            Divider()
-                            Button("Remove Server…", role: .destructive) { removing = server.name }
+                            if model.canMutate {
+                                ServerActions(server: server, run: run)
+                                Divider()
+                                Button("Remove Server…", role: .destructive) { askToRemove(server.name) }
+                            }
                         }
                 }
             }
@@ -190,7 +196,7 @@ private struct ServerListRow: View {
     }
 
     private var trailing: String? {
-        if server.health == .working { return "\(server.toolCount)" }
+        if server.health == .working { return server.toolCountText }
         if server.health.needsAttention { return server.health.label }
         return nil
     }
@@ -203,7 +209,7 @@ struct ServerActions: View {
 
     var body: some View {
         if server.health == .signInNeeded {
-            Button("Sign In…") { run(.signIn(server: server.name)) }
+            Button("Sign In") { run(.signIn(server: server.name)) }
         }
         if server.enabled {
             Button("Restart") { run(.restartServer(server.name)) }

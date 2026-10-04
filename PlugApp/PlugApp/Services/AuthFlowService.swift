@@ -29,7 +29,7 @@ struct AuthFlowService: Sendable {
 
     private func run(_ arguments: [String], failure: String) async throws {
         guard let executable else {
-            throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "The bundled Plug service is missing."])
+            throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "Plug is damaged. Download it again and replace this copy."])
         }
         let result = try await runner.run(
             executable: executable,

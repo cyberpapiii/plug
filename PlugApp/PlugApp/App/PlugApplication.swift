@@ -86,21 +86,21 @@ struct PlugApplication: App {
         }
         .defaultSize(width: 980, height: 640)
         .windowResizability(.contentMinSize)
-        .windowToolbarStyle(.unified)
         .commands {
             CommandGroup(after: .appInfo) {
                 Button("Check for Updates…") { runner.run(.checkForUpdates) }
             }
             CommandGroup(replacing: .newItem) {
-                Button("New Server…") { runner.run(.addServer) }
+                // One sheet at a time: these wait while another is open.
+                Button("Add Server…") { runner.run(.addServer) }
                     .keyboardShortcut("n", modifiers: .command)
-                    .disabled(!model.canMutate)
+                    .disabled(!model.canMutate || router.sheet != nil)
                 Button("Import Servers…") { runner.run(.importServers) }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(!model.canMutate)
+                    .disabled(!model.canMutate || router.sheet != nil)
                 Button("Watch a Tool…") { runner.run(.addWatch) }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
-                    .disabled(!model.canMutate)
+                    .disabled(!model.canMutate || router.sheet != nil)
             }
             SidebarCommands()
             CommandGroup(after: .sidebar) {
@@ -118,8 +118,8 @@ struct PlugApplication: App {
             }
             CommandGroup(replacing: .help) {
                 Button("How Plug Works") { runner.run(.showGuide) }
-                Button("Check Everything") { runner.run(.checkup) }
-                Button("Show Logs") { runner.run(.openLogs) }
+                Button("Run Checkup") { runner.run(.checkup) }
+                Button("Show Logs in Finder") { runner.run(.openLogs) }
             }
         }
 

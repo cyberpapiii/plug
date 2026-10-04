@@ -37,18 +37,20 @@ struct DetailForm<Content: View>: View {
 struct DetailHeader<Glyph: View, Controls: View>: View {
     let title: String
     var subtitle: String?
-    var monospaced = false
     @ViewBuilder var glyph: Glyph
     @ViewBuilder var controls: Controls
 
     var body: some View {
         HStack(spacing: Metric.snug) {
             glyph
+                .frame(width: Metric.glyphSlot, height: Metric.glyphSlot)
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(title)
-                    .font(monospaced ? .headline.monospaced() : .headline)
-                    .lineLimit(2)
+                    .font(.title3.weight(.semibold))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
                     .textSelection(.enabled)
+                    .help(title)
                 if let subtitle {
                     Text(subtitle)
                         .font(.callout)
@@ -60,19 +62,16 @@ struct DetailHeader<Glyph: View, Controls: View>: View {
             Spacer(minLength: Metric.tight)
             controls
         }
-        .padding(.vertical, Metric.rowGap)
     }
 }
 
 /// The right side when no row is selected.
 struct NoSelection: View {
     let item: String
+    let symbol: String
 
     var body: some View {
-        Text("No \(item) Selected")
-            .font(.title3)
-            .foregroundStyle(.tertiary)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+        ContentUnavailableView("No \(item) Selected", systemImage: symbol)
     }
 }
 
@@ -83,6 +82,9 @@ struct ProblemNote: View {
     let title: String
     var reason: String?
     var advice: String?
+    /// The one thing to press about it, under the words.
+    var actionTitle: String?
+    var action: (() -> Void)?
     var dismiss: (() -> Void)?
 
     var body: some View {
@@ -108,12 +110,19 @@ struct ProblemNote: View {
                         .font(.caption)
                         .fixedSize(horizontal: false, vertical: true)
                 }
+                if let actionTitle, let action {
+                    Button(actionTitle, action: action)
+                        .controlSize(.small)
+                        .padding(.top, Metric.rowGap)
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             if let dismiss {
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
-                        .font(.caption.weight(.semibold))
+                        .imageScale(.small)
+                        .frame(width: 20, height: 20)
+                        .contentShape(Rectangle())
                 }
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
@@ -150,37 +159,56 @@ struct ErrorToast: View {
             .padding(.horizontal, Metric.regular)
             .padding(.vertical, Metric.snug)
             .nativeGlassSurface(tint: .orange.opacity(0.08))
-            .padding()
+            .padding(Metric.regular)
     }
 }
 
+/// A page that is still loading. The words are for VoiceOver only.
 struct LoadingPage: View {
     let message: String
 
     var body: some View {
-        VStack(spacing: Metric.snug) {
-            ProgressView().controlSize(.small)
-            Text(message)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .accessibilityElement(children: .combine)
+        ProgressView()
+            .controlSize(.small)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .accessibilityLabel(message)
     }
 }
 
+/// The same wait inside a sheet, holding the height the content will take.
+struct SheetLoading: View {
+    let label: String
+    var height: CGFloat = 160
+
+    var body: some View {
+        ProgressView()
+            .controlSize(.small)
+            .frame(maxWidth: .infinity, minHeight: height)
+            .accessibilityLabel(label)
+    }
+}
+
+/// A page Plug cannot fill right now. It shows the verdict, so the page and
+/// the banner never say two different things.
 struct UnavailablePage: View {
-    let item: String
-    let retry: () -> Void
+    let verdict: Verdict
+    let run: (PlugIntent) -> Void
 
     var body: some View {
         ContentUnavailableView {
-            Label("\(item) unavailable", systemImage: "bolt.slash")
+            Label(verdict.title, systemImage: verdict.symbol)
         } description: {
-            Text("Plug could not reach its background service.")
+            if let detail = verdict.detail {
+                Text(detail)
+            }
         } actions: {
-            Button("Try Again", action: retry)
-                .buttonStyle(.borderedProminent)
+            if let primary = verdict.primary {
+                Button(primary.title) { run(primary.intent) }
+                    .buttonStyle(.borderedProminent)
+            }
+            if let secondary = verdict.secondary {
+                Button(secondary.title) { run(secondary.intent) }
+            }
         }
     }
 }
@@ -198,40 +226,18 @@ struct EmptyPage: View {
     var run: (PlugIntent) -> Void = { _ in }
 
     var body: some View {
-        VStack(spacing: Metric.snug) {
-            VStack(spacing: Metric.snug) {
-                Image(systemName: symbol)
-                    .font(.system(size: 34, weight: .light))
-                    .foregroundStyle(.tertiary)
-                    .accessibilityHidden(true)
-                Text(title).font(.title3.weight(.medium))
-                Text(message)
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .frame(maxWidth: 320)
+        ContentUnavailableView {
+            Label(title, systemImage: symbol)
+        } description: {
+            Text(message)
+        } actions: {
+            if let actionTitle, let actionIntent {
+                Button(actionTitle) { run(actionIntent) }
+                    .buttonStyle(.borderedProminent)
             }
-            .accessibilityElement(children: .combine)
-            if actionTitle != nil || secondaryTitle != nil {
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: Metric.snug) { actions }
-                    VStack(spacing: Metric.tight) { actions }
-                }
-                .padding(.top, Metric.tight)
+            if let secondaryTitle, let secondaryIntent {
+                Button(secondaryTitle) { run(secondaryIntent) }
             }
-        }
-        .padding(.horizontal, Metric.roomy)
-        .padding(.bottom, 36)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    @ViewBuilder private var actions: some View {
-        if let actionTitle, let actionIntent {
-            Button(actionTitle) { run(actionIntent) }
-                .buttonStyle(.borderedProminent)
-        }
-        if let secondaryTitle, let secondaryIntent {
-            Button(secondaryTitle) { run(secondaryIntent) }
         }
     }
 }
