@@ -15,6 +15,9 @@ final class Router {
     var isImportingServers = false
     var isAddingWatch = false
     var isShowingGuide = false
+    /// Counts the times a checkup was asked for from outside Settings, so
+    /// Settings runs one each time the number moves.
+    var checkupRequests = 0
     /// The server whose settings are open for editing, if any.
     var editingServer: ServerName?
     /// The server getting a second account, if any.
@@ -101,6 +104,10 @@ struct PlugIntentRunner {
             showWindow()
         case .showGuide:
             router.isShowingGuide = true
+            showWindow()
+        case .checkup:
+            router.section = .settings
+            router.checkupRequests += 1
             showWindow()
         case .openCurrentWindow:
             showWindow()

@@ -48,6 +48,8 @@ enum Metric {
     /// rows feel pinned to the window edges.
     static let contentMaxWidth: CGFloat = 960
     static let serverListWidth: CGFloat = 260
+    /// A form reads best as a column, not stretched across a wide window.
+    static let settingsMaxWidth: CGFloat = 640
 }
 
 // MARK: - Tone

@@ -71,6 +71,7 @@ final class PlugVerdictTests: XCTestCase {
         )
         XCTAssertEqual(verdict.title, "Plug is not running")
         XCTAssertEqual(verdict.primary?.intent, .reconnect)
+        XCTAssertEqual(verdict.secondary?.intent, .checkup)
     }
 
     func testVersionMismatchAsksForARestartInPlainWords() {
@@ -128,6 +129,7 @@ final class PlugVerdictTests: XCTestCase {
         let verdict = PlugVerdict.verdict(for: situation)
         XCTAssertEqual(verdict.title, "2 servers need attention")
         XCTAssertNil(verdict.primary)
+        XCTAssertEqual(verdict.secondary?.intent, .checkup)
         XCTAssertEqual(situation.troubledServers.map(\.name), ["a", "b"])
         XCTAssertEqual(situation.troubledServers.compactMap(\.fix).count, 2)
     }
@@ -235,7 +237,7 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: false, daemonUptimeSecs: 600), .off)
 
         let missing = server("Linear", health: .notLoaded)
-        XCTAssertEqual(missing.fix, .init("Reload", .reloadConfiguration))
+        XCTAssertEqual(missing.fix, .init("Load It", .reloadConfiguration))
         let verdict = PlugVerdict.verdict(
             for: PlugSituation(runtime: .running, servers: [missing, server("ok")])
         )

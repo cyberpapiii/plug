@@ -20,7 +20,6 @@ struct PlugPopover: View {
     let run: (PlugIntent) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dismiss) private var dismiss
-    @Environment(\.openSettings) private var openSettings
 
     private var situation: PlugSituation { model.situation }
 
@@ -218,7 +217,7 @@ struct PlugPopover: View {
         Button { send(.openWindow(.activity)) } label: {
             VStack(alignment: .leading, spacing: Metric.tight) {
                 HStack(spacing: Metric.tight) {
-                    Text("Recent")
+                    Text("Recent calls")
                         .font(.caption.weight(.semibold))
                         .foregroundStyle(.secondary)
                     Spacer(minLength: 0)
@@ -260,10 +259,7 @@ struct PlugPopover: View {
             // they are visible controls rather than entries inside a menu. Both
             // are icon-only: the picture is the label, and the tooltip and the
             // accessibility label carry the words.
-            Button {
-                dismiss()
-                openSettings()
-            } label: {
+            Button { send(.openWindow(.settings)) } label: {
                 Image(systemName: "gearshape")
             }
             .buttonStyle(QuietControlButtonStyle(iconOnly: true))
@@ -274,7 +270,7 @@ struct PlugPopover: View {
                 Text("Quit")
             }
             .buttonStyle(QuietControlButtonStyle())
-            .help("Quit Plug. Your servers keep running.")
+            .help("Quit the menu bar app. Plug keeps serving your clients until you switch it off.")
             .accessibilityLabel("Quit Plug")
         }
         .padding(.horizontal, Metric.snug)
@@ -285,7 +281,7 @@ struct PlugPopover: View {
     /// floating window can remain above the sheet or inspector it opened.
     private func send(_ intent: PlugIntent) {
         switch intent {
-        case .addServer, .importServers, .editServer, .openWindow,
+        case .addServer, .importServers, .editServer, .openWindow, .checkup,
              .openCurrentWindow, .reveal, .showRepairLog, .signIn:
             dismiss()
         default:

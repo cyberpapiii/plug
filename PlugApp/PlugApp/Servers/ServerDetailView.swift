@@ -52,7 +52,7 @@ struct ServerDetailView: View {
             Button("Remove Server", role: .destructive) { run(.removeServer(server.name)) }
             Button("Cancel", role: .cancel) { }
         } message: {
-            Text("Apps connected to Plug will stop seeing its tools. Your configuration file keeps everything else.")
+            Text("Clients connected to Plug will stop seeing its tools. Your settings file keeps everything else.")
         }
     }
 

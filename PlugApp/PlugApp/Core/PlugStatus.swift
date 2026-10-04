@@ -128,7 +128,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         switch health {
         case .signInNeeded: .init(isSigningIn ? "Try Again" : "Sign In", .signIn(server: name))
         case .down, .unknown: .init("Restart", .restartServer(name))
-        case .notLoaded: .init("Reload", .reloadConfiguration)
+        case .notLoaded: .init("Load It", .reloadConfiguration)
         case .working, .starting, .off: nil
         }
     }
@@ -136,7 +136,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     /// What is wrong, for a server whose fix is not a sign-in.
     var problem: String {
         health == .notLoaded
-            ? "Plug has not loaded this server. Reloading the configuration starts it."
+            ? "Plug has not loaded this server yet. It is in the settings file but not running."
             : "Plug couldn't reach this server."
     }
 
@@ -151,8 +151,8 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
 
     var transportLabel: String {
         switch transport.lowercased() {
-        case "stdio": "Runs on this Mac"
-        case "http", "sse", "streamable_http": "Remote server"
+        case "stdio": "On this Mac"
+        case "http", "sse", "streamable_http": "Over the network"
         case "openapi": "HTTP API"
         default: transport.capitalized
         }
@@ -247,6 +247,8 @@ enum PlugIntent: Equatable, Sendable {
     case openWindow(AppSection)
     /// Open the first-run guide.
     case showGuide
+    /// Open Settings and check everything.
+    case checkup
     case openCurrentWindow
     case reveal(server: String)
     case checkForUpdates
@@ -396,8 +398,9 @@ enum PlugVerdict {
                 tone: .blocked,
                 symbol: "bolt.slash",
                 title: "Plug is not running",
-                detail: "Connected clients cannot reach any servers.",
-                primary: .init("Start Plug", .reconnect)
+                detail: "Plug is on but stopped. Connected clients cannot reach any servers.",
+                primary: .init("Start Plug", .reconnect),
+                secondary: .init("Checkup", .checkup)
             )
         case .off:
             return Verdict(
@@ -426,7 +429,7 @@ enum PlugVerdict {
             return Verdict(
                 tone: .attention,
                 symbol: "bolt.horizontal.circle",
-                title: "No servers configured",
+                title: "No servers yet",
                 detail: "Add a server to make tools available.",
                 primary: .init("Add Server", .addServer)
             )
@@ -467,7 +470,8 @@ enum PlugVerdict {
                 tone: .attention,
                 symbol: "bolt.trianglebadge.exclamationmark",
                 title: "\(troubled.count) servers need attention",
-                detail: detail
+                detail: detail,
+                secondary: .init("Checkup", .checkup)
             )
         }
 

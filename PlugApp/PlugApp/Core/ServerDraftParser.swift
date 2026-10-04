@@ -303,14 +303,14 @@ enum ServerDraftParser {
             facts.append(DraftFact(label: "Kind", value: "HTTP API, one tool for each operation"))
         case "http", "sse":
             facts.append(DraftFact(label: "Connects to", value: config.url ?? "—"))
-            facts.append(DraftFact(label: "Kind", value: "Remote server"))
+            facts.append(DraftFact(label: "Kind", value: "Over the network"))
             if config.authToken != nil {
                 facts.append(DraftFact(label: "Authorization", value: "Token included"))
             }
         default:
             let invocation = ([config.command ?? ""] + config.args).joined(separator: " ")
             facts.append(DraftFact(label: "Runs", value: invocation.trimmingCharacters(in: .whitespaces)))
-            facts.append(DraftFact(label: "Kind", value: "Runs on this Mac"))
+            facts.append(DraftFact(label: "Kind", value: "On this Mac"))
             if !config.env.isEmpty {
                 let names = config.env.keys.sorted().joined(separator: ", ")
                 facts.append(DraftFact(label: "Environment", value: names))

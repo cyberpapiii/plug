@@ -8,12 +8,14 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case clients = "Clients"
     case events = "Events"
     case activity = "Activity"
+    case settings = "Settings"
 
     var id: Self { self }
 }
 
-/// The window. No sidebar: four peers do not earn a permanent column, and the
-/// space is better spent on the content itself.
+/// The window, and the only one: Settings is its fifth section, so the switch
+/// that turns Plug off and the checkup sit beside the things they affect. No
+/// sidebar: five peers do not earn a permanent column.
 struct RootView: View {
     let model: AppModel
     @Bindable var router: Router
@@ -43,6 +45,8 @@ struct RootView: View {
                 EventsView(model: model, router: router, search: $search, run: run)
             case .activity:
                 ActivityView(model: model, search: $search, run: run)
+            case .settings:
+                SettingsView(model: model, router: router, run: run)
             }
         }
         .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.verdict)
@@ -54,11 +58,9 @@ struct RootView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(minWidth: 280, idealWidth: 340, maxWidth: 340)
+                .frame(minWidth: 340, idealWidth: 420, maxWidth: 420)
             }
 
-            // Plug has no menu bar of its own — it is an accessory app — so the
-            // window carries the way into Settings itself.
             ToolbarItem {
                 Button { run(.showGuide) } label: {
                     Image(systemName: "questionmark.circle")
@@ -67,22 +69,8 @@ struct RootView: View {
                 .accessibilityLabel("How Plug works")
             }
 
-            ToolbarItem {
-                SettingsLink {
-                    Image(systemName: "gearshape")
-                }
-                .help("Settings")
-                .accessibilityLabel("Settings")
-            }
-
         }
-        // The system search field: it survives a narrow toolbar, carries the
-        // ⌘F shortcut, and clears itself the way every other Mac app does.
-        .searchable(
-            text: $search,
-            placement: .toolbar,
-            prompt: searchPrompt
-        )
+        .modifier(SectionSearch(text: $search, prompt: searchPrompt))
         .navigationTitle("Plug")
         .onChange(of: router.section) {
             search = ""
@@ -124,7 +112,7 @@ struct RootView: View {
     }
 
     /// Tools are searched from Servers, so its field says so.
-    private var searchPrompt: String {
+    private var searchPrompt: String? {
         switch router.section {
         // The servers prompt names both things it finds and still fits the
         // toolbar field at the minimum window width.
@@ -132,6 +120,23 @@ struct RootView: View {
         case .clients: "Search clients"
         case .events: "Search events"
         case .activity: "Search activity"
+        case .settings: nil
+        }
+    }
+}
+
+/// The system search field: it survives a narrow toolbar, carries the ⌘F
+/// shortcut, and clears itself the way every other Mac app does. A section
+/// with nothing to search shows no field.
+private struct SectionSearch: ViewModifier {
+    @Binding var text: String
+    let prompt: String?
+
+    func body(content: Content) -> some View {
+        if let prompt {
+            content.searchable(text: $text, placement: .toolbar, prompt: prompt)
+        } else {
+            content
         }
     }
 }

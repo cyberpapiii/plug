@@ -188,6 +188,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `plug server on|off` and `plug tools on|off` replace `enable|disable`; the
   old words still work. `plug --help` no longer lists the commands only Plug
   itself runs (`connect`, `serve`, `stop`, `reload`); they still work.
+- Settings is a section of the Plug window, next to Servers, Clients, Events,
+  and Activity, as one page: the switch that turns Plug off, Restart, Checkup,
+  the three preferences, the settings file and logs, and the version. The
+  separate Settings window is gone, and the gear in the menu bar panel opens
+  this section. When Plug is stopped or several servers need attention, the
+  banner offers Checkup, which opens Settings and runs it.
+- The app uses one word for one thing. A server is "On this Mac" or "Over the
+  network", the same as in `plug status`. The file is always the "settings
+  file". Whatever uses Plug is a "client", never an "app". A tool locked by a
+  rule is "Off by rule" everywhere, the list of calls is "Recent calls"
+  everywhere, importing is "Import Servers…" everywhere, and the guide has one
+  title, "How Plug works". A server Plug has not started yet offers "Load It".
 - Devin replaces Windsurf everywhere Plug speaks: the target is `devin`
   (`windsurf` still works as an alias), it writes
   `~/.config/devin/mcp_config.json`, the file Devin reads today, and import

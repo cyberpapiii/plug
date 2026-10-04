@@ -68,8 +68,6 @@ struct PlugApplication: App {
                     .keyboardShortcut("r", modifiers: .command)
             }
         }
-
-        Settings { SettingsView(model: model, run: runner.run) }
     }
 
     private static let windowID = "main"

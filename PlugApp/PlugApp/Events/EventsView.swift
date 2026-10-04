@@ -45,7 +45,7 @@ struct EventsView: View {
                     UnavailablePage(item: "Events") { run(.reconnect) }
                 } else if all.isEmpty {
                     EmptyPage(
-                        title: "Nothing is watched yet",
+                        title: "No events yet",
                         message: "Plug can watch a tool and tell a client when its result changes.",
                         symbol: "bell.badge",
                         actionTitle: model.canMutate ? "Watch a Tool" : nil,

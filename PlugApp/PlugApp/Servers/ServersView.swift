@@ -22,8 +22,8 @@ struct ServersView: View {
                     Button { run(.importServers) } label: {
                         Image(systemName: "square.and.arrow.down")
                     }
-                    .help("Import servers from other apps")
-                    .accessibilityLabel("Import servers from other apps")
+                    .help("Import servers from other clients")
+                    .accessibilityLabel("Import servers from other clients")
                 }
                 .disabled(!model.canMutate)
             }
@@ -40,7 +40,7 @@ struct ServersView: View {
                         symbol: "shippingbox",
                         actionTitle: "Add Server",
                         actionIntent: .addServer,
-                        secondaryTitle: "Import from Other Apps…",
+                        secondaryTitle: "Import Servers…",
                         secondaryIntent: .importServers,
                         run: run
                     )
@@ -223,6 +223,6 @@ struct ServerActions: View {
         } else {
             Button("Turn On") { run(.setServerEnabled(server.name, true)) }
         }
-        Button("Edit Server…") { run(.editServer(server.name)) }
+        Button("Edit…") { run(.editServer(server.name)) }
     }
 }
