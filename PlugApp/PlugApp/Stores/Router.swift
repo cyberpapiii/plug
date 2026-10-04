@@ -17,6 +17,8 @@ final class Router {
     var isShowingGuide = false
     /// The server whose settings are open for editing, if any.
     var editingServer: ServerName?
+    /// The server getting a second account, if any.
+    var addingAccountTo: ServerName?
 
     /// A server name that a sheet can be presented from.
     struct ServerName: Identifiable, Equatable, Sendable {
@@ -58,6 +60,10 @@ struct PlugIntentRunner {
         case let .editServer(name):
             router.section = .servers
             router.editingServer = Router.ServerName(id: name)
+            showWindow()
+        case let .addAccount(server):
+            router.section = .servers
+            router.addingAccountTo = Router.ServerName(id: server)
             showWindow()
         case let .setToolEnabled(tool, enabled):
             Task { await model.setToolEnabled(tool, enabled) }

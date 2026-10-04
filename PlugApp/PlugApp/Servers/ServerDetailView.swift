@@ -72,6 +72,7 @@ struct ServerDetailView: View {
                 }
                 Button("Edit…") { run(.editServer(server.name)) }
                 Menu {
+                    Button("Add Another Account…") { run(.addAccount(server: server.name)) }
                     if server.usesOAuth, server.health != .signInNeeded {
                         Button("Sign Out…") { confirmSignOut = true }
                     }

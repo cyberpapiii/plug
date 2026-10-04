@@ -59,6 +59,9 @@ struct ServersView: View {
         .sheet(item: $router.editingServer) { target in
             EditServerView(model: model, name: target.id)
         }
+        .sheet(item: $router.addingAccountTo) { target in
+            AddAccountView(model: model, router: router, server: target.id)
+        }
     }
 
     private var selected: ServerFacts? {

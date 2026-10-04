@@ -263,6 +263,9 @@ pub(crate) async fn cmd_server_command(
             .await
         }
         ServerCommands::Remove { name, yes } => cmd_server_remove(config_path, name, yes).await,
+        ServerCommands::AddAccount { server, account } => {
+            cmd_server_add_account(config_path, server, account).await
+        }
         ServerCommands::Edit {
             name,
             command,
@@ -328,6 +331,13 @@ pub(crate) async fn apply_server_mutation(
         }
         plug_core::operator::OperatorMutation::RemoveServer { name } => {
             plug_core::ipc::IpcRequest::RemoveServer { name, auth_token }
+        }
+        plug_core::operator::OperatorMutation::AddAccount { server, account } => {
+            plug_core::ipc::IpcRequest::AddAccount {
+                server,
+                account,
+                auth_token,
+            }
         }
         plug_core::operator::OperatorMutation::SetServerEnabled { name, enabled } => {
             plug_core::ipc::IpcRequest::SetServerEnabled {
@@ -602,6 +612,36 @@ pub(crate) async fn cmd_server_remove(
     )
     .await?;
     print_success_line(format!("Removed server `{name}`."));
+    Ok(())
+}
+
+pub(crate) async fn cmd_server_add_account(
+    config_path: Option<&std::path::PathBuf>,
+    server: String,
+    account: String,
+) -> anyhow::Result<()> {
+    let result = apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::AddAccount {
+            server: server.clone(),
+            account,
+        },
+    )
+    .await?;
+    let Some(added) = result.server else {
+        anyhow::bail!("the daemon did not say what it added");
+    };
+    let name = added.name;
+    print_success_line(format!("Added server `{name}`, a copy of `{server}`."));
+    if added.oauth {
+        print_info_line(format!(
+            "Sign in with the other account: plug auth login --server {name}"
+        ));
+    } else {
+        print_info_line(format!(
+            "It uses the credentials of `{server}` until you change them: plug server edit {name}"
+        ));
+    }
     Ok(())
 }
 

@@ -228,6 +228,12 @@ pub enum IpcRequest {
         auth_token: String,
         name: String,
     },
+    /// Add a configured server again as `<server>-<account>`.
+    AddAccount {
+        auth_token: String,
+        server: String,
+        account: String,
+    },
     SetServerEnabled {
         auth_token: String,
         name: String,
@@ -444,6 +450,14 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("RemoveServer")
                 .field("auth_token", &"[REDACTED]")
                 .field("name", name)
+                .finish(),
+            Self::AddAccount {
+                server, account, ..
+            } => f
+                .debug_struct("AddAccount")
+                .field("auth_token", &"[REDACTED]")
+                .field("server", server)
+                .field("account", account)
                 .finish(),
             Self::RenameClient { key, name, .. } => f
                 .debug_struct("RenameClient")
@@ -1166,6 +1180,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::AddServer { .. }
             | IpcRequest::UpdateServer { .. }
             | IpcRequest::RemoveServer { .. }
+            | IpcRequest::AddAccount { .. }
             | IpcRequest::SetServerEnabled { .. }
             | IpcRequest::SetToolEnabled { .. }
             | IpcRequest::RenameClient { .. }
@@ -1189,6 +1204,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::AddServer { auth_token, .. }
         | IpcRequest::UpdateServer { auth_token, .. }
         | IpcRequest::RemoveServer { auth_token, .. }
+        | IpcRequest::AddAccount { auth_token, .. }
         | IpcRequest::SetServerEnabled { auth_token, .. }
         | IpcRequest::SetToolEnabled { auth_token, .. }
         | IpcRequest::RenameClient { auth_token, .. }

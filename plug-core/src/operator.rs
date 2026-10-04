@@ -22,6 +22,12 @@ pub enum OperatorMutation {
     RemoveServer {
         name: String,
     },
+    /// Add a configured server again as `<server>-<account>`, for a second
+    /// account. See `account_copy`.
+    AddAccount {
+        server: String,
+        account: String,
+    },
     SetServerEnabled {
         name: String,
         enabled: bool,
@@ -143,6 +149,12 @@ pub fn apply_operator_mutation(
             }
             OperatorMutationResult::server(None)
         }
+        OperatorMutation::AddAccount { server, account } => {
+            let (name, copy) = account_copy(&config, &server, &account)?;
+            let summary = OperatorServerSummary::from_config(name.clone(), &copy);
+            config.servers.insert(name, copy);
+            OperatorMutationResult::server(Some(summary))
+        }
         OperatorMutation::SetServerEnabled { name, enabled } => {
             let server = config
                 .servers
@@ -197,6 +209,55 @@ pub fn apply_operator_mutation(
     };
     persist_config_atomic(path, &config)?;
     Ok((config, result))
+}
+
+/// The longest account label. It becomes part of every tool name.
+const MAX_ACCOUNT_LABEL: usize = 24;
+
+/// A second account for a server is the same server under another name.
+///
+/// The copy keeps the command, URL, and settings, secrets included, because
+/// only this side can read them. OAuth sign-ins are stored by server name, so
+/// the copy starts signed out and signs in on its own. Tool groups keep their
+/// shape with the account added, so `Gmail` becomes `GmailPersonal` and the
+/// two accounts never share a tool name.
+fn account_copy(
+    config: &Config,
+    server: &str,
+    account: &str,
+) -> anyhow::Result<(String, ServerConfig)> {
+    let source = config
+        .servers
+        .get(server)
+        .ok_or_else(|| anyhow::anyhow!("unknown server `{server}`"))?;
+    let label = account.trim();
+    let fits = !label.is_empty()
+        && label.len() <= MAX_ACCOUNT_LABEL
+        && label
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && label.starts_with(|c: char| c.is_ascii_lowercase());
+    if !fits {
+        anyhow::bail!(
+            "an account name is lowercase letters and digits, starts with a letter, and is at most {MAX_ACCOUNT_LABEL} long"
+        );
+    }
+    let name = format!("{server}-{label}");
+    if config.servers.contains_key(&name) {
+        anyhow::bail!("server `{name}` already exists");
+    }
+
+    let mut copy = source.clone();
+    let mut groups = source.tool_groups.clone();
+    if groups.is_empty() && server == "workspace" {
+        groups = crate::tool_naming::default_workspace_rules();
+    }
+    let suffix = crate::tool_naming::format_server_prefix(label);
+    for group in &mut groups {
+        group.prefix.push_str(&suffix);
+    }
+    copy.tool_groups = groups;
+    Ok((name, copy))
 }
 
 /// Turn one tool on or off by editing `disabled_tools`.
@@ -415,6 +476,76 @@ API_KEY = "sk-live-123"
         assert!(rename(&path, "cursor", "two\nlines").is_err());
         assert!(rename(&path, "  ", "Name").is_err());
         assert!(!path.exists(), "a refused rename must not write the config");
+    }
+
+    #[test]
+    fn a_second_account_is_the_same_server_under_another_name() {
+        let path = fixture_path();
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::AddServer {
+                name: "workspace".into(),
+                server: server_with_secrets(),
+            },
+        )
+        .unwrap();
+
+        let (config, result) = apply_operator_mutation(
+            &path,
+            OperatorMutation::AddAccount {
+                server: "workspace".into(),
+                account: "personal".into(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(result.server.unwrap().name, "workspace-personal");
+        let copy = &config.servers["workspace-personal"];
+        // The copy is made where the secrets can be read, so it keeps them.
+        assert_eq!(
+            copy.auth_token.as_ref().map(|token| token.as_str()),
+            Some("bearer-abc")
+        );
+        assert_eq!(copy.env["API_KEY"], "sk-live-123");
+        // The built-in Google groups carry over, named for the account.
+        assert!(config.servers["workspace"].tool_groups.is_empty());
+        assert!(copy.tool_groups.iter().any(|g| g.prefix == "GmailPersonal"));
+        assert!(
+            copy.tool_groups
+                .iter()
+                .all(|g| g.prefix.ends_with("Personal"))
+        );
+    }
+
+    #[test]
+    fn a_second_account_is_refused_when_it_cannot_be_named() {
+        let path = fixture_path();
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::AddServer {
+                name: "slack".into(),
+                server: server_with_secrets(),
+            },
+        )
+        .unwrap();
+        let add = |server: &str, account: &str| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::AddAccount {
+                    server: server.into(),
+                    account: account.into(),
+                },
+            )
+        };
+
+        assert!(add("missing", "work").is_err());
+        assert!(add("slack", "").is_err());
+        assert!(add("slack", "Work Team").is_err());
+        assert!(add("slack", "2nd").is_err());
+        assert!(add("slack", "work").is_ok());
+        assert!(add("slack", "work").is_err(), "the name is taken");
+        let config = load_editable_config(&path).unwrap();
+        assert_eq!(config.servers.len(), 2);
     }
 
     #[test]

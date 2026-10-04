@@ -27,6 +27,8 @@ output you can parse. If `plug` is not on the PATH, use
    - A local command:
      `plug server add <name> --command <command> --args <a,b,c> --env KEY=VALUE`
    - A remote service: `plug server add <name> --url <url> --auth oauth`
+   - A second account on a server that is already there:
+     `plug server add-account <server> <account>`
    - Sign in to a server that needs it: `plug auth login --server <name>`.
      This opens a browser. The person finishes the sign-in.
 5. **Connect clients.** Run `plug clients` to see which are installed, then
