@@ -273,6 +273,17 @@ struct MockServer {
     request_log_file: Option<String>,
 }
 
+/// MCP Apps (SEP-1865) fixture values.
+const APPS_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+const APPS_MIME_TYPE: &str = "text/html;profile=mcp-app";
+const APPS_WIDGET_URI: &str = "ui://mock/widget.html";
+
+fn apps_meta(ui: serde_json::Value) -> rmcp::model::MetaObject {
+    let mut meta = serde_json::Map::new();
+    meta.insert("ui".to_string(), ui);
+    rmcp::model::MetaObject(meta)
+}
+
 impl MockServer {
     fn build_tool(name: &str) -> Tool {
         let schema = serde_json::json!({
@@ -321,14 +332,32 @@ impl ServerHandler for MockServer {
     fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ListToolsResult, McpError>> + Send + '_ {
         async move {
             let _ = append_request_log(self.request_log_file.as_deref(), "tools/list").await;
+            // MCP Apps: a server links a tool to its UI only for a client
+            // that says it supports the extension.
+            let client_shows_apps = context.peer.peer_info().is_some_and(|info| {
+                info.capabilities
+                    .extensions
+                    .as_ref()
+                    .is_some_and(|extensions| extensions.contains_key(APPS_EXTENSION_ID))
+            });
             let tools: Vec<Tool> = self
                 .tool_names
                 .iter()
-                .map(|name| Self::build_tool(name))
+                .map(|name| {
+                    let tool = Self::build_tool(name);
+                    if name == "widget" && client_shows_apps {
+                        tool.with_meta(apps_meta(serde_json::json!({
+                            "resourceUri": APPS_WIDGET_URI,
+                            "visibility": ["model", "app"]
+                        })))
+                    } else {
+                        tool
+                    }
+                })
                 .collect();
 
             Ok(ListToolsResult::with_all_items(tools))
@@ -500,6 +529,7 @@ impl ServerHandler for MockServer {
                     .with_title("Mock Resource")
                     .with_description("Subscribable mock resource")
                     .with_mime_type("text/plain"),
+                Resource::new(APPS_WIDGET_URI, "widget").with_mime_type(APPS_MIME_TYPE),
             ]))
         }
     }
@@ -510,6 +540,17 @@ impl ServerHandler for MockServer {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<ReadResourceResponse, McpError>> + Send + '_ {
         async move {
+            if self.resources && request.uri == APPS_WIDGET_URI {
+                return Ok(ReadResourceResult::new(vec![
+                    ResourceContents::text("<!doctype html><p>mock widget</p>", request.uri)
+                        .with_mime_type(APPS_MIME_TYPE)
+                        .with_meta(apps_meta(serde_json::json!({
+                            "csp": {"connectDomains": ["https://api.example.test"]},
+                            "prefersBorder": true
+                        }))),
+                ])
+                .into());
+            }
             if !self.resources || request.uri != "file:///tmp/mock-resource.txt" {
                 return Err(McpError::resource_not_found(
                     format!("resource not found: {}", request.uri),

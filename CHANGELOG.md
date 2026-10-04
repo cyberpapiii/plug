@@ -138,6 +138,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- MCP Apps work through Plug. Plug now tells each server it can show app
+  pages, so servers that check before offering one offer it; the `ui` field
+  that links a tool to its page and carries the page's sandbox settings is
+  passed on instead of dropped; and a page can call its server's tools by the
+  names that server gave them, as long as only one listed tool has that name.
 - A removed server that never connected, one waiting for sign-in or one that
   failed to start, stayed in `plug servers` and the app until the service
   restarted. It now leaves at once.

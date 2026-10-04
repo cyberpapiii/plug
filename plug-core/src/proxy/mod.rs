@@ -117,6 +117,19 @@ impl RouterSnapshot {
         self.routes
             .get(tool_name)
             .or_else(|| self.routes_lower.get(&tool_name.to_ascii_lowercase()))
+            .or_else(|| self.route_by_upstream_name(tool_name))
+    }
+
+    /// An MCP App calls its server's tools by the names that server gave them,
+    /// which are not the names Plug lists. Such a name routes when exactly one
+    /// listed tool carries it.
+    fn route_by_upstream_name(&self, tool_name: &str) -> Option<&(String, String)> {
+        let mut matches = self
+            .routes
+            .values()
+            .filter(|(_, original_name)| original_name == tool_name);
+        let route = matches.next()?;
+        matches.next().is_none().then_some(route)
     }
 
     pub(crate) fn tool_by_name(&self, name: &str) -> Option<&Tool> {

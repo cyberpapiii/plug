@@ -107,11 +107,12 @@ impl ExtensionEnvelope {
             if validate_extension_key(key)? == ExtensionKeyDisposition::Ignore {
                 continue;
             }
-            if matches!(
-                key.as_str(),
-                "io.modelcontextprotocol/ui" | "io.modelcontextprotocol/apps"
-            ) && !value.is_object()
-            {
+            // A bare `ui` that is not an object is somebody else's unprefixed
+            // field, ignored like any other.
+            if key == "ui" && !value.is_object() {
+                continue;
+            }
+            if is_forwarded_mcp_extension_key(key) && !value.is_object() {
                 return Err(ExtensionEnvelopeError::InvalidKey);
             }
             validate_value(value, 1, &mut value_count)?;
@@ -179,6 +180,9 @@ fn validate_extension_key(key: &str) -> Result<ExtensionKeyDisposition, Extensio
 
     let Some((prefix, name)) = key.split_once('/') else {
         validate_meta_name(key)?;
+        if is_forwarded_mcp_extension_key(key) {
+            return Ok(ExtensionKeyDisposition::Forward);
+        }
         return Ok(ExtensionKeyDisposition::Ignore);
     };
     if name.contains('/') || !valid_meta_prefix(prefix) {
@@ -206,11 +210,12 @@ fn is_mcp_reserved_prefix(prefix: &str) -> bool {
 
 /// Official MCP extensions that Plug deliberately transports as opaque wire
 /// metadata. Their object shape is checked at the ingress loop before they are
-/// retained.
+/// retained. MCP Apps puts its fields under the bare key `ui`, the one
+/// unprefixed key that crosses.
 fn is_forwarded_mcp_extension_key(key: &str) -> bool {
     matches!(
         key,
-        "io.modelcontextprotocol/ui" | "io.modelcontextprotocol/apps"
+        "ui" | "io.modelcontextprotocol/ui" | "io.modelcontextprotocol/apps"
     )
 }
 
@@ -704,6 +709,28 @@ mod tests {
         assert_eq!(
             admitted.get("io.modelcontextprotocol/ui"),
             official_extension.get("io.modelcontextprotocol/ui")
+        );
+    }
+
+    #[test]
+    fn extension_envelope_carries_the_mcp_apps_ui_field() {
+        let source = meta(serde_json::json!({
+            "ui": {"resourceUri": "ui://widget", "visibility": ["model", "app"]},
+            "note": "unprefixed and not ours to forward"
+        }));
+        let admitted = ExtensionEnvelope::from_peer_catalog_meta(Some(&source))
+            .unwrap()
+            .into_meta()
+            .unwrap();
+        assert_eq!(admitted.get("ui"), source.get("ui"));
+        assert!(admitted.get("note").is_none());
+
+        let not_an_object = meta(serde_json::json!({"ui": "dark"}));
+        assert!(
+            ExtensionEnvelope::from_peer_meta(Some(&not_an_object))
+                .unwrap()
+                .into_meta()
+                .is_none()
         );
     }
 

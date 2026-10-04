@@ -806,6 +806,9 @@ impl UpstreamClientHandler {
     }
 }
 
+const MCP_APPS_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+const MCP_APPS_MIME_TYPE: &str = "text/html;profile=mcp-app";
+
 impl ClientHandler for UpstreamClientHandler {
     fn get_info(&self) -> ClientInfo {
         let mut info = ClientInfo::new(
@@ -821,6 +824,19 @@ impl ClientHandler for UpstreamClientHandler {
                 .with_form(FormElicitationCapability::default())
                 .with_url(UrlElicitationCapability::default()),
         );
+        // MCP Apps (SEP-1865). A server links a tool to its UI only for a
+        // client that says it supports the extension. Plug renders nothing,
+        // but a client behind it may, and every such tool has to work as
+        // plain text for the ones that do not.
+        let mut apps = serde_json::Map::new();
+        apps.insert(
+            "mimeTypes".to_string(),
+            serde_json::json!([MCP_APPS_MIME_TYPE]),
+        );
+        info.capabilities
+            .extensions
+            .get_or_insert_with(Default::default)
+            .insert(MCP_APPS_EXTENSION_ID.to_string(), apps);
         let protocol_version = {
             #[cfg(test)]
             if let Some(version) = &self.protocol_version_override {
