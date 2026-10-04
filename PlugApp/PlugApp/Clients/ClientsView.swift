@@ -747,7 +747,7 @@ private struct AppLinkRow: View {
             return count == 1 ? "1 session" : "\(count) sessions"
         }
         guard app.linked else { return app.detected ? "Not using Plug" : "Not installed" }
-        if !app.detected { return "Set up · app not found" }
+        if !app.detected { return "Set up · client not found" }
         return app.transport?.lowercased() == "http" ? "Ready · over the network" : "Ready"
     }
 }

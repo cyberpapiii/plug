@@ -114,7 +114,7 @@ struct ToolDetailView: View {
 
     private var stateLabel: String {
         guard !tool.isOn else { return "On" }
-        return tool.lockedByPattern == nil ? "Off" : "Off, by pattern"
+        return tool.lockedByPattern == nil ? "Off" : "Off by rule"
     }
 
     private func detailRow(_ label: String, _ value: String, symbol: String) -> some View {

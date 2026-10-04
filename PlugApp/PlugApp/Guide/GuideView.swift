@@ -22,7 +22,7 @@ struct GuideView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
             VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("Welcome to Plug").font(.title2.weight(.semibold))
+                Text("How Plug works").font(.title2.weight(.semibold))
                 Text("One place on your Mac that holds every tool you have and gives it to every client you use.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -114,7 +114,7 @@ struct GuideView: View {
         switch step {
         case .server:
             VStack(alignment: .trailing, spacing: Metric.rowGap) {
-                action("Import…", .importServers, prominent: prominent)
+                action("Import Servers…", .importServers, prominent: prominent)
                 action("Add Server…", .addServer, prominent: false)
             }
             .disabled(!model.canMutate)

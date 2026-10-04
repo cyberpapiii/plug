@@ -171,7 +171,7 @@ final class ServerGlyphTests: XCTestCase {
     func testLocalAndRemoteLookDifferent() {
         XCTAssertEqual(server(transport: "stdio").transportSymbol, "desktopcomputer")
         XCTAssertEqual(server(transport: "streamable_http").transportSymbol, "globe")
-        XCTAssertEqual(server(transport: "sse").transportLabel, "Remote server")
+        XCTAssertEqual(server(transport: "sse").transportLabel, "Over the network")
     }
 
     func testASwitchedOffServerSaysSoWithItsOwnGlyph() {

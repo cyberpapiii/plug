@@ -1,51 +1,19 @@
 import AppKit
 import SwiftUI
 
-/// Everything a person owns about Plug, in one window with three tabs.
+/// Everything a person owns about Plug, as one page of the main window.
 ///
-/// The old settings window held one switch and a version number, so the
-/// ordinary things a Mac app is expected to do — check for updates, restart
-/// the background service, look at the log, find out whether anything is wrong
-/// — had no home. Each tab answers one question: how should Plug behave, is it
-/// healthy, and what is this.
+/// Settings used to be its own window with three tabs, which put the switch
+/// that turns Plug off, Restart, and Checkup one window away from the place a
+/// problem is shown. It is now the fifth section, one page that scrolls: is
+/// Plug on and healthy, how should it behave, where are its files, what
+/// version is this.
 struct SettingsView: View {
     let model: AppModel
+    @Bindable var router: Router
     let run: (PlugIntent) -> Void
+    var checkups: any CheckupRunning = CheckupService()
 
-    var body: some View {
-        Group {
-            if #available(macOS 15.0, *) {
-                TabView {
-                    Tab("General", systemImage: "gearshape") { GeneralSettings() }
-                    Tab("Service", systemImage: "bolt.horizontal.circle") {
-                        ServiceSettings(model: model, run: run)
-                    }
-                    Tab("About", systemImage: "info.circle") {
-                        AboutSettings(model: model, run: run)
-                    }
-                }
-            } else {
-                legacyTabs
-            }
-        }
-        .frame(width: 540, height: 420)
-    }
-
-    private var legacyTabs: some View {
-        TabView {
-            GeneralSettings()
-                .tabItem { Label("General", systemImage: "gearshape") }
-            ServiceSettings(model: model, run: run)
-                .tabItem { Label("Service", systemImage: "bolt.horizontal.circle") }
-            AboutSettings(model: model, run: run)
-                .tabItem { Label("About", systemImage: "info.circle") }
-        }
-    }
-}
-
-// MARK: - General
-
-private struct GeneralSettings: View {
     // The login item lives in macOS, not in this app's defaults, so the toggle
     // starts from what SMAppService reports and the task below re-reads it.
     @State private var launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
@@ -53,202 +21,218 @@ private struct GeneralSettings: View {
     @State private var loginItemFailed = false
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
 
-    var body: some View {
-        Form {
-            Section {
-                Toggle(isOn: $launchAtLogin) {
-                    Label("Show Plug in the menu bar at login", systemImage: "power")
-                }
-                .listRowSeparator(.hidden)
-                .onChange(of: launchAtLogin) { _, enabled in
-                    do {
-                        try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
-                        loginItemFailed = false
-                    } catch {
-                        loginItemFailed = true
-                        DaemonServiceManager.shared.openLoginItemSettings()
-                    }
-                }
-                if loginItemFailed {
-                    Label(
-                        "macOS wants to confirm this in System Settings.",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .listRowSeparator(.hidden)
-                }
-                Toggle(isOn: $notify) {
-                    Label("Tell me when a server needs sign-in or a new client connects", systemImage: "bell")
-                }
-                .listRowSeparator(.hidden)
-                .onChange(of: notify) { _, enabled in
-                    if enabled { NotificationService.shared.requestAuthorization() }
-                }
-                Toggle(isOn: $automaticUpdates) {
-                    Label("Check for updates automatically", systemImage: "arrow.down.circle")
-                }
-                .listRowSeparator(.hidden)
-                .onChange(of: automaticUpdates) { _, enabled in
-                    UpdateService.shared.checksAutomatically = enabled
-                }
-            } footer: {
-                Label(
-                    "Plug and its servers keep running after you close this window or hide the menu bar icon.",
-                    systemImage: "info.circle"
-                )
-                .font(.caption)
-                .foregroundStyle(.secondary)
-            }
-            .listSectionSeparator(.hidden)
-        }
-        .formStyle(.grouped)
-        .task {
-            launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
-        }
-    }
-}
-
-// MARK: - Service
-
-private struct ServiceSettings: View {
-    let model: AppModel
-    let run: (PlugIntent) -> Void
-    var checkups: any CheckupRunning = CheckupService()
-
     @State private var checkup: Checkup?
     @State private var checking = false
     @State private var checkupError: String?
     @State private var showsPassingChecks = false
+
     var body: some View {
         Form {
-            Section {
-                ServicePowerToggle(model: model, run: run)
-                LabeledContent {
-                    Text(serviceStatus)
-                        .foregroundStyle(model.connectionState == .ready ? .primary : .secondary)
-                } label: {
-                    Label("Background service", systemImage: serviceSymbol)
-                        .foregroundStyle(serviceColor)
-                }
-                .listRowSeparator(.hidden)
-
-                HStack {
-                    Button {
-                        run(.restartService)
-                    } label: {
-                        Label("Restart", systemImage: "arrow.clockwise")
-                    }
-                    .disabled(model.isRestartingService || !model.serviceEnabled || model.isChangingService)
-
-                    Button {
-                        run(.reloadConfiguration)
-                    } label: {
-                        Label("Reload Configuration", systemImage: "arrow.triangle.2.circlepath")
-                    }
-                    .help("Reload server settings without restarting Plug")
-                    .disabled(!model.canMutate)
-
-                    if model.isRestartingService { ProgressView().controlSize(.small) }
-                    Spacer()
-                }
-                .listRowSeparator(.hidden)
-
-                // Right under the buttons, because this window is where the
-                // press happened and the main window may not be open at all.
-                if let error = model.actionError {
-                    HStack(alignment: .firstTextBaseline) {
-                        Label(error.message, systemImage: "exclamationmark.triangle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.red)
-                        Spacer()
-                        Button("Dismiss") { run(.dismissActionError) }
-                            .buttonStyle(.link)
-                            .font(.caption)
-                    }
-                    .listRowSeparator(.hidden)
-                }
-            } footer: {
-                Text("Restarting reconnects every server. Connected clients pick Plug back up on their own.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-            .listSectionSeparator(.hidden)
-
-            Section("Checkup") {
-                HStack {
-                    Button {
-                        Task { await runCheckup() }
-                    } label: {
-                        Label("Check everything", systemImage: "stethoscope")
-                    }
-                    .disabled(checking)
-                    if checking { ProgressView().controlSize(.small) }
-                    Spacer()
-                    if let checkup {
-                        Label(
-                            checkup.headline,
-                            systemImage: checkup.isClean
-                                ? "checkmark.circle.fill"
-                                : "exclamationmark.triangle.fill"
-                        )
-                        .font(.callout)
-                        .foregroundStyle(checkup.isClean ? Color.green : Color.orange)
-                    }
-                }
-                .listRowSeparator(.hidden)
-
-                if let checkupError {
-                    Label(checkupError, systemImage: "xmark.circle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .listRowSeparator(.hidden)
-                }
-
-                if let checkup {
-                    ForEach(problemChecks(in: checkup)) { check in
-                        CheckRow(check: check)
-                            .listRowSeparator(.hidden)
-                    }
-                    if !passingChecks(in: checkup).isEmpty {
-                        DisclosureGroup(
-                            passingChecksTitle(in: checkup),
-                            isExpanded: $showsPassingChecks
-                        ) {
-                            ForEach(passingChecks(in: checkup)) { check in
-                                CheckRow(check: check)
-                                    .padding(.top, Metric.tight)
-                            }
-                        }
-                        .listRowSeparator(.hidden)
-                    }
-                }
-            }
-            .listSectionSeparator(.hidden)
-
-            Section("Files") {
-                HStack {
-                    Button {
-                        Task {
-                            if let path = await checkups.configPath() {
-                                NSWorkspace.shared.activateFileViewerSelecting([path])
-                            }
-                        }
-                    } label: {
-                        Label("Show settings file", systemImage: "doc.text")
-                    }
-                    Button {
-                        run(.openLogs)
-                    } label: {
-                        Label("Show logs", systemImage: "list.bullet.rectangle")
-                    }
-                    Spacer()
-                }
-                .listRowSeparator(.hidden)
-            }
-            .listSectionSeparator(.hidden)
+            plug
+            checkupSection
+            behavior
+            files
+            about
         }
         .formStyle(.grouped)
+        .frame(maxWidth: Metric.settingsMaxWidth)
+        .frame(maxWidth: .infinity)
+        .task {
+            launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
+        }
+        // A problem elsewhere in the app can send a person here with the
+        // checkup already asked for.
+        .task(id: router.checkupRequests) {
+            if router.checkupRequests > 0 { await runCheckup() }
+        }
+    }
+
+    // MARK: Plug
+
+    private var plug: some View {
+        Section {
+            ServicePowerToggle(model: model, run: run)
+            LabeledContent {
+                Text(serviceStatus)
+                    .foregroundStyle(model.connectionState == .ready ? .primary : .secondary)
+            } label: {
+                Label("Background service", systemImage: serviceSymbol)
+                    .foregroundStyle(serviceColor)
+            }
+            HStack {
+                Button {
+                    run(.restartService)
+                } label: {
+                    Label("Restart Plug", systemImage: "arrow.clockwise")
+                }
+                .disabled(model.isRestartingService || !model.serviceEnabled || model.isChangingService)
+                if model.isRestartingService { ProgressView().controlSize(.small) }
+                Spacer()
+            }
+        } header: {
+            Text("Plug")
+        } footer: {
+            Text("Restarting reconnects every server. Connected clients pick Plug back up on their own.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Checkup
+
+    private var checkupSection: some View {
+        Section {
+            HStack {
+                Button {
+                    Task { await runCheckup() }
+                } label: {
+                    Label("Check Everything", systemImage: "stethoscope")
+                }
+                .disabled(checking)
+                if checking { ProgressView().controlSize(.small) }
+                Spacer()
+                if let checkup {
+                    Label(
+                        checkup.headline,
+                        systemImage: checkup.isClean
+                            ? "checkmark.circle.fill"
+                            : "exclamationmark.triangle.fill"
+                    )
+                    .font(.callout)
+                    .foregroundStyle(checkup.isClean ? Color.green : Color.orange)
+                }
+            }
+
+            if let checkupError {
+                Label(checkupError, systemImage: "xmark.circle.fill")
+                    .font(.caption)
+                    .foregroundStyle(.red)
+            }
+
+            if let checkup {
+                ForEach(problemChecks(in: checkup)) { check in
+                    CheckRow(check: check)
+                }
+                if !passingChecks(in: checkup).isEmpty {
+                    DisclosureGroup(
+                        passingChecksTitle(in: checkup),
+                        isExpanded: $showsPassingChecks
+                    ) {
+                        ForEach(passingChecks(in: checkup)) { check in
+                            CheckRow(check: check)
+                                .padding(.top, Metric.tight)
+                        }
+                    }
+                }
+            }
+        } header: {
+            Text("Checkup")
+        }
+    }
+
+    // MARK: Behavior
+
+    private var behavior: some View {
+        Section {
+            Toggle(isOn: $launchAtLogin) {
+                Label("Show Plug in the menu bar at login", systemImage: "power")
+            }
+            .onChange(of: launchAtLogin) { _, enabled in
+                do {
+                    try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
+                    loginItemFailed = false
+                } catch {
+                    loginItemFailed = true
+                    DaemonServiceManager.shared.openLoginItemSettings()
+                }
+            }
+            if loginItemFailed {
+                Label(
+                    "macOS wants to confirm this in System Settings.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            Toggle(isOn: $notify) {
+                Label("Tell me when a server needs sign-in or a new client connects", systemImage: "bell")
+            }
+            .onChange(of: notify) { _, enabled in
+                if enabled { NotificationService.shared.requestAuthorization() }
+            }
+            Toggle(isOn: $automaticUpdates) {
+                Label("Check for updates automatically", systemImage: "arrow.down.circle")
+            }
+            .onChange(of: automaticUpdates) { _, enabled in
+                UpdateService.shared.checksAutomatically = enabled
+            }
+        } header: {
+            Text("General")
+        } footer: {
+            Text("Plug and its servers keep running after you close this window or quit the menu bar icon.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: Files
+
+    private var files: some View {
+        Section {
+            HStack {
+                Button {
+                    Task {
+                        if let path = await checkups.configPath() {
+                            NSWorkspace.shared.activateFileViewerSelecting([path])
+                        }
+                    }
+                } label: {
+                    Label("Show Settings File", systemImage: "doc.text")
+                }
+                Button {
+                    run(.openLogs)
+                } label: {
+                    Label("Show Logs", systemImage: "list.bullet.rectangle")
+                }
+                Button {
+                    run(.reloadConfiguration)
+                } label: {
+                    Label("Read Settings File Again", systemImage: "arrow.triangle.2.circlepath")
+                }
+                .help("Use this after you change the settings file by hand")
+                .disabled(!model.canMutate)
+                Spacer()
+            }
+        } header: {
+            Text("Files")
+        } footer: {
+            Text("Plug keeps every server and client choice in one settings file. Changes made in this window are saved there for you.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    // MARK: About
+
+    private var about: some View {
+        Section {
+            LabeledContent("Version") {
+                Text(model.displayVersion)
+                    .monospacedDigit()
+                    .textSelection(.enabled)
+            }
+            HStack {
+                Button {
+                    run(.checkForUpdates)
+                } label: {
+                    Label("Check for Updates…", systemImage: "arrow.down.circle")
+                }
+                .disabled(!UpdateService.shared.canCheckForUpdates)
+                Spacer()
+            }
+        } header: {
+            Text("About")
+        }
     }
 
     private var serviceStatus: String {
@@ -258,7 +242,7 @@ private struct ServiceSettings: View {
         case .ready: return "Running"
         case .connecting: return "Connecting"
         case .reconnecting: return "Reconnecting"
-        case .incompatible: return "Update required"
+        case .incompatible: return "Restart required to finish update"
         case .disconnected: return "Not running"
         }
     }
@@ -366,46 +350,4 @@ private struct CheckRow: View {
         case .fail: "problem"
         }
     }
-}
-
-// MARK: - About
-
-private struct AboutSettings: View {
-    let model: AppModel
-    let run: (PlugIntent) -> Void
-
-    var body: some View {
-        VStack(spacing: Metric.regular) {
-            VStack(spacing: Metric.tight) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .frame(width: 64, height: 64)
-                    .accessibilityHidden(true)
-                Text("Plug")
-                    .font(.title2.weight(.semibold))
-                Text(versionText)
-                    .font(.callout.monospacedDigit())
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            .accessibilityElement(children: .combine)
-
-            Button {
-                run(.checkForUpdates)
-            } label: {
-                Label("Check for Updates…", systemImage: "arrow.down.circle")
-            }
-            .disabled(!UpdateService.shared.canCheckForUpdates)
-
-            Text("Plug keeps your MCP servers available to every connected client.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-                .frame(maxWidth: 320)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .padding(Metric.roomy)
-    }
-
-    private var versionText: String { "Version \(model.displayVersion)" }
 }

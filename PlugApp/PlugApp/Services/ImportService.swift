@@ -69,7 +69,7 @@ struct ImportService: ImportScanning {
             let message = String(data: result.stderr, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw ImportError.failed(
-                message?.isEmpty == false ? message! : "Plug could not read the other apps' settings."
+                message?.isEmpty == false ? message! : "Plug could not read your other clients' settings."
             )
         }
         return try ImportScan(json: result.stdout)
@@ -163,7 +163,7 @@ extension ImportScan {
         case "RooCode": "Roo Code"
         case "GrokBuild": "Grok Build"
         case "CopilotCli": "GitHub Copilot CLI"
-        case "": "Another app"
+        case "": "Another client"
         default: source
         }
     }

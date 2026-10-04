@@ -46,7 +46,7 @@ enum AppLinkError: LocalizedError, Equatable {
         switch self {
         case .serviceMissing: "The bundled Plug service is missing."
         case let .commandFailed(detail): detail
-        case .malformedOutput: "Plug returned an app list it could not read."
+        case .malformedOutput: "Plug returned a client list it could not read."
         }
     }
 }
@@ -108,7 +108,7 @@ struct AppLinkService: AppLinking {
             let detail = String(data: result.stderr, encoding: .utf8)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
             throw AppLinkError.commandFailed(
-                detail.flatMap { $0.isEmpty ? nil : $0 } ?? "Plug could not update that app."
+                detail.flatMap { $0.isEmpty ? nil : $0 } ?? "Plug could not update that client."
             )
         }
         return result.stdout

@@ -22,7 +22,7 @@ struct ImportServersView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
             VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("Import servers").font(.title2.weight(.semibold))
+                Text("Import Servers").font(.title2.weight(.semibold))
                 Text("Servers already set up in other clients on this Mac. Their settings are left as they are.")
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -64,7 +64,7 @@ struct ImportServersView: View {
     @ViewBuilder private var content: some View {
         if scanFailed {
             VStack(alignment: .leading, spacing: Metric.snug) {
-                Label(failure ?? "Plug could not scan the other apps.", systemImage: "exclamationmark.triangle")
+                Label(failure ?? "Plug could not read your other clients' settings.", systemImage: "exclamationmark.triangle")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                 Button("Try Again") { Task { await load() } }
@@ -75,7 +75,7 @@ struct ImportServersView: View {
                 VStack(alignment: .leading, spacing: Metric.tight) {
                     Label("Nothing new to import", systemImage: "checkmark.circle")
                         .font(.callout)
-                    Text("Every server your other apps use is already in Plug.")
+                    Text("Every server your other clients use is already in Plug.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -88,7 +88,7 @@ struct ImportServersView: View {
         } else {
             HStack(spacing: Metric.snug) {
                 ProgressView().controlSize(.small)
-                Text("Looking through your other apps…")
+                Text("Looking through your other clients…")
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
@@ -99,7 +99,7 @@ struct ImportServersView: View {
     private func found(_ scan: ImportScan) -> some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
             SectionLabel(
-                text: "Found in other apps",
+                text: "Found in other clients",
                 trailing: scan.servers.count == 1 ? "1 server" : "\(scan.servers.count) servers"
             )
             ScrollView {
@@ -153,12 +153,12 @@ struct ImportServersView: View {
         if let url = server.config.url,
            let host = URL(string: url)?.host
         {
-            return "Remote server · \(host)"
+            return "Over the network · \(host)"
         }
         if let command = server.config.command {
-            return "Runs on this Mac · \(URL(fileURLWithPath: command).lastPathComponent)"
+            return "On this Mac · \(URL(fileURLWithPath: command).lastPathComponent)"
         }
-        return "Server configuration"
+        return "Server"
     }
 
     private func binding(for server: DiscoveredServer) -> Binding<Bool> {
