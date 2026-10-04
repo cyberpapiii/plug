@@ -31,18 +31,82 @@ pub(crate) fn current() -> Option<ClientHost> {
             if !output.status.success() {
                 return None;
             }
-            host_of(std::process::id(), &String::from_utf8_lossy(&output.stdout))
+            let table = String::from_utf8_lossy(&output.stdout);
+            let (pid, executable) = find_host(std::process::id(), &table)?;
+            let mut host = describe(executable);
+            if is_interpreter(executable) {
+                host.script = command_line(pid).as_deref().and_then(script_of);
+            }
+            Some(host)
         })
         .clone()
     }
 }
 
+/// The target this connector was linked as, from `plug connect --client`.
+static LINK_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+pub(crate) fn set_link_target(target: Option<String>) {
+    let _ = LINK_TARGET.set(target);
+}
+
+pub(crate) fn link_target() -> Option<String> {
+    LINK_TARGET.get().cloned().flatten()
+}
+
+/// Programs that run something else and say nothing about what. Two clients
+/// started with a bare `python3` are the same executable, so the script is
+/// what tells them apart.
+const INTERPRETERS: &[&str] = &["node", "bun", "deno", "ruby", "perl"];
+
+fn is_interpreter(executable: &str) -> bool {
+    let name = file_name(executable);
+    name.starts_with("python") || INTERPRETERS.contains(&name)
+}
+
+#[cfg(not(test))]
+fn command_line(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("/bin/ps")
+        .args(["-o", "args=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// What an interpreter's command line says it runs: the script path, or the
+/// module after `-m`. `None` for inline code and for a bare interpreter.
+/// `ps` does not quote, so a path with a space in it is cut at the space;
+/// the key is still stable for that client.
+fn script_of(command_line: &str) -> Option<String> {
+    let mut words = command_line.split_whitespace().skip(1);
+    while let Some(word) = words.next() {
+        match word {
+            "-m" => return words.next().map(str::to_string),
+            "-c" | "-e" | "--eval" | "-p" | "--print" => return None,
+            // `deno run`, `bun run`
+            "run" => continue,
+            flag if flag.starts_with('-') => continue,
+            script => return Some(script.to_string()),
+        }
+    }
+    None
+}
+
 /// The host of `pid` in a `ps -axo pid=,ppid=,comm=` listing.
+#[cfg(test)]
 fn host_of(pid: u32, table: &str) -> Option<ClientHost> {
+    find_host(pid, table).map(|(_, executable)| describe(executable))
+}
+
+/// The pid and executable of the program that started `pid`.
+fn find_host(pid: u32, table: &str) -> Option<(u32, &str)> {
     let processes: std::collections::HashMap<u32, (u32, &str)> =
         table.lines().filter_map(parse_row).collect();
     let (mut parent, _) = *processes.get(&pid)?;
-    let mut found = None;
+    let mut found: Option<(u32, &str)> = None;
     for _ in 0..MAX_HOPS {
         // launchd adopts orphans and starts services; it is nobody's host.
         if parent <= 1 {
@@ -51,13 +115,13 @@ fn host_of(pid: u32, table: &str) -> Option<ClientHost> {
         let Some(&(grandparent, executable)) = processes.get(&parent) else {
             break;
         };
-        found = Some(executable);
+        found = Some((parent, executable));
         if !WRAPPERS.contains(&file_name(executable)) {
             break;
         }
         parent = grandparent;
     }
-    found.map(describe)
+    found
 }
 
 fn parse_row(line: &str) -> Option<(u32, (u32, &str))> {
@@ -91,6 +155,7 @@ fn describe(executable: &str) -> ClientHost {
         name: name.to_string(),
         executable: executable.to_string(),
         app: app.map(str::to_string),
+        script: None,
     }
 }
 
@@ -121,6 +186,32 @@ mod tests {
         let host = host_of(4227, table).expect("host");
         assert_eq!(host.name, "python3");
         assert_eq!(host.app, None);
+    }
+
+    #[test]
+    fn an_interpreter_is_told_apart_by_what_it_runs() {
+        assert!(is_interpreter(
+            "/Users/me/.hermes/tools/python/bin/python3.12"
+        ));
+        assert!(is_interpreter("/opt/homebrew/bin/node"));
+        assert!(!is_interpreter(
+            "/Applications/Cursor.app/Contents/MacOS/Cursor"
+        ));
+
+        assert_eq!(
+            script_of("python3 -u /opt/hermes/agent.py --port 1").as_deref(),
+            Some("/opt/hermes/agent.py")
+        );
+        assert_eq!(
+            script_of("/usr/bin/python3 -m hermes.agent").as_deref(),
+            Some("hermes.agent")
+        );
+        assert_eq!(
+            script_of("deno run --allow-all main.ts").as_deref(),
+            Some("main.ts")
+        );
+        assert_eq!(script_of("node -e console.log(1)"), None);
+        assert_eq!(script_of("python3"), None);
     }
 
     #[test]

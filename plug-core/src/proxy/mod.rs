@@ -356,6 +356,11 @@ pub struct DownstreamCallContext {
     pub client_id: Arc<str>,
     pub request_id: RequestId,
     pub client_type: ClientType,
+    /// Which client this is, as the key its settings are stored under:
+    /// `oauth:<client id>` for a verified grant, the shared key for any other
+    /// remote caller, a link target or host program for a local one. `None`
+    /// for a caller Plug cannot place and for Plug's own internal calls.
+    pub client_key: Option<Arc<str>>,
     pub trace_id: Arc<str>,
     pub protocol_era: crate::protocol::ProtocolEra,
     pub protocol_version: Arc<str>,
@@ -392,6 +397,7 @@ impl DownstreamCallContext {
             client_id: Arc::clone(&client_id),
             request_id,
             client_type,
+            client_key: None,
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
@@ -421,6 +427,7 @@ impl DownstreamCallContext {
             client_id: Arc::clone(&client_id),
             request_id,
             client_type,
+            client_key: None,
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
@@ -460,6 +467,7 @@ impl DownstreamCallContext {
             client_id: session_id,
             request_id,
             client_type,
+            client_key: None,
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
@@ -489,6 +497,7 @@ impl DownstreamCallContext {
             client_id: session_id,
             request_id,
             client_type,
+            client_key: None,
             trace_id: trace_id.into(),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
@@ -513,6 +522,11 @@ impl DownstreamCallContext {
         self.principal = Some(principal);
         self.scopes = Arc::new(scopes.into_iter().collect());
         self.local_trust = false;
+        self
+    }
+
+    pub fn with_client_key(mut self, client_key: Option<impl Into<Arc<str>>>) -> Self {
+        self.client_key = client_key.map(Into::into);
         self
     }
 

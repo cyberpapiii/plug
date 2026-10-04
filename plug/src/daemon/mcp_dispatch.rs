@@ -29,6 +29,7 @@ struct IpcDownstreamContext {
     registry_client_id: Option<Arc<str>>,
     request_id: RequestId,
     client_type: plug_core::types::ClientType,
+    client_key: Option<Arc<str>>,
     owner: Option<plug_core::tasks::TaskOwner>,
     /// Pre-built alongside `owner` (both derive from the resolved client id):
     /// reports whether the client registry still holds a session for that
@@ -45,7 +46,8 @@ impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
-        );
+        )
+        .with_client_key(self.client_key.clone());
         let context = match &self.registry_client_id {
             Some(client_id) => context.with_local_principal(
                 plug_core::types::PrincipalId::daemon_ipc_registry(client_id),
@@ -399,6 +401,10 @@ pub(super) async fn dispatch_mcp_request(
                 registry_client_id: registry_client_id.map(Arc::<str>::from),
                 request_id,
                 client_type,
+                client_key: ctx
+                    .client_registry
+                    .client_key(session_id)
+                    .map(Arc::<str>::from),
                 owner,
                 owner_liveness,
                 request_context: request_context.cloned(),
@@ -680,6 +686,7 @@ mod tests {
             registry_client_id: Some(Arc::from("stable-client")),
             request_id: request_id.clone(),
             client_type: plug_core::types::ClientType::Unknown,
+            client_key: None,
             owner: None,
             owner_liveness: None,
             request_context: Some(IpcMcpRequestContext {

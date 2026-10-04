@@ -735,6 +735,7 @@ mod tests {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),
+            script: None,
         });
         let mut named = session("Cursor", "daemon_proxy", 10);
         named.host = hosted.host.clone();
@@ -753,6 +754,7 @@ mod tests {
             name: "python3".to_string(),
             executable: "/opt/hermes/bin/python3".to_string(),
             app: None,
+            script: None,
         });
         hermes.key = Some("host:/opt/hermes/bin/python3".to_string());
         let mut renamed = hermes.clone();

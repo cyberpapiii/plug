@@ -919,6 +919,11 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     errors
 }
 
+/// The one spelling of a client target, for any name `plug link` accepts.
+pub fn canonical_client_target(target: &str) -> Option<&'static str> {
+    canonical_lazy_tool_client_target(target)
+}
+
 fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
     match target.parse::<crate::export::ExportTarget>().ok()? {
         crate::export::ExportTarget::ClaudeDesktop => Some("claude-desktop"),

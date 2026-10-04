@@ -1777,6 +1777,7 @@ mod tests {
             plug_core::ipc::IpcRequest::Register {
                 adapter_version: None,
                 host: None,
+                link_target: None,
                 ..
             }
         ));
@@ -1786,6 +1787,7 @@ mod tests {
             client_info: Some("cursor".to_string()),
             adapter_version: Some("0.6.4".to_string()),
             host: None,
+            link_target: None,
         };
         assert_eq!(
             serde_json::to_value(new_register).unwrap()["adapter_version"],

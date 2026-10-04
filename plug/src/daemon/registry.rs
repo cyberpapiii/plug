@@ -22,6 +22,7 @@ struct ClientSession {
     client_info: Option<String>,
     adapter_version: Option<String>,
     host: Option<plug_core::ipc::ClientHost>,
+    link_target: Option<String>,
     connected_at: Instant,
     capabilities: ClientCapabilities,
     cancellation_capability: String,
@@ -86,6 +87,7 @@ impl ClientRegistry {
                 client_info,
                 adapter_version,
                 host,
+                link_target: None,
                 connected_at: Instant::now(),
                 capabilities: ClientCapabilities::default(),
                 cancellation_capability: cancellation_capability.clone(),
@@ -128,6 +130,32 @@ impl ClientRegistry {
             );
             self.count_tx.send_modify(|c| *c = self.sessions.len());
         }
+    }
+
+    /// Record the target the connector says it was linked as. A name
+    /// `plug link` does not accept is dropped, so a key is never invented
+    /// from free text.
+    pub(super) fn set_link_target(&self, session_id: &str, link_target: Option<&str>) {
+        let Some(target) = link_target.and_then(plug_core::config::canonical_client_target) else {
+            return;
+        };
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            entry.link_target = Some(target.to_string());
+        }
+    }
+
+    /// The key this session's settings are stored under.
+    pub(super) fn client_key(&self, session_id: &str) -> Option<String> {
+        let entry = self.sessions.get(session_id)?;
+        plug_core::ipc::local_client_key(
+            entry.link_target.as_deref(),
+            entry
+                .client_info
+                .as_deref()
+                .map(plug_core::client_detect::detect_client)
+                .unwrap_or(plug_core::types::ClientType::Unknown),
+            entry.host.as_ref(),
+        )
     }
 
     /// Update client_info for an existing session.
@@ -210,6 +238,7 @@ impl ClientRegistry {
                 adapter_version: entry.adapter_version.clone(),
                 host: entry.host.clone(),
                 grant: None,
+                link_target: entry.link_target.clone(),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })
@@ -304,6 +333,7 @@ mod tests {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),
+            script: None,
         };
 
         registry.register_hosted(
@@ -331,5 +361,32 @@ mod tests {
             registry.list_live_sessions()[0].adapter_version.as_deref(),
             Some("0.6.5")
         );
+    }
+    #[test]
+    fn a_session_is_keyed_by_how_it_was_linked_before_what_it_reports() {
+        let (registry, _count_rx) = ClientRegistry::new();
+        let session = registry
+            .register(
+                "client".to_string(),
+                Some("cursor-vscode".to_string()),
+                None,
+            )
+            .session_id;
+        assert_eq!(registry.client_key(&session).as_deref(), Some("cursor"));
+
+        // Not a target `plug link` writes: nothing changes.
+        registry.set_link_target(&session, Some("../etc"));
+        assert_eq!(registry.client_key(&session).as_deref(), Some("cursor"));
+
+        registry.set_link_target(&session, Some("claude-code"));
+        assert_eq!(
+            registry.client_key(&session).as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(
+            registry.list_live_sessions()[0].link_target.as_deref(),
+            Some("claude-code")
+        );
+        assert_eq!(registry.client_key("gone"), None);
     }
 }

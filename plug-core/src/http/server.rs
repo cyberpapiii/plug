@@ -213,11 +213,14 @@ fn apply_http_auth(
     match (auth_status, http_principal(auth_status, oauth_issuer)) {
         (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
             .with_authorization(principal, claims.scopes.clone())
-            .with_principal_lifecycle(claims.principal_lifecycle.clone()),
-        (AuthStatus::Authenticated(None), Some(principal)) => {
-            context.with_local_principal(principal)
-        }
-        (AuthStatus::NoAuthRequired, _) => context.with_local_principal(http_loopback_principal()),
+            .with_principal_lifecycle(claims.principal_lifecycle.clone())
+            .with_client_key(Some(crate::ipc::grant_client_key(&claims.client_id))),
+        (AuthStatus::Authenticated(None), Some(principal)) => context
+            .with_local_principal(principal)
+            .with_client_key(Some(crate::ipc::SHARED_REMOTE_CLIENT_KEY)),
+        (AuthStatus::NoAuthRequired, _) => context
+            .with_local_principal(http_loopback_principal())
+            .with_client_key(Some(crate::ipc::SHARED_REMOTE_CLIENT_KEY)),
         (AuthStatus::Authenticated(_), None) => context,
     }
 }
@@ -3513,15 +3516,41 @@ mod tests {
             )
             .await
         {
-            crate::downstream_oauth::AccessTokenValidation::Valid(claims) => claims.client_id,
+            crate::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
             other => panic!("token must validate: {other:?}"),
         };
+        let claims = client_id;
+        let client_id = claims.client_id.clone();
         let snapshots = state.sessions.session_snapshots();
         let session = snapshots
             .iter()
             .find(|snapshot| snapshot.session_id == session_id)
             .expect("session is tracked");
         assert_eq!(session.grant.as_deref(), Some(client_id.as_str()));
+
+        // Every request carries the same key, session or no session, so a
+        // stateless request is placed as surely as a legacy one.
+        let context = |auth: &AuthStatus| {
+            apply_http_auth(
+                DownstreamCallContext::http("any", RequestId::Number(1)),
+                auth,
+                None,
+            )
+        };
+        assert_eq!(
+            context(&AuthStatus::Authenticated(Some(claims)))
+                .client_key
+                .as_deref(),
+            Some(format!("oauth:{client_id}").as_str())
+        );
+        // A shared bearer and an open loopback listener cannot tell their
+        // callers apart, so those callers share one key.
+        for auth in [AuthStatus::Authenticated(None), AuthStatus::NoAuthRequired] {
+            assert_eq!(
+                context(&auth).client_key.as_deref(),
+                Some(crate::ipc::SHARED_REMOTE_CLIENT_KEY)
+            );
+        }
     }
 
     #[tokio::test]

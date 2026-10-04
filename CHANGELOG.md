@@ -15,6 +15,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - GitHub Copilot CLI is a client. `plug link copilot-cli` and the Clients tab
   write `~/.copilot/mcp-config.json` with the `type` and `tools` fields Copilot
   CLI requires, and `plug import copilot-cli` reads servers from it.
+- Every request knows which client sent it. `plug connect --client <target>`
+  says which link started the connector, so a client is placed by how it was
+  linked rather than by the name it reports; a remote request is placed by its
+  grant, and requests on the shared token share one key. Nothing acts on the
+  key yet: it is the ground per-client access stands on.
+- An unknown local client started by an interpreter is told apart by the script
+  it runs. Two tools that both run under `python3` or `node` are now two
+  clients, each with its own name. A name given to such a client before this
+  change no longer applies; rename it once more.
 
 - A remote session knows the grant it came in on. Clients names a remote
   client Plug does not recognise after that grant, shows the matching app's

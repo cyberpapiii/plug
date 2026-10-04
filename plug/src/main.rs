@@ -210,7 +210,11 @@ enum Commands {
     },
     #[command(display_order = 13)]
     /// Internal: start the stdio adapter AI clients invoke
-    Connect,
+    Connect {
+        /// The target `plug link` installed this command for
+        #[arg(long, value_name = "TARGET")]
+        client: Option<String>,
+    },
     #[command(display_order = 14)]
     /// Internal: run plug as the shared foreground or background service
     Serve {
@@ -538,7 +542,9 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         None => views::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Start) => runtime::cmd_start(cli.config.as_ref(), &cli.output).await?,
-        Some(Commands::Connect) => runtime::cmd_connect(cli.config.as_ref()).await?,
+        Some(Commands::Connect { client }) => {
+            runtime::cmd_connect(cli.config.as_ref(), client).await?
+        }
         Some(Commands::Serve { daemon }) => {
             if daemon {
                 // Stderr is the only place this error would otherwise land, and
@@ -667,7 +673,7 @@ impl From<ClientLinkTransport> for plug_core::export::ExportTransport {
 /// output the user is reading, so only errors belong there.
 fn default_log_level(command: Option<&Commands>) -> &'static str {
     match command {
-        Some(Commands::Serve { .. }) | Some(Commands::Connect) => "info",
+        Some(Commands::Serve { .. }) | Some(Commands::Connect { .. }) => "info",
         Some(Commands::Status { .. })
         | Some(Commands::Servers)
         | Some(Commands::Clients { .. })
