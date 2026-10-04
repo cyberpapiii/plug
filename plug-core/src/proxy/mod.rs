@@ -2836,6 +2836,25 @@ impl ToolRouter {
             .map(|(name, _)| name.clone())
     }
 
+    /// The name clients call `tool` on `server` by, and whether the server
+    /// marks it read-only. Used to watch a tool for change.
+    pub(crate) fn watched_tool(&self, server: &str, tool: &str) -> Option<(String, bool)> {
+        let snapshot = self.cache.load();
+        let name = snapshot
+            .routes
+            .iter()
+            .find(|(_, (route_server, route_tool))| route_server == server && route_tool == tool)
+            .map(|(name, _)| name.clone())?;
+        let read_only = snapshot
+            .tools_by_name
+            .get(&name)
+            .and_then(|index| snapshot.tools_all.get(*index))
+            .and_then(|tool| tool.annotations.as_ref())
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false);
+        Some((name, read_only))
+    }
+
     /// Call a tool by its prefixed name, routing to the correct upstream server.
     ///
     /// Applies: health gate → circuit breaker → semaphore → timeout.

@@ -8,7 +8,7 @@ use super::{DeliveryResponse, EventDelivery};
 
 pub struct HttpsDelivery;
 
-pub(super) fn validate_url(value: &str) -> Result<Url, &'static str> {
+pub(crate) fn validate_url(value: &str) -> Result<Url, &'static str> {
     let url = Url::parse(value).map_err(|_| "invalid_url")?;
     if url.scheme() != "https"
         || !url.username().is_empty()

@@ -4422,6 +4422,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: std::sync::atomic::AtomicBool::new(false),

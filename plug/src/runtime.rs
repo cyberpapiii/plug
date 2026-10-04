@@ -775,6 +775,21 @@ fn build_configured_http_runtime(
         None
     };
 
+    // Opened whenever OAuth is on, so a watch added by a reload needs no restart.
+    // A watch is a convenience: failing to open its state must not stop Plug.
+    let watch_events = downstream_oauth.clone().and_then(|oauth| {
+        plug_core::events::WatchEvents::open(
+            &plug_core::config::config_dir().join("events").join("watch"),
+            Arc::new(plug_core::events::RuntimeWatchAccess::new(engine, oauth)),
+            Arc::new(plug_core::slack_events::HttpsDelivery),
+        )
+        .inspect_err(|error| tracing::warn!(%error, "watch events unavailable"))
+        .ok()
+    });
+    if let Some(events) = &watch_events {
+        events.spawn(engine.cancel_token().clone());
+    }
+
     let http_state = Arc::new(plug_core::http::server::HttpState {
         router: tool_router.clone(),
         sessions: Arc::clone(&sessions),
@@ -782,6 +797,7 @@ fn build_configured_http_runtime(
         auth_mode: config.http.auth_mode.clone(),
         downstream_oauth: downstream_oauth.clone(),
         slack_events,
+        watch_events,
         sse_channel_capacity: config.http.sse_channel_capacity,
         allowed_origins: config
             .http
@@ -2391,6 +2407,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2903,6 +2920,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -2952,6 +2970,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3018,6 +3037,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3400,6 +3420,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager.clone()),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3706,6 +3727,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3756,6 +3778,7 @@ mod tests {
             auth_mode: plug_core::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),

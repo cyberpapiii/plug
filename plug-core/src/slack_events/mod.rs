@@ -27,15 +27,16 @@ use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 
 pub use delivery::HttpsDelivery;
+pub(crate) use delivery::validate_url;
 pub const EVENT_NAME: &str = "slack.ditto_message";
 pub const EVENT_SCOPE: &str = "events:subscribe";
 pub const SOURCE_PATH: &str = "/events/slack";
 const OWNER_PROOF_MARKER: &str = "PLUG_EVENTS_PROOF_20261003";
-const DAY: u64 = 86_400;
-const MAX_BODY: usize = 256 * 1024;
-const MAX_QUEUE: usize = 128;
+pub(crate) const DAY: u64 = 86_400;
+pub(crate) const MAX_BODY: usize = 256 * 1024;
+pub(crate) const MAX_QUEUE: usize = 128;
 const MAX_SEEN: usize = 10_000;
-const MAX_ATTEMPTS: u32 = 8;
+pub(crate) const MAX_ATTEMPTS: u32 = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -135,28 +136,28 @@ pub struct EventError {
     pub message: &'static str,
     pub reason: Option<&'static str>,
 }
-fn invalid(message: &'static str) -> EventError {
+pub(crate) fn invalid(message: &'static str) -> EventError {
     EventError {
         code: -32602,
         message,
         reason: None,
     }
 }
-fn denied() -> EventError {
+pub(crate) fn denied() -> EventError {
     EventError {
         code: -32001,
         message: "event access denied",
         reason: None,
     }
 }
-fn unavailable() -> EventError {
+pub(crate) fn unavailable() -> EventError {
     EventError {
         code: -32603,
         message: "event state unavailable",
         reason: None,
     }
 }
-fn callback_error(reason: &'static str) -> EventError {
+pub(crate) fn callback_error(reason: &'static str) -> EventError {
     EventError {
         code: -32015,
         message: "callback verification failed",
@@ -233,7 +234,7 @@ pub fn now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn iso_time(seconds: u64) -> Result<String, EventError> {
+pub(crate) fn iso_time(seconds: u64) -> Result<String, EventError> {
     chrono::DateTime::from_timestamp(
         i64::try_from(seconds).map_err(|_| invalid("invalid timestamp"))?,
         0,
@@ -859,7 +860,7 @@ fn valid_slack_ts(value: &str) -> bool {
             .chain(fraction.bytes())
             .all(|b| b.is_ascii_digit())
 }
-fn signing_key(secret: &str) -> Result<Vec<u8>, EventError> {
+pub(crate) fn signing_key(secret: &str) -> Result<Vec<u8>, EventError> {
     let key = secret
         .strip_prefix("whsec_")
         .and_then(|s| STANDARD.decode(s).ok())
@@ -874,7 +875,7 @@ fn signature(key: &[u8], body: &[u8]) -> Vec<u8> {
     hmac.update(body);
     hmac.finalize().into_bytes().to_vec()
 }
-fn signed_headers(
+pub(crate) fn signed_headers(
     subscription: &str,
     event_id: &str,
     secret: &str,
@@ -938,7 +939,7 @@ fn verify_slack(
     }
     Ok(())
 }
-fn private_open(path: &Path, exclusive: bool) -> std::io::Result<File> {
+pub(crate) fn private_open(path: &Path, exclusive: bool) -> std::io::Result<File> {
     let mut options = OpenOptions::new();
     options.write(true).read(true);
     if exclusive {
@@ -953,7 +954,7 @@ fn private_open(path: &Path, exclusive: bool) -> std::io::Result<File> {
     }
     options.open(path)
 }
-fn check_private(path: &Path, directory: bool) -> anyhow::Result<()> {
+pub(crate) fn check_private(path: &Path, directory: bool) -> anyhow::Result<()> {
     let metadata = std::fs::symlink_metadata(path)?;
     anyhow::ensure!(
         !metadata.file_type().is_symlink() && metadata.is_dir() == directory,

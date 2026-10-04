@@ -17,6 +17,7 @@ pub mod downstream_oauth;
 pub mod engine;
 pub mod enrichment;
 pub mod error;
+pub mod events;
 pub mod export;
 pub mod fs_perm;
 pub mod health;
