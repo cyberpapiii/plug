@@ -472,6 +472,8 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case addServer(authToken: String, name: String, server: ServerConfig)
     case updateServer(authToken: String, name: String, server: ServerConfig)
     case removeServer(authToken: String, name: String)
+    /// Add a configured server again as `<server>-<account>`.
+    case addAccount(authToken: String, server: String, account: String)
     case setServerEnabled(authToken: String, name: String, enabled: Bool)
     case listTools
     case setToolEnabled(authToken: String, tool: String, enabled: Bool)
@@ -491,7 +493,7 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
         case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked
-        case watch, event
+        case watch, event, account
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -520,6 +522,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
         case let .removeServer(token, name):
             try c.encode("RemoveServer", forKey: .type); try c.encode(token, forKey: .authToken); try c.encode(name, forKey: .name)
+        case let .addAccount(token, server, account):
+            try c.encode("AddAccount", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(server, forKey: .server); try c.encode(account, forKey: .account)
         case let .setServerEnabled(token, name, enabled):
             try c.encode("SetServerEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(enabled, forKey: .enabled)

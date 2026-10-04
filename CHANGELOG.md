@@ -30,6 +30,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   client, use a tool, each with the button that does it and a tick when it is
   done. Copy Setup Prompt puts instructions on the clipboard that an agent can
   follow to set Plug up; the same text is `docs/guides/agent-setup.md`.
+- A server can have a second account. `plug server add-account <server>
+  <account>` and Add Another Account in a server's menu add the same server
+  again as `<server>-<account>`, with the same settings. An OAuth server's
+  copy starts signed out and signs in with the other account; any other copy
+  keeps the same credentials until you edit it. Tool groups carry the account
+  in their name, so `Gmail` and `GmailPersonal` sit side by side.
 - The Clients tab chooses which servers each client can use. Every client that
   uses Plug has a button that opens its servers with a switch each, and a
   client kept from something says so in its row. The popover says plainly that
@@ -132,6 +138,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A removed server that never connected, one waiting for sign-in or one that
+  failed to start, stayed in `plug servers` and the app until the service
+  restarted. It now leaves at once.
 - Linking VS Code wrote a file VS Code does not read, in a shape it does not
   accept. The link now writes top-level `servers` to `mcp.json` in the VS Code
   user folder, or to `.vscode/mcp.json` for a project link. Link VS Code again

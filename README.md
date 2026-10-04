@@ -185,6 +185,7 @@ plug link                    # Link plug to your AI clients
 plug clients                 # View and manage linked, detected, and live clients
 plug clients rename <client> "<name>"   # Give a client a name of your choosing
 plug servers                 # View and manage configured servers
+plug server add-account slack work   # The same server again, for a second account
 plug tools                   # View and manage the effective tool surface
 plug status                  # Show runtime health and next useful action
 plug doctor                  # Diagnose connectivity and configuration issues
@@ -300,6 +301,7 @@ Notes:
 
 - Wire names are always prefixed in the current release, regardless of `enable_prefix`
 - Some servers can be split into sub-service prefixes via `tool_groups`
+- A second account is the same server under another name. `plug server add-account slack work` adds `slack-work`, whose tools are `Slack-work__…`; a grouped server keeps its groups with the account added, `GmailWork__…`
 - Some clients still render raw `name` or synthesize their own labels, so perfect cross-client visual consistency is not always possible
 - Icon metadata is normalized before forwarding: HTTPS and bounded `data:` icon URIs are allowed; PNG/JPEG/WebP are forwarded for upstream icons, untrusted SVG is dropped, invalid schemes, invalid sizes, and oversized inline icons are dropped.
 

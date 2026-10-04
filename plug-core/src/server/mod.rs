@@ -2598,8 +2598,12 @@ impl ServerManager {
     /// Stop and remove a single upstream server.
     pub async fn stop_server(&self, name: &str) {
         self.last_errors.remove(name);
+        // A server that never connected, one waiting for sign-in or one that
+        // failed to start, has a status but no upstream. Forget it too, or a
+        // removed server stays in the list.
+        self.health.remove(name);
+        self.configured_auth.remove(name);
         if let Some(upstream_arc) = self.remove_upstream(name) {
-            self.health.remove(name);
             self.circuit_breakers.remove(name);
             self.metrics.remove(name);
             self.last_resources.remove(name);
@@ -4680,6 +4684,18 @@ mod tests {
         assert_eq!(statuses[0].server_id, "todoist");
         assert_eq!(statuses[0].health, ServerHealth::AuthRequired);
         assert_eq!(statuses[0].auth_status, "auth-required");
+    }
+
+    #[tokio::test]
+    async fn a_removed_server_that_never_connected_leaves_the_list() {
+        let mgr = ServerManager::new();
+        mgr.mark_auth_required("todoist");
+        mgr.mark_start_failure("broken");
+
+        mgr.stop_server("todoist").await;
+        mgr.stop_server("broken").await;
+
+        assert!(mgr.server_statuses().is_empty());
     }
 
     #[tokio::test]

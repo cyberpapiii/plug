@@ -334,6 +334,13 @@ pub(crate) enum ServerCommands {
         #[arg(long)]
         yes: bool,
     },
+    /// Add a server again for a second account, as <server>-<account>
+    AddAccount {
+        /// The server that is already configured
+        server: String,
+        /// A short name for the account: lowercase letters and digits
+        account: String,
+    },
     /// Change a server's command, URL, env, or auth
     Edit {
         /// Server name

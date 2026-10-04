@@ -2800,6 +2800,53 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
 }
 
 #[tokio::test]
+async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
+    let mut config = Config::default();
+    config
+        .servers
+        .insert("mock".to_string(), mock_server_config("echo,greet"));
+    config.disabled_tools = vec!["Mock__greet".to_string()];
+
+    let engine = Arc::new(Engine::new(config));
+    engine.start().await.expect("engine start");
+
+    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = proxy_handler
+            .serve(server_transport)
+            .await
+            .expect("start stdio proxy server");
+        let _ = server.waiting().await;
+    });
+
+    let client = TestClient
+        .serve(client_transport)
+        .await
+        .expect("connect stdio client");
+
+    let tools = client.peer().list_all_tools().await.expect("list tools");
+    let names = tools
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"Mock__echo".to_string()), "{names:?}");
+    assert!(!names.contains(&"Mock__greet".to_string()), "{names:?}");
+
+    // Hiding a tool is not enough: a client that already knows the name must
+    // not reach the server with it.
+    let refused = client
+        .call_tool(CallToolRequestParams::new("Mock__greet"))
+        .await;
+    assert!(
+        refused.is_err() || refused.is_ok_and(|result| result.is_error == Some(true)),
+        "a call to a tool turned off for everyone went through"
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn test_stdio_structured_content_passes_through_end_to_end() {
     let mut config = Config::default();
     config

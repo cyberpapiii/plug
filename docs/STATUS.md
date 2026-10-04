@@ -47,8 +47,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- Block single tools centrally. Asking before a call stays with the client.
-- Several accounts for one server without adding the server twice.
 - Tools from plain HTTP APIs (OpenAPI, GraphQL) with no MCP server.
 - Skills: namespace `skill://` resources per upstream server.
 - MCP Apps: confirm the UI capability and `ui://` resources survive

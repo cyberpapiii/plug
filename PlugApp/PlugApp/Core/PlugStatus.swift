@@ -230,6 +230,8 @@ enum PlugIntent: Equatable, Sendable {
     case setServerEnabled(String, Bool)
     case editServer(String)
     case removeServer(String)
+    /// Open the sheet that adds a server again for a second account.
+    case addAccount(server: String)
     case setToolEnabled(String, Bool)
     case linkApp(String)
     case unlinkApp(String)
