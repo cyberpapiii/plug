@@ -128,6 +128,15 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(AppIcons.target(forClientType: "codex-mcp-client"), "codex-cli")
     }
 
+    func testGoogleServersShareOneIconUnlessTheirAppIsHere() {
+        XCTAssertEqual(AppIcons.appName(forServer: "workspace"), "googledrive")
+        XCTAssertEqual(AppIcons.appName(forServer: "Gmail"), "googledrive")
+        XCTAssertEqual(AppIcons.appName(forServer: "GoogleCalendar"), "googledrive")
+        XCTAssertEqual(AppIcons.appName(forServer: "GoogleDocs") { $0 == "googledocs" }, "googledocs")
+        XCTAssertEqual(AppIcons.appName(forServer: "imessage"), "messages")
+        XCTAssertEqual(AppIcons.appName(forServer: "slack"), "slack")
+    }
+
     func testATileKeepsItsLetterAndItsColor() {
         XCTAssertEqual(MonogramTile.letter(for: "workspace"), "W")
         XCTAssertEqual(MonogramTile.letter(for: "-exa"), "E")

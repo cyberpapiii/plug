@@ -109,20 +109,31 @@ enum AppIcons {
     /// a server named "slack" shows Slack's icon.
     @MainActor
     static func image(forServer name: String) -> NSImage? {
-        let key = lookupKey(name)
-        return installedIcon(named: serverAliases[key] ?? key)
+        installedIcon(named: appName(forServer: name) { installedApps[$0] != nil })
     }
 
     /// Server names that are not their app's name.
     private static let serverAliases: [String: String] = [
         "imessage": "messages",
         "github": "githubdesktop",
-        "gmail": "mail",
         "applenotes": "notes",
-        "googledrive": "googledrive",
         "gdrive": "googledrive",
-        "linear": "linear",
+        "workspace": "googledrive",
+        "googleworkspace": "googledrive",
+        "gmail": "googledrive",
     ]
+
+    /// The lookup key of the app a server stands for. Google's servers go
+    /// by many names, one per product, and a Mac has an app for only a few
+    /// of them, so the rest share Google Drive's icon.
+    ///
+    /// Pure, so the matching is testable.
+    static func appName(forServer name: String, installed: (String) -> Bool = { _ in false }) -> String {
+        let key = lookupKey(name)
+        if let alias = serverAliases[key] { return alias }
+        if key.hasPrefix("google"), !installed(key) { return "googledrive" }
+        return key
+    }
 
     /// A name with everything but its letters and digits removed, so
     /// "agent-admin" finds AgentAdmin.app.
@@ -308,17 +319,17 @@ struct MonogramTile: View {
     var symbol: String?
     var size: CGFloat = 18
 
-    private static let tints: [Color] = [.blue, .indigo, .purple, .pink, .orange, .teal, .green, .brown]
+    private nonisolated static let tints: [Color] = [.blue, .indigo, .purple, .pink, .orange, .teal, .green, .brown]
 
     /// Which tint a name gets.
     ///
     /// Pure, so it can be tested: the same name always gets the same tint.
-    static func tintIndex(for name: String) -> Int {
+    nonisolated static func tintIndex(for name: String) -> Int {
         let sum = name.lowercased().unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) % 1_000_003 }
         return sum % tints.count
     }
 
-    static func letter(for name: String) -> String {
+    nonisolated static func letter(for name: String) -> String {
         name.first { $0.isLetter || $0.isNumber }.map { String($0).uppercased() } ?? "?"
     }
 
