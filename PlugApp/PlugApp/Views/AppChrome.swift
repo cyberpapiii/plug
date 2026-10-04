@@ -1,20 +1,93 @@
 import SwiftUI
 
-/// A section's rows on the left and the selected row in full on the right.
-/// Every section is laid out by this one view, so the divider, the list
-/// width, and the empty right side are the same everywhere.
+/// Which column of the window a section is drawing. The window shows each
+/// section twice, once per column, and the section's own views pick the half
+/// that belongs there.
+enum SplitPane {
+    /// Not in the window's columns: rows and detail side by side.
+    case whole
+    case list
+    case detail
+}
+
+extension EnvironmentValues {
+    @Entry var splitPane: SplitPane = .whole
+}
+
+/// A section's rows and the selected row in full. Every section is laid out
+/// by this one view. In the window the rows go in the middle column and the
+/// detail in the last, so the system draws the bars and the dividers the way
+/// it does in Mail.
 struct ListDetail<Rows: View, Detail: View>: View {
     @ViewBuilder var rows: Rows
     @ViewBuilder var detail: Detail
+    @Environment(\.splitPane) private var pane
 
     var body: some View {
-        HStack(spacing: 0) {
+        switch pane {
+        case .list:
             rows
-                .listStyle(.inset)
-                .frame(width: Metric.listWidth)
-            Divider()
+        case .detail:
             detail
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
+        case .whole:
+            HStack(spacing: 0) {
+                rows
+                    .listStyle(.inset)
+                    .frame(width: Metric.listWidth)
+                Divider()
+                detail
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        }
+    }
+}
+
+/// The name of a group of rows in a section's list. It is a row of its own
+/// and scrolls with the rest: a pinned header draws a line across the column
+/// under the bar, and the bar should read as one piece.
+struct ListGroupHeader: View {
+    let title: String
+
+    init(_ title: String) { self.title = title }
+
+    var body: some View {
+        Text(title)
+            .font(.subheadline.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.top, Metric.snug)
+            .selectionDisabled()
+            .listRowSeparator(.hidden)
+            .accessibilityAddTraits(.isHeader)
+    }
+}
+
+/// Something that fills a section instead of its rows: a wait, an empty
+/// state, a failure. It belongs to the detail column, and the list column
+/// stays empty beside it.
+struct PagePane<Content: View>: View {
+    @ViewBuilder var content: Content
+    @Environment(\.splitPane) private var pane
+
+    var body: some View {
+        if pane == .list {
+            Color.clear
+        } else {
+            content
+        }
+    }
+}
+
+/// A search that matched nothing. It is the list that came up empty, so the
+/// list column says so.
+struct NoSearchResults: View {
+    let text: String
+    @Environment(\.splitPane) private var pane
+
+    var body: some View {
+        if pane == .detail {
+            Color.clear
+        } else {
+            ContentUnavailableView.search(text: text)
         }
     }
 }
@@ -168,10 +241,12 @@ struct LoadingPage: View {
     let message: String
 
     var body: some View {
-        ProgressView()
-            .controlSize(.small)
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
-            .accessibilityLabel(message)
+        PagePane {
+            ProgressView()
+                .controlSize(.small)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityLabel(message)
+        }
     }
 }
 
@@ -195,19 +270,21 @@ struct UnavailablePage: View {
     let run: (PlugIntent) -> Void
 
     var body: some View {
-        ContentUnavailableView {
-            Label(verdict.title, systemImage: verdict.symbol)
-        } description: {
-            if let detail = verdict.detail {
-                Text(detail)
-            }
-        } actions: {
-            if let primary = verdict.primary {
-                Button(primary.title) { run(primary.intent) }
-                    .buttonStyle(.borderedProminent)
-            }
-            if let secondary = verdict.secondary {
-                Button(secondary.title) { run(secondary.intent) }
+        PagePane {
+            ContentUnavailableView {
+                Label(verdict.title, systemImage: verdict.symbol)
+            } description: {
+                if let detail = verdict.detail {
+                    Text(detail)
+                }
+            } actions: {
+                if let primary = verdict.primary {
+                    Button(primary.title) { run(primary.intent) }
+                        .buttonStyle(.borderedProminent)
+                }
+                if let secondary = verdict.secondary {
+                    Button(secondary.title) { run(secondary.intent) }
+                }
             }
         }
     }
@@ -226,17 +303,19 @@ struct EmptyPage: View {
     var run: (PlugIntent) -> Void = { _ in }
 
     var body: some View {
-        ContentUnavailableView {
-            Label(title, systemImage: symbol)
-        } description: {
-            Text(message)
-        } actions: {
-            if let actionTitle, let actionIntent {
-                Button(actionTitle) { run(actionIntent) }
-                    .buttonStyle(.borderedProminent)
-            }
-            if let secondaryTitle, let secondaryIntent {
-                Button(secondaryTitle) { run(secondaryIntent) }
+        PagePane {
+            ContentUnavailableView {
+                Label(title, systemImage: symbol)
+            } description: {
+                Text(message)
+            } actions: {
+                if let actionTitle, let actionIntent {
+                    Button(actionTitle) { run(actionIntent) }
+                        .buttonStyle(.borderedProminent)
+                }
+                if let secondaryTitle, let secondaryIntent {
+                    Button(secondaryTitle) { run(secondaryIntent) }
+                }
             }
         }
     }

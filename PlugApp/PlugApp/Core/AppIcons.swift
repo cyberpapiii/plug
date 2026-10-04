@@ -42,6 +42,7 @@ enum AppIcons {
         // identifier is unchecked; a miss costs a symbol.
         "gemini": "com.google.GeminiMacOS",
         "perplexity": "ai.perplexity.mac",
+        "chatgpt": "com.openai.chat",
     ]
 
     /// Targets that are command line tools. They have no icon to show, and a
@@ -101,14 +102,68 @@ enum AppIcons {
         if let appPath, FileManager.default.fileExists(atPath: appPath) {
             return NSWorkspace.shared.icon(forFile: appPath)
         }
-        guard !name.isEmpty else { return nil }
-        for directory in ["/Applications", "\(NSHomeDirectory())/Applications"] {
-            let path = "\(directory)/\(name).app"
-            if FileManager.default.fileExists(atPath: path) {
-                return NSWorkspace.shared.icon(forFile: path)
+        return installedIcon(named: name)
+    }
+
+    /// The icon of the app a server stands for, when this Mac has that app:
+    /// a server named "slack" shows Slack's icon.
+    @MainActor
+    static func image(forServer name: String) -> NSImage? {
+        installedIcon(named: appName(forServer: name) { installedApps[$0] != nil })
+    }
+
+    /// Server names that are not their app's name.
+    private static let serverAliases: [String: String] = [
+        "imessage": "messages",
+        "github": "githubdesktop",
+        "applenotes": "notes",
+        "gdrive": "googledrive",
+        "workspace": "googledrive",
+        "googleworkspace": "googledrive",
+        "gmail": "googledrive",
+    ]
+
+    /// The lookup key of the app a server stands for. Google's servers go
+    /// by many names, one per product, and a Mac has an app for only a few
+    /// of them, so the rest share Google Drive's icon.
+    ///
+    /// Pure, so the matching is testable.
+    static func appName(forServer name: String, installed: (String) -> Bool = { _ in false }) -> String {
+        let key = lookupKey(name)
+        if let alias = serverAliases[key] { return alias }
+        if key.hasPrefix("google"), !installed(key) { return "googledrive" }
+        return key
+    }
+
+    /// A name with everything but its letters and digits removed, so
+    /// "agent-admin" finds AgentAdmin.app.
+    ///
+    /// Pure, so the matching is testable.
+    static func lookupKey(_ name: String) -> String {
+        String(name.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
+    }
+
+    /// Where each installed app is, by lookup key. Read once: an app
+    /// installed while Plug is open shows its icon after the next launch.
+    @MainActor
+    private static let installedApps: [String: String] = {
+        var found: [String: String] = [:]
+        let directories = ["/Applications", "\(NSHomeDirectory())/Applications", "/System/Applications"]
+        for directory in directories {
+            let names = (try? FileManager.default.contentsOfDirectory(atPath: directory)) ?? []
+            for file in names where file.hasSuffix(".app") {
+                let key = lookupKey(String(file.dropLast(4)))
+                if found[key] == nil { found[key] = "\(directory)/\(file)" }
             }
         }
-        return nil
+        return found
+    }()
+
+    @MainActor
+    private static func installedIcon(named name: String) -> NSImage? {
+        let key = lookupKey(name)
+        guard !key.isEmpty, let path = installedApps[key] else { return nil }
+        return NSWorkspace.shared.icon(forFile: path)
     }
 
     /// Match a live session's reported client type to a known target, so a
@@ -126,6 +181,7 @@ enum AppIcons {
         if compact.contains("codex") {
             return "codex-cli"
         }
+        if compact.contains("openai") || compact.contains("chatgpt") { return "chatgpt" }
         if compact.contains("devin") || compact.contains("cascade") ||
             compact.contains("windsurf") || compact.contains("codeium") {
             return "devin"
@@ -189,7 +245,9 @@ enum AppIcons {
     }
 }
 
-/// One app, shown as itself.
+/// One app, shown as itself. An app with no icon on this Mac gets a tile
+/// with its symbol or its first letter, so every row has a picture of the
+/// same size and weight.
 struct AppGlyph: View {
     let target: String
     let name: String
@@ -204,12 +262,95 @@ struct AppGlyph: View {
                     .resizable()
                     .interpolation(.high)
             } else {
-                Image(systemName: AppIcons.symbol(target: target, name: name))
-                    .font(size > 24 ? .title2 : .body)
-                    .foregroundStyle(.secondary)
+                let symbol = AppIcons.symbol(target: target, name: name)
+                MonogramTile(
+                    name: name.isEmpty ? target : name,
+                    symbol: symbol == "app" ? nil : symbol,
+                    size: size
+                )
             }
         }
         .frame(width: size, height: size)
         .accessibilityHidden(true)
+    }
+}
+
+/// One server, shown as the app it stands for when this Mac has that app,
+/// and as a tile with its first letter when it does not.
+struct ServerGlyph: View {
+    let name: String
+    var size: CGFloat = 18
+    /// The server's state as a dot on the corner of the icon, the way an
+    /// app shows a contact's presence. Nil draws no dot.
+    var status: Color?
+
+    var body: some View {
+        Group {
+            if let icon = AppIcons.image(forServer: name) {
+                Image(nsImage: icon)
+                    .resizable()
+                    .interpolation(.high)
+            } else {
+                MonogramTile(name: name, size: size)
+            }
+        }
+        .frame(width: size, height: size)
+        .overlay(alignment: .bottomTrailing) {
+            if let status {
+                let dot = max(7, size * 0.32)
+                Circle()
+                    .fill(status)
+                    .frame(width: dot, height: dot)
+                    .overlay(Circle().stroke(.background, lineWidth: dot * 0.2))
+                    .offset(x: dot * 0.15, y: dot * 0.15)
+            }
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// The stand-in for an icon: a rounded tile carrying a symbol or the first
+/// letter of a name. The color comes from the name, so it stays the same
+/// from one launch to the next.
+struct MonogramTile: View {
+    let name: String
+    /// A symbol that says what kind of thing this is, shown instead of the
+    /// letter on a neutral tile.
+    var symbol: String?
+    var size: CGFloat = 18
+
+    private nonisolated static let tints: [Color] = [.blue, .indigo, .purple, .pink, .orange, .teal, .green, .brown]
+
+    /// Which tint a name gets.
+    ///
+    /// Pure, so it can be tested: the same name always gets the same tint.
+    nonisolated static func tintIndex(for name: String) -> Int {
+        let sum = name.lowercased().unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) % 1_000_003 }
+        return sum % tints.count
+    }
+
+    nonisolated static func letter(for name: String) -> String {
+        name.first { $0.isLetter || $0.isNumber }.map { String($0).uppercased() } ?? "?"
+    }
+
+    var body: some View {
+        // App icons keep a margin inside their square; the tile keeps the
+        // same one so the two sit level in a list.
+        let side = size * 0.84
+        RoundedRectangle(cornerRadius: side * 0.24, style: .continuous)
+            .fill(symbol == nil ? AnyShapeStyle(Self.tints[Self.tintIndex(for: name)].gradient) : AnyShapeStyle(Color.gray.gradient))
+            .frame(width: side, height: side)
+            .overlay {
+                if let symbol {
+                    Image(systemName: symbol)
+                        .font(.system(size: side * 0.5, weight: .semibold))
+                        .foregroundStyle(.white)
+                } else {
+                    Text(Self.letter(for: name))
+                        .font(.system(size: side * 0.58, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white)
+                }
+            }
+            .frame(width: size, height: size)
     }
 }

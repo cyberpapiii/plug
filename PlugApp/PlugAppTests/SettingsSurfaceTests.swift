@@ -117,6 +117,33 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(AppIcons.symbol(target: "brand-new-thing", name: "Brand New Thing"), "app")
     }
 
+    func testAServerFindsItsAppWhateverThePunctuation() {
+        XCTAssertEqual(AppIcons.lookupKey("agent-admin"), AppIcons.lookupKey("AgentAdmin"))
+        XCTAssertEqual(AppIcons.lookupKey("Google Drive"), "googledrive")
+        XCTAssertEqual(AppIcons.lookupKey("1password"), "1password")
+    }
+
+    func testAnOpenAIConnectorIsChatGPT() {
+        XCTAssertEqual(AppIcons.target(forClientType: "openai-mcp 1.0.0"), "chatgpt")
+        XCTAssertEqual(AppIcons.target(forClientType: "codex-mcp-client"), "codex-cli")
+    }
+
+    func testGoogleServersShareOneIconUnlessTheirAppIsHere() {
+        XCTAssertEqual(AppIcons.appName(forServer: "workspace"), "googledrive")
+        XCTAssertEqual(AppIcons.appName(forServer: "Gmail"), "googledrive")
+        XCTAssertEqual(AppIcons.appName(forServer: "GoogleCalendar"), "googledrive")
+        XCTAssertEqual(AppIcons.appName(forServer: "GoogleDocs") { $0 == "googledocs" }, "googledocs")
+        XCTAssertEqual(AppIcons.appName(forServer: "imessage"), "messages")
+        XCTAssertEqual(AppIcons.appName(forServer: "slack"), "slack")
+    }
+
+    func testATileKeepsItsLetterAndItsColor() {
+        XCTAssertEqual(MonogramTile.letter(for: "workspace"), "W")
+        XCTAssertEqual(MonogramTile.letter(for: "-exa"), "E")
+        XCTAssertEqual(MonogramTile.letter(for: ""), "?")
+        XCTAssertEqual(MonogramTile.tintIndex(for: "Workspace"), MonogramTile.tintIndex(for: "workspace"))
+    }
+
     func testLiveSessionsAreMatchedToTheAppTheyBelongTo() {
         XCTAssertEqual(AppIcons.target(forClientType: "claude_code"), "claude-code")
         XCTAssertEqual(AppIcons.target(forClientType: "Claude Desktop"), "claude-desktop")

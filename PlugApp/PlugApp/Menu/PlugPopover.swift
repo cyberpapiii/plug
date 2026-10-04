@@ -199,13 +199,22 @@ struct PlugPopover: View {
 
     private var footer: some View {
         HStack(spacing: Metric.tight) {
-            Button("Open Plug") { send(.openCurrentWindow) }
-            Button("Settings…") { send(.openSettings) }
-                .keyboardShortcut(",", modifiers: .command)
+            Button { send(.openCurrentWindow) } label: {
+                Label("Open Plug", systemImage: "macwindow")
+            }
             Spacer(minLength: 0)
-            Button("Quit Plug") { run(.quit) }
-                .keyboardShortcut("q", modifiers: .command)
-                .help("Quit the menu bar app. Plug keeps serving your clients until you turn it off.")
+            Button { send(.openSettings) } label: {
+                Label("Settings…", systemImage: "gearshape")
+            }
+            .labelStyle(.iconOnly)
+            .keyboardShortcut(",", modifiers: .command)
+            .help("Settings")
+            Button { run(.quit) } label: {
+                Label("Quit Plug", systemImage: "power")
+            }
+            .labelStyle(.iconOnly)
+            .keyboardShortcut("q", modifiers: .command)
+            .help("Quit the menu bar app. Plug keeps serving your clients until you turn it off.")
         }
         .buttonStyle(.accessoryBar)
         .padding(.horizontal, Metric.tight)
@@ -242,7 +251,8 @@ private struct PanelServerRow: View {
         HStack(spacing: Metric.tight) {
             Button { run(.reveal(server: server.name)) } label: {
                 HStack(spacing: Metric.snug) {
-                    StatusGlyph(health: server.health)
+                    ServerGlyph(name: server.name, status: server.enabled ? server.health.color : nil)
+                        .opacity(server.enabled ? 1 : 0.4)
                     Text(server.name)
                         .font(.callout)
                         .foregroundStyle(server.enabled ? .primary : .secondary)

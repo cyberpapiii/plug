@@ -8,6 +8,7 @@ struct EventsView: View {
     @Bindable var router: Router
     @Binding var search: String
     let run: (PlugIntent) -> Void
+    @Environment(\.splitPane) private var pane
     @State private var stopping: EventFacts?
     /// Kept apart from `stopping` so the title still names the event while
     /// the dialog closes.
@@ -48,7 +49,7 @@ struct EventsView: View {
                     run: run
                 )
             } else if events.isEmpty {
-                ContentUnavailableView.search(text: search)
+                NoSearchResults(text: search)
             } else {
                 // The detail says "5 min ago", so a tick a minute keeps it
                 // true between two changes of the snapshot.
@@ -59,6 +60,7 @@ struct EventsView: View {
                             ForEach(events) { event in
                                 EventRow(event: event)
                                     .tag(event.name)
+                                    .listRowSeparator(.hidden)
                                     .contextMenu {
                                         Button("Copy Event Name") { copy(event.name) }
                                         if event.canRemove, model.canMutate {
@@ -92,12 +94,16 @@ struct EventsView: View {
         }
         .navigationSubtitle(summary ?? "")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { run(.addWatch) } label: {
-                    Label("Watch a Tool", systemImage: "plus")
+            // The window draws a section once per column; the button goes
+            // above the list.
+            if pane != .detail {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { run(.addWatch) } label: {
+                        Label("Watch a Tool", systemImage: "plus")
+                    }
+                    .help("Watch a tool and send an event when its result changes")
+                    .disabled(!model.canMutate)
                 }
-                .help("Watch a tool and send an event when its result changes")
-                .disabled(!model.canMutate)
             }
         }
         .onChange(of: events.map(\.name), initial: true) { keepSelectionVisible() }

@@ -306,13 +306,15 @@ struct ClientsView: View {
                 LoadingPage(message: "Loading clients")
             } else if entries.isEmpty {
                 if let error = model.connectableAppsError {
-                    ContentUnavailableView {
-                        Label("Clients Unavailable", systemImage: "bolt.slash")
-                    } description: {
-                        Text(error)
-                    } actions: {
-                        Button("Try Again") { Task { await model.loadConnectableApps() } }
-                            .buttonStyle(.borderedProminent)
+                    PagePane {
+                        ContentUnavailableView {
+                            Label("Clients Unavailable", systemImage: "bolt.slash")
+                        } description: {
+                            Text(error)
+                        } actions: {
+                            Button("Try Again") { Task { await model.loadConnectableApps() } }
+                                .buttonStyle(.borderedProminent)
+                        }
                     }
                 } else if search.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyPage(
@@ -324,7 +326,7 @@ struct ClientsView: View {
                         run: run
                     )
                 } else {
-                    ContentUnavailableView.search(text: search)
+                    NoSearchResults(text: search)
                 }
             } else {
                 ListDetail {
@@ -377,11 +379,11 @@ struct ClientsView: View {
     private func group(_ group: Entry.Group, in entries: [Entry]) -> some View {
         let rows = entries.filter { $0.group == group }
         if !rows.isEmpty {
-            Section(group.rawValue) {
-                ForEach(rows) { entry in
-                    ClientRow(entry: entry, canMutate: model.canMutate).tag(entry.id)
-                }
+            ListGroupHeader(group.rawValue)
+            ForEach(rows) { entry in
+                ClientRow(entry: entry, canMutate: model.canMutate).tag(entry.id)
             }
+            .listRowSeparator(.hidden)
         }
     }
 
@@ -501,7 +503,7 @@ struct ClientsView: View {
             ),
             isLive: !sessions.isEmpty,
             dimmed: false,
-            glyph: .grant,
+            glyph: .grant(name: grant.clientName),
             isBusy: false,
             switchLabel: "Access",
             isOn: true,
@@ -623,7 +625,8 @@ struct ClientEntry: Identifiable {
 
     enum Glyph {
         case app(target: String, name: String, appPath: String?)
-        case grant
+        /// A client allowed in over the network, by the name it gave.
+        case grant(name: String)
     }
 
     /// One open connection of a client.
@@ -674,19 +677,12 @@ private struct ClientGlyph: View {
     var large = false
 
     var body: some View {
+        let size = large ? Metric.glyphSlot : 18
         switch glyph {
         case let .app(target, name, appPath):
-            if large {
-                AppGlyph(target: target, name: name, appPath: appPath, size: Metric.glyphSlot)
-            } else {
-                AppGlyph(target: target, name: name, appPath: appPath)
-            }
-        case .grant:
-            Image(systemName: "globe")
-                .font(large ? .title2 : .body)
-                .foregroundStyle(.secondary)
-                .frame(width: large ? Metric.glyphSlot : 18, height: large ? Metric.glyphSlot : 18)
-                .accessibilityHidden(true)
+            AppGlyph(target: target, name: name, appPath: appPath, size: size)
+        case let .grant(name):
+            AppGlyph(target: AppIcons.target(forClientType: name), name: name, size: size)
         }
     }
 }
@@ -803,10 +799,14 @@ private struct ClientDetail: View {
                                 )
                             ) {
                                 if server.enabled {
-                                    Text(server.name)
+                                    HStack(spacing: Metric.tight) {
+                                        ServerGlyph(name: server.name)
+                                        Text(server.name)
+                                    }
                                 } else {
                                     // Off in Plug, so no client can use it.
                                     HStack(spacing: Metric.tight) {
+                                        ServerGlyph(name: server.name).opacity(0.4)
                                         Text(server.name)
                                         Spacer(minLength: Metric.tight)
                                         Text("Off")

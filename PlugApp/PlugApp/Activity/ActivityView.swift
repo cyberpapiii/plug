@@ -10,13 +10,17 @@ struct ActivityView: View {
     @Bindable var router: Router
     @Binding var search: String
     let run: (PlugIntent) -> Void
-    @State private var scope: Scope = .everything
+    @Environment(\.splitPane) private var pane
 
     enum Scope: String, CaseIterable, Identifiable {
         case everything = "All"
         case problems = "Problems"
         var id: Self { self }
     }
+
+    /// Kept on the router, because the list column filters by it and the
+    /// detail column holds its control.
+    private var scope: Scope { router.activityScope }
 
     var body: some View {
         Group {
@@ -38,17 +42,17 @@ struct ActivityView: View {
                         symbol: "checkmark.circle"
                     )
                 } else {
-                    ContentUnavailableView.search(text: search)
+                    NoSearchResults(text: search)
                 }
             } else {
                 ListDetail {
                     List(selection: $router.selectedCall) {
                         ForEach(groups, id: \.title) { group in
-                            Section(group.title) {
-                                ForEach(group.events) { event in
-                                    ActivityRow(call: CallFacts(event)).tag(event.sequence)
-                                }
+                            ListGroupHeader(group.title)
+                            ForEach(group.events) { event in
+                                ActivityRow(call: CallFacts(event)).tag(event.sequence)
                             }
+                            .listRowSeparator(.hidden)
                         }
                     }
                 } detail: {
@@ -67,15 +71,19 @@ struct ActivityView: View {
         }
         .navigationSubtitle(model.activitySummary ?? "")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Picker("Show", selection: $scope) {
-                    ForEach(Scope.allCases) { scope in
-                        Text(scope.rawValue).tag(scope)
+            // The window draws a section once per column; the filter sits
+            // beside the search field.
+            if pane != .list {
+                ToolbarItem(placement: .primaryAction) {
+                    Picker("Show", selection: $router.activityScope) {
+                        ForEach(Scope.allCases) { scope in
+                            Text(scope.rawValue).tag(scope)
+                        }
                     }
+                    .pickerStyle(.segmented)
+                    .disabled(model.activities.isEmpty)
+                    .help("Show every call, or only the ones that failed")
                 }
-                .pickerStyle(.segmented)
-                .disabled(model.activities.isEmpty)
-                .help("Show every call, or only the ones that failed")
             }
         }
         .onChange(of: visible.first?.sequence, initial: true) { keepSelectionVisible() }

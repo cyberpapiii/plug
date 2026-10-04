@@ -47,19 +47,14 @@ struct RootView: View {
                 }
             }
             .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
+        } content: {
+            section
+                .environment(\.splitPane, .list)
+                .navigationSplitViewColumnWidth(min: 240, ideal: Metric.listWidth, max: 420)
+                .navigationTitle(router.section.rawValue)
         } detail: {
-            Group {
-                switch router.section {
-                case .servers:
-                    ServersView(model: model, router: router, search: $search, run: run)
-                case .clients:
-                    ClientsView(model: model, router: router, search: $search, run: run)
-                case .events:
-                    EventsView(model: model, router: router, search: $search, run: run)
-                case .activity:
-                    ActivityView(model: model, router: router, search: $search, run: run)
-                }
-            }
+            section
+                .environment(\.splitPane, .detail)
             .topBanner(
                 isShown: showsBanner,
                 transition: reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity)
@@ -79,9 +74,8 @@ struct RootView: View {
             }
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: showsBanner)
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actionError?.id)
-            .navigationTitle(router.section.rawValue)
-            .searchable(text: $search, placement: .toolbar, prompt: searchPrompt)
         }
+        .searchable(text: $search, placement: .toolbar, prompt: searchPrompt)
         .onChange(of: router.section) {
             search = ""
         }
@@ -116,6 +110,22 @@ struct RootView: View {
         }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    /// The section in view. The window draws it in two columns, the rows in
+    /// the middle one and the selected row in the last, and the section's
+    /// views pick their half from the environment.
+    @ViewBuilder private var section: some View {
+        switch router.section {
+        case .servers:
+            ServersView(model: model, router: router, search: $search, run: run)
+        case .clients:
+            ClientsView(model: model, router: router, search: $search, run: run)
+        case .events:
+            EventsView(model: model, router: router, search: $search, run: run)
+        case .activity:
+            ActivityView(model: model, router: router, search: $search, run: run)
+        }
     }
 
     /// The banner keeps quiet while the page itself is saying the same thing:
