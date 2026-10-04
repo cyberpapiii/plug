@@ -15,12 +15,57 @@ pub enum CheckStatus {
 }
 
 /// Result of a single diagnostic check.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct CheckResult {
     pub name: String,
     pub status: CheckStatus,
     pub message: String,
     pub fix_suggestion: Option<String>,
+}
+
+impl CheckResult {
+    /// What the check is called where a person reads it. `name` is an
+    /// identifier (`config_permissions`); the CLI and the app both show this.
+    pub fn title(&self) -> String {
+        let title = match self.name.as_str() {
+            "config_exists" => "Settings file",
+            "config_permissions" => "Settings file is private",
+            "keys_in_config" => "Keys kept in the Keychain",
+            "port_available" => "Network port",
+            "env_vars" => "Server keys",
+            "server_binaries" => "Server programs",
+            "tool_collisions" => "Tool names",
+            "client_limits" => "Tools a client can take",
+            "pid_staleness" | "runtime_health" => "Background service",
+            "client_configs" => "Client setup",
+            "server_connectivity" => "Servers responding",
+            "http_auth" | "downstream_oauth_owner" => "Remote access",
+            "downstream_oauth_clients" => "Remote clients",
+            "oauth_config" | "oauth_tokens" | "auth_availability" => "Stored sign-ins",
+            "runtime_auth_missing" | "runtime_auth_reauth" | "runtime_auth_degraded" => {
+                "Server sign-ins"
+            }
+            "runtime_degraded" | "runtime_failures" | "runtime_availability" => "Servers",
+            "codesign_identity" => "App signature",
+            "unified_install" => "Installation",
+            "doctor_interpretation" => "Summary",
+            other => return other.replace('_', " "),
+        };
+        title.to_string()
+    }
+}
+
+impl Serialize for CheckResult {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut check = serializer.serialize_struct("CheckResult", 5)?;
+        check.serialize_field("name", &self.name)?;
+        check.serialize_field("title", &self.title())?;
+        check.serialize_field("status", &self.status)?;
+        check.serialize_field("message", &self.message)?;
+        check.serialize_field("fix_suggestion", &self.fix_suggestion)?;
+        check.end()
+    }
 }
 
 /// Aggregated report from all diagnostic checks.
@@ -1411,6 +1456,25 @@ mod tests {
 
     fn test_config() -> Config {
         Config::default()
+    }
+
+    #[test]
+    fn a_check_carries_the_title_a_person_reads() {
+        let check = |name: &str| CheckResult {
+            name: name.to_string(),
+            status: CheckStatus::Pass,
+            message: String::new(),
+            fix_suggestion: None,
+        };
+        assert_eq!(
+            check("config_permissions").title(),
+            "Settings file is private"
+        );
+        assert_eq!(check("brand_new_check").title(), "brand new check");
+
+        let json = serde_json::to_value(check("client_configs")).unwrap();
+        assert_eq!(json["name"], "client_configs");
+        assert_eq!(json["title"], "Client setup");
     }
 
     fn stdio_server(cmd: &str) -> ServerConfig {

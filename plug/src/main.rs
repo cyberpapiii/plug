@@ -55,38 +55,29 @@ mod views;
 use clap::{Parser, Subcommand};
 
 const HELP_OVERVIEW: &str = "\
-Workflow:
-  Get started
-    plug start              Start the shared background service
-    plug setup              Discover servers and link clients
-    plug clients            View and manage AI clients
+Everyday:
+  plug status             Is Plug running, and does anything need you
+  plug servers            The servers Plug holds
+  plug tools              The tools those servers provide
+  plug clients            The clients that use them
+  plug events             Tell a client when a tool's result changes
+  plug doctor             Check the whole setup and say what to fix
 
-  Inspect
-    plug status             Show runtime health and next actions
-    plug clients            Show linked, detected, and live clients
-    plug servers            View and manage configured servers
-    plug tools              View and manage available tools
-    plug events             Watch a tool and tell clients when it changes
-    plug doctor             Diagnose setup problems
+Set up:
+  plug setup              Bring servers over and connect your clients
+  plug server add         Add one server
+  plug link               Connect a client to Plug
+  plug secret move        Move keys out of the settings file into the Keychain
 
-  Maintain
-    plug repair             Refresh linked client configs
-    plug config check       Validate config syntax and rules
-    plug config path        Print config file path
-    plug link               Link plug to your AI clients
-    plug unlink             Remove plug from your AI client configs
-
-  Internal
-    plug connect            stdio adapter invoked by AI clients
-    plug serve              Run the shared service in the foreground
-    plug serve --daemon     Run the shared background service (IPC + HTTP)
+Plug.app starts and stops the background service. `plug start` does the same
+from a terminal.
 ";
 
 #[derive(Parser)]
 #[command(
     name = "plug",
     version,
-    about = "MCP gateway — one config, every client connected",
+    about = "One place on your Mac that holds every tool and gives it to every client",
     after_help = HELP_OVERVIEW,
     styles = ui::cli_styles()
 )]
@@ -95,7 +86,7 @@ struct Cli {
     #[arg(long, global = true)]
     config: Option<std::path::PathBuf>,
 
-    /// Increase verbosity (-v for debug, -vv for trace; `clients` and `tools` spend the first -v on listing every row)
+    /// Increase verbosity (-v for debug, -vv for trace; `status`, `clients`, and `tools` spend the first -v on showing more)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
     verbose: u8,
 
@@ -122,10 +113,10 @@ pub(crate) enum ClientLinkTransport {
 #[derive(Subcommand)]
 enum Commands {
     #[command(display_order = 1)]
-    /// Start the shared background plug service (IPC + HTTP)
+    /// Start Plug in the background
     Start,
     #[command(display_order = 2)]
-    /// Discover servers, import config, and link your AI clients
+    /// Bring servers over from your other clients and connect those clients
     Setup {
         /// Import every server found and accept the defaults without asking
         #[arg(long)]
@@ -135,17 +126,17 @@ enum Commands {
         transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 3)]
-    /// Show runtime health and the next useful action
+    /// Is Plug running, and does anything need you (-v for detail)
     Status {
         /// Reveal the HTTP auth token (hidden by default)
         #[arg(long)]
         show_token: bool,
     },
     #[command(display_order = 4)]
-    /// Diagnose problems with your plug setup
+    /// Check the whole setup and say what to fix
     Doctor,
     #[command(display_order = 5)]
-    /// Refresh linked AI client configuration files
+    /// Write Plug into your connected clients again
     Repair {
         /// Client targets to repair, such as `cursor` or `codex-cli` (default: all)
         targets: Vec<String>,
@@ -156,20 +147,20 @@ enum Commands {
         #[arg(long)]
         dry_run: bool,
     },
-    #[command(display_order = 6)]
+    #[command(display_order = 6, hide = true)]
     /// Internal: reload service config from disk
     Reload,
     #[command(display_order = 7)]
-    /// View and manage linked, detected, and live AI clients (-v lists each session)
+    /// The clients that use Plug (-v lists each connection)
     Clients {
         #[command(subcommand)]
         command: Option<commands::clients::ClientCommands>,
     },
     #[command(display_order = 8)]
-    /// View and manage configured servers
+    /// The servers Plug holds
     Servers,
     #[command(display_order = 9)]
-    /// Tool counts per server; `plug tools <server>` lists that server's tools, -v lists all
+    /// Tools per server; `plug tools <server>` lists that server's tools, -v lists all
     Tools {
         #[command(subcommand)]
         command: Option<ToolCommands>,
@@ -177,13 +168,13 @@ enum Commands {
         server: Option<String>,
     },
     #[command(display_order = 9)]
-    /// Watch a tool and tell clients when its result changes
+    /// Tell a client when a tool's result changes
     Events {
         #[command(subcommand)]
         command: Option<commands::events::EventCommands>,
     },
     #[command(display_order = 10)]
-    /// Link plug to your AI clients
+    /// Connect a client to Plug
     Link {
         /// Client targets to link, such as `cursor` or `claude-code`
         targets: Vec<String>,
@@ -198,7 +189,7 @@ enum Commands {
         transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 11)]
-    /// Remove plug from your AI client configs
+    /// Disconnect a client from Plug
     Unlink {
         /// Client targets to unlink, such as `cursor` or `claude-code`
         targets: Vec<String>,
@@ -210,30 +201,30 @@ enum Commands {
         yes: bool,
     },
     #[command(display_order = 12)]
-    /// Manage configured servers
+    /// Add, change, remove, or switch a server on and off
     Server {
         #[command(subcommand)]
         command: ServerCommands,
     },
-    #[command(display_order = 13)]
+    #[command(display_order = 13, hide = true)]
     /// Internal: start the stdio adapter AI clients invoke
     Connect {
         /// The target `plug link` installed this command for
         #[arg(long, value_name = "TARGET")]
         client: Option<String>,
     },
-    #[command(display_order = 14)]
+    #[command(display_order = 14, hide = true)]
     /// Internal: run plug as the shared foreground or background service
     Serve {
         /// Run as the shared background service (IPC + HTTP) that launchd manages
         #[arg(long)]
         daemon: bool,
     },
-    #[command(display_order = 15)]
+    #[command(display_order = 15, hide = true)]
     /// Internal: stop the background plug service
     Stop,
     #[command(display_order = 16)]
-    /// Open the plug config file in your default editor
+    /// Open the settings file in your editor
     Config {
         /// Same as `plug config path`
         #[arg(long, hide = true)]
@@ -242,7 +233,7 @@ enum Commands {
         command: Option<ConfigCommands>,
     },
     #[command(display_order = 17)]
-    /// Advanced: import MCP servers from existing AI client configs
+    /// Bring servers over from your other clients
     Import {
         /// Comma-separated clients to scan, such as `cursor,claude-code` (default: all)
         #[arg(long, value_delimiter = ',')]
@@ -269,13 +260,13 @@ enum Commands {
         transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 19)]
-    /// Manage OAuth authentication for upstream servers
+    /// Sign in to a server, and see who is signed in
     Auth {
         #[command(subcommand)]
         command: AuthCommands,
     },
     #[command(display_order = 20)]
-    /// Keep a server's key in the Keychain instead of in the config file
+    /// Keep a server's key in the Keychain instead of in the settings file
     Secret {
         #[command(subcommand)]
         command: SecretCommands,
@@ -417,31 +408,36 @@ pub(crate) enum ServerCommands {
         #[arg(long, value_delimiter = ',')]
         oauth_scopes: Option<Vec<String>>,
     },
-    /// Turn a disabled server back on
+    /// Switch a server on
+    #[command(name = "on", alias = "enable")]
     Enable { name: Option<String> },
-    /// Keep a server in the config but stop starting it
+    /// Switch a server off; it stays in the settings file
+    #[command(name = "off", alias = "disable")]
     Disable { name: Option<String> },
 }
 
 #[derive(Subcommand)]
 pub(crate) enum ToolCommands {
-    /// Hide tools from every client
+    /// Switch tools off for every client
+    #[command(name = "off", alias = "disable")]
     Disable {
-        /// Hide every tool from this server
+        /// Switch off every tool from this server
         #[arg(long)]
         server: Option<String>,
         /// Tool names or glob patterns, such as `github__delete_*`
         patterns: Vec<String>,
     },
-    /// Re-enable tools you disabled
+    /// Switch tools back on
+    #[command(name = "on", alias = "enable")]
     Enable {
-        /// Show every tool from this server again
+        /// Switch on every tool from this server
         #[arg(long)]
         server: Option<String>,
         /// Tool names or glob patterns, such as `github__delete_*`
         patterns: Vec<String>,
     },
-    /// List disabled tool patterns
+    /// List the tools that are off
+    #[command(name = "off-list", alias = "disabled")]
     Disabled,
 }
 
@@ -571,12 +567,12 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // `plug clients -v` and `plug tools -v` spend the first -v on listing
-    // more rows, so their debug logs start at -vv.
+    // `plug status -v`, `plug clients -v`, and `plug tools -v` spend the
+    // first -v on showing more, so their debug logs start at -vv.
     let log_verbosity = match &cli.command {
-        Some(Commands::Clients { .. }) | Some(Commands::Tools { .. }) => {
-            cli.verbose.saturating_sub(1)
-        }
+        Some(Commands::Status { .. })
+        | Some(Commands::Clients { .. })
+        | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
         _ => cli.verbose,
     };
     let log_level = match log_verbosity {
@@ -615,7 +611,13 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Status { show_token }) => {
-            views::overview::cmd_status(cli.config.as_ref(), &cli.output, show_token).await?
+            views::overview::cmd_status(
+                cli.config.as_ref(),
+                &cli.output,
+                show_token,
+                cli.verbose > 0,
+            )
+            .await?
         }
         Some(Commands::Stop) => runtime::cmd_daemon_stop().await?,
         Some(Commands::Servers) => {

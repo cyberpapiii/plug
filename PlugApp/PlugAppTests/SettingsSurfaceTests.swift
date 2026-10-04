@@ -30,10 +30,15 @@ final class CheckupTests: XCTestCase {
         XCTAssertNil(result.checks[0].fix)
     }
 
-    func testIdentifiersBecomeTitlesAPersonCanRead() {
-        XCTAssertEqual(Check(name: "config_permissions", result: .pass, message: "").title, "Settings file is private")
-        XCTAssertEqual(Check(name: "server_binaries", result: .pass, message: "").title, "Server programs")
-        XCTAssertEqual(Check(name: "brand_new_check", result: .pass, message: "").title, "Brand New Check")
+    func testARowShowsTheTitleTheRuntimeSends() throws {
+        let result = try checkup(#"""
+        {"checks":[
+          {"name":"config_permissions","title":"Settings file is private","status":"pass","message":""},
+          {"name":"brand_new_check","status":"pass","message":""}
+        ]}
+        """#)
+        XCTAssertEqual(result.checks[0].title, "Settings file is private")
+        XCTAssertEqual(result.checks[1].title, "brand new check")
     }
 
     func testACleanCheckupSaysHowMuchWasChecked() {
