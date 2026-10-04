@@ -185,6 +185,17 @@ fn router_with_git_commit_tool() -> ToolRouter {
 }
 
 #[test]
+fn a_listed_tool_gives_its_own_name_and_says_when_it_is_not_read_only() {
+    let router = router_with_git_commit_tool();
+    // The merged name carries Plug's prefix; a watch is written without it.
+    assert_eq!(
+        router.own_tool("git__commit"),
+        Some(("commit".to_string(), false))
+    );
+    assert_eq!(router.own_tool("git__missing"), None);
+}
+
+#[test]
 fn get_info_returns_correct_server_info() {
     let sm = Arc::new(ServerManager::new());
     let handler = ProxyHandler::new(sm, test_router_config());

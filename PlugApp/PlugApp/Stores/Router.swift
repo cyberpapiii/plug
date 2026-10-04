@@ -13,6 +13,7 @@ final class Router {
     var selectedTool: String?
     var isAddingServer = false
     var isImportingServers = false
+    var isAddingWatch = false
     /// The server whose settings are open for editing, if any.
     var editingServer: ServerName?
 
@@ -76,6 +77,12 @@ struct PlugIntentRunner {
             router.section = .servers
             router.isAddingServer = true
             showWindow()
+        case .addWatch:
+            router.section = .events
+            router.isAddingWatch = true
+            showWindow()
+        case let .removeWatch(event):
+            perform { .removeWatch(authToken: $0, event: event) }
         case .importServers:
             router.section = .servers
             router.isImportingServers = true

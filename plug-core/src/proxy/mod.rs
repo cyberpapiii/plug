@@ -2836,6 +2836,19 @@ impl ToolRouter {
             .map(|(name, _)| name.clone())
     }
 
+    /// A listed tool's name on its own server, and whether that server marks
+    /// it read-only.
+    pub fn own_tool(&self, merged_name: &str) -> Option<(String, bool)> {
+        let snapshot = self.cache.load();
+        let (_, own) = snapshot.resolve_route(merged_name)?.clone();
+        let read_only = snapshot
+            .tool_by_name(merged_name)
+            .and_then(|tool| tool.annotations.as_ref())
+            .and_then(|annotations| annotations.read_only_hint)
+            .unwrap_or(false);
+        Some((own, read_only))
+    }
+
     /// The name clients call `tool` on `server` by, and whether the server
     /// marks it read-only. Used to watch a tool for change.
     pub(crate) fn watched_tool(&self, server: &str, tool: &str) -> Option<(String, bool)> {

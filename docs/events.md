@@ -33,6 +33,11 @@ plug events                      # every watch and how it is doing
 plug events unwatch gmail.inbox
 ```
 
+In the app, the Events tab lists the same watches. Watch a Tool asks for a
+server, a tool, and how often to check. It offers only tools the server marks
+read-only; More options has the event name, the arguments as JSON, and a
+switch that shows the other tools.
+
 What Plug does:
 
 - Calls the tool every `every_secs` seconds.

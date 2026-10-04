@@ -621,6 +621,12 @@ pub struct IpcToolInfo {
     pub disabled_by_pattern: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icons: Option<Vec<Icon>>,
+    /// The tool's name on its own server, which a watch is written with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub own_name: Option<String>,
+    /// Whether Plug will watch this tool without being told to allow writes.
+    #[serde(default)]
+    pub read_only: bool,
     #[serde(default)]
     pub risk: IpcToolRiskInfo,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1693,6 +1699,8 @@ mod tests {
             },
             IpcResponse::Tools {
                 tools: vec![IpcToolInfo {
+                    own_name: None,
+                    read_only: false,
                     name: "Imessage__send".to_string(),
                     server_id: "imessage".to_string(),
                     disabled: false,
@@ -1788,6 +1796,8 @@ mod tests {
     fn tools_response_json_includes_icons_and_upstream_metadata() {
         let response = IpcResponse::Tools {
             tools: vec![IpcToolInfo {
+                own_name: None,
+                read_only: false,
                 name: "Imessage__send".to_string(),
                 server_id: "imessage".to_string(),
                 disabled: false,

@@ -237,6 +237,10 @@ enum PlugIntent: Equatable, Sendable {
     case renameClient(key: String, name: String)
     case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case addServer
+    /// Open the sheet that picks a tool to watch.
+    case addWatch
+    /// Stop watching, by event name.
+    case removeWatch(event: String)
     case openWindow(AppSection)
     case openCurrentWindow
     case reveal(server: String)

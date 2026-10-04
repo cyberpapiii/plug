@@ -124,6 +124,146 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public var clientKey: String { "oauth:\(clientId)" }
 }
 
+/// One event a client can subscribe to, and how it is doing.
+public struct EventStatus: Codable, Identifiable, Equatable, Sendable {
+    public var id: String { name }
+    /// `<server>.<name>`.
+    public let name: String
+    public let server: String
+    /// The watched tool. Nil for an event Plug does not make by watching.
+    public let tool: String?
+    public let everySecs: UInt64?
+    /// `waiting`, `watching`, `tool_missing`, `not_read_only`, `call_failed`,
+    /// or `too_large`.
+    public let state: String
+    /// Unix seconds of the last check that reached the tool.
+    public let lastChecked: UInt64?
+    /// Unix seconds of the last change that became an event.
+    public let lastChanged: UInt64?
+    public let subscribers: Int
+
+    public init(
+        name: String,
+        server: String,
+        tool: String? = nil,
+        everySecs: UInt64? = nil,
+        state: String = "waiting",
+        lastChecked: UInt64? = nil,
+        lastChanged: UInt64? = nil,
+        subscribers: Int = 0
+    ) {
+        self.name = name
+        self.server = server
+        self.tool = tool
+        self.everySecs = everySecs
+        self.state = state
+        self.lastChecked = lastChecked
+        self.lastChanged = lastChanged
+        self.subscribers = subscribers
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case name, server, tool, everySecs, state, lastChecked, lastChanged, subscribers
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = try container.decode(String.self, forKey: .name)
+        server = try container.decode(String.self, forKey: .server)
+        tool = try container.decodeIfPresent(String.self, forKey: .tool)
+        everySecs = try container.decodeIfPresent(UInt64.self, forKey: .everySecs)
+        state = try container.decodeIfPresent(String.self, forKey: .state) ?? "waiting"
+        lastChecked = try container.decodeIfPresent(UInt64.self, forKey: .lastChecked)
+        lastChanged = try container.decodeIfPresent(UInt64.self, forKey: .lastChanged)
+        subscribers = try container.decodeIfPresent(Int.self, forKey: .subscribers) ?? 0
+    }
+}
+
+/// Any JSON value, for the arguments a watched tool is called with.
+public enum JSONValue: Encodable, Equatable, Sendable {
+    case null
+    case bool(Bool)
+    case number(Double)
+    case string(String)
+    case array([JSONValue])
+    case object([String: JSONValue])
+
+    /// Nil for anything JSON cannot hold.
+    public init?(_ value: Any) {
+        switch value {
+        case is NSNull: self = .null
+        case let number as NSNumber:
+            // JSONSerialization hands back booleans as NSNumber too.
+            self = CFGetTypeID(number) == CFBooleanGetTypeID() ? .bool(number.boolValue) : .number(number.doubleValue)
+        case let string as String: self = .string(string)
+        case let array as [Any]:
+            var values: [JSONValue] = []
+            for item in array {
+                guard let value = JSONValue(item) else { return nil }
+                values.append(value)
+            }
+            self = .array(values)
+        case let object as [String: Any]:
+            var values: [String: JSONValue] = [:]
+            for (key, item) in object {
+                guard let value = JSONValue(item) else { return nil }
+                values[key] = value
+            }
+            self = .object(values)
+        default: return nil
+        }
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.singleValueContainer()
+        switch self {
+        case .null: try container.encodeNil()
+        case let .bool(value): try container.encode(value)
+        case let .number(value):
+            // A whole number goes out as one, so a tool that wants an
+            // integer is not handed `5.0`.
+            if let whole = Int64(exactly: value) {
+                try container.encode(whole)
+            } else {
+                try container.encode(value)
+            }
+        case let .string(value): try container.encode(value)
+        case let .array(values): try container.encode(values)
+        // A dictionary keeps its keys as written. A keyed container would
+        // have them rewritten to snake case on the way out.
+        case let .object(values): try container.encode(values)
+        }
+    }
+}
+
+/// A tool Plug calls on a timer, sending an event when the result changes.
+public struct WatchConfig: Encodable, Equatable, Sendable {
+    /// The event is named `<server>.<name>`.
+    public var name: String
+    public var server: String
+    /// The tool's own name on that server, without Plug's prefix.
+    public var tool: String
+    public var arguments: [String: JSONValue]
+    public var everySecs: UInt64
+    public var allowWrites: Bool
+
+    public init(
+        name: String,
+        server: String,
+        tool: String,
+        arguments: [String: JSONValue] = [:],
+        everySecs: UInt64 = 300,
+        allowWrites: Bool = false
+    ) {
+        self.name = name
+        self.server = server
+        self.tool = tool
+        self.arguments = arguments
+        self.everySecs = everySecs
+        self.allowWrites = allowWrites
+    }
+}
+
 public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let runtimeVersion: String
     public let uptimeSecs: UInt64
@@ -142,6 +282,8 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public var clientNames: [ClientName]?
     /// What each client is kept from. Absent when nobody is kept from anything.
     public var clientBlocks: [ClientBlocks]?
+    /// The events clients can subscribe to. Absent when there are none.
+    public var events: [EventStatus]?
 
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",
@@ -201,6 +343,10 @@ public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
     public let disabled: Bool
     /// Set when a wildcard, rather than this tool's own name, is what hides it.
     public let disabledByPattern: String?
+    /// The name the server itself gives the tool, before any prefix or rename.
+    public let ownName: String?
+    /// The server says calling this tool changes nothing.
+    public let readOnly: Bool
 
     public init(
         name: String,
@@ -208,7 +354,9 @@ public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
         description: String? = nil,
         title: String? = nil,
         disabled: Bool = false,
-        disabledByPattern: String? = nil
+        disabledByPattern: String? = nil,
+        ownName: String? = nil,
+        readOnly: Bool = false
     ) {
         self.name = name
         self.serverId = serverId
@@ -216,10 +364,12 @@ public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
         self.title = title
         self.disabled = disabled
         self.disabledByPattern = disabledByPattern
+        self.ownName = ownName
+        self.readOnly = readOnly
     }
 
     private enum CodingKeys: String, CodingKey {
-        case name, serverId, description, title, disabled, disabledByPattern
+        case name, serverId, description, title, disabled, disabledByPattern, ownName, readOnly
     }
 
     public init(from decoder: Decoder) throws {
@@ -230,6 +380,8 @@ public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
         title = try container.decodeIfPresent(String.self, forKey: .title)
         disabled = try container.decodeIfPresent(Bool.self, forKey: .disabled) ?? false
         disabledByPattern = try container.decodeIfPresent(String.self, forKey: .disabledByPattern)
+        ownName = try container.decodeIfPresent(String.self, forKey: .ownName)
+        readOnly = try container.decodeIfPresent(Bool.self, forKey: .readOnly) ?? false
     }
 }
 
@@ -330,11 +482,16 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case renameClient(authToken: String, key: String, name: String)
     /// Keep a client from a server, or let it back in.
     case setClientServerBlocked(authToken: String, key: String, server: String, blocked: Bool)
+    /// Start watching a tool. The daemon checks the tool before it saves.
+    case addWatch(authToken: String, watch: WatchConfig)
+    /// Stop watching, by event name.
+    case removeWatch(authToken: String, event: String)
     case shutdown(authToken: String)
 
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
         case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked
+        case watch, event
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -386,6 +543,12 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode("server", forKey: .kind)
             try c.encode(server, forKey: .target); try c.encode(blocked, forKey: .blocked)
+        case let .addWatch(token, watch):
+            try c.encode("AddWatch", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(watch, forKey: .watch)
+        case let .removeWatch(token, event):
+            try c.encode("RemoveWatch", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(event, forKey: .event)
         case let .shutdown(token):
             try c.encode("Shutdown", forKey: .type); try c.encode(token, forKey: .authToken)
         }

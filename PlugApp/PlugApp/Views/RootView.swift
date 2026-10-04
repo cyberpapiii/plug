@@ -6,12 +6,13 @@ import SwiftUI
 enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case servers = "Servers"
     case clients = "Clients"
+    case events = "Events"
     case activity = "Activity"
 
     var id: Self { self }
 }
 
-/// The window. No sidebar: three peers do not earn a permanent column, and the
+/// The window. No sidebar: four peers do not earn a permanent column, and the
 /// space is better spent on the content itself.
 struct RootView: View {
     let model: AppModel
@@ -35,6 +36,8 @@ struct RootView: View {
                 ServersView(model: model, router: router, search: $search, run: run)
             case .clients:
                 ClientsView(model: model, search: $search, run: run)
+            case .events:
+                EventsView(model: model, router: router, search: $search, run: run)
             case .activity:
                 ActivityView(model: model, search: $search, run: run)
             }
@@ -48,7 +51,7 @@ struct RootView: View {
                     }
                 }
                 .pickerStyle(.segmented)
-                .frame(minWidth: 220, idealWidth: 270, maxWidth: 270)
+                .frame(minWidth: 280, idealWidth: 340, maxWidth: 340)
             }
 
             // Plug has no menu bar of its own — it is an accessory app — so the
@@ -93,6 +96,7 @@ struct RootView: View {
         // toolbar field at the minimum window width.
         case .servers: "Servers and tools"
         case .clients: "Search clients"
+        case .events: "Search events"
         case .activity: "Search activity"
         }
     }

@@ -12,9 +12,11 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## Open
 
-- General events: one core for many events and subscribers, then watching a
-  tool for change, then the Events tab, then relaying events a server emits.
-  Design and order of work: issue #255.
+- General events: the core, watching a tool for change, `plug events`, and
+  the Events tab are in. Left: relaying events a server emits itself, and
+  receivers other than a remote client that signs in. Unproven: a watch
+  delivering to a real subscriber end to end. Design and order of work:
+  issue #255.
 - `plug clients` still lists a remote session Plug does not recognise as
   Unknown. The app names it after its grant.
 - Clients missing from the registry, most used first (surveyed 2026-10-03):
