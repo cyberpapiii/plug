@@ -5214,3 +5214,42 @@ async fn a_blocked_resource_or_prompt_answers_as_one_that_does_not_exist() {
     assert_eq!(kept, unknown.replace("git://nope", "git://log"));
     assert_eq!(router.active_subscription_count(), 0);
 }
+
+#[test]
+fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
+    let router = router_with_blocked_resources_and_prompts();
+    let cursor = NotificationTarget::Stdio {
+        client_id: Arc::from("cursor-session"),
+    };
+    let zed = NotificationTarget::Stdio {
+        client_id: Arc::from("zed-session"),
+    };
+    // Both subscribed before `cursor` was kept from `git`.
+    for (target, key) in [(&cursor, "cursor"), (&zed, "zed")] {
+        router
+            .resource_subscriptions
+            .insert_active_for_test("git://log", target.clone());
+        router
+            .subscriber_client_keys
+            .insert(target.clone(), key.to_string());
+    }
+    let mut notifications = router.subscribe_notifications();
+    let mut heard = |router: &ToolRouter| {
+        router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("git://log"));
+        let mut targets = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if let ProtocolNotification::ResourceUpdated { target, .. } = notification {
+                targets.push(target);
+            }
+        }
+        targets
+    };
+
+    assert_eq!(heard(&router), vec![zed.clone()]);
+
+    // Lifting the block brings the updates back without a new subscribe.
+    router.set_client_access(&std::collections::BTreeMap::new());
+    let both = heard(&router);
+    assert_eq!(both.len(), 2);
+    assert!(both.contains(&cursor) && both.contains(&zed));
+}
