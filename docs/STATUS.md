@@ -38,16 +38,12 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   to. The current one is a placeholder.
 - Text-message agents: Poke takes a custom MCP server and can reach Plug as
   a remote client. Instinct and Tomo document no way to add one (2026-10-04).
-- The app needs one audit and redesign, whole: every flow, the menu bar,
-  and the CLI's wording, held to the grandma test. Known complaints:
-  Settings is a separate window and should live in the main one; layout
-  bugs and rough edges throughout; the three surfaces do not feel like one
-  product. Audit and write the findings before changing anything.
+- The app redesign. The audit is done and is #276: every screen, the menu
+  bar, and the CLI's wording, held to the grandma test, with a proposed
+  direction. Nothing is rebuilt until the direction is approved.
 - Order agreed 2026-10-04: clients and their icons (done), secret stores
   (done), skills pass-through (first step done), then the app redesign, the
   app icon, and a release.
-- CI has no job timeout. A hung `Test (Plug.app)` ran 65 minutes on #269
-  before it was cancelled by hand.
 - A connected Pi, Warp, or Kiro is named from what it reports, with no client
   type behind it. Warp's and Kiro's icons use identifiers read off Homebrew's
   casks, not off an installed copy.
