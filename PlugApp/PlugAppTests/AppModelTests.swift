@@ -739,18 +739,19 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.actionError)
     }
 
+    /// A message that leaves while it is being read is no message.
     @MainActor
-    func testAFailedPressClearsItselfAfterAWhile() async {
+    func testAFailedPressStaysAndSaysWhatToDo() async {
         let model = AppModel(
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
-            appLinker: FailingAppLinker(),
-            actionErrorLifetime: .milliseconds(100)
+            appLinker: FailingAppLinker()
         )
         await model.setAppLinked("claude-code", true)
+        XCTAssertEqual(model.actionError?.title, "Could not add Plug to Claude Code.")
+        XCTAssertEqual(model.actionError?.advice.isEmpty, false)
+        try? await Task.sleep(for: .milliseconds(200))
         XCTAssertNotNil(model.actionError)
-        let cleared = await eventually { model.actionError == nil }
-        XCTAssertTrue(cleared)
     }
 
     @MainActor

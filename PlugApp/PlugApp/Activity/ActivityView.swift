@@ -3,13 +3,15 @@ import SwiftUI
 
 /// What Plug has been doing. A log table answered "what fields exist"; this
 /// answers "what happened, and is anything going wrong repeatedly?" — so
-/// failures are countable and grouped by day, and every row has a real time on
-/// it instead of a bare latency number.
+/// failures are countable and grouped by day, every row has a real time on
+/// it, and every row opens to say what happened and what to do about it.
 struct ActivityView: View {
     let model: AppModel
     @Binding var search: String
     let run: (PlugIntent) -> Void
     @State private var scope: Scope = .everything
+    /// The call whose detail is open.
+    @State private var opened: UInt64?
 
     enum Scope: String, CaseIterable, Identifiable {
         case everything = "Everything"
@@ -40,7 +42,7 @@ struct ActivityView: View {
                 } else if model.activities.isEmpty {
                     EmptyPage(
                         title: "No activity yet",
-                        message: "Tool calls will appear here with their client, server, time, and result.",
+                        message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked.",
                         symbol: "clock.arrow.circlepath"
                     )
                 } else if visible.isEmpty {
@@ -62,7 +64,15 @@ struct ActivityView: View {
                                 .listRowSeparator(.hidden)
                                 .listRowBackground(Color.clear)
                             ForEach(group.events) { event in
-                                ActivityRow(event: event)
+                                ActivityRow(
+                                    call: CallFacts(event),
+                                    isOpen: Binding(
+                                        get: { opened == event.sequence },
+                                        set: { opened = $0 ? event.sequence : nil }
+                                    ),
+                                    canShowServer: serverNames.contains(event.server ?? ""),
+                                    run: run
+                                )
                                     .listRowSeparator(.hidden)
                                     .listRowInsets(Metric.listRowInsets)
                             }
@@ -89,6 +99,8 @@ struct ActivityView: View {
         let summary = "\(count) recent \(count == 1 ? "call" : "calls")"
         return model.dataIsStale ? "Last known · \(summary)" : summary
     }
+
+    private var serverNames: Set<String> { Set(model.situation.servers.map(\.name)) }
 
     private var problemsLabel: String {
         let count = model.activities.filter { $0.outcome != "success" }.count
@@ -141,114 +153,121 @@ struct ActivityView: View {
 }
 
 private struct ActivityRow: View {
-    let event: ActivityEvent
+    let call: CallFacts
+    @Binding var isOpen: Bool
+    let canShowServer: Bool
+    let run: (PlugIntent) -> Void
 
     var body: some View {
-        HStack(spacing: Metric.snug) {
-            // The calling app's own icon, so a long list can be scanned by
-            // picture rather than read line by line. Trouble replaces the
-            // icon with a warning, so a failure is visible from across the room.
-            ZStack {
-                if succeeded {
-                    AppGlyph(target: target, name: appName ?? "", size: 22)
-                } else {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.body)
-                        .foregroundStyle(.orange)
-                        .symbolRenderingMode(.hierarchical)
-                }
-            }
-            .frame(width: 22, height: 22)
-            .accessibilityLabel(succeeded ? "Succeeded" : event.outcome.capitalized)
-            VStack(alignment: .leading, spacing: 1) {
-                HStack(spacing: Metric.rowGap) {
-                    if let prefix = toolPrefix {
-                        Text(prefix)
-                            .font(.callout.weight(.medium))
-                            .foregroundStyle(.secondary)
-                        Text("·").foregroundStyle(.quaternary)
+        Button { isOpen = true } label: {
+            HStack(spacing: Metric.snug) {
+                // The calling client's own icon, so a long list can be scanned
+                // by picture rather than read line by line. Trouble replaces
+                // the icon with a warning, so a failure is visible at a glance.
+                ZStack {
+                    if call.succeeded {
+                        AppGlyph(target: call.callerTarget, name: call.caller, size: 22)
+                    } else {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.body)
+                            .foregroundStyle(.orange)
+                            .symbolRenderingMode(.hierarchical)
                     }
-                    Text(headline)
-                        .font(.callout.monospaced())
-                        .lineLimit(1)
-                        .truncationMode(.middle)
                 }
-                Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                .frame(width: 22, height: 22)
+                VStack(alignment: .leading, spacing: 1) {
+                    HStack(spacing: Metric.rowGap) {
+                        if let server = call.server {
+                            Text(server)
+                                .font(.callout.weight(.medium))
+                                .foregroundStyle(.secondary)
+                            Text("·").foregroundStyle(.quaternary)
+                        }
+                        Text(call.tool)
+                            .font(.callout.monospaced())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
+                    Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
+                }
+                Spacer(minLength: Metric.tight)
+                VStack(alignment: .trailing, spacing: 1) {
+                    Text(time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Text(call.duration)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(call.slow ? Color.orange : Color.secondary.opacity(0.7))
+                }
             }
-            Spacer(minLength: Metric.tight)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                Text(latency)
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(slow ? Color.orange : Color.secondary.opacity(0.7))
+            .padding(.vertical, Metric.tight)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            "\(call.result). \(call.tool)\(call.server.map { ", \($0)" } ?? ""), \(context), \(time), \(call.spokenDuration)"
+        )
+        .accessibilityHint("Shows what happened")
+        .popover(isPresented: $isOpen, arrowEdge: .trailing) {
+            CallDetail(call: call, canShowServer: canShowServer) { intent in
+                isOpen = false
+                run(intent)
             }
         }
-        .padding(.vertical, Metric.tight)
-        .accessibilityElement(children: .combine)
     }
 
-    private var succeeded: Bool { event.outcome == "success" }
-    private var slow: Bool { event.latencyMs >= 5_000 }
-    private var target: String { AppIcons.target(forClientType: event.clientType ?? "") }
-
-    /// Tool names arrive as `Server__tool`. The server half is shown once, as
-    /// a word; the tool half stays in code so it can be matched to a call.
-    private var toolParts: (prefix: String?, name: String) {
-        guard let tool = event.tool, !tool.isEmpty else { return (nil, event.method) }
-        guard let range = tool.range(of: "__"), !range.isEmpty, range.lowerBound > tool.startIndex else {
-            return (nil, tool)
-        }
-        return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))
-    }
-
-    private var toolPrefix: String? { toolParts.prefix }
-    private var headline: String { toolParts.name }
-
-    /// Who called it, then where it went. Names the app, and separately the
-    /// window or session inside that app, because two Claude Code windows are
-    /// two callers.
+    /// Who called, then why it failed when it did.
     private var context: String {
-        var parts: [String] = []
-        parts.append(appName ?? "Plug")
-        if let server = event.server, !server.isEmpty,
-           server.caseInsensitiveCompare(toolPrefix ?? "") != .orderedSame {
-            parts.append(server)
-        }
-        if let session = sessionTag { parts.append(session) }
-        let joined = parts.joined(separator: " · ")
-        return succeeded ? joined : "\(joined) · \(event.outcome)"
-    }
-
-    /// The product name when Plug recognises the app; the app's own label
-    /// otherwise. A raw client type is the last resort, never the first.
-    private var appName: String? {
-        if let name = AppIcons.displayName(forTarget: target) { return name }
-        if let label = event.clientLabel, !label.isEmpty { return label }
-        guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {
-            return nil
-        }
-        return type
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-            .capitalized
-    }
-
-    /// A short, stable stand-in for one connection of that app. The full value
-    /// is a UUID nobody can read; the leading characters are enough to tell two
-    /// open windows apart, which is the only thing it is for.
-    private var sessionTag: String? {
-        guard let client = event.client, !client.isEmpty else { return nil }
-        return "session \(client.prefix(4))"
+        guard !call.succeeded else { return call.caller }
+        return "\(call.caller) · \(call.reason ?? call.result)"
     }
 
     private var time: String {
-        Date(timeIntervalSince1970: Double(event.occurredAtMs) / 1_000)
-            .formatted(date: .omitted, time: .shortened)
+        call.date.formatted(date: .omitted, time: .shortened)
+    }
+}
+
+/// One call, opened: what ran, who asked, when, how long, and the result. A
+/// failure says why and what to do next.
+private struct CallDetail: View {
+    let call: CallFacts
+    let canShowServer: Bool
+    let run: (PlugIntent) -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Metric.regular) {
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(call.tool)
+                    .font(.headline.monospaced())
+                    .fixedSize(horizontal: false, vertical: true)
+                    .textSelection(.enabled)
+                Text(call.result)
+                    .font(.callout)
+                    .foregroundStyle(call.succeeded ? Color.secondary : .orange)
+            }
+            if !call.succeeded {
+                ProblemNote(
+                    title: call.reason ?? "This call \(call.result.lowercased()).",
+                    advice: call.advice
+                )
+            }
+            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Metric.regular, verticalSpacing: Metric.tight) {
+                if let server = call.server { line("Server", server) }
+                line("Client", call.caller)
+                line("When", call.date.formatted(date: .abbreviated, time: .standard))
+                line("Took", call.duration)
+            }
+            if canShowServer, let server = call.event.server {
+                Button("Show Server") { run(.reveal(server: server)) }
+            }
+        }
+        .padding(Metric.regular)
+        .frame(width: 320, alignment: .leading)
     }
 
-    private var latency: String {
-        event.latencyMs >= 1_000
-            ? String(format: "%.1fs", Double(event.latencyMs) / 1_000)
-            : "\(event.latencyMs) ms"
+    private func line(_ name: String, _ value: String) -> some View {
+        GridRow {
+            Text(name).font(.callout).foregroundStyle(.secondary)
+            Text(value).font(.callout).textSelection(.enabled)
+        }
     }
 }

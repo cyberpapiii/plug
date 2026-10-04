@@ -57,9 +57,11 @@ struct PlugIntentRunner {
         case let .cancelSignIn(server):
             model.cancelSignIn(server: server)
         case let .restartServer(name):
-            perform { .restartServer(authToken: $0, serverID: name) }
+            perform("restart \(name)") { .restartServer(authToken: $0, serverID: name) }
         case let .setServerEnabled(name, enabled):
-            perform { .setServerEnabled(authToken: $0, name: name, enabled: enabled) }
+            perform("turn \(name) \(enabled ? "on" : "off")") {
+                .setServerEnabled(authToken: $0, name: name, enabled: enabled)
+            }
         case let .editServer(name):
             router.section = .servers
             router.editingServer = Router.ServerName(id: name)
@@ -76,13 +78,15 @@ struct PlugIntentRunner {
             Task { await model.setAppLinked(target, false) }
         case let .removeServer(name):
             if router.selectedServer == name { router.selectedServer = nil }
-            perform { .removeServer(authToken: $0, name: name) }
+            perform("remove \(name)") { .removeServer(authToken: $0, name: name) }
         case let .revokeClient(id):
-            perform { .revokeClient(authToken: $0, clientID: id) }
+            perform("remove that client's access") { .revokeClient(authToken: $0, clientID: id) }
         case let .renameClient(key, name):
-            perform { .renameClient(authToken: $0, key: key, name: name) }
+            perform("rename the client") { .renameClient(authToken: $0, key: key, name: name) }
         case let .setClientServerBlocked(key, server, blocked):
-            perform { .setClientServerBlocked(authToken: $0, key: key, server: server, blocked: blocked) }
+            perform("\(blocked ? "turn off" : "turn on") \(server) for that client") {
+                .setClientServerBlocked(authToken: $0, key: key, server: server, blocked: blocked)
+            }
         case .addServer:
             router.section = .servers
             router.isAddingServer = true
@@ -92,7 +96,7 @@ struct PlugIntentRunner {
             router.isAddingWatch = true
             showWindow()
         case let .removeWatch(event):
-            perform { .removeWatch(authToken: $0, event: event) }
+            perform("stop watching \(event)") { .removeWatch(authToken: $0, event: event) }
         case .importServers:
             router.section = .servers
             router.isImportingServers = true
@@ -121,7 +125,7 @@ struct PlugIntentRunner {
         case let .setServiceEnabled(enabled):
             Task { await model.setServiceEnabled(enabled) }
         case .reloadConfiguration:
-            perform { .reload(authToken: $0) }
+            perform("reload the settings file") { .reload(authToken: $0) }
         case .openLogs:
             NSWorkspace.shared.open(
                 URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory)
@@ -133,7 +137,7 @@ struct PlugIntentRunner {
         }
     }
 
-    private func perform(_ request: @escaping (String) -> IPCRequest) {
-        Task { await model.perform(request) }
+    private func perform(_ doing: String, _ request: @escaping (String) -> IPCRequest) {
+        Task { await model.perform(doing, request) }
     }
 }

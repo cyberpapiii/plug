@@ -11,7 +11,8 @@ struct SheetFrame<Content: View, Extra: View>: View {
 
     let title: String
     var subtitle: String?
-    /// What went wrong, in a sentence. Stays until the next attempt.
+    /// What went wrong, in a sentence. Stays until the next attempt. The
+    /// sheet adds what to do about it.
     var failure: String?
     /// True while the sheet is saving; it cannot be closed half way.
     var busy = false
@@ -41,15 +42,11 @@ struct SheetFrame<Content: View, Extra: View>: View {
 
             content
 
+            if let failure {
+                ProblemNote(reason: failure)
+            }
+
             HStack(spacing: Metric.snug) {
-                if let failure {
-                    Label(failure, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(3)
-                        .fixedSize(horizontal: false, vertical: true)
-                        .textSelection(.enabled)
-                }
                 Spacer(minLength: 0)
                 extra
                 Button(cancelTitle) { dismiss() }

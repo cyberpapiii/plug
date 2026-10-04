@@ -473,15 +473,63 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(PlugPopover.recentCalls(events, limit: 3).map(\.sequence), [6, 5, 3])
     }
 
-    func testCallPartsSplitTheServerPrefix() {
-        let parts = PlugPopover.callParts(event(1, tool: "Figma__get_file", server: "figma"))
-        XCTAssertEqual(parts.server, "Figma")
-        XCTAssertEqual(parts.tool, "get_file")
+    func testCallFactsSplitTheServerPrefix() {
+        let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"))
+        XCTAssertEqual(call.server, "Figma")
+        XCTAssertEqual(call.tool, "get_file")
     }
 
-    func testCallPartsKeepAnUnprefixedName() {
-        let parts = PlugPopover.callParts(event(1, tool: "search", server: "notion"))
-        XCTAssertEqual(parts.server, "notion")
-        XCTAssertEqual(parts.tool, "search")
+    func testCallFactsKeepAnUnprefixedName() {
+        let call = CallFacts(event(1, tool: "search", server: "notion"))
+        XCTAssertEqual(call.server, "notion")
+        XCTAssertEqual(call.tool, "search")
+    }
+
+    func testACallThatWorkedHasNoReasonOrAdvice() {
+        let call = CallFacts(event(1, tool: "Figma__get_file"))
+        XCTAssertEqual(call.result, "Worked")
+        XCTAssertNil(call.reason)
+        XCTAssertNil(call.advice)
+        XCTAssertEqual(call.caller, "Unknown client")
+    }
+
+    func testAFailedCallSaysWhyAndWhatToDo() {
+        let failed = CallFacts(ActivityEvent(
+            sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
+            tool: "Notion__search", clientType: "claude-code", latencyMs: 30_000,
+            outcome: "error", reason: "upstream request timed out"
+        ))
+        XCTAssertEqual(failed.result, "Failed")
+        XCTAssertEqual(failed.caller, "Claude Code")
+        XCTAssertEqual(failed.reason, "upstream request timed out")
+        XCTAssertEqual(failed.advice, Explain.advice(forReason: "timed out"))
+        XCTAssertEqual(failed.duration, "30.0 s")
+
+        let old = CallFacts(ActivityEvent(
+            sequence: 2, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
+            latencyMs: 12, outcome: "error"
+        ))
+        XCTAssertNil(old.reason)
+        XCTAssertNotNil(old.advice, "a failure always has a next step")
+        XCTAssertEqual(old.duration, "12 ms")
+    }
+
+    func testEveryFailureGetsANextStep() {
+        XCTAssertTrue(Explain.advice(forReason: "HTTP 401 Unauthorized").contains("Sign in"))
+        XCTAssertTrue(Explain.advice(forReason: "connection refused").contains("address"))
+        XCTAssertTrue(Explain.advice(forReason: "No such file or directory (os error 2)").contains("command"))
+        XCTAssertEqual(Explain.advice(forReason: "took 1500 ms and broke"), Explain.fallback, "1500 is not a 500")
+        XCTAssertEqual(Explain.advice(forReason: "zzz"), Explain.fallback)
+    }
+
+    func testAPartialImportNamesWhatFailed() {
+        XCTAssertEqual(
+            ImportServersView.summary(failed: ["notion"], of: 3),
+            "Could not add notion. 2 servers were added. The reason is under each one."
+        )
+        XCTAssertEqual(
+            ImportServersView.summary(failed: ["a", "b", "c", "d", "e"], of: 5),
+            "Could not add a, b, c, and 2 more. The reason is under each one."
+        )
     }
 }

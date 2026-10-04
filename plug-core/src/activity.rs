@@ -39,6 +39,28 @@ pub struct ActivityEvent {
     pub client_label: Option<String>,
     pub latency_ms: u64,
     pub outcome: ActivityOutcome,
+    /// Why a call failed, in the error's own words, cut to
+    /// [`ACTIVITY_REASON_LIMIT`] characters. Absent for a call that worked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+/// The longest reason kept for a failed call. An error message can echo part
+/// of what was sent, and Activity stays a record of metadata.
+pub const ACTIVITY_REASON_LIMIT: usize = 240;
+
+/// The reason stored for a failed call: one line, trimmed, and bounded.
+pub fn activity_reason(message: &str) -> Option<String> {
+    let line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if line.is_empty() {
+        return None;
+    }
+    if line.chars().count() <= ACTIVITY_REASON_LIMIT {
+        return Some(line);
+    }
+    let mut cut: String = line.chars().take(ACTIVITY_REASON_LIMIT).collect();
+    cut.push('…');
+    Some(cut)
 }
 
 #[derive(Debug, Clone, Default)]
@@ -119,7 +141,20 @@ mod tests {
             client_label: Some("codex 1.0".into()),
             latency_ms: 1,
             outcome: ActivityOutcome::Success,
+            reason: None,
         }
+    }
+
+    #[test]
+    fn a_failed_call_keeps_a_short_one_line_reason() {
+        assert_eq!(activity_reason("  \n "), None);
+        assert_eq!(
+            activity_reason("upstream timed out\n  after 30s").as_deref(),
+            Some("upstream timed out after 30s")
+        );
+        let long = activity_reason(&"é".repeat(ACTIVITY_REASON_LIMIT + 50)).unwrap();
+        assert_eq!(long.chars().count(), ACTIVITY_REASON_LIMIT + 1);
+        assert!(long.ends_with('…'));
     }
 
     #[test]

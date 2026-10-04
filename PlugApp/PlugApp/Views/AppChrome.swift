@@ -38,18 +38,40 @@ extension PageHeader where Content == EmptyView {
     }
 }
 
-/// A brief report of something that just failed. Persistent trouble is the
-/// verdict's job; this is only for one-off action failures.
-struct ErrorToast: View {
-    let message: String
+/// A problem, said the same way everywhere: what happened, why, and what to
+/// do. The window, the menu bar panel, and every sheet show this one view, so
+/// trouble never looks like three different things.
+struct ProblemNote: View {
+    let title: String
+    var reason: String?
+    var advice: String?
     var dismiss: (() -> Void)?
 
     var body: some View {
-        HStack(alignment: .firstTextBaseline, spacing: Metric.snug) {
-            Label(message, systemImage: "exclamationmark.triangle.fill")
-                .font(.callout)
-                .lineLimit(3)
-                .accessibilityLabel("Error. \(message)")
+        HStack(alignment: .top, spacing: Metric.snug) {
+            Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(.orange)
+                .symbolRenderingMode(.hierarchical)
+                .accessibilityHidden(true)
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(title)
+                    .font(.callout.weight(.medium))
+                    .fixedSize(horizontal: false, vertical: true)
+                if let reason, !reason.isEmpty, reason != title {
+                    Text(reason)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
+                        .textSelection(.enabled)
+                }
+                if let advice, !advice.isEmpty {
+                    Text(advice)
+                        .font(.caption)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
             if let dismiss {
                 Button(action: dismiss) {
                     Image(systemName: "xmark")
@@ -58,14 +80,39 @@ struct ErrorToast: View {
                 .buttonStyle(.borderless)
                 .foregroundStyle(.secondary)
                 .help("Dismiss")
-                .accessibilityLabel("Dismiss error")
+                .accessibilityLabel("Dismiss")
             }
         }
-        .padding(.horizontal, Metric.regular)
-        .padding(.vertical, Metric.snug)
-        .nativeGlassSurface(tint: .red.opacity(0.08))
-        .padding()
         .accessibilityElement(children: .contain)
+        .accessibilityLabel("Problem. \(title) \(reason ?? "") \(advice ?? "")")
+    }
+}
+
+extension ProblemNote {
+    init(_ error: ActionError, dismiss: (() -> Void)? = nil) {
+        self.init(title: error.title, reason: error.message, advice: error.advice, dismiss: dismiss)
+    }
+
+    /// A failure inside a sheet, where the sheet's title already says what
+    /// was being done: the reason leads, and the next step follows.
+    init(reason: String) {
+        self.init(title: reason, advice: Explain.advice(forReason: reason))
+    }
+}
+
+/// A press that failed, floating over the window until it is dismissed.
+/// Persistent trouble is the verdict's job; this is for one action.
+struct ErrorToast: View {
+    let error: ActionError
+    let dismiss: () -> Void
+
+    var body: some View {
+        ProblemNote(error, dismiss: dismiss)
+            .frame(maxWidth: 460)
+            .padding(.horizontal, Metric.regular)
+            .padding(.vertical, Metric.snug)
+            .nativeGlassSurface(tint: .orange.opacity(0.08))
+            .padding()
     }
 }
 

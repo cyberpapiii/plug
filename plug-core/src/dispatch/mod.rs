@@ -122,6 +122,10 @@ pub async fn dispatch_tools_call(
         } else {
             crate::activity::ActivityOutcome::Error
         },
+        reason: result
+            .as_ref()
+            .err()
+            .and_then(|error| crate::activity::activity_reason(&error.message)),
     });
     result
 }

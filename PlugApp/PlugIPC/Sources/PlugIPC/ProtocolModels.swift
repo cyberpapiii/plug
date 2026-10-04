@@ -306,6 +306,9 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
     public let clientLabel: String?
     public let latencyMs: UInt64
     public let outcome: String
+    /// Why a failed call failed, in the error's own words. Absent for a call
+    /// that worked, and from a daemon older than this field.
+    public let reason: String?
 
     public init(
         sequence: UInt64,
@@ -317,7 +320,8 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         clientType: String? = nil,
         clientLabel: String? = nil,
         latencyMs: UInt64,
-        outcome: String
+        outcome: String,
+        reason: String? = nil
     ) {
         self.sequence = sequence
         self.occurredAtMs = occurredAtMs
@@ -329,6 +333,7 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         self.clientLabel = clientLabel
         self.latencyMs = latencyMs
         self.outcome = outcome
+        self.reason = reason
     }
 }
 

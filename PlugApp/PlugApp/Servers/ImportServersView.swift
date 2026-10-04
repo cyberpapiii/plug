@@ -18,39 +18,21 @@ struct ImportServersView: View {
     @State private var failure: String?
     @State private var importing = false
     @State private var scanFailed = false
+    /// Why each server that could not be added was refused, by server id.
+    @State private var refused: [String: String] = [:]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text("Import Servers").font(.title2.weight(.semibold))
-                Text("Servers already set up in other clients on this Mac. Their settings are left as they are.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            }
-
+        SheetFrame(
+            title: "Import Servers",
+            subtitle: "Servers already set up in other clients on this Mac. Their settings are left as they are.",
+            failure: scanFailed ? nil : failure,
+            busy: importing,
+            confirmTitle: scan?.isEmpty == false ? importTitle : nil,
+            confirmDisabled: chosen.isEmpty,
+            confirm: importChosen
+        ) {
             content
-
-            HStack(spacing: Metric.snug) {
-                if let failure, !scanFailed {
-                    Label(failure, systemImage: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .lineLimit(2)
-                }
-                Spacer(minLength: 0)
-                Button("Cancel") { dismiss() }
-                    .keyboardShortcut(.cancelAction)
-                if let scan, !scan.isEmpty {
-                    Button(importTitle) { importChosen() }
-                        .buttonStyle(.borderedProminent)
-                        .keyboardShortcut(.defaultAction)
-                        .disabled(chosen.isEmpty || importing)
-                }
-            }
         }
-        .padding(Metric.roomy)
-        .frame(width: 520)
-        .interactiveDismissDisabled(importing)
         .task { await load() }
     }
 
@@ -140,6 +122,12 @@ struct ImportServersView: View {
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                    if let reason = refused[server.id] {
+                        Text("Not added: \(reason)")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 Spacer(minLength: 0)
             }
@@ -184,7 +172,10 @@ struct ImportServersView: View {
 
     // MARK: - Work
 
-    private func load() async {
+    /// Reads what the other clients have. `keeping` is what stays ticked;
+    /// nil ticks everything, because someone who opens this sheet wants their
+    /// servers, not a checklist.
+    private func load(keeping: Set<String>? = nil) async {
         scanFailed = false
         failure = nil
         scan = nil
@@ -192,9 +183,8 @@ struct ImportServersView: View {
             let result = try await scanner.scan()
             scan = result
             scanFailed = false
-            // Everything is ticked to begin with: someone who opens this sheet
-            // wants their servers, not a checklist.
-            chosen = Set(result.servers.map(\.id))
+            let found = Set(result.servers.map(\.id))
+            chosen = keeping.map { $0.intersection(found) } ?? found
         } catch {
             scan = nil
             scanFailed = true
@@ -206,26 +196,42 @@ struct ImportServersView: View {
         guard let scan else { return }
         importing = true
         failure = nil
+        refused = [:]
         let wanted = scan.servers.filter { chosen.contains($0.id) }
         Task {
-            var failed: [String] = []
+            var failed: [String: String] = [:]
             for server in wanted {
                 do {
                     try await model.performOperation {
                         .addServer(authToken: $0, name: server.name, server: server.config)
                     }
                 } catch {
-                    failed.append(server.name)
+                    failed[server.id] = error.localizedDescription
                 }
             }
             importing = false
-            if failed.isEmpty {
+            guard !failed.isEmpty else {
                 dismiss()
-            } else {
-                failure = failed.count == 1
-                    ? "\(failed[0]) could not be added."
-                    : "\(failed.count) servers could not be added."
+                return
             }
+            // The ones that went in leave the list; the rest stay ticked with
+            // their reason, so trying again retries only what failed.
+            await load(keeping: Set(failed.keys))
+            refused = failed
+            failure = Self.summary(
+                failed: wanted.filter { failed[$0.id] != nil }.map(\.name),
+                of: wanted.count
+            )
         }
+    }
+
+    /// Names what could not be added, and says the rest went in.
+    nonisolated static func summary(failed: [String], of total: Int) -> String {
+        let names = failed.count <= 3
+            ? failed.joined(separator: ", ")
+            : failed.prefix(3).joined(separator: ", ") + ", and \(failed.count - 3) more"
+        let added = total - failed.count
+        let rest = added == 0 ? "" : added == 1 ? " 1 server was added." : " \(added) servers were added."
+        return "Could not add \(names).\(rest) The reason is under each one."
     }
 }

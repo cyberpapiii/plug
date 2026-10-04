@@ -81,7 +81,6 @@ final class AppModel {
     /// poll that succeeds says nothing about the press, and clearing one with
     /// the other used to wipe the message before anyone could read it.
     private(set) var actionError: ActionError?
-    private var actionErrorExpiry: Task<Void, Never>?
     private(set) var signingInServers: Set<String> = []
     /// The running `plug auth login` per server, so Cancel and Try Again can
     /// stop it instead of leaving it waiting on the browser.
@@ -116,11 +115,9 @@ final class AppModel {
     static let backgroundPollInterval = Duration.seconds(30)
     static let reconnectPollInterval = Duration.seconds(1)
     static let reconnectGrace = Duration.seconds(10)
-    static let actionErrorLifetime = Duration.seconds(8)
     private let foregroundPollInterval: Duration
     private let backgroundPollInterval: Duration
     private let reconnectGrace: Duration
-    private let actionErrorLifetime: Duration
     private let authFlow: AuthFlowService
     /// When a working connection first failed, while it is `reconnecting`.
     private var connectionLostAt: ContinuousClock.Instant?
@@ -151,7 +148,6 @@ final class AppModel {
         foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
         backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
         reconnectGrace: Duration = AppModel.reconnectGrace,
-        actionErrorLifetime: Duration = AppModel.actionErrorLifetime,
         authFlow: AuthFlowService = AuthFlowService(),
         serviceDisabledURL: URL = AppModel.defaultServiceDisabledURL
     ) {
@@ -163,7 +159,6 @@ final class AppModel {
         self.foregroundPollInterval = foregroundPollInterval
         self.backgroundPollInterval = backgroundPollInterval
         self.reconnectGrace = reconnectGrace
-        self.actionErrorLifetime = actionErrorLifetime
         self.authFlow = authFlow
         self.serviceDisabledURL = serviceDisabledURL
         self.serviceEnabled = !FileManager.default.fileExists(atPath: serviceDisabledURL.path)
@@ -383,7 +378,7 @@ final class AppModel {
             do {
                 try await coordinator.restartService()
             } catch {
-                self?.reportActionError(error)
+                self?.reportActionError("restart Plug", error)
                 await coordinator.retry()
             }
         }
@@ -425,7 +420,7 @@ final class AppModel {
                 connectionState = .disconnected
                 connectionLostAt = nil
             }
-        } catch { reportActionError(error) }
+        } catch { reportActionError("turn Plug \(enabled ? "on" : "off")", error) }
         isChangingService = false
         if serviceEnabled {
             await refresh()
@@ -598,28 +593,26 @@ final class AppModel {
         return api
     }
 
-    func perform(_ request: (String) -> IPCRequest) async {
+    /// Runs one change the person asked for. `doing` finishes the sentence
+    /// "Could not …", so a failure names what was being attempted.
+    func perform(_ doing: String, _ request: (String) -> IPCRequest) async {
         do {
             try await performOperation(request)
-        } catch { reportActionError(error) }
+        } catch { reportActionError(doing, error) }
     }
 
-    /// Shows a failed press until it is dismissed or `actionErrorLifetime`
-    /// passes, whichever comes first. A newer failure replaces it.
-    private func reportActionError(_ error: any Error) {
-        let shown = ActionError(message: error.localizedDescription)
-        actionError = shown
-        actionErrorExpiry?.cancel()
-        actionErrorExpiry = Task { [weak self, actionErrorLifetime] in
-            try? await Task.sleep(for: actionErrorLifetime)
-            guard !Task.isCancelled, self?.actionError?.id == shown.id else { return }
-            self?.actionError = nil
-        }
+    /// Shows a failed press until it is dismissed. A newer failure replaces
+    /// it. It does not leave by itself: a message that vanishes while it is
+    /// being read is no message.
+    private func reportActionError(_ doing: String, _ error: any Error) {
+        actionError = ActionError(
+            title: "Could not \(doing).",
+            message: error.localizedDescription,
+            advice: Explain.advice(for: error)
+        )
     }
 
     func dismissActionError() {
-        actionErrorExpiry?.cancel()
-        actionErrorExpiry = nil
         actionError = nil
     }
 
@@ -629,7 +622,9 @@ final class AppModel {
     func setToolEnabled(_ tool: String, _ enabled: Bool) async {
         guard busyTools.insert(tool).inserted else { return }
         defer { busyTools.remove(tool) }
-        await perform { .setToolEnabled(authToken: $0, tool: tool, enabled: enabled) }
+        await perform("turn \(tool) \(enabled ? "on" : "off")") {
+            .setToolEnabled(authToken: $0, tool: tool, enabled: enabled)
+        }
     }
 
     func serverConfig(name: String) async throws -> ServerConfig {
@@ -674,7 +669,10 @@ final class AppModel {
             }
             await loadConnectableApps()
             await refresh()
-        } catch { reportActionError(error) }
+        } catch {
+            let name = AppIcons.displayName(forTarget: target) ?? target
+            reportActionError(linked ? "add Plug to \(name)" : "remove Plug from \(name)", error)
+        }
     }
 
     /// Forgets a server's stored account. The button that starts this is behind
@@ -683,7 +681,7 @@ final class AppModel {
         do {
             try await authFlow.signOut(server: server)
             await refresh()
-        } catch { reportActionError(error) }
+        } catch { reportActionError("sign out of \(server)", error) }
     }
 
     /// Starts a sign-in. Pressed again while one is open, it is Try Again:
@@ -718,7 +716,7 @@ final class AppModel {
         } catch let error where Task.isCancelled || error is CancellationError {
             // Cancelled on purpose. Nothing failed.
         } catch {
-            reportActionError(error)
+            reportActionError("sign in to \(server)", error)
         }
     }
 
@@ -740,9 +738,13 @@ final class AppModel {
     }
 }
 
+/// A press that failed: what was being done, why it failed in the error's
+/// own words, and what to do next.
 struct ActionError: Identifiable, Equatable {
     let id = UUID()
+    let title: String
     let message: String
+    let advice: String
 }
 
 private struct ServerConfigReadRequiredError: LocalizedError {
