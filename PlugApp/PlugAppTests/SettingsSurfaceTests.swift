@@ -238,6 +238,46 @@ final class FoundIconTests: XCTestCase {
         XCTAssertEqual(SiteIcon.hosts(server: nil, website: nil), [])
     }
 
+    func testAMakersSiteIsFoundFromAName() {
+        XCTAssertEqual(SiteIcon.brandHost(forName: "oura"), "ouraring.com")
+        XCTAssertEqual(SiteIcon.brandHost(forName: "Oura-MCP"), "ouraring.com")
+        XCTAssertEqual(SiteIcon.brandHost(forName: "python3"), "python.org")
+        XCTAssertEqual(SiteIcon.brandHost(forName: "Qwen Code"), "qwen.ai")
+        XCTAssertNil(SiteIcon.brandHost(forName: "boxer"), "a word is matched whole")
+        XCTAssertNil(SiteIcon.brandHost(forName: "cli"))
+    }
+
+    func testAPackageIsReadFromTheCommandThatRunsIt() {
+        XCTAssertEqual(
+            SiteIcon.package(command: "npx", args: ["-y", "@scope/thing-mcp@1.2.3", "--flag"]),
+            SiteIcon.Package(registry: .npm, name: "@scope/thing-mcp")
+        )
+        XCTAssertEqual(
+            SiteIcon.package(command: "/opt/homebrew/bin/npx", args: ["thing-mcp@latest"]),
+            SiteIcon.Package(registry: .npm, name: "thing-mcp")
+        )
+        XCTAssertEqual(
+            SiteIcon.package(command: "uvx", args: ["thing-mcp==2.0"]),
+            SiteIcon.Package(registry: .pypi, name: "thing-mcp")
+        )
+        XCTAssertNil(SiteIcon.package(command: "node", args: ["/Users/me/thing/index.js"]))
+        XCTAssertNil(SiteIcon.package(command: "npx", args: ["-y"]))
+        XCTAssertNil(SiteIcon.package(command: "npx", args: ["../thing?x=1"]), "only a plain name is asked about")
+        XCTAssertNil(SiteIcon.package(command: nil, args: []))
+    }
+
+    func testAPackagesLinksGiveItsSiteAndItsOwner() {
+        let places = SiteIcon.places(forPackageLinks: [
+            "https://thing.example.com/docs",
+            "git+https://github.com/someone/thing-mcp.git",
+            "https://www.npmjs.com/package/thing",
+            "http://insecure.example.com",
+        ])
+        XCTAssertEqual(places.hosts, ["thing.example.com"])
+        XCTAssertEqual(places.picture?.absoluteString, "https://github.com/someone.png")
+        XCTAssertNil(SiteIcon.places(forPackageLinks: []).picture)
+    }
+
     func testAPagesIconsComeBestFirst() throws {
         let html = """
         <html><head>

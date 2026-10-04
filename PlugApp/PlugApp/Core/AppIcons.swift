@@ -375,6 +375,7 @@ struct IconSource: Equatable, Sendable {
     var address: String?
     /// What starts a local server.
     var command: String?
+    var args: [String] = []
     /// The web page the server gave for itself.
     var website: String?
     /// The icons the server gave for itself.
@@ -385,13 +386,14 @@ struct IconSource: Equatable, Sendable {
 ///
 /// A server's icon is, first to last: the one its owner chose, the one the
 /// server offers for itself, the app on this Mac with its name, the app its
-/// command lives in, and the icon of its own web site. A client's is the
-/// one its owner chose, its app on this Mac, then a logo that ships with
-/// Plug for the command line clients that have no app.
+/// command lives in, and the icon of a web site: its own, then its
+/// maker's, then the one its package names. A client's is the one its
+/// owner chose, its app on this Mac, a logo that ships with Plug for the
+/// command line clients that have no app, then its maker's web site.
 ///
-/// The web site is asked only when nothing earlier answered, only over
-/// HTTPS, and only at the server's own address or the page it named, so no
-/// third party learns which servers are here.
+/// A web site is asked only when nothing earlier answered and only over
+/// HTTPS. Each one asked belongs to the server, its maker, or the registry
+/// its package came from, so no icon service learns which servers are here.
 @MainActor @Observable
 final class IconStore {
     static let shared = IconStore()
@@ -400,6 +402,7 @@ final class IconStore {
     private var advertised: [String: NSImage] = [:]
     private var commandApps: [String: NSImage] = [:]
     private var sites: [String: NSImage] = [:]
+    private var clientSites: [String: NSImage] = [:]
 
     @ObservationIgnored private let chosenDirectory: URL
     @ObservationIgnored private let cacheDirectory: URL
@@ -407,6 +410,7 @@ final class IconStore {
     @ObservationIgnored private var search: Task<Void, Never>?
     /// What was already looked for since launch, found or not.
     @ObservationIgnored private var searched: Set<String> = []
+    @ObservationIgnored private var clientsAsked: Set<String> = []
 
     /// A found icon is kept this long before its site is asked again.
     private static let keepFound: TimeInterval = 30 * 24 * 3600
@@ -440,6 +444,26 @@ final class IconStore {
         chosen[Self.key(client: target)]
             ?? AppIcons.image(target: target, name: name, appPath: appPath)
             ?? NSImage(named: "client-\(target.lowercased())")
+            ?? clientSites[target]
+            ?? findLater(client: target, name: name)
+    }
+
+    /// Ask a client's maker for its icon, once. Answers nil now; the icon
+    /// shows when it arrives.
+    private func findLater(client target: String, name: String) -> NSImage? {
+        guard !clientsAsked.contains(target),
+              let host = SiteIcon.brandHost(forName: name) ?? SiteIcon.brandHost(forName: target) else { return nil }
+        clientsAsked.insert(target)
+        Task { [weak self] in
+            guard let self else { return }
+            let key = "site-\(host)"
+            switch self.kept(key) {
+            case let .found(image): self.clientSites[target] = image
+            case .missing: break
+            case .unknown: self.clientSites[target] = self.keep(await SiteIcon.find(hosts: [host]), as: key)
+            }
+        }
+        return nil
     }
 
     /// The name a chosen icon is kept under.
@@ -504,6 +528,7 @@ final class IconStore {
                     name: server.name,
                     address: config?.url,
                     command: config?.command,
+                    args: config?.args ?? [],
                     website: upstream?.websiteUrl,
                     icons: upstream?.icons ?? []
                 ))
@@ -514,7 +539,7 @@ final class IconStore {
     }
 
     func load(_ sources: [IconSource]) async {
-        var wanted: [(name: String, key: String, hosts: [String])] = []
+        var wanted: [(name: String, key: String, hosts: [String], package: SiteIcon.Package?)] = []
         for source in sources {
             if let command = source.command, let app = AppIcons.appBundle(containing: command),
                commandApps[source.name] == nil, FileManager.default.fileExists(atPath: app) {
@@ -533,11 +558,17 @@ final class IconStore {
                 }
             }
             guard image(forServer: source.name) == nil else { continue }
-            let hosts = SiteIcon.hosts(server: source.address, website: source.website)
-            if let first = hosts.first { wanted.append((source.name, "site-\(first)", hosts)) }
+            var hosts = SiteIcon.hosts(server: source.address, website: source.website)
+            if let brand = SiteIcon.brandHost(forName: source.name), !hosts.contains(brand) { hosts.append(brand) }
+            let package = SiteIcon.package(command: source.command, args: source.args)
+            if let first = hosts.first {
+                wanted.append((source.name, "site-\(first)", hosts, package))
+            } else if let package {
+                wanted.append((source.name, "package-\(AppIcons.lookupKey(package.name))", hosts, package))
+            }
         }
         // Sites answer at their own pace; ask them side by side.
-        var asking: [(name: String, key: String, hosts: [String])] = []
+        var asking: [(name: String, key: String, hosts: [String], package: SiteIcon.Package?)] = []
         for want in wanted {
             switch kept(want.key) {
             case let .found(image): sites[want.name] = image
@@ -548,7 +579,12 @@ final class IconStore {
         let answers = await withTaskGroup(of: (Int, Data?).self) { group in
             for (index, want) in asking.enumerated() {
                 let hosts = want.hosts
-                group.addTask { (index, await SiteIcon.find(hosts: hosts)) }
+                let package = want.package
+                group.addTask {
+                    if let data = await SiteIcon.find(hosts: hosts) { return (index, data) }
+                    guard let package else { return (index, nil) }
+                    return (index, await SiteIcon.find(package: package))
+                }
             }
             var answers: [Int: Data] = [:]
             for await (index, data) in group { answers[index] = data }
@@ -651,6 +687,123 @@ enum SiteIcon {
             }
         }
         return found
+    }
+
+    /// Makers' web sites, by the word their servers and clients are named
+    /// with. A local command has no address of its own to ask, and its
+    /// name is all there is to go on.
+    private static let brands: [String: String] = [
+        "airtable": "airtable.com", "amplitude": "amplitude.com", "anthropic": "anthropic.com",
+        "asana": "asana.com", "atlassian": "atlassian.com", "aws": "aws.amazon.com",
+        "box": "box.com", "brave": "brave.com", "bun": "bun.sh", "canva": "canva.com",
+        "clickup": "clickup.com", "cloudflare": "cloudflare.com", "confluence": "atlassian.com",
+        "context7": "context7.com", "datadog": "datadoghq.com", "discord": "discord.com",
+        "docker": "docker.com", "dropbox": "dropbox.com", "elevenlabs": "elevenlabs.io",
+        "exa": "exa.ai", "figma": "figma.com", "firecrawl": "firecrawl.dev",
+        "gemini": "gemini.google.com", "github": "github.com", "gitlab": "gitlab.com",
+        "grafana": "grafana.com", "homeassistant": "home-assistant.io", "hubspot": "hubspot.com",
+        "huggingface": "huggingface.co", "intercom": "intercom.com", "jira": "atlassian.com",
+        "kimi": "kimi.com", "krisp": "krisp.ai", "kubernetes": "kubernetes.io",
+        "linear": "linear.app", "miro": "miro.com", "mistral": "mistral.ai",
+        "mixpanel": "mixpanel.com", "monday": "monday.com", "mongodb": "mongodb.com",
+        "mysql": "mysql.com", "netlify": "netlify.com", "node": "nodejs.org",
+        "notion": "notion.com", "obsidian": "obsidian.md", "openai": "openai.com",
+        "oura": "ouraring.com", "pagerduty": "pagerduty.com", "paypal": "paypal.com",
+        "perplexity": "perplexity.ai", "plaid": "plaid.com", "playwright": "playwright.dev",
+        "postgres": "postgresql.org", "postgresql": "postgresql.org", "posthog": "posthog.com",
+        "python": "python.org", "python3": "python.org", "qwen": "qwen.ai",
+        "raycast": "raycast.com", "reddit": "reddit.com", "redis": "redis.io",
+        "replicate": "replicate.com", "salesforce": "salesforce.com", "sentry": "sentry.io",
+        "shopify": "shopify.com", "slack": "slack.com", "snowflake": "snowflake.com",
+        "spotify": "spotify.com", "sqlite": "sqlite.org", "strava": "strava.com",
+        "stripe": "stripe.com", "supabase": "supabase.com", "svelte": "svelte.dev",
+        "tavily": "tavily.com", "telegram": "telegram.org", "todoist": "todoist.com",
+        "trello": "trello.com", "twilio": "twilio.com", "vercel": "vercel.com",
+        "xero": "xero.com", "youtube": "youtube.com", "zapier": "zapier.com",
+        "zendesk": "zendesk.com", "zoom": "zoom.us",
+    ]
+
+    /// The maker's site for a name: the whole name, then each word of it.
+    /// "oura" and "oura-mcp" both give Oura's.
+    static func brandHost(forName name: String) -> String? {
+        if let host = brands[AppIcons.lookupKey(name)] { return host }
+        let words = name.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber })
+        return words.lazy.compactMap { brands[String($0)] }.first
+    }
+
+    /// A package a registry can describe.
+    struct Package: Equatable, Sendable {
+        enum Registry: Sendable { case npm, pypi }
+        let registry: Registry
+        let name: String
+    }
+
+    /// The package a command runs, when it runs one straight from a
+    /// registry: `npx -y @scope/thing@1.2` runs `@scope/thing`.
+    static func package(command: String?, args: [String]) -> Package? {
+        guard let tool = command?.split(separator: "/").last else { return nil }
+        let registry: Package.Registry
+        switch tool {
+        case "npx", "bunx", "pnpx": registry = .npm
+        case "uvx", "pipx": registry = .pypi
+        default: return nil
+        }
+        guard var name = args.first(where: { !$0.hasPrefix("-") && $0 != "run" }) else { return nil }
+        // Drop a version, keeping the "@" a scope starts with.
+        if let at = name.lastIndex(of: "@"), at != name.startIndex { name = String(name[..<at]) }
+        if registry == .pypi, let cut = name.firstIndex(where: { "=<>[".contains($0) }) { name = String(name[..<cut]) }
+        let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "@/._-"))
+        guard !name.isEmpty, name.unicodeScalars.allSatisfy(allowed.contains) else { return nil }
+        return Package(registry: registry, name: name)
+    }
+
+    /// Where to look for a package's icon, given the links its registry
+    /// lists: its own site, and its owner's picture on GitHub.
+    static func places(forPackageLinks links: [String]) -> (hosts: [String], picture: URL?) {
+        var hosts: [String] = []
+        var picture: URL?
+        for link in links {
+            let address = link.replacingOccurrences(of: "git+", with: "")
+            guard let url = URL(string: address), let host = url.host?.lowercased() else { continue }
+            if host == "github.com" || host == "www.github.com" {
+                let owner = url.path.split(separator: "/").first.map(String.init) ?? ""
+                if picture == nil, !owner.isEmpty { picture = URL(string: "https://github.com/\(owner).png") }
+            } else if url.scheme == "https", !host.hasSuffix("npmjs.com"), !host.hasSuffix("pypi.org"),
+                      !hosts.contains(host) {
+                hosts.append(host)
+            }
+        }
+        return (hosts, picture)
+    }
+
+    /// The icon of a package's site, or of its owner, as PNG data.
+    static func find(package: Package) async -> Data? {
+        let address = switch package.registry {
+        case .npm: "https://registry.npmjs.org/\(package.name)/latest"
+        case .pypi: "https://pypi.org/pypi/\(package.name)/json"
+        }
+        let session = makeSession()
+        defer { session.invalidateAndCancel() }
+        guard let url = URL(string: address), let (data, response) = try? await session.data(from: url),
+              (response as? HTTPURLResponse)?.statusCode == 200, data.count <= maxPage,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
+        var links: [String] = []
+        let facts = (object["info"] as? [String: Any]) ?? object
+        for key in ["homepage", "home_page"] {
+            if let link = facts[key] as? String { links.append(link) }
+        }
+        if let repository = facts["repository"] as? [String: Any], let link = repository["url"] as? String {
+            links.append(link)
+        } else if let link = facts["repository"] as? String {
+            links.append(link)
+        }
+        if let urls = facts["project_urls"] as? [String: Any] {
+            links += urls.keys.sorted().compactMap { urls[$0] as? String }
+        }
+        let places = places(forPackageLinks: links)
+        if let found = await find(hosts: places.hosts) { return found }
+        guard let picture = places.picture else { return nil }
+        return await image(at: picture, session: session)
     }
 
     /// The site one label up: `mcp.example.com` gives `example.com`. Nil
