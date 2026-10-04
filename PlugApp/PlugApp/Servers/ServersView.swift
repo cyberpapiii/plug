@@ -8,59 +8,57 @@ struct ServersView: View {
     @Bindable var router: Router
     @Binding var search: String
     let run: (PlugIntent) -> Void
+    /// The server being removed, while the app asks first.
+    @State private var removing: String?
 
     var body: some View {
-        VStack(spacing: 0) {
-            PageHeader(title: "Servers", detail: serverSummary) {
-                HStack(spacing: Metric.tight) {
-                    Button { run(.addServer) } label: {
-                        Label("Add Server", systemImage: "plus")
-                    }
-                    .keyboardShortcut("n", modifiers: .command)
-                    .help("Add a server")
-
-                    Button { run(.importServers) } label: {
-                        Image(systemName: "square.and.arrow.down")
-                    }
-                    .help("Import servers from other clients")
-                    .accessibilityLabel("Import servers from other clients")
-                }
-                .disabled(!model.canMutate)
+        Group {
+            if model.isLoadingInitialData {
+                LoadingPage(message: "Loading servers…")
+            } else if model.initialDataUnavailable {
+                UnavailablePage(item: "Servers") { run(.reconnect) }
+            } else if model.situation.servers.isEmpty {
+                EmptyPage(
+                    title: "No servers yet",
+                    message: "Add one and every client connected to Plug can use it right away.",
+                    symbol: "shippingbox",
+                    actionTitle: "Add Server",
+                    actionIntent: .addServer,
+                    secondaryTitle: "Import Servers…",
+                    secondaryIntent: .importServers,
+                    run: run
+                )
+            } else if visibleNames.isEmpty {
+                ContentUnavailableView.search(text: search)
+            } else {
+                list
             }
-
-            Group {
-                if model.isLoadingInitialData {
-                    LoadingPage(message: "Loading servers…")
-                } else if model.initialDataUnavailable {
-                    UnavailablePage(item: "Servers") { run(.reconnect) }
-                } else if model.situation.servers.isEmpty {
-                    EmptyPage(
-                        title: "No servers yet",
-                        message: "Add one and every client connected to Plug can use it right away.",
-                        symbol: "shippingbox",
-                        actionTitle: "Add Server",
-                        actionIntent: .addServer,
-                        secondaryTitle: "Import Servers…",
-                        secondaryIntent: .importServers,
-                        run: run
-                    )
-                } else {
-                    list
+        }
+        .navigationSubtitle(serverSummary ?? "")
+        .toolbar {
+            ToolbarItemGroup(placement: .primaryAction) {
+                Button { run(.addServer) } label: {
+                    Label("Add Server", systemImage: "plus")
                 }
+                .help("Add a server")
+
+                Button { run(.importServers) } label: {
+                    Label("Import Servers", systemImage: "square.and.arrow.down")
+                }
+                .help("Import servers from other clients")
             }
         }
         .onChange(of: visibleNames, initial: true) { keepSelectionVisible() }
-        .sheet(isPresented: $router.isAddingServer) {
-            AddServerView(model: model)
-        }
-        .sheet(isPresented: $router.isImportingServers) {
-            ImportServersView(model: model)
-        }
-        .sheet(item: $router.editingServer) { target in
-            EditServerView(model: model, name: target.id)
-        }
-        .sheet(item: $router.addingAccountTo) { target in
-            AddAccountView(model: model, router: router, server: target.id)
+        .confirmationDialog(
+            "Remove \(removing ?? "")?",
+            isPresented: Binding(get: { removing != nil }, set: { if !$0 { removing = nil } }),
+            titleVisibility: .visible,
+            presenting: removing
+        ) { name in
+            Button("Remove Server", role: .destructive) { run(.removeServer(name)) }
+            Button("Cancel", role: .cancel) { }
+        } message: { _ in
+            Text("Clients connected to Plug will stop seeing its tools. Your settings file keeps everything else.")
         }
     }
 
@@ -70,35 +68,30 @@ struct ServersView: View {
 
     /// Servers on the left, the selected one in full on the right. A server is
     /// always selected, so the right side is never an empty placeholder.
-    @ViewBuilder private var list: some View {
-        if visibleNames.isEmpty {
-            ContentUnavailableView.search(text: search)
-        } else {
-            HStack(spacing: 0) {
-                List(selection: $router.selectedServer) {
-                    group("Needs attention", servers: matching(model.situation.troubledServers))
-                    group("Starting", servers: matching(startingServers))
-                    group("Running", servers: matching(runningServers))
-                    group("Off", servers: matching(offServers))
-                }
-                .listStyle(.inset)
-                .frame(width: Metric.serverListWidth)
-                Divider()
-                if let selected {
-                    ServerDetailView(
-                        model: model,
-                        server: selected,
-                        query: search,
-                        router: router,
-                        run: run
-                    )
-                    .id(selected.name)
-                } else {
-                    Color.clear
-                }
+    private var list: some View {
+        ListDetail {
+            List(selection: $router.selectedServer) {
+                group("Needs Attention", servers: matching(model.situation.troubledServers))
+                group("Starting", servers: matching(startingServers))
+                group("Running", servers: matching(runningServers))
+                group("Off", servers: matching(offServers))
             }
-            .frame(maxWidth: Metric.contentMaxWidth)
-            .frame(maxWidth: .infinity)
+            .onDeleteCommand {
+                if model.canMutate { removing = router.selectedServer }
+            }
+        } detail: {
+            if let selected {
+                ServerDetailView(
+                    model: model,
+                    server: selected,
+                    query: search,
+                    router: router,
+                    run: run
+                )
+                .id(selected.name)
+            } else {
+                NoSelection(item: "Server")
+            }
         }
     }
 
@@ -123,19 +116,16 @@ struct ServersView: View {
     @ViewBuilder
     private func group(_ title: String, servers: [ServerFacts]) -> some View {
         if !servers.isEmpty {
-            SectionLabel(
-                text: title,
-                trailing: servers.count == 1 ? "1 server" : "\(servers.count) servers"
-            )
-                .padding(.top, Metric.regular)
-                .listRowSeparator(.hidden)
-                .listRowBackground(Color.clear)
-            ForEach(servers) { server in
-                ServerListRow(server: server)
-                    .tag(server.name)
-                    .listRowSeparator(.hidden)
-                    .listRowInsets(Metric.listRowInsets)
-                    .contextMenu { ServerActions(server: server, run: run) }
+            Section(title) {
+                ForEach(servers) { server in
+                    ServerListRow(server: server)
+                        .tag(server.name)
+                        .contextMenu {
+                            ServerActions(server: server, run: run)
+                            Divider()
+                            Button("Remove Server…", role: .destructive) { removing = server.name }
+                        }
+                }
             }
         }
     }
@@ -169,38 +159,40 @@ struct ServersView: View {
     }
 }
 
-/// A server as a row: state, name, and what it offers. The fix for a
-/// troubled server is in the details beside the list.
+/// A server as a row: one glyph for its state, its name, and what it offers.
+/// The group it sits in already says whether it is running, so the row does
+/// not say it again.
 private struct ServerListRow: View {
     let server: ServerFacts
 
     var body: some View {
-        HStack(spacing: Metric.snug) {
+        HStack(spacing: Metric.tight) {
             StatusGlyph(health: server.health)
-            VStack(alignment: .leading, spacing: Metric.rowGap) {
-                Text(server.name).font(.callout.weight(.medium))
-                Label(subtitle, systemImage: server.subtitleSymbol)
-                    .font(.caption)
+            Text(server.name)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .foregroundStyle(server.enabled ? .primary : .secondary)
+            Spacer(minLength: Metric.tight)
+            if let trailing {
+                Text(trailing)
+                    .font(.callout.monospacedDigit())
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
-                    .truncationMode(.middle)
-            }
-            Spacer(minLength: Metric.tight)
-            if server.health == .working {
-                Text(server.toolCountText)
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.secondary)
+                    .layoutPriority(1)
             }
         }
-        .padding(.vertical, Metric.tight)
-        .contentShape(Rectangle())
-        .accessibilityElement(children: .combine)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(
+            server.health == .working
+                ? "\(server.name), \(server.health.label), \(server.toolCountText)"
+                : "\(server.name), \(server.health.label)"
+        )
     }
 
-    private var subtitle: String {
+    private var trailing: String? {
+        if server.health == .working { return "\(server.toolCount)" }
         if server.health.needsAttention { return server.health.label }
-        if !server.enabled { return server.health.label }
-        return server.transportLabel
+        return nil
     }
 }
 

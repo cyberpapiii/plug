@@ -226,7 +226,7 @@ struct PlugPopover: View {
             // they are visible controls rather than entries inside a menu. Both
             // are icon-only: the picture is the label, and the tooltip and the
             // accessibility label carry the words.
-            Button { send(.openWindow(.settings)) } label: {
+            Button { send(.openSettings) } label: {
                 Image(systemName: "gearshape")
             }
             .buttonStyle(QuietControlButtonStyle(iconOnly: true))
@@ -248,7 +248,7 @@ struct PlugPopover: View {
     /// floating window can remain above the sheet or inspector it opened.
     private func send(_ intent: PlugIntent) {
         switch intent {
-        case .addServer, .importServers, .editServer, .openWindow, .checkup,
+        case .addServer, .importServers, .editServer, .openWindow, .openSettings, .checkup,
              .openCurrentWindow, .reveal, .showRepairLog, .signIn:
             dismiss()
         default:

@@ -1,13 +1,9 @@
 import AppKit
 import SwiftUI
 
-/// Everything a person owns about Plug, as one page of the main window.
-///
-/// Settings used to be its own window with three tabs, which put the switch
-/// that turns Plug off, Restart, and Checkup one window away from the place a
-/// problem is shown. It is now the fifth section, one page that scrolls: is
-/// Plug on and healthy, how should it behave, where are its files, what
-/// version is this.
+/// Everything a person owns about Plug, in the Settings window: is Plug on
+/// and healthy, how should it behave, where are its files, what version is
+/// this. One page, so nothing is behind a tab.
 struct SettingsView: View {
     let model: AppModel
     @Bindable var router: Router
@@ -35,8 +31,8 @@ struct SettingsView: View {
             about
         }
         .formStyle(.grouped)
-        .frame(maxWidth: Metric.settingsMaxWidth)
-        .frame(maxWidth: .infinity)
+        .frame(width: Metric.settingsWidth)
+        .frame(height: 620)
         .task {
             launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
         }
@@ -52,45 +48,33 @@ struct SettingsView: View {
     private var plug: some View {
         Section {
             ServicePowerToggle(model: model, run: run)
-            LabeledContent {
-                Text(serviceStatus)
-                    .foregroundStyle(model.connectionState == .ready ? .primary : .secondary)
-            } label: {
-                Label("Background service", systemImage: serviceSymbol)
-                    .foregroundStyle(serviceColor)
-            }
-            HStack {
-                Button {
-                    run(.restartService)
-                } label: {
-                    Label("Restart Plug", systemImage: "arrow.clockwise")
+            LabeledContent("Background service") {
+                HStack(spacing: Metric.tight) {
+                    Image(systemName: serviceSymbol)
+                        .foregroundStyle(serviceColor)
+                        .accessibilityHidden(true)
+                    Text(serviceStatus)
+                    if model.isRestartingService { ProgressView().controlSize(.small) }
+                    Button("Restart") { run(.restartService) }
+                        .disabled(model.isRestartingService || !model.serviceEnabled || model.isChangingService)
                 }
-                .disabled(model.isRestartingService || !model.serviceEnabled || model.isChangingService)
-                if model.isRestartingService { ProgressView().controlSize(.small) }
-                Spacer()
             }
-        } header: {
-            Text("Plug")
         } footer: {
             Text("Restarting reconnects every server. Connected clients pick Plug back up on their own.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
         }
     }
 
     // MARK: Checkup
 
     private var checkupSection: some View {
-        Section {
-            HStack {
-                Button {
-                    Task { await runCheckup() }
-                } label: {
-                    Label("Check Everything", systemImage: "stethoscope")
+        Section("Checkup") {
+            LabeledContent {
+                HStack(spacing: Metric.tight) {
+                    if checking { ProgressView().controlSize(.small) }
+                    Button("Check Everything") { Task { await runCheckup() } }
+                        .disabled(checking)
                 }
-                .disabled(checking)
-                if checking { ProgressView().controlSize(.small) }
-                Spacer()
+            } label: {
                 if let checkup {
                     Label(
                         checkup.headline,
@@ -98,14 +82,15 @@ struct SettingsView: View {
                             ? "checkmark.circle.fill"
                             : "exclamationmark.triangle.fill"
                     )
-                    .font(.callout)
                     .foregroundStyle(checkup.isClean ? Color.green : Color.orange)
+                } else {
+                    Text("Look for anything wrong with Plug")
                 }
             }
 
             if let checkupError {
                 Label(checkupError, systemImage: "xmark.circle.fill")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.red)
             }
 
@@ -120,13 +105,10 @@ struct SettingsView: View {
                     ) {
                         ForEach(passingChecks(in: checkup)) { check in
                             CheckRow(check: check)
-                                .padding(.top, Metric.tight)
                         }
                     }
                 }
             }
-        } header: {
-            Text("Checkup")
         }
     }
 
@@ -134,44 +116,35 @@ struct SettingsView: View {
 
     private var behavior: some View {
         Section {
-            Toggle(isOn: $launchAtLogin) {
-                Label("Show Plug in the menu bar at login", systemImage: "power")
-            }
-            .onChange(of: launchAtLogin) { _, enabled in
-                do {
-                    try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
-                    loginItemFailed = false
-                } catch {
-                    loginItemFailed = true
-                    DaemonServiceManager.shared.openLoginItemSettings()
+            Toggle("Open Plug at login", isOn: $launchAtLogin)
+                .onChange(of: launchAtLogin) { _, enabled in
+                    do {
+                        try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
+                        loginItemFailed = false
+                    } catch {
+                        loginItemFailed = true
+                        DaemonServiceManager.shared.openLoginItemSettings()
+                    }
                 }
-            }
             if loginItemFailed {
                 Label(
                     "macOS wants to confirm this in System Settings.",
                     systemImage: "exclamationmark.triangle"
                 )
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
             }
             Toggle(isOn: $notify) {
-                Label("Tell me when a server needs sign-in or a new client connects", systemImage: "bell")
+                Text("Notifications")
+                Text("When a server needs sign-in or a new client connects.")
             }
             .onChange(of: notify) { _, enabled in
                 if enabled { NotificationService.shared.requestAuthorization() }
             }
-            Toggle(isOn: $automaticUpdates) {
-                Label("Check for updates automatically", systemImage: "arrow.down.circle")
-            }
-            .onChange(of: automaticUpdates) { _, enabled in
-                UpdateService.shared.checksAutomatically = enabled
-            }
         } header: {
             Text("General")
         } footer: {
-            Text("Plug and its servers keep running after you close this window or quit the menu bar icon.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("Plug and its servers keep running after you close its windows or quit the menu bar icon.")
         }
     }
 
@@ -179,59 +152,47 @@ struct SettingsView: View {
 
     private var files: some View {
         Section {
-            HStack {
-                Button {
-                    Task {
-                        if let path = await checkups.configPath() {
-                            NSWorkspace.shared.activateFileViewerSelecting([path])
+            LabeledContent("Settings file") {
+                HStack(spacing: Metric.tight) {
+                    Button("Read Again") { run(.reloadConfiguration) }
+                        .help("Use this after you change the settings file by hand")
+                        .disabled(!model.canMutate)
+                    Button("Show in Finder") {
+                        Task {
+                            if let path = await checkups.configPath() {
+                                NSWorkspace.shared.activateFileViewerSelecting([path])
+                            }
                         }
                     }
-                } label: {
-                    Label("Show Settings File", systemImage: "doc.text")
                 }
-                Button {
-                    run(.openLogs)
-                } label: {
-                    Label("Show Logs", systemImage: "list.bullet.rectangle")
-                }
-                Button {
-                    run(.reloadConfiguration)
-                } label: {
-                    Label("Read Settings File Again", systemImage: "arrow.triangle.2.circlepath")
-                }
-                .help("Use this after you change the settings file by hand")
-                .disabled(!model.canMutate)
-                Spacer()
+            }
+            LabeledContent("Logs") {
+                Button("Show in Finder") { run(.openLogs) }
             }
         } header: {
             Text("Files")
         } footer: {
-            Text("Plug keeps every server and client choice in one settings file. Changes made in this window are saved there for you.")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            Text("Plug keeps every server and client choice in one settings file. Changes made in the app are saved there for you.")
         }
     }
 
     // MARK: About
 
     private var about: some View {
-        Section {
-            LabeledContent("Version") {
-                Text(model.displayVersion)
-                    .monospacedDigit()
-                    .textSelection(.enabled)
-            }
-            HStack {
-                Button {
-                    run(.checkForUpdates)
-                } label: {
-                    Label("Check for Updates…", systemImage: "arrow.down.circle")
+        Section("Updates") {
+            Toggle("Check for updates automatically", isOn: $automaticUpdates)
+                .onChange(of: automaticUpdates) { _, enabled in
+                    UpdateService.shared.checksAutomatically = enabled
                 }
-                .disabled(!UpdateService.shared.canCheckForUpdates)
-                Spacer()
+            LabeledContent("Version") {
+                HStack(spacing: Metric.tight) {
+                    Text(model.displayVersion)
+                        .monospacedDigit()
+                        .textSelection(.enabled)
+                    Button("Check Now…") { run(.checkForUpdates) }
+                        .disabled(!UpdateService.shared.canCheckForUpdates)
+                }
             }
-        } header: {
-            Text("About")
         }
     }
 

@@ -44,12 +44,11 @@ enum Metric {
     static let popoverRowHeight: CGFloat = 34
     /// Whole rows shown before the list scrolls.
     static let popoverVisibleRows = 7
-    /// Keep long management lists readable on wide displays without making
-    /// rows feel pinned to the window edges.
-    static let contentMaxWidth: CGFloat = 960
-    static let serverListWidth: CGFloat = 260
-    /// A form reads best as a column, not stretched across a wide window.
-    static let settingsMaxWidth: CGFloat = 640
+    /// The list beside a detail, the same width in every section.
+    static let listWidth: CGFloat = 270
+    /// A detail reads best as a column, not stretched across a wide window.
+    static let detailMaxWidth: CGFloat = 680
+    static let settingsWidth: CGFloat = 520
 }
 
 // MARK: - Tone

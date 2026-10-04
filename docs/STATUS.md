@@ -40,9 +40,11 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   casks, not off an installed copy.
 - Code identifiers still call clients apps (`connectableApps`, `AppLinkRow`,
   `connectedApps`, `busyApps`). Rename when touching those files.
-- The redesign in #276 is built but nobody has looked at it yet: the eight
-  moves were checked by tests and by reading the accessibility tree, not by
-  eye. Look at each screen once and file what reads wrong.
+- The window was rebuilt on the standard Mac layout (sidebar, list and
+  detail, Settings window, menus) after the owner found #276 inconsistent.
+  Each screen was checked from the app's own drawing of itself in light and
+  dark. Not seen: the menu bar panel, the sidebar's glass, and Events with a
+  watch in it. Look at those once and file what reads wrong.
 - The app icon (a white power symbol on blue) was chosen without the owner
   seeing it in the Dock. Confirm it, or swap the files in `docs/assets/` and
   the app's icon set.

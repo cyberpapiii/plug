@@ -71,6 +71,42 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(model.visibleServers.isEmpty)
     }
 
+    /// Settings is its own window, so asking for it must not pull the main
+    /// window forward or move its section.
+    @MainActor func testSettingsOpensItsOwnWindow() {
+        let router = Router()
+        router.section = .clients
+        var windows = 0, settings = 0
+        let runner = PlugIntentRunner(
+            model: AppModel(), router: router,
+            showWindow: { windows += 1 }, showSettings: { settings += 1 }
+        )
+        runner.run(.openSettings)
+        XCTAssertEqual(settings, 1)
+        XCTAssertEqual(windows, 0)
+        XCTAssertEqual(router.section, .clients)
+        XCTAssertEqual(router.checkupRequests, 0)
+    }
+
+    /// A checkup asked for from a menu opens Settings and tells it to run one.
+    @MainActor func testACheckupOpensSettingsAndAsksForARun() {
+        let router = Router()
+        var windows = 0, settings = 0
+        let runner = PlugIntentRunner(
+            model: AppModel(), router: router,
+            showWindow: { windows += 1 }, showSettings: { settings += 1 }
+        )
+        runner.run(.checkup)
+        XCTAssertEqual(router.checkupRequests, 1)
+        XCTAssertEqual(settings, 1)
+        XCTAssertEqual(windows, 0)
+    }
+
+    /// The sidebar lists the four things Plug manages. Settings is not one.
+    func testTheSidebarHasFourSections() {
+        XCTAssertEqual(AppSection.allCases.map(\.rawValue), ["Servers", "Clients", "Events", "Activity"])
+    }
+
     func testBundleClientVersionFallback() {
         XCTAssertEqual(PlugIPCClient.clientVersion(from: [:]), "development")
         XCTAssertEqual(

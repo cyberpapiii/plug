@@ -5,6 +5,30 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The window is laid out like a Mac app. A sidebar on the left lists Servers,
+  Clients, Events, and Activity. Every section is a list with the selected
+  item's details beside it, where before each section had its own layout:
+  cards, popovers, and rows that opened in place.
+- Settings is its own window, on Command-comma and from the gear in the menu
+  bar panel. It is no longer a tab in the main window.
+- Lists and detail panes use the system's own list and form styles, so
+  spacing, selection, and text sizes match the rest of macOS in light and
+  dark.
+
+### Added
+
+- Menus and shortcuts. File has New Server (Command-N), Import Servers
+  (Shift-Command-I), and Watch a Tool (Shift-Command-N). View has the four
+  sections on Command-1 to Command-4, Refresh on Command-R, and the sidebar
+  toggle. Help has How Plug Works, Check Everything, and Show Logs. Check for
+  Updates is in the Plug menu.
+- Delete removes the selected server, after asking. Remove Server is also in
+  a server's right-click menu.
+
 ## [0.9.0] - 2026-10-04
 
 ### Added

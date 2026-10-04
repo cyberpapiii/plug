@@ -258,6 +258,8 @@ enum PlugIntent: Equatable, Sendable {
     /// Stop watching, by event name.
     case removeWatch(event: String)
     case openWindow(AppSection)
+    /// Open the Settings window.
+    case openSettings
     /// Open the first-run guide.
     case showGuide
     /// Open Settings and check everything.
