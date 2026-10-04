@@ -838,13 +838,97 @@ impl Engine {
         crate::operator::OperatorMutationResult,
         crate::reload::ReloadReport,
     )> {
-        let _guard = self.reload_lock.lock().await;
-        let (_, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
-        // The mutation persists the raw file, `$VAR` refs and all. Reload what the
-        // daemon would load at startup, or every env-ref server looks changed.
-        let config = crate::config::load_config(Some(&config_path.to_path_buf()))?;
-        let report = crate::reload::apply_reload(self, config).await?;
+        let (mutation, kept_for, before) = self.keep_typed_secrets(mutation).await;
+        let (result, report) = {
+            let _guard = self.reload_lock.lock().await;
+            let (_, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
+            // The mutation persists the raw file, `$VAR` refs and all. Reload what the
+            // daemon would load at startup, or every env-ref server looks changed.
+            let config = crate::config::load_config(Some(&config_path.to_path_buf()))?;
+            let report = crate::reload::apply_reload(self, config).await?;
+            (result, report)
+        };
+        if let Some((name, server)) = before {
+            let now = self.config.load().servers.get(&name).cloned();
+            let _ = tokio::task::spawn_blocking(move || {
+                crate::secrets::Stores::builtin().forget(&name, &server, now.as_ref());
+            })
+            .await;
+        }
+        // A new value under a name the config already held leaves the file as
+        // it was, so the reload saw nothing to restart.
+        if let Some(name) = kept_for
+            && report.unchanged.contains(&name)
+            && let Err(error) = self.restart_server(&name).await
+        {
+            tracing::warn!(server = %name, %error, "new secret is used at the next restart");
+        }
         Ok((result, report))
+    }
+
+    /// Before a server is written to the config file, move the credentials
+    /// typed into it to the Keychain. This runs in the service, which is the
+    /// one process sure to be in the login session.
+    ///
+    /// Returns the mutation to apply, the server that received new secrets,
+    /// and the server as it was, so secrets it stops referring to are removed.
+    async fn keep_typed_secrets(
+        &self,
+        mutation: crate::operator::OperatorMutation,
+    ) -> (
+        crate::operator::OperatorMutation,
+        Option<String>,
+        Option<(String, ServerConfig)>,
+    ) {
+        use crate::operator::OperatorMutation;
+        let keep = |name: String, mut server: ServerConfig| async move {
+            let owner = name.clone();
+            match tokio::task::spawn_blocking(move || {
+                let kept = crate::secrets::Stores::builtin().keep(&owner, &mut server);
+                (server, !kept.is_empty())
+            })
+            .await
+            {
+                Ok((server, kept)) => Ok((name, server, kept)),
+                Err(error) => Err(anyhow::anyhow!(error)),
+            }
+        };
+        let before = |name: &str| {
+            self.config
+                .load()
+                .servers
+                .get(name)
+                .map(|server| (name.to_string(), server.clone()))
+        };
+        match mutation {
+            OperatorMutation::AddServer { name, server } => {
+                let server = match keep(name.clone(), server.clone()).await {
+                    Ok((_, kept, _)) => kept,
+                    Err(_) => server,
+                };
+                (OperatorMutation::AddServer { name, server }, None, None)
+            }
+            OperatorMutation::UpdateServer { name, server } => {
+                let before = before(&name);
+                let (server, kept) = match keep(name.clone(), server.clone()).await {
+                    Ok((_, server, kept)) => (server, kept),
+                    Err(_) => (server, false),
+                };
+                (
+                    OperatorMutation::UpdateServer {
+                        name: name.clone(),
+                        server,
+                    },
+                    kept.then_some(name),
+                    before,
+                )
+            }
+            OperatorMutation::RemoveServer { name } => {
+                let before = before(&name);
+                (OperatorMutation::RemoveServer { name }, None, before)
+            }
+            other => (other, None, None),
+        }
     }
 
     pub fn validate_server_draft(
@@ -1899,6 +1983,57 @@ mod tests {
                 .servers
                 .contains_key("fixture")
         );
+    }
+
+    #[tokio::test]
+    async fn a_key_typed_into_a_server_is_written_as_a_reference() {
+        use crate::secrets::SecretStore;
+        let engine = Arc::new(Engine::new(Config::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::operator::persist_config_atomic(&path, &Config::default()).unwrap();
+        let server: crate::config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "echo",
+            "enabled": false,
+            "env": { "API_TOKEN": "typed-engine-value", "MODE": "fast" }
+        }))
+        .unwrap();
+
+        engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::AddServer {
+                    name: "keeper".into(),
+                    server,
+                },
+            )
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("typed-engine-value"), "{written}");
+        let saved = crate::operator::load_editable_config(&path).unwrap();
+        assert_eq!(
+            saved.servers["keeper"].env["API_TOKEN"],
+            "keychain:keeper.API_TOKEN"
+        );
+        assert_eq!(saved.servers["keeper"].env["MODE"], "fast");
+        let keychain = crate::secrets::memory::keychain();
+        assert_eq!(
+            keychain.get("keeper.API_TOKEN").unwrap().unwrap().as_str(),
+            "typed-engine-value"
+        );
+
+        engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::RemoveServer {
+                    name: "keeper".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(keychain.get("keeper.API_TOKEN").unwrap().is_none());
     }
 
     #[tokio::test]

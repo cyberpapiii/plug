@@ -186,6 +186,12 @@ fn ensure_unit_test_credential_environment() {
     });
 }
 
+/// Whether credentials go to the isolated test backend instead of the
+/// operator's Keychain.
+pub(crate) fn uses_test_credentials() -> bool {
+    test_credential_environment().is_some()
+}
+
 fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
     #[cfg(test)]
     ensure_unit_test_credential_environment();

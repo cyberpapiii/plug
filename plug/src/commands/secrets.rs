@@ -11,7 +11,10 @@ use plug_core::types::SecretString;
 
 use crate::ui;
 
-pub(crate) fn cmd_secret(command: crate::SecretCommands) -> anyhow::Result<()> {
+pub(crate) async fn cmd_secret(
+    config_path: Option<&std::path::PathBuf>,
+    command: crate::SecretCommands,
+) -> anyhow::Result<()> {
     let stores = Stores::builtin();
     let keychain = stores
         .get(KEYCHAIN)
@@ -31,6 +34,55 @@ pub(crate) fn cmd_secret(command: crate::SecretCommands) -> anyhow::Result<()> {
             keychain.remove(&name)?;
             ui::print_success_line(format!(
                 "Removed `{name}` from the Keychain. A running server keeps the value until it restarts."
+            ));
+        }
+        crate::SecretCommands::Move => move_keys(config_path, &stores).await?,
+    }
+    Ok(())
+}
+
+/// Hand each server that has a key in the clear back to the service, which
+/// stores the key and writes a reference, the same as when a key is typed.
+async fn move_keys(
+    config_path: Option<&std::path::PathBuf>,
+    stores: &Stores,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        config_path.is_none(),
+        "`plug secret move` works on the config Plug is running, not on --config"
+    );
+    let (path, config) = super::config::load_editable_config(None)?;
+    let mut servers: Vec<_> = config
+        .servers
+        .into_iter()
+        .filter(|(_, server)| !stores.plaintext(server).is_empty())
+        .collect();
+    servers.sort_by(|a, b| a.0.cmp(&b.0));
+    if servers.is_empty() {
+        ui::print_info_line("No keys are written in the config file.");
+        return Ok(());
+    }
+    for (name, server) in servers {
+        let fields = stores.plaintext(&server).join(", ");
+        super::servers::apply_server_mutation(
+            None,
+            plug_core::operator::OperatorMutation::UpdateServer {
+                name: name.clone(),
+                server,
+            },
+        )
+        .await?;
+        let left = plug_core::operator::load_editable_config(&path)?
+            .servers
+            .get(&name)
+            .map(|server| stores.plaintext(server))
+            .unwrap_or_default();
+        if left.is_empty() {
+            ui::print_success_line(format!("{name}: moved {fields} to the Keychain."));
+        } else {
+            ui::print_warning_line(format!(
+                "{name}: the Keychain did not take {}; left in the config file.",
+                left.join(", ")
             ));
         }
     }

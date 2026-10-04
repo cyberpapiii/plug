@@ -3556,7 +3556,7 @@ mod tests {
     async fn a_resolved_secret_reaches_the_server_and_never_the_error() {
         use crate::secrets::SecretStore;
         let value = "resolved-secret-value-0123";
-        crate::secrets::testing::keychain()
+        crate::secrets::memory::keychain()
             .set("start-present", &value.to_string().into())
             .unwrap();
         let mut config = test_server_config();
