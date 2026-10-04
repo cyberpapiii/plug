@@ -15,6 +15,9 @@ targets:
     platform: macOS
     sources:
       - path: PlugApp
+      - path: ../docs/guides/agent-setup.md
+        type: file
+        buildPhase: resources
     dependencies:
       - package: PlugIPC
       - package: Sparkle

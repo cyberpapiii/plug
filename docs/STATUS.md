@@ -47,9 +47,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- A guided first run in the app. Import and one-switch linking exist, but
-  nothing walks a newcomer through what Plug is and its two sides. Also a
-  prompt or skill an agent can follow to set Plug up.
 - Block single tools centrally. Asking before a call stays with the client.
 - Several accounts for one server without adding the server twice.
 - Tools from plain HTTP APIs (OpenAPI, GraphQL) with no MCP server.

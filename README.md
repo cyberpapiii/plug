@@ -89,6 +89,10 @@ plug setup
 
 This discovers existing MCP servers, imports them into `plug`, and walks you through linking your AI clients.
 
+In Plug.app, the question mark in the window's toolbar opens the same steps
+as a guide. To have an agent do the setup, give it
+[docs/guides/agent-setup.md](docs/guides/agent-setup.md).
+
 Or create a config file manually at
 `~/Library/Application Support/plug/config.toml` on macOS
 (`~/.config/plug/config.toml` on Linux):

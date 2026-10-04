@@ -14,6 +14,7 @@ final class Router {
     var isAddingServer = false
     var isImportingServers = false
     var isAddingWatch = false
+    var isShowingGuide = false
     /// The server whose settings are open for editing, if any.
     var editingServer: ServerName?
 
@@ -91,6 +92,9 @@ struct PlugIntentRunner {
             Task { await model.signOut(server: server) }
         case let .openWindow(section):
             router.section = section
+            showWindow()
+        case .showGuide:
+            router.isShowingGuide = true
             showWindow()
         case .openCurrentWindow:
             showWindow()

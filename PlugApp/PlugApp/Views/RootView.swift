@@ -20,6 +20,9 @@ struct RootView: View {
     let run: (PlugIntent) -> Void
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var search = ""
+    @AppStorage(RootView.guideSeenKey) private var guideSeen = false
+
+    static let guideSeenKey = "guideSeen"
 
     var body: some View {
         VStack(spacing: 0) {
@@ -57,6 +60,14 @@ struct RootView: View {
             // Plug has no menu bar of its own — it is an accessory app — so the
             // window carries the way into Settings itself.
             ToolbarItem {
+                Button { run(.showGuide) } label: {
+                    Image(systemName: "questionmark.circle")
+                }
+                .help("How Plug works")
+                .accessibilityLabel("How Plug works")
+            }
+
+            ToolbarItem {
                 SettingsLink {
                     Image(systemName: "gearshape")
                 }
@@ -76,6 +87,21 @@ struct RootView: View {
         .onChange(of: router.section) {
             search = ""
         }
+        .sheet(isPresented: $router.isShowingGuide, onDismiss: { guideSeen = true }) {
+            GuideView(model: model) { intent in
+                router.isShowingGuide = false
+                guard let intent else { return }
+                // The window shows one sheet at a time, so the next one waits
+                // for this one to finish closing.
+                Task {
+                    try? await Task.sleep(for: .milliseconds(400))
+                    run(intent)
+                }
+            }
+        }
+        .onChange(of: guideOpensByItself, initial: true) {
+            if guideOpensByItself { router.isShowingGuide = true }
+        }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
         .overlay(alignment: .bottom) {
@@ -87,6 +113,14 @@ struct RootView: View {
                     .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
             }
         }
+    }
+
+    private var guideOpensByItself: Bool {
+        FirstRunGuide.opensByItself(
+            seen: guideSeen,
+            loaded: !model.isLoadingInitialData && !model.initialDataUnavailable,
+            serverCount: model.snapshot.configuredServers.count
+        )
     }
 
     /// Tools are searched from Servers, so its field says so.
