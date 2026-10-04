@@ -59,6 +59,8 @@ pub struct HttpState {
     pub auth_mode: crate::config::DownstreamAuthMode,
     pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
     pub slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
+    /// Events made by watching a tool. See `crate::events`.
+    pub watch_events: Option<Arc<crate::events::WatchEvents>>,
     pub sse_channel_capacity: usize,
     pub allowed_origins: Vec<Arc<str>>,
     pub notification_task_started: AtomicBool,
@@ -762,6 +764,23 @@ fn permitted_events<'a>(
         claims.principal_lifecycle.is_active()
             && events.available_to(&claims.client_id, &claims.scopes)
     })
+}
+
+/// The watch events and the client asking, when that client can see any.
+fn watch_events_for<'a>(
+    state: &'a HttpState,
+    auth: &'a AuthStatus,
+) -> Option<(&'a Arc<crate::events::WatchEvents>, &'a str)> {
+    let AuthStatus::Authenticated(Some(claims)) = auth else {
+        return None;
+    };
+    let events = state.watch_events.as_ref()?;
+    (claims.principal_lifecycle.is_active() && events.discoverable_to(&claims.client_id))
+        .then_some((events, claims.client_id.as_str()))
+}
+
+fn events_discoverable(state: &HttpState, auth: &AuthStatus) -> bool {
+    discoverable_events(state, auth).is_some() || watch_events_for(state, auth).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1562,7 +1581,7 @@ async fn handle_request(
         tracing::info!(
             method,
             protocol_era = if modern { "modern" } else { "legacy" },
-            selected_event_client = discoverable_events(state, &auth_status).is_some(),
+            selected_event_client = events_discoverable(state, &auth_status),
             "MCP Events discovery request"
         );
     }
@@ -1611,7 +1630,7 @@ async fn handle_request(
             result.set_server_info(crate::branding::plug_implementation(env!(
                 "CARGO_PKG_VERSION"
             )));
-            if discoverable_events(state, &auth_status).is_some() {
+            if events_discoverable(state, &auth_status) {
                 tracing::info!(
                     method = "server/discover",
                     status = 200,
@@ -1901,10 +1920,7 @@ async fn handle_request(
             if custom.method != "events/list"
                 && let AuthStatus::Authenticated(Some(claims)) = &auth_status
                 && claims.principal_lifecycle.is_active()
-                && state
-                    .slack_events
-                    .as_ref()
-                    .is_some_and(|events| events.discoverable_to(&claims.client_id))
+                && events_discoverable(state, &auth_status)
                 && !claims
                     .scopes
                     .iter()
@@ -1930,7 +1946,15 @@ async fn handle_request(
             } else {
                 permitted_events(state, &auth_status)
             };
-            let Some(events) = eligible else {
+            let params = custom.params.unwrap_or_else(|| json!({}));
+            // A watch event goes to the watch source; everything else is Slack's.
+            let watch = watch_events_for(state, &auth_status).filter(|(events, _)| {
+                custom.method == "events/list"
+                    || params["name"]
+                        .as_str()
+                        .is_some_and(|name| events.owns(name))
+            });
+            if eligible.is_none() && watch.is_none() {
                 if let Some(method) = subscription_method {
                     tracing::info!(
                         method,
@@ -1945,8 +1969,7 @@ async fn handle_request(
                     ),
                     era,
                 );
-            };
-            let params = custom.params.unwrap_or_else(|| json!({}));
+            }
             let result = match custom.method.as_str() {
                 "events/list" => {
                     if params
@@ -1965,11 +1988,26 @@ async fn handle_request(
                             status = 200,
                             "MCP Events discovery outcome"
                         );
-                        Ok(events.catalog())
+                        let mut list = eligible
+                            .map_or_else(|| json!({"events": []}), |events| events.catalog());
+                        if let (Some((events, client_id)), Some(all)) =
+                            (watch, list["events"].as_array_mut())
+                        {
+                            all.extend(events.catalog(client_id));
+                        }
+                        Ok(list)
                     }
                 }
-                "events/subscribe" => events.subscribe(&params).await,
-                _ => events.unsubscribe(&params).await,
+                "events/subscribe" => match (watch, eligible) {
+                    (Some((events, client_id)), _) => events.subscribe(client_id, &params).await,
+                    (None, Some(events)) => events.subscribe(&params).await,
+                    (None, None) => Err(crate::slack_events::denied()),
+                },
+                _ => match (watch, eligible) {
+                    (Some((events, client_id)), _) => events.unsubscribe(client_id, &params).await,
+                    (None, Some(events)) => events.unsubscribe(&params).await,
+                    (None, None) => Err(crate::slack_events::denied()),
+                },
             };
             if let Some(method) = subscription_method {
                 tracing::info!(
@@ -2863,6 +2901,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -3090,6 +3129,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -4104,6 +4144,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(manager),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: state.sse_channel_capacity,
             allowed_origins: state.allowed_origins.clone(),
             notification_task_started: AtomicBool::new(false),
@@ -4626,6 +4667,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -4902,6 +4944,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Auto,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: vec![Arc::from("https://claude.ai")],
             notification_task_started: AtomicBool::new(false),
@@ -6019,6 +6062,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Bearer,
             downstream_oauth: None,
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -6147,6 +6191,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -6210,6 +6255,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -6276,6 +6322,7 @@ mod tests {
                 "offline_access".to_string(),
             ])),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -7487,6 +7534,7 @@ mod tests {
                 "offline_access".to_string(),
             ])),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -7542,6 +7590,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -8153,6 +8202,7 @@ mod tests {
             auth_mode: crate::config::DownstreamAuthMode::Oauth,
             downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
             slack_events: None,
+            watch_events: None,
             sse_channel_capacity: 32,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),

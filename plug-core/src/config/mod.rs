@@ -52,6 +52,9 @@ pub struct Config {
     /// `IpcLiveSessionInfo::client_key`.
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub clients: std::collections::BTreeMap<String, ClientSettings>,
+    /// Events Plug makes itself, such as watching a tool for change.
+    #[serde(default, skip_serializing_if = "crate::events::EventsConfig::is_empty")]
+    pub events: crate::events::EventsConfig,
     /// HTTP server configuration.
     #[serde(default)]
     pub http: HttpConfig,
@@ -90,6 +93,7 @@ impl Default for Config {
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
             clients: std::collections::BTreeMap::new(),
+            events: crate::events::EventsConfig::default(),
             http: HttpConfig::default(),
             modern_upstream_enabled: false,
             daemon_grace_period_secs: 0,
@@ -689,6 +693,29 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             .is_some_and(|server| server.enabled)
         {
             errors.push("http.slack_events requires the enabled slack upstream".into());
+        }
+    }
+    errors.extend(config.events.validate());
+    if !config.events.watch.is_empty() {
+        if !config.http.modern_downstream_enabled
+            || config.http.auth_mode != DownstreamAuthMode::Oauth
+        {
+            errors.push("events.watch requires modern downstream MCP and OAuth".into());
+        }
+        if !config.http.oauth_scopes.as_ref().is_some_and(|scopes| {
+            scopes
+                .iter()
+                .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
+        }) {
+            errors.push("events.watch requires explicit events:subscribe OAuth scope".into());
+        }
+        for watch in &config.events.watch {
+            if !config.servers.contains_key(&watch.server) {
+                errors.push(format!(
+                    "events.watch '{}' names a server that is not configured",
+                    watch.event_name()
+                ));
+            }
         }
     }
 

@@ -9,6 +9,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Plug can watch a tool and tell a client when its result changes. Add an
+  `[[events.watch]]` entry naming a server, a tool, and how often to check, and
+  the event `<server>.<name>` appears to remote clients that support MCP
+  Events. Plug only watches tools their server marks read-only unless the
+  watch says `allow_writes = true`, sends nothing for the first result, and
+  keeps a client away from the events of a server it is kept from. See
+  `docs/events.md`.
 - The Clients tab chooses which servers each client can use. Every client that
   uses Plug has a button that opens its servers with a switch each, and a
   client kept from something says so in its row. The popover says plainly that
