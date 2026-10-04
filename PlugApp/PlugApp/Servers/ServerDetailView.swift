@@ -51,7 +51,12 @@ struct ServerDetailView: View {
 
     private var header: some View {
         DetailHeader(title: server.name, subtitle: statusLine) {
-            StatusGlyph(health: server.health, large: true)
+            ServerGlyph(
+                name: server.name,
+                size: Metric.glyphSlot,
+                status: server.enabled ? server.health.color : nil
+            )
+            .opacity(server.enabled ? 1 : 0.5)
         } controls: {
             Button("Edit…") { run(.editServer(server.name)) }
             Menu {

@@ -9,6 +9,7 @@ struct ServersView: View {
     @Binding var search: String
     let run: (PlugIntent) -> Void
     /// The server being removed, while the app asks first.
+    @Environment(\.splitPane) private var pane
     @State private var removing: String?
     /// Its name, kept so the question still reads right while it closes.
     @State private var removingName = ""
@@ -31,19 +32,23 @@ struct ServersView: View {
                     run: run
                 )
             } else if visibleNames.isEmpty {
-                ContentUnavailableView.search(text: search)
+                NoSearchResults(text: search)
             } else {
                 list
             }
         }
         .navigationSubtitle(serverSummary ?? "")
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
-                Button { run(.addServer) } label: {
-                    Label("Add Server", systemImage: "plus")
+            // The window draws a section once per column; the button goes
+            // above the list.
+            if pane != .detail {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { run(.addServer) } label: {
+                        Label("Add Server", systemImage: "plus")
+                    }
+                    .help("Add a server")
+                    .disabled(!model.canMutate)
                 }
-                .help("Add a server")
-                .disabled(!model.canMutate)
             }
         }
         .onChange(of: visibleNames, initial: true) { keepSelectionVisible() }
@@ -120,19 +125,19 @@ struct ServersView: View {
     @ViewBuilder
     private func group(_ title: String, servers: [ServerFacts]) -> some View {
         if !servers.isEmpty {
-            Section(title) {
-                ForEach(servers) { server in
-                    ServerListRow(server: server)
-                        .tag(server.name)
-                        .contextMenu {
-                            if model.canMutate {
-                                ServerActions(server: server, run: run)
-                                Divider()
-                                Button("Remove Server…", role: .destructive) { askToRemove(server.name) }
-                            }
+            ListGroupHeader(title)
+            ForEach(servers) { server in
+                ServerListRow(server: server)
+                    .tag(server.name)
+                    .contextMenu {
+                        if model.canMutate {
+                            ServerActions(server: server, run: run)
+                            Divider()
+                            Button("Remove Server…", role: .destructive) { askToRemove(server.name) }
                         }
-                }
+                    }
             }
+            .listRowSeparator(.hidden)
         }
     }
 
@@ -165,20 +170,24 @@ struct ServersView: View {
     }
 }
 
-/// A server as a row: one glyph for its state, its name, and what it offers.
-/// The group it sits in already says whether it is running, so the row does
-/// not say it again.
+/// A server as a row: its icon, its name, and what it offers. The group it
+/// sits in already says whether it is running, so only a server that is not
+/// running as it should carries a state glyph.
 private struct ServerListRow: View {
     let server: ServerFacts
 
     var body: some View {
         HStack(spacing: Metric.tight) {
-            StatusGlyph(health: server.health)
+            ServerGlyph(name: server.name)
+                .opacity(server.enabled ? 1 : 0.4)
             Text(server.name)
                 .lineLimit(1)
                 .truncationMode(.middle)
                 .foregroundStyle(server.enabled ? .primary : .secondary)
             Spacer(minLength: Metric.tight)
+            if server.enabled, server.health != .working {
+                StatusGlyph(health: server.health)
+            }
             if let trailing {
                 Text(trailing)
                     .font(.callout.monospacedDigit())

@@ -13,6 +13,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   Clients, Events, and Activity. Every section is a list with the selected
   item's details beside it, where before each section had its own layout:
   cards, popovers, and rows that opened in place.
+- The window has three columns: the sidebar, the list, and the selected
+  item. macOS draws the bars and the dividers between them, so the top bar
+  and the lines between the columns no longer look broken.
+- Servers and clients show icons. A server named for an app on this Mac
+  shows that app's icon, and so does a client connected over the network.
+  Anything else gets a tile with its first letter. A server's state shows as
+  a dot on its icon, and in the list only when it needs attention.
+- The buttons at the bottom of the menu bar panel have icons again.
 - Settings is its own window, on Command-comma and from the menu bar panel.
   It is no longer a tab in the main window.
 - Lists and detail panes use the system's own list and form styles, so

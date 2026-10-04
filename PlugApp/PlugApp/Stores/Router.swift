@@ -17,6 +17,8 @@ final class Router {
     var selectedClient: String?
     var selectedEvent: String?
     var selectedCall: UInt64?
+    /// Whether Activity shows every call or only the failed ones.
+    var activityScope: ActivityView.Scope = .everything
     /// Counts the times a checkup was asked for from outside Settings, so
     /// Settings runs one each time the number moves.
     var checkupRequests = 0
