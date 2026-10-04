@@ -1680,7 +1680,44 @@ impl ServerManager {
             .insert(name.to_string(), failure::summarize_error(error, &secrets));
     }
 
+    /// Follow the secret references in `config`, then start the server.
+    ///
+    /// This is the only place a reference becomes a value. The value goes to
+    /// the transport and nowhere else: the server keeps the config as the
+    /// person wrote it, and an error that quotes the value is redacted here,
+    /// while the value is still known.
     async fn start_server_with_router(
+        name: &str,
+        config: &ServerConfig,
+        tool_router: std::sync::Weak<ToolRouter>,
+        modern_upstream_gate_state: u64,
+    ) -> Result<UpstreamServer, anyhow::Error> {
+        let resolved = crate::secrets::Stores::builtin()
+            .resolve_server(config)
+            .await?;
+        let result =
+            Self::start_resolved(name, &resolved, tool_router, modern_upstream_gate_state).await;
+        if matches!(resolved, std::borrow::Cow::Borrowed(_)) {
+            return result;
+        }
+        match result {
+            Ok(mut upstream) => {
+                upstream.config = config.clone();
+                Ok(upstream)
+            }
+            Err(error) => {
+                let secrets = failure::config_secrets(&resolved);
+                let text = format!("{error:#}");
+                if secrets.iter().any(|secret| text.contains(secret.as_str())) {
+                    Err(anyhow::anyhow!(failure::redact(&text, &secrets)))
+                } else {
+                    Err(error)
+                }
+            }
+        }
+    }
+
+    async fn start_resolved(
         name: &str,
         config: &ServerConfig,
         tool_router: std::sync::Weak<ToolRouter>,
@@ -3487,6 +3524,59 @@ mod tests {
             tool_filter_enabled: true,
             enrichment_servers: std::collections::HashSet::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn a_server_whose_secret_is_missing_says_so_and_does_not_start() {
+        let mut config = test_server_config();
+        config
+            .env
+            .insert("API_KEY".to_string(), "keychain:start-absent".to_string());
+        let manager = ServerManager::new();
+        let error = manager
+            .start_server("needs-key", &config)
+            .await
+            .err()
+            .expect("a missing secret must stop the start");
+        assert_eq!(
+            error.to_string(),
+            "no secret named `start-absent` in keychain; run `plug secret set start-absent`"
+        );
+        assert_eq!(
+            manager
+                .last_errors
+                .get("needs-key")
+                .map(|error| error.clone())
+                .as_deref(),
+            Some("no secret named `start-absent` in keychain; run `plug secret set start-absent`")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_resolved_secret_reaches_the_server_and_never_the_error() {
+        use crate::secrets::SecretStore;
+        let value = "resolved-secret-value-0123";
+        crate::secrets::testing::keychain()
+            .set("start-present", &value.to_string().into())
+            .unwrap();
+        let mut config = test_server_config();
+        config.command = Some("sh".to_string());
+        config.args = vec![
+            "-c".to_string(),
+            "echo \"got $API_KEY\" >&2; exit 3".to_string(),
+        ];
+        config.timeout_secs = 10;
+        config
+            .env
+            .insert("API_KEY".to_string(), "keychain:start-present".to_string());
+        let error = ServerManager::new()
+            .start_server("has-key", &config)
+            .await
+            .err()
+            .expect("the command exits before it speaks MCP");
+        let text = format!("{error:#}");
+        assert!(text.contains("got "), "the server ran with its env: {text}");
+        assert!(!text.contains(value), "the value leaked: {text}");
     }
 
     fn test_server_config() -> ServerConfig {

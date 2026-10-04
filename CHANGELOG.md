@@ -9,6 +9,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A server's key can live in the Keychain instead of in `config.toml`.
+  `plug secret set <name>` asks for the value without showing it, or takes it
+  from a pipe, and stores it; the server then says `keychain:<name>` where the
+  key used to be, as its bearer token or as the value of one of its `env`
+  entries. Only the service reads the value, when it starts that server. A
+  server whose secret is missing says so in `plug status` and the others start
+  as usual. `plug secret rm <name>` removes one.
 - Plug can watch a tool and tell a client when its result changes. Add an
   `[[events.watch]]` entry naming a server, a tool, and how often to check, and
   the event `<server>.<name>` appears to remote clients that support MCP

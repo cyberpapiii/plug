@@ -34,6 +34,7 @@ pub mod operator;
 pub mod protocol;
 pub mod proxy;
 pub mod reload;
+pub mod secrets;
 pub mod server;
 pub mod session;
 pub mod slack_events;
