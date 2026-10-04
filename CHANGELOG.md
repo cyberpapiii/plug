@@ -20,6 +20,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   changed, and how many clients listen. `plug events watch <server> <tool>`
   adds one and says at once when the tool does not exist or is not read-only;
   `plug events unwatch <event>` removes it.
+- The app has an Events tab. It lists every event with how it is doing in one
+  sentence and how many clients listen. Watch a Tool asks for a server, a
+  tool, and how often to check; it offers only the tools the server marks
+  read-only unless you ask for the rest, and Stop Watching removes a watch.
 - The Clients tab chooses which servers each client can use. Every client that
   uses Plug has a button that opens its servers with a switch each, and a
   client kept from something says so in its row. The popover says plainly that

@@ -154,6 +154,65 @@ final class FrameCodecTests: XCTestCase {
         )
     }
 
+    func testAWatchIsSentAsTheDaemonReadsItAndKeepsArgumentKeys() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let request = IPCRequest.addWatch(
+            authToken: "secret",
+            watch: WatchConfig(
+                name: "unread", server: "gmail", tool: "search_messages",
+                arguments: ["maxResults": .number(5), "filter": .object(["labelIds": .array([.string("INBOX")])])],
+                everySecs: 60
+            )
+        )
+        let frame = try FrameCodec.encode(request, encoder: encoder)
+        let sent = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
+        XCTAssertEqual(
+            sent,
+            [
+                "type": "AddWatch", "auth_token": "secret",
+                "watch": [
+                    "name": "unread", "server": "gmail", "tool": "search_messages",
+                    // Argument names belong to the tool and go out untouched.
+                    "arguments": ["maxResults": 5, "filter": ["labelIds": ["INBOX"]]],
+                    "every_secs": 60, "allow_writes": false,
+                ] as NSDictionary,
+            ] as NSDictionary
+        )
+
+        let removal = try FrameCodec.encode(
+            IPCRequest.removeWatch(authToken: "secret", event: "gmail.unread"), encoder: encoder
+        )
+        XCTAssertEqual(
+            try JSONSerialization.jsonObject(with: removal.dropFirst(4)) as? NSDictionary,
+            ["type": "RemoveWatch", "auth_token": "secret", "event": "gmail.unread"] as NSDictionary
+        )
+    }
+
+    func testSnapshotEventsAndToolFactsDecode() throws {
+        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let events = try decoder.decode([EventStatus].self, from: Data(#"""
+        [{"name":"gmail.unread","server":"gmail","tool":"search_messages","every_secs":300,
+          "state":"call_failed","last_checked":10,"subscribers":2},
+         {"name":"slack.ditto_message","server":"slack"}]
+        """#.utf8))
+        XCTAssertEqual(events[0].everySecs, 300)
+        XCTAssertEqual(events[0].state, "call_failed")
+        XCTAssertEqual(events[0].lastChecked, 10)
+        XCTAssertNil(events[0].lastChanged)
+        XCTAssertEqual(events[0].subscribers, 2)
+        XCTAssertEqual(events[1].state, "waiting")
+        XCTAssertNil(events[1].tool)
+
+        let tools = try decoder.decode([ToolInfo].self, from: Data(#"""
+        [{"name":"Gmail__search","server_id":"workspace","own_name":"search_gmail","read_only":true},
+         {"name":"old__tool","server_id":"old"}]
+        """#.utf8))
+        XCTAssertEqual(tools[0].ownName, "search_gmail")
+        XCTAssertTrue(tools[0].readOnly)
+        XCTAssertNil(tools[1].ownName)
+        XCTAssertFalse(tools[1].readOnly)
+    }
+
     func testServerConfigRequestAndResponseRoundTripAdvancedFields() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let request = IPCRequest.serverConfig(authToken: "secret", name: "workspace")

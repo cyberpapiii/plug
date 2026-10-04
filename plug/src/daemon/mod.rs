@@ -1970,7 +1970,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     let upstream = tool_router
                         .server_manager()
                         .get_upstream_metadata(&server_id);
+                    let own = tool_router.own_tool(tool.name.as_ref());
                     plug_core::ipc::IpcToolInfo {
+                        own_name: own.as_ref().map(|(name, _)| name.clone()),
+                        read_only: own.is_some_and(|(_, read_only)| read_only),
                         source: config
                             .servers
                             .get(&server_id)

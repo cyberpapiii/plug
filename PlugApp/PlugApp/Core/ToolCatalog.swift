@@ -15,19 +15,28 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
     /// The wildcard hiding this tool, when it is not switched off by name.
     /// A tool inside a wildcard cannot be switched back on by itself.
     let lockedByPattern: String?
+    /// The name the server gives the tool. A rename or a group prefix can
+    /// make the merged name unrelated to it.
+    let ownName: String?
+    /// The server says calling this tool changes nothing.
+    let isReadOnly: Bool
 
     init(
         name: String,
         server: String,
         summary: String? = nil,
         isOn: Bool = true,
-        lockedByPattern: String? = nil
+        lockedByPattern: String? = nil,
+        ownName: String? = nil,
+        isReadOnly: Bool = false
     ) {
         self.name = name
         self.server = server
         self.summary = summary
         self.isOn = isOn
         self.lockedByPattern = lockedByPattern
+        self.ownName = ownName
+        self.isReadOnly = isReadOnly
     }
 
     /// The name without its server prefix, which the surrounding group already
@@ -50,7 +59,9 @@ extension ToolFacts {
             server: info.serverId,
             summary: info.description ?? info.title,
             isOn: !info.disabled,
-            lockedByPattern: info.disabledByPattern
+            lockedByPattern: info.disabledByPattern,
+            ownName: info.ownName,
+            isReadOnly: info.readOnly
         )
     }
 }

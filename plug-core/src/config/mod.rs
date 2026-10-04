@@ -700,14 +700,17 @@ pub fn validate_config(config: &Config) -> Vec<String> {
         if !config.http.modern_downstream_enabled
             || config.http.auth_mode != DownstreamAuthMode::Oauth
         {
-            errors.push("events.watch requires modern downstream MCP and OAuth".into());
+            errors.push(
+                "events.watch needs remote clients that sign in: set http.modern_downstream_enabled = true and http.auth_mode = \"oauth\""
+                    .into(),
+            );
         }
         if !config.http.oauth_scopes.as_ref().is_some_and(|scopes| {
             scopes
                 .iter()
                 .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
         }) {
-            errors.push("events.watch requires explicit events:subscribe OAuth scope".into());
+            errors.push("events.watch needs \"events:subscribe\" in http.oauth_scopes".into());
         }
         for watch in &config.events.watch {
             if !config.servers.contains_key(&watch.server) {
