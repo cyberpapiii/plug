@@ -52,35 +52,10 @@ fn live_inventory_summary(inventory: &crate::runtime::LiveInventoryMetadata) -> 
 }
 
 fn configured_client_state_text(client: &crate::commands::clients::ClientView) -> String {
-    let mut states = Vec::new();
-    if client.detected {
-        states.push("detected".to_string());
-    }
-    if client.live {
-        let transport_summary = if client.live_transports.is_empty() {
-            "unknown".to_string()
-        } else {
-            client
-                .live_transports
-                .iter()
-                .map(|transport| match transport.as_str() {
-                    "daemon_proxy" => "local",
-                    other => other,
-                })
-                .collect::<Vec<_>>()
-                .join("+")
-        };
-        let sessions = match client.live_sessions {
-            1 => "1 live session".to_string(),
-            count => format!("{count} live sessions"),
-        };
-        states.push(format!("{sessions} ({transport_summary})"));
-    }
-
-    if states.is_empty() {
-        "configured only".to_string()
-    } else {
-        states.join(", ")
+    match client.live_sessions {
+        _ if !client.live => "not connected now".to_string(),
+        1 => "connected now".to_string(),
+        count => format!("connected now, {count} connections"),
     }
 }
 
@@ -329,9 +304,9 @@ fn unlinked_clients_text(clients: &[crate::commands::clients::ClientView]) -> Op
         .filter(|client| !client.linked)
         .map(|client| {
             if client.live {
-                format!("{} (live)", client.name)
+                format!("{} (connected now)", client.name)
             } else if client.detected {
-                format!("{} (detected)", client.name)
+                format!("{} (on this Mac)", client.name)
             } else {
                 client.name.clone()
             }
@@ -381,7 +356,7 @@ pub(crate) async fn cmd_client_list(
             return Ok(());
         }
 
-        print_banner("◆", "Clients", "Linked, detected, and live AI clients");
+        print_banner("◆", "Clients", "The clients that use Plug");
         if started {
             println!();
         }
@@ -390,38 +365,44 @@ pub(crate) async fn cmd_client_list(
             LiveClientSupport::DaemonRestartRequired
         ) {
             print_warning_line(
-                "Live client inspection requires restarting the background daemon after this upgrade.",
+                "Plug was updated. Restart it to see which clients are connected now.",
             );
             println!();
         } else if let Some(error) = &daemon_error {
             print_warning_line(format!(
-                "Live client inspection unavailable: {error}. Showing linked and detected clients from config only."
+                "Plug is not answering ({error}), so it cannot say who is connected now."
             ));
             println!();
         }
         if let Some(error) = &config_error {
             print_warning_line(format!(
-                "Config validation failed: {error}. Lazy tool modes below fall back to defaults until config is fixed."
+                "The settings file has a problem: {error}. Run `plug config check`."
             ));
             println!();
         }
         let linked_count = clients.iter().filter(|client| client.linked).count();
         let detected_count = clients.iter().filter(|client| client.detected).count();
         print_heading("Summary");
-        print_label_value("Linked", style(linked_count).green().bold());
-        print_label_value("Detected", style(detected_count).cyan().bold());
+        print_label_value("Set up", style(linked_count).green().bold());
+        print_label_value("On this Mac", style(detected_count).cyan().bold());
         match (&daemon_error, &live_client_support) {
             (Some(_), _) => {
-                print_label_value("Live", style("unavailable").yellow().bold());
+                print_label_value("Connected now", style("unknown").yellow().bold());
             }
             (None, LiveClientSupport::Supported) => {
-                print_label_value("Live", style(inventory.session_count).bold());
+                print_label_value("Connected now", style(inventory.session_count).bold());
             }
             (None, LiveClientSupport::DaemonRestartRequired) => {
-                print_label_value("Live", style("restart required").yellow().bold());
+                print_label_value(
+                    "Connected now",
+                    style("restart Plug to see").yellow().bold(),
+                );
             }
         }
-        if daemon_error.is_none() && matches!(live_client_support, LiveClientSupport::Supported) {
+        if verbose
+            && daemon_error.is_none()
+            && matches!(live_client_support, LiveClientSupport::Supported)
+        {
             print_label_value("Live Inventory", live_inventory_summary(&inventory));
             print_info_line(live_inventory_scope_text(live_inventory_scope));
             print_label_value("Live Transports", inventory.session_transports.summary());
@@ -432,15 +413,15 @@ pub(crate) async fn cmd_client_list(
             }
         }
         println!();
-        print_heading("Live Sessions");
+        print_heading("Connected now");
         if live_sessions.is_empty() {
-            print_info_line("No live downstream sessions observed.");
+            print_info_line("No client is connected right now.");
         } else {
             println!(
-                "  {:<24} {:<10} {:<14} {}",
+                "  {:<24} {:<12} {:<14} {}",
                 style("CLIENT").dim(),
-                style("SESSIONS").dim(),
-                style("TRANSPORT").dim(),
+                style("CONNECTIONS").dim(),
+                style("FROM").dim(),
                 style("LONGEST").dim()
             );
             println!(
@@ -449,7 +430,7 @@ pub(crate) async fn cmd_client_list(
             );
             for group in live_session_groups(&live_sessions) {
                 println!(
-                    "  {:<24} {:<10} {:<14} {}",
+                    "  {:<24} {:<12} {:<14} {}",
                     group.client,
                     group.sessions,
                     group.transports.join("+"),
@@ -460,7 +441,7 @@ pub(crate) async fn cmd_client_list(
                 println!();
                 print_live_session_rows(&live_sessions);
             } else {
-                print_info_line(style("Run `plug clients -v` to list each session.").dim());
+                print_info_line(style("`plug clients -v` lists each connection.").dim());
             }
         }
 
@@ -473,17 +454,17 @@ pub(crate) async fn cmd_client_list(
             .collect::<Vec<_>>();
         if !blocks.is_empty() {
             println!();
-            print_heading("Blocked");
+            print_heading("Switched off for a client");
             for (key, settings) in blocks {
                 print_info_line(crate::commands::clients::client_blocks_line(key, settings));
             }
         }
 
         println!();
-        print_heading("Configured Clients");
+        print_heading("Set up to use Plug");
         let linked_clients = clients.iter().filter(|client| client.linked);
         if linked_count == 0 {
-            print_info_line("No clients linked yet. Run `plug link` to add one.");
+            print_info_line("No client is set up yet. Run `plug link` to connect one.");
         } else {
             println!("  {:<24} {}", style("CLIENT").dim(), style("STATE").dim());
             println!(
@@ -497,14 +478,16 @@ pub(crate) async fn cmd_client_list(
                 client.name,
                 style(configured_client_state_text(client)).dim()
             );
-            if let Some(link_text) = configured_client_link_text(client) {
-                print_info_line(style(link_text).dim());
+            if verbose {
+                if let Some(link_text) = configured_client_link_text(client) {
+                    print_info_line(style(link_text).dim());
+                }
+                print_info_line(style(configured_client_lazy_tool_text(client)).dim());
             }
-            print_info_line(style(configured_client_lazy_tool_text(client)).dim());
         }
         if let Some(unlinked) = unlinked_clients_text(&clients) {
             println!();
-            print_label_value("Not linked", style(unlinked).dim());
+            print_label_value("Not set up", style(unlinked).dim());
         }
 
         if !interactive {
@@ -660,7 +643,7 @@ mod tests {
         };
         assert_eq!(
             configured_client_state_text(&client),
-            "detected, 2 live sessions (local)"
+            "connected now, 2 connections"
         );
     }
 
@@ -914,7 +897,7 @@ mod tests {
         ];
         assert_eq!(
             unlinked_clients_text(&clients).as_deref(),
-            Some("Claude Desktop (detected), Goose (live), Zed")
+            Some("Claude Desktop (on this Mac), Goose (connected now), Zed")
         );
         assert_eq!(unlinked_clients_text(&clients[..1]), None);
     }

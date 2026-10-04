@@ -205,16 +205,17 @@ pub(crate) async fn cmd_doctor(
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
         OutputFormat::Text => {
-            print_banner("◆", "Doctor", "Diagnose problems with your plug setup");
+            print_banner("◆", "Checkup", "The whole setup, and what to fix");
             for c in &report.checks {
                 let marker = match c.status {
                     plug_core::doctor::CheckStatus::Pass => style("●").green().bold(),
                     plug_core::doctor::CheckStatus::Warn => style("!").yellow().bold(),
                     plug_core::doctor::CheckStatus::Fail => style("×").red().bold(),
                 };
-                let prefix_text = format!("  {} {:<24} ", "•", c.name);
+                let title = c.title();
+                let prefix_text = format!("  {} {:<26} ", "•", title);
                 let prefix_display =
-                    format!("  {} {} ", marker, style(format!("{:<24}", c.name)).bold());
+                    format!("  {} {} ", marker, style(format!("{:<26}", title)).bold());
                 crate::ui::print_wrapped_rows(
                     &prefix_text,
                     prefix_display,

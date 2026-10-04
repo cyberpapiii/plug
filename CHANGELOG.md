@@ -178,6 +178,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- The command line uses the app's words. `plug status` leads with whether
+  Plug is running, how many clients are connected, and one line per server
+  (Running, Unsteady, Down, Sign-in needed; On this Mac or Over the network);
+  the connection and address detail moved behind `plug status -v`.
+  `plug doctor` names each check the way the app's Checkup does, and the app
+  now takes those names from the same list. `plug clients` says Set up, On
+  this Mac, and Connected now, and keeps link and lazy-tool detail for `-v`.
+- `plug server on|off` and `plug tools on|off` replace `enable|disable`; the
+  old words still work. `plug --help` no longer lists the commands only Plug
+  itself runs (`connect`, `serve`, `stop`, `reload`); they still work.
 - Devin replaces Windsurf everywhere Plug speaks: the target is `devin`
   (`windsurf` still works as an alias), it writes
   `~/.config/devin/mcp_config.json`, the file Devin reads today, and import

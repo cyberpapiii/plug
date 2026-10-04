@@ -8,18 +8,22 @@ struct Check: Identifiable, Equatable, Sendable, Decodable {
 
     var id: String { name }
     let name: String
+    /// What the row says. The runtime owns these words, so the app and
+    /// `plug doctor` name every check the same way.
+    let title: String
     let result: Result
     let message: String
     /// What the runtime suggests doing about it, when it has a suggestion.
     let fix: String?
 
     private enum CodingKeys: String, CodingKey {
-        case name, status, message
+        case name, title, status, message
         case fix = "fix_suggestion"
     }
 
-    init(name: String, result: Result, message: String, fix: String? = nil) {
+    init(name: String, title: String? = nil, result: Result, message: String, fix: String? = nil) {
         self.name = name
+        self.title = title ?? Self.readable(name)
         self.result = result
         self.message = message
         self.fix = fix
@@ -28,6 +32,7 @@ struct Check: Identifiable, Equatable, Sendable, Decodable {
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
+        title = try container.decodeIfPresent(String.self, forKey: .title) ?? Self.readable(name)
         message = try container.decodeIfPresent(String.self, forKey: .message) ?? ""
         fix = try container.decodeIfPresent(String.self, forKey: .fix)
         let status = try container.decodeIfPresent(String.self, forKey: .status)?.lowercased()
@@ -38,27 +43,8 @@ struct Check: Identifiable, Equatable, Sendable, Decodable {
         }
     }
 
-    /// The check's own name is an identifier (`config_permissions`). This is
-    /// what the row says instead.
-    var title: String {
-        switch name {
-        case "config_exists": "Settings file"
-        case "config_permissions": "Settings file is private"
-        case "keys_in_config": "Keys kept in the Keychain"
-        case "port_available": "Network port"
-        case "env_vars": "Server passwords and keys"
-        case "server_binaries": "Server programs"
-        case "tool_collisions": "Tool names"
-        case "client_limits": "How many tools apps can take"
-        case "pid_staleness", "runtime_health": "Background service"
-        case "client_configs": "App setup"
-        case "server_connectivity": "Servers responding"
-        case "http_auth", "downstream_oauth_owner": "Remote access"
-        case "oauth_config", "oauth_tokens": "Stored sign-ins"
-        case "codesign_identity": "App signature"
-        case "unified_install": "Installation"
-        default: name.replacingOccurrences(of: "_", with: " ").capitalized
-        }
+    private static func readable(_ name: String) -> String {
+        name.replacingOccurrences(of: "_", with: " ")
     }
 }
 

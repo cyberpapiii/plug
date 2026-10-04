@@ -230,10 +230,10 @@ pub(crate) fn status_label(
     health: &plug_core::types::ServerHealth,
 ) -> console::StyledObject<&'static str> {
     match health {
-        plug_core::types::ServerHealth::Healthy => style("Healthy").green(),
-        plug_core::types::ServerHealth::Degraded => style("Degraded").yellow(),
-        plug_core::types::ServerHealth::Failed => style("Failed").red(),
-        plug_core::types::ServerHealth::AuthRequired => style("Auth Required").magenta(),
+        plug_core::types::ServerHealth::Healthy => style("Running").green(),
+        plug_core::types::ServerHealth::Degraded => style("Unsteady").yellow(),
+        plug_core::types::ServerHealth::Failed => style("Down").red(),
+        plug_core::types::ServerHealth::AuthRequired => style("Sign-in needed").magenta(),
     }
 }
 
@@ -299,6 +299,15 @@ pub(crate) fn summarize_server_transport(
         Some(plug_core::config::TransportType::Sse) => "sse",
         Some(plug_core::config::TransportType::OpenApi) => "openapi",
         None => "unknown",
+    }
+}
+
+/// Where a server runs, in the words the app uses.
+pub(crate) fn server_place(server: Option<&plug_core::config::ServerConfig>) -> &'static str {
+    match server.map(|server| &server.transport) {
+        Some(plug_core::config::TransportType::Stdio) => "On this Mac",
+        Some(_) => "Over the network",
+        None => "",
     }
 }
 

@@ -191,8 +191,8 @@ plug status                  # Show runtime health and next useful action
 plug doctor                  # Diagnose connectivity and configuration issues
 plug repair                  # Refresh linked client configuration files
 plug config check            # Validate config syntax and core rules
-plug tools disable --server slack
-plug tools enable --server slack
+plug tools off --server slack
+plug tools on --server slack
 plug tools --output json     # Machine-readable output for agent use
 plug auth login --server name  # OAuth login for remote MCP servers
 plug auth status               # Show per-server auth status

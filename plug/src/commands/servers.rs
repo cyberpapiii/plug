@@ -1032,9 +1032,9 @@ pub(crate) async fn cmd_server_set_enabled(
     )
     .await?;
     if enabled {
-        print_success_line(format!("Enabled server `{name}`."));
+        print_success_line(format!("{name} is on."));
     } else {
-        print_success_line(format!("Disabled server `{name}`."));
+        print_success_line(format!("{name} is off."));
     }
     Ok(())
 }

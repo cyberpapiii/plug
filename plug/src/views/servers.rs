@@ -139,9 +139,9 @@ pub(crate) async fn cmd_server_list(
                 }
                 OutputFormat::Text => {
                     if servers.is_empty() {
-                        print_banner("◆", "Servers", "No servers configured");
+                        print_banner("◆", "Servers", "No servers yet");
                         println!();
-                        print_info_line("Use `Add server` below to create your first upstream.");
+                        print_info_line("Use `Add server` below to add your first one.");
                     } else {
                         let mut healthy = 0usize;
                         let mut degraded = 0usize;
@@ -162,7 +162,7 @@ pub(crate) async fn cmd_server_list(
                             "◆",
                             "Servers",
                             &format!(
-                                "{} server(s) active",
+                                "{} on",
                                 servers
                                     .iter()
                                     .filter(|server| server.server_id != "__plug_internal__")
@@ -173,12 +173,12 @@ pub(crate) async fn cmd_server_list(
                             println!();
                         }
                         print_heading("Summary");
-                        print_label_value("Healthy", style(healthy).green().bold());
-                        print_label_value("Degraded", style(degraded).yellow().bold());
-                        print_label_value("Failed", style(failed).red().bold());
-                        print_label_value("Auth Required", style(auth_required).yellow().bold());
+                        print_label_value("Running", style(healthy).green().bold());
+                        print_label_value("Unsteady", style(degraded).yellow().bold());
+                        print_label_value("Down", style(failed).red().bold());
+                        print_label_value("Sign-in needed", style(auth_required).yellow().bold());
                         println!();
-                        print_heading("Inventory");
+                        print_heading("Servers");
                         for s in &servers {
                             if s.server_id == "__plug_internal__" {
                                 continue;
@@ -186,20 +186,18 @@ pub(crate) async fn cmd_server_list(
                             let server_cfg = config
                                 .as_ref()
                                 .and_then(|cfg| cfg.servers.get(&s.server_id));
-                            let transport = summarize_server_transport(server_cfg);
-                            let auth = summarize_server_auth(server_cfg);
+                            let place = crate::ui::server_place(server_cfg);
                             let target = summarize_server_target(server_cfg, 28);
                             let protocol = protocol_label(
                                 s.selected_protocol_era,
                                 s.selected_protocol_version.as_deref(),
                             );
                             println!(
-                                "  {} {:<18} {:<12} {:<8} {:<6} {:<28} ({} tools; {})",
+                                "  {} {:<18} {:<14} {:<16} {:<28} ({} tools; {})",
                                 status_marker(&s.health),
                                 style(&s.server_id).bold(),
                                 status_label(&s.health),
-                                transport,
-                                auth,
+                                place,
                                 target,
                                 s.tool_count,
                                 protocol
@@ -233,33 +231,27 @@ pub(crate) async fn cmd_server_list(
                             || !degraded_servers.is_empty()
                         {
                             println!();
-                            print_heading("Recovery");
+                            print_heading("Needs you");
                             if !auth_required_servers.is_empty() {
-                                print_label_value(
-                                    "Auth",
-                                    format!(
-                                        "{} need re-auth — run `plug auth status` or `plug auth login --server <name>`",
-                                        auth_required_servers.join(", ")
-                                    ),
-                                );
+                                for name in &auth_required_servers {
+                                    print_info_line(format!(
+                                        "{name} needs a sign-in. Run `plug auth login --server {name}`."
+                                    ));
+                                }
                             }
                             if !failed_servers.is_empty() {
-                                print_label_value(
-                                    "Failed",
-                                    format!(
-                                        "{} failed — the reason is under each server; Plug keeps retrying",
-                                        failed_servers.join(", ")
-                                    ),
-                                );
+                                for name in &failed_servers {
+                                    print_info_line(format!(
+                                        "{name} is down. The reason is under its name; Plug keeps trying."
+                                    ));
+                                }
                             }
                             if !degraded_servers.is_empty() {
-                                print_label_value(
-                                    "Degraded",
-                                    format!(
-                                        "{} are degraded — compare `plug status` and `plug doctor` for runtime/auth details",
-                                        degraded_servers.join(", ")
-                                    ),
-                                );
+                                for name in &degraded_servers {
+                                    print_info_line(format!(
+                                        "{name} is unsteady: some calls fail. Run `plug doctor`."
+                                    ));
+                                }
                             }
                         }
                     }
@@ -285,7 +277,7 @@ pub(crate) async fn cmd_server_list(
                         }
                     ),
                 );
-                print_heading("Inventory");
+                print_heading("Servers");
                 println!(
                     "  {:<18} {:<8} {:<6} {:<40} {}",
                     style("SERVER").dim(),
