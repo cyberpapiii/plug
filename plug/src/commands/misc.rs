@@ -1690,7 +1690,7 @@ mod tests {
         assert_eq!(exported["mcpServers"]["plug"]["command"], canonical_command);
         assert_eq!(
             exported["mcpServers"]["plug"]["args"],
-            serde_json::json!(["connect"])
+            serde_json::json!(["connect", "--client", "cursor"])
         );
 
         // Production delegation is a full exec plan into the verified app.

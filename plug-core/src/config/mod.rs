@@ -925,31 +925,10 @@ pub fn canonical_client_target(target: &str) -> Option<&'static str> {
 }
 
 fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
-    match target.parse::<crate::export::ExportTarget>().ok()? {
-        crate::export::ExportTarget::ClaudeDesktop => Some("claude-desktop"),
-        crate::export::ExportTarget::ClaudeCode => Some("claude-code"),
-        crate::export::ExportTarget::Cursor => Some("cursor"),
-        crate::export::ExportTarget::Devin => Some("devin"),
-        crate::export::ExportTarget::VSCodeCopilot => Some("vscode"),
-        crate::export::ExportTarget::CopilotCli => Some("copilot-cli"),
-        crate::export::ExportTarget::GeminiCli => Some("gemini-cli"),
-        crate::export::ExportTarget::CodexCli => Some("codex-cli"),
-        crate::export::ExportTarget::GrokBuild => Some("grok-build"),
-        crate::export::ExportTarget::OpenCode => Some("opencode"),
-        crate::export::ExportTarget::Zed => Some("zed"),
-        crate::export::ExportTarget::Cline => Some("cline"),
-        crate::export::ExportTarget::ClineCli => Some("cline-cli"),
-        crate::export::ExportTarget::RooCode => Some("roocode"),
-        crate::export::ExportTarget::Factory => Some("factory"),
-        crate::export::ExportTarget::Nanobot => Some("nanobot"),
-        crate::export::ExportTarget::Junie => Some("junie"),
-        crate::export::ExportTarget::Kilo => Some("kilo"),
-        crate::export::ExportTarget::Pi => Some("pi"),
-        crate::export::ExportTarget::Warp => Some("warp"),
-        crate::export::ExportTarget::Kiro => Some("kiro"),
-        crate::export::ExportTarget::Antigravity => Some("antigravity"),
-        crate::export::ExportTarget::Goose => Some("goose"),
-    }
+    target
+        .parse::<crate::export::ExportTarget>()
+        .ok()
+        .map(|target| target.target_name())
 }
 
 fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String> {

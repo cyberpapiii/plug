@@ -127,6 +127,9 @@ struct ClientNames: Equatable {
         let key = key(of: session)
         return name(forKey: key)
             ?? session.knownName
+            // A link says which client it was written for; that outranks
+            // the program that happened to start the connector.
+            ?? key.flatMap(AppIcons.displayName(forTarget:))
             ?? key.flatMap { grantNames[$0] }
             ?? session.displayName
     }
@@ -386,7 +389,7 @@ struct ClientsView: View {
     private func sessionRow(_ session: LiveSession) -> some View {
         HStack(spacing: Metric.snug) {
             AppGlyph(
-                target: AppIcons.target(forClientType: session.clientType),
+                target: sessionTarget(session),
                 name: displayName(session),
                 appPath: session.host?.app
             )
@@ -416,6 +419,17 @@ struct ClientsView: View {
     }
 
     private func displayName(_ session: LiveSession) -> String { names.displayName(session) }
+
+    /// The target whose icon a session shows: the client it reports, else the
+    /// client its link was written for.
+    private func sessionTarget(_ session: LiveSession) -> String {
+        let reported = AppIcons.target(forClientType: session.clientType)
+        if AppIcons.displayName(forTarget: reported) != nil { return reported }
+        if let key = names.key(of: session), AppIcons.displayName(forTarget: key) != nil {
+            return key
+        }
+        return reported
+    }
 
     /// Says how it reached Plug in words, not transport identifiers.
     private func connectionDescription(_ session: LiveSession) -> String {

@@ -76,14 +76,25 @@ pub(crate) struct LiveSessionView {
 
 impl LiveSessionView {
     /// What to call the session: the name the owner gave it, else the client
-    /// Plug recognised, else the program that started it.
+    /// Plug recognised, else the client its link was written for, else the
+    /// program that started it.
     pub(crate) fn label(&self) -> &str {
         if let Some(name) = &self.name {
             return name;
         }
-        match &self.host {
-            Some(host) if self.client_type == "Unknown" => &host.name,
-            _ => &self.client_type,
+        if self.client_type != "Unknown" {
+            return &self.client_type;
+        }
+        let linked = self.key.as_deref().and_then(|key| {
+            all_client_targets()
+                .iter()
+                .find(|(_, target)| *target == key)
+                .map(|(name, _)| *name)
+        });
+        match (linked, &self.host) {
+            (Some(name), _) => name,
+            (None, Some(host)) => &host.name,
+            (None, None) => &self.client_type,
         }
     }
 }
@@ -354,7 +365,7 @@ pub fn classify_plug_client_command(
     args: &[String],
     canonical: &Path,
 ) -> PlugLinkDisposition {
-    if args != ["connect"] {
+    if !plug_core::export::is_connect_args(args) {
         return PlugLinkDisposition::UnknownCommand;
     }
 
@@ -1513,7 +1524,10 @@ fn replace_json_stdio_command(
     .and_then(serde_json::Value::as_object_mut)
     .ok_or_else(|| anyhow::anyhow!("missing JSON Plug entry"))?;
     plug.insert("command".to_string(), serde_json::Value::String(command));
-    plug.insert("args".to_string(), serde_json::json!(["connect"]));
+    plug.insert(
+        "args".to_string(),
+        serde_json::json!(["connect", "--client", target.target_name()]),
+    );
     Ok(serde_json::to_string_pretty(&value)?)
 }
 
@@ -1925,6 +1939,29 @@ extensions:
             ),
             PlugLinkDisposition::UnknownCommand
         );
+
+        // A link that says which client it serves is the same link.
+        let named = ["connect", "--client", "cursor"].map(str::to_string);
+        assert_eq!(
+            classify_plug_client_command(canonical.to_str().unwrap(), &named, canonical),
+            PlugLinkDisposition::Canonical
+        );
+        assert_eq!(
+            classify_plug_client_command("/opt/homebrew/bin/plug", &named, canonical),
+            PlugLinkDisposition::RecognizedLegacy
+        );
+        for other in [
+            vec!["connect", "--client"],
+            vec!["connect", "--config", "/tmp/other.toml"],
+            vec!["connect", "--client", "cursor", "--verbose"],
+        ] {
+            let other: Vec<String> = other.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                classify_plug_client_command(canonical.to_str().unwrap(), &other, canonical),
+                PlugLinkDisposition::UnknownCommand,
+                "{other:?} is not an argument list plug link writes"
+            );
+        }
     }
 
     #[test]
