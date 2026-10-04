@@ -350,6 +350,18 @@ pub(crate) async fn apply_server_mutation(
                 auth_token,
             }
         }
+        plug_core::operator::OperatorMutation::SetClientBlock {
+            key,
+            kind,
+            target,
+            blocked,
+        } => plug_core::ipc::IpcRequest::SetClientBlock {
+            key,
+            kind,
+            target,
+            blocked,
+            auth_token,
+        },
     };
     match crate::daemon::ipc_request(&request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),

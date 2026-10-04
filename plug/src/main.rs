@@ -573,6 +573,28 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Clients {
             command: Some(commands::clients::ClientCommands::Rename { client, name }),
         }) => commands::clients::cmd_client_rename(cli.config.as_ref(), client, name).await?,
+        Some(Commands::Clients {
+            command:
+                Some(commands::clients::ClientCommands::Block {
+                    client,
+                    servers,
+                    tools,
+                }),
+        }) => {
+            commands::clients::cmd_client_block(cli.config.as_ref(), client, servers, tools, true)
+                .await?
+        }
+        Some(Commands::Clients {
+            command:
+                Some(commands::clients::ClientCommands::Unblock {
+                    client,
+                    servers,
+                    tools,
+                }),
+        }) => {
+            commands::clients::cmd_client_block(cli.config.as_ref(), client, servers, tools, false)
+                .await?
+        }
         Some(Commands::Tools { command, server }) => {
             commands::tools::cmd_tool_command(
                 cli.config.as_ref(),

@@ -1688,6 +1688,24 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             )
             .await
         }
+        IpcRequest::SetClientBlock {
+            key,
+            kind,
+            target,
+            blocked,
+            ..
+        } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::SetClientBlock {
+                    key: key.clone(),
+                    kind: *kind,
+                    target: target.clone(),
+                    blocked: *blocked,
+                },
+            )
+            .await
+        }
         IpcRequest::RestartServer { server_id, .. } => {
             match ctx.engine.restart_server(server_id).await {
                 Ok(()) => IpcResponse::Ok,

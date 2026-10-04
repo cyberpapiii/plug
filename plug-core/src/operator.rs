@@ -35,6 +35,23 @@ pub enum OperatorMutation {
         key: String,
         name: String,
     },
+    /// Keep a client from a server or a tool, or let it back in.
+    SetClientBlock {
+        key: String,
+        kind: ClientBlockKind,
+        target: String,
+        blocked: bool,
+    },
+}
+
+/// What a per-client block names.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientBlockKind {
+    /// A whole upstream server, by its name in the config.
+    Server,
+    /// A tool, by the name Plug lists it under; `*` is a wildcard.
+    Tool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -137,6 +154,15 @@ pub fn apply_operator_mutation(
             rename_client(&mut config, &key, &name)?;
             OperatorMutationResult::server(None)
         }
+        OperatorMutation::SetClientBlock {
+            key,
+            kind,
+            target,
+            blocked,
+        } => {
+            set_client_block(&mut config, &key, kind, &target, blocked)?;
+            OperatorMutationResult::server(None)
+        }
     };
     persist_config_atomic(path, &config)?;
     Ok((config, result))
@@ -205,6 +231,46 @@ fn rename_client(config: &mut Config, key: &str, name: &str) -> anyhow::Result<(
         }
     } else {
         config.clients.entry(key.to_string()).or_default().name = Some(name.to_string());
+    }
+    Ok(())
+}
+
+/// Keep a client from a server or a tool, or let it back in.
+///
+/// Like a name, a block is stored under a key that need not be connected. A
+/// server has to be one in the config to be blocked, so a typo cannot sit
+/// there looking like a block; anything can be unblocked, so a block on a
+/// server since removed can still be cleared.
+fn set_client_block(
+    config: &mut Config,
+    key: &str,
+    kind: ClientBlockKind,
+    target: &str,
+    blocked: bool,
+) -> anyhow::Result<()> {
+    let key = key.trim();
+    let target = target.trim();
+    if key.is_empty() {
+        anyhow::bail!("client key is required");
+    }
+    if target.is_empty() || target.chars().any(char::is_control) {
+        anyhow::bail!("name the server or tool to block");
+    }
+    if blocked && kind == ClientBlockKind::Server && !config.servers.contains_key(target) {
+        anyhow::bail!("no server is called `{target}`; run `plug servers` to see their names");
+    }
+    let settings = config.clients.entry(key.to_string()).or_default();
+    let list = match kind {
+        ClientBlockKind::Server => &mut settings.blocked_servers,
+        ClientBlockKind::Tool => &mut settings.blocked_tools,
+    };
+    list.retain(|existing| existing != target);
+    if blocked {
+        list.push(target.to_string());
+        list.sort();
+    }
+    if settings.is_empty() {
+        config.clients.remove(key);
     }
     Ok(())
 }
@@ -528,5 +594,53 @@ API_KEY = "sk-live-123"
 
         let reloaded = load_editable_config(&path).unwrap();
         assert!(!reloaded.servers["search"].enabled);
+    }
+    #[test]
+    fn a_client_block_round_trips_and_leaves_no_empty_entry() {
+        let path = fixture_path();
+        std::fs::write(
+            &path,
+            "[servers.git]\ncommand = \"git-mcp\"\n\n[clients.cursor]\nname = \"Work Cursor\"\n",
+        )
+        .unwrap();
+        let block = |key: &str, kind, target: &str, blocked| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::SetClientBlock {
+                    key: key.to_string(),
+                    kind,
+                    target: target.to_string(),
+                    blocked,
+                },
+            )
+        };
+
+        // A server has to exist to be blocked; a tool pattern is free text.
+        assert!(block("pi", ClientBlockKind::Server, "gti", true).is_err());
+        block("pi", ClientBlockKind::Server, "git", true).unwrap();
+        block("pi", ClientBlockKind::Server, "git", true).unwrap();
+        block("pi", ClientBlockKind::Tool, "slack__*", true).unwrap();
+        let (config, _) = block("cursor", ClientBlockKind::Tool, "git__push", true).unwrap();
+        assert_eq!(config.clients["pi"].blocked_servers, ["git"]);
+        assert_eq!(config.clients["pi"].blocked_tools, ["slack__*"]);
+        assert_eq!(
+            config.clients["cursor"].name.as_deref(),
+            Some("Work Cursor")
+        );
+
+        let reloaded = crate::config::load_config(Some(&path)).unwrap();
+        assert_eq!(reloaded.clients, config.clients);
+
+        block("pi", ClientBlockKind::Server, "git", false).unwrap();
+        let (config, _) = block("pi", ClientBlockKind::Tool, "slack__*", false).unwrap();
+        assert!(!config.clients.contains_key("pi"), "nothing left to keep");
+        // Unblocking keeps the name, and unblocking what was never blocked
+        // is not an error.
+        let (config, _) = block("cursor", ClientBlockKind::Tool, "git__push", false).unwrap();
+        assert_eq!(
+            config.clients["cursor"].name.as_deref(),
+            Some("Work Cursor")
+        );
+        block("nobody", ClientBlockKind::Server, "gone", false).unwrap();
     }
 }

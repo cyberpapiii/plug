@@ -34,6 +34,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   tidy tool list, it is not a security boundary: any program running as you
   can link itself under another name. For a remote client the key is its
   verified grant.
+- `plug clients block <client> --server <name>` and `--tool <name>` keep a
+  client from a server or a tool, and `plug clients unblock` lets it back in.
+  The client is picked as in `plug clients rename`: by the name it shows
+  under, or by its key. It applies at once, without a reload, and
+  `plug clients` lists who is kept from what.
 - An unknown local client started by an interpreter is told apart by the script
   it runs. Two tools that both run under `python3` or `node` are now two
   clients, each with its own name. A name given to such a client before this
