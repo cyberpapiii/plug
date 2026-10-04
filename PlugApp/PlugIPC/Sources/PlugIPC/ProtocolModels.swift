@@ -406,6 +406,10 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public var toolRenames: [String: String] = [:]
     public var toolGroups: [ToolGroupRule] = []
     public var sandbox: StdioSandboxConfig?
+    /// The OpenAPI document of an API server, and the operations it exposes.
+    /// The app has no fields for these; it carries them so a save keeps them.
+    public var spec: String?
+    public var operations: [String] = []
 
     public static func command(_ command: String, args: [String]) -> Self {
         Self(command: command, args: args, transport: "stdio")
@@ -421,7 +425,7 @@ extension ServerConfig {
         case command, args, env, enabled, transport, protocolMode = "protocol", url, authToken
         case auth, oauthClientID, oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
         case healthCheckIntervalSecs, circuitBreakerEnabled, enrichment, toolRenames, toolGroups
-        case sandbox
+        case sandbox, spec, operations
     }
 
     public init(from decoder: Decoder) throws {
@@ -446,6 +450,8 @@ extension ServerConfig {
         toolRenames = try c.decodeIfPresent([String: String].self, forKey: .toolRenames) ?? [:]
         toolGroups = try c.decodeIfPresent([ToolGroupRule].self, forKey: .toolGroups) ?? []
         sandbox = try c.decodeIfPresent(StdioSandboxConfig.self, forKey: .sandbox)
+        spec = try c.decodeIfPresent(String.self, forKey: .spec)
+        operations = try c.decodeIfPresent([String].self, forKey: .operations) ?? []
     }
 }
 

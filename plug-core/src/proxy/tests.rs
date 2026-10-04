@@ -3171,6 +3171,8 @@ fn subscribable_test_server_config() -> crate::config::ServerConfig {
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     }
 }
 

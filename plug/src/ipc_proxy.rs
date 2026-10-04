@@ -2031,6 +2031,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 

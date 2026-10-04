@@ -220,9 +220,12 @@ pub(crate) fn parse_transport(
         Some("stdio") | None if url.is_none() => Ok(plug_core::config::TransportType::Stdio),
         Some("http") => Ok(plug_core::config::TransportType::Http),
         Some("sse") => Ok(plug_core::config::TransportType::Sse),
+        Some("openapi") => Ok(plug_core::config::TransportType::OpenApi),
         None => Ok(plug_core::config::TransportType::Http),
         Some(other) => {
-            anyhow::bail!("unsupported transport `{other}`; use `stdio`, `http`, or `sse`")
+            anyhow::bail!(
+                "unsupported transport `{other}`; use `stdio`, `http`, `sse`, or `openapi`"
+            )
         }
     }
 }
@@ -245,6 +248,8 @@ pub(crate) async fn cmd_server_command(
             oauth_client_id,
             oauth_scopes,
             disabled,
+            openapi,
+            operations,
         } => {
             cmd_server_add(
                 config_path,
@@ -259,6 +264,8 @@ pub(crate) async fn cmd_server_command(
                 oauth_client_id,
                 oauth_scopes,
                 disabled,
+                openapi,
+                operations,
             )
             .await
         }
@@ -399,6 +406,8 @@ pub(crate) async fn cmd_server_add(
     oauth_client_id: Option<String>,
     oauth_scopes: Option<Vec<String>>,
     disabled: bool,
+    openapi: Option<String>,
+    operations: Vec<String>,
 ) -> anyhow::Result<()> {
     let (_path, config) = load_editable_config(config_path)?;
     let name = match name {
@@ -422,8 +431,16 @@ pub(crate) async fn cmd_server_add(
         || auth.is_some()
         || bearer_token.is_some()
         || oauth_client_id.is_some()
-        || oauth_scopes.is_some();
+        || oauth_scopes.is_some()
+        || openapi.is_some();
+    if openapi.is_some() && !matches!(transport.as_deref(), None | Some("openapi")) {
+        anyhow::bail!("`--openapi` cannot be combined with another `--transport`");
+    }
+    if !operations.is_empty() && openapi.is_none() {
+        anyhow::bail!("`--operations` only applies with `--openapi`");
+    }
     let transport = match transport {
+        None if openapi.is_some() => plug_core::config::TransportType::OpenApi,
         Some(value) => parse_transport(Some(value), &url)?,
         None if command.is_some() => plug_core::config::TransportType::Stdio,
         None if url.is_some() => plug_core::config::TransportType::Http,
@@ -491,6 +508,8 @@ pub(crate) async fn cmd_server_add(
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             }
         }
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
@@ -534,6 +553,8 @@ pub(crate) async fn cmd_server_add(
                 tool_renames: HashMap::new(),
                 tool_groups: Vec::new(),
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             };
             if let Some(selection) = noninteractive_remote_auth_selection(
                 auth,
@@ -546,6 +567,67 @@ pub(crate) async fn cmd_server_add(
                 let selection = prompt_remote_auth_selection(&name, None)?;
                 apply_remote_auth_selection(&mut server, selection);
             }
+            server
+        }
+        plug_core::config::TransportType::OpenApi => {
+            if command.is_some() || !args.is_empty() || !env.is_empty() {
+                anyhow::bail!("`--command`, `--args`, and `--env` only apply to stdio servers");
+            }
+            if oauth_client_id.is_some()
+                || oauth_scopes.is_some()
+                || !matches!(auth.as_deref(), None | Some("none" | "bearer"))
+            {
+                anyhow::bail!("an API server signs in with `--bearer-token`, not OAuth");
+            }
+            let spec = match openapi {
+                Some(spec) => spec,
+                None => Input::with_theme(&cli_prompt_theme())
+                    .with_prompt("OpenAPI document (URL or file)")
+                    .interact_text()?,
+            };
+            // The daemon reads the file from its own working directory, so a
+            // relative path is pinned to where it is now.
+            let spec = if spec.starts_with("http://") || spec.starts_with("https://") {
+                spec
+            } else {
+                std::fs::canonicalize(&spec)
+                    .map_err(|e| anyhow::anyhow!("could not read OpenAPI document '{spec}': {e}"))?
+                    .to_string_lossy()
+                    .into_owned()
+            };
+            let server = plug_core::config::ServerConfig {
+                command: None,
+                args: Vec::new(),
+                env: HashMap::new(),
+                enabled: !disabled,
+                transport,
+                protocol_mode: Default::default(),
+                url,
+                auth_token: bearer_token.map(Into::into),
+                auth: None,
+                oauth_client_id: None,
+                oauth_scopes: None,
+                timeout_secs: 30,
+                call_timeout_secs: 300,
+                max_concurrent: 4,
+                health_check_interval_secs: 60,
+                circuit_breaker_enabled: true,
+                enrichment: false,
+                tool_renames: HashMap::new(),
+                tool_groups: Vec::new(),
+                sandbox: None,
+                spec: Some(spec),
+                operations,
+            };
+            // Read the document now, so a bad address or an API too large to
+            // add whole is reported here and not later in a log.
+            let document = plug_core::openapi::load(&name, &server).await?;
+            print_info_line(format!(
+                "{}: {} tools, calling {}",
+                document.title,
+                document.operations.len(),
+                document.base_url
+            ));
             server
         }
     };
@@ -824,6 +906,38 @@ pub(crate) async fn cmd_server_edit(
                     apply_remote_auth_selection(server, selection);
                 }
             }
+            plug_core::config::TransportType::OpenApi => {
+                if switching_transport
+                    && !matches!(server.transport, plug_core::config::TransportType::OpenApi)
+                {
+                    anyhow::bail!("add an API server with `plug server add --openapi`");
+                }
+                if command.is_some()
+                    || args.is_some()
+                    || !env.is_empty()
+                    || !unset_env.is_empty()
+                    || oauth_client_id.is_some()
+                    || oauth_scopes.is_some()
+                    || !matches!(auth.as_deref(), None | Some("none" | "bearer"))
+                {
+                    anyhow::bail!("an API server takes `--url` and `--bearer-token` only");
+                }
+                if !non_interactive {
+                    anyhow::bail!(
+                        "edit an API server with `--url` or `--bearer-token`, or change \
+                         `spec` and `operations` in the config file"
+                    );
+                }
+                if let Some(url) = url {
+                    server.url = Some(url);
+                }
+                if auth.as_deref() == Some("none") {
+                    server.auth_token = None;
+                }
+                if let Some(token) = bearer_token {
+                    server.auth_token = Some(token.into());
+                }
+            }
         }
 
         server.auth.as_deref() == Some("oauth")
@@ -948,6 +1062,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 
@@ -974,6 +1090,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 
@@ -1244,6 +1362,8 @@ mod tests {
             None,
             None,
             false,
+            None,
+            Vec::new(),
         )
         .await
         .unwrap();

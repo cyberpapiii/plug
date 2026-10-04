@@ -216,6 +216,8 @@ pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> b
         || old.oauth_client_id != new.oauth_client_id
         || old.oauth_scopes != new.oauth_scopes
         || old.health_check_interval_secs != new.health_check_interval_secs
+        || old.spec != new.spec
+        || old.operations != new.operations
 }
 
 /// Apply a config diff to the running engine.
@@ -390,6 +392,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 

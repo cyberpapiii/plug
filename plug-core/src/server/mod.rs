@@ -1876,6 +1876,45 @@ impl ServerManager {
                     )
                     .await
                 }
+                TransportType::OpenApi => {
+                    let document = crate::openapi::load(name, config).await?;
+
+                    // The adapter is a real MCP server on the far end of an
+                    // in-process pipe. It stops when the client side drops.
+                    let (server_io, client_io) = tokio::io::duplex(64 * 1024);
+                    let adapter = crate::openapi::OpenApiServer::new(document, config);
+                    tokio::spawn(async move {
+                        if let Ok(service) = adapter.serve(server_io).await {
+                            let _ = service.waiting().await;
+                        }
+                    });
+
+                    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+                    let handler = Arc::new(UpstreamClientHandler {
+                        server_id: Arc::from(name),
+                        tools: Arc::clone(&tools),
+                        router: tool_router.clone(),
+                        list_timeout: Duration::from_secs(config.call_timeout_secs),
+                        #[cfg(test)]
+                        protocol_version_override: None,
+                    });
+                    let client: McpClient = handler
+                        .serve(client_io)
+                        .await
+                        .map_err(|e| anyhow::anyhow!("failed to initialize client: {e}"))?;
+
+                    Self::finish_upstream_connection(
+                        name,
+                        config,
+                        client,
+                        tools,
+                        "OpenAPI upstream",
+                        UpstreamProtocolMode::Legacy,
+                        modern_upstream_gate_state,
+                        ConnectionGeneration::new(),
+                    )
+                    .await
+                }
             }
         })
         .await;
@@ -2829,7 +2868,7 @@ async fn resolve_upstream_auth(
     }
 }
 
-fn is_blocked_host(host: &str) -> bool {
+pub(crate) fn is_blocked_host(host: &str) -> bool {
     // Known metadata hostnames
     if host == "metadata.google.internal" {
         return true;
@@ -2896,6 +2935,8 @@ mod tests {
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 
@@ -3469,6 +3510,8 @@ mod tests {
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 
@@ -4673,6 +4716,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
 
         let err = anyhow::anyhow!(
@@ -6204,6 +6249,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 

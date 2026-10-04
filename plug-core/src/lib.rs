@@ -29,6 +29,7 @@ pub mod legacy_tasks;
 pub(crate) mod mcp_http_headers;
 pub mod notifications;
 pub mod oauth;
+pub mod openapi;
 pub mod operator;
 pub mod protocol;
 pub mod proxy;

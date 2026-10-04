@@ -121,6 +121,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `~/.kimi-code/mcp.json` and `plug link qwen-code` writes
   `~/.qwen/settings.json`; both also import from those files and show in the
   app's client list.
+- An HTTP API can be a server. `plug server add <name> --openapi <url-or-file>`
+  reads an OpenAPI 3 document, JSON or YAML, and lists each operation as one
+  tool; a call makes the HTTP request. `--url` sets where the API lives when
+  the document does not say, `--bearer-token` signs in, and `--operations`
+  picks which operations to expose, which an API with more than 50 requires.
+  GET and HEAD operations are marked read-only, a status of 400 or above is a
+  tool error, and requests go only to the API's own address. In the config
+  this is `transport = "openapi"` with `spec` and `operations`.
 
 ### Changed
 

@@ -1207,6 +1207,8 @@ mod tests {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
         config
@@ -1245,6 +1247,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 
@@ -1614,6 +1618,8 @@ mod tests {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -1793,6 +1799,8 @@ mod tests {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -1832,6 +1840,8 @@ mod tests {
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -1959,6 +1969,8 @@ HOME_DIR = "$HOME"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 
@@ -2276,6 +2288,8 @@ HOME_DIR = "$HOME"
                 tool_groups: Vec::new(),
 
                 sandbox: None,
+                spec: None,
+                operations: Vec::new(),
             },
         );
 

@@ -126,7 +126,8 @@ struct EditServerView: View {
     }
 
     private var isComplete: Bool {
-        isRemote
+        if loadedConfig?.transport == "openapi", isRemote { return true }
+        return isRemote
             ? !url.trimmingCharacters(in: .whitespaces).isEmpty
             : !command.trimmingCharacters(in: .whitespaces).isEmpty
     }
@@ -171,10 +172,14 @@ struct EditServerView: View {
             return
         }
         if isRemote {
-            config.transport = "http"
+            // A server that was already remote keeps its kind: saving must not
+            // turn an SSE server or an API server into a plain HTTP one.
+            if config.transport.lowercased() == "stdio" { config.transport = "http" }
             config.command = nil
             config.args = []
-            config.url = url.trimmingCharacters(in: .whitespaces)
+            let address = url.trimmingCharacters(in: .whitespaces)
+            // An API server may leave the address to its document.
+            config.url = address.isEmpty && config.transport == "openapi" ? nil : address
             let token = authToken.trimmingCharacters(in: .whitespaces)
             if !token.isEmpty {
                 config.authToken = token

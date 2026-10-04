@@ -554,6 +554,8 @@ fn yaml_entry_to_server_config(entry: &serde_norway::Value) -> Option<ServerConf
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     })
 }
 
@@ -742,6 +744,8 @@ fn json_entry_to_server_config(entry: &serde_json::Value) -> Option<ServerConfig
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     })
 }
 
@@ -842,6 +846,8 @@ fn toml_entry_to_server_config(entry: &toml::Value) -> Option<ServerConfig> {
         tool_renames: HashMap::new(),
         tool_groups: Vec::new(),
         sandbox: None,
+        spec: None,
+        operations: Vec::new(),
     })
 }
 
@@ -884,6 +890,10 @@ fn server_signature(config: &ServerConfig) -> String {
         TransportType::Sse => {
             let url = config.url.as_deref().unwrap_or("");
             format!("sse:{url}")
+        }
+        TransportType::OpenApi => {
+            let spec = config.spec.as_deref().unwrap_or("");
+            format!("openapi:{spec}")
         }
     }
 }
@@ -1014,6 +1024,8 @@ pub fn servers_to_toml(servers: &[DiscoveredServer], existing_names: &[String]) 
                     output.push_str(&format!("transport = \"sse\"\nurl = {}\n", toml_quote(url)));
                 }
             }
+            // No client config describes an API server, so none is imported.
+            TransportType::OpenApi => {}
         }
 
         if !server.config.env.is_empty() {
@@ -1307,6 +1319,8 @@ extensions:
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         }
     }
 }

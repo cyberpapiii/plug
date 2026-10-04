@@ -1636,6 +1636,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
 
         assert!(
@@ -1671,6 +1673,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
 
         let store = oauth::get_or_create_store(&server_name);
@@ -1725,6 +1729,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -1770,6 +1776,8 @@ mod tests {
             tool_groups: Vec::new(),
 
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -2079,6 +2087,8 @@ mod tests {
             tool_renames: std::collections::HashMap::new(),
             tool_groups: Vec::new(),
             sandbox: None,
+            spec: None,
+            operations: Vec::new(),
         };
         let store = oauth::get_or_create_store(&server_name);
         store.clear().await.unwrap();
