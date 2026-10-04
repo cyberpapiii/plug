@@ -72,6 +72,7 @@ struct PlugApplication: App {
                 .task {
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
                     NotificationService.shared.perform = { runner.run($0) }
+                    IconStore.shared.attach(to: model)
                     await model.start()
                 }
         }
@@ -82,7 +83,10 @@ struct PlugApplication: App {
         Window("Plug", id: Self.windowID) {
             RootView(model: model, router: router, run: runner.run)
                 .frame(minWidth: 860, minHeight: 520)
-                .task { await model.start() }
+                .task {
+                    IconStore.shared.attach(to: model)
+                    await model.start()
+                }
         }
         .defaultSize(width: 980, height: 640)
         .windowResizability(.contentMinSize)

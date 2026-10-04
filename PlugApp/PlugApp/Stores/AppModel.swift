@@ -66,6 +66,9 @@ final class AppModel {
     private(set) var connectionState: ConnectionState = .connecting
     private(set) var snapshot: OperatorSnapshot = .empty
     private(set) var hasLoadedSnapshot = false
+    /// Called with each snapshot read. The app uses it to find icons; a
+    /// model under test leaves it unset and asks the daemon nothing extra.
+    @ObservationIgnored var snapshotDidLoad: ((OperatorSnapshot) -> Void)?
     private(set) var activities: [ActivityEvent] = []
     /// How far back the history goes. The daemon keeps a bounded ring, so this
     /// is the whole of what can be asked for, not a page of a longer list.
@@ -542,6 +545,7 @@ final class AppModel {
         let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
         snapshot = value
         hasLoadedSnapshot = true
+        snapshotDidLoad?(value)
         NotificationService.shared.observe(value)
         if case let .activity(events) = try await ipc.request(
             .activity(
@@ -637,6 +641,15 @@ final class AppModel {
         await perform("turn \(tool) \(enabled ? "on" : "off")") {
             .setToolEnabled(authToken: $0, tool: tool, enabled: enabled)
         }
+    }
+
+    /// Every server with what it said about itself. The snapshot leaves the
+    /// icons out, so they are asked for apart from it, and rarely.
+    func serverDescriptions() async throws -> [ServerStatus] {
+        guard case let .status(servers) = try await ipc.request(.status) else {
+            throw PlugIPCError.unexpectedResponse("Status")
+        }
+        return servers
     }
 
     func serverConfig(name: String) async throws -> ServerConfig {

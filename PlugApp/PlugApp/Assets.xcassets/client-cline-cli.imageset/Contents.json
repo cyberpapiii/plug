@@ -1,0 +1,12 @@
+{
+  "images" : [
+    {
+      "filename" : "client-cline-cli.png",
+      "idiom" : "universal"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

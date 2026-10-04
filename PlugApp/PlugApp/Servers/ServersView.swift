@@ -133,6 +133,10 @@ struct ServersView: View {
                         if model.canMutate {
                             ServerActions(server: server, run: run)
                             Divider()
+                        }
+                        IconMenu(key: IconStore.key(server: server.name))
+                        if model.canMutate {
+                            Divider()
                             Button("Remove Server…", role: .destructive) { askToRemove(server.name) }
                         }
                     }

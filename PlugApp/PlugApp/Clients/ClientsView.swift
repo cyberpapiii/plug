@@ -627,6 +627,14 @@ struct ClientEntry: Identifiable {
         case app(target: String, name: String, appPath: String?)
         /// A client allowed in over the network, by the name it gave.
         case grant(name: String)
+
+        /// The name a chosen icon for this client is kept under.
+        var iconKey: String {
+            switch self {
+            case let .app(target, _, _): IconStore.key(client: target)
+            case let .grant(name): IconStore.key(client: AppIcons.target(forClientType: name))
+            }
+        }
     }
 
     /// One open connection of a client.
@@ -721,12 +729,14 @@ private struct ClientRow: View {
             ClientSwitch(entry: entry, canMutate: canMutate, size: .mini)
         }
         .contextMenu {
-            if entry.grantID != nil {
-                if canMutate {
-                    Button("Remove Access…", role: .destructive) { entry.setOn(false) }
-                }
-            } else if let isOn = entry.isOn, !entry.isBusy {
+            if entry.grantID == nil, let isOn = entry.isOn, !entry.isBusy {
                 Button(isOn ? "Turn Off" : "Turn On") { entry.setOn(!isOn) }
+                Divider()
+            }
+            IconMenu(key: entry.glyph.iconKey)
+            if entry.grantID != nil, canMutate {
+                Divider()
+                Button("Remove Access…", role: .destructive) { entry.setOn(false) }
             }
         }
     }

@@ -201,3 +201,124 @@ final class ServerPlaceTests: XCTestCase {
         XCTAssertEqual(server(transport: "sse").transportLabel, "Over the network")
     }
 }
+
+/// Where an icon comes from when no app on this Mac supplies it.
+final class FoundIconTests: XCTestCase {
+    private func picture(side: Int = 64) throws -> Data {
+        let rep = try XCTUnwrap(NSBitmapImageRep(
+            bitmapDataPlanes: nil, pixelsWide: side, pixelsHigh: side, bitsPerSample: 8,
+            samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+            colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+        ))
+        return try XCTUnwrap(rep.representation(using: .png, properties: [:]))
+    }
+
+    func testAServerStartedFromInsideAnAppIsThatApp() {
+        XCTAssertEqual(
+            AppIcons.appBundle(containing: "/Applications/Foo Bar.app/Contents/MacOS/foo-mcp"),
+            "/Applications/Foo Bar.app"
+        )
+        XCTAssertNil(AppIcons.appBundle(containing: "/usr/local/bin/foo-mcp"))
+        XCTAssertNil(AppIcons.appBundle(containing: "npx"))
+    }
+
+    func testOnlyAServersOwnHTTPSSitesAreAsked() {
+        XCTAssertEqual(
+            SiteIcon.hosts(server: "https://mcp.example.com/mcp?key=1", website: nil),
+            ["mcp.example.com", "example.com"]
+        )
+        XCTAssertEqual(
+            SiteIcon.hosts(server: "https://mcp.example.com/mcp", website: "https://developers.example.com/docs"),
+            ["mcp.example.com", "example.com", "developers.example.com"]
+        )
+        XCTAssertEqual(SiteIcon.hosts(server: "http://localhost:8000/mcp", website: nil), [])
+        XCTAssertEqual(SiteIcon.hosts(server: "http://127.0.0.1:8080", website: "http://example.com"), [])
+        XCTAssertEqual(SiteIcon.hosts(server: "https://10.0.0.12/mcp", website: nil), ["10.0.0.12"])
+        XCTAssertEqual(SiteIcon.hosts(server: "https://example.com/mcp", website: nil), ["example.com"])
+        XCTAssertEqual(SiteIcon.hosts(server: nil, website: nil), [])
+    }
+
+    func testAPagesIconsComeBestFirst() throws {
+        let html = """
+        <html><head>
+        <link rel="stylesheet" href="/site.css">
+        <link rel="icon" sizes="32x32" href="/small.png">
+        <LINK REL='icon' SIZES='192x192' HREF='https://cdn.example.com/big.png'>
+        <link rel=apple-touch-icon href=touch.png>
+        <link rel="mask-icon" href="/mask.svg">
+        <link rel="icon" href="http://example.com/plain.png">
+        </head></html>
+        """
+        let base = try XCTUnwrap(URL(string: "https://example.com/docs/"))
+        XCTAssertEqual(SiteIcon.candidates(inHTML: html, base: base).map(\.absoluteString), [
+            "https://example.com/docs/touch.png",
+            "https://cdn.example.com/big.png",
+            "https://example.com/small.png",
+            "https://example.com/apple-touch-icon.png",
+            "https://example.com/favicon.ico",
+        ])
+        XCTAssertEqual(SiteIcon.candidates(inHTML: "", base: base).map(\.path), [
+            "/apple-touch-icon.png", "/favicon.ico",
+        ])
+    }
+
+    func testTheLargestIconAServerOffersIsUsed() throws {
+        let icons = [
+            ServerIcon(src: "data:image/png;base64,AAAA", sizes: ["16x16"]),
+            ServerIcon(src: "data:image/png;base64,QUJD", sizes: ["64x64"]),
+            ServerIcon(src: "https://example.com/icon.png", sizes: ["32x32"]),
+        ]
+        let best = try XCTUnwrap(SiteIcon.best(of: icons))
+        XCTAssertEqual(best.src, "data:image/png;base64,QUJD")
+        XCTAssertEqual(SiteIcon.data(fromDataURI: best.src), Data("ABC".utf8))
+        XCTAssertNil(SiteIcon.data(fromDataURI: "https://example.com/icon.png"))
+        XCTAssertNil(SiteIcon.data(fromDataURI: "data:image/png,raw"))
+        XCTAssertNil(SiteIcon.best(of: []))
+    }
+
+    func testOnlyAPictureBecomesAnIcon() throws {
+        XCTAssertNotNil(IconTile.png(from: try picture()))
+        XCTAssertNil(IconTile.png(from: Data("<html>not found</html>".utf8)))
+        XCTAssertNil(IconTile.png(from: try picture(side: 8)), "too small to show")
+    }
+
+    @MainActor
+    func testAChosenIconIsKeptAndCanBeTakenBack() throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "plug-icons-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let key = IconStore.key(server: "No Such Server")
+        XCTAssertEqual(key, "server-nosuchserver")
+
+        let store = IconStore(chosenDirectory: directory, cacheDirectory: directory.appending(path: "cache"))
+        XCTAssertNil(store.image(forServer: "No Such Server"))
+        XCTAssertFalse(store.setChosenIcon(Data("nope".utf8), for: key))
+        XCTAssertTrue(store.setChosenIcon(try picture(), for: key))
+        XCTAssertNotNil(store.image(forServer: "no-such-server"), "the name matches whatever its punctuation")
+
+        let reopened = IconStore(chosenDirectory: directory, cacheDirectory: directory.appending(path: "cache"))
+        XCTAssertNotNil(reopened.image(forServer: "No Such Server"))
+        reopened.removeChosenIcon(for: key)
+        XCTAssertNil(reopened.image(forServer: "No Such Server"))
+        XCTAssertNil(IconStore(chosenDirectory: directory, cacheDirectory: directory).image(forServer: "No Such Server"))
+    }
+
+    func testTheStatusAnswerCarriesWhatAServerSaysAboutItself() throws {
+        let json = """
+        {"type":"Status","servers":[
+          {"server_id":"a","health":"Healthy","tool_count":3,"auth_status":"none",
+           "upstream":{"name":"a","version":"1","website_url":"https://example.com",
+                       "icons":[{"src":"data:image/png;base64,QUJD","sizes":["64x64"]}]}},
+          {"server_id":"b","health":"Failed","tool_count":0}
+        ],"clients":0,"uptime_secs":5}
+        """
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard case let .status(servers) = try decoder.decode(IPCResponse.self, from: Data(json.utf8)) else {
+            return XCTFail("expected a status answer")
+        }
+        XCTAssertEqual(servers.map(\.serverId), ["a", "b"])
+        XCTAssertEqual(servers[0].upstream?.websiteUrl, "https://example.com")
+        XCTAssertEqual(servers[0].upstream?.icons?.first?.sizes, ["64x64"])
+        XCTAssertNil(servers[1].upstream)
+    }
+}
