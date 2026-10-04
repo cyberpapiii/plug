@@ -175,12 +175,20 @@ pub struct ClientSettings {
     /// The name to show in place of the one Plug works out.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// Servers this client does not get: none of their tools are listed to
+    /// it or callable by it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocked_servers: Vec<String>,
+    /// Tools this client does not get, by the name Plug lists them under.
+    /// `*` matches any run of characters, as in `disabled_tools`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub blocked_tools: Vec<String>,
 }
 
 impl ClientSettings {
     /// Nothing is set, so the entry need not be kept.
     pub fn is_empty(&self) -> bool {
-        self.name.is_none()
+        self.name.is_none() && self.blocked_servers.is_empty() && self.blocked_tools.is_empty()
     }
 }
 

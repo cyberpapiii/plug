@@ -185,6 +185,7 @@ impl super::ToolRouter {
             }));
         }
 
+        self.ensure_client_may_use_tool(downstream.as_ref(), tool_name)?;
         let cache = self.cache.load();
         let (server_id, original_name) =
             cache.resolve_route(tool_name).cloned().ok_or_else(|| {

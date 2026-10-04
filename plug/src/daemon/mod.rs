@@ -1542,6 +1542,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                         .list_tools_for_client_session(
                             session.client_type,
                             Some(live_session_lazy_key(session).as_str()),
+                            session.access_key().as_deref(),
                         )
                         .len(),
                     client_key: session.client_key(),

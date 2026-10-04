@@ -127,6 +127,14 @@ impl RouterSnapshot {
     }
 }
 
+/// What one client is kept from, in the form the request path reads.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ClientAccess {
+    blocked_servers: HashSet<String>,
+    /// Lowercased, as `is_disabled_tool` expects.
+    blocked_tools: Vec<String>,
+}
+
 /// Configuration for token efficiency and tool filtering.
 #[derive(Clone, Debug)]
 pub struct RouterConfig {
@@ -277,6 +285,10 @@ pub struct ToolRouter {
     downstream_bridges: DashMap<NotificationTarget, Arc<dyn DownstreamBridge>>,
     /// Session-scoped lazy loaded routed tool names, oldest first.
     lazy_working_sets: DashMap<String, VecDeque<String>>,
+    /// What each client is kept from, by client key. Reloadable: the owner
+    /// changes it while clients are connected. A client with no entry gets
+    /// everything.
+    client_access: ArcSwap<HashMap<String, ClientAccess>>,
     /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
     task_store: Mutex<TaskStore>,
     /// One process-wide admission ledger shared by every downstream transport.
@@ -926,6 +938,7 @@ impl ToolRouter {
             client_roots: DashMap::new(),
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
+            client_access: ArcSwap::from_pointee(HashMap::new()),
             task_store: Mutex::new(TaskStore::new()),
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
@@ -967,6 +980,87 @@ impl ToolRouter {
 
     pub fn publish_protocol_notification(&self, notification: ProtocolNotification) {
         let _ = self.protocol_notification_tx.send(notification);
+    }
+
+    /// Take the owner's per-client blocks. Clients are told their tool list
+    /// changed only when a block did, so a rename costs them nothing.
+    pub fn set_client_access(
+        &self,
+        clients: &std::collections::BTreeMap<String, crate::config::ClientSettings>,
+    ) {
+        let next: HashMap<String, ClientAccess> = clients
+            .iter()
+            .filter(|(_, settings)| {
+                !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
+            })
+            .map(|(key, settings)| {
+                (
+                    key.clone(),
+                    ClientAccess {
+                        blocked_servers: settings.blocked_servers.iter().cloned().collect(),
+                        blocked_tools: settings
+                            .blocked_tools
+                            .iter()
+                            .map(|pattern| pattern.to_ascii_lowercase())
+                            .collect(),
+                    },
+                )
+            })
+            .collect();
+        if **self.client_access.load() == next {
+            return;
+        }
+        self.client_access.store(Arc::new(next));
+        self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+    }
+
+    /// Whether the client behind `client_key` may see and call `tool_name`.
+    /// A request with no key is Plug's own and is never blocked.
+    pub fn client_may_use_tool(&self, client_key: Option<&str>, tool_name: &str) -> bool {
+        let Some(client_key) = client_key else {
+            return true;
+        };
+        let access = self.client_access.load();
+        let Some(access) = access.get(client_key) else {
+            return true;
+        };
+        if is_disabled_tool(&access.blocked_tools, tool_name) {
+            return false;
+        }
+        if access.blocked_servers.is_empty() {
+            return true;
+        }
+        self.cache
+            .load()
+            .resolve_route(tool_name)
+            .is_none_or(|(server_id, _)| !access.blocked_servers.contains(server_id))
+    }
+
+    /// Whether the client behind `client_key` may see `server_id` at all.
+    pub fn client_may_use_server(&self, client_key: Option<&str>, server_id: &str) -> bool {
+        let Some(client_key) = client_key else {
+            return true;
+        };
+        self.client_access
+            .load()
+            .get(client_key)
+            .is_none_or(|access| !access.blocked_servers.contains(server_id))
+    }
+
+    fn ensure_client_may_use_tool(
+        &self,
+        downstream: Option<&DownstreamCallContext>,
+        tool_name: &str,
+    ) -> Result<(), McpError> {
+        let client_key = downstream.and_then(|context| context.client_key.as_deref());
+        if self.client_may_use_tool(client_key, tool_name) {
+            return Ok(());
+        }
+        // The same answer a tool that does not exist gets: a blocked client
+        // learns nothing about what it is kept from.
+        Err(McpError::from(ProtocolError::ToolNotFound {
+            tool_name: tool_name.to_string(),
+        }))
     }
 
     pub fn set_modern_downstream_enabled(&self, enabled: bool) {
@@ -1025,6 +1119,7 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                 .into_error(downstream.protocol_era));
         }
+        self.ensure_client_may_use_tool(Some(downstream), tool_name)?;
         if canonical_plug_meta_tool_name(tool_name).is_some() {
             if has_continuation {
                 return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
@@ -2989,6 +3084,9 @@ impl ToolRouter {
     > {
         Box::pin(async move {
             let _in_flight = self.track_call();
+            // Every way to call a tool ends here, the invoke wrapper included,
+            // so this is where a per-client block cannot be stepped around.
+            self.ensure_client_may_use_tool(downstream.as_ref(), tool_name)?;
             // Intercept plug meta-tools (case-insensitive for LLM casing drift).
             if let Some(meta_tool_name) = canonical_plug_meta_tool_name(tool_name) {
                 if !self.meta_tool_visible_for_call(meta_tool_name, downstream.as_ref()) {
@@ -2997,10 +3095,12 @@ impl ToolRouter {
                     }));
                 }
                 match meta_tool_name {
-                    "plug__list_servers" => return Ok(self.handle_list_servers().into()),
+                    "plug__list_servers" => {
+                        return Ok(self.handle_list_servers(downstream.as_ref()).into());
+                    }
                     "plug__list_tools" => {
                         return self
-                            .handle_list_tools(round.arguments.clone())
+                            .handle_list_tools(round.arguments.clone(), downstream.as_ref())
                             .map(Into::into);
                     }
                     "plug__search_tools" => {
@@ -3471,16 +3571,18 @@ impl ToolRouter {
         }
     }
 
-    fn handle_list_servers(&self) -> CallToolResult {
+    fn handle_list_servers(&self, downstream: Option<&DownstreamCallContext>) -> CallToolResult {
+        let client_key = downstream.and_then(|context| context.client_key.as_deref());
         let snapshot = self.cache.load();
         let mut tool_counts: HashMap<&str, usize> = HashMap::new();
-        for (server_id, _) in snapshot.routes.values() {
-            if server_id != "__plug_internal__" {
+        for (tool_name, (server_id, _)) in snapshot.routes.iter() {
+            if server_id != "__plug_internal__" && self.client_may_use_tool(client_key, tool_name) {
                 *tool_counts.entry(server_id.as_str()).or_insert(0) += 1;
             }
         }
 
-        let statuses = self.server_manager.server_statuses();
+        let mut statuses = self.server_manager.server_statuses();
+        statuses.retain(|status| self.client_may_use_server(client_key, &status.server_id));
         if statuses.is_empty() {
             return CallToolResult::success(vec![ContentBlock::text(
                 "No upstream servers configured.",
@@ -3505,7 +3607,9 @@ impl ToolRouter {
     fn handle_list_tools(
         &self,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
+        downstream: Option<&DownstreamCallContext>,
     ) -> Result<CallToolResult, McpError> {
+        let client_key = downstream.and_then(|context| context.client_key.as_deref());
         let server_filter = arguments
             .as_ref()
             .and_then(|args| args.get("server_id"))
@@ -3530,6 +3634,9 @@ impl ToolRouter {
                 continue;
             };
             if server_id == "__plug_internal__" {
+                continue;
+            }
+            if !self.client_may_use_tool(client_key, tool.name.as_ref()) {
                 continue;
             }
             if let Some(filter) = server_filter.as_ref()
@@ -3624,6 +3731,7 @@ impl ToolRouter {
             .and_then(|value| value.as_u64())
             .map(|value| value.min(BRIDGE_SEARCH_RESULT_MAX as u64) as usize)
             .unwrap_or(5);
+        let client_key = downstream.and_then(|context| context.client_key.as_deref());
         let snapshot = self.cache.load_full();
         let index = self.search_index_for(&snapshot);
         let mut ranked = Vec::new();
@@ -3631,6 +3739,11 @@ impl ToolRouter {
             let Some(score) = score_normalized_match(&entry.text, &query_phrase, &tokens) else {
                 continue;
             };
+            // Before the cut to `limit`, so a blocked match cannot crowd out
+            // one the client may use.
+            if !self.client_may_use_tool(client_key, &entry.tool_name) {
+                continue;
+            }
             ranked.push((score, entry.server_id.as_str(), entry.tool_name.as_str()));
         }
         ranked.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.2.cmp(b.2)));

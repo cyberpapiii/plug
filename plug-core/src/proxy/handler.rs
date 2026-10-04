@@ -333,7 +333,15 @@ impl ServerHandler for ProxyHandler {
     }
 
     fn get_tool(&self, name: &str) -> Option<Tool> {
-        self.router.get_tool_definition(name)
+        let client_type = self
+            .client_type
+            .read()
+            .map(|ct| *ct)
+            .unwrap_or(ClientType::Unknown);
+        self.router.get_tool_definition(
+            name,
+            crate::ipc::local_client_key(None, client_type, None).as_deref(),
+        )
     }
 
     fn discover(
@@ -686,8 +694,12 @@ impl ServerHandler for ProxyHandler {
                 ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
             let modern = is_modern_protocol(&context);
             Ok(strip_legacy_catalog_cache(
-                self.router
-                    .list_tools_page_for_client_session(ct, Some(&session_key), request),
+                self.router.list_tools_page_for_client_session(
+                    ct,
+                    Some(&session_key),
+                    crate::ipc::local_client_key(None, ct, None).as_deref(),
+                    request,
+                ),
                 modern,
             ))
         }

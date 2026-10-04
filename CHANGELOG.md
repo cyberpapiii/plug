@@ -24,6 +24,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   local link, so a client whose own name Plug does not recognise (Pi, Warp,
   Kiro, Kilo Code) shows under its real name and icon. Links written before
   this keep working unchanged; link the client again to pick it up.
+- A client can be kept from a server or from single tools. Under
+  `[clients."<key>"]` in the config, `blocked_servers = ["slack"]` and
+  `blocked_tools = ["github__delete_*"]` take those tools out of that client's
+  list and make a call to one answer as an unknown tool, by any route: a
+  direct call, a task, tool search, or the invoke wrapper. The key is the one
+  `plug clients -v` shows. A change applies on config reload, and connected
+  clients are told their tool list changed. For a local client this keeps a
+  tidy tool list, it is not a security boundary: any program running as you
+  can link itself under another name. For a remote client the key is its
+  verified grant.
 - An unknown local client started by an interpreter is told apart by the script
   it runs. Two tools that both run under `python3` or `node` are now two
   clients, each with its own name. A name given to such a client before this

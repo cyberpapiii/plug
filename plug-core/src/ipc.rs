@@ -845,6 +845,20 @@ impl IpcLiveSessionInfo {
             self.host.as_ref(),
         )
     }
+
+    /// The key this session's requests carry, which is the key per-client
+    /// blocks are read under. It differs from `client_key` for one kind of
+    /// session: a remote one with no grant. Its requests cannot be told from
+    /// any other on the shared token, so they share one key, while the row it
+    /// shows under is still named after what it reports.
+    pub fn access_key(&self) -> Option<String> {
+        match self.transport {
+            LiveSessionTransport::Http | LiveSessionTransport::Sse if self.grant.is_none() => {
+                Some(SHARED_REMOTE_CLIENT_KEY.to_string())
+            }
+            _ => self.client_key(),
+        }
+    }
 }
 
 /// Per-server OAuth authentication info returned by `AuthStatus`.
