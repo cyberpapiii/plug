@@ -33,6 +33,24 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   `plug clients block`; there is no allow list (`only_servers`); every client
   on the shared bearer token is one client, `remote:shared`; and a changed
   block tells every client to re-read its lists, not only the one it touches.
+- Plug needs a real app icon: minimal, distinct, and legible small, because
+  it shows in the Dock, the menu bar, and inside every client Plug connects
+  to. The current one is a placeholder.
+- The client list should cover what people use, each with its own icon:
+  the missing registry clients above, and agents that are not desktop apps,
+  such as the iMessage agents Instinct and Tomo. Survey first; the field
+  moves monthly.
+- The app needs one audit and redesign, whole: every flow, the menu bar,
+  and the CLI's wording, held to the grandma test. Known complaints:
+  Settings is a separate window and should live in the main one; layout
+  bugs and rough edges throughout; the three surfaces do not feel like one
+  product. Audit and write the findings before changing anything.
+- Order agreed 2026-10-04: clients and their icons, the app icon, secret
+  providers (#264), skills pass-through (#262), the app redesign, then a
+  release. Skills is wanted now, small and clean, not held for a server
+  that uses it.
+- CI has no job timeout. A hung `Test (Plug.app)` ran 65 minutes on #269
+  before it was cancelled by hand.
 - Warp and Kiro link but show no app icon: their bundle identifiers were not
   read off an installed copy. A connected Pi, Warp, or Kiro is named from what
   it reports, with no client type behind it.
@@ -51,9 +69,10 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
-- Tools from plain HTTP APIs, the rest: a recipe for GraphQL, and choosing
-  operations in the app. OpenAPI servers shipped in the
-  CLI and the app, with a bearer token or an API key (#263).
+- GraphQL APIs as servers. Decided 2026-10-04: not now. Build the small
+  built-in form described on #263 on the day a GraphQL API with no MCP
+  server is needed. OpenAPI servers are done: CLI and app, bearer token or
+  API key, operations chosen in either.
 - Skills: carry the skills extension through Plug, with the server's name in
   each skill URI. Waits for a server and a client that use it (#262).
 - Secret providers: server credentials from a 1Password mount, read by the

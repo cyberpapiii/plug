@@ -582,6 +582,22 @@ final class AppModel {
         await refresh()
     }
 
+    /// The operations of the OpenAPI document at `spec`. The daemon may have
+    /// to fetch the document, which outlasts the poll's short timeout, so
+    /// this asks over a connection of its own.
+    func describeAPI(_ spec: String) async throws -> APISummary {
+        guard canMutate else { throw RuntimeUnavailableError() }
+        let token = try String(contentsOf: tokenURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let patient = PlugIPCClient(clientVersion: clientVersion, requestTimeout: 15)
+        guard case let .apiDescribed(api) = try await patient.request(
+            .describeAPI(authToken: token, spec: spec)
+        ) else {
+            throw PlugIPCError.unexpectedResponse("ApiDescribed")
+        }
+        return api
+    }
+
     func perform(_ request: (String) -> IPCRequest) async {
         do {
             try await performOperation(request)

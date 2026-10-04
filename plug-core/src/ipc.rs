@@ -214,6 +214,12 @@ pub enum IpcRequest {
         name: String,
         server: Box<crate::config::ServerConfig>,
     },
+    /// List the operations of the OpenAPI document at `spec`, so a person
+    /// can choose among them before adding the server.
+    DescribeApi {
+        auth_token: String,
+        spec: String,
+    },
     AddServer {
         auth_token: String,
         name: String,
@@ -435,6 +441,11 @@ impl fmt::Debug for IpcRequest {
                 .debug_struct("ValidateServer")
                 .field("auth_token", &"[REDACTED]")
                 .field("name", name)
+                .finish(),
+            Self::DescribeApi { spec, .. } => f
+                .debug_struct("DescribeApi")
+                .field("auth_token", &"[REDACTED]")
+                .field("spec", spec)
                 .finish(),
             Self::AddServer { name, .. } => f
                 .debug_struct("AddServer")
@@ -981,6 +992,9 @@ pub enum IpcResponse {
     ServerValidated {
         server: crate::operator::OperatorServerSummary,
     },
+    ApiDescribed {
+        api: crate::openapi::ApiSummary,
+    },
     OperatorMutation {
         result: crate::operator::OperatorMutationResult,
         reload: crate::reload::ReloadReport,
@@ -1182,6 +1196,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::GetServerConfig { .. }
             | IpcRequest::RevokeDownstreamClient { .. }
             | IpcRequest::ValidateServer { .. }
+            | IpcRequest::DescribeApi { .. }
             | IpcRequest::AddServer { .. }
             | IpcRequest::UpdateServer { .. }
             | IpcRequest::RemoveServer { .. }
@@ -1206,6 +1221,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::GetServerConfig { auth_token, .. }
         | IpcRequest::RevokeDownstreamClient { auth_token, .. } => Some(auth_token.as_str()),
         IpcRequest::ValidateServer { auth_token, .. }
+        | IpcRequest::DescribeApi { auth_token, .. }
         | IpcRequest::AddServer { auth_token, .. }
         | IpcRequest::UpdateServer { auth_token, .. }
         | IpcRequest::RemoveServer { auth_token, .. }
