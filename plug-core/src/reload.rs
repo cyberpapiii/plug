@@ -71,6 +71,26 @@ async fn run_reload_start_actions(
         .await
 }
 
+/// The servers a reload starts: every changed or added server that is on.
+/// A server that is off is stopped with the rest and stays stopped.
+fn reload_start_actions(diff: &ConfigDiff) -> Vec<ReloadStartAction> {
+    let action = |kind| {
+        move |(name, config): &(String, ServerConfig)| {
+            config.enabled.then(|| ReloadStartAction {
+                name: name.clone(),
+                config: config.clone(),
+                kind,
+            })
+        }
+    };
+    let changed = diff
+        .changed
+        .iter()
+        .filter_map(action(ReloadStartKind::Restart));
+    let added = diff.added.iter().filter_map(action(ReloadStartKind::Start));
+    changed.chain(added).collect()
+}
+
 /// Compare two configs and return the diff.
 pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     let old_names: HashSet<&String> = old.servers.keys().collect();
@@ -273,17 +293,7 @@ pub async fn apply_reload(
         engine.reset_supervision(name);
     }
 
-    let mut start_actions = Vec::new();
-    start_actions.extend(diff.changed.iter().map(|(name, cfg)| ReloadStartAction {
-        name: name.clone(),
-        config: cfg.clone(),
-        kind: ReloadStartKind::Restart,
-    }));
-    start_actions.extend(diff.added.iter().map(|(name, cfg)| ReloadStartAction {
-        name: name.clone(),
-        config: cfg.clone(),
-        kind: ReloadStartKind::Start,
-    }));
+    let start_actions = reload_start_actions(&diff);
 
     let start_results = run_reload_start_actions(
         start_actions,
@@ -437,6 +447,40 @@ mod tests {
         assert!(diff.removed.is_empty());
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].0, "github");
+    }
+
+    #[test]
+    fn a_reload_starts_only_the_servers_that_are_on() {
+        let mut old = Config::default();
+        old.servers.insert("turned-off".into(), make_server("npx"));
+        old.servers.insert("edited".into(), make_server("npx"));
+        let mut off = make_server("npx");
+        off.enabled = false;
+        old.servers.insert("edited-while-off".into(), off.clone());
+
+        let mut new = Config::default();
+        new.servers.insert("turned-off".into(), off.clone());
+        new.servers.insert("edited".into(), make_server("node"));
+        off.command = Some("node".into());
+        new.servers.insert("edited-while-off".into(), off.clone());
+        new.servers.insert("added-off".into(), off);
+        new.servers.insert("added".into(), make_server("npx"));
+
+        let diff = diff_configs(&old, &new);
+        assert_eq!(diff.changed.len(), 3, "all three are stopped");
+
+        let mut started: Vec<_> = reload_start_actions(&diff)
+            .into_iter()
+            .map(|action| (action.name, action.kind))
+            .collect();
+        started.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            started,
+            vec![
+                ("added".to_string(), ReloadStartKind::Start),
+                ("edited".to_string(), ReloadStartKind::Restart),
+            ]
+        );
     }
 
     #[test]
