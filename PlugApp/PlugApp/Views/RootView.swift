@@ -8,14 +8,22 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
     case clients = "Clients"
     case events = "Events"
     case activity = "Activity"
-    case settings = "Settings"
 
     var id: Self { self }
+
+    var symbol: String {
+        switch self {
+        case .servers: "shippingbox"
+        case .clients: "macwindow.on.rectangle"
+        case .events: "bell"
+        case .activity: "clock"
+        }
+    }
 }
 
-/// The window, and the only one: Settings is its fifth section, so the switch
-/// that turns Plug off and the checkup sit beside the things they affect. No
-/// sidebar: five peers do not earn a permanent column.
+/// The window, laid out the way a Mac window is: the sections down a sidebar,
+/// and each section a list beside the row that is selected. Settings is its
+/// own window, opened the way every Mac app opens it.
 struct RootView: View {
     let model: AppModel
     @Bindable var router: Router
@@ -27,51 +35,44 @@ struct RootView: View {
     static let guideSeenKey = "guideSeen"
 
     var body: some View {
-        VStack(spacing: 0) {
-            if model.verdict.tone != .good {
-                VerdictView(verdict: model.verdict, style: .compact, run: run)
-                    .padding(.horizontal, Metric.roomy)
-                    .padding(.vertical, Metric.snug)
+        NavigationSplitView {
+            List(selection: sidebarSelection) {
+                ForEach(AppSection.allCases) { section in
+                    Label(section.rawValue, systemImage: section.symbol)
+                        .badge(badge(for: section))
+                        .tag(section)
+                }
+            }
+            .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
+        } detail: {
+            Group {
+                switch router.section {
+                case .servers:
+                    ServersView(model: model, router: router, search: $search, run: run)
+                case .clients:
+                    ClientsView(model: model, router: router, search: $search, run: run)
+                case .events:
+                    EventsView(model: model, router: router, search: $search, run: run)
+                case .activity:
+                    ActivityView(model: model, router: router, search: $search, run: run)
+                }
+            }
+            .safeAreaInset(edge: .top, spacing: 0) {
+                if model.verdict.tone != .good {
+                    VStack(spacing: 0) {
+                        VerdictView(verdict: model.verdict, style: .compact, run: run)
+                            .padding(.horizontal, Metric.roomy)
+                            .padding(.vertical, Metric.snug)
+                        Divider()
+                    }
                     .background(.bar)
                     .transition(reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity))
+                }
             }
-
-            switch router.section {
-            case .servers:
-                ServersView(model: model, router: router, search: $search, run: run)
-            case .clients:
-                ClientsView(model: model, search: $search, run: run)
-            case .events:
-                EventsView(model: model, router: router, search: $search, run: run)
-            case .activity:
-                ActivityView(model: model, search: $search, run: run)
-            case .settings:
-                SettingsView(model: model, router: router, run: run)
-            }
+            .navigationTitle(router.section.rawValue)
+            .searchable(text: $search, placement: .toolbar, prompt: searchPrompt)
         }
         .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.verdict)
-        .toolbar {
-            ToolbarItem(placement: .principal) {
-                Picker("Section", selection: $router.section) {
-                    ForEach(AppSection.allCases) { section in
-                        Text(section.rawValue).tag(section)
-                    }
-                }
-                .pickerStyle(.segmented)
-                .frame(minWidth: 340, idealWidth: 420, maxWidth: 420)
-            }
-
-            ToolbarItem {
-                Button { run(.showGuide) } label: {
-                    Image(systemName: "questionmark.circle")
-                }
-                .help("How Plug works")
-                .accessibilityLabel("How Plug works")
-            }
-
-        }
-        .modifier(SectionSearch(text: $search, prompt: searchPrompt))
-        .navigationTitle("Plug")
         .onChange(of: router.section) {
             search = ""
         }
@@ -86,6 +87,21 @@ struct RootView: View {
                     run(intent)
                 }
             }
+        }
+        .sheet(isPresented: $router.isAddingServer) {
+            AddServerView(model: model)
+        }
+        .sheet(isPresented: $router.isImportingServers) {
+            ImportServersView(model: model)
+        }
+        .sheet(item: $router.editingServer) { target in
+            EditServerView(model: model, name: target.id)
+        }
+        .sheet(item: $router.addingAccountTo) { target in
+            AddAccountView(model: model, router: router, server: target.id)
+        }
+        .sheet(isPresented: $router.isAddingWatch) {
+            AddWatchView(model: model)
         }
         .onChange(of: guideOpensByItself, initial: true) {
             if guideOpensByItself { router.isShowingGuide = true }
@@ -103,6 +119,17 @@ struct RootView: View {
         }
     }
 
+    /// The sidebar always has one section selected.
+    private var sidebarSelection: Binding<AppSection?> {
+        Binding(get: { router.section }, set: { if let section = $0 { router.section = section } })
+    }
+
+    /// The one number worth carrying in the sidebar: servers that need the
+    /// owner. Zero shows nothing.
+    private func badge(for section: AppSection) -> Int {
+        section == .servers ? model.situation.troubledServers.count : 0
+    }
+
     private var guideOpensByItself: Bool {
         FirstRunGuide.opensByItself(
             seen: guideSeen,
@@ -112,31 +139,12 @@ struct RootView: View {
     }
 
     /// Tools are searched from Servers, so its field says so.
-    private var searchPrompt: String? {
+    private var searchPrompt: String {
         switch router.section {
-        // The servers prompt names both things it finds and still fits the
-        // toolbar field at the minimum window width.
         case .servers: "Servers and tools"
         case .clients: "Search clients"
         case .events: "Search events"
         case .activity: "Search activity"
-        case .settings: nil
-        }
-    }
-}
-
-/// The system search field: it survives a narrow toolbar, carries the ⌘F
-/// shortcut, and clears itself the way every other Mac app does. A section
-/// with nothing to search shows no field.
-private struct SectionSearch: ViewModifier {
-    @Binding var text: String
-    let prompt: String?
-
-    func body(content: Content) -> some View {
-        if let prompt {
-            content.searchable(text: $text, placement: .toolbar, prompt: prompt)
-        } else {
-            content
         }
     }
 }

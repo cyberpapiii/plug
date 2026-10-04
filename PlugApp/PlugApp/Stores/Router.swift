@@ -15,6 +15,10 @@ final class Router {
     var isImportingServers = false
     var isAddingWatch = false
     var isShowingGuide = false
+    /// The selected row in each of the other sections.
+    var selectedClient: String?
+    var selectedEvent: String?
+    var selectedCall: UInt64?
     /// Counts the times a checkup was asked for from outside Settings, so
     /// Settings runs one each time the number moves.
     var checkupRequests = 0
@@ -41,6 +45,7 @@ struct PlugIntentRunner {
     let model: AppModel
     let router: Router
     var showWindow: () -> Void = {}
+    var showSettings: () -> Void = {}
 
     func run(_ intent: PlugIntent) {
         switch intent {
@@ -109,10 +114,11 @@ struct PlugIntentRunner {
         case .showGuide:
             router.isShowingGuide = true
             showWindow()
+        case .openSettings:
+            showSettings()
         case .checkup:
-            router.section = .settings
             router.checkupRequests += 1
-            showWindow()
+            showSettings()
         case .openCurrentWindow:
             showWindow()
         case let .reveal(server):

@@ -1,40 +1,78 @@
 import SwiftUI
 
-/// One stable content header for every section. It gives controls context and
-/// keeps them out of the crowded window toolbar.
-struct PageHeader<Content: View>: View {
-    let title: String
-    var detail: String?
-    @ViewBuilder let content: Content
+/// A section's rows on the left and the selected row in full on the right.
+/// Every section is laid out by this one view, so the divider, the list
+/// width, and the empty right side are the same everywhere.
+struct ListDetail<Rows: View, Detail: View>: View {
+    @ViewBuilder var rows: Rows
+    @ViewBuilder var detail: Detail
 
     var body: some View {
-        HStack(alignment: .center, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(title)
-                    .font(.title3.weight(.semibold))
-                if let detail {
-                    Text(detail)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-            }
-            .fixedSize(horizontal: false, vertical: true)
-            .layoutPriority(1)
-            Spacer(minLength: 0)
-            content
+        HStack(spacing: 0) {
+            rows
+                .listStyle(.inset)
+                .frame(width: Metric.listWidth)
+            Divider()
+            detail
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
         }
-        .padding(.horizontal, Metric.roomy)
-        .padding(.vertical, Metric.snug)
-        .frame(minHeight: 56)
-        .frame(maxWidth: Metric.contentMaxWidth)
-        .frame(maxWidth: .infinity)
-        .accessibilityAddTraits(.isHeader)
     }
 }
 
-extension PageHeader where Content == EmptyView {
-    init(_ title: String, detail: String? = nil) {
-        self.init(title: title, detail: detail) { EmptyView() }
+/// The right side of a section: one grouped form, the system's own look for
+/// "everything about this one thing".
+struct DetailForm<Content: View>: View {
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        Form { content }
+            .formStyle(.grouped)
+            .frame(maxWidth: Metric.detailMaxWidth)
+            .frame(maxWidth: .infinity)
+    }
+}
+
+/// The first row of every detail: a picture, the name, one line of status,
+/// and the controls that act on the whole thing.
+struct DetailHeader<Glyph: View, Controls: View>: View {
+    let title: String
+    var subtitle: String?
+    var monospaced = false
+    @ViewBuilder var glyph: Glyph
+    @ViewBuilder var controls: Controls
+
+    var body: some View {
+        HStack(spacing: Metric.snug) {
+            glyph
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(title)
+                    .font(monospaced ? .headline.monospaced() : .headline)
+                    .lineLimit(2)
+                    .textSelection(.enabled)
+                if let subtitle {
+                    Text(subtitle)
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .layoutPriority(1)
+            Spacer(minLength: Metric.tight)
+            controls
+        }
+        .padding(.vertical, Metric.rowGap)
+    }
+}
+
+/// The right side when no row is selected.
+struct NoSelection: View {
+    let item: String
+
+    var body: some View {
+        Text("No \(item) Selected")
+            .font(.title3)
+            .foregroundStyle(.tertiary)
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 

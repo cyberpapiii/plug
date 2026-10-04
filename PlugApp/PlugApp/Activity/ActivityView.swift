@@ -4,14 +4,13 @@ import SwiftUI
 /// What Plug has been doing. A log table answered "what fields exist"; this
 /// answers "what happened, and is anything going wrong repeatedly?" — so
 /// failures are countable and grouped by day, every row has a real time on
-/// it, and every row opens to say what happened and what to do about it.
+/// it, and the selected row says what happened and what to do about it.
 struct ActivityView: View {
     let model: AppModel
+    @Bindable var router: Router
     @Binding var search: String
     let run: (PlugIntent) -> Void
     @State private var scope: Scope = .everything
-    /// The call whose detail is open.
-    @State private var opened: UInt64?
 
     enum Scope: String, CaseIterable, Identifiable {
         case everything = "Everything"
@@ -20,82 +19,93 @@ struct ActivityView: View {
     }
 
     var body: some View {
-        VStack(spacing: 0) {
-            PageHeader(title: "Activity", detail: activitySummary) {
-                if !model.activities.isEmpty {
-                    Picker("Show", selection: $scope) {
-                        ForEach(Scope.allCases) { scope in
-                            Text(scope == .problems ? problemsLabel : scope.rawValue).tag(scope)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .frame(width: 190)
-                }
-            }
-
-            Group {
-                if model.isLoadingInitialData {
-                    LoadingPage(message: "Loading activity…")
-                } else if model.initialDataUnavailable {
-                    UnavailablePage(item: "Activity") { run(.reconnect) }
-                } else if model.activities.isEmpty {
+        Group {
+            if model.isLoadingInitialData {
+                LoadingPage(message: "Loading activity…")
+            } else if model.initialDataUnavailable {
+                UnavailablePage(item: "Activity") { run(.reconnect) }
+            } else if model.activities.isEmpty {
+                EmptyPage(
+                    title: "No activity yet",
+                    message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked.",
+                    symbol: "clock"
+                )
+            } else if visible.isEmpty {
+                if scope == .problems, search.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyPage(
-                        title: "No activity yet",
-                        message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked.",
-                        symbol: "clock.arrow.circlepath"
-                    )
-                } else if visible.isEmpty {
-                    EmptyPage(
-                        title: scope == .problems ? "No problems" : "No matches",
-                        message: scope == .problems
-                            ? "Every recent call went through cleanly."
-                            : "Nothing recent matches that search.",
-                        symbol: scope == .problems ? "checkmark.circle" : "magnifyingglass"
+                        title: "No problems",
+                        message: "Every recent call went through cleanly.",
+                        symbol: "checkmark.circle"
                     )
                 } else {
-                    List {
+                    ContentUnavailableView.search(text: search)
+                }
+            } else {
+                ListDetail {
+                    List(selection: $router.selectedCall) {
                         ForEach(groups, id: \.title) { group in
-                            SectionLabel(
-                                text: group.title,
-                                trailing: group.events.count == 1 ? "1 call" : "\(group.events.count) calls"
-                            )
-                                .padding(.top, Metric.regular)
-                                .listRowSeparator(.hidden)
-                                .listRowBackground(Color.clear)
-                            ForEach(group.events) { event in
-                                ActivityRow(
-                                    call: CallFacts(event),
-                                    isOpen: Binding(
-                                        get: { opened == event.sequence },
-                                        set: { opened = $0 ? event.sequence : nil }
-                                    ),
-                                    canShowServer: serverNames.contains(event.server ?? ""),
-                                    run: run
-                                )
-                                    .listRowSeparator(.hidden)
-                                    .listRowInsets(Metric.listRowInsets)
+                            Section(group.title) {
+                                ForEach(group.events) { event in
+                                    ActivityRow(call: CallFacts(event)).tag(event.sequence)
+                                }
                             }
                         }
                         if model.activityIsCapped {
                             Text("This is the most recent \(AppModel.activityLimit) calls. Older ones are not kept.")
                                 .font(.caption)
                                 .foregroundStyle(.tertiary)
-                                .frame(maxWidth: .infinity, alignment: .center)
                                 .listRowSeparator(.hidden)
                         }
                     }
-                    .listStyle(.inset)
-                    .frame(maxWidth: Metric.contentMaxWidth)
-                    .frame(maxWidth: .infinity)
+                } detail: {
+                    if let selected {
+                        CallDetail(
+                            call: CallFacts(selected),
+                            canShowServer: serverNames.contains(selected.server ?? ""),
+                            run: run
+                        )
+                        .id(selected.sequence)
+                    } else {
+                        NoSelection(item: "Call")
+                    }
                 }
             }
+        }
+        .navigationSubtitle(activitySummary ?? "")
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Picker("Show", selection: $scope) {
+                    ForEach(Scope.allCases) { scope in
+                        Text(scope == .problems ? problemsLabel : scope.rawValue).tag(scope)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .disabled(model.activities.isEmpty)
+                .help("Show every call, or only the ones that went wrong")
+            }
+        }
+        .onChange(of: visible.first?.sequence, initial: true) { keepSelectionVisible() }
+        .onChange(of: scope) { keepSelectionVisible() }
+    }
+
+    private var selected: ActivityEvent? {
+        visible.first { $0.sequence == router.selectedCall }
+    }
+
+    /// The newest call is selected until the owner picks one, so the right
+    /// side is never an empty placeholder.
+    private func keepSelectionVisible() {
+        if selected != nil { return }
+        Task { @MainActor in
+            await Task.yield()
+            router.selectedCall = visible.first?.sequence
         }
     }
 
     private var activitySummary: String? {
         guard model.hasLoadedSnapshot else { return nil }
         let count = model.activities.count
+        guard count > 0 else { return nil }
         let summary = "\(count) recent \(count == 1 ? "call" : "calls")"
         return model.dataIsStale ? "Last known · \(summary)" : summary
     }
@@ -154,71 +164,48 @@ struct ActivityView: View {
 
 private struct ActivityRow: View {
     let call: CallFacts
-    @Binding var isOpen: Bool
-    let canShowServer: Bool
-    let run: (PlugIntent) -> Void
 
     var body: some View {
-        Button { isOpen = true } label: {
-            HStack(spacing: Metric.snug) {
-                // The calling client's own icon, so a long list can be scanned
-                // by picture rather than read line by line. Trouble replaces
-                // the icon with a warning, so a failure is visible at a glance.
-                ZStack {
-                    if call.succeeded {
-                        AppGlyph(target: call.callerTarget, name: call.caller, size: 22)
-                    } else {
-                        Image(systemName: "exclamationmark.triangle.fill")
-                            .font(.body)
-                            .foregroundStyle(.orange)
-                            .symbolRenderingMode(.hierarchical)
-                    }
-                }
-                .frame(width: 22, height: 22)
-                VStack(alignment: .leading, spacing: 1) {
-                    HStack(spacing: Metric.rowGap) {
-                        if let server = call.server {
-                            Text(server)
-                                .font(.callout.weight(.medium))
-                                .foregroundStyle(.secondary)
-                            Text("·").foregroundStyle(.quaternary)
-                        }
-                        Text(call.tool)
-                            .font(.callout.monospaced())
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                    }
-                    Text(context).font(.caption).foregroundStyle(.secondary).lineLimit(1)
-                }
-                Spacer(minLength: Metric.tight)
-                VStack(alignment: .trailing, spacing: 1) {
-                    Text(time).font(.caption.monospacedDigit()).foregroundStyle(.secondary)
-                    Text(call.duration)
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(call.slow ? Color.orange : Color.secondary.opacity(0.7))
+        HStack(spacing: Metric.tight) {
+            // The calling client's own icon, so a long list can be scanned
+            // by picture rather than read line by line. Trouble replaces
+            // the icon with a warning, so a failure is visible at a glance.
+            Group {
+                if call.succeeded {
+                    AppGlyph(target: call.callerTarget, name: call.caller, size: 20)
+                } else {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .symbolRenderingMode(.hierarchical)
                 }
             }
-            .padding(.vertical, Metric.tight)
-            .contentShape(Rectangle())
+            .frame(width: 20, height: 20)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(call.tool)
+                    .font(.callout.monospaced())
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(context)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+            Spacer(minLength: Metric.tight)
+            Text(time)
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .layoutPriority(1)
         }
-        .buttonStyle(.plain)
+        .padding(.vertical, Metric.hairline)
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(
-            "\(call.result). \(call.tool)\(call.server.map { ", \($0)" } ?? ""), \(context), \(time), \(call.spokenDuration)"
+            "\(call.result). \(call.tool)\(call.server.map { ", \($0)" } ?? ""), \(call.caller), \(time), \(call.spokenDuration)"
         )
-        .accessibilityHint("Shows what happened")
-        .popover(isPresented: $isOpen, arrowEdge: .trailing) {
-            CallDetail(call: call, canShowServer: canShowServer) { intent in
-                isOpen = false
-                run(intent)
-            }
-        }
     }
 
-    /// Who called, then why it failed when it did.
+    /// Which server, then who called.
     private var context: String {
-        guard !call.succeeded else { return call.caller }
-        return "\(call.caller) · \(call.reason ?? call.result)"
+        [call.server, call.caller].compactMap { $0 }.joined(separator: " · ")
     }
 
     private var time: String {
@@ -226,7 +213,7 @@ private struct ActivityRow: View {
     }
 }
 
-/// One call, opened: what ran, who asked, when, how long, and the result. A
+/// One call in full: what ran, who asked, when, how long, and the result. A
 /// failure says why and what to do next.
 private struct CallDetail: View {
     let call: CallFacts
@@ -234,40 +221,44 @@ private struct CallDetail: View {
     let run: (PlugIntent) -> Void
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text(call.tool)
-                    .font(.headline.monospaced())
-                    .fixedSize(horizontal: false, vertical: true)
-                    .textSelection(.enabled)
-                Text(call.result)
-                    .font(.callout)
-                    .foregroundStyle(call.succeeded ? Color.secondary : .orange)
+        DetailForm {
+            Section {
+                DetailHeader(title: call.tool, subtitle: call.result, monospaced: true) {
+                    Image(systemName: call.succeeded ? "checkmark.circle.fill" : "exclamationmark.triangle.fill")
+                        .font(.title2)
+                        .symbolRenderingMode(.hierarchical)
+                        .foregroundStyle(call.succeeded ? Color.green : .orange)
+                        .accessibilityHidden(true)
+                } controls: {
+                    EmptyView()
+                }
+                if !call.succeeded {
+                    ProblemNote(
+                        title: call.reason ?? "This call \(call.result.lowercased()).",
+                        advice: call.advice
+                    )
+                }
             }
-            if !call.succeeded {
-                ProblemNote(
-                    title: call.reason ?? "This call \(call.result.lowercased()).",
-                    advice: call.advice
-                )
+            Section {
+                if let server = call.server {
+                    LabeledContent("Server") {
+                        HStack(spacing: Metric.tight) {
+                            Text(server).textSelection(.enabled)
+                            if canShowServer, let name = call.event.server {
+                                Button { run(.reveal(server: name)) } label: {
+                                    Image(systemName: "arrow.right.circle.fill")
+                                }
+                                .buttonStyle(.borderless)
+                                .help("Show this server")
+                                .accessibilityLabel("Show Server")
+                            }
+                        }
+                    }
+                }
+                LabeledContent("Client", value: call.caller)
+                LabeledContent("When", value: call.date.formatted(date: .abbreviated, time: .standard))
+                LabeledContent("Took", value: call.duration)
             }
-            Grid(alignment: .leadingFirstTextBaseline, horizontalSpacing: Metric.regular, verticalSpacing: Metric.tight) {
-                if let server = call.server { line("Server", server) }
-                line("Client", call.caller)
-                line("When", call.date.formatted(date: .abbreviated, time: .standard))
-                line("Took", call.duration)
-            }
-            if canShowServer, let server = call.event.server {
-                Button("Show Server") { run(.reveal(server: server)) }
-            }
-        }
-        .padding(Metric.regular)
-        .frame(width: 320, alignment: .leading)
-    }
-
-    private func line(_ name: String, _ value: String) -> some View {
-        GridRow {
-            Text(name).font(.callout).foregroundStyle(.secondary)
-            Text(value).font(.callout).textSelection(.enabled)
         }
     }
 }

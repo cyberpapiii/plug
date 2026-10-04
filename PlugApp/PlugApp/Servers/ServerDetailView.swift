@@ -16,21 +16,19 @@ struct ServerDetailView: View {
     @State private var showsOffOnly = false
 
     var body: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: Metric.roomy) {
+        DetailForm {
+            Section {
                 header
                 if server.health == .signInNeeded {
                     signInCard
                 } else if let fix = server.fix {
                     problemCard(fix)
                 }
-                details
-                if !recentCalls.isEmpty { recent }
-                tools
             }
-            .padding(Metric.roomy)
+            details
+            if !recentCalls.isEmpty { recent }
+            tools
         }
-        .scrollBounceBehavior(.basedOnSize)
         .onChange(of: offCount) { _, count in
             if count == 0 { showsOffOnly = false }
         }
@@ -59,33 +57,31 @@ struct ServerDetailView: View {
     // MARK: - Header
 
     private var header: some View {
-        HStack(alignment: .center, spacing: Metric.snug) {
+        DetailHeader(title: server.name, subtitle: statusLine) {
             StatusGlyph(health: server.health, size: .title2)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(server.name).font(.title3.weight(.semibold))
-                Text(statusLine).font(.callout).foregroundStyle(.secondary)
-            }
-            Spacer(minLength: Metric.tight)
-            HStack(spacing: Metric.tight) {
+        } controls: {
+            ControlGroup {
                 if server.enabled {
                     Button("Restart") { run(.restartServer(server.name)) }
                 }
                 Button("Edit…") { run(.editServer(server.name)) }
-                Menu {
-                    Button("Add Another Account…") { run(.addAccount(server: server.name)) }
-                    if server.usesOAuth, server.health != .signInNeeded {
-                        Button("Sign Out…") { confirmSignOut = true }
-                    }
-                    Button("Remove Server…", role: .destructive) { confirmRemoval = true }
-                } label: {
-                    Image(systemName: "ellipsis")
-                }
-                .menuIndicator(.hidden)
-                .fixedSize()
-                .help("More")
-                .accessibilityLabel("More")
             }
-            .controlSize(.small)
+            .fixedSize()
+            Menu {
+                Button("Add Another Account…") { run(.addAccount(server: server.name)) }
+                if server.usesOAuth, server.health != .signInNeeded {
+                    Button("Sign Out…") { confirmSignOut = true }
+                }
+                Divider()
+                Button("Remove Server…", role: .destructive) { confirmRemoval = true }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .help("More")
+            .accessibilityLabel("More")
             Toggle(
                 "On",
                 isOn: Binding(
@@ -95,7 +91,6 @@ struct ServerDetailView: View {
             )
             .labelsHidden()
             .toggleStyle(.switch)
-            .controlSize(.small)
             .help(server.enabled ? "Turn off \(server.name)" : "Turn on \(server.name)")
             .accessibilityLabel("\(server.name) on")
         }
@@ -113,7 +108,8 @@ struct ServerDetailView: View {
 
     private var signInCard: some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
-            Text("This server needs you to sign in to your account.")
+            Label("This server needs you to sign in to your account.", systemImage: "exclamationmark.triangle.fill")
+                .symbolRenderingMode(.multicolor)
                 .font(.callout.weight(.medium))
             if server.isSigningIn {
                 HStack(spacing: Metric.tight) {
@@ -133,13 +129,14 @@ struct ServerDetailView: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(Metric.regular)
-        .nativeInsetSurface(AnyShapeStyle(.orange.opacity(0.1)))
+        .padding(.vertical, Metric.rowGap)
     }
 
     private func problemCard(_ button: Verdict.Button) -> some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
-            Text(server.problem).font(.callout.weight(.medium))
+            Label(server.problem, systemImage: "exclamationmark.triangle.fill")
+                .symbolRenderingMode(.multicolor)
+                .font(.callout.weight(.medium))
             if let error = server.error, !error.isEmpty {
                 Text(error)
                     .font(.caption.monospaced())
@@ -152,45 +149,24 @@ struct ServerDetailView: View {
                 .buttonStyle(.borderedProminent)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(Metric.regular)
-        .nativeInsetSurface(AnyShapeStyle(.orange.opacity(0.1)))
+        .padding(.vertical, Metric.rowGap)
     }
 
     // MARK: - Details
 
     private var details: some View {
-        VStack(alignment: .leading, spacing: Metric.snug) {
-            SectionLabel(text: "Details")
-            detailRow("Kind", server.transportLabel, symbol: server.transportSymbol)
+        Section("Details") {
+            LabeledContent("Kind", value: server.transportLabel)
             if server.usesOAuth {
-                detailRow("Account", accountLabel, symbol: accountSymbol)
+                LabeledContent("Account", value: accountLabel)
             }
             ForEach(server.authWarnings, id: \.self) { warning in
                 Label(warning, systemImage: "exclamationmark.circle")
-                    .font(.caption)
+                    .font(.callout)
                     .foregroundStyle(.orange)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
-    }
-
-    private func detailRow(_ label: String, _ value: String, symbol: String) -> some View {
-        LabeledContent {
-            Text(value)
-                .font(.callout)
-                .multilineTextAlignment(.trailing)
-                .textSelection(.enabled)
-        } label: {
-            Label(label, systemImage: symbol)
-                .font(.callout)
-                .foregroundStyle(.secondary)
-        }
-    }
-
-    /// The account line's own glyph, so "needs sign-in" is visible before the
-    /// words are read.
-    private var accountSymbol: String {
-        return server.health == .signInNeeded ? "person.badge.key.fill" : "person.badge.shield.checkmark"
     }
 
     private var accountLabel: String {
@@ -211,23 +187,24 @@ struct ServerDetailView: View {
     }
 
     private var recent: some View {
-        VStack(alignment: .leading, spacing: Metric.tight) {
-            SectionLabel(text: "Recent calls")
+        Section("Recent Calls") {
             ForEach(recentCalls) { event in
                 let call = CallFacts(event)
                 HStack(spacing: Metric.tight) {
-                    Image(systemName: call.succeeded ? "checkmark" : "exclamationmark.triangle.fill")
-                        .font(.caption2)
-                        .foregroundStyle(call.succeeded ? Color.secondary : .orange)
-                        .frame(width: 12)
                     Text(call.tool)
-                        .font(.caption.monospaced())
+                        .font(.callout.monospaced())
                         .lineLimit(1)
                         .truncationMode(.middle)
                     Spacer(minLength: Metric.tight)
+                    if !call.succeeded {
+                        Label(call.result, systemImage: "exclamationmark.triangle.fill")
+                            .font(.callout)
+                            .foregroundStyle(.orange)
+                            .lineLimit(1)
+                    }
                     Text(call.duration)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(.tertiary)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
                 .help(call.reason ?? call.result)
                 .accessibilityElement(children: .ignore)
@@ -246,46 +223,48 @@ struct ServerDetailView: View {
         return showsOffOnly ? matched.filter { !$0.isOn } : matched
     }
 
-    private var toolsSummary: String {
+    /// Nil when every tool is on and shown: the header above already gives
+    /// the count.
+    private var toolsSummary: String? {
         let total = allTools.count
         let shown = shownTools.count
         if shown < total, !showsOffOnly { return "\(shown) of \(total)" }
         if offCount > 0 { return "\(total - offCount) of \(total) on" }
-        return total == 1 ? "1 tool" : "\(total) tools"
+        return nil
     }
 
-    @ViewBuilder private var tools: some View {
-        VStack(alignment: .leading, spacing: Metric.tight) {
+    private var tools: some View {
+        Section {
+            if allTools.isEmpty {
+                Text(server.health == .working ? "This server offers no tools." : "Tools appear once the server is running.")
+                    .foregroundStyle(.secondary)
+            } else if shownTools.isEmpty {
+                Text("No tool matches “\(query.trimmingCharacters(in: .whitespaces))”.")
+                    .foregroundStyle(.secondary)
+            } else {
+                ForEach(shownTools) { tool in
+                    toolRow(tool)
+                }
+            }
+        } header: {
             HStack(spacing: Metric.snug) {
-                SectionLabel(text: "Tools", trailing: allTools.isEmpty ? nil : toolsSummary)
+                Text("Tools")
+                if let toolsSummary {
+                    Text(toolsSummary)
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
                 if offCount > 0 {
                     Picker("Show", selection: $showsOffOnly) {
                         Text("All").tag(false)
-                        Text("Off \(offCount)").tag(true)
+                        Text("Off (\(offCount))").tag(true)
                     }
                     .pickerStyle(.segmented)
                     .labelsHidden()
                     .controlSize(.small)
                     .fixedSize()
                 }
-            }
-            if allTools.isEmpty {
-                Text(server.health == .working ? "This server offers no tools." : "Tools appear once the server is running.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            } else if shownTools.isEmpty {
-                Text("No tool matches “\(query.trimmingCharacters(in: .whitespaces))”.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-            } else {
-                LazyVStack(alignment: .leading, spacing: 0) {
-                    ForEach(shownTools) { tool in
-                        toolRow(tool)
-                    }
-                }
-                // Rows carry their own inset; pull them back so tool names
-                // line up with the section label.
-                .padding(.horizontal, -Metric.snug)
             }
         }
     }
@@ -300,10 +279,6 @@ struct ServerDetailView: View {
             onSelect: { router.selectedTool = tool.name },
             run: run
         )
-        .padding(.horizontal, Metric.snug)
-        .frame(minHeight: tool.summary?.isEmpty == false ? 46 : 36)
-        .hoverHighlight(cornerRadius: 7)
-        .contentShape(Rectangle())
         .accessibilityAction(named: "Show details") { router.selectedTool = tool.name }
         .popover(
             isPresented: Binding(

@@ -32,7 +32,6 @@ struct ToolRow: View {
             .accessibilityLabel("Show details for \(tool.shortName)")
             trailing
         }
-        .padding(.vertical, Metric.tight)
         .help(tool.summary ?? tool.name)
         .accessibilityElement(children: .contain)
     }
@@ -45,11 +44,11 @@ struct ToolRow: View {
                 .accessibilityLabel("Updating \(tool.shortName)")
         } else if !canManage {
             Text(tool.isOn ? "On" : "Off")
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
         } else if let pattern = tool.lockedByPattern {
             Label("Off by rule", systemImage: "lock.fill")
-                .font(.caption)
+                .font(.callout)
                 .foregroundStyle(.secondary)
                 .help("The pattern \(pattern) covers this tool. Remove it to switch this tool back on.")
         } else {
