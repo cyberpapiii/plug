@@ -96,6 +96,18 @@ final class AppIconTests: XCTestCase {
         )
     }
 
+    func testRemoteClientsAndTextAgentsAreNamedAndPictured() {
+        XCTAssertEqual(AppIcons.target(forClientType: "gemini-cli-mcp-client"), "gemini-cli")
+        XCTAssertEqual(AppIcons.target(forClientType: "Gemini"), "gemini")
+        XCTAssertEqual(AppIcons.target(forClientType: "Perplexity"), "perplexity")
+        XCTAssertEqual(AppIcons.target(forClientType: "Mistral Le Chat"), "le-chat")
+        XCTAssertEqual(AppIcons.target(forClientType: "hermes-agent"), "hermes")
+        XCTAssertEqual(AppIcons.displayName(forTarget: "hermes"), "Hermes Agent")
+        XCTAssertEqual(AppIcons.displayName(forTarget: "poke"), "Poke")
+        XCTAssertEqual(AppIcons.symbol(target: "poke"), "message")
+        XCTAssertEqual(AppIcons.symbol(target: "le-chat"), "globe")
+    }
+
     func testAnUnknownAppStillGetsSomethingAppShaped() {
         XCTAssertEqual(AppIcons.symbol(target: "brand-new-thing", name: "Brand New Thing"), "app.dashed")
     }
@@ -117,8 +129,8 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(AppIcons.displayName(forTarget: "grok-bot"), "Grok Bot")
         XCTAssertEqual(AppIcons.symbol(target: "grok-build", name: "Grok Build"), "terminal")
         XCTAssertEqual(AppIcons.target(forClientType: "cursor"), "cursor")
-        XCTAssertEqual(AppIcons.target(forClientType: "Hermes Agent"), "hermes-agent")
-        XCTAssertNil(AppIcons.displayName(forTarget: "hermes-agent"))
+        XCTAssertEqual(AppIcons.target(forClientType: "Some Agent"), "some-agent")
+        XCTAssertNil(AppIcons.displayName(forTarget: "some-agent"))
     }
 
     func testAnUnrecognizedClientTypeIsPassedThroughRatherThanGuessed() {

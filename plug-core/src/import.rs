@@ -50,6 +50,7 @@ pub enum ClientSource {
     QwenCode,
     Antigravity,
     Goose,
+    Hermes,
 }
 
 impl ClientSource {
@@ -81,6 +82,7 @@ impl ClientSource {
             Self::QwenCode => "Qwen Code",
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
+            Self::Hermes => "Hermes Agent",
         }
     }
 
@@ -112,6 +114,7 @@ impl ClientSource {
             Self::QwenCode,
             Self::Antigravity,
             Self::Goose,
+            Self::Hermes,
         ]
     }
 }
@@ -338,6 +341,7 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
         }
         ClientSource::Antigravity => antigravity_paths(&home),
         ClientSource::Goose => goose_paths(&home),
+        ClientSource::Hermes => vec![home.join(".hermes/config.yaml")],
     }
 }
 
@@ -446,6 +450,7 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
 
         // YAML clients
         ClientSource::Goose => parse_yaml_mcp_extensions(&content, source, "extensions"),
+        ClientSource::Hermes => parse_yaml_mcp_extensions(&content, source, "mcp_servers"),
     }
 }
 
@@ -469,7 +474,7 @@ fn parse_yaml_mcp_extensions(
             Some(s) => s.to_string(),
             None => continue,
         };
-        if name == "plug" {
+        if name.eq_ignore_ascii_case("plug") {
             continue;
         }
         if let Some(config) = yaml_entry_to_server_config(entry) {
@@ -488,8 +493,14 @@ fn parse_yaml_mcp_extensions(
 fn yaml_entry_to_server_config(entry: &serde_norway::Value) -> Option<ServerConfig> {
     let obj = entry.as_mapping()?;
 
-    // Goose uses "type: stdio" or "sse"
-    let transport_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or("stdio");
+    // Goose uses "type: stdio" or "sse". Hermes Agent has no type: an entry
+    // with a `url` and no `command` is an HTTP server.
+    let untyped = if obj.get("command").is_none() && obj.get("url").is_some() {
+        "http"
+    } else {
+        "stdio"
+    };
+    let transport_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or(untyped);
     let transport = match transport_type {
         "stdio" => crate::config::TransportType::Stdio,
         "sse" => crate::config::TransportType::Sse,
@@ -953,6 +964,7 @@ fn resolve_name_against_set(
         ClientSource::QwenCode => "qwen",
         ClientSource::Antigravity => "antigravity",
         ClientSource::Goose => "goose",
+        ClientSource::Hermes => "hermes",
     };
     format!("{name}-{suffix}")
 }
@@ -1131,6 +1143,23 @@ GITHUB_TOKEN = "$GITHUB_TOKEN"
             servers[0].config.env.get("GITHUB_TOKEN").unwrap(),
             "$GITHUB_TOKEN"
         );
+    }
+
+    #[test]
+    fn parse_hermes_yaml_imports_servers_and_skips_plug() {
+        let yaml = "mcp_servers:\n  Plug:\n    command: plug\n    args: [connect]\n  files:\n    command: npx\n    args: [\"-y\", \"server-filesystem\"]\n  company:\n    url: https://mcp.example.com\n";
+        let servers = parse_yaml_mcp_extensions(yaml, ClientSource::Hermes, "mcp_servers").unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(servers[0].name, "files");
+        assert_eq!(servers[0].config.command.as_deref(), Some("npx"));
+        assert_eq!(
+            servers[1].config.url.as_deref(),
+            Some("https://mcp.example.com")
+        );
+        assert!(matches!(
+            servers[1].config.transport,
+            crate::config::TransportType::Http
+        ));
     }
 
     #[test]

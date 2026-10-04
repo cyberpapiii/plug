@@ -34,6 +34,14 @@ enum AppIcons {
         "antigravity": "com.google.antigravity",
         "junie": "com.jetbrains.junie",
         "goose": "com.block.goose",
+        // Read off Homebrew's casks on 2026-10-04, not off an installed copy.
+        "warp": "dev.warp.Warp-Stable",
+        "kiro": "dev.kiro.desktop",
+        "hermes": "com.nousresearch.hermes",
+        // Remote clients whose Mac app supplies the icon. Perplexity's
+        // identifier is unchecked; a miss costs a symbol.
+        "gemini": "com.google.GeminiMacOS",
+        "perplexity": "ai.perplexity.mac",
     ]
 
     /// Targets that are command line tools. They have no icon to show, and a
@@ -42,6 +50,13 @@ enum AppIcons {
         "cline-cli", "gemini-cli", "grok-build", "copilot-cli", "pi",
         "goose", "opencode", "nanobot", "crush", "kimi-code", "qwen-code",
     ]
+
+    /// Clients that live on someone else's servers and reach Plug over the
+    /// public address. They have no link target, only a name and a picture.
+    private static let remoteTargets: Set<String> = ["gemini", "perplexity", "le-chat"]
+
+    /// Agents a person talks to by text message.
+    private static let textAgentTargets: Set<String> = ["poke"]
 
     /// The symbol that stands in for an app with no icon on this Mac.
     ///
@@ -66,6 +81,9 @@ enum AppIcons {
             return "bird.fill"
         }
         if commandLineTargets.contains(key) || text.contains("cli") { return "terminal" }
+        // An agent reached by text message has no app to show.
+        if textAgentTargets.contains(key) { return "message" }
+        if remoteTargets.contains(key) { return "globe" }
         if text.contains("code") || text.contains("cursor") || text.contains("zed") {
             return "chevron.left.forwardslash.chevron.right"
         }
@@ -122,6 +140,12 @@ enum AppIcons {
         if compact.contains("grok") {
             return compact.contains("bot") ? "grok-bot" : "grok-build"
         }
+        // Gemini is a terminal client and a remote one.
+        if compact.contains("gemini") {
+            return compact.contains("cli") ? "gemini-cli" : "gemini"
+        }
+        if compact.contains("mistral") || compact.contains("lechat") { return "le-chat" }
+        if compact.contains("poke") { return "poke" }
         for target in bundleIdentifiers.keys where value.contains(target) { return target }
         for target in commandLineTargets where value.contains(target) { return target }
         return value
@@ -153,6 +177,13 @@ enum AppIcons {
         case "grok-bot": return "Grok Bot"
         case "opencode": return "OpenCode"
         case "goose": return "Goose"
+        case "warp": return "Warp"
+        case "kiro": return "Kiro"
+        case "hermes": return "Hermes Agent"
+        case "gemini": return "Gemini"
+        case "perplexity": return "Perplexity"
+        case "le-chat": return "Le Chat"
+        case "poke": return "Poke"
         default: return nil
         }
     }
