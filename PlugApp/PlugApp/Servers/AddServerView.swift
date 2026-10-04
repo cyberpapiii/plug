@@ -16,6 +16,11 @@ struct AddServerView: View {
     @State private var failure: String?
     /// The person's answer to "is this address an API?", when they gave one.
     @State private var addressIsAPI: Bool?
+    /// The operations of the API being added, once the daemon has read its
+    /// document, and which of them the person kept.
+    @State private var choice: APIOperationChoice?
+    @State private var choiceFailure: String?
+    @State private var showsOperations = false
     @FocusState private var focus: Field?
 
     private enum Field { case paste, name }
@@ -62,7 +67,7 @@ struct AddServerView: View {
                 Button(saving ? "Adding…" : "Add Server") { add() }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.defaultAction)
-                    .disabled(draft == nil || trimmedName.isEmpty || saving)
+                    .disabled(draft == nil || trimmedName.isEmpty || saving || choice?.problem != nil)
             }
         }
         .padding(Metric.roomy)
@@ -74,6 +79,7 @@ struct AddServerView: View {
             addressIsAPI = nil
             if !nameEdited, let draft { name = draft.name }
         }
+        .task(id: apiSpec) { await readOperations() }
     }
 
     private static let placeholder = """
@@ -93,6 +99,91 @@ struct AddServerView: View {
     private var draft: ServerDraft? {
         if case let .draft(value) = parse { return value }
         return nil
+    }
+
+    /// The document to read operations from, when the draft is an API.
+    private var apiSpec: String? {
+        guard let draft, draft.config.transport == "openapi" else { return nil }
+        return draft.config.spec
+    }
+
+    /// Waits for typing to settle, then asks the daemon what the API offers.
+    /// A failure here does not block adding: the server reports it later.
+    private func readOperations() async {
+        choice = nil
+        choiceFailure = nil
+        guard let spec = apiSpec else { return }
+        try? await Task.sleep(for: .milliseconds(500))
+        guard !Task.isCancelled else { return }
+        do {
+            let api = try await model.describeAPI(spec)
+            guard !Task.isCancelled else { return }
+            let read = APIOperationChoice(api: api)
+            choice = read
+            showsOperations = read.problem != nil
+        } catch {
+            guard !Task.isCancelled else { return }
+            choiceFailure = error.localizedDescription
+        }
+    }
+
+    @ViewBuilder private var operations: some View {
+        if let choice {
+            DisclosureGroup(isExpanded: $showsOperations) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: Metric.hairline) {
+                        ForEach(choice.groups, id: \.tag) { group in
+                            Text(group.tag)
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .padding(.top, Metric.hairline)
+                            ForEach(group.operations) { operation in
+                                Toggle(isOn: Binding(
+                                    get: { choice.chosen.contains(operation.name) },
+                                    set: { on in
+                                        if on {
+                                            self.choice?.chosen.insert(operation.name)
+                                        } else {
+                                            self.choice?.chosen.remove(operation.name)
+                                        }
+                                    }
+                                )) {
+                                    Text(operation.name).font(.caption.monospaced())
+                                        + Text("  \(operation.method) \(operation.path)")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                .toggleStyle(.checkbox)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(operation.summary)
+                                .accessibilityLabel("\(operation.name), \(operation.method) \(operation.path)")
+                            }
+                        }
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+                .frame(maxHeight: 160)
+            } label: {
+                HStack(spacing: Metric.snug) {
+                    Text("\(choice.chosen.count) of \(choice.api.operations.count) operations")
+                        .font(.caption)
+                    if let problem = choice.problem {
+                        Text(problem).font(.caption).foregroundStyle(.orange)
+                    }
+                }
+            }
+        } else if let choiceFailure {
+            Label(choiceFailure, systemImage: "exclamationmark.triangle")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+        } else if apiSpec != nil {
+            HStack(spacing: Metric.snug) {
+                ProgressView().controlSize(.small)
+                Text("Reading the document…").font(.caption).foregroundStyle(.secondary)
+            }
+        }
     }
 
     @ViewBuilder private var preview: some View {
@@ -141,6 +232,7 @@ struct AddServerView: View {
                             .textSelection(.enabled)
                     }
                 }
+                operations
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .padding(Metric.regular)
@@ -156,7 +248,8 @@ struct AddServerView: View {
     }
 
     private func add() {
-        guard let draft else { return }
+        guard var draft else { return }
+        if let choice { draft.config.operations = choice.setting }
         saving = true
         failure = nil
         let finalName = trimmedName

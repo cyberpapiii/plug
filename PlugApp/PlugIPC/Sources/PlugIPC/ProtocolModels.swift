@@ -477,12 +477,46 @@ public struct StdioSandboxConfig: Codable, Equatable, Sendable {
     public var profilePath: String?
 }
 
+/// What an API offers, read from its OpenAPI document.
+public struct APISummary: Decodable, Equatable, Sendable {
+    /// The most operations one API server may expose.
+    public static let operationLimit = 50
+
+    public var title: String
+    public var operations: [APIOperation]
+
+    public init(title: String, operations: [APIOperation]) {
+        self.title = title
+        self.operations = operations
+    }
+}
+
+/// One operation of an API, named as the tool it becomes.
+public struct APIOperation: Decodable, Equatable, Sendable, Identifiable {
+    public var name: String
+    public var method: String
+    public var path: String
+    public var summary: String
+    public var tag: String?
+    public var id: String { name }
+
+    public init(name: String, method: String, path: String, summary: String, tag: String? = nil) {
+        self.name = name
+        self.method = method
+        self.path = path
+        self.summary = summary
+        self.tag = tag
+    }
+}
+
 public enum IPCRequest: Encodable, Equatable, Sendable {
     case handshake(clientVersion: String, ipcMin: UInt16, ipcMax: UInt16)
     case snapshot(authToken: String)
     case serverConfig(authToken: String, name: String)
     case activity(authToken: String, afterSequence: UInt64, limit: Int, failuresOnly: Bool)
     case validateServer(authToken: String, name: String, server: ServerConfig)
+    /// List the operations of an OpenAPI document before its server exists.
+    case describeAPI(authToken: String, spec: String)
     case addServer(authToken: String, name: String, server: ServerConfig)
     case updateServer(authToken: String, name: String, server: ServerConfig)
     case removeServer(authToken: String, name: String)
@@ -507,7 +541,7 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
         case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked
-        case watch, event, account
+        case watch, event, account, spec
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -528,6 +562,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .validateServer(token, name, server):
             try c.encode("ValidateServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+        case let .describeAPI(token, spec):
+            try c.encode("DescribeApi", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(spec, forKey: .spec)
         case let .addServer(token, name, server):
             try c.encode("AddServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
@@ -618,6 +655,7 @@ public enum IPCResponse: Decodable, Sendable {
     case activity([ActivityEvent])
     case tools([ToolInfo])
     case validated
+    case apiDescribed(APISummary)
     case mutation
     case revoked(String)
     /// What a reload changed, so the app can say something specific about it.
@@ -627,6 +665,7 @@ public enum IPCResponse: Decodable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, handshake, snapshot, events, tools, clientId, code, message, report, name, server
+        case api
     }
 
     public init(from decoder: Decoder) throws {
@@ -642,6 +681,7 @@ public enum IPCResponse: Decodable, Sendable {
         case "ActivitySnapshot": self = .activity(try c.decode([ActivityEvent].self, forKey: .events))
         case "Tools": self = .tools(try c.decode([ToolInfo].self, forKey: .tools))
         case "ServerValidated": self = .validated
+        case "ApiDescribed": self = .apiDescribed(try c.decode(APISummary.self, forKey: .api))
         case "OperatorMutation": self = .mutation
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
         case "Reloaded": self = .reloaded(try c.decode(ReloadSummary.self, forKey: .report))

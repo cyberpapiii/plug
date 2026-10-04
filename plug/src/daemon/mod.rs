@@ -87,6 +87,8 @@ use mcp_dispatch::dispatch_mcp_request;
 /// Idle timeout for short-lived IPC connections (status queries, admin commands).
 /// Proxy connections (those that have called Register) are exempt from this timeout.
 const CONNECTION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long reading an OpenAPI document for the app may take.
+const API_DESCRIBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ──────────────────────────────── Auth token ─────────────────────────────────
 
@@ -1642,6 +1644,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 Ok(server) => IpcResponse::ServerValidated { server },
                 Err(error) => IpcResponse::Error {
                     code: "INVALID_SERVER".to_string(),
+                    message: error.to_string(),
+                },
+            }
+        }
+        IpcRequest::DescribeApi { spec, .. } => {
+            match plug_core::openapi::describe(spec, API_DESCRIBE_TIMEOUT).await {
+                Ok(api) => IpcResponse::ApiDescribed { api },
+                Err(error) => IpcResponse::Error {
+                    code: "API_UNREADABLE".to_string(),
                     message: error.to_string(),
                 },
             }

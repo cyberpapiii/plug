@@ -1,3 +1,4 @@
+import PlugIPC
 import XCTest
 @testable import Plug
 
@@ -141,6 +142,31 @@ final class ServerDraftParserTests: XCTestCase {
             return XCTFail("expected an explanation")
         }
         XCTAssertTrue(reason.contains("command"), reason)
+    }
+
+    private func api(_ count: Int) -> APISummary {
+        APISummary(title: "Pets", operations: (0 ..< count).map {
+            APIOperation(name: "op\($0)", method: "GET", path: "/p\($0)", summary: "", tag: $0 % 2 == 0 ? "even" : nil)
+        })
+    }
+
+    func testASmallAPIStartsWholeAndSavesNoList() {
+        var choice = APIOperationChoice(api: api(3))
+        XCTAssertNil(choice.problem)
+        XCTAssertEqual(choice.setting, [])
+        choice.chosen.remove("op1")
+        XCTAssertEqual(choice.setting, ["op0", "op2"])
+        XCTAssertEqual(choice.groups.map(\.tag), ["even", "Other"])
+    }
+
+    func testALargeAPIMustBeNarrowedBeforeItIsAdded() {
+        var choice = APIOperationChoice(api: api(APISummary.operationLimit + 1))
+        XCTAssertNotNil(choice.problem)
+        choice.chosen = ["op4", "op2"]
+        XCTAssertNil(choice.problem)
+        XCTAssertEqual(choice.setting, ["op2", "op4"])
+        choice.chosen = Set(choice.api.operations.map(\.name))
+        XCTAssertNotNil(choice.problem)
     }
 
     func testPreviewNeverInventsFactsItDoesNotHave() throws {

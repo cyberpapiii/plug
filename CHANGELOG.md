@@ -136,6 +136,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   the key goes in a header or a query parameter, the token from
   `--bearer-token` is sent there; `--token-in header:<name>`, `query:<name>`,
   or `bearer` (`token_in` in the config) says so when the document does not.
+- Add Server lists an API's operations, grouped as the document groups them,
+  with a checkbox on each. An API with more than 50 operations starts with
+  none chosen and is added once 50 or fewer are.
 
 ### Changed
 

@@ -60,6 +60,8 @@ pub struct Operation {
     method: http::Method,
     path: String,
     description: String,
+    /// The first tag the document files the operation under.
+    tag: Option<String>,
     parameters: Vec<Parameter>,
     /// The argument that carries the JSON request body, if the operation
     /// takes one.
@@ -305,6 +307,66 @@ pub fn parse_document(
     url_override: Option<&str>,
     selected: &[String],
 ) -> anyhow::Result<ApiDocument> {
+    let document = parse_unlimited(text, spec, url_override, selected)?;
+    if document.operations.len() > MAX_OPERATIONS {
+        anyhow::bail!(
+            "this API has {} operations and a server may expose {MAX_OPERATIONS}; \
+             name the ones you want with 'operations'",
+            document.operations.len()
+        );
+    }
+    Ok(document)
+}
+
+/// What an API offers, for a person choosing operations before the server
+/// exists.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ApiSummary {
+    pub title: String,
+    pub operations: Vec<OperationSummary>,
+}
+
+/// One operation as a choice: its tool name and what the document says of it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct OperationSummary {
+    pub name: String,
+    pub method: String,
+    pub path: String,
+    pub summary: String,
+    pub tag: Option<String>,
+}
+
+/// Read the document at `spec` and list every operation in it, however many.
+pub async fn describe(spec: &str, timeout: Duration) -> anyhow::Result<ApiSummary> {
+    let text = read_document(spec, timeout).await?;
+    let document = parse_unlimited(&text, spec, None, &[])?;
+    Ok(ApiSummary {
+        title: document.title,
+        operations: document
+            .operations
+            .into_iter()
+            .map(|operation| OperationSummary {
+                summary: operation
+                    .description
+                    .lines()
+                    .next()
+                    .unwrap_or_default()
+                    .to_string(),
+                name: operation.name,
+                method: operation.method.to_string(),
+                path: operation.path,
+                tag: operation.tag,
+            })
+            .collect(),
+    })
+}
+
+fn parse_unlimited(
+    text: &str,
+    spec: &str,
+    url_override: Option<&str>,
+    selected: &[String],
+) -> anyhow::Result<ApiDocument> {
     let root: Value = match serde_json::from_str(text) {
         Ok(value) => value,
         Err(_) => serde_norway::from_str(text)
@@ -380,14 +442,6 @@ pub fn parse_document(
         }
         anyhow::bail!("no operation in the OpenAPI document matches 'operations'");
     }
-    if operations.len() > MAX_OPERATIONS {
-        anyhow::bail!(
-            "this API has {} operations and a server may expose {MAX_OPERATIONS}; \
-             name the ones you want with 'operations'",
-            operations.len()
-        );
-    }
-
     Ok(ApiDocument {
         title,
         version,
@@ -659,6 +713,10 @@ fn build_operation(
             .map_err(|_| anyhow::anyhow!("unsupported HTTP method '{method}'"))?,
         path: path.to_string(),
         description,
+        tag: operation
+            .pointer("/tags/0")
+            .and_then(Value::as_str)
+            .map(str::to_string),
         parameters,
         body_argument,
         input_schema,
@@ -1266,5 +1324,29 @@ mod tests {
             request.headers.last(),
             Some(&("authorization".to_string(), "Bearer secret".to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn describing_an_api_lists_every_operation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("big.json");
+        std::fs::write(&path, large_document(MAX_OPERATIONS + 5)).expect("write");
+        let summary = describe(&path.to_string_lossy(), Duration::from_secs(5))
+            .await
+            .expect("describe");
+        assert_eq!(summary.operations.len(), MAX_OPERATIONS + 5);
+
+        let pets = directory.path().join("pets.json");
+        std::fs::write(&pets, PETSTORE).expect("write");
+        let summary = describe(&pets.to_string_lossy(), Duration::from_secs(5))
+            .await
+            .expect("describe");
+        let list = summary
+            .operations
+            .iter()
+            .find(|operation| operation.name == "listPets")
+            .expect("listPets");
+        assert_eq!((list.method.as_str(), list.path.as_str()), ("GET", "/pets"));
+        assert_eq!(list.summary, "List pets");
     }
 }

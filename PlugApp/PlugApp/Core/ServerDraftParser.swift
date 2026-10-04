@@ -319,3 +319,50 @@ enum ServerDraftParser {
         return facts
     }
 }
+
+/// Which operations of an API become tools, as the person chose them.
+struct APIOperationChoice: Equatable {
+    let api: APISummary
+    var chosen: Set<String>
+
+    /// A small API starts with everything on. A large one starts empty,
+    /// because it cannot be added whole.
+    init(api: APISummary) {
+        self.api = api
+        chosen = api.operations.count <= APISummary.operationLimit
+            ? Set(api.operations.map(\.name))
+            : []
+    }
+
+    /// The operations under each tag, in the document's order. Operations
+    /// with no tag come last.
+    var groups: [(tag: String, operations: [APIOperation])] {
+        var order: [String] = []
+        var byTag: [String: [APIOperation]] = [:]
+        for operation in api.operations {
+            let tag = operation.tag ?? ""
+            if byTag[tag] == nil { order.append(tag) }
+            byTag[tag, default: []].append(operation)
+        }
+        return order
+            .sorted { !$0.isEmpty && $1.isEmpty }
+            .map { (tag: $0.isEmpty ? "Other" : $0, operations: byTag[$0] ?? []) }
+    }
+
+    /// Why this choice cannot be added, if it cannot.
+    var problem: String? {
+        if chosen.isEmpty { return "Choose at least one operation." }
+        if chosen.count > APISummary.operationLimit {
+            return "Choose \(APISummary.operationLimit) or fewer; \(chosen.count) are on."
+        }
+        return nil
+    }
+
+    /// What the server's `operations` setting should hold: nothing when
+    /// every operation is on, the chosen names otherwise.
+    var setting: [String] {
+        chosen.count == api.operations.count
+            ? []
+            : api.operations.map(\.name).filter(chosen.contains)
+    }
+}
