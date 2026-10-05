@@ -19,6 +19,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- A client you name after one Plug knows takes that client's icon: a second
+  Cursor sign-in renamed "GrokBot" shows Grok Bot's icon, not Cursor's.
 - Quitting Plug asks first. "Quit" closes the app and leaves Plug serving,
   with the icon away until Plug is opened again; "Turn Plug Off and Quit"
   stops it. Before, quitting left Plug serving without saying so.

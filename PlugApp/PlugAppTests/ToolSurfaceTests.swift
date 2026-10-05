@@ -310,6 +310,36 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(named[1].host?.app)
     }
 
+    func testAClientNamedAsOnePlugKnowsTakesThatClientsIcon() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let visibility = try decoder.decode(
+            [ClientVisibility].self,
+            from: Data(
+                """
+                [{"session_id":"g1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:abc"},
+                 {"session_id":"c1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"}]
+                """.utf8
+            )
+        )
+        let stored = try decoder.decode(
+            [ClientName].self,
+            from: Data(#"[{"key":"oauth:abc","name":"GrokBot"},{"key":"oauth:def","name":"Work laptop"}]"#.utf8)
+        )
+        let names = ClientNames(visibility: visibility, names: stored)
+        let live = try sessions(
+            """
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1}]
+            """
+        )
+        XCTAssertEqual(names.target(of: live[0]), "grok-bot")
+        // A name Plug does not know leaves the icon to what the client reports.
+        XCTAssertEqual(names.target(of: live[1]), "cursor")
+        XCTAssertEqual(names.knownTarget(named: "GrokBot"), "grok-bot")
+        XCTAssertNil(names.knownTarget(named: "Work laptop"))
+    }
+
     func testANameTheOwnerGaveWinsAndFollowsTheClientNotTheSession() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
