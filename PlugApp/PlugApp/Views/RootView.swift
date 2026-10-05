@@ -37,8 +37,10 @@ struct RootView: View {
 
     static let guideSeenKey = "guideSeen"
 
+    @State private var columns = NavigationSplitViewVisibility.all
+
     var body: some View {
-        NavigationSplitView {
+        NavigationSplitView(columnVisibility: $columns) {
             List(selection: sidebarSelection) {
                 ForEach(AppSection.allCases) { section in
                     Label(section.rawValue, systemImage: section.symbol)
@@ -50,7 +52,13 @@ struct RootView: View {
         } content: {
             section
                 .environment(\.splitPane, .list)
-                .navigationSplitViewColumnWidth(min: 240, ideal: Metric.listWidth, max: 420)
+                // Without the sidebar the window's buttons and title sit over
+                // this column, and a narrow one lets the title run past its edge.
+                .navigationSplitViewColumnWidth(
+                    min: columns == .all ? 240 : Metric.listWidthUnderTitle,
+                    ideal: columns == .all ? Metric.listWidth : Metric.listWidthUnderTitle,
+                    max: 420
+                )
                 .navigationTitle(router.section.rawValue)
         } detail: {
             section

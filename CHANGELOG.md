@@ -25,6 +25,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- With the sidebar hidden, the window's title and count no longer run past
+  the edge of the first column.
 - The top of each column in the window no longer changes when the pointer
   moves over it. macOS was fading a line in under the bar on hover.
 
