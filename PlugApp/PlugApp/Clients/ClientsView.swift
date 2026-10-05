@@ -136,6 +136,36 @@ struct ClientNames: Equatable {
             ?? key.flatMap { grantNames[$0] }
             ?? session.displayName
     }
+
+    /// The target whose icon a session shows: the client it reports, else the
+    /// client its link was written for.
+    func target(of session: LiveSession) -> String {
+        let reported = AppIcons.target(forClientType: session.clientType)
+        if AppIcons.displayName(forTarget: reported) != nil { return reported }
+        if let key = key(of: session), AppIcons.displayName(forTarget: key) != nil {
+            return key
+        }
+        return reported
+    }
+
+    /// The distinct clients behind a set of open sessions, first seen first,
+    /// each as the Clients list names and pictures it.
+    func connectedClients(_ sessions: [LiveSession]) -> [ConnectedClient] {
+        var seen = Set<String>()
+        return sessions.compactMap { session in
+            let target = target(of: session)
+            let known = AppIcons.displayName(forTarget: target) != nil
+            // A client Plug knows is one client however it is keyed. Any
+            // other is told apart by its key.
+            let identity = known ? target : (key(of: session) ?? target)
+            guard seen.insert(identity).inserted else { return nil }
+            return ConnectedClient(
+                target: target,
+                name: displayName(session),
+                appPath: session.host?.app
+            )
+        }
+    }
 }
 
 /// What one client may reach, as its row offers it. A block belongs to a
@@ -353,7 +383,7 @@ struct ClientsView: View {
                 if let error = model.connectableAppsError {
                     PagePane {
                         ContentUnavailableView {
-                            Label("Clients Unavailable", systemImage: "bolt.slash")
+                            Label("Clients Unavailable", systemImage: "powerplug.portrait")
                         } description: {
                             Text(error)
                         } actions: {
@@ -593,14 +623,7 @@ struct ClientsView: View {
 
     /// The target whose icon a session shows: the client it reports, else the
     /// client its link was written for.
-    private func sessionTarget(_ session: LiveSession) -> String {
-        let reported = AppIcons.target(forClientType: session.clientType)
-        if AppIcons.displayName(forTarget: reported) != nil { return reported }
-        if let key = names.key(of: session), AppIcons.displayName(forTarget: key) != nil {
-            return key
-        }
-        return reported
-    }
+    private func sessionTarget(_ session: LiveSession) -> String { names.target(of: session) }
 
     /// Says how it reached Plug in words, not transport identifiers.
     private func place(_ session: LiveSession) -> String {

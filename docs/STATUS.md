@@ -17,8 +17,6 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   receivers other than a remote client that signs in. Unproven: a watch
   delivering to a real subscriber end to end. Design and order of work:
   issue #255.
-- `plug clients` still lists a remote session Plug does not recognise as
-  Unknown. The app names it after its grant.
 - Amp, OpenClaw, LM Studio, and Muse Code are linked from their makers'
   documentation as read on 2026-10-05; none was installed to try. Correct
   the path or the entry when one is. Amp and OpenClaw allow comments in

@@ -77,7 +77,8 @@ impl std::str::FromStr for ExportTarget {
             "amp" => Ok(Self::Amp),
             "openclaw" => Ok(Self::OpenClaw),
             "lm-studio" | "lmstudio" => Ok(Self::LmStudio),
-            "muse" | "muse-code" => Ok(Self::MuseCode),
+            // `muse` alone is Meta's agent, a remote client with no file to write.
+            "muse-code" => Ok(Self::MuseCode),
             _ => Err(format!("unknown export target: {s}")),
         }
     }

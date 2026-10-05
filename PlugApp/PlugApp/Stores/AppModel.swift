@@ -223,16 +223,17 @@ final class AppModel {
             setup: setupState,
             runtime: runtimeState,
             servers: serverFacts,
-            connectedApps: connectedAppTargets.count,
-            connectedAppTargets: connectedAppTargets,
+            connectedApps: connectedClients.count,
+            connectedAppTargets: connectedClients.map(\.target),
+            connectedClients: connectedClients,
             version: snapshot.runtimeVersion
         )
     }
 
     /// Distinct connected apps, first seen first, so the panel's icon row is
     /// stable while sessions come and go.
-    private var connectedAppTargets: [String] {
-        AppIcons.distinctTargets(forClientTypes: snapshot.liveSessions.map(\.clientType))
+    private var connectedClients: [ConnectedClient] {
+        ClientNames(snapshot: snapshot).connectedClients(snapshot.liveSessions)
     }
 
     /// The single sentence every surface renders.
@@ -288,7 +289,7 @@ final class AppModel {
         }
     }
 
-    var menuBarSymbol: String { PlugVerdict.menuBarSymbol(for: verdict) }
+    var menuBarMark: MenuBarMark { PlugVerdict.menuBarMark(for: verdict) }
 
     /// The version About shows: the daemon's once it has answered, the app's
     /// own before that. The two match except in the middle of an update.

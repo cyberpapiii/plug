@@ -12,7 +12,7 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
     var id: Self { self }
 
     /// Plug itself, where a picture puts it between servers and clients.
-    static let plugSymbol = "bolt"
+    static let plugSymbol = "powerplug.portrait"
 
     var symbol: String {
         switch self {
