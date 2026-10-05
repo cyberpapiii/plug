@@ -75,6 +75,7 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: showsBanner)
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actionError?.id)
         }
+        .plainWindowBar()
         .searchable(text: $search, placement: .toolbar, prompt: searchPrompt)
         .onChange(of: router.section) {
             search = ""
@@ -169,6 +170,17 @@ struct RootView: View {
 }
 
 private extension View {
+    /// No bar background behind the window's toolbar. With one, macOS fades
+    /// a line in under each column's bar whenever the pointer is over it.
+    @ViewBuilder
+    func plainWindowBar() -> some View {
+        if #available(macOS 15.0, *) {
+            toolbarBackgroundVisibility(.hidden, for: .windowToolbar)
+        } else {
+            self
+        }
+    }
+
     /// The verdict banner above a section. On macOS 26 it is a safe area bar,
     /// so the toolbar's scroll edge effect carries on under it; before that it
     /// is an inset on the bar material with its own divider.

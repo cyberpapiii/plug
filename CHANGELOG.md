@@ -5,6 +5,13 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The top of each column in the window no longer changes when the pointer
+  moves over it. macOS was fading a line in under the bar on hover.
+
 ## [0.10.0] - 2026-10-05
 
 ### Changed
