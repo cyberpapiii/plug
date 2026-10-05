@@ -30,6 +30,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Native OAuth clients such as Claude Code can sign in using temporary
+  loopback callback ports. Callback host, path, and query remain checked.
 - With the sidebar hidden, the window's title and count no longer run past
   the edge of the first column.
 - Linking OpenCode or Kilo Code writes the entry where those clients read

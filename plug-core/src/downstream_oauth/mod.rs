@@ -1352,7 +1352,7 @@ impl DownstreamOauthManager {
         if !client
             .redirect_uris
             .iter()
-            .any(|uri| uri == request.redirect_uri)
+            .any(|uri| registered_redirect_matches(uri, request.redirect_uri))
         {
             return Err(DownstreamOauthError::InvalidRedirectUri);
         }
@@ -1805,6 +1805,33 @@ fn safe_client_name(value: Option<&str>) -> String {
     } else {
         sanitized
     }
+}
+
+fn registered_redirect_matches(registered: &str, requested: &str) -> bool {
+    if registered == requested {
+        return true;
+    }
+    if !valid_redirect_uri(registered) || !valid_redirect_uri(requested) {
+        return false;
+    }
+    let (Ok(mut registered), Ok(mut requested)) =
+        (url::Url::parse(registered), url::Url::parse(requested))
+    else {
+        return false;
+    };
+    // RFC 8252 section 7.3: native loopback callbacks use ephemeral ports.
+    // Only the port may vary; token exchange still requires the actual callback.
+    if registered.scheme() != "http"
+        || requested.scheme() != "http"
+        || !registered.host_str().is_some_and(is_loopback_host)
+        || !requested.host_str().is_some_and(is_loopback_host)
+    {
+        return false;
+    }
+    if registered.set_port(None).is_err() || requested.set_port(None).is_err() {
+        return false;
+    }
+    registered == requested
 }
 
 fn valid_redirect_uri(value: &str) -> bool {
@@ -4961,6 +4988,36 @@ mod tests {
     }
 
     #[test]
+    fn registered_loopback_redirect_allows_only_port_variation() {
+        assert!(registered_redirect_matches(
+            "http://localhost/callback",
+            "http://localhost:62557/callback"
+        ));
+        assert!(registered_redirect_matches(
+            "http://127.0.0.1:1234/callback",
+            "http://127.0.0.1:62557/callback"
+        ));
+        for requested in [
+            "http://127.0.0.1:62557/callback",
+            "http://localhost:62557/other",
+            "http://localhost:62557/callback?extra=1",
+            "http://localhost:62557/callback#fragment",
+            "http://user@localhost:62557/callback",
+            "https://localhost:62557/callback",
+            "http://example.com:62557/callback",
+        ] {
+            assert!(!registered_redirect_matches(
+                "http://localhost/callback",
+                requested
+            ));
+        }
+        assert!(!registered_redirect_matches(
+            "https://example.com/callback",
+            "https://example.com:62557/callback"
+        ));
+    }
+
+    #[test]
     fn redirect_validation_accepts_web_loopback_and_exact_cursor_native_callback() {
         assert!(valid_redirect_uri("https://client.example/callback"));
         assert!(valid_redirect_uri("http://127.0.0.1:8787/callback"));
@@ -5292,9 +5349,23 @@ mod tests {
     async fn exact_redirect_pkce_scope_and_resource_are_enforced() {
         let (manager, _) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
+        let consent = manager
+            .begin_authorization(AuthorizationRequest {
+                response_type: "code",
+                client_id: &client.client_id,
+                redirect_uri: "http://localhost:8788/callback",
+                state: "state",
+                code_challenge: "challenge",
+                code_challenge_method: "S256",
+                scope: Some("tools:read"),
+                resource: "https://plug.example.com/mcp",
+            })
+            .await
+            .expect("native callback port may vary");
+        assert_eq!(consent.redirect_uri, "http://localhost:8788/callback");
         for (redirect, method, scope, resource, expected) in [
             (
-                "http://localhost:8788/callback",
+                "http://localhost:8788/other",
                 "S256",
                 "tools:read",
                 "https://plug.example.com/mcp",
