@@ -9,9 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
-- Plug's menu bar icon comes back on its own when something else closes the
-  app while Plug is serving: a quit-all, a crash, a force quit. Settings has
-  a "Keep in Menu Bar" switch for it, on by default.
+- Plug's menu bar icon is there whenever Plug is serving. It comes back on
+  its own when something else closes the app (a quit-all, a crash, a force
+  quit) and appears after login. Settings has a "Keep in Menu Bar" switch
+  for it, on by default.
 - Settings has a Permissions section: whether macOS lets Plug run in the
   background, open at login, and send notifications, with the way to System
   Settings beside anything that was turned off there.

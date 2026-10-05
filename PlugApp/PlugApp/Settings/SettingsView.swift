@@ -77,7 +77,7 @@ struct SettingsView: View {
             }
             Toggle(isOn: $keepsInMenuBar) {
                 Text("Keep in Menu Bar")
-                Text("If something else closes Plug while it is serving, its icon comes back.")
+                Text("While Plug is serving, its icon is in the menu bar. It comes back if something else closes it.")
             }
             .onChange(of: keepsInMenuBar) { _, keeps in
                 MenuBarPresence.standard.keeps = keeps

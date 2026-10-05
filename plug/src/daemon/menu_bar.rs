@@ -3,8 +3,8 @@
 //!
 //! The daemon outlives `Plug.app`, so after a quit-all or a crash it keeps
 //! serving with nothing on screen to say so. While the daemon runs from inside
-//! the app bundle it watches for the app, and once it has seen the app running
-//! and then gone for two looks in a row, it opens it again in the background.
+//! the app bundle it watches for the app, and once the app has been gone for
+//! two looks in a row, it opens it in the background. That covers login too.
 //! The app writes `menu-bar-hidden` beside the socket when its owner chose to
 //! quit it or turned this off, and the daemon then leaves it closed.
 
@@ -20,21 +20,13 @@ const LOOKS_BEFORE_REOPEN: u8 = 2;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 struct Watch {
-    seen_running: bool,
     missing: u8,
 }
 
 impl Watch {
     /// One look. Returns true when the app should be opened now.
     fn look(&mut self, running: bool, hidden_by_owner: bool) -> bool {
-        if running {
-            self.seen_running = true;
-            self.missing = 0;
-            return false;
-        }
-        // An app that was never open under this daemon was not closed by
-        // anything; at login it is the login item's to open, not ours.
-        if !self.seen_running || hidden_by_owner {
+        if running || hidden_by_owner {
             self.missing = 0;
             return false;
         }
@@ -144,11 +136,10 @@ mod tests {
     }
 
     #[test]
-    fn an_app_never_seen_open_is_not_opened() {
+    fn an_app_not_open_when_the_daemon_starts_is_opened() {
         let mut watch = Watch::default();
-        for _ in 0..5 {
-            assert!(!watch.look(false, false));
-        }
+        assert!(!watch.look(false, false));
+        assert!(watch.look(false, false));
     }
 
     #[test]
