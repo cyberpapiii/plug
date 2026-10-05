@@ -30,6 +30,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Ditto history and email-manager clients use Python icons while retaining their distinct workflow names.
 - HTTP-linked clients no longer have a redundant local configuration row
   beside their network authorization. Existing local sessions remain visible;
   clients not using Plug have their own section.

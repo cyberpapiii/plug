@@ -797,7 +797,8 @@ private struct ClientGlyph: View {
         case let .app(target, name, appPath):
             AppGlyph(target: target, name: name, appPath: appPath, size: size)
         case let .grant(name):
-            AppGlyph(target: AppIcons.target(forClientType: name), name: name, size: size)
+            let target = AppIcons.target(forClientType: name)
+            AppGlyph(target: target, name: target == "python" ? "Python" : name, size: size)
         }
     }
 }

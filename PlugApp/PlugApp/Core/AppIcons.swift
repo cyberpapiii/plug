@@ -190,6 +190,7 @@ enum AppIcons {
             .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
             .joined(separator: "-")
         let compact = value.replacingOccurrences(of: "-", with: "")
+        if compact == "dittohistory" || compact == "dittoemailmanager" { return "python" }
         if compact.contains("claudecode") { return "claude-code" }
         if compact.contains("claude") { return "claude-desktop" }
         if compact.contains("codex") {
