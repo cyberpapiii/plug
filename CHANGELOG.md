@@ -30,6 +30,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- HTTP-linked clients no longer have a redundant local configuration row
+  beside their network authorization. Existing local sessions remain visible;
+  clients not using Plug have their own section.
 - Native OAuth clients such as Claude Code can sign in using temporary
   loopback callback ports. Callback host, path, and query remain checked.
 - With the sidebar hidden, the window's title and count no longer run past

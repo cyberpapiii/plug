@@ -430,6 +430,7 @@ struct ClientsView: View {
                         }
                         group(.onThisMac, in: entries)
                         group(.network, in: entries)
+                        group(.notUsing, in: entries)
                     }
                 } detail: {
                     if let selected = entries.first(where: { $0.id == router.selectedClient }) {
@@ -493,11 +494,25 @@ struct ClientsView: View {
                 }
             }
             .map { sessionEntry(id: $0.id, sessions: $0.sessions) }
-        let all = connectedApps.map { appEntry($0.app, sessions: $0.sessions) }
+        let represented = Set(allApps.filter { app in
+            ClientStatus.hasNetworkRepresentation(app, grantNames: model.snapshot.downstreamClients.map(\.clientName))
+        }.map(\.target))
+        let all = connectedApps.filter { !represented.contains($0.app.target) }.map { appEntry($0.app, sessions: $0.sessions) }
             + others.filter { $0.group == .onThisMac }
-            + idleApps.map { appEntry($0, sessions: []) }
+            + idleApps.filter { !represented.contains($0.target) }.map { appEntry($0, sessions: []) }
             + others.filter { $0.group == .network }
-            + grants.map { grantEntry($0, sessions: unclaimed.byGrant[$0.clientKey] ?? []) }
+            + grants.map { grant in
+                let target = AppIcons.target(forClientType: grant.clientName)
+                var own = sessions.filter { names.key(of: $0) == grant.clientKey }
+                // A uniquely identified grant can show its still-open local
+                // sessions too. Multiple grants remain separate identities.
+                if represented.contains(target), model.snapshot.downstreamClients.filter({
+                    AppIcons.target(forClientType: $0.clientName) == target
+                }).count == 1 {
+                    own += sessions.filter { !Self.isRemote($0) && AppRoster.targets(of: $0).contains(target) }
+                }
+                return grantEntry(grant, sessions: own)
+            }
         // Only clients that share a name need telling apart.
         let shared = Dictionary(grouping: all, by: \.name).filter { $0.value.count > 1 }
         return all.map { entry in
@@ -523,7 +538,7 @@ struct ClientsView: View {
         }
         return Entry(
             id: "app:\(app.target)",
-            group: .onThisMac,
+            group: !app.linked && sessions.isEmpty ? .notUsing : .onThisMac,
             name: name,
             originalName: app.name,
             status: ClientStatus.app(app, connections: sessions.count, limit: access?.summary),
@@ -675,6 +690,11 @@ struct ClientsView: View {
 struct ClientStatus: Equatable {
     let text: String
 
+    static func hasNetworkRepresentation(_ app: LinkableApp, grantNames: [String]) -> Bool {
+        app.linked && app.transport?.lowercased() == "http"
+            && grantNames.contains { AppIcons.target(forClientType: $0) == app.target }
+    }
+
     /// A state, followed by what is off for the client when something is.
     init(state: String, limit: String?) {
         text = limit.map { "\(state) · \($0)" } ?? state
@@ -707,6 +727,7 @@ struct ClientEntry: Identifiable {
     enum Group: String {
         case onThisMac = "On This Mac"
         case network = "Over the Network"
+        case notUsing = "Not Using Plug"
     }
 
     enum Glyph {

@@ -515,6 +515,18 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "Not using Plug")
         XCTAssertEqual(ClientStatus.app(list[2], connections: 0, limit: nil).text, "Not found on this Mac")
     }
+
+    func testOnlyLinkedHTTPClientsAreRepresentedByTheirOwnGrant() throws {
+        let list = try apps(#"""
+        [{"target":"cursor","detected":true,"linked":true,"linked_transport":"http"},
+         {"target":"claude-code","detected":true,"linked":true,"linked_transport":"stdio"},
+         {"target":"codex-cli","detected":true,"linked_transport":"http"}]
+        """#)
+        XCTAssertTrue(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Cursor"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Claude Code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[1], grantNames: ["Claude Code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[2], grantNames: ["Codex CLI"]))
+    }
 }
 
 @MainActor
