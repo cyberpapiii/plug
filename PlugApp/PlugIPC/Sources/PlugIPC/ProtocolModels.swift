@@ -547,8 +547,10 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case validateServer(authToken: String, name: String, server: ServerConfig)
     /// List the operations of an OpenAPI document before its server exists.
     case describeAPI(authToken: String, spec: String)
-    case addServer(authToken: String, name: String, server: ServerConfig)
-    case updateServer(authToken: String, name: String, server: ServerConfig)
+    /// `secretStore` names where the keys typed into the server are kept:
+    /// the Keychain when nil, or `file` for Plug's `.env` file.
+    case addServer(authToken: String, name: String, server: ServerConfig, secretStore: String? = nil)
+    case updateServer(authToken: String, name: String, server: ServerConfig, secretStore: String? = nil)
     case removeServer(authToken: String, name: String)
     /// Add a configured server again as `<server>-<account>`.
     case addAccount(authToken: String, server: String, account: String)
@@ -573,7 +575,7 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
         case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked
-        case watch, event, account, spec
+        case watch, event, account, spec, secretStore
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -599,12 +601,14 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .describeAPI(token, spec):
             try c.encode("DescribeApi", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(spec, forKey: .spec)
-        case let .addServer(token, name, server):
+        case let .addServer(token, name, server, store):
             try c.encode("AddServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
-        case let .updateServer(token, name, server):
+            try c.encodeIfPresent(store, forKey: .secretStore)
+        case let .updateServer(token, name, server, store):
             try c.encode("UpdateServer", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+            try c.encodeIfPresent(store, forKey: .secretStore)
         case let .removeServer(token, name):
             try c.encode("RemoveServer", forKey: .type); try c.encode(token, forKey: .authToken); try c.encode(name, forKey: .name)
         case let .addAccount(token, server, account):

@@ -69,11 +69,10 @@ up to Open before starting it.
   them: `skills/list` and `skills/get` on the 2026-07-28 path with the
   extension's capability, then `resources/directory/read`.
 - Secret stores (#264). Done: the Keychain, the `.env` file, 1Password, and
-  any command as stores; `plug secret set`, typed keys going to the Keychain,
-  `plug secret move`. Left: choosing a store in the app's server form;
-  editing a server in the app without retyping its key leaves an old
-  plaintext key in the file until `plug secret move`; `$NAME` expansion from
-  `.env` still works beside `file:<name>` and could be retired.
+  any command as stores; `plug secret set`, typed keys going to the Keychain
+  or the `.env` file as the server form chooses, `plug secret move`. Left:
+  `$NAME` expansion from `.env` still works beside `file:<name>` and could
+  be retired.
 - A code-execution tool surface in place of real tools. Current evidence is
   against it as a default; the opt-in search-then-load mode covers clients with
   hard tool caps.

@@ -418,7 +418,12 @@ impl Stores {
     /// A value the store will not take stays where it is, so a machine with no
     /// credential store keeps working the way it did.
     pub fn keep(&self, server_name: &str, server: &mut ServerConfig) -> Vec<String> {
-        let Some(store) = self.get(KEYCHAIN) else {
+        self.keep_in(KEYCHAIN, server_name, server)
+    }
+
+    /// [`Stores::keep`], into the store named `id` in place of the Keychain.
+    pub fn keep_in(&self, id: &str, server_name: &str, server: &mut ServerConfig) -> Vec<String> {
+        let Some(store) = self.get(id) else {
             return Vec::new();
         };
         let mut kept = Vec::new();
@@ -430,7 +435,7 @@ impl Stores {
             match store.set(&name, &value.to_string().into()) {
                 Ok(()) => {
                     kept.push(name.clone());
-                    Some(reference(KEYCHAIN, &name))
+                    Some(reference(id, &name))
                 }
                 Err(error) => {
                     tracing::warn!(server = %server_name, %error, "secret stays in the config file");
@@ -470,7 +475,7 @@ impl Stores {
                 continue;
             }
             if let Some((id, name)) = self.parse(value)
-                && id == KEYCHAIN
+                && (id == KEYCHAIN || id == FILE)
                 && name.starts_with(&prefix)
                 && let Some(store) = self.get(id)
                 && let Err(error) = store.remove(name)

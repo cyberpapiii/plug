@@ -6,6 +6,26 @@ import SwiftUI
 /// Adding and editing are the same form. It starts from a complete server
 /// definition and gives one back, so settings the form has no field for stay
 /// as they were.
+/// Where Plug keeps a key typed into a server's form.
+enum KeyStore: String, CaseIterable, Identifiable, Sendable {
+    case keychain
+    case file
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .keychain: "Keychain"
+        case .file: "Plug's .env File"
+        }
+    }
+
+    /// What the daemon is told. The Keychain is what it uses unasked.
+    var sent: String? {
+        self == .keychain ? nil : rawValue
+    }
+}
+
 struct ServerForm: Equatable, Sendable {
     var isRemote: Bool
     var command: String
@@ -14,6 +34,8 @@ struct ServerForm: Equatable, Sendable {
     /// A key typed now. Empty keeps whatever the server already has.
     var key = ""
     var removeKey = false
+    /// Where a key typed now is kept.
+    var keyStore = KeyStore.keychain
     var settings: String
     private(set) var base: ServerConfig
 
@@ -174,7 +196,7 @@ struct ServerFormFields<Extra: View>: View {
             } footer: {
                 if form.isRemote {
                     if !signsIn {
-                        Text("A key is kept in the Keychain, not in the settings file.")
+                        Text("A key is kept out of the settings file.")
                     } else if name != nil {
                         Text("Plug asks you to sign in after you add it.")
                     } else {
@@ -195,8 +217,18 @@ struct ServerFormFields<Extra: View>: View {
                 if let problem = form.settingsProblem {
                     InlineWarning(problem)
                 } else {
-                    Text("Values the server's instructions ask for, such as API_KEY. Keys are kept in the Keychain.")
+                    Text("Values the server's instructions ask for, such as API_KEY. Keys are kept out of the settings file.")
                 }
+            }
+
+            Section {
+                Picker("Keep Keys In", selection: $form.keyStore) {
+                    ForEach(KeyStore.allCases) { store in
+                        Text(store.title).tag(store)
+                    }
+                }
+            } footer: {
+                Text("To use a key from 1Password, type where it is, such as op://vault/item/field, in place of the key.")
             }
 
             extra

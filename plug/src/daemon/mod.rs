@@ -1374,9 +1374,17 @@ async fn dispatch_operator_mutation(
     ctx: &ConnectionContext,
     mutation: plug_core::operator::OperatorMutation,
 ) -> IpcResponse {
+    dispatch_operator_mutation_keeping(ctx, mutation, None).await
+}
+
+async fn dispatch_operator_mutation_keeping(
+    ctx: &ConnectionContext,
+    mutation: plug_core::operator::OperatorMutation,
+    secret_store: Option<&str>,
+) -> IpcResponse {
     match ctx
         .engine
-        .apply_operator_mutation(&ctx.config_path, mutation)
+        .apply_operator_mutation_keeping(&ctx.config_path, mutation, secret_store)
         .await
     {
         Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
@@ -1657,23 +1665,35 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::AddServer { name, server, .. } => {
-            dispatch_operator_mutation(
+        IpcRequest::AddServer {
+            name,
+            server,
+            secret_store,
+            ..
+        } => {
+            dispatch_operator_mutation_keeping(
                 ctx,
                 plug_core::operator::OperatorMutation::AddServer {
                     name: name.clone(),
                     server: *server.clone(),
                 },
+                secret_store.as_deref(),
             )
             .await
         }
-        IpcRequest::UpdateServer { name, server, .. } => {
-            dispatch_operator_mutation(
+        IpcRequest::UpdateServer {
+            name,
+            server,
+            secret_store,
+            ..
+        } => {
+            dispatch_operator_mutation_keeping(
                 ctx,
                 plug_core::operator::OperatorMutation::UpdateServer {
                     name: name.clone(),
                     server: *server.clone(),
                 },
+                secret_store.as_deref(),
             )
             .await
         }

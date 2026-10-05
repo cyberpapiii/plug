@@ -845,7 +845,29 @@ impl Engine {
         crate::operator::OperatorMutationResult,
         crate::reload::ReloadReport,
     )> {
-        let (mutation, kept_for, before) = self.keep_typed_secrets(mutation).await;
+        self.apply_operator_mutation_keeping(config_path, mutation, None)
+            .await
+    }
+
+    /// [`Engine::apply_operator_mutation`], with the credentials typed into a
+    /// server kept in `secret_store` in place of the Keychain. Only a store
+    /// Plug can write to is taken: the Keychain or its own `.env` file.
+    pub async fn apply_operator_mutation_keeping(
+        self: &Arc<Self>,
+        config_path: &std::path::Path,
+        mutation: crate::operator::OperatorMutation,
+        secret_store: Option<&str>,
+    ) -> anyhow::Result<(
+        crate::operator::OperatorMutationResult,
+        crate::reload::ReloadReport,
+    )> {
+        let store = secret_store.unwrap_or(crate::secrets::KEYCHAIN);
+        if ![crate::secrets::KEYCHAIN, crate::secrets::FILE].contains(&store) {
+            anyhow::bail!("Plug cannot write keys to `{store}`; choose `keychain` or `file`");
+        }
+        let (mutation, kept_for, before) = self
+            .keep_typed_secrets(config_path, mutation, store.to_string())
+            .await;
         let (result, report) = {
             let _guard = self.reload_lock.lock().await;
             let (_, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
@@ -887,7 +909,9 @@ impl Engine {
     /// and the server as it was, so secrets it stops referring to are removed.
     async fn keep_typed_secrets(
         &self,
+        config_path: &std::path::Path,
         mutation: crate::operator::OperatorMutation,
+        store: String,
     ) -> (
         crate::operator::OperatorMutation,
         Option<String>,
@@ -897,7 +921,7 @@ impl Engine {
         let keep = |name: String, mut server: ServerConfig| async move {
             let owner = name.clone();
             match tokio::task::spawn_blocking(move || {
-                let kept = crate::secrets::Stores::current().keep(&owner, &mut server);
+                let kept = crate::secrets::Stores::current().keep_in(&store, &owner, &mut server);
                 (server, !kept.is_empty())
             })
             .await
@@ -921,8 +945,14 @@ impl Engine {
                 };
                 (OperatorMutation::AddServer { name, server }, None, None)
             }
-            OperatorMutation::UpdateServer { name, server } => {
+            OperatorMutation::UpdateServer { name, mut server } => {
                 let before = before(&name);
+                // A key left untouched arrives as a placeholder. Put back what
+                // the file holds for it, so a key still written there in the
+                // clear is moved along with the ones typed now.
+                if let Ok(file) = crate::operator::load_editable_config(config_path) {
+                    server.restore_redacted_secrets(file.servers.get(&name));
+                }
                 let (server, kept) = match keep(name.clone(), server.clone()).await {
                     Ok((_, server, kept)) => (server, kept),
                     Err(_) => (server, false),
@@ -2061,6 +2091,122 @@ mod tests {
             .await
             .unwrap();
         assert!(keychain.get("keeper.API_TOKEN").unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_key_left_untouched_in_an_edit_leaves_the_file_too() {
+        use crate::secrets::SecretStore;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            r#"
+[servers.older]
+command = "echo"
+enabled = false
+
+[servers.older.env]
+API_TOKEN = "written-in-the-clear"
+FROM_ENV = "$HOME"
+"#,
+        )
+        .unwrap();
+        let config = crate::config::load_config(Some(&path)).unwrap();
+        let engine = Arc::new(Engine::new(config));
+        // What a client is given to edit: every value hidden.
+        let mut edited = engine.config().servers["older"].redacted();
+        edited.args = vec!["hello".into()];
+
+        engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::UpdateServer {
+                    name: "older".into(),
+                    server: edited,
+                },
+            )
+            .await
+            .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("written-in-the-clear"), "{written}");
+        let saved = crate::operator::load_editable_config(&path).unwrap();
+        assert_eq!(
+            saved.servers["older"].env["API_TOKEN"],
+            "keychain:older.API_TOKEN"
+        );
+        assert_eq!(saved.servers["older"].env["FROM_ENV"], "$HOME");
+        assert_eq!(saved.servers["older"].args, ["hello"]);
+        assert_eq!(
+            crate::secrets::memory::keychain()
+                .get("older.API_TOKEN")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "written-in-the-clear"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_key_is_kept_in_the_store_that_was_chosen() {
+        let engine = Arc::new(Engine::new(Config::default()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::operator::persist_config_atomic(&path, &Config::default()).unwrap();
+        let server = || -> crate::config::ServerConfig {
+            serde_json::from_value(serde_json::json!({
+                "command": "echo",
+                "enabled": false,
+                "env": { "API_TOKEN": "typed-for-the-file" }
+            }))
+            .unwrap()
+        };
+        let add = |name: &str| crate::operator::OperatorMutation::AddServer {
+            name: name.into(),
+            server: server(),
+        };
+
+        engine
+            .apply_operator_mutation_keeping(&path, add("filed"), Some(crate::secrets::FILE))
+            .await
+            .unwrap();
+        let written = std::fs::read_to_string(&path).unwrap();
+        assert!(!written.contains("typed-for-the-file"), "{written}");
+        let saved = crate::operator::load_editable_config(&path).unwrap();
+        assert_eq!(
+            saved.servers["filed"].env["API_TOKEN"],
+            "file:filed.API_TOKEN"
+        );
+        let stores = crate::secrets::Stores::current();
+        let file = stores.get(crate::secrets::FILE).unwrap();
+        assert_eq!(
+            file.get("filed.API_TOKEN").unwrap().unwrap().as_str(),
+            "typed-for-the-file"
+        );
+
+        engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::RemoveServer {
+                    name: "filed".into(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(file.get("filed.API_TOKEN").unwrap().is_none());
+
+        // 1Password is read, never written, so it is not a place to keep a key.
+        let error = engine
+            .apply_operator_mutation_keeping(&path, add("refused"), Some("op"))
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cannot write keys"), "{error}");
+        assert!(
+            !crate::operator::load_editable_config(&path)
+                .unwrap()
+                .servers
+                .contains_key("refused")
+        );
     }
 
     #[tokio::test]

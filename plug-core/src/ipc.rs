@@ -224,11 +224,17 @@ pub enum IpcRequest {
         auth_token: String,
         name: String,
         server: Box<crate::config::ServerConfig>,
+        /// Where the keys typed into the server are kept: `keychain` when
+        /// absent, or `file` for Plug's `.env` file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_store: Option<String>,
     },
     UpdateServer {
         auth_token: String,
         name: String,
         server: Box<crate::config::ServerConfig>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_store: Option<String>,
     },
     RemoveServer {
         auth_token: String,

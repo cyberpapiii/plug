@@ -282,13 +282,14 @@ struct AddServerView: View {
         saving = true
         failure = nil
         let saved = config
+        let store = form.keyStore.sent
         Task {
             do {
                 try await model.performOperation {
                     .validateServer(authToken: $0, name: finalName, server: saved)
                 }
                 try await model.performOperation {
-                    .addServer(authToken: $0, name: finalName, server: saved)
+                    .addServer(authToken: $0, name: finalName, server: saved, secretStore: store)
                 }
                 saving = false
                 router.reveal(server: finalName)
