@@ -50,6 +50,10 @@ pub(crate) fn cmd_import(
                 "antigravity" => Some(ClientSource::Antigravity),
                 "goose" => Some(ClientSource::Goose),
                 "hermes" => Some(ClientSource::Hermes),
+                "amp" => Some(ClientSource::Amp),
+                "openclaw" => Some(ClientSource::OpenClaw),
+                "lm-studio" => Some(ClientSource::LmStudio),
+                "muse-code" => Some(ClientSource::MuseCode),
                 _ => None,
             })
             .collect(),

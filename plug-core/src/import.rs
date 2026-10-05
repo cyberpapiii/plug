@@ -51,6 +51,10 @@ pub enum ClientSource {
     Antigravity,
     Goose,
     Hermes,
+    Amp,
+    OpenClaw,
+    LmStudio,
+    MuseCode,
 }
 
 impl ClientSource {
@@ -83,6 +87,10 @@ impl ClientSource {
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
             Self::Hermes => "Hermes Agent",
+            Self::Amp => "Amp",
+            Self::OpenClaw => "OpenClaw",
+            Self::LmStudio => "LM Studio",
+            Self::MuseCode => "Muse Code",
         }
     }
 
@@ -115,6 +123,10 @@ impl ClientSource {
             Self::Antigravity,
             Self::Goose,
             Self::Hermes,
+            Self::Amp,
+            Self::OpenClaw,
+            Self::LmStudio,
+            Self::MuseCode,
         ]
     }
 }
@@ -342,6 +354,10 @@ fn config_paths(source: ClientSource) -> Vec<PathBuf> {
         ClientSource::Antigravity => antigravity_paths(&home),
         ClientSource::Goose => goose_paths(&home),
         ClientSource::Hermes => vec![home.join(".hermes/config.yaml")],
+        ClientSource::Amp => vec![home.join(".config/amp/settings.json")],
+        ClientSource::OpenClaw => vec![home.join(".openclaw/openclaw.json")],
+        ClientSource::LmStudio => vec![home.join(".lmstudio/mcp.json")],
+        ClientSource::MuseCode => vec![home.join(".config/muse/settings.json")],
     }
 }
 
@@ -451,6 +467,13 @@ fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServe
         // YAML clients
         ClientSource::Goose => parse_yaml_mcp_extensions(&content, source, "extensions"),
         ClientSource::Hermes => parse_yaml_mcp_extensions(&content, source, "mcp_servers"),
+
+        // Amp keeps its servers under one dotted key at the top of the file
+        ClientSource::Amp => parse_json_mcp_servers(&content, source, "amp.mcpServers"),
+        // OpenClaw nests them under "mcp" -> "servers", as VS Code once did
+        ClientSource::OpenClaw => parse_vscode_config(&content, source),
+        ClientSource::LmStudio => parse_json_mcp_servers(&content, source, "mcpServers"),
+        ClientSource::MuseCode => parse_json_mcp_servers(&content, source, "mcp_servers"),
     }
 }
 
@@ -965,6 +988,10 @@ fn resolve_name_against_set(
         ClientSource::Antigravity => "antigravity",
         ClientSource::Goose => "goose",
         ClientSource::Hermes => "hermes",
+        ClientSource::Amp => "amp",
+        ClientSource::OpenClaw => "openclaw",
+        ClientSource::LmStudio => "lmstudio",
+        ClientSource::MuseCode => "muse",
     };
     format!("{name}-{suffix}")
 }

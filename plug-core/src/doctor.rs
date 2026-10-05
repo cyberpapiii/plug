@@ -644,7 +644,12 @@ fn plug_entry_count(content: &str, extension: Option<&str>) -> usize {
                 return 0;
             };
             let mut count = 0;
-            for key in ["mcpServers", "context_servers"] {
+            for key in [
+                "mcpServers",
+                "context_servers",
+                "amp.mcpServers",
+                "mcp_servers",
+            ] {
                 if json.get(key).and_then(|v| v.get("plug")).is_some() {
                     count += 1;
                 }
@@ -976,6 +981,10 @@ async fn check_client_configs() -> CheckResult {
         "antigravity",
         "goose",
         "hermes",
+        "amp",
+        "openclaw",
+        "lm-studio",
+        "muse-code",
     ];
 
     for target in all_targets {

@@ -19,12 +19,10 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   issue #255.
 - `plug clients` still lists a remote session Plug does not recognise as
   Unknown. The app names it after its grant.
-- Clients missing from the registry (surveyed 2026-10-04): Muse Code, Amp,
-  OpenClaw, LM Studio. Check each config path against the vendor's docs on
-  the day before writing to it; on 2026-10-04 Amp's manual did not show its
-  settings path. Amp is said to keep its servers under the key
-  `amp.mcpServers`, OpenClaw under `mcp.servers` in a JSON5 file; linking,
-  repair, and doctor read neither.
+- Amp, OpenClaw, LM Studio, and Muse Code are linked from their makers'
+  documentation as read on 2026-10-05; none was installed to try. Correct
+  the path or the entry when one is. Amp and OpenClaw allow comments in
+  their settings file, and Plug refuses to write a file that has them.
 - Remote clients are named and pictured by guesswork: the app matches
   Gemini, Perplexity, Le Chat, and Poke on the name a client reports, and
   nobody has seen what each one reports. Correct the match when one connects.
