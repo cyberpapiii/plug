@@ -154,6 +154,22 @@ final class FrameCodecTests: XCTestCase {
         )
     }
 
+    func testKeepingAClientFromAToolIsSentAsTheDaemonReadsIt() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        let request = IPCRequest.setClientToolBlocked(
+            authToken: "secret", key: "pi", tool: "notion__search", blocked: false
+        )
+        let frame = try FrameCodec.encode(request, encoder: encoder)
+        let sent = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
+        XCTAssertEqual(
+            sent,
+            [
+                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
+                "kind": "tool", "target": "notion__search", "blocked": false,
+            ] as NSDictionary
+        )
+    }
+
     func testAWatchIsSentAsTheDaemonReadsItAndKeepsArgumentKeys() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let request = IPCRequest.addWatch(

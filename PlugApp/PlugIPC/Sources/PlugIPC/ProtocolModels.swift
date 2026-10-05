@@ -562,6 +562,8 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case renameClient(authToken: String, key: String, name: String)
     /// Keep a client from a server, or let it back in.
     case setClientServerBlocked(authToken: String, key: String, server: String, blocked: Bool)
+    /// Keep a client from one tool, by the name Plug lists it under.
+    case setClientToolBlocked(authToken: String, key: String, tool: String, blocked: Bool)
     /// Start watching a tool. The daemon checks the tool before it saves.
     case addWatch(authToken: String, watch: WatchConfig)
     /// Stop watching, by event name.
@@ -631,6 +633,10 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode("server", forKey: .kind)
             try c.encode(server, forKey: .target); try c.encode(blocked, forKey: .blocked)
+        case let .setClientToolBlocked(token, key, tool, blocked):
+            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode("tool", forKey: .kind)
+            try c.encode(tool, forKey: .target); try c.encode(blocked, forKey: .blocked)
         case let .addWatch(token, watch):
             try c.encode("AddWatch", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(watch, forKey: .watch)

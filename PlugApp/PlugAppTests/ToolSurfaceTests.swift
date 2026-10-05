@@ -379,6 +379,28 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(access("pi").summary, "2 tools off")
         XCTAssertNil(access("claude-code").summary)
         XCTAssertFalse(access("claude-code").isLimited)
+
+        // A tool is off by its own name, or under a rule that covers it.
+        XCTAssertEqual(access("pi").state(ofTool: "Slack__DM"), .off)
+        XCTAssertEqual(access("pi").state(ofTool: "Git__commit"), .offByRule("git__*"))
+        XCTAssertEqual(access("pi").state(ofTool: "slack__post"), .on)
+        XCTAssertEqual(access("cursor").state(ofTool: "slack__post"), .off)
+        let tools = ["git__commit", "git__log", "slack__dm", "slack__post"].map {
+            ToolFacts(name: $0, server: String($0.prefix(while: { $0 != "_" })))
+        }
+        XCTAssertEqual(access("pi").offCount(among: tools), 3)
+        XCTAssertEqual(access("claude-code").offCount(among: tools), 0)
+    }
+
+    func testARuleFitsTheWayTheDaemonReadsIt() {
+        XCTAssertTrue(ClientAccess.rule("*", fits: "anything"))
+        XCTAssertTrue(ClientAccess.rule("git__*", fits: "git__log"))
+        XCTAssertTrue(ClientAccess.rule("*__delete", fits: "git__delete"))
+        XCTAssertTrue(ClientAccess.rule("git__*_all", fits: "git__push_all"))
+        XCTAssertTrue(ClientAccess.rule("*delete*", fits: "git__delete_branch"))
+        XCTAssertFalse(ClientAccess.rule("git__*", fits: "slack__git__log"))
+        XCTAssertFalse(ClientAccess.rule("*__delete", fits: "git__delete_branch"))
+        XCTAssertFalse(ClientAccess.rule("git__log", fits: "git__logs"))
     }
 
     func testARemoteSessionIsNamedAfterItsGrantUnlessPlugKnowsTheProduct() throws {
