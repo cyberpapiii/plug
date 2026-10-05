@@ -10,6 +10,36 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   delivery from public channels the owner has not joined, and unattended
   renewal of the one-day subscription.
 
+## Next, in order
+
+Agreed with the owner on 2026-10-05. No release until the first six are in.
+Remove a line when it lands.
+
+1. Paper cuts. With the sidebar collapsed, the window's title and count
+   overlap the first column. Add others here as the owner reports them.
+2. Client audit. Remove clients that are stale or gone (Windsurf is one;
+   find where the app still shows it). Tell GrokBot from Cursor: the owner
+   has GrokBot make a few tool calls, and its id is read off them. Name the
+   connections that show as `python3` (Hermes Agent).
+3. A "where its settings are" row on each server page: open the app it comes
+   from, show the file named in its arguments, its options in Plug, or its
+   page. Only what Plug knows; no scanning the disk for guesses.
+4. Client labels: where each client runs, and the Clients column grouped by
+   it. Issue #300.
+5. Check-up of the naming layer (grouping, renames) and a way to tell
+   several accounts of one service apart. Issue #301.
+6. Widening: an allow list per client, the shared bearer token split into
+   separate clients, and relaying events a server emits itself (#255).
+7. Single servers served on their own, beside the one Plug endpoint, so a
+   client can mix its own connectors with only the servers it lacks. Comes
+   out of the allow list. Issue #304.
+8. Plug into Plug: several Plugs feeding one, each remote server shown as
+   its own server and marked with its machine. Design first. Issue #302.
+
+Unproven, to watch working along the way: an event watch delivering to a
+real subscriber, Slack renewing its subscription unattended, and one of
+Amp, OpenClaw, LM Studio, or Muse Code on a real install.
+
 ## Open
 
 - General events: the core, watching a tool for change, `plug events`, and
