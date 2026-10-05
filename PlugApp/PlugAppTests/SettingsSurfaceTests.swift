@@ -109,6 +109,11 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(AppIcons.target(forClientType: "hermes-agent"), "hermes")
         XCTAssertEqual(AppIcons.displayName(forTarget: "hermes"), "Hermes Agent")
         XCTAssertEqual(AppIcons.displayName(forTarget: "poke"), "Poke")
+        XCTAssertEqual(AppIcons.symbol(target: "amp"), "terminal")
+        XCTAssertEqual(AppIcons.symbol(target: "openclaw"), "terminal")
+        XCTAssertEqual(AppIcons.symbol(target: "muse-code"), "terminal")
+        XCTAssertEqual(SiteIcon.brandHost(forName: "LM Studio"), "lmstudio.ai")
+        XCTAssertEqual(SiteIcon.brandHost(forName: "Muse Code"), "meta.ai")
         XCTAssertEqual(AppIcons.symbol(target: "poke"), "message")
         XCTAssertEqual(AppIcons.symbol(target: "le-chat"), "globe")
     }

@@ -52,6 +52,7 @@ enum AppIcons {
     private static let commandLineTargets: Set<String> = [
         "cline-cli", "gemini-cli", "grok-build", "copilot-cli", "pi",
         "goose", "opencode", "nanobot", "crush", "kimi-code", "qwen-code",
+        "openclaw", "muse-code",
     ]
 
     /// Clients that live on someone else's servers and reach Plug over the
@@ -83,7 +84,9 @@ enum AppIcons {
         if key == "goose" || text.contains("goose") {
             return "bird"
         }
-        if commandLineTargets.contains(key) || text.contains("cli") { return "terminal" }
+        // Amp is a command line tool too. Its name is too short to match on
+        // inside another, so it is not in the set above.
+        if commandLineTargets.contains(key) || key == "amp" || text.contains("cli") { return "terminal" }
         // An agent reached by text message has no app to show.
         if textAgentTargets.contains(key) { return "message" }
         if remoteTargets.contains(key) { return "globe" }
@@ -693,7 +696,7 @@ enum SiteIcon {
     /// with. A local command has no address of its own to ask, and its
     /// name is all there is to go on.
     private static let brands: [String: String] = [
-        "airtable": "airtable.com", "amplitude": "amplitude.com", "anthropic": "anthropic.com",
+        "airtable": "airtable.com", "amp": "ampcode.com", "amplitude": "amplitude.com", "anthropic": "anthropic.com",
         "asana": "asana.com", "atlassian": "atlassian.com", "aws": "aws.amazon.com",
         "box": "box.com", "brave": "brave.com", "bun": "bun.sh", "canva": "canva.com",
         "clickup": "clickup.com", "cloudflare": "cloudflare.com", "confluence": "atlassian.com",
@@ -703,7 +706,7 @@ enum SiteIcon {
         "gemini": "gemini.google.com", "github": "github.com", "gitlab": "gitlab.com",
         "grafana": "grafana.com", "homeassistant": "home-assistant.io", "hubspot": "hubspot.com",
         "huggingface": "huggingface.co", "intercom": "intercom.com", "jira": "atlassian.com",
-        "kimi": "kimi.com", "krisp": "krisp.ai", "kubernetes": "kubernetes.io",
+        "kimi": "kimi.com", "lmstudio": "lmstudio.ai", "muse": "meta.ai", "openclaw": "openclaw.ai", "krisp": "krisp.ai", "kubernetes": "kubernetes.io",
         "linear": "linear.app", "miro": "miro.com", "mistral": "mistral.ai",
         "mixpanel": "mixpanel.com", "monday": "monday.com", "mongodb": "mongodb.com",
         "mysql": "mysql.com", "netlify": "netlify.com", "node": "nodejs.org",

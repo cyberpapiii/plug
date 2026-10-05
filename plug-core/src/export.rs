@@ -35,6 +35,10 @@ pub enum ExportTarget {
     Antigravity,
     Goose,
     Hermes,
+    Amp,
+    OpenClaw,
+    LmStudio,
+    MuseCode,
 }
 
 impl std::str::FromStr for ExportTarget {
@@ -70,6 +74,10 @@ impl std::str::FromStr for ExportTarget {
             "antigravity" => Ok(Self::Antigravity),
             "goose" => Ok(Self::Goose),
             "hermes" | "hermes-agent" => Ok(Self::Hermes),
+            "amp" => Ok(Self::Amp),
+            "openclaw" => Ok(Self::OpenClaw),
+            "lm-studio" | "lmstudio" => Ok(Self::LmStudio),
+            "muse" | "muse-code" => Ok(Self::MuseCode),
             _ => Err(format!("unknown export target: {s}")),
         }
     }
@@ -106,6 +114,10 @@ impl ExportTarget {
             Self::Antigravity => "antigravity",
             Self::Goose => "goose",
             Self::Hermes => "hermes",
+            Self::Amp => "amp",
+            Self::OpenClaw => "openclaw",
+            Self::LmStudio => "lm-studio",
+            Self::MuseCode => "muse-code",
         }
     }
 
@@ -137,6 +149,10 @@ impl ExportTarget {
             Self::Antigravity => "Google Antigravity",
             Self::Goose => "Goose",
             Self::Hermes => "Hermes Agent",
+            Self::Amp => "Amp",
+            Self::OpenClaw => "OpenClaw",
+            Self::LmStudio => "LM Studio",
+            Self::MuseCode => "Muse Code",
         }
     }
 
@@ -169,6 +185,10 @@ impl ExportTarget {
             "antigravity",
             "goose",
             "hermes",
+            "amp",
+            "openclaw",
+            "lm-studio",
+            "muse-code",
         ]
     }
 }
@@ -239,7 +259,14 @@ pub fn export_config(options: &ExportOptions) -> String {
         | ExportTarget::Warp
         | ExportTarget::Kiro
         | ExportTarget::KimiCode
+        | ExportTarget::LmStudio
         | ExportTarget::Antigravity => export_json_mcp_servers(options, "mcpServers"),
+
+        // Amp keeps its servers under one dotted key at the top of the file
+        ExportTarget::Amp => export_json_mcp_servers(options, "amp.mcpServers"),
+
+        ExportTarget::OpenClaw => export_openclaw(options),
+        ExportTarget::MuseCode => export_muse_code(options),
 
         // Qwen Code reads `url` as the older SSE transport
         ExportTarget::QwenCode => export_qwen_code(options),
@@ -306,6 +333,45 @@ fn export_qwen_code(options: &ExportOptions) -> String {
         }
     });
 
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate the OpenClaw entry, under `mcp.servers`. OpenClaw refuses to
+/// start on a key it does not know, so the entry carries only what its
+/// documentation names.
+fn export_openclaw(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => serde_json::json!({
+            "command": options.command,
+            "args": connect_args(options)
+        }),
+        ExportTransport::Http => serde_json::json!({
+            "url": resolved_http_url(options),
+            "transport": "streamable-http"
+        }),
+    };
+    let config = serde_json::json!({ "mcp": { "servers": { "plug": server_entry } } });
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate the Muse Code entry, under `mcp_servers`. Every entry names its
+/// transport. `optional` lets Muse Code start when Plug is not running; its
+/// default stops the whole run.
+fn export_muse_code(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => serde_json::json!({
+            "transport": "stdio",
+            "command": options.command,
+            "args": connect_args(options),
+            "mode": "optional"
+        }),
+        ExportTransport::Http => serde_json::json!({
+            "transport": "streamable_http",
+            "url": resolved_http_url(options),
+            "mode": "optional"
+        }),
+    };
+    let config = serde_json::json!({ "mcp_servers": { "plug": server_entry } });
     serde_json::to_string_pretty(&config).unwrap()
 }
 
@@ -671,6 +737,17 @@ pub fn default_config_path(target: ExportTarget, project: bool) -> Option<std::p
         // https://hermes-agent.nousresearch.com/docs/user-guide/features/mcp
         // Hermes Agent has one config file and no per-project one.
         ExportTarget::Hermes => Some(home.join(".hermes/config.yaml")),
+        // The four below were read off each maker's documentation on
+        // 2026-10-05 and have not been tried against an installed copy.
+        // Each has one file Plug writes to and no per-project one.
+        // https://ampcode.com/docs/cli/settings
+        ExportTarget::Amp => Some(home.join(".config/amp/settings.json")),
+        // https://docs.openclaw.ai/gateway/configuration
+        ExportTarget::OpenClaw => Some(home.join(".openclaw/openclaw.json")),
+        // https://lmstudio.ai/docs/app/mcp
+        ExportTarget::LmStudio => Some(home.join(".lmstudio/mcp.json")),
+        // https://dev.meta.ai/docs/muse-code/configuration
+        ExportTarget::MuseCode => Some(home.join(".config/muse/settings.json")),
     }
 }
 
@@ -819,6 +896,10 @@ mod tests {
             ExportTarget::Antigravity,
             ExportTarget::Goose,
             ExportTarget::Hermes,
+            ExportTarget::Amp,
+            ExportTarget::OpenClaw,
+            ExportTarget::LmStudio,
+            ExportTarget::MuseCode,
         ];
         for target in &targets {
             let options = ExportOptions {
@@ -838,7 +919,8 @@ mod tests {
                     .unwrap_or_else(|| panic!("{name} link lacks {needle}: {output}"))
             };
             assert!(position("connect") < position("--client"));
-            assert!(position("--client") < position(name));
+            // Amp's own key holds its name, so the target is the last one.
+            assert!(position("--client") < output.rfind(name).unwrap());
         }
     }
 

@@ -53,6 +53,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Plug links four more clients: Amp, OpenClaw, LM Studio, and Muse Code.
+  `plug link`, `plug import`, repair, and `plug doctor` know where each
+  keeps its servers. The paths come from each maker's documentation; none
+  was installed to try.
 - Menus and shortcuts. File has Add Server (Command-N), Import Servers
   (Shift-Command-I), and Watch a Tool (Shift-Command-N). View has the four
   sections on Command-1 to Command-4, Refresh on Command-R, and the sidebar
@@ -68,6 +72,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   `op://vault/item/field`, in place of the key.
 - Delete removes the selected server, after asking. Remove Server is also in
   a server's right-click menu.
+
+### Fixed
+
+- Linking or unlinking a client whose settings file is not plain JSON, such
+  as one with comments, no longer replaces the file with only Plug's entry.
+  Plug leaves the file alone and says so.
 
 ## [0.9.0] - 2026-10-04
 

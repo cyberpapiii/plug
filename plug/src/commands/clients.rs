@@ -316,6 +316,10 @@ pub(crate) fn all_client_targets() -> &'static [(&'static str, &'static str)] {
         ("Google Antigravity", "antigravity"),
         ("Goose", "goose"),
         ("Hermes Agent", "hermes"),
+        ("Amp", "amp"),
+        ("OpenClaw", "openclaw"),
+        ("LM Studio", "lm-studio"),
+        ("Muse Code", "muse-code"),
     ]
 }
 
@@ -426,6 +430,9 @@ pub(crate) fn linked_client_config_from_content(
             let plug = match target_enum {
                 ExportTarget::Nanobot => json.get("tools")?.get("mcpServers")?.get("plug")?,
                 ExportTarget::VSCodeCopilot => json.get("servers")?.get("plug")?,
+                ExportTarget::Amp => json.get("amp.mcpServers")?.get("plug")?,
+                ExportTarget::OpenClaw => json.get("mcp")?.get("servers")?.get("plug")?,
+                ExportTarget::MuseCode => json.get("mcp_servers")?.get("plug")?,
                 _ => json
                     .get("mcpServers")
                     .and_then(|s| s.get("plug"))
@@ -1287,11 +1294,32 @@ pub(crate) fn is_linked(target: &str, project: bool) -> bool {
     linked_client_transport(target, project).is_some()
 }
 
+/// A client's JSON settings as a value. An empty file is an empty object.
+///
+/// A file that is not plain JSON, such as one with comments, is refused:
+/// writing it back would drop everything Plug could not read.
+fn read_client_json(existing: &str) -> anyhow::Result<serde_json::Value> {
+    if existing.trim().is_empty() {
+        return Ok(serde_json::json!({}));
+    }
+    serde_json::from_str(existing).map_err(|error| {
+        anyhow::anyhow!(
+            "this client's settings file is not plain JSON ({error}), so Plug left it alone; \
+             run `plug export <client>` and add the entry by hand"
+        )
+    })
+}
+
 fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
-    let mut json: serde_json::Value =
-        serde_json::from_str(existing).unwrap_or_else(|_| serde_json::json!({}));
+    let mut json = read_client_json(existing)?;
     if let Some(obj) = json.as_object_mut() {
-        for key in ["mcpServers", "context_servers", "servers"] {
+        for key in [
+            "mcpServers",
+            "context_servers",
+            "servers",
+            "amp.mcpServers",
+            "mcp_servers",
+        ] {
             if let Some(inner) = obj.get_mut(key).and_then(|v| v.as_object_mut()) {
                 inner.remove("plug");
             }
@@ -1311,8 +1339,7 @@ fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
 }
 
 fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
-    let mut existing_json: serde_json::Value =
-        serde_json::from_str(existing).unwrap_or_else(|_| serde_json::json!({}));
+    let mut existing_json = read_client_json(existing)?;
     let snippet_json: serde_json::Value = serde_json::from_str(snippet)?;
     if let (Some(e_obj), Some(s_obj)) = (existing_json.as_object_mut(), snippet_json.as_object()) {
         for (k, v) in s_obj {
@@ -1690,6 +1717,16 @@ fn replace_json_stdio_command(
         ExportTarget::VSCodeCopilot => value
             .get_mut("servers")
             .and_then(|servers| servers.get_mut("plug")),
+        ExportTarget::Amp => value
+            .get_mut("amp.mcpServers")
+            .and_then(|servers| servers.get_mut("plug")),
+        ExportTarget::OpenClaw => value
+            .get_mut("mcp")
+            .and_then(|mcp| mcp.get_mut("servers"))
+            .and_then(|servers| servers.get_mut("plug")),
+        ExportTarget::MuseCode => value
+            .get_mut("mcp_servers")
+            .and_then(|servers| servers.get_mut("plug")),
         _ => {
             if value
                 .get("mcpServers")
@@ -1713,6 +1750,19 @@ fn replace_json_stdio_command(
         "args".to_string(),
         serde_json::json!(["connect", "--client", target.target_name()]),
     );
+    Ok(serde_json::to_string_pretty(&value)?)
+}
+
+/// Muse Code reads no settings file without `schema_version`, so a file Plug
+/// starts gets the one its documentation names. A version already there is
+/// the person's and stays.
+fn with_muse_schema(merged: &str) -> anyhow::Result<String> {
+    let mut value: serde_json::Value = serde_json::from_str(merged)?;
+    if let Some(settings) = value.as_object_mut()
+        && !settings.contains_key("schema_version")
+    {
+        settings.insert("schema_version".to_string(), serde_json::json!(1));
+    }
     Ok(serde_json::to_string_pretty(&value)?)
 }
 
@@ -1788,6 +1838,9 @@ pub(crate) fn execute_export(
                 link_yaml_text(&existing, &snippet)?
             }
             Some("yaml") | Some("yml") => merge_yaml_config(&existing, &snippet)?,
+            _ if target_enum == ExportTarget::MuseCode => {
+                with_muse_schema(&merge_json_config(&existing, &snippet)?)?
+            }
             _ => merge_json_config(&existing, &snippet)?,
         };
         std::fs::write(&path, updated)?;
@@ -1905,7 +1958,7 @@ port = 4444
                 &merged,
             )
             .expect("linked config");
-            assert_eq!(linked.transport, ExportTransport::Stdio);
+            assert!(matches!(linked.transport, ExportTransport::Stdio));
             assert_eq!(linked.command.as_deref(), Some("plug"));
 
             let unlinked = unmerge_json_config(&merged).expect("unmerge");
@@ -2087,6 +2140,88 @@ port = 4444
             config.endpoint.as_deref(),
             Some("https://plug.example.com/mcp")
         );
+    }
+
+    #[test]
+    fn the_four_newer_clients_link_where_each_keeps_its_servers() {
+        use plug_core::export::{ExportOptions, export_config};
+        for (target, existing, pointer) in [
+            (
+                ExportTarget::Amp,
+                r#"{"amp.showCosts":true,"amp.mcpServers":{"other":{"command":"x"}}}"#,
+                "/amp.mcpServers",
+            ),
+            (
+                ExportTarget::OpenClaw,
+                r#"{"gateway":{"port":1},"mcp":{"servers":{"other":{"command":"x"}}}}"#,
+                "/mcp/servers",
+            ),
+            (
+                ExportTarget::LmStudio,
+                r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+                "/mcpServers",
+            ),
+            (
+                ExportTarget::MuseCode,
+                r#"{"schema_version":1,"mcp_servers":{"other":{"transport":"stdio","command":"x"}}}"#,
+                "/mcp_servers",
+            ),
+        ] {
+            let snippet = export_config(&ExportOptions {
+                target,
+                transport: ExportTransport::Stdio,
+                port: 3282,
+                http_url: None,
+                command: "/usr/local/bin/plug".to_string(),
+            });
+            let merged = merge_json_config(existing, &snippet).expect("merge");
+            let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+            let servers = value.pointer(pointer).expect("servers");
+            assert!(
+                servers.get("other").is_some(),
+                "{target:?} keeps other servers"
+            );
+            assert!(servers.get("plug").is_some(), "{target:?} gains plug");
+
+            let path = std::path::Path::new("settings.json");
+            let linked = linked_client_config_from_content(path, target, &merged).expect("linked");
+            assert!(matches!(linked.transport, ExportTransport::Stdio));
+            assert_eq!(linked.command.as_deref(), Some("/usr/local/bin/plug"));
+
+            let moved = replace_json_stdio_command(target, &merged, "/new/plug".to_string())
+                .expect("repair");
+            let moved: serde_json::Value = serde_json::from_str(&moved).unwrap();
+            assert_eq!(
+                moved.pointer(pointer).unwrap()["plug"]["command"],
+                serde_json::json!("/new/plug")
+            );
+
+            let unlinked = unmerge_json_config(&merged).expect("unmerge");
+            let value: serde_json::Value = serde_json::from_str(&unlinked).unwrap();
+            let servers = value.pointer(pointer).expect("servers");
+            assert!(servers.get("plug").is_none(), "{target:?} loses plug");
+            assert!(servers.get("other").is_some(), "{target:?} still has other");
+        }
+    }
+
+    #[test]
+    fn a_settings_file_with_comments_is_left_alone() {
+        let commented = "{\n  // my servers\n  \"amp.mcpServers\": {}\n}\n";
+        let snippet = r#"{"amp.mcpServers":{"plug":{"command":"plug"}}}"#;
+        assert!(merge_json_config(commented, snippet).is_err());
+        assert!(unmerge_json_config(commented).is_err());
+        assert!(merge_json_config("", snippet).is_ok());
+    }
+
+    #[test]
+    fn a_muse_code_file_plug_starts_names_its_schema() {
+        let started = with_muse_schema(r#"{"mcp_servers":{"plug":{}}}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&started).unwrap();
+        assert_eq!(value["schema_version"], serde_json::json!(1));
+
+        let kept = with_muse_schema(r#"{"schema_version":2,"mcp_servers":{}}"#).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&kept).unwrap();
+        assert_eq!(value["schema_version"], serde_json::json!(2));
     }
 
     #[test]
