@@ -9,6 +9,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- The menu bar icon is a plug, where it was a lightning bolt. It is solid
+  when everything runs and an outline when Plug is off, and carries a small
+  badge when Plug is starting, needs attention, or cannot run. The same plug
+  stands for Plug in the window.
+- The menu bar panel shows connected clients with the names and icons the
+  Clients list gives them. A client known only by its link, or one that
+  signed in over the network, showed there as a blank tile.
 - The window is laid out like a Mac app. A sidebar on the left lists Servers,
   Clients, Events, and Activity. Every section is a list with the selected
   item's details beside it, where before each section had its own layout:
@@ -53,6 +60,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Muse, Meta's agent, is named and pictured when it connects as a remote
+  client. It is a different client from Muse Code, the command line tool.
 - Plug links four more clients: Amp, OpenClaw, LM Studio, and Muse Code.
   `plug link`, `plug import`, repair, and `plug doctor` know where each
   keeps its servers. The paths come from each maker's documentation; none
@@ -75,6 +84,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug clients` names a remote client it does not recognise after the name
+  it signed in under, as the app does. It showed as Unknown.
 - Linking or unlinking a client whose settings file is not plain JSON, such
   as one with comments, no longer replaces the file with only Plug's entry.
   Plug leaves the file alone and says so.

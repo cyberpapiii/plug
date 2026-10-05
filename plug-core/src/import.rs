@@ -991,7 +991,7 @@ fn resolve_name_against_set(
         ClientSource::Amp => "amp",
         ClientSource::OpenClaw => "openclaw",
         ClientSource::LmStudio => "lmstudio",
-        ClientSource::MuseCode => "muse",
+        ClientSource::MuseCode => "muse-code",
     };
     format!("{name}-{suffix}")
 }

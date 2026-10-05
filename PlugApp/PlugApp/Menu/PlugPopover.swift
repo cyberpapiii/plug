@@ -130,7 +130,7 @@ struct PlugPopover: View {
     private var connectedAppsRow: some View {
         Button { send(.openWindow(.clients)) } label: {
             HStack(spacing: Metric.snug) {
-                AppIconStack(targets: situation.connectedAppTargets)
+                AppIconStack(clients: situation.connectedClients)
                 Text(connectedAppsText)
                     .font(.callout)
                     .contentTransition(.numericText())
@@ -148,7 +148,7 @@ struct PlugPopover: View {
     }
 
     private var connectedAppsText: String {
-        let names = situation.connectedAppTargets.compactMap(AppIcons.displayName(forTarget:))
+        let names = situation.connectedClients.map(\.name).filter { !$0.isEmpty }
         if !names.isEmpty, names.count == situation.connectedApps, names.count <= 2 {
             return names.joined(separator: " and ") + " connected"
         }
@@ -346,15 +346,12 @@ private struct RecentCallRow: View {
 /// Up to three connected app icons, so the row says who is connected before
 /// the words do.
 private struct AppIconStack: View {
-    let targets: [String]
+    let clients: [ConnectedClient]
 
     var body: some View {
         HStack(spacing: Metric.rowGap) {
-            ForEach(Array(targets.prefix(3).enumerated()), id: \.offset) { _, target in
-                AppGlyph(
-                    target: target,
-                    name: AppIcons.displayName(forTarget: target) ?? ""
-                )
+            ForEach(Array(clients.prefix(3).enumerated()), id: \.offset) { _, client in
+                AppGlyph(target: client.target, name: client.name, appPath: client.appPath)
             }
         }
         .accessibilityHidden(true)

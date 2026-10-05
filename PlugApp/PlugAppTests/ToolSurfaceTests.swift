@@ -439,6 +439,12 @@ final class AppRosterTests: XCTestCase {
             ["Perplexity", "Cursor", "Unknown client r3"]
         )
         XCTAssertEqual(names.key(of: live[0]), "oauth:abc", "a remote session is renamed through its grant")
+        // The menu bar panel shows the same clients under the same names.
+        XCTAssertEqual(
+            names.connectedClients(live + live).map(\.name),
+            ["Perplexity", "Cursor", "Unknown client r3"]
+        )
+        XCTAssertEqual(names.connectedClients(live)[1].target, "cursor")
 
         let renamed = ClientNames(
             visibility: visibility,

@@ -57,7 +57,7 @@ enum AppIcons {
 
     /// Clients that live on someone else's servers and reach Plug over the
     /// public address. They have no link target, only a name and a picture.
-    private static let remoteTargets: Set<String> = ["gemini", "perplexity", "le-chat"]
+    private static let remoteTargets: Set<String> = ["gemini", "perplexity", "le-chat", "muse"]
 
     /// Agents a person talks to by text message.
     private static let textAgentTargets: Set<String> = ["poke"]
@@ -216,6 +216,10 @@ enum AppIcons {
         }
         if compact.contains("mistral") || compact.contains("lechat") { return "le-chat" }
         if compact.contains("poke") { return "poke" }
+        // Meta has two: Muse, its agent, and Muse Code, in a terminal.
+        if compact.contains("muse") {
+            return compact.contains("code") ? "muse-code" : "muse"
+        }
         for target in bundleIdentifiers.keys where value.contains(target) { return target }
         for target in commandLineTargets where value.contains(target) { return target }
         return value
@@ -253,6 +257,8 @@ enum AppIcons {
         case "gemini": return "Gemini"
         case "perplexity": return "Perplexity"
         case "le-chat": return "Le Chat"
+        case "muse": return "Muse"
+        case "muse-code": return "Muse Code"
         case "poke": return "Poke"
         default: return nil
         }

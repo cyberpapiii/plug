@@ -67,7 +67,7 @@ struct PlugApplication: App {
             // The label is the one view that exists from launch, so the
             // runtime connection starts here rather than in a window that may
             // never be opened.
-            Image(systemName: model.menuBarSymbol)
+            Image(nsImage: MenuBarIcon.image(for: model.menuBarMark))
                 .accessibilityLabel("Plug: \(model.verdict.title)")
                 .task {
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
@@ -148,5 +148,49 @@ struct PlugApplication: App {
                 NSApp.activate(ignoringOtherApps: true)
             }
         )
+    }
+}
+
+/// Draws the menu bar icon. The system has a plug symbol but none with a
+/// badge, so the badge is drawn on: a gap is cut from the plug around it, the
+/// way the system's own badged symbols are made.
+enum MenuBarIcon {
+    @MainActor private static var drawn: [MenuBarMark: NSImage] = [:]
+
+    @MainActor
+    static func image(for mark: MenuBarMark) -> NSImage {
+        if let image = drawn[mark] { return image }
+        // A plain plug takes no more room than it needs.
+        let width: CGFloat = mark.badge == nil ? 16 : 22
+        let image = NSImage(size: NSSize(width: width, height: 18), flipped: false) { rect in
+            guard let plug = symbol(mark.plug, points: 14, weight: .medium) else { return false }
+            // A badged plug sits a little left so the pair stays centred.
+            let shift: CGFloat = mark.badge == nil ? 0 : 1.5
+            plug.draw(
+                at: NSPoint(
+                    x: (rect.width - plug.size.width) / 2 - shift,
+                    y: (rect.height - plug.size.height) / 2
+                ),
+                from: .zero, operation: .sourceOver, fraction: 1
+            )
+            guard let name = mark.badge, let badge = symbol(name, points: 8.5, weight: .bold),
+                  let context = NSGraphicsContext.current?.cgContext else { return true }
+            let size = badge.size
+            let origin = NSPoint(x: rect.width / 2 + 5 - size.width / 2, y: 5 - size.height / 2)
+            context.setBlendMode(.destinationOut)
+            context.fillEllipse(in: CGRect(origin: origin, size: size).insetBy(dx: -1.2, dy: -1.2))
+            context.setBlendMode(.normal)
+            badge.draw(at: origin, from: .zero, operation: .sourceOver, fraction: 1)
+            return true
+        }
+        // A template takes the menu bar's own colour, light or dark.
+        image.isTemplate = true
+        drawn[mark] = image
+        return image
+    }
+
+    private static func symbol(_ name: String, points: CGFloat, weight: NSFont.Weight) -> NSImage? {
+        NSImage(systemSymbolName: name, accessibilityDescription: nil)?
+            .withSymbolConfiguration(.init(pointSize: points, weight: weight))
     }
 }

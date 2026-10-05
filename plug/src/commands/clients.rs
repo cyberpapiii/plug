@@ -70,6 +70,9 @@ pub(crate) struct LiveSessionView {
     /// The name the owner gave this client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
+    /// The name a remote client signed in under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) grant_name: Option<String>,
     /// The key this session's requests carry, which blocks are stored under.
     /// It is `key` for every session but a remote one with no grant.
     #[serde(skip)]
@@ -81,7 +84,8 @@ pub(crate) struct LiveSessionView {
 impl LiveSessionView {
     /// What to call the session: the name the owner gave it, else the client
     /// Plug recognised, else the client its link was written for, else the
-    /// program that started it.
+    /// name a remote client signed in under, else the program that started
+    /// it.
     pub(crate) fn label(&self) -> &str {
         if let Some(name) = &self.name {
             return name;
@@ -95,10 +99,11 @@ impl LiveSessionView {
                 .find(|(_, target)| *target == key)
                 .map(|(name, _)| *name)
         });
-        match (linked, &self.host) {
-            (Some(name), _) => name,
-            (None, Some(host)) => &host.name,
-            (None, None) => &self.client_type,
+        match (linked, &self.grant_name, &self.host) {
+            (Some(name), _, _) => name,
+            (None, Some(name), _) => name,
+            (None, None, Some(host)) => &host.name,
+            (None, None, None) => &self.client_type,
         }
     }
 }
@@ -203,7 +208,10 @@ pub(crate) async fn cmd_client_rename(
     let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
     // Names already given are loaded too, so a client can be picked by one.
     let config = plug_core::config::load_config(config_path).ok();
-    let key = resolve_client_key(&client, &live_session_views(&live, config.as_ref()))?;
+    let key = resolve_client_key(
+        &client,
+        &live_session_views(&live, config.as_ref(), &downstream_grants().await),
+    )?;
     let name = name.trim().to_string();
     crate::commands::servers::apply_server_mutation(
         config_path,
@@ -237,7 +245,10 @@ pub(crate) async fn cmd_client_block(
     }
     let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
     let config = plug_core::config::load_config(config_path).ok();
-    let key = resolve_client_access_key(&client, &live_session_views(&live, config.as_ref()))?;
+    let key = resolve_client_access_key(
+        &client,
+        &live_session_views(&live, config.as_ref(), &downstream_grants().await),
+    )?;
     let targets = servers
         .into_iter()
         .map(|server| (ClientBlockKind::Server, server))
@@ -808,9 +819,27 @@ pub(crate) fn client_views(
     views
 }
 
+/// The remote clients that signed in, as the daemon lists them. Empty when
+/// the daemon cannot be asked: the names are a nicety, not a need.
+pub(crate) async fn downstream_grants() -> Vec<plug_core::downstream_oauth::RegisteredClientSummary>
+{
+    let Ok(auth_token) = crate::daemon::read_auth_token() else {
+        return Vec::new();
+    };
+    match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot { auth_token })
+        .await
+    {
+        Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) => {
+            snapshot.downstream_clients
+        }
+        _ => Vec::new(),
+    }
+}
+
 pub(crate) fn live_session_views(
     live: &[plug_core::ipc::IpcLiveSessionInfo],
     config: Option<&plug_core::config::Config>,
+    grants: &[plug_core::downstream_oauth::RegisteredClientSummary],
 ) -> Vec<LiveSessionView> {
     let mut views = live
         .iter()
@@ -820,6 +849,13 @@ pub(crate) fn live_session_views(
             name: key
                 .as_ref()
                 .and_then(|key| config?.clients.get(key)?.name.clone()),
+            grant_name: key.as_ref().and_then(|key| {
+                grants
+                    .iter()
+                    .find(|grant| plug_core::ipc::grant_client_key(&grant.client_id) == *key)
+                    .map(|grant| grant.client_name.trim().to_string())
+                    .filter(|name| !name.is_empty())
+            }),
             key,
             transport: match session.transport {
                 plug_core::ipc::LiveSessionTransport::DaemonProxy => "daemon_proxy".to_string(),

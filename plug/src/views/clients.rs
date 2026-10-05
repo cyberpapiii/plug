@@ -338,7 +338,8 @@ pub(crate) async fn cmd_client_list(
         let config_error = config_result.as_ref().err().map(|error| error.to_string());
         let config = config_result.ok();
         let clients = client_views(&live, config.as_ref());
-        let live_sessions = live_session_views(&live, config.as_ref());
+        let grants = crate::commands::clients::downstream_grants().await;
+        let live_sessions = live_session_views(&live, config.as_ref(), &grants);
 
         if matches!(output, OutputFormat::Json) {
             println!(
@@ -542,6 +543,7 @@ mod tests {
             host: None,
             key: None,
             name: None,
+            grant_name: None,
             access_key: None,
             connected_secs: 12,
             last_activity_secs: Some(3),
@@ -722,6 +724,7 @@ mod tests {
             host: None,
             key: None,
             name: None,
+            grant_name: None,
             access_key: None,
             connected_secs,
             last_activity_secs: None,
@@ -756,6 +759,11 @@ mod tests {
             script: None,
         });
         assert_eq!(linked.label(), "node");
+        // A remote client Plug does not know goes by the name it signed in
+        // under.
+        linked.grant_name = Some("Poke".to_string());
+        assert_eq!(linked.label(), "Poke");
+        linked.grant_name = None;
         linked.key = Some("pi".to_string());
         assert_eq!(linked.label(), "Pi");
         linked.name = Some("Work Pi".to_string());

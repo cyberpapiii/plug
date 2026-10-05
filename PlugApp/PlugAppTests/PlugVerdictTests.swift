@@ -195,11 +195,17 @@ final class PlugVerdictTests: XCTestCase {
 
     func testMenuBarIconChangesShapeNotJustColour() {
         let symbols = [
-            PlugVerdict.menuBarSymbol(for: PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: [server("a")]))),
-            PlugVerdict.menuBarSymbol(for: PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: [server("a", health: .down)]))),
-            PlugVerdict.menuBarSymbol(for: PlugVerdict.verdict(for: PlugSituation(runtime: .stopped)))
+            PlugVerdict.menuBarMark(for: PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: [server("a")]))),
+            PlugVerdict.menuBarMark(for: PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: [server("a", health: .down)]))),
+            PlugVerdict.menuBarMark(for: PlugVerdict.verdict(for: PlugSituation(runtime: .stopped)))
         ]
         XCTAssertEqual(Set(symbols).count, 3)
+        // Every state has a mark of its own.
+        let tones: [Verdict.Tone] = [.good, .quiet, .busy, .attention, .blocked]
+        let marks = tones.map {
+            PlugVerdict.menuBarMark(for: Verdict(tone: $0, symbol: "", title: "", detail: ""))
+        }
+        XCTAssertEqual(Set(marks).count, tones.count)
     }
 
     func testHealthNeverLeaksProtocolVocabulary() {
