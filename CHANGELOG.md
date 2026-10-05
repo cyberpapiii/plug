@@ -7,8 +7,31 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Plug's menu bar icon is there whenever Plug is serving. It comes back on
+  its own when something else closes the app (a quit-all, a crash, a force
+  quit) and appears after login. Settings has a "Keep in Menu Bar" switch
+  for it, on by default.
+- Settings has a Permissions section: whether macOS lets Plug run in the
+  background, open at login, and send notifications, with the way to System
+  Settings beside anything that was turned off there.
+
+### Changed
+
+- A client you name after one Plug knows takes that client's icon: a second
+  Cursor sign-in renamed "GrokBot" shows Grok Bot's icon, not Cursor's.
+- Activity shows each call under the name you gave the client that made
+  it. Two sign-ins that both report "Cursor" are told apart from then on;
+  calls recorded before this stay as they were.
+- Quitting Plug asks first. "Quit" closes the app and leaves Plug serving,
+  with the icon away until Plug is opened again; "Turn Plug Off and Quit"
+  stops it. Before, quitting left Plug serving without saying so.
+
 ### Fixed
 
+- With the sidebar hidden, the window's title and count no longer run past
+  the edge of the first column.
 - Linking OpenCode or Kilo Code writes the entry where those clients read
   it. It went under a key OpenCode does not accept, so OpenCode would not
   start and Plug showed it as not linked.

@@ -104,6 +104,7 @@ pub async fn dispatch_tools_call(
         .client_metadata
         .as_ref()
         .map(crate::protocol::ClientMetadata::display_label);
+    let client_key = downstream.client_key.as_deref().map(str::to_string);
     let tool = params.name.to_string();
     let server = router.server_for_tool(&tool);
     let result = dispatch_tools_call_inner(router, ctx, params).await;
@@ -116,6 +117,7 @@ pub async fn dispatch_tools_call(
         tool: Some(tool),
         client_type: Some(client_type),
         client_label,
+        client_key,
         latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         outcome: if result.is_ok() {
             crate::activity::ActivityOutcome::Success

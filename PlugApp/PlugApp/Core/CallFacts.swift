@@ -8,8 +8,13 @@ import PlugIPC
 /// took, and the result never differ between them.
 struct CallFacts: Equatable {
     let event: ActivityEvent
+    /// What the owner called this client, when they named it.
+    let ownerName: String?
 
-    init(_ event: ActivityEvent) { self.event = event }
+    init(_ event: ActivityEvent, ownerName: String? = nil) {
+        self.event = event
+        self.ownerName = ownerName
+    }
 
     var succeeded: Bool { event.outcome == "success" }
     /// The client stopped the call. Nothing went wrong, so it is not a problem.
@@ -39,11 +44,18 @@ struct CallFacts: Equatable {
     var server: String? { parts.server }
 
     /// The icon to show for whoever called.
-    var callerTarget: String { AppIcons.target(forClientType: event.clientType ?? "") }
+    var callerTarget: String {
+        if let ownerName {
+            let named = AppIcons.target(forClientType: ownerName)
+            if AppIcons.displayName(forTarget: named) != nil { return named }
+        }
+        return AppIcons.target(forClientType: event.clientType ?? "")
+    }
 
     /// The product name when Plug recognises the client; the client's own
     /// label otherwise. A raw client type is the last resort.
     var caller: String {
+        if let ownerName, !ownerName.isEmpty { return ownerName }
         if let name = AppIcons.displayName(forTarget: callerTarget) { return name }
         if let label = event.clientLabel, !label.isEmpty { return label }
         guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {

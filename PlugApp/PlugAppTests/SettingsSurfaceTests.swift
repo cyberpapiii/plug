@@ -403,3 +403,45 @@ final class FoundIconTests: XCTestCase {
         XCTAssertNil(servers[1].upstream)
     }
 }
+
+/// The daemon reopens the app unless one file says its owner wants it closed,
+/// so these pin when that file exists.
+final class MenuBarPresenceTests: XCTestCase {
+    private var directory: URL!
+    private var defaults: UserDefaults!
+    private var suite: String!
+
+    override func setUp() {
+        directory = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        suite = "MenuBarPresenceTests-\(UUID().uuidString)"
+        defaults = UserDefaults(suiteName: suite)
+    }
+
+    override func tearDown() {
+        try? FileManager.default.removeItem(at: directory)
+        defaults.removePersistentDomain(forName: suite)
+    }
+
+    private var presence: MenuBarPresence {
+        MenuBarPresence(marker: directory.appending(path: "menu-bar-hidden"), defaults: defaults)
+    }
+
+    private var hidden: Bool { FileManager.default.fileExists(atPath: presence.marker.path) }
+
+    func testAnAppItsOwnerQuitStaysClosedUntilItIsOpenedAgain() {
+        presence.ownerDidQuit()
+        XCTAssertTrue(hidden)
+        presence.appDidOpen()
+        XCTAssertFalse(hidden)
+    }
+
+    func testTurningTheSettingOffLeavesTheAppClosedAcrossLaunches() {
+        XCTAssertTrue(presence.keeps)
+        presence.keeps = false
+        XCTAssertTrue(hidden)
+        presence.appDidOpen()
+        XCTAssertTrue(hidden)
+        presence.keeps = true
+        XCTAssertFalse(hidden)
+    }
+}

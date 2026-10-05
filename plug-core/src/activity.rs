@@ -37,6 +37,11 @@ pub struct ActivityEvent {
     /// Client-declared name and version from MCP initialize, when supplied.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_label: Option<String>,
+    /// The key the client's name and blocks are kept under (`oauth:<id>`,
+    /// `claude-code`, ...). Two sign-ins that report the same name differ
+    /// here, so this is what tells them apart afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
     pub latency_ms: u64,
     pub outcome: ActivityOutcome,
     /// Why a call failed, in the error's own words, cut to
@@ -139,6 +144,7 @@ mod tests {
             tool: Some(format!("fixture__tool_{index}")),
             client_type: Some("codex-cli".into()),
             client_label: Some("codex 1.0".into()),
+            client_key: None,
             latency_ms: 1,
             outcome: ActivityOutcome::Success,
             reason: None,

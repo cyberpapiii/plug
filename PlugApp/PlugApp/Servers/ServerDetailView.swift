@@ -158,7 +158,7 @@ struct ServerDetailView: View {
     private var recent: some View {
         Section("Recent Activity") {
             ForEach(recentCalls) { event in
-                let call = CallFacts(event)
+                let call = model.call(event)
                 HStack(spacing: Metric.tight) {
                     Text(call.tool)
                         .lineLimit(1)

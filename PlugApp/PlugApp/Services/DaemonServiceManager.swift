@@ -2,6 +2,7 @@ import Darwin
 import Foundation
 import PlugIPC
 import ServiceManagement
+import UserNotifications
 
 enum DaemonServiceError: Error, Equatable {
     case adoptionRequired
@@ -26,6 +27,7 @@ protocol DaemonServiceBackend: AnyObject {
     func handshake() async throws -> OperatorHandshake
     func waitBeforeRetry() async
     func openLoginItemSettings()
+    var backgroundItemAllowance: SystemAllowance { get }
 }
 
 @MainActor
@@ -54,6 +56,12 @@ final class DaemonServiceManager {
 
     var appServiceEnabled: Bool { backend.enabled }
     var mainAppAtLoginEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    /// What macOS says about Plug running in the background and opening at
+    /// login. Both are switched off by the person in System Settings > Login
+    /// Items, and neither says so on its own.
+    var backgroundItemAllowance: SystemAllowance { backend.backgroundItemAllowance }
+    var loginItemAllowance: SystemAllowance { SystemAllowance(SMAppService.mainApp.status) }
 
     func inspect(
         canonical: VerifiedAppInstallation,
@@ -472,6 +480,7 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool { agent.status == .enabled }
+    var backgroundItemAllowance: SystemAllowance { SystemAllowance(agent.status) }
 
     func pauseConnectors() async -> [Int32] {
         DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()).compactMap { pid in
@@ -570,5 +579,77 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
         )
         guard let result, result.status == 0 else { return "" }
         return String(decoding: result.stdout, as: UTF8.self)
+    }
+}
+
+extension DaemonServiceBackend {
+    var backgroundItemAllowance: SystemAllowance { enabled ? .allowed : .notAsked }
+}
+
+/// Where one thing Plug needs from macOS stands.
+enum SystemAllowance: Equatable, Sendable {
+    case allowed
+    /// The person turned it off in System Settings; only they can turn it on.
+    case turnedOff
+    /// Nothing has asked macOS for it yet.
+    case notAsked
+
+    init(_ status: SMAppService.Status) {
+        switch status {
+        case .enabled: self = .allowed
+        case .requiresApproval: self = .turnedOff
+        case .notRegistered, .notFound: self = .notAsked
+        @unknown default: self = .notAsked
+        }
+    }
+
+    init(_ status: UNAuthorizationStatus) {
+        switch status {
+        case .authorized, .provisional, .ephemeral: self = .allowed
+        case .denied: self = .turnedOff
+        case .notDetermined: self = .notAsked
+        @unknown default: self = .notAsked
+        }
+    }
+}
+
+/// Whether Plug's menu bar icon comes back after something else closed the
+/// app. The daemon does the reopening and reads one file to know whether it
+/// may: `menu-bar-hidden` beside its socket means the owner wants the app
+/// left closed.
+struct MenuBarPresence {
+    static let preferenceKey = "keepInMenuBar"
+    static var standard: MenuBarPresence {
+        MenuBarPresence(
+            marker: URL.homeDirectory.appending(path: "Library/Application Support/plug/menu-bar-hidden"),
+            defaults: .standard
+        )
+    }
+
+    let marker: URL
+    let defaults: UserDefaults
+
+    /// On unless the person turned it off.
+    var keeps: Bool {
+        get { defaults.object(forKey: Self.preferenceKey) as? Bool ?? true }
+        nonmutating set {
+            defaults.set(newValue, forKey: Self.preferenceKey)
+            appDidOpen()
+        }
+    }
+
+    /// The app is open, so an earlier quit no longer hides it.
+    func appDidOpen() {
+        if keeps { try? FileManager.default.removeItem(at: marker) } else { hide() }
+    }
+
+    /// The owner quit the app themselves; it stays closed until they open it.
+    func ownerDidQuit() { hide() }
+
+    private func hide() {
+        try? FileManager.default.createDirectory(
+            at: marker.deletingLastPathComponent(), withIntermediateDirectories: true
+        )
+        try? Data().write(to: marker, options: .atomic)
     }
 }

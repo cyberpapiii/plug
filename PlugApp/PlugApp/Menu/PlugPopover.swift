@@ -187,7 +187,7 @@ struct PlugPopover: View {
             .help("Show All Activity")
 
             ForEach(recentCalls) { event in
-                RecentCallRow(call: CallFacts(event))
+                RecentCallRow(call: model.call(event))
                     .padding(.horizontal, Metric.panelInset)
             }
         }
@@ -214,7 +214,7 @@ struct PlugPopover: View {
             }
             .labelStyle(.iconOnly)
             .keyboardShortcut("q", modifiers: .command)
-            .help("Quit the menu bar app. Plug keeps serving your clients until you turn it off.")
+            .help("Quit Plug")
         }
         .buttonStyle(.accessoryBar)
         .padding(.horizontal, Metric.tight)

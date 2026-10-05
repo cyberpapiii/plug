@@ -50,7 +50,7 @@ struct ActivityView: View {
                         ForEach(groups, id: \.title) { group in
                             ListGroupHeader(group.title)
                             ForEach(group.events) { event in
-                                ActivityRow(call: CallFacts(event)).tag(event.sequence)
+                                ActivityRow(call: model.call(event)).tag(event.sequence)
                             }
                             .listRowSeparator(.hidden)
                         }
@@ -58,7 +58,7 @@ struct ActivityView: View {
                 } detail: {
                     if let selected {
                         CallDetail(
-                            call: CallFacts(selected),
+                            call: model.call(selected),
                             canShowServer: serverNames.contains(selected.server ?? ""),
                             run: run
                         )

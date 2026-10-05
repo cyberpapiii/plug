@@ -137,9 +137,27 @@ struct ClientNames: Equatable {
             ?? session.displayName
     }
 
-    /// The target whose icon a session shows: the client it reports, else the
-    /// client its link was written for.
+    /// The client a name belongs to, when the name is one Plug knows. An
+    /// owner who names a client "Grok Bot" has said what it is, whatever the
+    /// client reports about itself.
+    func knownTarget(named name: String?) -> String? {
+        guard let name else { return nil }
+        let target = AppIcons.target(forClientType: name)
+        return AppIcons.displayName(forTarget: target) == nil ? nil : target
+    }
+
+    /// The name a remote client is pictured by: the owner's, when it is a
+    /// client Plug knows, else the one on its grant.
+    func picturedName(forGrant grant: DownstreamClient) -> String {
+        let owned = name(forKey: grant.clientKey)
+        return knownTarget(named: owned) == nil ? grant.clientName : (owned ?? grant.clientName)
+    }
+
+    /// The target whose icon a session shows: the client its owner named it
+    /// as, else the client it reports, else the client its link was written
+    /// for.
     func target(of session: LiveSession) -> String {
+        if let named = knownTarget(named: name(forKey: key(of: session))) { return named }
         let reported = AppIcons.target(forClientType: session.clientType)
         if AppIcons.displayName(forTarget: reported) != nil { return reported }
         if let key = key(of: session), AppIcons.displayName(forTarget: key) != nil {
@@ -578,7 +596,7 @@ struct ClientsView: View {
             ),
             isLive: !sessions.isEmpty,
             dimmed: false,
-            glyph: .grant(name: grant.clientName),
+            glyph: .grant(name: names.picturedName(forGrant: grant)),
             isBusy: false,
             switchLabel: "Access",
             isOn: true,

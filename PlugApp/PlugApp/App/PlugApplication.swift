@@ -7,6 +7,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
         NotificationService.shared.install()
+        MenuBarPresence.standard.appDidOpen()
         installSnapshotHook()
     }
 
@@ -105,6 +106,10 @@ struct PlugApplication: App {
                 Button("Watch a Tool…") { runner.run(.addWatch) }
                     .keyboardShortcut("n", modifiers: [.command, .shift])
                     .disabled(!model.canMutate || router.sheet != nil)
+            }
+            CommandGroup(replacing: .appTermination) {
+                Button("Quit Plug") { runner.run(.quit) }
+                    .keyboardShortcut("q", modifiers: .command)
             }
             SidebarCommands()
             CommandGroup(after: .sidebar) {

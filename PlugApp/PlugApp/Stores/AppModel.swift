@@ -230,6 +230,15 @@ final class AppModel {
         )
     }
 
+    /// A call in the words every surface uses, under the name its owner gave
+    /// the client that made it.
+    func call(_ event: ActivityEvent) -> CallFacts {
+        let name = event.clientKey.flatMap { key in
+            snapshot.clientNames?.first { $0.key == key }?.name
+        }
+        return CallFacts(event, ownerName: name)
+    }
+
     /// Distinct connected apps, first seen first, so the panel's icon row is
     /// stable while sessions come and go.
     private var connectedClients: [ConnectedClient] {
