@@ -245,7 +245,6 @@ pub fn export_config(options: &ExportOptions) -> String {
     match options.target {
         // JSON clients with "mcpServers"
         ExportTarget::ClaudeDesktop
-        | ExportTarget::ClaudeCode
         | ExportTarget::Cursor
         | ExportTarget::Devin
         | ExportTarget::GeminiCli
@@ -253,15 +252,19 @@ pub fn export_config(options: &ExportOptions) -> String {
         | ExportTarget::ClineCli
         | ExportTarget::RooCode
         | ExportTarget::Factory
-        | ExportTarget::OpenCode
         | ExportTarget::Junie
-        | ExportTarget::Kilo
         | ExportTarget::Pi
         | ExportTarget::Warp
         | ExportTarget::Kiro
         | ExportTarget::KimiCode
         | ExportTarget::LmStudio
         | ExportTarget::Antigravity => export_json_mcp_servers(options, "mcpServers"),
+
+        // Claude Code takes a `url` for a command unless the entry says http
+        ExportTarget::ClaudeCode => export_claude_code(options),
+
+        // OpenCode and Kilo Code keep servers under "mcp", command as one list
+        ExportTarget::OpenCode | ExportTarget::Kilo => export_opencode(options),
 
         // Amp keeps its servers under one dotted key at the top of the file
         ExportTarget::Amp => export_json_mcp_servers(options, "amp.mcpServers"),
@@ -394,6 +397,43 @@ fn export_json_mcp_servers(options: &ExportOptions, key: &str) -> String {
         }
     });
 
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate the Claude Code entry. An HTTP entry names its type; without it
+/// Claude Code reads the entry as a command with none given.
+fn export_claude_code(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => serde_json::json!({
+            "command": options.command,
+            "args": connect_args(options)
+        }),
+        ExportTransport::Http => serde_json::json!({
+            "type": "http",
+            "url": resolved_http_url(options)
+        }),
+    };
+    let config = serde_json::json!({ "mcpServers": { "plug": server_entry } });
+    serde_json::to_string_pretty(&config).unwrap()
+}
+
+/// Generate the OpenCode entry, also read by Kilo Code. Servers sit under
+/// `mcp`, each one `local` with its command and arguments in one list, or
+/// `remote` with a URL. Any other top-level key stops OpenCode from starting.
+fn export_opencode(options: &ExportOptions) -> String {
+    let server_entry = match options.transport {
+        ExportTransport::Stdio => {
+            let mut command = vec![options.command.clone()];
+            command.extend(connect_args(options).iter().map(ToString::to_string));
+            serde_json::json!({ "type": "local", "command": command, "enabled": true })
+        }
+        ExportTransport::Http => serde_json::json!({
+            "type": "remote",
+            "url": resolved_http_url(options),
+            "enabled": true
+        }),
+    };
+    let config = serde_json::json!({ "mcp": { "plug": server_entry } });
     serde_json::to_string_pretty(&config).unwrap()
 }
 
