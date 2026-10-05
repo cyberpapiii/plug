@@ -560,8 +560,8 @@ struct ClientsView: View {
     ) -> Entry {
         let name = names.name(forKey: app.target) ?? app.name
         // Linked over the network, its choices are kept under its sign-in.
-        let access = grant.map { access(key: $0.clientKey, name: name) }
-            ?? access(to: app, sessions: sessions)
+        let access = grant.map { self.access(key: $0.clientKey, name: name) }
+            ?? self.access(to: app, sessions: sessions)
         let known = app.detected || app.linked
         let about = if !app.detected {
             "Plug cannot find this client on this Mac."
