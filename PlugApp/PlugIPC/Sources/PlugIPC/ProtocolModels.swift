@@ -327,6 +327,9 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
     public let tool: String?
     public let clientType: String?
     public let clientLabel: String?
+    /// The key the client's name is kept under. Absent from a daemon older
+    /// than this field.
+    public let clientKey: String?
     public let latencyMs: UInt64
     public let outcome: String
     /// Why a failed call failed, in the error's own words. Absent for a call
@@ -342,6 +345,7 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         tool: String? = nil,
         clientType: String? = nil,
         clientLabel: String? = nil,
+        clientKey: String? = nil,
         latencyMs: UInt64,
         outcome: String,
         reason: String? = nil
@@ -354,6 +358,7 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         self.tool = tool
         self.clientType = clientType
         self.clientLabel = clientLabel
+        self.clientKey = clientKey
         self.latencyMs = latencyMs
         self.outcome = outcome
         self.reason = reason

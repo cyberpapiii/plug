@@ -544,6 +544,22 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(PlugPopover.recentCalls(events, limit: 3).map(\.sequence), [6, 5, 3])
     }
 
+    func testACallIsShownUnderTheNameItsOwnerGaveTheClient() {
+        let reported = ActivityEvent(
+            sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
+            tool: "IMessage__get_messages", clientType: "Cursor", clientLabel: "Cursor 1.0",
+            clientKey: "oauth:abc", latencyMs: 1, outcome: "success"
+        )
+        let named = CallFacts(reported, ownerName: "GrokBot")
+        XCTAssertEqual(named.caller, "GrokBot")
+        XCTAssertEqual(named.callerTarget, "grok-bot")
+        // A name Plug does not know keeps the icon of what the client reports.
+        let other = CallFacts(reported, ownerName: "Work laptop")
+        XCTAssertEqual(other.caller, "Work laptop")
+        XCTAssertEqual(other.callerTarget, "cursor")
+        XCTAssertEqual(CallFacts(reported).caller, "Cursor")
+    }
+
     func testCallFactsSplitTheServerPrefix() {
         let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"))
         XCTAssertEqual(call.server, "Figma")

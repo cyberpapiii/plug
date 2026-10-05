@@ -187,7 +187,7 @@ struct PlugPopover: View {
             .help("Show All Activity")
 
             ForEach(recentCalls) { event in
-                RecentCallRow(call: CallFacts(event))
+                RecentCallRow(call: model.call(event))
                     .padding(.horizontal, Metric.panelInset)
             }
         }
