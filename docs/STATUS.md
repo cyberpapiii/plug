@@ -30,7 +30,10 @@ Remove a line when it lands.
    several accounts of one service apart. Issue #301.
 6. Widening: an allow list per client, the shared bearer token split into
    separate clients, and relaying events a server emits itself (#255).
-7. Plug into Plug: several Plugs feeding one, each remote server shown as
+7. Single servers served on their own, beside the one Plug endpoint, so a
+   client can mix its own connectors with only the servers it lacks. Comes
+   out of the allow list. Issue #304.
+8. Plug into Plug: several Plugs feeding one, each remote server shown as
    its own server and marked with its machine. Design first. Issue #302.
 
 Unproven, to watch working along the way: an event watch delivering to a
