@@ -29,8 +29,7 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
   Gemini, Perplexity, Le Chat, and Poke on the name a client reports, and
   nobody has seen what each one reports. Correct the match when one connects.
 - Per-client access is in: a client can be kept from servers and from single
-  tools. Left over: the app switches servers only, single tools go through
-  `plug clients block`; there is no allow list (`only_servers`); every client
+  tools. Left over: there is no allow list (`only_servers`); every client
   on the shared bearer token is one client, `remote:shared`; and a changed
   block tells every client to re-read its lists, not only the one it touches.
 - Text-message agents: Poke takes a custom MCP server and can reach Plug as

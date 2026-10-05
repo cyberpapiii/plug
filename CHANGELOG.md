@@ -55,6 +55,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   sections on Command-1 to Command-4, Refresh on Command-R, and the sidebar
   toggle. Help has How Plug Works, Run Checkup, and Show Logs in Finder. Check for
   Updates is in the Plug menu.
+- A client can be kept from single tools in the app. In a client's details,
+  open a server to see its tools, each with its own switch. A tool that a
+  rule written with `plug clients block` turns off says so and is changed
+  there.
 - Delete removes the selected server, after asking. Remove Server is also in
   a server's right-click menu.
 

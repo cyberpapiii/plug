@@ -149,8 +149,10 @@ struct ClientAccess: Equatable {
     let isRemote: Bool
     let servers: [ConfiguredServer]
     let blockedServers: Set<String>
-    /// Single tools the owner blocked from the command line.
-    let blockedToolCount: Int
+    /// Tools kept from the client, lowercased, as the daemon compares
+    /// them. A name with `*` in it is a rule and covers every tool it fits.
+    let blockedTools: [String]
+    var blockedToolCount: Int { blockedTools.count }
 
     init(key: String, name: String, servers: [ConfiguredServer], blocks: [ClientBlocks]) {
         self.key = key
@@ -160,7 +162,50 @@ struct ClientAccess: Equatable {
         let blocks = blocks.first { $0.key == key }
         // A block on a server that is gone does nothing and is not counted.
         blockedServers = Set(blocks?.servers ?? []).intersection(servers.map(\.name))
-        blockedToolCount = blocks?.tools?.count ?? 0
+        blockedTools = (blocks?.tools ?? []).map { $0.lowercased() }
+    }
+
+    /// How a tool stands for this client.
+    enum ToolState: Equatable {
+        case on
+        /// Off by its own name; a switch turns it back on.
+        case off
+        /// Off under a rule that covers other tools as well.
+        case offByRule(String)
+    }
+
+    func state(ofTool name: String) -> ToolState {
+        let name = name.lowercased()
+        if blockedTools.contains(name) { return .off }
+        if let rule = blockedTools.first(where: { $0.contains("*") && Self.rule($0, fits: name) }) {
+            return .offByRule(rule)
+        }
+        return .on
+    }
+
+    /// How many of these tools the client is kept from.
+    func offCount(among tools: [ToolFacts]) -> Int {
+        tools.filter { state(ofTool: $0.name) != .on }.count
+    }
+
+    /// Whether `text` fits a rule in which `*` stands for any run of
+    /// characters, the way the daemon reads one.
+    static func rule(_ rule: String, fits text: String) -> Bool {
+        let parts = rule.components(separatedBy: "*")
+        guard parts.count > 1 else { return rule == text }
+        var rest = Substring(text)
+        for (index, part) in parts.enumerated() where !part.isEmpty {
+            if index == 0 {
+                guard rest.hasPrefix(part) else { return false }
+                rest = rest.dropFirst(part.count)
+            } else if index == parts.count - 1 {
+                return rest.hasSuffix(part)
+            } else {
+                guard let found = rest.range(of: part) else { return false }
+                rest = rest[found.upperBound...]
+            }
+        }
+        return true
     }
 
     var isLimited: Bool { !blockedServers.isEmpty || blockedToolCount > 0 }
@@ -340,7 +385,7 @@ struct ClientsView: View {
                     }
                 } detail: {
                     if let selected = entries.first(where: { $0.id == router.selectedClient }) {
-                        ClientDetail(entry: selected, canMutate: model.canMutate, run: run)
+                        ClientDetail(entry: selected, tools: model.toolCatalog, canMutate: model.canMutate, run: run)
                             .id(selected.id)
                     } else {
                         NoSelection(item: "Client", symbol: AppSection.clients.symbol)
@@ -768,13 +813,17 @@ private struct ClientSwitch: View {
 /// has open, and its name.
 private struct ClientDetail: View {
     let entry: ClientEntry
+    let tools: ToolCatalog
     let canMutate: Bool
     let run: (PlugIntent) -> Void
     /// The name being typed. Empty means the client's own name.
     @State private var draft: String
+    /// The servers whose tools are showing.
+    @State private var opened: Set<String> = []
 
-    init(entry: ClientEntry, canMutate: Bool, run: @escaping (PlugIntent) -> Void) {
+    init(entry: ClientEntry, tools: ToolCatalog, canMutate: Bool, run: @escaping (PlugIntent) -> Void) {
         self.entry = entry
+        self.tools = tools
         self.canMutate = canMutate
         self.run = run
         _draft = State(initialValue: entry.name == entry.originalName ? "" : entry.name)
@@ -798,34 +847,7 @@ private struct ClientDetail: View {
                         Text("No servers yet").foregroundStyle(.secondary)
                     } else {
                         ForEach(access.servers) { server in
-                            Toggle(
-                                isOn: Binding(
-                                    get: { !access.blockedServers.contains(server.name) },
-                                    set: {
-                                        run(.setClientServerBlocked(
-                                            key: access.key, server: server.name, blocked: !$0
-                                        ))
-                                    }
-                                )
-                            ) {
-                                if server.enabled {
-                                    HStack(spacing: Metric.tight) {
-                                        ServerGlyph(name: server.name)
-                                        Text(server.name)
-                                    }
-                                } else {
-                                    // Off in Plug, so no client can use it.
-                                    HStack(spacing: Metric.tight) {
-                                        ServerGlyph(name: server.name).opacity(0.4)
-                                        Text(server.name)
-                                        Spacer(minLength: Metric.tight)
-                                        Text("Off")
-                                    }
-                                    .foregroundStyle(.secondary)
-                                }
-                            }
-                            .controlSize(.mini)
-                            .disabled(!canMutate || !server.enabled)
+                            serverRow(server, access: access)
                         }
                     }
                 } header: {
@@ -875,16 +897,93 @@ private struct ClientDetail: View {
         }
     }
 
-    static func note(for access: ClientAccess) -> String {
-        var lines = [
-            access.isRemote
-                ? "Turn a server off to keep this client from using its tools."
-                : "Turn a server off to hide its tools from this client. This tidies the list; it is not a security lock.",
-        ]
-        if access.blockedToolCount > 0 {
-            let count = access.blockedToolCount
-            lines.append(count == 1 ? "1 tool is also off for this client." : "\(count) tools are also off for this client.")
+    /// One server's switch for this client, and under it, when opened, a
+    /// switch for each of its tools.
+    @ViewBuilder private func serverRow(_ server: ConfiguredServer, access: ClientAccess) -> some View {
+        let serverOn = !access.blockedServers.contains(server.name)
+        let own = tools.tools(for: server.name).filter(\.isOn)
+        let off = access.offCount(among: own)
+        let isOpen = opened.contains(server.name) && server.enabled && serverOn && !own.isEmpty
+        HStack(spacing: Metric.tight) {
+            Button {
+                if isOpen { opened.remove(server.name) } else { opened.insert(server.name) }
+            } label: {
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .rotationEffect(.degrees(isOpen ? 90 : 0))
+                    .frame(width: 12)
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .opacity(server.enabled && serverOn && !own.isEmpty ? 1 : 0)
+            .accessibilityLabel(isOpen ? "Hide \(server.name) Tools" : "Show \(server.name) Tools")
+            .help(isOpen ? "Hide Tools" : "Show Tools")
+            ServerGlyph(name: server.name).opacity(server.enabled ? 1 : 0.4)
+            Text(server.name)
+            Spacer(minLength: Metric.tight)
+            if !server.enabled {
+                // Off in Plug, so no client can use it.
+                Text("Off")
+            } else if serverOn, off > 0 {
+                Text(off == 1 ? "1 tool off" : "\(off) tools off")
+                    .font(.callout)
+            }
+            Toggle(
+                server.name,
+                isOn: Binding(
+                    get: { serverOn },
+                    set: {
+                        run(.setClientServerBlocked(key: access.key, server: server.name, blocked: !$0))
+                    }
+                )
+            )
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .controlSize(.mini)
+            .disabled(!canMutate || !server.enabled)
         }
-        return lines.joined(separator: " ")
+        .foregroundStyle(server.enabled ? .primary : .secondary)
+        if isOpen {
+            ForEach(own) { tool in
+                toolRow(tool, access: access)
+            }
+        }
+    }
+
+    private func toolRow(_ tool: ToolFacts, access: ClientAccess) -> some View {
+        let state = access.state(ofTool: tool.name)
+        return HStack(spacing: Metric.tight) {
+            Text(tool.shortName)
+                .foregroundStyle(state == .on ? .primary : .secondary)
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(tool.summary ?? tool.shortName)
+            Spacer(minLength: Metric.tight)
+            if case let .offByRule(rule) = state {
+                Label("Off by Rule", systemImage: "lock.fill")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .help("A rule in the settings file (\(rule)) keeps this tool from this client. Remove the rule to turn it back on.")
+            } else {
+                Toggle(
+                    tool.shortName,
+                    isOn: Binding(
+                        get: { state == .on },
+                        set: { run(.setClientToolBlocked(key: access.key, tool: tool.name, blocked: !$0)) }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+                .controlSize(.mini)
+                .disabled(!canMutate)
+            }
+        }
+        .padding(.leading, 44)
+    }
+
+    static func note(for access: ClientAccess) -> String {
+        access.isRemote
+            ? "Turn a server off to keep this client from using its tools. Open a server to turn off single tools."
+            : "Turn a server off to hide its tools from this client, or open it to hide single tools. This tidies the list; it is not a security lock."
     }
 }
