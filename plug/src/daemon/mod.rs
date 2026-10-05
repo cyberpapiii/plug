@@ -78,6 +78,8 @@ fn config_error_summary(message: &str) -> String {
         .join(" ")
 }
 
+#[cfg(target_os = "macos")]
+mod menu_bar;
 mod notify;
 use notify::send_ipc_control_notification;
 
@@ -439,6 +441,9 @@ pub(crate) async fn run_daemon_with_lock(
     // A grace_period_secs of 0 disables auto-shutdown (explicit shutdown only),
     // which is the default behavior.
     let grace_cancel = CancellationToken::new();
+
+    #[cfg(target_os = "macos")]
+    menu_bar::spawn(cancel.clone());
 
     if grace_period_secs > 0 {
         spawn_grace_period_task(

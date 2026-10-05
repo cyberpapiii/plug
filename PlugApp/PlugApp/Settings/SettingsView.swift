@@ -1,5 +1,6 @@
 import AppKit
 import SwiftUI
+import UserNotifications
 
 /// Everything a person owns about Plug, in the Settings window: is Plug on
 /// and healthy, how should it behave, where are its files, what version is
@@ -17,6 +18,10 @@ struct SettingsView: View {
     @State private var loginItemFailed = false
     @State private var notificationsDenied = false
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
+    @State private var keepsInMenuBar = MenuBarPresence.standard.keeps
+    @State private var backgroundItem = DaemonServiceManager.shared.backgroundItemAllowance
+    @State private var loginItem = DaemonServiceManager.shared.loginItemAllowance
+    @State private var notifications = SystemAllowance.notAsked
 
     @State private var checkup: Checkup?
     @State private var checking = false
@@ -28,6 +33,7 @@ struct SettingsView: View {
         Form {
             general
             plug
+            permissions
             files
             about
         }
@@ -36,13 +42,16 @@ struct SettingsView: View {
         .frame(height: Metric.settingsHeight)
         .task {
             readLoginItem()
+            await readPermissions()
             configURL = await checkups.configPath()
         }
         // Allowing the login item happens in System Settings, so look again
         // when the person comes back.
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
             readLoginItem()
+            Task { await readPermissions() }
         }
+        .task(id: model.serviceEnabled) { await readPermissions() }
         // A problem elsewhere in the app can send a person here with the
         // checkup already asked for.
         .task(id: router.checkupRequests) {
@@ -66,6 +75,13 @@ struct SettingsView: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            Toggle(isOn: $keepsInMenuBar) {
+                Text("Keep in Menu Bar")
+                Text("If something else closes Plug while it is serving, its icon comes back.")
+            }
+            .onChange(of: keepsInMenuBar) { _, keeps in
+                MenuBarPresence.standard.keeps = keeps
+            }
             Toggle(isOn: $notify) {
                 Text("Notifications")
                 Text(notificationsDenied
@@ -78,6 +94,7 @@ struct SettingsView: View {
                     let allowed = await NotificationService.shared.requestAuthorization()
                     notificationsDenied = !allowed
                     if !allowed { notify = false }
+                    await readPermissions()
                 }
             }
             Toggle("Check for updates automatically", isOn: $automaticUpdates)
@@ -114,6 +131,44 @@ struct SettingsView: View {
             Text("Plug")
         } footer: {
             Text("Plug keeps serving your clients after you close the window or quit. To stop it, turn Plug off.")
+        }
+    }
+
+    // MARK: Permissions
+
+    /// What Plug itself needs from macOS, and whether it has it. A row with
+    /// nothing to fix says so and offers nothing.
+    private var permissions: some View {
+        Section {
+            PermissionRow(
+                title: "Run in the Background",
+                detail: "Keeps Plug serving when its window is closed.",
+                allowance: model.serviceEnabled ? backgroundItem : nil,
+                idle: "Not needed while Plug is off",
+                fix: "Open Login Items…"
+            ) { DaemonServiceManager.shared.openLoginItemSettings() }
+            PermissionRow(
+                title: "Open at Login",
+                detail: "Puts Plug in the menu bar when you log in.",
+                allowance: loginItem == .turnedOff || launchAtLogin ? loginItem : nil,
+                idle: "Off",
+                fix: "Open Login Items…"
+            ) { DaemonServiceManager.shared.openLoginItemSettings() }
+            PermissionRow(
+                title: "Notifications",
+                detail: "Tells you when a server needs sign-in or a new client connects.",
+                allowance: notifications == .turnedOff || notify ? notifications : nil,
+                idle: "Off",
+                fix: "Open Notifications…"
+            ) {
+                if let url = URL(string: "x-apple.systempreferences:com.apple.Notifications-Settings.extension") {
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        } header: {
+            Text("Permissions")
+        } footer: {
+            Text("Plug keeps sign-ins and keys in your Keychain; when macOS asks, choose Always Allow. A server that reads your Mac's data, such as messages or contacts, has permissions of its own under Privacy & Security, which Plug cannot see or grant.")
         }
     }
 
@@ -200,6 +255,12 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    private func readPermissions() async {
+        backgroundItem = DaemonServiceManager.shared.backgroundItemAllowance
+        loginItem = DaemonServiceManager.shared.loginItemAllowance
+        notifications = SystemAllowance(await UNUserNotificationCenter.current().notificationSettings().authorizationStatus)
     }
 
     // MARK: Login item
@@ -298,6 +359,45 @@ struct SettingsView: View {
 
     private func passingChecksTitle(in checkup: Checkup) -> String {
         checkup.isClean ? "Details" : "\(passingChecks(in: checkup).count) passed"
+    }
+}
+
+/// One thing Plug needs from macOS: what it is for, where it stands, and the
+/// way to System Settings when the person has turned it off there.
+private struct PermissionRow: View {
+    let title: String
+    let detail: String
+    /// Nil while Plug is not using it.
+    let allowance: SystemAllowance?
+    let idle: String
+    let fix: String
+    let open: () -> Void
+
+    var body: some View {
+        LabeledContent {
+            HStack(spacing: Metric.tight) {
+                switch allowance {
+                case .allowed:
+                    Image(systemName: "checkmark.circle.fill")
+                        .foregroundStyle(.green)
+                        .accessibilityHidden(true)
+                    Text("Allowed")
+                case .turnedOff:
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .accessibilityHidden(true)
+                    Text("Turned off")
+                    Button(fix, action: open)
+                case .notAsked:
+                    Text("Not asked yet").foregroundStyle(.secondary)
+                case nil:
+                    Text(idle).foregroundStyle(.secondary)
+                }
+            }
+        } label: {
+            Text(title)
+            Text(detail)
+        }
     }
 }
 

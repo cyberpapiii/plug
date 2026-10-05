@@ -158,7 +158,37 @@ struct PlugIntentRunner {
         case .dismissActionError:
             model.dismissActionError()
         case .quit:
+            quit()
+        }
+    }
+
+    /// Quitting the app does not stop Plug, which nothing on screen says once
+    /// the icon is gone. So the person chooses, and the app they quit
+    /// themselves stays closed.
+    private func quit() {
+        guard model.serviceEnabled else {
             NSApp.terminate(nil)
+            return
+        }
+        let alert = NSAlert()
+        alert.messageText = "Quit Plug?"
+        alert.informativeText = "Plug keeps serving your clients. Its menu bar icon stays away until you open Plug again."
+        alert.addButton(withTitle: "Quit")
+        alert.addButton(withTitle: "Cancel")
+        alert.addButton(withTitle: "Turn Plug Off and Quit")
+        NSApp.activate(ignoringOtherApps: true)
+        switch alert.runModal() {
+        case .alertFirstButtonReturn:
+            MenuBarPresence.standard.ownerDidQuit()
+            NSApp.terminate(nil)
+        case .alertThirdButtonReturn:
+            Task {
+                await model.setServiceEnabled(false)
+                // Still on means turning off failed, and the app says why.
+                if !model.serviceEnabled { NSApp.terminate(nil) }
+            }
+        default:
+            break
         }
     }
 

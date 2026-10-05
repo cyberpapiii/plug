@@ -7,6 +7,21 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Added
+
+- Plug's menu bar icon comes back on its own when something else closes the
+  app while Plug is serving: a quit-all, a crash, a force quit. Settings has
+  a "Keep in Menu Bar" switch for it, on by default.
+- Settings has a Permissions section: whether macOS lets Plug run in the
+  background, open at login, and send notifications, with the way to System
+  Settings beside anything that was turned off there.
+
+### Changed
+
+- Quitting Plug asks first. "Quit" closes the app and leaves Plug serving,
+  with the icon away until Plug is opened again; "Turn Plug Off and Quit"
+  stops it. Before, quitting left Plug serving without saying so.
+
 ### Fixed
 
 - The top of each column in the window no longer changes when the pointer
