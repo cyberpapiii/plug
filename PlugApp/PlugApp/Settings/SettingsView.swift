@@ -260,7 +260,13 @@ struct SettingsView: View {
     private func readPermissions() async {
         backgroundItem = DaemonServiceManager.shared.backgroundItemAllowance
         loginItem = DaemonServiceManager.shared.loginItemAllowance
-        notifications = SystemAllowance(await UNUserNotificationCenter.current().notificationSettings().authorizationStatus)
+        // The settings object cannot cross to the main actor; only what it
+        // says does.
+        notifications = await withCheckedContinuation { done in
+            UNUserNotificationCenter.current().getNotificationSettings {
+                done.resume(returning: SystemAllowance($0.authorizationStatus))
+            }
+        }
     }
 
     // MARK: Login item
