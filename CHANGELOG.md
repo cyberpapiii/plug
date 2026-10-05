@@ -32,6 +32,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 - With the sidebar hidden, the window's title and count no longer run past
   the edge of the first column.
+- A client linked over the network is one row in Clients, with its sign-in,
+  not two. Clients found on this Mac that do not use Plug are listed last,
+  under their own heading.
 - Linking OpenCode or Kilo Code writes the entry where those clients read
   it. It went under a key OpenCode does not accept, so OpenCode would not
   start and Plug showed it as not linked.

@@ -277,6 +277,50 @@ final class AppRosterTests: XCTestCase {
         XCTAssertTrue(roster.other.isEmpty)
     }
 
+    func testAClientLinkedOverTheNetworkIsOneRowWithItsSignIn() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let grants = try decoder.decode(
+            [DownstreamClient].self,
+            from: Data(
+                """
+                [{"client_id":"plug_a","client_name":"Cursor","redirect_uris":[],"source":"dynamic"},
+                 {"client_id":"plug_b","client_name":"Devin CLI","redirect_uris":[],"source":"dynamic"},
+                 {"client_id":"plug_c","client_name":"Devin CLI","redirect_uris":[],"source":"dynamic"},
+                 {"client_id":"plug_d","client_name":"Codex","redirect_uris":[],"source":"dynamic"}]
+                """.utf8
+            )
+        )
+        let linked = try apps(
+            """
+            [{"target":"cursor","linked":true,"detected":true,"linked_transport":"http"},
+             {"target":"devin","linked":true,"detected":true,"linked_transport":"http"},
+             {"target":"codex-cli","linked":true,"detected":true,"linked_transport":"stdio"}]
+            """
+        )
+        let own = AppRoster.ownGrants(apps: linked, grants: grants) {
+            AppIcons.target(forClientType: $0.clientName)
+        }
+        // Two sign-ins for one client stay apart, and so does a sign-in whose
+        // client is linked on this Mac.
+        XCTAssertEqual(own.mapValues(\.clientId), ["cursor": "plug_a"])
+    }
+
+    func testASessionItsOwnerNamedIsNotTheClientItReports() throws {
+        let live = try sessions(
+            """
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","connected_secs":1},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","connected_secs":1}]
+            """
+        )
+        let roster = AppRoster(
+            apps: try apps(#"[{"target":"cursor","linked":true,"detected":true}]"#),
+            sessions: live
+        ) { $0.sessionId == "g1" ? "grok-bot" : nil }
+        XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["c1"])
+        XCTAssertEqual(roster.other.map(\.sessionId), ["g1"])
+    }
+
     func testASessionFromNoKnownAppIsKeptApart() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true}]"#),

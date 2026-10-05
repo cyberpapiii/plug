@@ -17,12 +17,22 @@ struct AppRoster: Equatable {
     /// Open sessions from something Plug has no app entry for.
     let other: [LiveSession]
 
-    init(apps: [LinkableApp], sessions: [LiveSession]) {
+    /// `named` is the client a session's owner named it as, when that is a
+    /// client Plug knows. It outranks what the session reports: a sign-in
+    /// named Grok Bot is not Cursor's, though it says Cursor.
+    init(
+        apps: [LinkableApp],
+        sessions: [LiveSession],
+        named: (LiveSession) -> String? = { _ in nil }
+    ) {
         var claimed = Set<String>()
         var connected: [Connected] = []
         var idle: [LinkableApp] = []
         for app in apps {
-            let own = sessions.filter { Self.targets(of: $0).contains(app.target) }
+            let own = sessions.filter { session in
+                if let target = named(session) { return target == app.target }
+                return Self.targets(of: session).contains(app.target)
+            }
             claimed.formUnion(own.map(\.sessionId))
             if !own.isEmpty {
                 connected.append(Connected(app: app, sessions: own))
@@ -33,6 +43,24 @@ struct AppRoster: Equatable {
         self.connected = connected
         self.idle = idle
         self.other = sessions.filter { !claimed.contains($0.sessionId) }
+    }
+
+    /// The sign-in each client linked over the network made, by the client's
+    /// target, so the client and its sign-in are one row. A client with two
+    /// sign-ins keeps them apart: nothing says which one is its own.
+    static func ownGrants(
+        apps: [LinkableApp],
+        grants: [DownstreamClient],
+        target: (DownstreamClient) -> String?
+    ) -> [String: DownstreamClient] {
+        let byTarget = Dictionary(grouping: grants) { target($0) ?? "" }
+        var own: [String: DownstreamClient] = [:]
+        for app in apps where app.linked && app.transport?.lowercased() == "http" {
+            if let candidates = byTarget[app.target], candidates.count == 1 {
+                own[app.target] = candidates[0]
+            }
+        }
+        return own
     }
 
     static func targets(of session: LiveSession) -> Set<String> {
@@ -300,7 +328,12 @@ struct ClientsView: View {
     /// Every app is placed against all sessions, then search narrows what
     /// shows, so a session never leaves its app's row because the app was
     /// filtered out.
-    private var roster: AppRoster { AppRoster(apps: allApps, sessions: sessions) }
+    private var roster: AppRoster {
+        let names = self.names
+        return AppRoster(apps: allApps, sessions: sessions) {
+            names.knownTarget(named: names.name(forKey: names.key(of: $0)))
+        }
+    }
     private var connectedApps: [AppRoster.Connected] {
         roster.connected.filter { matches($0.app.name) || matches($0.app.target) }
     }
@@ -430,6 +463,7 @@ struct ClientsView: View {
                         }
                         group(.onThisMac, in: entries)
                         group(.network, in: entries)
+                        group(.notUsing, in: entries)
                     }
                 } detail: {
                     if let selected = entries.first(where: { $0.id == router.selectedClient }) {
@@ -493,11 +527,22 @@ struct ClientsView: View {
                 }
             }
             .map { sessionEntry(id: $0.id, sessions: $0.sessions) }
-        let all = connectedApps.map { appEntry($0.app, sessions: $0.sessions) }
+        let own = AppRoster.ownGrants(
+            apps: roster.connected.map(\.app) + roster.idle,
+            grants: model.snapshot.downstreamClients
+        ) { names.knownTarget(named: names.picturedName(forGrant: $0)) }
+        let joined = Set(own.values.map(\.clientId))
+        func app(_ app: LinkableApp, _ sessions: [LiveSession]) -> Entry {
+            let grant = own[app.target]
+            let signedIn = grant.flatMap { unclaimed.byGrant[$0.clientKey] } ?? []
+            return appEntry(app, sessions: sessions + signedIn, grant: grant)
+        }
+        let all = connectedApps.map { app($0.app, $0.sessions) }
             + others.filter { $0.group == .onThisMac }
-            + idleApps.map { appEntry($0, sessions: []) }
+            + idleApps.map { app($0, []) }
             + others.filter { $0.group == .network }
-            + grants.map { grantEntry($0, sessions: unclaimed.byGrant[$0.clientKey] ?? []) }
+            + grants.filter { !joined.contains($0.clientId) }
+                .map { grantEntry($0, sessions: unclaimed.byGrant[$0.clientKey] ?? []) }
         // Only clients that share a name need telling apart.
         let shared = Dictionary(grouping: all, by: \.name).filter { $0.value.count > 1 }
         return all.map { entry in
@@ -510,9 +555,13 @@ struct ClientsView: View {
 
     /// A client on this Mac. Its switch adds Plug to the client's settings or
     /// takes it out.
-    private func appEntry(_ app: LinkableApp, sessions: [LiveSession]) -> Entry {
+    private func appEntry(
+        _ app: LinkableApp, sessions: [LiveSession], grant: DownstreamClient? = nil
+    ) -> Entry {
         let name = names.name(forKey: app.target) ?? app.name
-        let access = access(to: app, sessions: sessions)
+        // Linked over the network, its choices are kept under its sign-in.
+        let access = grant.map { self.access(key: $0.clientKey, name: name) }
+            ?? self.access(to: app, sessions: sessions)
         let known = app.detected || app.linked
         let about = if !app.detected {
             "Plug cannot find this client on this Mac."
@@ -523,7 +572,7 @@ struct ClientsView: View {
         }
         return Entry(
             id: "app:\(app.target)",
-            group: .onThisMac,
+            group: app.linked || !sessions.isEmpty ? .onThisMac : .notUsing,
             name: name,
             originalName: app.name,
             status: ClientStatus.app(app, connections: sessions.count, limit: access?.summary),
@@ -707,6 +756,8 @@ struct ClientEntry: Identifiable {
     enum Group: String {
         case onThisMac = "On This Mac"
         case network = "Over the Network"
+        /// Found on this Mac, with Plug not in its settings.
+        case notUsing = "Not Using Plug"
     }
 
     enum Glyph {
