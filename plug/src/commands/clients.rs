@@ -444,6 +444,7 @@ pub(crate) fn linked_client_config_from_content(
                 ExportTarget::Amp => json.get("amp.mcpServers")?.get("plug")?,
                 ExportTarget::OpenClaw => json.get("mcp")?.get("servers")?.get("plug")?,
                 ExportTarget::MuseCode => json.get("mcp_servers")?.get("plug")?,
+                ExportTarget::OpenCode | ExportTarget::Kilo => json.get("mcp")?.get("plug")?,
                 _ => json
                     .get("mcpServers")
                     .and_then(|s| s.get("plug"))
@@ -459,6 +460,15 @@ pub(crate) fn linked_client_config_from_content(
                     endpoint: Some(url.to_string()),
                     command: None,
                     args: None,
+                })
+            } else if let Some(mut words) = plug.get("command").and_then(json_string_args) {
+                // OpenCode: the command and its arguments are one list.
+                let args = words.split_off(words.len().min(1));
+                Some(LinkedClientConfig {
+                    transport: ExportTransport::Stdio,
+                    endpoint: None,
+                    command: words.pop(),
+                    args: Some(args),
                 })
             } else if plug.get("command").is_some() {
                 Some(LinkedClientConfig {
@@ -1360,10 +1370,12 @@ fn unmerge_json_config(existing: &str) -> anyhow::Result<String> {
                 inner.remove("plug");
             }
         }
-        if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut())
-            && let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut())
-        {
-            srv.remove("plug");
+        if let Some(mcp) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) {
+            // OpenCode keeps the entry here; OpenClaw one level down.
+            mcp.remove("plug");
+            if let Some(srv) = mcp.get_mut("servers").and_then(|v| v.as_object_mut()) {
+                srv.remove("plug");
+            }
         }
         if let Some(tools) = obj.get_mut("tools").and_then(|v| v.as_object_mut())
             && let Some(srv) = tools.get_mut("mcpServers").and_then(|v| v.as_object_mut())
@@ -1385,7 +1397,11 @@ fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
                     v.as_object(),
                 ) {
                     for (ik, iv) in s_inner {
-                        if let (Some(e_deep), Some(s_deep)) = (
+                        // Plug's own entry is replaced whole, so a command
+                        // does not stay behind beside a URL.
+                        if ik == "plug" {
+                            e_inner.insert(ik.clone(), iv.clone());
+                        } else if let (Some(e_deep), Some(s_deep)) = (
                             e_inner.get_mut(ik).and_then(|v| v.as_object_mut()),
                             iv.as_object(),
                         ) {
@@ -1763,6 +1779,18 @@ fn replace_json_stdio_command(
         ExportTarget::MuseCode => value
             .get_mut("mcp_servers")
             .and_then(|servers| servers.get_mut("plug")),
+        ExportTarget::OpenCode | ExportTarget::Kilo => {
+            let plug = value
+                .get_mut("mcp")
+                .and_then(|servers| servers.get_mut("plug"))
+                .and_then(serde_json::Value::as_object_mut)
+                .ok_or_else(|| anyhow::anyhow!("missing JSON Plug entry"))?;
+            plug.insert(
+                "command".to_string(),
+                serde_json::json!([command, "connect", "--client", target.target_name()]),
+            );
+            return Ok(serde_json::to_string_pretty(&value)?);
+        }
         _ => {
             if value
                 .get("mcpServers")
@@ -2176,6 +2204,81 @@ port = 4444
             config.endpoint.as_deref(),
             Some("https://plug.example.com/mcp")
         );
+    }
+
+    #[test]
+    fn opencode_links_under_mcp_and_moves_from_a_command_to_a_url() {
+        use plug_core::export::{ExportOptions, export_config};
+        let options = |transport| ExportOptions {
+            target: ExportTarget::OpenCode,
+            transport,
+            port: 3282,
+            http_url: Some("https://plug.example.com/mcp".to_string()),
+            command: "/usr/local/bin/plug".to_string(),
+        };
+        let path = std::path::Path::new("opencode.json");
+        let existing = r#"{"permission":"allow","mcp":{"other":{"type":"local","command":["x"]}}}"#;
+
+        let local = export_config(&options(ExportTransport::Stdio));
+        let merged = merge_json_config(existing, &local).expect("merge");
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert!(
+            value.get("mcpServers").is_none(),
+            "OpenCode refuses the key"
+        );
+        assert_eq!(
+            value["mcp"]["plug"]["command"],
+            serde_json::json!(["/usr/local/bin/plug", "connect", "--client", "opencode"])
+        );
+        let linked = linked_client_config_from_content(path, ExportTarget::OpenCode, &merged)
+            .expect("linked");
+        assert!(matches!(linked.transport, ExportTransport::Stdio));
+        assert_eq!(linked.command.as_deref(), Some("/usr/local/bin/plug"));
+        assert_eq!(
+            linked.args.as_deref(),
+            Some(
+                &[
+                    "connect".to_string(),
+                    "--client".to_string(),
+                    "opencode".to_string()
+                ][..]
+            )
+        );
+
+        let moved =
+            replace_json_stdio_command(ExportTarget::OpenCode, &merged, "/new/plug".to_string())
+                .expect("repair");
+        let moved: serde_json::Value = serde_json::from_str(&moved).unwrap();
+        assert_eq!(moved["mcp"]["plug"]["command"][0], "/new/plug");
+
+        let remote = export_config(&options(ExportTransport::Http));
+        let merged = merge_json_config(&merged, &remote).expect("merge");
+        let value: serde_json::Value = serde_json::from_str(&merged).unwrap();
+        assert_eq!(value["mcp"]["plug"]["type"], "remote");
+        assert!(value["mcp"]["plug"].get("command").is_none());
+        assert!(value["mcp"].get("other").is_some());
+        let linked = linked_client_config_from_content(path, ExportTarget::OpenCode, &merged)
+            .expect("linked");
+        assert!(matches!(linked.transport, ExportTransport::Http));
+
+        let unlinked = unmerge_json_config(&merged).expect("unmerge");
+        let value: serde_json::Value = serde_json::from_str(&unlinked).unwrap();
+        assert!(value["mcp"].get("plug").is_none());
+        assert!(value["mcp"].get("other").is_some());
+    }
+
+    #[test]
+    fn claude_code_over_http_names_its_type() {
+        use plug_core::export::{ExportOptions, export_config};
+        let snippet = export_config(&ExportOptions {
+            target: ExportTarget::ClaudeCode,
+            transport: ExportTransport::Http,
+            port: 3282,
+            http_url: None,
+            command: "plug".to_string(),
+        });
+        let value: serde_json::Value = serde_json::from_str(&snippet).unwrap();
+        assert_eq!(value["mcpServers"]["plug"]["type"], "http");
     }
 
     #[test]
