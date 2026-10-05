@@ -329,6 +329,7 @@ pub(crate) async fn apply_server_mutation(
                 name,
                 server: Box::new(server),
                 auth_token,
+                secret_store: None,
             }
         }
         plug_core::operator::OperatorMutation::UpdateServer { name, server } => {
@@ -336,6 +337,7 @@ pub(crate) async fn apply_server_mutation(
                 name,
                 server: Box::new(server),
                 auth_token,
+                secret_store: None,
             }
         }
         plug_core::operator::OperatorMutation::RemoveServer { name } => {

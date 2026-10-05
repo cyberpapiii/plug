@@ -47,6 +47,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   are together at the top, and the checkup sits with the Plug switch.
 - Rename a client by typing in its Name field. Leave the field empty to go
   back to the client's own name.
+- Editing a server moves a key that was still written in the settings file
+  to the place keys are kept, where before it stayed in the file until
+  `plug secret move`.
 
 ### Added
 
@@ -59,6 +62,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   open a server to see its tools, each with its own switch. A tool that a
   rule written with `plug clients block` turns off says so and is changed
   there.
+- Choose where a server's keys are kept. The form for adding or editing a
+  server has Keep Keys In, with the Keychain and Plug's `.env` file. A key
+  from 1Password is used by typing where it is, such as
+  `op://vault/item/field`, in place of the key.
 - Delete removes the selected server, after asking. Remove Server is also in
   a server's right-click menu.
 

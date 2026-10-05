@@ -85,7 +85,9 @@ struct EditServerView: View {
             failure = AppModel.serverConfigReadRequiredCopy
             return
         }
-        guard let saved = form?.config else { return }
+        guard let form else { return }
+        let saved = form.config
+        let store = form.keyStore.sent
         saving = true
         failure = nil
         Task {
@@ -94,7 +96,7 @@ struct EditServerView: View {
                     .validateServer(authToken: $0, name: name, server: saved)
                 }
                 try await model.performOperation {
-                    .updateServer(authToken: $0, name: name, server: saved)
+                    .updateServer(authToken: $0, name: name, server: saved, secretStore: store)
                 }
                 saving = false
                 dismiss()

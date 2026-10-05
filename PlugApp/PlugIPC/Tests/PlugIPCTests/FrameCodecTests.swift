@@ -170,6 +170,20 @@ final class FrameCodecTests: XCTestCase {
         )
     }
 
+    func testTheStoreForAServersKeysIsSentOnlyWhenOneIsChosen() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        func sent(_ request: IPCRequest) throws -> [String: Any] {
+            let frame = try FrameCodec.encode(request, encoder: encoder)
+            return try XCTUnwrap(JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? [String: Any])
+        }
+        let server = ServerConfig.command("/bin/true", args: [])
+        let chosen = try sent(.updateServer(authToken: "secret", name: "linear", server: server, secretStore: "file"))
+        XCTAssertEqual(chosen["type"] as? String, "UpdateServer")
+        XCTAssertEqual(chosen["secret_store"] as? String, "file")
+        let plain = try sent(.addServer(authToken: "secret", name: "linear", server: server))
+        XCTAssertNil(plain["secret_store"])
+    }
+
     func testAWatchIsSentAsTheDaemonReadsItAndKeepsArgumentKeys() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let request = IPCRequest.addWatch(
