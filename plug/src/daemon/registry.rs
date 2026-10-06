@@ -132,15 +132,15 @@ impl ClientRegistry {
         }
     }
 
-    /// Record the target the connector says it was linked as. A name
-    /// `plug link` does not accept is dropped, so a key is never invented
-    /// from free text.
+    /// Record the target the connector says it was linked as. One that is
+    /// neither a client `plug link` accepts nor one the owner named is
+    /// dropped, so a key is never invented from free text.
     pub(super) fn set_link_target(&self, session_id: &str, link_target: Option<&str>) {
-        let Some(target) = link_target.and_then(plug_core::config::canonical_client_target) else {
+        let Some(target) = link_target.and_then(plug_core::ipc::link_target_key) else {
             return;
         };
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
-            entry.link_target = Some(target.to_string());
+            entry.link_target = Some(target);
         }
     }
 

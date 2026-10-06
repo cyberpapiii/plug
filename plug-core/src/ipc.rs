@@ -880,6 +880,26 @@ impl ClientHost {
 /// caller from another.
 pub const SHARED_REMOTE_CLIENT_KEY: &str = "remote:shared";
 
+/// What a target the owner made up for a client Plug has no entry for
+/// starts with. The app writes it into the command it hands that client.
+pub const CUSTOM_CLIENT_PREFIX: &str = "custom:";
+
+/// The settings key a link target stands for: a client Plug knows, or one
+/// the owner named in the app. Anything else is dropped, so a key is never
+/// made from free text.
+pub fn link_target_key(target: &str) -> Option<String> {
+    if let Some(known) = crate::config::canonical_client_target(target) {
+        return Some(known.to_string());
+    }
+    let slug = target.strip_prefix(CUSTOM_CLIENT_PREFIX)?;
+    let shaped = !slug.is_empty()
+        && slug.len() <= 40
+        && slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
+    shaped.then(|| target.to_string())
+}
+
 /// The settings key of a local client.
 ///
 /// The target `plug link` wrote into the client's config comes first: the
@@ -892,8 +912,8 @@ pub fn local_client_key(
     client_type: crate::types::ClientType,
     host: Option<&ClientHost>,
 ) -> Option<String> {
-    if let Some(target) = link_target.and_then(crate::config::canonical_client_target) {
-        return Some(target.to_string());
+    if let Some(key) = link_target.and_then(link_target_key) {
+        return Some(key);
     }
     if let Some(slug) = client_type.target_slug() {
         return Some(slug.to_string());
@@ -1942,6 +1962,29 @@ mod tests {
         assert_eq!(risk.plug_inferred.destructive, Some(true));
         assert_eq!(risk.effective.idempotent, Some(false));
         assert!(risk.has_conflict);
+    }
+
+    #[test]
+    fn a_client_the_owner_named_keeps_its_own_key() {
+        use crate::types::ClientType;
+        // A known target wins, however it is spelled.
+        assert_eq!(link_target_key("codex").as_deref(), Some("codex-cli"));
+        // One the owner made up is its own key, whatever the client reports.
+        assert_eq!(
+            local_client_key(Some("custom:my-tool"), ClientType::Cursor, None).as_deref(),
+            Some("custom:my-tool")
+        );
+        // Free text is not a key.
+        for target in [
+            "my tool",
+            "custom:",
+            "custom:My Tool",
+            "custom:a/b",
+            "other:x",
+        ] {
+            assert_eq!(link_target_key(target), None, "{target}");
+        }
+        assert_eq!(link_target_key(&format!("custom:{}", "a".repeat(41))), None);
     }
 
     #[test]

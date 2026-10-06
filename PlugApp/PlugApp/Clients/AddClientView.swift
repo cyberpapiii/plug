@@ -97,9 +97,27 @@ enum AddClient {
         return "\(place), add a connector or MCP server and paste this address. Plug then opens a page asking you to approve it.\(reach)"
     }
 
+    /// The target a client the owner named connects as, which is also the
+    /// key its name is stored under. Nil when the name has nothing to make
+    /// one from. The daemon accepts lowercase letters, digits and hyphens.
+    static func customTarget(named name: String) -> String? {
+        let slug = name.lowercased().unicodeScalars
+            .map { ("a"..."z").contains($0) || ("0"..."9").contains($0) ? String($0) : "-" }
+            .joined()
+            .split(separator: "-", omittingEmptySubsequences: true)
+            .joined(separator: "-")
+            .prefix(40)
+        return slug.isEmpty ? nil : "custom:\(slug)"
+    }
+
+    /// What follows Plug's command. A target makes the client its own row.
+    static func arguments(target: String?) -> [String] {
+        target.map { ["connect", "--client", $0] } ?? ["connect"]
+    }
+
     /// The settings entry most clients take, for pasting whole.
-    static func settingsEntry(command: String) -> String {
-        entry(["command": command, "args": ["connect"]])
+    static func settingsEntry(command: String, target: String? = nil) -> String {
+        entry(["command": command, "args": arguments(target: target)])
     }
 
     static func settingsEntry(address: String) -> String {
@@ -140,6 +158,9 @@ struct AddClientView: View {
     @State private var choice: AddClient.Choice?
     @State private var way = AddClient.Way.onThisMac
     @State private var copied: String?
+    /// What the owner calls a client Plug has no entry for.
+    @State private var name = ""
+    @State private var failure: String?
 
     private var apps: [LinkableApp] { model.connectableApps }
     private var address: String? { model.snapshot.clientAddress }
@@ -161,7 +182,8 @@ struct AddClientView: View {
     var body: some View {
         SheetFrame(
             title: "Add a Client",
-            subtitle: "A client is an app that uses your servers, such as Claude or Cursor."
+            subtitle: "A client is an app that uses your servers, such as Claude or Cursor.",
+            failure: failure
         ) {
             Form {
                 Section {
@@ -183,6 +205,10 @@ struct AddClientView: View {
                         Section {
                             Text("Another Client").tag(AddClient.Choice.other)
                         }
+                    }
+                    if namesIt {
+                        TextField("Name", text: $name, prompt: Text("What you call it"))
+                            .onChange(of: name) { copied = nil }
                     }
                     if ways.count > 1 {
                         VStack(alignment: .leading, spacing: Metric.rowGap) {
@@ -230,7 +256,11 @@ struct AddClientView: View {
                 Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
             }
         case .command:
-            paste(label: "Command", value: "\(command) connect", entry: AddClient.settingsEntry(command: command))
+            paste(
+                label: "Command",
+                value: ([command] + AddClient.arguments(target: customTarget)).joined(separator: " "),
+                entry: AddClient.settingsEntry(command: command, target: customTarget)
+            )
             caption("\(notFoundNote)In \(chosenName ?? "the client")'s MCP settings, add a server that runs this command. \(namingNote)")
         case .address:
             if let address {
@@ -250,9 +280,32 @@ struct AddClientView: View {
         return ""
     }
 
-    /// A client Plug has no entry for is named by the person.
+    /// A client Plug has no entry for is named here when it runs Plug's
+    /// command, which can carry the name. An address cannot.
+    private var namesIt: Bool { chosen == .other && chosenWay == .onThisMac }
+
+    private var customTarget: String? { namesIt ? AddClient.customTarget(named: name) : nil }
+
     private var namingNote: String {
-        chosen == .other ? "It shows in Clients the first time it connects, where you can name it and choose its icon." : ""
+        guard chosen == .other else { return "" }
+        return customTarget == nil
+            ? "It shows in Clients the first time it connects, where you can name it and choose its icon."
+            : "It shows in Clients under that name the first time it connects, where you can choose its icon."
+    }
+
+    /// The name is stored when the command is copied, so the client has it
+    /// the first time it connects.
+    private func keepName() {
+        guard let customTarget else { return }
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        failure = nil
+        Task {
+            do {
+                try await model.performOperation { .renameClient(authToken: $0, key: customTarget, name: name) }
+            } catch {
+                failure = "Plug could not keep the name: \(error.localizedDescription)"
+            }
+        }
     }
 
     private func paste(label: String, value: String, entry: String) -> some View {
@@ -277,6 +330,7 @@ struct AddClientView: View {
             NSPasteboard.general.clearContents()
             NSPasteboard.general.setString(text, forType: .string)
             copied = title
+            keepName()
         }
     }
 
