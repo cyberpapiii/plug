@@ -655,6 +655,26 @@ async fn main() -> anyhow::Result<()> {
             commands::clients::cmd_client_block(cli.config.as_ref(), client, servers, tools, false)
                 .await?
         }
+        Some(Commands::Clients {
+            command:
+                Some(commands::clients::ClientCommands::Only {
+                    client,
+                    servers,
+                    tools,
+                    remove,
+                    off,
+                }),
+        }) => {
+            commands::clients::cmd_client_only(
+                cli.config.as_ref(),
+                client,
+                servers,
+                tools,
+                remove,
+                off,
+            )
+            .await?
+        }
         Some(Commands::Events { command: None }) => {
             commands::events::cmd_event_list(cli.config.as_ref(), &cli.output).await?
         }

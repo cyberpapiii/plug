@@ -617,6 +617,52 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(access("claude-code").offCount(among: tools), 0)
     }
 
+    func testAClientWithAnAllowListGetsOnlyWhatIsOnIt() throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let servers = try decoder.decode(
+            [ConfiguredServer].self,
+            from: Data(
+                """
+                [{"name":"git","enabled":true,"transport":"stdio","oauth":false},
+                 {"name":"slack","enabled":true,"transport":"http","oauth":true},
+                 {"name":"notion","enabled":true,"transport":"http","oauth":true}]
+                """.utf8
+            )
+        )
+        let blocks = try decoder.decode(
+            [ClientBlocks].self,
+            from: Data(
+                """
+                [{"key":"radar","only_allowed":true,"allowed_servers":["slack"],
+                  "allowed_tools":["Git__commit"],"partly_allowed_servers":["git"],
+                  "tools":["slack__dm"]},
+                 {"key":"empty","only_allowed":true}]
+                """.utf8
+            )
+        )
+        let radar = ClientAccess(key: "radar", name: "Radar", servers: servers, blocks: blocks)
+        XCTAssertTrue(radar.isOn(server: "slack"))
+        XCTAssertTrue(radar.isOn(server: "git"))
+        XCTAssertFalse(radar.isOn(server: "notion"))
+        XCTAssertEqual(radar.summary, "1 server and 1 tool off")
+
+        // On a server that is on the list whole, a tool is off only by a
+        // block. On one that is not, a tool is on only if it is listed.
+        let tool = { ToolFacts(name: $0, server: $1) }
+        XCTAssertEqual(radar.state(of: tool("slack__post", "slack")), .on)
+        XCTAssertEqual(radar.state(of: tool("slack__dm", "slack")), .off)
+        XCTAssertFalse(radar.isListedSingly(tool("slack__dm", "slack")))
+        XCTAssertEqual(radar.state(of: tool("git__commit", "git")), .on)
+        XCTAssertEqual(radar.state(of: tool("git__push", "git")), .off)
+        XCTAssertTrue(radar.isListedSingly(tool("git__push", "git")))
+
+        // An empty list is still a list.
+        let empty = ClientAccess(key: "empty", name: "Empty", servers: servers, blocks: blocks)
+        XCTAssertEqual(empty.offServers, ["git", "slack", "notion"])
+        XCTAssertEqual(empty.summary, "3 servers off")
+    }
+
     func testARuleFitsTheWayTheDaemonReadsIt() {
         XCTAssertTrue(ClientAccess.rule("*", fits: "anything"))
         XCTAssertTrue(ClientAccess.rule("git__*", fits: "git__log"))

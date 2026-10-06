@@ -139,6 +139,17 @@ pub struct ClientBlocks {
     pub servers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tools: Vec<String>,
+    /// The client gets only what the two lists below name.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub only_allowed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_servers: Vec<String>,
+    /// Single tools on the allow list, by the name each is listed under now.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<String>,
+    /// The servers those single tools belong to.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partly_allowed_servers: Vec<String>,
 }
 
 /// The settings key of a remote client that holds a grant.

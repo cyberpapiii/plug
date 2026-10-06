@@ -160,18 +160,71 @@ struct ClientAccess {
     blocked_tools: Vec<(String, String)>,
     /// Rules over the names Plug lists tools under.
     named_tools: Vec<String>,
+    /// Whether the client gets only what the allow list names.
+    only_allowed: bool,
+    allowed_servers: HashSet<String>,
+    /// A server, and that server's own name for a tool, lowercased.
+    allowed_tools: Vec<(String, String)>,
 }
 
 impl ClientAccess {
+    fn has_allow_list(&self) -> bool {
+        self.only_allowed
+    }
+
     fn blocks_any_tool(&self) -> bool {
-        !self.blocked_tools.is_empty() || !self.named_tools.is_empty()
+        !self.blocked_tools.is_empty() || !self.named_tools.is_empty() || self.has_allow_list()
+    }
+
+    /// Whether any server is out of this client's reach. An allow list
+    /// always leaves some out: the next one to be added, if no other.
+    fn keeps_from_a_server(&self) -> bool {
+        !self.blocked_servers.is_empty() || self.has_allow_list()
+    }
+
+    /// Whether the client gets nothing of `server`: it is blocked, or there
+    /// is an allow list and neither it nor any tool of it is on the list.
+    fn keeps_from_server(&self, server: &str) -> bool {
+        self.blocked_servers.contains(server)
+            || (self.has_allow_list()
+                && !self.allowed_servers.contains(server)
+                && !self.allowed_tools.iter().any(|(of, _)| of == server))
+    }
+
+    /// The servers this client may reach among `servers`, for telling when
+    /// a change of rules moved one in or out.
+    fn servers_in_reach(&self) -> (bool, Vec<String>, Vec<String>) {
+        let mut blocked: Vec<String> = self.blocked_servers.iter().cloned().collect();
+        blocked.sort();
+        let mut allowed: Vec<String> = self
+            .allowed_servers
+            .iter()
+            .cloned()
+            .chain(self.allowed_tools.iter().map(|(server, _)| server.clone()))
+            .collect();
+        allowed.sort();
+        allowed.dedup();
+        (self.has_allow_list(), blocked, allowed)
     }
 
     /// Whether this client is kept from `tool` on `server`, which Plug lists
     /// or listed as `listed`.
     fn keeps_from(&self, server: &str, tool: Option<&str>, listed: &str, delimiter: &str) -> bool {
-        if self.blocked_servers.contains(server) {
+        if self.keeps_from_server(server) {
             return true;
+        }
+        // Only some of the server's tools are on the allow list. A result
+        // whose tool is not known is not one of them.
+        if self.has_allow_list() && !self.allowed_servers.contains(server) {
+            let allowed = tool.is_some_and(|tool| {
+                let tool = tool.to_ascii_lowercase();
+                self.allowed_tools
+                    .iter()
+                    .any(|(of, name)| of == server && *name == tool)
+            });
+            if !allowed {
+                return true;
+            }
         }
         let by_server = self
             .blocked_tools
@@ -1076,12 +1129,23 @@ impl ToolRouter {
         let next: HashMap<String, ClientAccess> = clients
             .iter()
             .filter(|(_, settings)| {
-                !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
+                !settings.blocked_servers.is_empty()
+                    || !settings.blocked_tools.is_empty()
+                    || settings.has_allow_list()
             })
             .map(|(key, settings)| {
                 (
                     key.clone(),
                     ClientAccess {
+                        only_allowed: settings.has_allow_list(),
+                        allowed_servers: settings.allowed_servers.iter().cloned().collect(),
+                        allowed_tools: settings
+                            .allowed_tools
+                            .iter()
+                            .map(|allowed| {
+                                (allowed.server.clone(), allowed.tool.to_ascii_lowercase())
+                            })
+                            .collect(),
                         blocked_servers: settings.blocked_servers.iter().cloned().collect(),
                         blocked_tools: settings
                             .blocked_tools
@@ -1111,13 +1175,13 @@ impl ToolRouter {
         if *current == next {
             return;
         }
-        // A tool block touches the tool list only; a server block also moves
-        // that server's resources and prompts in or out of reach.
+        // A tool block touches the tool list only; a server going in or out
+        // of reach also moves that server's resources and prompts.
         let server_blocks = |table: &HashMap<String, ClientAccess>| {
             table
                 .iter()
-                .filter(|(_, access)| !access.blocked_servers.is_empty())
-                .map(|(key, access)| (key.clone(), access.blocked_servers.clone()))
+                .filter(|(_, access)| access.keeps_from_a_server())
+                .map(|(key, access)| (key.clone(), access.servers_in_reach()))
                 .collect::<HashMap<_, _>>()
         };
         let servers_changed = server_blocks(&current) != server_blocks(&next);
@@ -1135,7 +1199,7 @@ impl ToolRouter {
             self.client_access
                 .load()
                 .get(key)
-                .is_some_and(|access| !access.blocked_servers.is_empty())
+                .is_some_and(ClientAccess::keeps_from_a_server)
         })
     }
 
@@ -1202,7 +1266,7 @@ impl ToolRouter {
         let Some(access) = access.get(client_key) else {
             return true;
         };
-        if !access.blocks_any_tool() && access.blocked_servers.is_empty() {
+        if !access.blocks_any_tool() && !access.keeps_from_a_server() {
             return true;
         }
         let Some(server) = server else {
@@ -1229,7 +1293,7 @@ impl ToolRouter {
         self.client_access
             .load()
             .get(client_key)
-            .is_none_or(|access| !access.blocked_servers.contains(server_id))
+            .is_none_or(|access| !access.keeps_from_server(server_id))
     }
 
     /// Whether the client behind `client_key` may be sent `notification`, by
@@ -1263,7 +1327,7 @@ impl ToolRouter {
             self.client_access
                 .load()
                 .get(client_key)
-                .is_some_and(|access| !access.blocked_servers.is_empty())
+                .is_some_and(ClientAccess::keeps_from_a_server)
         })
     }
 

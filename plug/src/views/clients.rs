@@ -471,6 +471,19 @@ pub(crate) async fn cmd_client_list(
             }
         }
 
+        let allow_lists = config
+            .iter()
+            .flat_map(|config| config.clients.iter())
+            .filter(|(_, settings)| settings.has_allow_list())
+            .collect::<Vec<_>>();
+        if !allow_lists.is_empty() {
+            println!();
+            print_heading("Given only what is named");
+            for (key, settings) in allow_lists {
+                print_info_line(crate::commands::clients::client_allow_line(key, settings));
+            }
+        }
+
         println!();
         print_heading("Set up to use Plug");
         let linked_clients = clients.iter().filter(|client| client.linked);

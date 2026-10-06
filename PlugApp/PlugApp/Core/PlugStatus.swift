@@ -258,6 +258,9 @@ enum PlugIntent: Equatable, Sendable {
     case setClientPlace(key: String, place: String)
     case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case setClientToolBlocked(key: String, tool: String, blocked: Bool)
+    case setClientServerAllowed(key: String, server: String, allowed: Bool)
+    case setClientToolAllowed(key: String, tool: String, allowed: Bool)
+    case setClientAllowList(key: String, on: Bool)
     case addServer
     /// Open the sheet that adds Plug to a client.
     case addClient

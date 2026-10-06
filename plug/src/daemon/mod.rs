@@ -1631,11 +1631,35 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .clients
                 .iter()
                 .filter(|(_, settings)| {
-                    !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
+                    !settings.blocked_servers.is_empty()
+                        || !settings.blocked_tools.is_empty()
+                        || settings.has_allow_list()
                 })
                 .map(|(key, settings)| plug_core::ipc::ClientBlocks {
                     key: key.clone(),
                     servers: settings.blocked_servers.clone(),
+                    only_allowed: settings.has_allow_list(),
+                    partly_allowed_servers: {
+                        let mut servers: Vec<String> = settings
+                            .allowed_tools
+                            .iter()
+                            .map(|allowed| allowed.server.clone())
+                            .collect();
+                        servers.sort();
+                        servers.dedup();
+                        servers
+                    },
+                    allowed_servers: settings.allowed_servers.clone(),
+                    allowed_tools: settings
+                        .allowed_tools
+                        .iter()
+                        .map(|allowed| {
+                            ctx.engine
+                                .tool_router()
+                                .listed_name(&allowed.server, &allowed.tool)
+                                .unwrap_or_else(|| allowed.to_string())
+                        })
+                        .collect(),
                     // By the name each tool is listed under now, which is
                     // how the app and the command line know a tool.
                     tools: settings

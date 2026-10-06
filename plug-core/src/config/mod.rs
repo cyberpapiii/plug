@@ -207,6 +207,34 @@ pub struct ClientSettings {
     /// Tools this client does not get. See [`ToolBlock`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_tools: Vec<ToolBlock>,
+    /// The client gets only what `allowed_servers` and `allowed_tools`
+    /// name, even when they name nothing. Naming anything in either does
+    /// the same, so this is written only to keep an empty list in force.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub only_allowed: bool,
+    /// The allow list. Once this or `allowed_tools` names anything, the
+    /// client gets only what the two name, so a server added later does not
+    /// reach it. A block still takes away what the list lets in.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_servers: Vec<String>,
+    /// Single tools on the allow list, each by its server and the name that
+    /// server gives it.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub allowed_tools: Vec<AllowedTool>,
+}
+
+/// One tool a client with an allow list gets, stored the way a tool block
+/// is so no rename moves it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct AllowedTool {
+    pub server: String,
+    pub tool: String,
+}
+
+impl std::fmt::Display for AllowedTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} on {}", self.tool, self.server)
+    }
 }
 
 /// One tool kept from a client.
@@ -245,6 +273,12 @@ impl ClientSettings {
             && self.place.is_none()
             && self.blocked_servers.is_empty()
             && self.blocked_tools.is_empty()
+            && !self.has_allow_list()
+    }
+
+    /// Whether the client gets only what its allow list names.
+    pub fn has_allow_list(&self) -> bool {
+        self.only_allowed || !self.allowed_servers.is_empty() || !self.allowed_tools.is_empty()
     }
 }
 

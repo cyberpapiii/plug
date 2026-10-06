@@ -76,6 +76,19 @@ pub enum ClientBlockKind {
     /// and that server's name for it. A name with `*` in it, or one Plug
     /// lists no tool under, is stored as a rule over listed names.
     Tool,
+    /// A server on the client's allow list. `blocked` puts it on the list
+    /// and its absence takes it off. A client with anything on its allow
+    /// list gets only what the list names.
+    AllowedServer,
+    /// A tool on the client's allow list, by the name Plug lists it under,
+    /// stored by its server and that server's name for it.
+    AllowedTool,
+    /// The allow list itself; the target is not read. `blocked` starts one
+    /// holding every server the client gets now, and its absence ends it,
+    /// keeping the client from the servers that were not on it. Either way
+    /// the client goes on getting what it got: what changes is whether a
+    /// server added later reaches it.
+    AllowList,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -403,10 +416,19 @@ fn set_client_block(
     if target.is_empty() || target.chars().any(char::is_control) {
         anyhow::bail!("name the server or tool to block");
     }
-    if blocked && kind == ClientBlockKind::Server && !config.servers.contains_key(target) {
+    if blocked
+        && matches!(
+            kind,
+            ClientBlockKind::Server | ClientBlockKind::AllowedServer
+        )
+        && !config.servers.contains_key(target)
+    {
         anyhow::bail!("no server is called `{target}`; run `plug servers` to see their names");
     }
     let settings = config.clients.entry(key.to_string()).or_default();
+    // Taking the last entry off an allow list leaves an empty list, not
+    // none: the client gets nothing, where no list would give it everything.
+    let had_allow_list = settings.has_allow_list();
     match kind {
         ClientBlockKind::Server => {
             let list = &mut settings.blocked_servers;
@@ -426,6 +448,74 @@ fn set_client_block(
             if blocked {
                 list.push(block);
                 list.sort();
+            }
+        }
+        ClientBlockKind::AllowedServer => {
+            let list = &mut settings.allowed_servers;
+            list.retain(|existing| existing != target);
+            if blocked {
+                list.push(target.to_string());
+                list.sort();
+                // On the list means the client gets it.
+                settings
+                    .blocked_servers
+                    .retain(|existing| existing != target);
+            } else {
+                // Off the list is all of it.
+                settings
+                    .allowed_tools
+                    .retain(|allowed| allowed.server != target);
+                settings.only_allowed = had_allow_list;
+            }
+        }
+        ClientBlockKind::AllowList => {
+            let servers: Vec<String> = config.servers.keys().cloned().collect();
+            if blocked {
+                if !settings.has_allow_list() {
+                    settings.allowed_servers = servers
+                        .into_iter()
+                        .filter(|server| !settings.blocked_servers.contains(server))
+                        .collect();
+                    settings.allowed_servers.sort();
+                    settings.blocked_servers.clear();
+                }
+                settings.only_allowed = true;
+            } else if settings.has_allow_list() {
+                let allowed = std::mem::take(&mut settings.allowed_servers);
+                settings.allowed_tools.clear();
+                settings.only_allowed = false;
+                settings.blocked_servers.extend(
+                    servers
+                        .into_iter()
+                        .filter(|server| !allowed.contains(server)),
+                );
+                settings.blocked_servers.sort();
+                settings.blocked_servers.dedup();
+            }
+        }
+        ClientBlockKind::AllowedTool => {
+            // An allow list is exact, so a tool goes on it only once Plug
+            // knows which server's tool it is. One already on it can be
+            // taken off by the same name or as `server/tool`.
+            let found = tool_behind(target).or_else(|| {
+                target
+                    .split_once('/')
+                    .map(|(server, tool)| (server.to_string(), tool.to_string()))
+                    .filter(|_| !blocked)
+            });
+            let Some((server, tool)) = found else {
+                anyhow::bail!(
+                    "Plug lists no tool called `{target}`; run `plug tools -v` to see their names"
+                );
+            };
+            let allowed = crate::config::AllowedTool { server, tool };
+            let list = &mut settings.allowed_tools;
+            list.retain(|existing| *existing != allowed);
+            if blocked {
+                list.push(allowed);
+                list.sort();
+            } else {
+                settings.only_allowed = had_allow_list;
             }
         }
     }
@@ -930,6 +1020,77 @@ API_KEY = "sk-live-123"
             Some("Work Cursor")
         );
         block("nobody", ClientBlockKind::Server, "gone", false).unwrap();
+    }
+
+    #[test]
+    fn an_allow_list_names_servers_and_tools_plug_knows() {
+        use crate::config::AllowedTool;
+
+        let path = fixture_path();
+        std::fs::write(&path, "[servers.git]\ncommand = \"git-mcp\"\n").unwrap();
+        let tool_behind = |listed: &str| {
+            (listed == "Code__push").then(|| ("git".to_string(), "push".to_string()))
+        };
+        let allow = |kind, target: &str, allowed| {
+            apply_operator_mutation_knowing(
+                &path,
+                OperatorMutation::SetClientBlock {
+                    key: "radar".to_string(),
+                    kind,
+                    target: target.to_string(),
+                    blocked: allowed,
+                },
+                &tool_behind,
+            )
+        };
+
+        assert!(allow(ClientBlockKind::AllowedServer, "gti", true).is_err());
+        // A tool Plug does not list cannot go on: the list is exact.
+        assert!(allow(ClientBlockKind::AllowedTool, "Code__pull", true).is_err());
+        allow(ClientBlockKind::AllowedServer, "git", true).unwrap();
+        allow(ClientBlockKind::AllowedTool, "Code__push", true).unwrap();
+        let (config, _) = allow(ClientBlockKind::AllowedTool, "Code__push", true).unwrap();
+        let push = AllowedTool {
+            server: "git".to_string(),
+            tool: "push".to_string(),
+        };
+        assert_eq!(config.clients["radar"].allowed_servers, ["git"]);
+        assert_eq!(config.clients["radar"].allowed_tools, [push]);
+        assert_eq!(
+            crate::config::load_config(Some(&path)).unwrap().clients,
+            config.clients
+        );
+
+        // Off by the server's own name too, for a tool no longer listed.
+        allow(ClientBlockKind::AllowedTool, "git/push", false).unwrap();
+        let (config, _) = allow(ClientBlockKind::AllowedServer, "git", false).unwrap();
+        // An emptied list still holds: nothing, not everything.
+        assert!(config.clients["radar"].has_allow_list());
+        assert!(config.clients["radar"].allowed_servers.is_empty());
+        assert_eq!(
+            crate::config::load_config(Some(&path)).unwrap().clients,
+            config.clients
+        );
+
+        // Ending the list keeps the client from what was not on it, and
+        // starting one again puts on it what the client gets.
+        let (config, _) = allow(ClientBlockKind::AllowList, "*", false).unwrap();
+        assert!(!config.clients["radar"].has_allow_list());
+        assert_eq!(config.clients["radar"].blocked_servers, ["git"]);
+        let (config, _) = allow(ClientBlockKind::AllowList, "*", true).unwrap();
+        assert!(config.clients["radar"].has_allow_list());
+        assert!(config.clients["radar"].blocked_servers.is_empty());
+        assert!(config.clients["radar"].allowed_servers.is_empty());
+        allow(ClientBlockKind::AllowedServer, "git", true).unwrap();
+        let (config, _) = allow(ClientBlockKind::AllowList, "*", false).unwrap();
+        assert!(
+            !config.clients.contains_key("radar"),
+            "nothing left to keep"
+        );
+
+        // Taking off what was never on starts no list.
+        let (config, _) = allow(ClientBlockKind::AllowedServer, "git", false).unwrap();
+        assert!(!config.clients.contains_key("radar"));
     }
 
     #[test]

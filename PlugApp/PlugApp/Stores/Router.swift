@@ -117,6 +117,18 @@ struct PlugIntentRunner {
             perform("\(blocked ? "turn off" : "turn on") that tool for that client") {
                 .setClientToolBlocked(authToken: $0, key: key, tool: tool, blocked: blocked)
             }
+        case let .setClientServerAllowed(key, server, allowed):
+            perform("\(allowed ? "turn on" : "turn off") \(server) for that client") {
+                .setClientServerAllowed(authToken: $0, key: key, server: server, allowed: allowed)
+            }
+        case let .setClientToolAllowed(key, tool, allowed):
+            perform("\(allowed ? "turn on" : "turn off") that tool for that client") {
+                .setClientToolAllowed(authToken: $0, key: key, tool: tool, allowed: allowed)
+            }
+        case let .setClientAllowList(key, on):
+            perform("change what that client gets of new servers") {
+                .setClientAllowList(authToken: $0, key: key, on: on)
+            }
         case .addServer:
             router.section = .servers
             router.sheet = .addServer

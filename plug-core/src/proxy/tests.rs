@@ -4864,6 +4864,68 @@ fn result_text(result: &CallToolResult) -> String {
 }
 
 #[test]
+fn a_client_with_an_allow_list_gets_only_what_is_on_it() {
+    let mut config = test_router_config();
+    config.tool_filter_enabled = false;
+    let router = router_with_client_blocks(config);
+    let allowed_tool = |server: &str, tool: &str| crate::config::AllowedTool {
+        server: server.to_string(),
+        tool: tool.to_string(),
+    };
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "radar".to_string(),
+        crate::config::ClientSettings {
+            allowed_servers: vec!["slack".to_string()],
+            ..Default::default()
+        },
+    );
+    clients.insert(
+        "bot".to_string(),
+        crate::config::ClientSettings {
+            allowed_tools: vec![allowed_tool("git", "commit")],
+            ..Default::default()
+        },
+    );
+    // A block takes away what the list lets in.
+    clients.insert(
+        "both".to_string(),
+        crate::config::ClientSettings {
+            allowed_servers: vec!["git".to_string()],
+            blocked_tools: vec!["git__push".into()],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    let listed = |client_key: &str| {
+        tool_names(&router.list_tools_for_client_session(
+            ClientType::ClaudeCode,
+            None,
+            Some(client_key),
+        ))
+    };
+
+    assert_eq!(listed("radar"), ["slack__post"]);
+    assert_eq!(listed("bot"), ["git__commit"]);
+    assert_eq!(listed("both"), ["git__commit"]);
+    assert_eq!(listed("other"), ["git__commit", "git__push", "slack__post"]);
+
+    assert!(router.client_may_use_server(Some("radar"), "slack"));
+    assert!(!router.client_may_use_server(Some("radar"), "git"));
+    // A server added later is not on the list.
+    assert!(!router.client_may_use_server(Some("radar"), "notion"));
+    assert!(router.client_is_kept_from_a_server(Some("radar")));
+
+    // A result is read by the same rule, and one whose tool was not
+    // recorded is not on a list of single tools.
+    assert!(router.client_may_read_result_of(Some("bot"), Some("git"), Some("commit"), "x"));
+    assert!(!router.client_may_read_result_of(Some("bot"), Some("git"), Some("push"), "x"));
+    assert!(!router.client_may_read_result_of(Some("bot"), Some("git"), None, "x"));
+    assert!(!router.client_may_read_result_of(Some("bot"), None, None, "x"));
+    assert!(router.client_may_read_result_of(Some("radar"), Some("slack"), None, "x"));
+}
+
+#[test]
 fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
     let mut config = test_router_config();
     config.tool_filter_enabled = false;
