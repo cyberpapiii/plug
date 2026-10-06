@@ -62,9 +62,9 @@ Amp, OpenClaw, LM Studio, or Muse Code on a real install.
   Gemini, Perplexity, Le Chat, and Poke on the name a client reports, and
   nobody has seen what each one reports. Correct the match when one connects.
 - Per-client access is in: a client can be kept from servers and from single
-  tools. Left over: there is no allow list (`only_servers`); every client
-  on the shared bearer token is one client, `remote:shared`; and a changed
-  block tells every client to re-read its lists, not only the one it touches.
+  tools, or given only the ones picked. Left over: every client on the
+  shared bearer token is one client, `remote:shared`; and a changed block
+  tells every client to re-read its lists, not only the one it touches.
 - `health::tests::a_server_that_stays_down_backs_off_and_stays_quiet` failed
   once under a full run on 2026-10-06 and passed on every rerun. Look at its
   timing if it fails again.
