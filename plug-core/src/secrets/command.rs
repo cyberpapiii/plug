@@ -73,14 +73,22 @@ impl Command {
 
 /// Everything a pipe gives, read on its own thread so a full pipe never
 /// stalls the command.
-fn drain(pipe: Option<impl Read + Send + 'static>) -> std::thread::JoinHandle<Vec<u8>> {
+/// How long past the deadline a finished command's output may take to arrive.
+const PIPE_GRACE: Duration = Duration::from_millis(250);
+
+/// Read a pipe to its end on another thread. The bytes arrive on the
+/// channel, so the caller can stop waiting: a program the command started
+/// may hold the pipe open long after the command itself is done.
+fn drain(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
+    let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
         if let Some(mut pipe) = pipe {
             let _ = pipe.read_to_end(&mut bytes);
         }
-        bytes
-    })
+        let _ = tx.send(bytes);
+    });
+    rx
 }
 
 impl SecretStore for Command {
@@ -125,8 +133,13 @@ impl SecretStore for Command {
                 Err(error) => return Err(self.unavailable(error)),
             }
         };
-        let stdout = stdout.join().unwrap_or_default();
-        let stderr = stderr.join().unwrap_or_default();
+        let left = || deadline.saturating_duration_since(Instant::now()) + PIPE_GRACE;
+        let Ok(stdout) = stdout.recv_timeout(left()) else {
+            return Err(SecretError::TimedOut {
+                store: self.id.clone(),
+            });
+        };
+        let stderr = stderr.recv_timeout(left()).unwrap_or_default();
 
         if !status.success() {
             // The tool's own first line says it best: locked, not signed in,
@@ -210,6 +223,20 @@ mod tests {
     #[test]
     fn a_command_that_waits_for_a_person_is_stopped() {
         let store = shell("sleep 30", Duration::from_millis(200));
+        let started = Instant::now();
+        assert_eq!(
+            store.get("github").unwrap_err(),
+            SecretError::TimedOut {
+                store: "vault".to_string()
+            }
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_program_the_command_left_running_does_not_hold_the_read() {
+        // The command is done at once; what it started keeps the pipe open.
+        let store = shell("sleep 30 & echo value", Duration::from_millis(200));
         let started = Instant::now();
         assert_eq!(
             store.get("github").unwrap_err(),

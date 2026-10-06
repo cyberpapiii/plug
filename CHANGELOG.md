@@ -73,6 +73,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Setting up a client whose config file is YAML that cannot be read leaves
+  the file alone and says so, where before Plug wrote a fresh file over it.
+- One watched tool that is slow to answer no longer holds up the other
+  watches that are due with it.
+- A secret store command that leaves a program running behind it no longer
+  hangs the read; it stops at the store's time limit.
 - Removing a client's access ends the sessions it has open, where before an
   open stream stayed up until it timed out. A session answers only to the
   client that opened it.
