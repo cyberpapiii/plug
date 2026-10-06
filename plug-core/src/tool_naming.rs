@@ -337,6 +337,56 @@ pub fn default_workspace_rules() -> Vec<crate::config::ToolGroupRule> {
     ]
 }
 
+/// The name the Google Workspace MCP server reports for itself.
+const GOOGLE_WORKSPACE_REPORTED_NAME: &str = "google_workspace";
+
+/// The group rules a server gets when its config carries none of its own.
+///
+/// Google Workspace is known by what the server says it is, so it is grouped
+/// under any name the owner gave it. A server named `workspace` is still
+/// taken for one before it has connected and said so.
+pub fn builtin_group_rules(
+    server_name: &str,
+    reported_name: Option<&str>,
+) -> Option<Vec<crate::config::ToolGroupRule>> {
+    let is_google_workspace =
+        server_name == "workspace" || reported_name == Some(GOOGLE_WORKSPACE_REPORTED_NAME);
+    is_google_workspace.then(default_workspace_rules)
+}
+
+/// The prefixes under which two servers have a tool of the same name.
+///
+/// Each claim is a server, the prefix it puts a tool under, and the tool's
+/// name. Two servers claiming one name would leave one tool: the second
+/// would replace the first without a word.
+pub fn shared_prefixes<'a>(
+    claims: impl IntoIterator<Item = (&'a str, &'a str, &'a str)>,
+) -> std::collections::HashSet<String> {
+    let mut servers: std::collections::HashMap<(&str, &str), std::collections::HashSet<&str>> =
+        std::collections::HashMap::new();
+    for (server, prefix, name) in claims {
+        servers.entry((prefix, name)).or_default().insert(server);
+    }
+    servers
+        .into_iter()
+        .filter(|(_, servers)| servers.len() > 1)
+        .map(|((prefix, _), _)| prefix.to_string())
+        .collect()
+}
+
+/// A shared prefix with the server added, so `Gmail` from `google-work`
+/// becomes `GmailGoogleWork`.
+pub fn prefix_for_server(prefix: &str, server_name: &str) -> String {
+    let mut qualified = prefix.to_string();
+    for word in server_name
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|word| !word.is_empty())
+    {
+        qualified.push_str(&format_server_prefix(word));
+    }
+    qualified
+}
+
 /// Classify a workspace tool into a Google sub-service using built-in defaults.
 /// Returns (&'static str, String) = (sub_service_prefix, original_tool_name)
 ///
@@ -448,6 +498,33 @@ pub fn classify_workspace_tool(tool_name: &str) -> (&'static str, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_workspace_is_grouped_under_any_name() {
+        assert!(builtin_group_rules("workspace", None).is_some());
+        assert!(builtin_group_rules("google-work", Some("google_workspace")).is_some());
+        assert!(builtin_group_rules("google-work", None).is_none());
+        assert!(builtin_group_rules("slack", Some("Slack MCP Server")).is_none());
+    }
+
+    #[test]
+    fn a_prefix_two_servers_share_is_told_apart_by_server() {
+        let shared = shared_prefixes([
+            ("workspace", "Gmail", "search_messages"),
+            ("workspace", "Gmail", "send_message"),
+            ("google-work", "Gmail", "search_messages"),
+            // One prefix, different tools: nothing is lost, nothing changes.
+            ("workspace", "GoogleDrive", "list_items"),
+            ("drive-extras", "GoogleDrive", "empty_trash"),
+            ("slack", "Slack", "search_messages"),
+        ]);
+        assert_eq!(
+            shared,
+            std::collections::HashSet::from(["Gmail".to_string()])
+        );
+        assert_eq!(prefix_for_server("Gmail", "google-work"), "GmailGoogleWork");
+        assert_eq!(prefix_for_server("Gmail", "workspace"), "GmailWorkspace");
+    }
 
     #[test]
     fn sanitize_hyphens_to_underscores() {

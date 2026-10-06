@@ -2225,19 +2225,18 @@ impl ToolRouter {
 
             let ctx = server_ctx.entry(server_name.clone()).or_insert_with(|| {
                 let upstream = self.server_manager.get_upstream(&server_name);
+                let metadata = self.server_manager.get_upstream_metadata(&server_name);
                 let tool_group_rules = upstream.as_ref().and_then(|u| {
                     if !u.config.tool_groups.is_empty() {
                         Some(u.config.tool_groups.clone())
-                    } else if server_name == "workspace" {
-                        Some(crate::tool_naming::default_workspace_rules())
                     } else {
-                        None
+                        crate::tool_naming::builtin_group_rules(
+                            &server_name,
+                            metadata.as_ref().map(|metadata| metadata.name.as_str()),
+                        )
                     }
                 });
-                let icons = self
-                    .server_manager
-                    .get_upstream_metadata(&server_name)
-                    .and_then(|metadata| metadata.icons);
+                let icons = metadata.and_then(|metadata| metadata.icons);
                 ServerRefreshCtx {
                     upstream,
                     tool_group_rules,
@@ -2299,6 +2298,20 @@ impl ToolRouter {
                 stripped_name,
                 full_name,
             });
+        }
+
+        // Two servers with one name for a tool would leave one tool. Each
+        // gets the prefix with its own name added instead.
+        let shared = crate::tool_naming::shared_prefixes(classified.iter().flat_map(|c| {
+            [&c.stripped_name, &c.full_name]
+                .map(|name| (c.server_name.as_str(), c.prefix.as_str(), name.as_str()))
+        }));
+        if !shared.is_empty() {
+            for c in &mut classified {
+                if shared.contains(&c.prefix) {
+                    c.prefix = crate::tool_naming::prefix_for_server(&c.prefix, &c.server_name);
+                }
+            }
         }
 
         // ── Pass 2: detect collisions in stripped wire names ──
