@@ -144,6 +144,53 @@ final class LinkableAppTests: XCTestCase {
         return try JSONDecoder().decode(Listing.self, from: Data(json.utf8)).clients
     }
 
+    func testAddAClientOffersWhatIsOnThisMacAndNotYetUsingPlug() throws {
+        let apps = try decode(
+            """
+            {"clients":[
+            {"target":"zed","name":"Zed","linked":false,"detected":true},
+            {"target":"cursor","name":"Cursor","linked":true,"detected":true},
+            {"target":"amp","name":"Amp","linked":false,"detected":false},
+            {"target":"claude-code","name":"Claude Code","linked":false,"detected":true}]}
+            """
+        )
+        XCTAssertEqual(AddClient.choices(apps, added: []).map(\.target), ["claude-code", "zed"])
+        // One added from the sheet stays, so its row can say it was added.
+        XCTAssertEqual(AddClient.choices(apps, added: ["cursor"]).map(\.target), ["claude-code", "cursor", "zed"])
+    }
+
+    func testTheAddressAdviceSaysHowFarTheAddressReaches() {
+        XCTAssertTrue(AddClient.reachesBeyondThisMac("https://plug.example.com/mcp"))
+        XCTAssertFalse(AddClient.reachesBeyondThisMac("http://localhost:3282/mcp"))
+        XCTAssertFalse(AddClient.reachesBeyondThisMac("http://127.0.0.1:3282/mcp"))
+        XCTAssertTrue(AddClient.addressAdvice("http://localhost:3282/mcp").contains("only on this Mac"))
+        XCTAssertTrue(AddClient.addressAdvice("https://plug.example.com/mcp").contains("ChatGPT"))
+    }
+
+    func testANetworkClientWithNoSignInLeftSaysSoAndHow() throws {
+        XCTAssertEqual(ClientStatus.grant(connections: 0, needsSignIn: true, limit: nil).text, "Needs sign-in")
+        XCTAssertEqual(
+            ClientStatus.grant(connections: 0, needsSignIn: false, limit: nil).text, "Allowed over the network"
+        )
+        // An open connection is proof of a sign-in.
+        XCTAssertEqual(ClientStatus.grant(connections: 1, needsSignIn: true, limit: nil).text, "Connected")
+        XCTAssertTrue(ClientSignIn.steps(target: "codex-cli", name: "Codex CLI").contains("codex mcp login plug"))
+        XCTAssertEqual(ClientSignIn.steps(target: "devin", name: "Devin"), "Open Devin and use Plug from there.")
+
+        // A daemon older than the field says nothing, which is signed in.
+        let decoder = JSONDecoder()
+        let old = try decoder.decode(
+            DownstreamClient.self,
+            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test"}"#.utf8)
+        )
+        XCTAssertFalse(old.needsSignIn)
+        let lapsed = try decoder.decode(
+            DownstreamClient.self,
+            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","signedIn":false}"#.utf8)
+        )
+        XCTAssertTrue(lapsed.needsSignIn)
+    }
+
     func testDecodesTheListingTheCommandPrints() throws {
         let apps = try decode(
             """

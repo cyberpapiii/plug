@@ -187,6 +187,15 @@ pub struct RegisteredClientSummary {
     pub created_at: u64,
     pub last_used_at: Option<u64>,
     pub expires_at: u64,
+    /// False when the client holds no token that still works: its sign-in
+    /// ran out or was revoked, and only the client can start another. A
+    /// reader older than this field sees every client as signed in.
+    #[serde(default = "signed_in_when_unsaid")]
+    pub signed_in: bool,
+}
+
+fn signed_in_when_unsaid() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -412,6 +421,7 @@ impl From<&RegisteredClient> for RegisteredClientSummary {
             created_at: value.created_at,
             last_used_at: value.last_used_at,
             expires_at: value.expires_at,
+            signed_in: true,
         }
     }
 }
@@ -1274,14 +1284,28 @@ impl DownstreamOauthManager {
     }
 
     pub async fn list_clients(&self) -> Vec<RegisteredClientSummary> {
-        let mut clients = self
-            .state
-            .lock()
-            .await
+        let guard = self.state.lock().await;
+        let now = epoch_secs();
+        let mut clients = guard
             .clients
             .values()
-            .map(RegisteredClientSummary::from)
+            .map(|client| {
+                let id = client.client_id.as_str();
+                let holds_a_token = guard
+                    .refresh_tokens
+                    .values()
+                    .any(|token| token.client_id == id && token.expires_at > now)
+                    || guard
+                        .access_tokens
+                        .values()
+                        .any(|token| token.client_id == id && token.expires_at > now);
+                RegisteredClientSummary {
+                    signed_in: holds_a_token,
+                    ..RegisteredClientSummary::from(client)
+                }
+            })
             .collect::<Vec<_>>();
+        drop(guard);
         clients.sort_by(|a, b| {
             a.client_name
                 .cmp(&b.client_name)
@@ -4194,6 +4218,13 @@ mod tests {
             .await
             .expect("the second process, a moment later, renews too");
         assert_ne!(first.refresh_token, second.refresh_token);
+        assert!(
+            manager
+                .list_clients()
+                .await
+                .iter()
+                .any(|listed| listed.client_id == client.client_id && listed.signed_in)
+        );
         for pair in [&first, &second] {
             assert!(matches!(
                 manager
@@ -4221,9 +4252,20 @@ mod tests {
                 .await,
             Err(DownstreamOauthError::InvalidGrant)
         ));
-        let state = manager.state.lock().await;
-        assert!(state.refresh_tokens.is_empty(), "no refresh token survives");
-        assert!(state.access_tokens.is_empty(), "no access token survives");
+        {
+            let state = manager.state.lock().await;
+            assert!(state.refresh_tokens.is_empty(), "no refresh token survives");
+            assert!(state.access_tokens.is_empty(), "no access token survives");
+        }
+        // The registration stays, and says its sign-in is gone.
+        let listed = manager.list_clients().await;
+        let signed_in = |id: &str| {
+            listed
+                .iter()
+                .find(|listed| listed.client_id == id)
+                .map(|listed| listed.signed_in)
+        };
+        assert_eq!(signed_in(&client.client_id), Some(false));
     }
 
     #[tokio::test(flavor = "current_thread")]

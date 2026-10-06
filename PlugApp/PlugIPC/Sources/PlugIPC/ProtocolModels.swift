@@ -141,6 +141,13 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public let clientName: String
     public let redirectUris: [String]
     public let source: String
+    /// False when the client holds no token that still works. Absent from a
+    /// daemon older than the field, which is read as signed in.
+    public var signedIn: Bool?
+
+    /// Its sign-in ran out or was revoked, and only the client can start
+    /// another.
+    public var needsSignIn: Bool { signedIn == false }
 
     /// What this client's settings are stored under. Matches the daemon's
     /// `grant_client_key`.
@@ -307,6 +314,8 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public var clientBlocks: [ClientBlocks]?
     /// The events clients can subscribe to. Absent when there are none.
     public var events: [EventStatus]?
+    /// The address a client Plug has no switch for is given to reach it.
+    public var clientAddress: String?
 
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",

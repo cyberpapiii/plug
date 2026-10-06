@@ -417,8 +417,14 @@ fn registered_client_timeline(
     } else {
         "expired".to_string()
     };
+    // The registration outlives the sign-in made under it.
+    let sign_in = if registered.signed_in || registered.expires_at <= now {
+        ""
+    } else {
+        ", needs sign-in"
+    };
     format!(
-        "Registered {}, last used {last_used}, {expiry}",
+        "Registered {}, last used {last_used}, {expiry}{sign_in}",
         ago(registered.created_at)
     )
 }
@@ -1572,10 +1578,16 @@ mod tests {
             created_at: 100 * day - 19 * day,
             last_used_at: Some(100 * day - 19 * day),
             expires_at: 100 * day + 71 * day,
+            signed_in: true,
         };
         assert_eq!(
             registered_client_timeline(&registered, 100 * day),
             "Registered 19d ago, last used 19d ago, expires in 71d"
+        );
+        registered.signed_in = false;
+        assert_eq!(
+            registered_client_timeline(&registered, 100 * day),
+            "Registered 19d ago, last used 19d ago, expires in 71d, needs sign-in"
         );
         registered.last_used_at = None;
         registered.expires_at = 99 * day;

@@ -922,13 +922,19 @@ pub(crate) fn configured_http_export_url(
     config_path: Option<&std::path::PathBuf>,
 ) -> Option<String> {
     let config = plug_core::config::load_config(config_path).ok()?;
+    Some(http_export_url(&config))
+}
+
+/// The address a client is given to reach Plug over HTTP: the public one when
+/// there is one, else this Mac's own.
+pub(crate) fn http_export_url(config: &plug_core::config::Config) -> String {
     let base = config
         .http
         .public_base_url
         .clone()
-        .unwrap_or_else(|| localhost_export_base(&config));
+        .unwrap_or_else(|| localhost_export_base(config));
     let trimmed = base.trim_end_matches('/');
-    Some(format!("{trimmed}/mcp"))
+    format!("{trimmed}/mcp")
 }
 
 fn requested_link_transport(

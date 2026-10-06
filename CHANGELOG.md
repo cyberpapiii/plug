@@ -16,6 +16,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Settings has a Permissions section: whether macOS lets Plug run in the
   background, open at login, and send notifications, with the way to System
   Settings beside anything that was turned off there.
+- Clients has an Add Client button. It lists the clients on this Mac that
+  do not use Plug yet, each with one Add button, and shows the address to
+  paste into any other client, such as ChatGPT or Claude on the web.
+- A client whose sign-in to Plug ended says "Needs sign-in" in Clients, with
+  how to sign it in again, and Plug sends a notification when it happens.
+  `plug auth clients list` says so too.
 
 ### Changed
 

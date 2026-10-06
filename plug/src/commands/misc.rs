@@ -2052,6 +2052,7 @@ mod tests {
             created_at: 1,
             last_used_at: Some(1),
             expires_at: 2,
+            signed_in: true,
         }
     }
 

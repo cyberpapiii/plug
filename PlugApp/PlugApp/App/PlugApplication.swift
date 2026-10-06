@@ -100,6 +100,8 @@ struct PlugApplication: App {
                 Button("Add Server…") { runner.run(.addServer) }
                     .keyboardShortcut("n", modifiers: .command)
                     .disabled(!model.canMutate || router.sheet != nil)
+                Button("Add Client…") { runner.run(.addClient) }
+                    .disabled(router.sheet != nil)
                 Button("Import Servers…") { runner.run(.importServers) }
                     .keyboardShortcut("i", modifiers: [.command, .shift])
                     .disabled(!model.canMutate || router.sheet != nil)
