@@ -80,8 +80,18 @@ pub struct Config {
     #[serde(default)]
     pub supervision: SupervisionConfig,
     /// Upstream server definitions.
-    #[serde(default)]
+    #[serde(default, serialize_with = "in_name_order")]
     pub servers: HashMap<String, ServerConfig>,
+}
+
+/// Write a map's entries in the order of their names, so saving the same
+/// config twice writes the same file.
+fn in_name_order<S, V>(map: &HashMap<String, V>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+    V: Serialize,
+{
+    serializer.collect_map(map.iter().collect::<std::collections::BTreeMap<_, _>>())
 }
 
 impl Default for Config {
@@ -217,6 +227,7 @@ pub struct LazyToolsConfig {
     /// Global policy. `auto` uses the client capability matrix.
     pub mode: LazyToolSetting,
     /// Per-client target overrides keyed by export target slug, e.g. `opencode`.
+    #[serde(serialize_with = "in_name_order")]
     pub clients: HashMap<String, LazyToolSetting>,
 }
 
@@ -436,7 +447,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables to set for the child process.
-    #[serde(default)]
+    #[serde(default, serialize_with = "in_name_order")]
     pub env: HashMap<String, String>,
     /// Whether this server is enabled.
     #[serde(default = "default_true")]
@@ -480,7 +491,7 @@ pub struct ServerConfig {
     #[serde(default)]
     pub enrichment: bool,
     /// Manual tool renames (original_name -> new_name).
-    #[serde(default)]
+    #[serde(default, serialize_with = "in_name_order")]
     pub tool_renames: HashMap<String, String>,
     /// Tool group classification for sub-service decomposition.
     /// Maps group prefix (e.g. "Gmail") to match rules.
@@ -1270,6 +1281,22 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
 mod tests {
     use super::*;
     use figment::Figment;
+
+    #[test]
+    fn a_saved_config_lists_servers_in_name_order() {
+        let mut config = Config::default();
+        for name in ["zulu", "alpha", "mike", "bravo", "yankee", "charlie"] {
+            let server: ServerConfig =
+                serde_json::from_value(serde_json::json!({"command": "echo"})).unwrap();
+            config.servers.insert(name.to_string(), server);
+        }
+        let saved = toml::to_string_pretty(&config).unwrap();
+        let order: Vec<usize> = ["alpha", "bravo", "charlie", "mike", "yankee", "zulu"]
+            .iter()
+            .map(|name| saved.find(&format!("[servers.{name}]")).unwrap())
+            .collect();
+        assert!(order.is_sorted(), "{saved}");
+    }
     use figment::providers::{Format, Serialized, Toml};
     use std::path::PathBuf;
 

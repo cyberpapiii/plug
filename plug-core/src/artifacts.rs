@@ -31,6 +31,8 @@ const PAYLOAD_FILE: &str = "result.json";
 pub struct ArtifactRecord {
     pub id: String,
     pub source_tool: String,
+    /// The server the tool belongs to, when the result came from a call.
+    pub source_server: Option<String>,
     pub original_size_bytes: usize,
     pub created_at: SystemTime,
     pub expires_at: SystemTime,
@@ -50,6 +52,8 @@ pub struct ArtifactStore {
 struct ArtifactMetadata {
     id: String,
     source_tool: String,
+    #[serde(default)]
+    source_server: Option<String>,
     original_size_bytes: usize,
     created_at_secs: u64,
     expires_at_secs: u64,
@@ -85,12 +89,31 @@ impl ArtifactStore {
         source_tool: &str,
         result: CallToolResult,
     ) -> Result<CallToolResult, McpError> {
-        self.maybe_spill_tool_result_with_limit(source_tool, result, ARTIFACT_STORE_MAX_BYTES)
+        self.maybe_spill_tool_result_with_limit(None, source_tool, result, ARTIFACT_STORE_MAX_BYTES)
             .await
+    }
+
+    /// [`ArtifactStore::maybe_spill_tool_result`] for a call to `source_tool`
+    /// on `source_server`. The server is kept with the artifact, so who may
+    /// read it later does not depend on the tool still being listed.
+    pub async fn maybe_spill_result_of(
+        &self,
+        source_server: &str,
+        source_tool: &str,
+        result: CallToolResult,
+    ) -> Result<CallToolResult, McpError> {
+        self.maybe_spill_tool_result_with_limit(
+            Some(source_server),
+            source_tool,
+            result,
+            ARTIFACT_STORE_MAX_BYTES,
+        )
+        .await
     }
 
     async fn maybe_spill_tool_result_with_limit(
         &self,
+        source_server: Option<&str>,
         source_tool: &str,
         result: CallToolResult,
         max_store_bytes: u64,
@@ -146,6 +169,7 @@ impl ArtifactStore {
         let record = ArtifactRecord {
             id: id.clone(),
             source_tool: source_tool.to_string(),
+            source_server: source_server.map(str::to_string),
             original_size_bytes: size,
             created_at,
             expires_at: created_at + ARTIFACT_RETENTION,
@@ -169,13 +193,14 @@ impl ArtifactStore {
 
     /// Hold a record for `source_tool` with nothing on disk behind it.
     #[cfg(test)]
-    pub(crate) fn insert_for_test(&self, id: &str, source_tool: &str) {
+    pub(crate) fn insert_for_test(&self, id: &str, source_server: Option<&str>, source_tool: &str) {
         let now = SystemTime::now();
         self.records.insert(
             id.to_string(),
             ArtifactRecord {
                 id: id.to_string(),
                 source_tool: source_tool.to_string(),
+                source_server: source_server.map(str::to_string),
                 original_size_bytes: 0,
                 created_at: now,
                 expires_at: now + std::time::Duration::from_secs(60),
@@ -187,10 +212,13 @@ impl ArtifactStore {
         );
     }
 
-    /// The tool whose result the artifact at `uri` holds.
-    pub fn source_tool(&self, uri: &str) -> Option<String> {
+    /// The server and tool whose result the artifact at `uri` holds. The
+    /// server is unknown for a task's result and for an artifact kept
+    /// before servers were recorded.
+    pub fn source(&self, uri: &str) -> Option<(Option<String>, String)> {
         let request = parse_artifact_uri(uri)?;
-        Some(self.records.get(&request.id)?.source_tool.clone())
+        let record = self.records.get(&request.id)?;
+        Some((record.source_server.clone(), record.source_tool.clone()))
     }
 
     pub fn read(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
@@ -643,6 +671,7 @@ fn write_metadata(artifact_dir: &Path, record: &ArtifactRecord) -> anyhow::Resul
     let metadata = ArtifactMetadata {
         id: record.id.clone(),
         source_tool: record.source_tool.clone(),
+        source_server: record.source_server.clone(),
         original_size_bytes: record.original_size_bytes,
         created_at_secs: to_unix_secs(record.created_at)?,
         expires_at_secs: to_unix_secs(record.expires_at)?,
@@ -677,6 +706,7 @@ fn load_record_from_dir(dir: &Path) -> Option<ArtifactRecord> {
         return Some(ArtifactRecord {
             id: metadata.id,
             source_tool: metadata.source_tool,
+            source_server: metadata.source_server,
             original_size_bytes: metadata.original_size_bytes,
             created_at: from_unix_secs(metadata.created_at_secs),
             expires_at: from_unix_secs(metadata.expires_at_secs),
@@ -707,6 +737,7 @@ fn load_record_from_dir(dir: &Path) -> Option<ArtifactRecord> {
     Some(ArtifactRecord {
         id,
         source_tool: "unknown".to_string(),
+        source_server: None,
         original_size_bytes: payload.len(),
         created_at: modified,
         expires_at: modified + ARTIFACT_RETENTION,
@@ -823,6 +854,7 @@ mod tests {
             ArtifactRecord {
                 id: "expired-id".to_string(),
                 source_tool: "tool".to_string(),
+                source_server: None,
                 original_size_bytes: 2,
                 created_at: SystemTime::UNIX_EPOCH,
                 expires_at: SystemTime::UNIX_EPOCH,
@@ -855,6 +887,7 @@ mod tests {
             ArtifactRecord {
                 id: "expired-read-id".to_string(),
                 source_tool: "tool".to_string(),
+                source_server: None,
                 original_size_bytes: 2,
                 created_at: SystemTime::UNIX_EPOCH,
                 expires_at: SystemTime::UNIX_EPOCH,
@@ -902,6 +935,7 @@ mod tests {
         let record = ArtifactRecord {
             id: "chunk-read-id".to_string(),
             source_tool: "tool".to_string(),
+            source_server: None,
             original_size_bytes: content.len(),
             created_at: SystemTime::now(),
             expires_at: SystemTime::now() + Duration::from_secs(3600),
@@ -981,7 +1015,7 @@ mod tests {
         let result = CallToolResult::success(vec![ContentBlock::text("X".repeat(2_000_000))]);
 
         let spilled = store
-            .maybe_spill_tool_result_with_limit("Mock__attachment_get_data", result, 1_024)
+            .maybe_spill_tool_result_with_limit(None, "Mock__attachment_get_data", result, 1_024)
             .await
             .expect("fallback result");
 

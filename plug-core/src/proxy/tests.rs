@@ -222,8 +222,9 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
     // The name reads as harmless, the server says the tool writes.
     assert_eq!(with(Some(false), Some(true)), Some(false));
     assert_eq!(with(Some(true), Some(true)), Some(true));
-    // A server that says nothing leaves it to the name.
-    assert_eq!(with(None, Some(true)), Some(true));
+    // A server that says nothing has not said the tool is safe, whatever
+    // the name suggests. The owner can still allow the watch by hand.
+    assert_eq!(with(None, Some(true)), Some(false));
     assert_eq!(with(None, None), Some(false));
 }
 
@@ -5124,12 +5125,23 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     // A result too large to send is kept as an artifact; the block on the
     // tool covers that too.
     blocked(&["git__commit"]);
-    router.artifact_store.insert_for_test("kept", "git__commit");
-    let uri = "plug://artifact/kept/manifest";
-    let read = |key| futures::executor::block_on(router.read_resource(uri, key));
-    assert!(read(key).is_err());
-    assert!(read(Some("oauth:someone-else")).is_ok());
-    assert!(read(None).is_ok());
+    let store = &router.artifact_store;
+    store.insert_for_test("kept", Some("git"), "git__commit");
+    // A result of a tool that is no longer listed, by any name.
+    store.insert_for_test("gone", Some("git"), "git__retired");
+    store.insert_for_test("unknown", None, "task_result:1");
+    let read = |id: &str, key| {
+        let uri = format!("plug://artifact/{id}/manifest");
+        futures::executor::block_on(router.read_resource(&uri, key)).is_ok()
+    };
+    assert!(!read("kept", key));
+    assert!(read("kept", Some("oauth:someone-else")));
+    assert!(read("kept", None));
+    assert!(read("gone", key), "only git__commit is blocked");
+    // Where a result came from is not known, so a client with any block
+    // does not get it.
+    assert!(!read("unknown", key));
+    assert!(read("unknown", Some("oauth:someone-else")));
 
     // A tool block alone keeps the client from no server.
     assert!(!router.client_is_kept_from_a_server(key));
@@ -5143,6 +5155,9 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     );
     router.set_client_access(&clients);
     assert!(router.client_is_kept_from_a_server(key));
+    // Kept from the server, so from every result it ever produced.
+    assert!(!read("kept", key));
+    assert!(!read("gone", key));
     assert!(!router.client_is_kept_from_a_server(None));
 }
 

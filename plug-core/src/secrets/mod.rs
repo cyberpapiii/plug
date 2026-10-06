@@ -261,8 +261,22 @@ fn readable_name(server: &str, field: &str) -> String {
 /// Whether `name` is one Plug made for `field` of `server`, now or under
 /// the older naming.
 fn made_for(server: &str, field: &str, name: &str) -> bool {
-    name == name_for(server, field) || name == readable_name(server, field)
+    // An `env` entry called `token` once shared the bearer token's name.
+    let field_then = if field == ENV_TOKEN { "token" } else { field };
+    name == name_for(server, field) || name == readable_name(server, field_then)
 }
+
+/// The field an `env` entry is stored under: its own name, except the one
+/// name the bearer token already goes by.
+fn env_field(key: &str) -> Cow<'_, str> {
+    if key == "token" {
+        Cow::Borrowed(ENV_TOKEN)
+    } else {
+        Cow::Borrowed(key)
+    }
+}
+
+const ENV_TOKEN: &str = "env.token";
 
 /// A value a person typed, as opposed to a `$VAR`, a redaction placeholder,
 /// or nothing.
@@ -488,7 +502,11 @@ impl Stores {
             };
             match store.set(&name, &value.to_string().into()) {
                 Ok(()) => {
-                    kept.push((name.clone(), before));
+                    // The first value seen under a name is the one to go
+                    // back to, however often the name is written.
+                    if !kept.iter().any(|(seen, _)| seen == &name) {
+                        kept.push((name.clone(), before));
+                    }
                     Some(reference(id, &name))
                 }
                 Err(error) => {
@@ -504,7 +522,7 @@ impl Stores {
         }
         for (key, value) in &mut server.env {
             if looks_secret(key)
-                && let Some(reference) = put(key, value)
+                && let Some(reference) = put(&env_field(key), value)
             {
                 *value = reference;
             }
@@ -514,10 +532,13 @@ impl Stores {
 
     /// Undo [`Stores::keep_staged`] in the store named `id`: each name gets
     /// back what it held, or is removed when it held nothing.
-    pub fn put_back(&self, id: &str, staged: Vec<(String, Option<SecretString>)>) {
+    ///
+    /// Returns the names that could not be put back.
+    pub fn put_back(&self, id: &str, staged: Vec<(String, Option<SecretString>)>) -> Vec<String> {
         let Some(store) = self.get(id) else {
-            return;
+            return staged.into_iter().map(|(name, _)| name).collect();
         };
+        let mut failed = Vec::new();
         for (name, before) in staged {
             let outcome = match &before {
                 Some(value) => store.set(&name, value),
@@ -525,8 +546,10 @@ impl Stores {
             };
             if let Err(error) = outcome {
                 tracing::warn!(secret = %name, %error, "could not undo a stored secret");
+                failed.push(name);
             }
         }
+        failed
     }
 
     /// Remove what [`Stores::keep`] stored for `server` and no server in
@@ -540,16 +563,16 @@ impl Stores {
         server: &ServerConfig,
         remaining: impl IntoIterator<Item = &'a ServerConfig>,
     ) {
-        fn fields(server: &ServerConfig) -> impl Iterator<Item = (&str, &str)> {
+        fn fields(server: &ServerConfig) -> impl Iterator<Item = (Cow<'_, str>, &str)> {
             server
                 .auth_token
                 .iter()
-                .map(|token| ("token", token.as_str()))
+                .map(|token| (Cow::Borrowed("token"), token.as_str()))
                 .chain(
                     server
                         .env
                         .iter()
-                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                        .map(|(key, value)| (env_field(key), value.as_str())),
                 )
         }
         let in_use: std::collections::HashSet<&str> = remaining
@@ -571,7 +594,7 @@ impl Stores {
                 && owners
                     .iter()
                     .flatten()
-                    .any(|owner| made_for(owner, field, name))
+                    .any(|owner| made_for(owner, &field, name))
                 && let Some(store) = self.get(id)
                 && let Err(error) = store.remove(name)
             {
@@ -939,12 +962,44 @@ OPENAI_API_KEY = "keychain:mine"
             "typed"
         );
 
-        stores.put_back(KEYCHAIN, staged);
+        assert!(stores.put_back(KEYCHAIN, staged).is_empty());
         assert_eq!(
             memory.get("github.token").unwrap().unwrap().as_str(),
             "working"
         );
         assert!(memory.get("github.API_KEY").unwrap().is_none());
+    }
+
+    #[test]
+    fn the_bearer_token_and_an_env_entry_called_token_are_kept_apart() {
+        let memory = Arc::new(Memory::default());
+        let stores = Stores::default().with(KEYCHAIN, memory.clone());
+        let read = |name: &str| memory.get(name).unwrap().map(|v| v.as_str().to_string());
+        memory
+            .set("github.token", &"working".to_string().into())
+            .unwrap();
+        let typed = || {
+            server("command = \"server\"\nauth_token = \"bearer\"\n[env]\ntoken = \"from-env\"\n")
+        };
+        let mut config = typed();
+        let staged = stores.keep_staged(KEYCHAIN, "github", &mut config);
+        assert_eq!(staged.len(), 2);
+        assert_eq!(read("github.token").as_deref(), Some("bearer"));
+        let env_name = config.env["token"].split_once(':').unwrap().1.to_string();
+        assert_ne!(env_name, "github.token");
+        assert_eq!(read(&env_name).as_deref(), Some("from-env"));
+
+        // Undone, the working key is back and the env entry's is gone.
+        assert!(stores.put_back(KEYCHAIN, staged).is_empty());
+        assert_eq!(read("github.token").as_deref(), Some("working"));
+        assert_eq!(read(&env_name), None);
+
+        // Removing the server removes both.
+        let mut config = typed();
+        stores.keep_staged(KEYCHAIN, "github", &mut config);
+        stores.forget("github", &config, []);
+        assert_eq!(read("github.token"), None);
+        assert_eq!(read(&env_name), None);
     }
 
     #[test]

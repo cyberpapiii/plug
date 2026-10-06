@@ -92,16 +92,13 @@ pub(crate) struct RouterSnapshot {
 
 impl RouterSnapshot {
     /// Whether the tool listed as `name` only reads, so a watch may call it
-    /// again and again. What the server says about its own tool decides;
-    /// Plug's reading of the tool's name counts only when the server says
-    /// nothing, since a name like `get_and_clear` reads as harmless.
+    /// again and again. Only the server's own word counts. Plug's reading of
+    /// a tool's name is a guess, good for sorting a list and not for calling
+    /// something on a timer: `get_and_clear` reads as harmless.
     fn safe_to_repeat(&self, name: &str) -> bool {
-        let Some(risk) = self.tool_risk_inventory.get(name) else {
-            return false;
-        };
-        risk.upstream_declared
-            .read_only
-            .or(risk.effective.read_only)
+        self.tool_risk_inventory
+            .get(name)
+            .and_then(|risk| risk.upstream_declared.read_only)
             .unwrap_or(false)
     }
 
@@ -1094,6 +1091,37 @@ impl ToolRouter {
         // or while it had one, still holds.
         !access.blocked_servers.contains(server_id)
             && !crate::tool_naming::other_names(tool_name, server_id, &self.config.prefix_delimiter)
+                .iter()
+                .any(|name| is_disabled_tool(&access.blocked_tools, name))
+    }
+
+    /// Whether the client behind `client_key` may read a result that
+    /// `tool_name` on `server` produced earlier. Asked of what was recorded
+    /// with the result, not of today's tool list: the tool may have been
+    /// renamed or its server removed since, and the block still holds. A
+    /// result of unknown origin is kept from any client with a block.
+    pub fn client_may_read_result_of(
+        &self,
+        client_key: Option<&str>,
+        server: Option<&str>,
+        tool_name: &str,
+    ) -> bool {
+        let Some(client_key) = client_key else {
+            return true;
+        };
+        let access = self.client_access.load();
+        let Some(access) = access.get(client_key) else {
+            return true;
+        };
+        if access.blocked_tools.is_empty() && access.blocked_servers.is_empty() {
+            return true;
+        }
+        let Some(server) = server else {
+            return false;
+        };
+        !access.blocked_servers.contains(server)
+            && !is_disabled_tool(&access.blocked_tools, tool_name)
+            && !crate::tool_naming::other_names(tool_name, server, &self.config.prefix_delimiter)
                 .iter()
                 .any(|name| is_disabled_tool(&access.blocked_tools, name))
     }
@@ -3583,7 +3611,7 @@ impl ToolRouter {
                         "proxy tool call completed"
                     );
                     self.artifact_store
-                        .maybe_spill_tool_result(tool_name, response)
+                        .maybe_spill_result_of(&server_id, tool_name, response)
                         .await
                         .map(Into::into)
                 }
