@@ -21,8 +21,9 @@ Remove a line when it lands.
    find where the app still shows it). Tell GrokBot from Cursor: the owner
    has GrokBot make a few tool calls, and its id is read off them. Name the
    connections that show as `python3` (Hermes Agent).
-3. Check-up of the naming layer (grouping, renames) and a way to tell
-   several accounts of one service apart. Issue #301.
+3. Naming layer, what is left of the check-up: an agent sees the account
+   label the owner typed, not the address that is signed in, and renames
+   are still config-only. Issue #301.
 4. Widening: an allow list per client, the shared bearer token split into
    separate clients, and relaying events a server emits itself (#255).
 5. Single servers served on their own, beside the one Plug endpoint, so a
