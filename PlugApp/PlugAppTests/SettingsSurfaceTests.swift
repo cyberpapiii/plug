@@ -107,6 +107,8 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(AppIcons.target(forClientType: "Perplexity"), "perplexity")
         XCTAssertEqual(AppIcons.target(forClientType: "Mistral Le Chat"), "le-chat")
         XCTAssertEqual(AppIcons.target(forClientType: "hermes-agent"), "hermes")
+        XCTAssertEqual(AppIcons.target(forClientType: "Ditto history"), "python")
+        XCTAssertEqual(AppIcons.target(forClientType: "Ditto email-manager"), "python")
         XCTAssertEqual(AppIcons.displayName(forTarget: "hermes"), "Hermes Agent")
         XCTAssertEqual(AppIcons.displayName(forTarget: "poke"), "Poke")
         XCTAssertEqual(AppIcons.target(forClientType: "Muse"), "muse")

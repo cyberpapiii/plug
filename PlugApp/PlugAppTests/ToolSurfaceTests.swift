@@ -277,35 +277,6 @@ final class AppRosterTests: XCTestCase {
         XCTAssertTrue(roster.other.isEmpty)
     }
 
-    func testAClientLinkedOverTheNetworkIsOneRowWithItsSignIn() throws {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let grants = try decoder.decode(
-            [DownstreamClient].self,
-            from: Data(
-                """
-                [{"client_id":"plug_a","client_name":"Cursor","redirect_uris":[],"source":"dynamic"},
-                 {"client_id":"plug_b","client_name":"Devin CLI","redirect_uris":[],"source":"dynamic"},
-                 {"client_id":"plug_c","client_name":"Devin CLI","redirect_uris":[],"source":"dynamic"},
-                 {"client_id":"plug_d","client_name":"Codex","redirect_uris":[],"source":"dynamic"}]
-                """.utf8
-            )
-        )
-        let linked = try apps(
-            """
-            [{"target":"cursor","linked":true,"detected":true,"linked_transport":"http"},
-             {"target":"devin","linked":true,"detected":true,"linked_transport":"http"},
-             {"target":"codex-cli","linked":true,"detected":true,"linked_transport":"stdio"}]
-            """
-        )
-        let own = AppRoster.ownGrants(apps: linked, grants: grants) {
-            AppIcons.target(forClientType: $0.clientName)
-        }
-        // Two sign-ins for one client stay apart, and so does a sign-in whose
-        // client is linked on this Mac.
-        XCTAssertEqual(own.mapValues(\.clientId), ["cursor": "plug_a"])
-    }
-
     func testASessionItsOwnerNamedIsNotTheClientItReports() throws {
         let live = try sessions(
             """
@@ -556,8 +527,20 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(ClientStatus.app(list[0], connections: 2, limit: nil).text, "2 connections")
         XCTAssertEqual(ClientStatus.app(list[0], connections: 1, limit: "1 server off").text, "Connected · 1 server off")
         XCTAssertEqual(ClientStatus.app(list[0], connections: 0, limit: nil).text, "Not open")
-        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "Not using Plug")
+        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "No local Plug configuration")
         XCTAssertEqual(ClientStatus.app(list[2], connections: 0, limit: nil).text, "Not found on this Mac")
+    }
+
+    func testOnlyLinkedHTTPClientsAreRepresentedByTheirOwnGrant() throws {
+        let list = try apps(#"""
+        [{"target":"cursor","detected":true,"linked":true,"linked_transport":"http"},
+         {"target":"claude-code","detected":true,"linked":true,"linked_transport":"stdio"},
+         {"target":"codex-cli","detected":true,"linked_transport":"http"}]
+        """#)
+        XCTAssertTrue(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Cursor"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Claude Code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[1], grantNames: ["Claude Code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[2], grantNames: ["Codex CLI"]))
     }
 }
 

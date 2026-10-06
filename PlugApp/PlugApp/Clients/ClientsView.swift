@@ -45,24 +45,6 @@ struct AppRoster: Equatable {
         self.other = sessions.filter { !claimed.contains($0.sessionId) }
     }
 
-    /// The sign-in each client linked over the network made, by the client's
-    /// target, so the client and its sign-in are one row. A client with two
-    /// sign-ins keeps them apart: nothing says which one is its own.
-    static func ownGrants(
-        apps: [LinkableApp],
-        grants: [DownstreamClient],
-        target: (DownstreamClient) -> String?
-    ) -> [String: DownstreamClient] {
-        let byTarget = Dictionary(grouping: grants) { target($0) ?? "" }
-        var own: [String: DownstreamClient] = [:]
-        for app in apps where app.linked && app.transport?.lowercased() == "http" {
-            if let candidates = byTarget[app.target], candidates.count == 1 {
-                own[app.target] = candidates[0]
-            }
-        }
-        return own
-    }
-
     static func targets(of session: LiveSession) -> Set<String> {
         var targets = [AppIcons.target(forClientType: session.clientType)]
         if let info = session.clientInfo, !info.isEmpty {
@@ -488,7 +470,14 @@ struct ClientsView: View {
         } message: { _ in
             Text("It can no longer use Plug and leaves this list. To come back, it has to ask you again.")
         }
-        .task { await model.loadConnectableApps() }
+        // Links change outside the app too (`plug link`, another tool editing
+        // a client's settings), so the list is read again while it is shown.
+        .task {
+            while !Task.isCancelled {
+                await model.loadConnectableApps()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
     }
 
     /// NSTableView is still finishing its own update when the list changes, so
@@ -527,22 +516,25 @@ struct ClientsView: View {
                 }
             }
             .map { sessionEntry(id: $0.id, sessions: $0.sessions) }
-        let own = AppRoster.ownGrants(
-            apps: roster.connected.map(\.app) + roster.idle,
-            grants: model.snapshot.downstreamClients
-        ) { names.knownTarget(named: names.picturedName(forGrant: $0)) }
-        let joined = Set(own.values.map(\.clientId))
-        func app(_ app: LinkableApp, _ sessions: [LiveSession]) -> Entry {
-            let grant = own[app.target]
-            let signedIn = grant.flatMap { unclaimed.byGrant[$0.clientKey] } ?? []
-            return appEntry(app, sessions: sessions + signedIn, grant: grant)
-        }
-        let all = connectedApps.map { app($0.app, $0.sessions) }
+        let represented = Set(allApps.filter { app in
+            ClientStatus.hasNetworkRepresentation(app, grantNames: model.snapshot.downstreamClients.map(\.clientName))
+        }.map(\.target))
+        let all = connectedApps.filter { !represented.contains($0.app.target) }.map { appEntry($0.app, sessions: $0.sessions) }
             + others.filter { $0.group == .onThisMac }
-            + idleApps.map { app($0, []) }
+            + idleApps.filter { !represented.contains($0.target) }.map { appEntry($0, sessions: []) }
             + others.filter { $0.group == .network }
-            + grants.filter { !joined.contains($0.clientId) }
-                .map { grantEntry($0, sessions: unclaimed.byGrant[$0.clientKey] ?? []) }
+            + grants.map { grant in
+                let target = AppIcons.target(forClientType: grant.clientName)
+                var own = sessions.filter { names.key(of: $0) == grant.clientKey }
+                // A uniquely identified grant can show its still-open local
+                // sessions too. Multiple grants remain separate identities.
+                if represented.contains(target), model.snapshot.downstreamClients.filter({
+                    AppIcons.target(forClientType: $0.clientName) == target
+                }).count == 1 {
+                    own += sessions.filter { !Self.isRemote($0) && AppRoster.targets(of: $0).contains(target) }
+                }
+                return grantEntry(grant, sessions: own)
+            }
         // Only clients that share a name need telling apart.
         let shared = Dictionary(grouping: all, by: \.name).filter { $0.value.count > 1 }
         return all.map { entry in
@@ -555,24 +547,20 @@ struct ClientsView: View {
 
     /// A client on this Mac. Its switch adds Plug to the client's settings or
     /// takes it out.
-    private func appEntry(
-        _ app: LinkableApp, sessions: [LiveSession], grant: DownstreamClient? = nil
-    ) -> Entry {
+    private func appEntry(_ app: LinkableApp, sessions: [LiveSession]) -> Entry {
         let name = names.name(forKey: app.target) ?? app.name
-        // Linked over the network, its choices are kept under its sign-in.
-        let access = grant.map { self.access(key: $0.clientKey, name: name) }
-            ?? self.access(to: app, sessions: sessions)
+        let access = access(to: app, sessions: sessions)
         let known = app.detected || app.linked
         let about = if !app.detected {
             "Plug cannot find this client on this Mac."
         } else if app.linked {
             "Plug is in this client's settings. Restart the client after changing this."
         } else {
-            "Turn this on to add Plug to the client's settings, then restart the client."
+            "No direct Plug entry in this client's local settings. A hosted connector may already provide access; see its network authorization above."
         }
         return Entry(
             id: "app:\(app.target)",
-            group: app.linked || !sessions.isEmpty ? .onThisMac : .notUsing,
+            group: !app.linked && sessions.isEmpty ? .notUsing : .onThisMac,
             name: name,
             originalName: app.name,
             status: ClientStatus.app(app, connections: sessions.count, limit: access?.summary),
@@ -626,6 +614,10 @@ struct ClientsView: View {
     /// client has to ask again, so the app asks first.
     private func grantEntry(_ grant: DownstreamClient, sessions: [LiveSession]) -> Entry {
         let name = names.name(forKey: grant.clientKey) ?? grant.clientName
+        let linkedNames = allApps.filter {
+            ClientStatus.hasNetworkRepresentation($0, grantNames: [grant.clientName])
+        }.map(\.name).sorted()
+        let linkedDetail = linkedNames.isEmpty ? "" : " Local HTTP configuration: \(linkedNames.joined(separator: ", "))."
         let access = access(key: grant.clientKey, name: name)
         let host = URL(string: grant.clientId)?.host()
         // A client Plug registered gets a short id, since two can share a
@@ -652,7 +644,7 @@ struct ClientsView: View {
             setOn: { allowed in
                 if !allowed { revoking = Revoking(id: grant.clientId, name: name) }
             },
-            about: "You allowed this client to use Plug over the network. Turn this off to remove its access.",
+            about: "This is an OAuth authorization, not a separate app installation.\(linkedDetail) Authorized does not mean connected now. Turn this off to remove access.",
             access: access,
             connections: sessions.map(connection),
             renameKey: grant.clientKey,
@@ -724,6 +716,11 @@ struct ClientsView: View {
 struct ClientStatus: Equatable {
     let text: String
 
+    static func hasNetworkRepresentation(_ app: LinkableApp, grantNames: [String]) -> Bool {
+        app.linked && app.transport?.lowercased() == "http"
+            && grantNames.contains { AppIcons.target(forClientType: $0) == app.target }
+    }
+
     /// A state, followed by what is off for the client when something is.
     init(state: String, limit: String?) {
         text = limit.map { "\(state) · \($0)" } ?? state
@@ -742,7 +739,7 @@ struct ClientStatus: Equatable {
         } else if !app.detected {
             state = "Not found on this Mac"
         } else if !app.linked {
-            state = "Not using Plug"
+            state = "No local Plug configuration"
         } else {
             state = app.transport?.lowercased() == "http" ? "Uses Plug over the network" : "Not open"
         }
@@ -756,8 +753,7 @@ struct ClientEntry: Identifiable {
     enum Group: String {
         case onThisMac = "On This Mac"
         case network = "Over the Network"
-        /// Found on this Mac, with Plug not in its settings.
-        case notUsing = "Not Using Plug"
+        case notUsing = "No Local Plug Configuration"
     }
 
     enum Glyph {
@@ -827,7 +823,8 @@ private struct ClientGlyph: View {
         case let .app(target, name, appPath):
             AppGlyph(target: target, name: name, appPath: appPath, size: size)
         case let .grant(name):
-            AppGlyph(target: AppIcons.target(forClientType: name), name: name, size: size)
+            let target = AppIcons.target(forClientType: name)
+            AppGlyph(target: target, name: target == "python" ? "Python" : name, size: size)
         }
     }
 }
