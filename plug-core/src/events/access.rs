@@ -55,16 +55,18 @@ impl WatchAccess for RuntimeWatchAccess {
             .collect()
     }
 
-    fn may_use(&self, client_id: &str, server: &str) -> bool {
+    fn may_use(&self, client_id: &str, watch: &WatchConfig) -> bool {
         self.engine.upgrade().is_some_and(|engine| {
-            engine
-                .tool_router()
-                .client_may_use_server(Some(&format!("oauth:{client_id}")), server)
+            engine.tool_router().client_may_watch(
+                Some(&format!("oauth:{client_id}")),
+                &watch.server,
+                &watch.tool,
+            )
         })
     }
 
-    async fn permits(&self, client_id: &str, server: &str) -> bool {
-        self.may_use(client_id, server)
+    async fn permits(&self, client_id: &str, watch: &WatchConfig) -> bool {
+        self.may_use(client_id, watch)
             && self
                 .oauth
                 .permits_event_delivery(client_id, EVENT_SCOPE)

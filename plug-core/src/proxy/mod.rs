@@ -1059,13 +1059,29 @@ impl ToolRouter {
         if is_disabled_tool(&access.blocked_tools, tool_name) {
             return false;
         }
-        if access.blocked_servers.is_empty() {
+        if access.blocked_tools.is_empty() && access.blocked_servers.is_empty() {
             return true;
         }
-        self.cache
-            .load()
-            .resolve_route(tool_name)
-            .is_none_or(|(server_id, _)| !access.blocked_servers.contains(server_id))
+        let cache = self.cache.load();
+        let Some((server_id, _)) = cache.resolve_route(tool_name) else {
+            return true;
+        };
+        // A block written before a second account changed the tool's name,
+        // or while it had one, still holds.
+        !access.blocked_servers.contains(server_id)
+            && !crate::tool_naming::other_names(tool_name, server_id, &self.config.prefix_delimiter)
+                .iter()
+                .any(|name| is_disabled_tool(&access.blocked_tools, name))
+    }
+
+    /// Whether the client behind `client_key` may be sent what a watch of
+    /// `tool` on `server` sees: it is kept from neither. An event carries
+    /// the tool's result, so a block on the tool covers it.
+    pub fn client_may_watch(&self, client_key: Option<&str>, server: &str, tool: &str) -> bool {
+        self.client_may_use_server(client_key, server)
+            && self
+                .watched_tool(server, tool)
+                .is_none_or(|(name, _)| self.client_may_use_tool(client_key, &name))
     }
 
     /// Whether the client behind `client_key` may see `server_id` at all.
@@ -2307,9 +2323,15 @@ impl ToolRouter {
                 .map(|name| (c.server_name.as_str(), c.prefix.as_str(), name.as_str()))
         }));
         if !shared.is_empty() {
+            let qualified = crate::tool_naming::prefixes_for_servers(
+                classified
+                    .iter()
+                    .filter(|c| shared.contains(&c.prefix))
+                    .map(|c| (c.prefix.as_str(), c.server_name.as_str())),
+            );
             for c in &mut classified {
-                if shared.contains(&c.prefix) {
-                    c.prefix = crate::tool_naming::prefix_for_server(&c.prefix, &c.server_name);
+                if let Some(prefix) = qualified.get(&(c.prefix.clone(), c.server_name.clone())) {
+                    c.prefix = prefix.clone();
                 }
             }
         }
@@ -2365,10 +2387,31 @@ impl ToolRouter {
                 final_name.clone()
             };
 
-            if is_disabled_tool(&self.config.disabled_tools, &prefixed_name) {
+            // A tool switched off stays off when a second account changes
+            // its name, or when the account that changed it is removed.
+            if is_disabled_tool(&self.config.disabled_tools, &prefixed_name)
+                || crate::tool_naming::other_names(
+                    &prefixed_name,
+                    &c.server_name,
+                    &self.config.prefix_delimiter,
+                )
+                .iter()
+                .any(|name| is_disabled_tool(&self.config.disabled_tools, name))
+            {
                 continue;
             }
 
+            // One name, one tool. A second claim is dropped and said so
+            // rather than sent to whichever server came last.
+            if let Some((other, _)) = routes.get(&prefixed_name) {
+                tracing::error!(
+                    tool = %prefixed_name,
+                    kept = %other,
+                    dropped = %c.server_name,
+                    "two servers claim one tool name; the second is left out"
+                );
+                continue;
+            }
             routes.insert(
                 prefixed_name.clone(),
                 (c.server_name.clone(), c.tool.name.to_string()),
