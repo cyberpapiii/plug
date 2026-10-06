@@ -148,7 +148,7 @@ pub struct DownstreamOauthManager {
     principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
     /// One flag per sign-in a token has been checked under, set when that
     /// sign-in is revoked so work admitted under it stops.
-    family_ended: Arc<dashmap::DashMap<String, Arc<AtomicBool>>>,
+    family_ended: Arc<dashmap::DashMap<String, Arc<SignIn>>>,
     registration_rate: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
     state_path: Arc<PathBuf>,
     durability_degraded: Arc<AtomicBool>,
@@ -300,9 +300,29 @@ impl PrincipalLifecycleState {
 pub struct PrincipalLifecycleLease {
     state: Arc<PrincipalLifecycleState>,
     generation: u64,
-    /// Set once the sign-in this token descends from is revoked, which
-    /// leaves the client itself registered.
-    family_ended: Option<Arc<AtomicBool>>,
+    /// The sign-in this token descends from, which can end while the client
+    /// itself stays registered.
+    family_ended: Option<Arc<SignIn>>,
+}
+
+/// One sign-in, shared by everything opened under it.
+#[derive(Debug, Default)]
+struct SignIn {
+    /// It was revoked.
+    ended: AtomicBool,
+    /// When its last token stops working, in seconds since the epoch. Each
+    /// refresh moves it on; a sign-in nobody refreshes runs out here.
+    until: std::sync::atomic::AtomicU64,
+}
+
+impl SignIn {
+    fn is_over(&self) -> bool {
+        self.ended.load(Ordering::SeqCst) || self.until.load(Ordering::SeqCst) <= epoch_secs()
+    }
+
+    fn lasts_until(&self, when: u64) {
+        self.until.fetch_max(when, Ordering::SeqCst);
+    }
 }
 
 impl PrincipalLifecycleLease {
@@ -312,7 +332,7 @@ impl PrincipalLifecycleLease {
             && !self
                 .family_ended
                 .as_ref()
-                .is_some_and(|ended| ended.load(Ordering::SeqCst))
+                .is_some_and(|sign_in| sign_in.is_over())
     }
 
     #[cfg(test)]
@@ -1624,8 +1644,8 @@ impl DownstreamOauthManager {
                 }
                 // Before the save, as for a removed client: if the save
                 // fails, what is already open under this sign-in still ends.
-                if let Some((_, ended)) = self.family_ended.remove(&consumed.family_id) {
-                    ended.store(true, Ordering::SeqCst);
+                if let Some((_, sign_in)) = self.family_ended.remove(&consumed.family_id) {
+                    sign_in.ended.store(true, Ordering::SeqCst);
                 }
                 let mut next = guard.clone();
                 let revoked = revoke_token_family(&mut next, &consumed.family_id);
@@ -1665,6 +1685,10 @@ impl DownstreamOauthManager {
             &refresh.family_id,
         );
         self.commit_state(&mut guard, next)?;
+        // What is open under this sign-in lasts as long as the new pair.
+        if let Some(sign_in) = self.family_ended.get(&refresh.family_id) {
+            sign_in.lasts_until(epoch_secs() + REFRESH_TOKEN_LIFETIME_SECS);
+        }
         Ok(token)
     }
 
@@ -1707,12 +1731,23 @@ impl DownstreamOauthManager {
                     generation,
                     // A record from before sign-ins were tracked has none.
                     family_ended: (!record.family_id.is_empty()).then(|| {
-                        Arc::clone(
+                        let sign_in = Arc::clone(
                             self.family_ended
                                 .entry(record.family_id.clone())
                                 .or_default()
                                 .value(),
-                        )
+                        );
+                        // Its last token to stop working is the refresh
+                        // token, or this one when there is none.
+                        sign_in.lasts_until(
+                            guard
+                                .refresh_tokens
+                                .values()
+                                .filter(|refresh| refresh.family_id == record.family_id)
+                                .map(|refresh| refresh.expires_at)
+                                .fold(record.expires_at, u64::max),
+                        );
+                        sign_in
                     }),
                 };
                 if !lease.is_active() {
@@ -4225,6 +4260,46 @@ mod tests {
 
     async fn age_spent_refresh_tokens(manager: &DownstreamOauthManager) {
         manager.age_spent_refresh_tokens_for_tests().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn what_is_open_under_a_sign_in_ends_when_the_sign_in_runs_out() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let resource = "https://plug.example.com/mcp";
+        let AccessTokenValidation::Valid(open) = manager
+            .validate_access_token_for(&tokens.access_token, &[], resource)
+            .await
+        else {
+            panic!("a fresh token works");
+        };
+        // It lasts as long as the refresh token, not only the hour the
+        // access token has.
+        let sign_in = Arc::clone(open.principal_lifecycle.family_ended.as_ref().unwrap());
+        assert!(
+            sign_in.until.load(Ordering::SeqCst) >= epoch_secs() + REFRESH_TOKEN_LIFETIME_SECS - 5
+        );
+        assert!(open.principal_lifecycle.is_active());
+
+        // Nobody refreshed, and the last token has stopped working.
+        sign_in.until.store(epoch_secs(), Ordering::SeqCst);
+        assert!(!open.principal_lifecycle.is_active());
+
+        // A refresh in time moves the end on for what is already open.
+        sign_in.until.store(epoch_secs() + 5, Ordering::SeqCst);
+        manager
+            .exchange_refresh_token(
+                &client.client_id,
+                &tokens.refresh_token.expect("refresh token"),
+                resource,
+            )
+            .await
+            .expect("refresh");
+        assert!(
+            sign_in.until.load(Ordering::SeqCst) >= epoch_secs() + REFRESH_TOKEN_LIFETIME_SECS - 5
+        );
+        assert!(open.principal_lifecycle.is_active());
     }
 
     #[tokio::test(flavor = "current_thread")]

@@ -390,6 +390,9 @@ impl super::ToolRouter {
                                 store.create_passthrough(owner, &tool_name, &result.task, upstream)
                             }
                         };
+                        if let Ok(task) = &created {
+                            store.record_source(&task.task_id, &server_id, &original_name);
+                        }
                         (created, store.take_expired_cleanup())
                     };
                     router.finish_expired_task_cleanup(expired_cleanup).await;
@@ -445,6 +448,7 @@ impl super::ToolRouter {
         // detaching the future, which kept running and kept holding its
         // server's `max_concurrent` semaphore permit.) No await is held
         // across this scope other than acquiring the lock itself.
+        let behind = self.tool_behind(tool_name);
         let created = {
             let mut store = self.task_store.lock().await;
             let task = match task_quota_lease {
@@ -454,6 +458,9 @@ impl super::ToolRouter {
             match task {
                 Ok(task) => {
                     let task_id = task.task_id.clone();
+                    if let Some((server, own_tool)) = &behind {
+                        store.record_source(&task_id, server, own_tool);
+                    }
                     let router = Arc::clone(self);
                     let tool_name = tool_name.to_string();
                     let handle = tokio::spawn(async move {
@@ -631,27 +638,35 @@ impl super::ToolRouter {
             let payload = crate::legacy_tasks::parse_payload_result(response)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?
                 .0;
-            let (cached, cleanup) = {
+            let (cached, source, cleanup) = {
                 let mut store = self.task_store.lock().await;
                 let cached = store.cache_result_for_owner(owner, task_id, payload.clone());
-                (cached, store.take_expired_cleanup())
+                (
+                    cached,
+                    store.source_of(task_id),
+                    store.take_expired_cleanup(),
+                )
             };
             self.finish_expired_task_cleanup(cleanup).await;
             cached?;
             return self
                 .artifact_store
-                .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload)
+                .maybe_spill_task_payload(source.as_ref(), task_id, payload)
                 .await;
         }
-        let (payload, cleanup) = {
+        let (payload, source, cleanup) = {
             let mut store = self.task_store.lock().await;
             let payload = store.get_result_for_owner(owner, task_id);
-            (payload, store.take_expired_cleanup())
+            (
+                payload,
+                store.source_of(task_id),
+                store.take_expired_cleanup(),
+            )
         };
         self.finish_expired_task_cleanup(cleanup).await;
         let payload = payload?;
         self.artifact_store
-            .maybe_spill_task_payload(&format!("task_result:{task_id}"), payload.0)
+            .maybe_spill_task_payload(source.as_ref(), task_id, payload.0)
             .await
     }
 

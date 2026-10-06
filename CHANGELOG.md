@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- Clients lists a client that connects, makes its calls, and leaves again,
+  such as a script on a timer. It shows where it runs, with "Last used" and
+  the time, and can be named, given an icon, and kept from servers and tools
+  like any other client. It stays listed while its last call is in Activity.
 - Plug's menu bar icon is there whenever Plug is serving. It comes back on
   its own when something else closes the app (a quit-all, a crash, a force
   quit) and appears after login. Settings has a "Keep in Menu Bar" switch
@@ -73,6 +77,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A task's large result is kept with the tool the task ran, so a client is
+  kept from it only when it is kept from that tool. A client with a block on
+  anything used to be refused every such result.
+- A network client's open session ends when its sign-in runs out, not only
+  when the sign-in is revoked.
 - The menu bar panel and Activity show a client's icon wherever the
   Clients list does: a network client that says nothing about itself is
   pictured by its sign-in's name in the panel too, and ChatGPT is found by

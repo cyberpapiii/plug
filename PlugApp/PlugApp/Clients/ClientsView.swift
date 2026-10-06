@@ -218,6 +218,33 @@ struct ClientNames: Equatable {
     }
 }
 
+/// Clients known only by the calls they made: not connected now, and with
+/// no entry of their own.
+enum RecentCallers {
+    /// The last call of each client that is not already shown, newest
+    /// first. A call with no key belongs to no client Plug can tell apart.
+    static func latest(_ events: [ActivityEvent], excluding shown: Set<String>) -> [ActivityEvent] {
+        var last: [String: ActivityEvent] = [:]
+        for event in events {
+            guard let key = event.clientKey, !key.isEmpty, !shown.contains(key) else { continue }
+            if last[key].map({ $0.occurredAtMs < event.occurredAtMs }) ?? true { last[key] = event }
+        }
+        return last.values.sorted { $0.occurredAtMs > $1.occurredAtMs }
+    }
+
+    /// Whether a key belongs to a client that reaches Plug over the network.
+    static func isRemote(key: String) -> Bool {
+        key.hasPrefix("oauth:") || key.hasPrefix("remote:")
+    }
+
+    /// "Last used 11:15 AM" today, and with the day before that.
+    static func lastUsed(_ date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
+        let time = date.formatted(date: .omitted, time: .shortened)
+        if calendar.isDate(date, inSameDayAs: now) { return "Last used \(time)" }
+        return "Last used \(date.formatted(.dateTime.month(.abbreviated).day())), \(time)"
+    }
+}
+
 /// The sections of the Clients column. A client sits under how it reaches
 /// Plug unless the owner has said where it runs; then it sits under that.
 enum ClientPlaces {
@@ -583,22 +610,35 @@ struct ClientsView: View {
         let represented = Set(allApps.filter { app in
             ClientStatus.hasNetworkRepresentation(app, grantNames: model.snapshot.downstreamClients.map(\.clientName))
         }.map(\.target))
-        let all = connectedApps.filter { !represented.contains($0.app.target) }.map { appEntry($0.app, sessions: $0.sessions) }
-            + others.filter { $0.group == .onThisMac }
-            + idleApps.filter { !represented.contains($0.target) }.map { appEntry($0, sessions: []) }
-            + others.filter { $0.group == .network }
-            + grants.map { grant in
-                let target = AppIcons.target(forClientType: grant.clientName)
-                var own = sessions.filter { names.key(of: $0) == grant.clientKey }
-                // A uniquely identified grant can show its still-open local
-                // sessions too. Multiple grants remain separate identities.
-                if represented.contains(target), model.snapshot.downstreamClients.filter({
-                    AppIcons.target(forClientType: $0.clientName) == target
-                }).count == 1 {
-                    own += sessions.filter { !Self.isRemote($0) && AppRoster.targets(of: $0).contains(target) }
-                }
-                return grantEntry(grant, sessions: own)
+        let apps = connectedApps.filter { !represented.contains($0.app.target) }.map { appEntry($0.app, sessions: $0.sessions) }
+        let idle = idleApps.filter { !represented.contains($0.target) }.map { appEntry($0, sessions: []) }
+        let granted = grants.map { grant in
+            let target = AppIcons.target(forClientType: grant.clientName)
+            var own = sessions.filter { names.key(of: $0) == grant.clientKey }
+            // A uniquely identified grant can show its still-open local
+            // sessions too. Multiple grants remain separate identities.
+            if represented.contains(target), model.snapshot.downstreamClients.filter({
+                AppIcons.target(forClientType: $0.clientName) == target
+            }).count == 1 {
+                own += sessions.filter { !Self.isRemote($0) && AppRoster.targets(of: $0).contains(target) }
             }
+            return grantEntry(grant, sessions: own)
+        }
+        // A client that connects, calls, and is gone again has no row of
+        // its own above. Its last call puts it here.
+        let shown = Set((apps + idle + others + granted).flatMap { [$0.renameKey, $0.placeKey].compactMap { $0 } })
+            .union(allApps.map(\.target))
+            .union(sessions.compactMap(names.key(of:)))
+        let recent = RecentCallers.latest(model.activities, excluding: shown)
+            .map(recentEntry)
+            .filter { matches($0.name) }
+        let all = apps
+            + others.filter { $0.group == .onThisMac }
+            + recent.filter { $0.group == .onThisMac }
+            + idle
+            + others.filter { $0.group == .network }
+            + granted
+            + recent.filter { $0.group == .network }
         // Only clients that share a name need telling apart.
         let shared = Dictionary(grouping: all, by: \.name).filter { $0.value.count > 1 }
         return all.map { entry in
@@ -680,6 +720,40 @@ struct ClientsView: View {
             renameKey: names.key(of: first),
             placeKey: names.key(of: first),
             disambiguator: String(first.sessionId.prefix(4))
+        )
+    }
+
+    /// A client that is not connected now and has no entry of its own, by
+    /// the last call it made. A script that runs on a timer is one.
+    private func recentEntry(_ event: ActivityEvent) -> Entry {
+        let call = model.call(event)
+        let key = event.clientKey ?? ""
+        let group: Entry.Group = RecentCallers.isRemote(key: key) ? .network : .onThisMac
+        // Every remote client without a sign-in of its own shares one key,
+        // so there are no choices to offer for one of them.
+        let choices = key.hasPrefix("remote:") ? nil : access(key: key, name: call.caller)
+        return Entry(
+            id: "recent:\(key)",
+            group: group,
+            place: ClientPlaces.place(owners: names.place(forKey: key), group: group),
+            name: call.caller,
+            originalName: CallFacts(event, grantName: call.grantName).caller,
+            status: ClientStatus(
+                state: RecentCallers.lastUsed(Date(timeIntervalSince1970: Double(event.occurredAtMs) / 1000)),
+                limit: choices?.summary
+            ),
+            isLive: false,
+            dimmed: false,
+            glyph: .app(target: call.callerTarget, name: call.callerIconName, appPath: nil),
+            isBusy: false,
+            switchLabel: "",
+            isOn: nil,
+            setOn: { _ in },
+            about: "Not connected now. This client connects when it has something to do and leaves when it is done, so Plug lists it by its last call. It stays here while that call is in Activity.",
+            access: choices,
+            connections: [],
+            renameKey: choices == nil ? nil : key,
+            placeKey: choices == nil ? nil : key
         )
     }
 
