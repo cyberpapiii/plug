@@ -182,7 +182,8 @@ struct ClientNames: Equatable {
 
     /// The target whose icon a session shows: the client its owner named it
     /// as, else its own when the owner made it up in Add a Client, else the
-    /// client it reports, else the client its link was written for.
+    /// client it reports, else the client its link was written for, else
+    /// the client its sign-in names. A call is pictured the same way.
     func target(of session: LiveSession) -> String {
         if let named = knownTarget(named: name(forKey: key(of: session))) { return named }
         if let key = key(of: session), key.hasPrefix(AddClient.customPrefix) { return key }
@@ -190,6 +191,9 @@ struct ClientNames: Equatable {
         if AppIcons.displayName(forTarget: reported) != nil { return reported }
         if let key = key(of: session), AppIcons.displayName(forTarget: key) != nil {
             return key
+        }
+        if let grant = key(of: session).flatMap({ grantNames[$0] }) {
+            return AppIcons.target(forClientType: grant)
         }
         return reported
     }

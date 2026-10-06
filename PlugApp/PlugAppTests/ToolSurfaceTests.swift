@@ -531,6 +531,7 @@ final class AppRosterTests: XCTestCase {
         // A name Plug does not know leaves the icon to what the client reports.
         XCTAssertEqual(names.target(of: live[1]), "cursor")
         XCTAssertEqual(names.knownTarget(named: "GrokBot"), "grok-bot")
+        XCTAssertEqual(names.knownTarget(named: "ChatGPT Desktop"), "chatgpt")
         XCTAssertNil(names.knownTarget(named: "Work laptop"))
     }
 
@@ -669,6 +670,9 @@ final class AppRosterTests: XCTestCase {
             ["Perplexity", "Cursor", "Unknown client r3"]
         )
         XCTAssertEqual(names.connectedClients(live)[1].target, "cursor")
+        // One that reports nothing useful is pictured by its sign-in's name,
+        // as the Clients list and a call picture it.
+        XCTAssertEqual(names.connectedClients(live)[0].target, "perplexity")
 
         let renamed = ClientNames(
             visibility: visibility,
