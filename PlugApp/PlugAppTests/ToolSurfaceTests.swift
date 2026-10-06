@@ -144,27 +144,60 @@ final class LinkableAppTests: XCTestCase {
         return try JSONDecoder().decode(Listing.self, from: Data(json.utf8)).clients
     }
 
-    func testAddAClientOffersWhatIsOnThisMacAndNotYetUsingPlug() throws {
+    func testAddAClientCoversEveryClientAndBothWaysIn() throws {
         let apps = try decode(
             """
             {"clients":[
             {"target":"zed","name":"Zed","linked":false,"detected":true},
-            {"target":"cursor","name":"Cursor","linked":true,"detected":true},
+            {"target":"cursor","name":"Cursor","linked":true,"detected":true,"linked_transport":"http"},
             {"target":"amp","name":"Amp","linked":false,"detected":false},
-            {"target":"claude-code","name":"Claude Code","linked":false,"detected":true}]}
+            {"target":"claude-code","name":"Claude Code","linked":true,"detected":true,"linked_transport":"stdio"}]}
             """
         )
-        XCTAssertEqual(AddClient.choices(apps, added: []).map(\.target), ["claude-code", "zed"])
-        // One added from the sheet stays, so its row can say it was added.
-        XCTAssertEqual(AddClient.choices(apps, added: ["cursor"]).map(\.target), ["claude-code", "cursor", "zed"])
+        let remote = "https://plug.example.com/mcp"
+        func step(_ choice: AddClient.Choice, _ way: AddClient.Way, address: String? = remote) -> AddClient.Step {
+            AddClient.step(choice, way: way, apps: apps, address: address)
+        }
+        XCTAssertEqual(AddClient.found(apps).map(\.target), ["claude-code", "cursor", "zed"])
+        XCTAssertEqual(AddClient.notFound(apps).map(\.target), ["amp"])
+        XCTAssertEqual(AddClient.firstChoice(apps), .app("zed"))
+
+        // A client on this Mac is one button, either way in.
+        XCTAssertEqual(step(.app("zed"), .onThisMac), .write(target: "zed"))
+        XCTAssertEqual(step(.app("zed"), .network), .write(target: "zed"))
+        // One already in says so, and can still be moved to the other way.
+        XCTAssertEqual(step(.app("cursor"), .network), .done(target: "cursor"))
+        XCTAssertEqual(step(.app("cursor"), .onThisMac), .write(target: "cursor"))
+        XCTAssertEqual(step(.app("claude-code"), .onThisMac), .done(target: "claude-code"))
+        // Plug writes nothing for a client it cannot find or does not know.
+        XCTAssertEqual(step(.app("amp"), .onThisMac), .command)
+        XCTAssertEqual(step(.other, .onThisMac), .command)
+        XCTAssertEqual(step(.other, .network), .address)
+        // A client on the web needs an address it can reach.
+        XCTAssertEqual(AddClient.ways(for: .hosted("ChatGPT")), [.network])
+        XCTAssertEqual(step(.hosted("ChatGPT"), .network), .address)
+        XCTAssertEqual(step(.hosted("ChatGPT"), .network, address: "http://localhost:3282/mcp"), .unreachable)
+        XCTAssertEqual(step(.hosted("ChatGPT"), .network, address: nil), .unreachable)
     }
 
-    func testTheAddressAdviceSaysHowFarTheAddressReaches() {
+    func testWhatIsPastedIsAnEntryAClientAccepts() throws {
         XCTAssertTrue(AddClient.reachesBeyondThisMac("https://plug.example.com/mcp"))
-        XCTAssertFalse(AddClient.reachesBeyondThisMac("http://localhost:3282/mcp"))
         XCTAssertFalse(AddClient.reachesBeyondThisMac("http://127.0.0.1:3282/mcp"))
-        XCTAssertTrue(AddClient.addressAdvice("http://localhost:3282/mcp").contains("only on this Mac"))
-        XCTAssertTrue(AddClient.addressAdvice("https://plug.example.com/mcp").contains("ChatGPT"))
+        XCTAssertTrue(AddClient.addressAdvice("http://localhost:3282/mcp", name: nil).contains("only on this Mac"))
+        XCTAssertTrue(AddClient.addressAdvice("https://plug.example.com/mcp", name: "ChatGPT").hasPrefix("In ChatGPT,"))
+
+        func plug(_ entry: String) throws -> [String: Any] {
+            let object = try JSONSerialization.jsonObject(with: Data(entry.utf8)) as? [String: Any]
+            let servers = object?["mcpServers"] as? [String: Any]
+            return try XCTUnwrap(servers?["plug"] as? [String: Any])
+        }
+        let local = try plug(AddClient.settingsEntry(command: "/Applications/Plug.app/Contents/Resources/plug"))
+        XCTAssertEqual(local["command"] as? String, "/Applications/Plug.app/Contents/Resources/plug")
+        XCTAssertEqual(local["args"] as? [String], ["connect"])
+        XCTAssertEqual(
+            try plug(AddClient.settingsEntry(address: "https://plug.example.com/mcp"))["url"] as? String,
+            "https://plug.example.com/mcp"
+        )
     }
 
     func testANetworkClientWithNoSignInLeftSaysSoAndHow() throws {
