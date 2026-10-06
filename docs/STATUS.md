@@ -60,6 +60,14 @@ Amp, OpenClaw, LM Studio, or Muse Code on a real install.
 - `health::tests::a_server_that_stays_down_backs_off_and_stays_quiet` failed
   once under a full run on 2026-10-06 and passed on every rerun. Look at its
   timing if it fails again.
+- `a_tool_turned_off_for_everyone_is_neither_listed_nor_callable` listed no
+  tools once under a full run on 2026-10-06 and passed on every rerun.
+- A client with any block cannot read back its own oversized task result: a
+  task's result does not record which server it came from, so it is kept
+  from such a client. Record the server and the owner with the result.
+- A remote session ends when its client is removed or its sign-in is
+  revoked. One whose sign-in simply runs out stays open until it is next
+  used or goes idle.
 - Text-message agents: Poke takes a custom MCP server and can reach Plug as
   a remote client. Instinct and Tomo document no way to add one (2026-10-04).
 - A connected Pi, Warp, or Kiro is named from what it reports, with no client

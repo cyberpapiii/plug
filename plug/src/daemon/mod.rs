@@ -913,7 +913,9 @@ async fn handle_ipc_loop(
                         write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
                     }
                     recv = rx.recv() => {
-                        send_ipc_logging_notification(writer, recv).await?;
+                        if may_tell(ctx.listener(), &recv) {
+                            send_ipc_logging_notification(writer, recv).await?;
+                        }
                     }
                     recv = async {
                         if let Some(ref mut crx) = ctrl_rx {
@@ -922,7 +924,9 @@ async fn handle_ipc_loop(
                             std::future::pending().await
                         }
                     } => {
-                        send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
+                        if may_tell(ctx.listener(), &recv) {
+                            send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
+                        }
                     }
                     _ = modern_gate_changed(&mut gate_rx) => {
                         push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
@@ -1067,6 +1071,7 @@ async fn handle_ipc_loop(
         let response = {
             use std::pin::pin;
 
+            let (engine, registry) = (Arc::clone(&ctx.engine), Arc::clone(&ctx.client_registry));
             let dispatch_fut = pin!(dispatch_request(&request, ctx));
             let mut dispatch_fut = dispatch_fut;
             let mut done = false;
@@ -1106,7 +1111,9 @@ async fn handle_ipc_loop(
                             std::future::pending().await
                         }
                     } => {
-                        send_ipc_logging_notification(writer, recv).await?;
+                        if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
+                            send_ipc_logging_notification(writer, recv).await?;
+                        }
                     }
                     // Forward control notifications (list_changed, progress, cancelled)
                     recv = async {
@@ -1116,7 +1123,9 @@ async fn handle_ipc_loop(
                             std::future::pending().await
                         }
                     } => {
-                        send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
+                        if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
+                            send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
+                        }
                     }
                     _ = modern_gate_changed(&mut gate_rx) => {
                         push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
@@ -1173,7 +1182,10 @@ async fn handle_ipc_loop(
             loop {
                 match rx.try_recv() {
                     Ok(notif) => {
-                        send_ipc_logging_notification(writer, Ok(notif)).await?;
+                        let recv = Ok(notif);
+                        if may_tell(ctx.listener(), &recv) {
+                            send_ipc_logging_notification(writer, recv).await?;
+                        }
                     }
                     Err(TryRecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "IPC logging notification lagged");
@@ -1195,8 +1207,11 @@ async fn handle_ipc_loop(
             loop {
                 match crx.try_recv() {
                     Ok(notif) => {
-                        send_ipc_control_notification(writer, Ok(notif), ctx.session_id.as_deref())
-                            .await?;
+                        let recv = Ok(notif);
+                        if may_tell(ctx.listener(), &recv) {
+                            send_ipc_control_notification(writer, recv, ctx.session_id.as_deref())
+                                .await?;
+                        }
                     }
                     Err(TryRecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "IPC control notification lagged");
@@ -1283,6 +1298,35 @@ async fn write_in_flight_reply(
 /// gates the skip on the response being `IpcResponse::Ok`.
 fn is_deregister_request(request: &IpcRequest) -> bool {
     matches!(request, IpcRequest::Deregister { .. })
+}
+
+/// Whether this connection's client may be sent what `recv` holds. See
+/// [`plug_core::proxy::ToolRouter::client_may_be_told`].
+fn may_tell(
+    (engine, registry, session_id): (&Engine, &ClientRegistry, Option<&str>),
+    recv: &Result<
+        plug_core::notifications::ProtocolNotification,
+        tokio::sync::broadcast::error::RecvError,
+    >,
+) -> bool {
+    let Ok(notification) = recv else {
+        return true;
+    };
+    let key = session_id.and_then(|session_id| registry.client_key(session_id));
+    engine
+        .tool_router()
+        .client_may_be_told(key.as_deref(), notification)
+}
+
+impl ConnectionContext {
+    /// Who [`may_tell`] is asked about on this connection.
+    fn listener(&self) -> (&Engine, &ClientRegistry, Option<&str>) {
+        (
+            &self.engine,
+            &self.client_registry,
+            self.session_id.as_deref(),
+        )
+    }
 }
 
 /// Send a logging notification to the IPC client, handling broadcast errors.

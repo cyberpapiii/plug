@@ -570,7 +570,10 @@ impl HttpState {
                                             && let Some(message) =
                                                 notification_to_sse_message(&notification)
                                         {
-                                            state.sessions.broadcast(message, kind);
+                                            let router = &state.router;
+                                            state.sessions.broadcast_where(message, kind, &|grant| {
+                                                may_be_told(router, grant, &notification)
+                                            });
                                         }
                                     }
                                 }
@@ -619,16 +622,7 @@ impl HttpState {
                                     log_state.sessions.broadcast_where(
                                         message,
                                         crate::session::BroadcastKind::Logging,
-                                        &|grant| {
-                                            let key = match grant {
-                                                Some(client_id) => {
-                                                    crate::ipc::grant_client_key(client_id)
-                                                }
-                                                None => crate::ipc::SHARED_REMOTE_CLIENT_KEY
-                                                    .to_string(),
-                                            };
-                                            !router.client_is_kept_from_a_server(Some(&key))
-                                        },
+                                        &|grant| may_be_told(router, grant, &notif),
                                     );
                                 }
                             }
@@ -2601,6 +2595,20 @@ fn project_legacy_capabilities(result: &mut InitializeResult, context: &Downstre
     }
 }
 
+/// Whether a session opened under `grant` may be sent `notification`. See
+/// [`crate::proxy::ToolRouter::client_may_be_told`].
+fn may_be_told(
+    router: &crate::proxy::ToolRouter,
+    grant: Option<&str>,
+    notification: &ProtocolNotification,
+) -> bool {
+    let key = match grant {
+        Some(client_id) => crate::ipc::grant_client_key(client_id),
+        None => crate::ipc::SHARED_REMOTE_CLIENT_KEY.to_string(),
+    };
+    router.client_may_be_told(Some(&key), notification)
+}
+
 /// Resolve which broadcast notifications this principal may observe.
 ///
 /// The SSE fan-out task is shared by every HTTP session and holds no request
@@ -3191,6 +3199,45 @@ mod tests {
             reverse_request_counter: AtomicU64::new(1),
             client_capabilities: DashMap::new(),
         })
+    }
+
+    #[test]
+    fn word_about_a_server_goes_only_to_clients_allowed_that_server() {
+        let state = test_state();
+        let mut clients = std::collections::BTreeMap::new();
+        clients.insert(
+            crate::ipc::grant_client_key("watcher"),
+            crate::config::ClientSettings {
+                blocked_servers: vec!["git".to_string()],
+                ..Default::default()
+            },
+        );
+        state.router.set_client_access(&clients);
+        let told = |grant, notification| may_be_told(&state.router, Some(grant), &notification);
+        let sign_in = |server: &str| ProtocolNotification::AuthStateChanged {
+            server_id: server.into(),
+            new_state: crate::types::ServerHealth::AuthRequired,
+        };
+        let refreshed = |server: &str| ProtocolNotification::TokenRefreshExchanged {
+            server_id: server.into(),
+        };
+        let log = || ProtocolNotification::LoggingMessage {
+            params: rmcp::model::LoggingMessageNotificationParam::new(
+                rmcp::model::LoggingLevel::Info,
+                serde_json::json!("line"),
+            ),
+        };
+        assert!(!told("watcher", sign_in("git")));
+        assert!(!told("watcher", refreshed("git")));
+        assert!(told("watcher", sign_in("mail")));
+        assert!(!told("watcher", log()), "a log line names no server");
+        assert!(told("watcher", ProtocolNotification::ToolListChanged));
+        for notification in [sign_in("git"), refreshed("git"), log()] {
+            assert!(told("someone-else", notification));
+        }
+        // The block is lifted while streams are open: the next one arrives.
+        state.router.set_client_access(&Default::default());
+        assert!(told("watcher", sign_in("git")));
     }
 
     fn test_state() -> Arc<HttpState> {

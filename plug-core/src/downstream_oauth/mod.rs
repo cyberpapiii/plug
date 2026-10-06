@@ -146,6 +146,9 @@ pub struct DownstreamOauthManager {
     pub owner_security: Arc<OwnerSecurity>,
     state: Arc<Mutex<DownstreamOauthState>>,
     principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
+    /// One flag per sign-in a token has been checked under, set when that
+    /// sign-in is revoked so work admitted under it stops.
+    family_ended: Arc<dashmap::DashMap<String, Arc<AtomicBool>>>,
     registration_rate: Arc<Mutex<HashMap<String, VecDeque<u64>>>>,
     state_path: Arc<PathBuf>,
     durability_degraded: Arc<AtomicBool>,
@@ -297,12 +300,19 @@ impl PrincipalLifecycleState {
 pub struct PrincipalLifecycleLease {
     state: Arc<PrincipalLifecycleState>,
     generation: u64,
+    /// Set once the sign-in this token descends from is revoked, which
+    /// leaves the client itself registered.
+    family_ended: Option<Arc<AtomicBool>>,
 }
 
 impl PrincipalLifecycleLease {
     pub fn is_active(&self) -> bool {
         self.state.active.load(Ordering::SeqCst)
             && self.state.generation.load(Ordering::SeqCst) == self.generation
+            && !self
+                .family_ended
+                .as_ref()
+                .is_some_and(|ended| ended.load(Ordering::SeqCst))
     }
 
     #[cfg(test)]
@@ -310,6 +320,7 @@ impl PrincipalLifecycleLease {
         Self {
             state: Arc::new(PrincipalLifecycleState::active()),
             generation: 1,
+            family_ended: None,
         }
     }
 
@@ -724,6 +735,7 @@ impl DownstreamOauthManager {
             owner_security,
             state: Arc::new(Mutex::new(state)),
             principal_lifecycles: Arc::new(principal_lifecycles),
+            family_ended: Arc::default(),
             registration_rate: Arc::new(Mutex::new(HashMap::new())),
             state_path: Arc::new(state_path),
             durability_degraded: Arc::new(AtomicBool::new(false)),
@@ -1610,6 +1622,11 @@ impl DownstreamOauthManager {
                     self.commit_state(&mut guard, next)?;
                     return Ok(token);
                 }
+                // Before the save, as for a removed client: if the save
+                // fails, what is already open under this sign-in still ends.
+                if let Some((_, ended)) = self.family_ended.remove(&consumed.family_id) {
+                    ended.store(true, Ordering::SeqCst);
+                }
                 let mut next = guard.clone();
                 let revoked = revoke_token_family(&mut next, &consumed.family_id);
                 tracing::warn!(
@@ -1688,6 +1705,15 @@ impl DownstreamOauthManager {
                 let lease = PrincipalLifecycleLease {
                     state: Arc::clone(lifecycle.value()),
                     generation,
+                    // A record from before sign-ins were tracked has none.
+                    family_ended: (!record.family_id.is_empty()).then(|| {
+                        Arc::clone(
+                            self.family_ended
+                                .entry(record.family_id.clone())
+                                .or_default()
+                                .value(),
+                        )
+                    }),
                 };
                 if !lease.is_active() {
                     return AccessTokenValidation::Invalid;
@@ -4286,16 +4312,13 @@ mod tests {
         let rotated_refresh = rotated.refresh_token.expect("rotated refresh token");
 
         // The rotated pair works before the replay.
-        assert!(matches!(
-            manager
-                .validate_access_token_for(
-                    &rotated.access_token,
-                    &[],
-                    "https://plug.example.com/mcp",
-                )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+        let AccessTokenValidation::Valid(open_under_it) = manager
+            .validate_access_token_for(&rotated.access_token, &[], "https://plug.example.com/mcp")
+            .await
+        else {
+            panic!("the rotated pair works before the replay");
+        };
+        assert!(open_under_it.principal_lifecycle.is_active());
 
         // Replay the token that was already spent.
         age_spent_refresh_tokens(&manager).await;
@@ -4309,6 +4332,11 @@ mod tests {
                 .await,
             Err(DownstreamOauthError::InvalidGrant)
         ));
+
+        // What was opened under that sign-in, a stream say, ends with it,
+        // though the client itself is still registered.
+        assert!(!open_under_it.principal_lifecycle.is_active());
+        assert!(manager.principal_lifecycles.contains_key(&client.client_id));
 
         // Rejecting the replay is not enough: the chain the attacker did not
         // present has to die too, or the stolen token keeps a live descendant.

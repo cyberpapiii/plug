@@ -160,7 +160,12 @@ impl SecretStore for Command {
                 store: self.id.clone(),
             });
         };
-        let stderr = stderr.recv_timeout(left()).unwrap_or_default();
+        // Something the command started still holds the error pipe. What the
+        // command printed is complete; the helper is stopped all the same.
+        let stderr = stderr.recv_timeout(left()).unwrap_or_else(|_| {
+            stop(&mut child);
+            Vec::new()
+        });
         if stdout.len() > MOST_OUTPUT {
             stop(&mut child);
             return Err(self.unavailable("the command printed far too much to be a key"));
@@ -238,18 +243,10 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(8));
     }
 
-    #[test]
-    fn a_timed_out_command_takes_what_it_started_with_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let pid_file = dir.path().join("pid");
-        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
-        let store = shell(&script, Duration::from_millis(400));
-        assert!(matches!(
-            store.get("github"),
-            Err(SecretError::TimedOut { .. })
-        ));
-        let pid = std::fs::read_to_string(&pid_file).unwrap();
-        // `kill -0` asks only whether the process is still there.
+    /// Whether the process whose id `script` wrote to `pid_file` is gone
+    /// within two seconds. `kill -0` asks only whether it is still there.
+    fn helper_is_gone(pid_file: &std::path::Path) -> bool {
+        let pid = std::fs::read_to_string(pid_file).unwrap();
         let alive = || {
             std::process::Command::new("/bin/kill")
                 .args(["-0", pid.trim()])
@@ -262,7 +259,35 @@ mod tests {
         while alive() && Instant::now() < gone_by {
             std::thread::sleep(Duration::from_millis(25));
         }
-        assert!(!alive(), "the helper outlived the command");
+        !alive()
+    }
+
+    #[test]
+    fn a_timed_out_command_takes_what_it_started_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let store = shell(&script, Duration::from_millis(400));
+        assert!(matches!(
+            store.get("github"),
+            Err(SecretError::TimedOut { .. })
+        ));
+        assert!(helper_is_gone(&pid_file), "the helper outlived the command");
+    }
+
+    #[test]
+    fn a_helper_left_holding_only_the_error_pipe_is_stopped_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        // The command prints its value and is done. Its helper has let go
+        // of the output pipe and kept the error pipe.
+        let script = format!(
+            "sleep 30 >/dev/null & echo $! > '{}'; printf value",
+            pid_file.display()
+        );
+        let store = shell(&script, Duration::from_millis(300));
+        assert_eq!(store.get("github").unwrap().unwrap().as_str(), "value");
+        assert!(helper_is_gone(&pid_file), "the helper outlived the command");
     }
 
     #[test]

@@ -1147,6 +1147,30 @@ impl ToolRouter {
             .is_none_or(|access| !access.blocked_servers.contains(server_id))
     }
 
+    /// Whether the client behind `client_key` may be sent `notification`, by
+    /// the rules as they stand now. Asked at every delivery on every path,
+    /// so a block added while a client is connected applies to the next
+    /// message. Word about a server's sign-in names the server and goes by
+    /// that server's block. A log line does not say which server wrote it,
+    /// so a client kept from any server gets none.
+    pub fn client_may_be_told(
+        &self,
+        client_key: Option<&str>,
+        notification: &crate::notifications::ProtocolNotification,
+    ) -> bool {
+        use crate::notifications::ProtocolNotification;
+        match notification {
+            ProtocolNotification::AuthStateChanged { server_id, .. }
+            | ProtocolNotification::TokenRefreshExchanged { server_id } => {
+                self.client_may_use_server(client_key, server_id)
+            }
+            ProtocolNotification::LoggingMessage { .. } => {
+                !self.client_is_kept_from_a_server(client_key)
+            }
+            _ => true,
+        }
+    }
+
     /// Whether the client behind `client_key` is kept from any server, so the
     /// lists it is served need filtering at all.
     pub(crate) fn client_has_blocked_servers(&self, client_key: Option<&str>) -> bool {
