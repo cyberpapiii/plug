@@ -73,6 +73,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A watch check that was waiting its turn no longer runs after the watch is
+  removed or while Plug is shutting down.
 - Servers whose names read alike are numbered around names already in use,
   so a numbered name can no longer land on another server and hide its tool.
 - A remote client's open session ends when its sign-in does, however that
