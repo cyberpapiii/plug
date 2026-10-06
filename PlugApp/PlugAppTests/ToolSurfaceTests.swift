@@ -775,6 +775,35 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(CallFacts(reported).caller, "Cursor")
     }
 
+    func testAClientThatCameAndWentIsListedByItsLastCall() {
+        func call(_ sequence: UInt64, at ms: UInt64, key: String?) -> ActivityEvent {
+            ActivityEvent(
+                sequence: sequence, occurredAtMs: ms, client: "s", method: "tools/call", server: "gmail",
+                tool: "Gmail__search_messages", clientType: "Unknown", clientLabel: "radar",
+                clientKey: key, latencyMs: 1, outcome: "success"
+            )
+        }
+        let events = [
+            call(1, at: 100, key: "host:python#radar.py"),
+            call(2, at: 300, key: "host:python#radar.py"),
+            call(3, at: 200, key: "oauth:abc"),
+            call(4, at: 400, key: "cursor"),
+            call(5, at: 500, key: nil),
+        ]
+        // One row a client, by its newest call; a client already shown and a
+        // call nobody can be told apart by add none.
+        XCTAssertEqual(RecentCallers.latest(events, excluding: ["cursor"]).map(\.sequence), [2, 3])
+        XCTAssertFalse(RecentCallers.isRemote(key: "host:python#radar.py"))
+        XCTAssertTrue(RecentCallers.isRemote(key: "oauth:abc"))
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = .gmt
+        let now = Date(timeIntervalSince1970: 1_800_000_000)
+        XCTAssertTrue(RecentCallers.lastUsed(now.addingTimeInterval(-60), now: now, calendar: calendar).hasPrefix("Last used "))
+        XCTAssertFalse(RecentCallers.lastUsed(now.addingTimeInterval(-60), now: now, calendar: calendar).contains(","))
+        XCTAssertTrue(RecentCallers.lastUsed(now.addingTimeInterval(-3 * 86400), now: now, calendar: calendar).contains(","))
+    }
+
     func testACallFromANetworkClientIsPicturedByItsSignIn() {
         func call(_ type: String, grant: String?) -> CallFacts {
             CallFacts(ActivityEvent(

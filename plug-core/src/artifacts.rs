@@ -277,14 +277,30 @@ impl ArtifactStore {
         ]))
     }
 
+    /// Keep a task's result when it is too large to send. It is kept with
+    /// the tool the task ran, when the task still says which; one that does
+    /// not is kept with no tool, and is withheld from a client with a block.
     pub async fn maybe_spill_task_payload(
         &self,
-        source_tool: &str,
+        source: Option<&crate::tasks::TaskSource>,
+        task_id: &str,
         payload: Value,
     ) -> Result<GetTaskPayloadResult, McpError> {
         match serde_json::from_value::<CallToolResult>(payload.clone()) {
             Ok(result) => {
-                let spilled = self.maybe_spill_tool_result(source_tool, result).await?;
+                let unknown = format!("task_result:{task_id}");
+                let listed = source.map_or(unknown.as_str(), |source| source.listed.as_str());
+                let behind = source
+                    .and_then(|source| source.behind.as_ref())
+                    .map(|(server, own_tool)| (server.as_str(), own_tool.as_str()));
+                let spilled = self
+                    .maybe_spill_tool_result_with_limit(
+                        behind,
+                        listed,
+                        result,
+                        ARTIFACT_STORE_MAX_BYTES,
+                    )
+                    .await?;
                 let value = serde_json::to_value(spilled)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
                 Ok(GetTaskPayloadResult::new(value))
@@ -1031,6 +1047,57 @@ mod tests {
         rehydrated.rehydrate_from_disk();
         let manifest = rehydrated.read(&uri).expect("read rehydrated manifest");
         assert_eq!(manifest.contents.len(), 1);
+
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    #[tokio::test]
+    async fn a_tasks_large_result_is_kept_with_the_tool_the_task_ran() {
+        let base_dir = temp_dir("task-source");
+        let store = test_store(base_dir.clone());
+        let large = || {
+            serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+                "T".repeat(ARTIFACT_RESULT_MIN_BYTES + 1),
+            )]))
+            .unwrap()
+        };
+        let kept = |payload: GetTaskPayloadResult| {
+            let result: CallToolResult = serde_json::from_value(payload.0).unwrap();
+            let uri = &result
+                .content
+                .iter()
+                .find_map(ContentBlock::as_resource_link)
+                .expect("artifact resource_link")
+                .uri;
+            store.source(uri).expect("a kept artifact")
+        };
+
+        let source = crate::tasks::TaskSource {
+            listed: "git__commit".to_string(),
+            behind: Some(("git".to_string(), "commit".to_string())),
+        };
+        let payload = store
+            .maybe_spill_task_payload(Some(&source), "task_1", large())
+            .await
+            .unwrap();
+        assert_eq!(
+            kept(payload),
+            (
+                Some("git".to_string()),
+                Some("commit".to_string()),
+                "git__commit".to_string()
+            )
+        );
+        // A task that is gone says nothing, and its result is kept with no
+        // tool: a client with a block does not get it.
+        let payload = store
+            .maybe_spill_task_payload(None, "task_2", large())
+            .await
+            .unwrap();
+        assert_eq!(
+            kept(payload),
+            (None, None, "task_result:task_2".to_string())
+        );
 
         let _ = std::fs::remove_dir_all(base_dir);
     }

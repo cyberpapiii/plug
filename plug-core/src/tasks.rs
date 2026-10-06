@@ -53,9 +53,19 @@ pub enum TaskUpstreamRef {
     },
 }
 
+/// The tool a task is running: the name it was called by, and the server
+/// and the server's own name for it when Plug knew them. A large result is
+/// kept with these, so who may read it back follows the tool.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskSource {
+    pub listed: String,
+    pub behind: Option<(String, String)>,
+}
+
 struct TaskRecord {
     task: Task,
     owner: TaskOwner,
+    source: TaskSource,
     result: Option<Value>,
     abort_handle: Option<JoinHandle<()>>,
     upstream: Option<TaskUpstreamRef>,
@@ -300,6 +310,10 @@ impl TaskStore {
             TaskRecord {
                 task: task.clone(),
                 owner,
+                source: TaskSource {
+                    listed: name.to_string(),
+                    behind: None,
+                },
                 result: None,
                 abort_handle: None,
                 upstream: None,
@@ -344,6 +358,19 @@ impl TaskStore {
             };
         }
         UpstreamRecordOutcome::Missing
+    }
+
+    /// Record the server and the server's own name for the tool a task
+    /// runs. Nothing happens when the task is already gone.
+    pub fn record_source(&mut self, task_id: &str, server: &str, own_tool: &str) {
+        if let Some(record) = self.tasks.get_mut(task_id) {
+            record.source.behind = Some((server.to_string(), own_tool.to_string()));
+        }
+    }
+
+    /// The tool a task is running, while the task is kept.
+    pub fn source_of(&self, task_id: &str) -> Option<TaskSource> {
+        self.tasks.get(task_id).map(|record| record.source.clone())
     }
 
     pub fn create_passthrough(
@@ -391,6 +418,10 @@ impl TaskStore {
             TaskRecord {
                 task: task.clone(),
                 owner,
+                source: TaskSource {
+                    listed: name.to_string(),
+                    behind: None,
+                },
                 result: None,
                 abort_handle: None,
                 upstream: Some(upstream),
@@ -921,6 +952,31 @@ mod tests {
                 .is_err(),
             "another principal must not observe the task"
         );
+    }
+
+    #[test]
+    fn a_task_remembers_the_tool_it_runs() {
+        let mut store = TaskStore::new();
+        let owner = TaskOwner::new(Arc::<str>::from("principal:a"));
+        let task = store.create(owner, "git__commit").expect("task");
+        let listed = "git__commit".to_string();
+        assert_eq!(
+            store.source_of(&task.task_id),
+            Some(TaskSource {
+                listed: listed.clone(),
+                behind: None
+            })
+        );
+        store.record_source(&task.task_id, "git", "commit");
+        assert_eq!(
+            store.source_of(&task.task_id),
+            Some(TaskSource {
+                listed,
+                behind: Some(("git".to_string(), "commit".to_string()))
+            })
+        );
+        store.record_source("task_gone", "git", "commit");
+        assert_eq!(store.source_of("task_gone"), None);
     }
 
     #[test]
