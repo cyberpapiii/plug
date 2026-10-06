@@ -1195,7 +1195,7 @@ private struct ClientDetail: View {
             if let access = entry.access, !access.servers.isEmpty {
                 Section {
                     Toggle(
-                        "Turn On New Servers",
+                        "Adopt Newly Added Servers",
                         isOn: Binding(
                             get: { !access.onlyAllowed },
                             set: { run(.setClientAllowList(key: access.key, on: !$0)) }

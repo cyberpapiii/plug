@@ -9,8 +9,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
-- A client can be given only the servers you pick. Switch off "Turn On New
-  Servers" under Settings on a client's page and a server you add later stays off for that client
+- A client can be given only the servers you pick. Switch off "Adopt Newly
+  Added Servers" under Settings on a client's page and a server you add later stays off for that client
   until you turn it on; what the client gets today does not change. The
   same from the command line with `plug clients only <client> --server
   <name>` or `--tool <name>`, and `--off` to end it.
