@@ -417,6 +417,47 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(named[1].host?.app)
     }
 
+    func testClientsAreGroupedByWhereTheyRun() throws {
+        // What the owner said wins. Otherwise Plug says only what it can tell.
+        XCTAssertEqual(ClientPlaces.place(owners: "Work laptop", isRemote: false), "Work laptop")
+        XCTAssertEqual(ClientPlaces.place(owners: nil, isRemote: false), ClientPlaces.thisMac)
+        XCTAssertEqual(ClientPlaces.place(owners: "", isRemote: true), ClientPlaces.elsewhere)
+        XCTAssertEqual(ClientPlaces.place(owners: nil, isRemote: true, site: "chatgpt.com"), ClientPlaces.web)
+        XCTAssertEqual(
+            ClientPlaces.place(owners: nil, isRemote: true, setUpHere: true),
+            ClientPlaces.thisMac
+        )
+
+        XCTAssertEqual(
+            ClientPlaces.ordered([
+                ClientPlaces.notUsing, "Work laptop", ClientPlaces.elsewhere, "Cloud",
+                ClientPlaces.thisMac, ClientPlaces.web, "Cloud",
+            ]),
+            [ClientPlaces.thisMac, "Cloud", "Work laptop", ClientPlaces.web, ClientPlaces.elsewhere, ClientPlaces.notUsing]
+        )
+        XCTAssertEqual(ClientPlaces.ordered(["Cloud"]), ["Cloud"])
+        XCTAssertEqual(ClientPlaces.choices(owners: ["Cloud", "This Mac"]), ["This Mac", "Cloud"])
+
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        let places = try decoder.decode(
+            [ClientPlace].self,
+            from: Data(#"[{"key":"oauth:abc","place":"Work laptop"},{"key":"oauth:def","place":"Cloud"}]"#.utf8)
+        )
+        // The daemon's own reply, read the way the app reads it.
+        let snapshot = try decoder.decode(OperatorSnapshot.self, from: Data(#"""
+        {"runtime_version":"1","uptime_secs":1,"ownership":"app_managed","configured_servers":[],
+         "servers":[],"live_sessions":[],"client_visibility":[],"upstream_auth":[],"downstream_clients":[],
+         "client_places":[{"key":"claude-code","place":"Work laptop"}]}
+        """#.utf8))
+        XCTAssertEqual(ClientNames(snapshot: snapshot).place(forKey: "claude-code"), "Work laptop")
+
+        let names = ClientNames(visibility: [], names: [], places: places)
+        XCTAssertEqual(names.place(forKey: "oauth:abc"), "Work laptop")
+        XCTAssertNil(names.place(forKey: "oauth:zzz"))
+        XCTAssertEqual(names.ownerPlaces, ["Cloud", "Work laptop"])
+    }
+
     func testAServersSettingsPlaceIsOnlyWhatPlugAlreadyKnows() {
         let home = "/Users/someone"
         let onDisk: Set<String> = [
@@ -709,6 +750,11 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(named.caller, "GrokBot")
         XCTAssertEqual(named.callerTarget, "grok-bot")
         // A name Plug does not know keeps the icon of what the client reports.
+        // Where it runs follows the name, when the owner has said.
+        XCTAssertEqual(
+            CallFacts(reported, ownerName: "GrokBot", place: "Cloud").callerAndPlace, "GrokBot (Cloud)"
+        )
+        XCTAssertEqual(CallFacts(reported, ownerName: "GrokBot").callerAndPlace, "GrokBot")
         let other = CallFacts(reported, ownerName: "Work laptop")
         XCTAssertEqual(other.caller, "Work laptop")
         XCTAssertEqual(other.callerTarget, "cursor")

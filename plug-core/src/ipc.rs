@@ -124,6 +124,13 @@ pub struct ClientName {
     pub name: String,
 }
 
+/// Where the owner says a client runs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientPlace {
+    pub key: String,
+    pub place: String,
+}
+
 /// What the owner keeps a client from.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientBlocks {
@@ -162,6 +169,10 @@ pub struct OperatorSnapshot {
     /// paths and a reader may rewrite map keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_names: Vec<ClientName>,
+    /// Where the owner says each client runs. Clients on this Mac are left
+    /// out.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub client_places: Vec<ClientPlace>,
     /// What each client is kept from. Clients kept from nothing are left out.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub client_blocks: Vec<ClientBlocks>,
@@ -266,6 +277,13 @@ pub enum IpcRequest {
         auth_token: String,
         key: String,
         name: String,
+    },
+    /// Say where a client runs by editing `clients`. An empty place removes
+    /// it.
+    SetClientPlace {
+        auth_token: String,
+        key: String,
+        place: String,
     },
     /// Keep a client from a server or a tool, or let it back in, by editing
     /// `clients`.
@@ -485,6 +503,12 @@ impl fmt::Debug for IpcRequest {
                 .field("auth_token", &"[REDACTED]")
                 .field("key", key)
                 .field("name", name)
+                .finish(),
+            Self::SetClientPlace { key, place, .. } => f
+                .debug_struct("SetClientPlace")
+                .field("auth_token", &"[REDACTED]")
+                .field("key", key)
+                .field("place", place)
                 .finish(),
             Self::SetClientBlock {
                 key,
@@ -1234,6 +1258,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::SetServerEnabled { .. }
             | IpcRequest::SetToolEnabled { .. }
             | IpcRequest::RenameClient { .. }
+            | IpcRequest::SetClientPlace { .. }
             | IpcRequest::SetClientBlock { .. }
             | IpcRequest::AddWatch { .. }
             | IpcRequest::RemoveWatch { .. }
@@ -1259,6 +1284,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::SetServerEnabled { auth_token, .. }
         | IpcRequest::SetToolEnabled { auth_token, .. }
         | IpcRequest::RenameClient { auth_token, .. }
+        | IpcRequest::SetClientPlace { auth_token, .. }
         | IpcRequest::SetClientBlock { auth_token, .. }
         | IpcRequest::AddWatch { auth_token, .. }
         | IpcRequest::RemoveWatch { auth_token, .. } => Some(auth_token.as_str()),
@@ -2659,6 +2685,7 @@ mod tests {
                         signed_in: true,
                     }],
                     client_names: Vec::new(),
+                    client_places: Vec::new(),
                     client_blocks: Vec::new(),
                     events: Vec::new(),
                     config_error: None,

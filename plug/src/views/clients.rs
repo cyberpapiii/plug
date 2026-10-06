@@ -226,9 +226,19 @@ fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
 #[derive(Debug, PartialEq, Eq)]
 struct LiveSessionGroup<'a> {
     client: &'a str,
+    /// Where the owner says the client runs.
+    place: Option<&'a str>,
     sessions: usize,
     transports: Vec<&'a str>,
     longest_connected_secs: u64,
+}
+
+/// A client's name, with where it runs when the owner has said.
+fn client_and_place(client: &str, place: Option<&str>) -> String {
+    match place {
+        Some(place) => format!("{client} ({place})"),
+        None => client.to_string(),
+    }
 }
 
 /// Busiest client first, then by name.
@@ -241,10 +251,9 @@ fn live_session_groups(
             "daemon_proxy" => "local",
             other => other,
         };
-        match groups
-            .iter_mut()
-            .find(|group| group.client == session.label())
-        {
+        match groups.iter_mut().find(|group| {
+            group.client == session.label() && group.place == session.place.as_deref()
+        }) {
             Some(group) => {
                 group.sessions += 1;
                 if !group.transports.contains(&transport) {
@@ -255,6 +264,7 @@ fn live_session_groups(
             }
             None => groups.push(LiveSessionGroup {
                 client: session.label(),
+                place: session.place.as_deref(),
                 sessions: 1,
                 transports: vec![transport],
                 longest_connected_secs: session.connected_secs,
@@ -287,7 +297,7 @@ fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView
         println!(
             "  {:<18} {:<14} {:<12} {:<10} {:<10} {}",
             &session.session_id[..session.session_id.len().min(18)],
-            session.label(),
+            client_and_place(session.label(), session.place.as_deref()),
             session.transport,
             crate::ui::format_duration(session.connected_secs),
             idle,
@@ -432,7 +442,7 @@ pub(crate) async fn cmd_client_list(
             for group in live_session_groups(&live_sessions) {
                 println!(
                     "  {:<24} {:<12} {:<14} {}",
-                    group.client,
+                    client_and_place(group.client, group.place),
                     group.sessions,
                     group.transports.join("+"),
                     crate::ui::format_duration(group.longest_connected_secs),
@@ -543,6 +553,7 @@ mod tests {
             host: None,
             key: None,
             name: None,
+            place: None,
             grant_name: None,
             access_key: None,
             connected_secs: 12,
@@ -724,11 +735,27 @@ mod tests {
             host: None,
             key: None,
             name: None,
+            place: None,
             grant_name: None,
             access_key: None,
             connected_secs,
             last_activity_secs: None,
         }
+    }
+
+    #[test]
+    fn one_client_in_two_places_is_two_groups_each_saying_where() {
+        let here = session("Claude Code", "daemon_proxy", 30);
+        let mut there = session("Claude Code", "http", 10);
+        there.place = Some("Work laptop".to_string());
+        let sessions = [here, there];
+
+        let groups = live_session_groups(&sessions);
+        let shown = groups
+            .iter()
+            .map(|group| super::client_and_place(group.client, group.place))
+            .collect::<Vec<_>>();
+        assert_eq!(shown, ["Claude Code", "Claude Code (Work laptop)"]);
     }
 
     #[test]
@@ -875,18 +902,21 @@ mod tests {
             vec![
                 LiveSessionGroup {
                     client: "Codex CLI",
+                    place: None,
                     sessions: 3,
                     transports: vec!["local", "http"],
                     longest_connected_secs: 7_200,
                 },
                 LiveSessionGroup {
                     client: "Claude Code",
+                    place: None,
                     sessions: 1,
                     transports: vec!["local"],
                     longest_connected_secs: 60,
                 },
                 LiveSessionGroup {
                     client: "Cursor",
+                    place: None,
                     sessions: 1,
                     transports: vec!["http"],
                     longest_connected_secs: 5,

@@ -239,7 +239,10 @@ final class AppModel {
         let grant = event.clientKey.flatMap { key in
             snapshot.downstreamClients.first { $0.clientKey == key }?.clientName
         }
-        return CallFacts(event, ownerName: name, grantName: grant)
+        let place = event.clientKey.flatMap { key in
+            snapshot.clientPlaces?.first { $0.key == key }?.place
+        }
+        return CallFacts(event, ownerName: name, grantName: grant, place: place)
     }
 
     /// Distinct connected apps, first seen first, so the panel's icon row is

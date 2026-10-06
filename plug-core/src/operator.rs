@@ -41,6 +41,11 @@ pub enum OperatorMutation {
         key: String,
         name: String,
     },
+    /// Say where a client runs. An empty place removes it.
+    SetClientPlace {
+        key: String,
+        place: String,
+    },
     /// Keep a client from a server or a tool, or let it back in.
     SetClientBlock {
         key: String,
@@ -171,7 +176,11 @@ pub fn apply_operator_mutation(
             }
         }
         OperatorMutation::RenameClient { key, name } => {
-            rename_client(&mut config, &key, &name)?;
+            label_client(&mut config, &key, &name, ClientLabel::Name)?;
+            OperatorMutationResult::server(None)
+        }
+        OperatorMutation::SetClientPlace { key, place } => {
+            label_client(&mut config, &key, &place, ClientLabel::Place)?;
             OperatorMutationResult::server(None)
         }
         OperatorMutation::SetClientBlock {
@@ -302,27 +311,50 @@ const CLIENT_NAME_MAX_CHARS: usize = 60;
 ///
 /// The key is not checked against connected clients: a name is set once and
 /// has to hold while its client is closed.
-fn rename_client(config: &mut Config, key: &str, name: &str) -> anyhow::Result<()> {
+/// The two things the owner types about a client.
+#[derive(Clone, Copy)]
+enum ClientLabel {
+    Name,
+    Place,
+}
+
+fn label_client(
+    config: &mut Config,
+    key: &str,
+    text: &str,
+    label: ClientLabel,
+) -> anyhow::Result<()> {
     let key = key.trim();
-    let name = name.trim();
+    let text = text.trim();
+    let what = match label {
+        ClientLabel::Name => "name",
+        ClientLabel::Place => "place",
+    };
     if key.is_empty() {
         anyhow::bail!("client key is required");
     }
-    if name.chars().count() > CLIENT_NAME_MAX_CHARS {
-        anyhow::bail!("a client name can be at most {CLIENT_NAME_MAX_CHARS} characters");
+    if text.chars().count() > CLIENT_NAME_MAX_CHARS {
+        anyhow::bail!("a client {what} can be at most {CLIENT_NAME_MAX_CHARS} characters");
     }
-    if name.chars().any(char::is_control) {
-        anyhow::bail!("a client name cannot contain control characters");
+    if text.chars().any(char::is_control) {
+        anyhow::bail!("a client {what} cannot contain control characters");
     }
-    if name.is_empty() {
+    let slot = |settings: &mut crate::config::ClientSettings, value: Option<String>| match label {
+        ClientLabel::Name => settings.name = value,
+        ClientLabel::Place => settings.place = value,
+    };
+    if text.is_empty() {
         if let Some(settings) = config.clients.get_mut(key) {
-            settings.name = None;
+            slot(settings, None);
             if settings.is_empty() {
                 config.clients.remove(key);
             }
         }
     } else {
-        config.clients.entry(key.to_string()).or_default().name = Some(name.to_string());
+        slot(
+            config.clients.entry(key.to_string()).or_default(),
+            Some(text.to_string()),
+        );
     }
     Ok(())
 }
@@ -447,6 +479,32 @@ API_KEY = "sk-live-123"
             },
         )
         .map(|(config, _)| config)
+    }
+
+    #[test]
+    fn where_a_client_runs_is_stored_beside_its_name_and_removed_alone() {
+        let path = fixture_path();
+        let key = "oauth:abc";
+        let place = |text: &str| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::SetClientPlace {
+                    key: key.into(),
+                    place: text.into(),
+                },
+            )
+            .map(|(config, _)| config)
+        };
+
+        rename(&path, key, "Claude Code").unwrap();
+        let config = place("  Work laptop ").unwrap();
+        assert_eq!(config.clients[key].place.as_deref(), Some("Work laptop"));
+        assert_eq!(config.clients[key].name.as_deref(), Some("Claude Code"));
+
+        let config = place("").unwrap();
+        assert_eq!(config.clients[key].place, None);
+        assert_eq!(config.clients[key].name.as_deref(), Some("Claude Code"));
+        assert!(place("a\u{7}b").is_err());
     }
 
     #[test]

@@ -1573,6 +1573,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     })
                 })
                 .collect();
+            let client_places = config
+                .clients
+                .iter()
+                .filter_map(|(key, settings)| {
+                    Some(plug_core::ipc::ClientPlace {
+                        key: key.clone(),
+                        place: settings.place.clone()?,
+                    })
+                })
+                .collect();
             let client_blocks = config
                 .clients
                 .iter()
@@ -1606,6 +1616,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     upstream_auth,
                     downstream_clients,
                     client_names,
+                    client_places,
                     client_blocks,
                     events,
                     config_error,
@@ -1748,6 +1759,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 plug_core::operator::OperatorMutation::RenameClient {
                     key: key.clone(),
                     name: name.clone(),
+                },
+            )
+            .await
+        }
+        IpcRequest::SetClientPlace { key, place, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::SetClientPlace {
+                    key: key.clone(),
+                    place: place.clone(),
                 },
             )
             .await

@@ -105,6 +105,8 @@ struct PlugIntentRunner {
             perform("remove that client's access") { .revokeClient(authToken: $0, clientID: id) }
         case let .renameClient(key, name):
             perform("rename the client") { .renameClient(authToken: $0, key: key, name: name) }
+        case let .setClientPlace(key, place):
+            perform("say where the client runs") { .setClientPlace(authToken: $0, key: key, place: place) }
         case let .setClientServerBlocked(key, server, blocked):
             perform("\(blocked ? "turn off" : "turn on") \(server) for that client") {
                 .setClientServerBlocked(authToken: $0, key: key, server: server, blocked: blocked)

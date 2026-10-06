@@ -253,6 +253,7 @@ enum PlugIntent: Equatable, Sendable {
     case unlinkApp(String)
     case revokeClient(id: String)
     case renameClient(key: String, name: String)
+    case setClientPlace(key: String, place: String)
     case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case setClientToolBlocked(key: String, tool: String, blocked: Bool)
     case addServer
