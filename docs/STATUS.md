@@ -57,8 +57,6 @@ Amp, OpenClaw, LM Studio, or Muse Code on a real install.
   tools. Left over: there is no allow list (`only_servers`); every client
   on the shared bearer token is one client, `remote:shared`; and a changed
   block tells every client to re-read its lists, not only the one it touches.
-- Saving the config from the app or the CLI writes the servers back in a
-  different order each time. Nothing breaks; a hand-kept file loses its order.
 - `health::tests::a_server_that_stays_down_backs_off_and_stays_quiet` failed
   once under a full run on 2026-10-06 and passed on every rerun. Look at its
   timing if it fails again.

@@ -11,8 +11,10 @@ impl super::ToolRouter {
             // tool is kept from it.
             if self
                 .artifact_store
-                .source_tool(uri)
-                .is_some_and(|tool| !self.client_may_use_tool(client_key, &tool))
+                .source(uri)
+                .is_some_and(|(server, tool)| {
+                    !self.client_may_read_result_of(client_key, server.as_deref(), &tool)
+                })
             {
                 return Err(McpError::from(ProtocolError::InvalidRequest {
                     detail: format!("artifact not found: {uri}"),

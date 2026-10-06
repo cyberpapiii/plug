@@ -865,37 +865,56 @@ impl Engine {
         if ![crate::secrets::KEYCHAIN, crate::secrets::FILE].contains(&store) {
             anyhow::bail!("Plug cannot write keys to `{store}`; choose `keychain` or `file`");
         }
-        let (mutation, kept_for, before, staged) = self
-            .keep_typed_secrets(config_path, mutation, store.to_string())
-            .await;
-        let (result, report) = {
+        // One change at a time, from the first key stored to the last one
+        // removed: two changes side by side could undo each other's keys.
+        let (result, report, kept_for) = {
             let _guard = self.reload_lock.lock().await;
+            let file_before = std::fs::read(config_path).ok();
+            let (mutation, kept_for, before, staged) = self
+                .keep_typed_secrets(config_path, mutation, store.to_string())
+                .await;
             let result = match crate::operator::apply_operator_mutation(config_path, mutation) {
                 Ok((_, result)) => result,
+                // The file can be in place and the save still report a
+                // failure after it. Its references then need their keys.
+                Err(error) if std::fs::read(config_path).ok() != file_before => {
+                    return Err(error.context("the change was saved, but not confirmed on disk"));
+                }
                 Err(error) => {
                     // Nothing was saved, so the stores go back to what they
                     // held: a refused change must not replace a working key.
                     let store = store.to_string();
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::secrets::Stores::current().put_back(&store, staged);
+                    let failed = tokio::task::spawn_blocking(move || {
+                        crate::secrets::Stores::current().put_back(&store, staged)
                     })
-                    .await;
-                    return Err(error);
+                    .await
+                    .unwrap_or_default();
+                    if failed.is_empty() {
+                        return Err(error);
+                    }
+                    return Err(error.context(format!(
+                        "these stored keys could not be put back: {}",
+                        failed.join(", ")
+                    )));
                 }
             };
             // The mutation persists the raw file, `$VAR` refs and all. Reload what the
             // daemon would load at startup, or every env-ref server looks changed.
             let config = crate::config::load_config(Some(&config_path.to_path_buf()))?;
             let report = crate::reload::apply_reload(self, config).await?;
-            (result, report)
+            if let Some((name, server)) = before {
+                let config = self.config.load_full();
+                let _ = tokio::task::spawn_blocking(move || {
+                    crate::secrets::Stores::current().forget(
+                        &name,
+                        &server,
+                        config.servers.values(),
+                    );
+                })
+                .await;
+            }
+            (result, report, kept_for)
         };
-        if let Some((name, server)) = before {
-            let config = self.config.load_full();
-            let _ = tokio::task::spawn_blocking(move || {
-                crate::secrets::Stores::current().forget(&name, &server, config.servers.values());
-            })
-            .await;
-        }
         // A new value under a name the config already held leaves the file as
         // it was, so the reload saw nothing to restart.
         if let Some(name) = kept_for
@@ -2242,6 +2261,38 @@ FROM_ENV = "$HOME"
         assert_eq!(
             file.get("twice.API_TOKEN").unwrap().unwrap().as_str(),
             "typed-for-the-file"
+        );
+
+        // A refused change and an accepted one at the same moment: the
+        // refused one must not undo the key the accepted one stored.
+        let with = |value: &str| {
+            let mut server = server();
+            server.env.insert("API_TOKEN".into(), value.into());
+            server
+        };
+        let (refused, accepted) = tokio::join!(
+            engine.apply_operator_mutation_keeping(
+                &path,
+                crate::operator::OperatorMutation::AddServer {
+                    name: "twice".into(),
+                    server: with("refused"),
+                },
+                Some(crate::secrets::FILE),
+            ),
+            engine.apply_operator_mutation_keeping(
+                &path,
+                crate::operator::OperatorMutation::UpdateServer {
+                    name: "twice".into(),
+                    server: with("accepted"),
+                },
+                Some(crate::secrets::FILE),
+            ),
+        );
+        refused.unwrap_err();
+        accepted.unwrap();
+        assert_eq!(
+            file.get("twice.API_TOKEN").unwrap().unwrap().as_str(),
+            "accepted"
         );
 
         // 1Password is read, never written, so it is not a place to keep a key.

@@ -73,6 +73,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A server's bearer token and an environment entry named `token` no longer
+  share one stored key, and a refused change puts each key back exactly as
+  it was. A whole server change, keys included, now happens one at a time,
+  so two changes at once cannot undo each other's keys.
+- A watch calls a tool on a timer only when the server itself marks the tool
+  read-only. A tool the server says nothing about needs `allow_writes`, as a
+  writing tool does; before, a harmless-looking name was enough.
+- A large result Plug set aside stays out of reach of a client kept from its
+  server or tool even after the tool is renamed or the server is removed.
+- Saving the config writes servers in name order, so the file no longer
+  reshuffles on every save.
 - Setting up a client whose config file is YAML that cannot be read leaves
   the file alone and says so, where before Plug wrote a fresh file over it.
 - One watched tool that is slow to answer no longer holds up the other
