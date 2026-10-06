@@ -15,6 +15,8 @@ struct ServerDetailView: View {
     let onRemove: () -> Void
     @State private var confirmSignOut = false
     @State private var showsOffOnly = false
+    /// Where this server's own settings are. Nil until Plug has read them.
+    @State private var settingsPlace: ServerSettingsPlace?
 
     var body: some View {
         DetailForm {
@@ -35,6 +37,7 @@ struct ServerDetailView: View {
             if !recentCalls.isEmpty { recent }
             tools
         }
+        .task(id: server.name) { await findSettingsPlace() }
         .confirmationDialog(
             "Sign out of \(server.name)?",
             isPresented: $confirmSignOut,
@@ -124,6 +127,18 @@ struct ServerDetailView: View {
     private var details: some View {
         Section("Details") {
             LabeledContent("Runs", value: server.transportLabel)
+            if let settingsPlace {
+                LabeledContent("Settings") {
+                    HStack(spacing: Metric.snug) {
+                        Text(settingsPlace.label())
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Button(settingsPlace.actionTitle) {
+                            if settingsPlace == .plug { run(.editServer(server.name)) } else { settingsPlace.open() }
+                        }
+                    }
+                }
+            }
             if server.usesOAuth, server.health != .signInNeeded {
                 LabeledContent("Account", value: accountLabel)
             }
@@ -137,6 +152,15 @@ struct ServerDetailView: View {
                 .fixedSize(horizontal: false, vertical: true)
             }
         }
+    }
+
+    private func findSettingsPlace() async {
+        settingsPlace = nil
+        guard let config = try? await model.serverConfig(name: server.name) else { return }
+        let described = (try? await model.serverDescriptions()) ?? []
+        let website = described.first { $0.serverId == server.name }?.upstream?.websiteUrl
+        guard !Task.isCancelled else { return }
+        settingsPlace = ServerSettingsPlace.find(config: config, website: website)
     }
 
     private var accountLabel: String {
