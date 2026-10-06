@@ -77,6 +77,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A script that connects on this Mac is called by its own name, or by its
+  folder when the file is a `main.py`. It showed as `python3` or `node`,
+  the same as every other script.
 - A task's large result is kept with the tool the task ran, so a client is
   kept from it only when it is kept from that tool. A client with a block on
   anything used to be refused every such result.
