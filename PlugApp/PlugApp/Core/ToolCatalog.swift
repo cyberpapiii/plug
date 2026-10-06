@@ -86,6 +86,16 @@ struct ToolCatalog: Equatable, Sendable {
     }
 
     var isEmpty: Bool { tools.isEmpty }
+
+    /// The names a server's tools are filed under for clients, in order.
+    /// More than one means Plug splits the server into groups.
+    static func groups(ofNames names: [String]) -> [String] {
+        Set(names.compactMap { name in
+            name.range(of: "__").map { String(name[..<$0.lowerBound]) }
+        })
+        .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
+
     var onCount: Int { tools.filter(\.isOn).count }
     var offCount: Int { tools.count - onCount }
 

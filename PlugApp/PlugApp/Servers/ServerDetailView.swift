@@ -142,6 +142,12 @@ struct ServerDetailView: View {
             if server.usesOAuth, server.health != .signInNeeded {
                 LabeledContent("Account", value: accountLabel)
             }
+            if toolGroups.count > 1 {
+                LabeledContent("Clients See") {
+                    Text(toolGroups.joined(separator: ", "))
+                        .multilineTextAlignment(.trailing)
+                }
+            }
             ForEach(server.authWarnings, id: \.self) { warning in
                 Label {
                     Text(warning)
@@ -212,6 +218,8 @@ struct ServerDetailView: View {
     // MARK: - Tools
 
     private var allTools: [ToolFacts] { model.toolCatalog.tools(for: server.name) }
+    /// The groups this server's tools are split into, when there are several.
+    private var toolGroups: [String] { ToolCatalog.groups(ofNames: allTools.map(\.name)) }
     private var offCount: Int { allTools.filter { !$0.isOn }.count }
 
     private var shownTools: [ToolFacts] {
