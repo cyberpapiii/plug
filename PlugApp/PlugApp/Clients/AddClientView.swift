@@ -97,6 +97,10 @@ enum AddClient {
         return "\(place), add a connector or MCP server and paste this address. Plug then opens a page asking you to approve it.\(reach)"
     }
 
+    /// What the key of a client the owner made up starts with. The daemon
+    /// knows the same word.
+    static let customPrefix = "custom:"
+
     /// The target a client the owner named connects as, which is also the
     /// key its name is stored under. Nil when the name has nothing to make
     /// one from. The daemon accepts lowercase letters, digits and hyphens.
@@ -107,7 +111,7 @@ enum AddClient {
             .split(separator: "-", omittingEmptySubsequences: true)
             .joined(separator: "-")
             .prefix(40)
-        return slug.isEmpty ? nil : "custom:\(slug)"
+        return slug.isEmpty ? nil : customPrefix + slug
     }
 
     /// What follows Plug's command. A target makes the client its own row.
@@ -209,6 +213,16 @@ struct AddClientView: View {
                     if namesIt {
                         TextField("Name", text: $name, prompt: Text("What you call it"))
                             .onChange(of: name) { copied = nil }
+                        if let customTarget {
+                            LabeledContent("Icon") {
+                                HStack(spacing: Metric.snug) {
+                                    AppGlyph(target: customTarget, name: name, size: 22)
+                                    Button("Choose…") {
+                                        IconStore.shared.chooseIcon(for: IconStore.key(client: customTarget))
+                                    }
+                                }
+                            }
+                        }
                     }
                     if ways.count > 1 {
                         VStack(alignment: .leading, spacing: Metric.rowGap) {
@@ -290,7 +304,7 @@ struct AddClientView: View {
         guard chosen == .other else { return "" }
         return customTarget == nil
             ? "It shows in Clients the first time it connects, where you can name it and choose its icon."
-            : "It shows in Clients under that name the first time it connects, where you can choose its icon."
+            : "It shows in Clients under that name and icon the first time it connects."
     }
 
     /// The name is stored when the command is copied, so the client has it
