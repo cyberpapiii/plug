@@ -5121,6 +5121,16 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     blocked(&["other__commit"]);
     assert!(router.client_may_use_tool(key, "git__commit"));
 
+    // A result too large to send is kept as an artifact; the block on the
+    // tool covers that too.
+    blocked(&["git__commit"]);
+    router.artifact_store.insert_for_test("kept", "git__commit");
+    let uri = "plug://artifact/kept/manifest";
+    let read = |key| futures::executor::block_on(router.read_resource(uri, key));
+    assert!(read(key).is_err());
+    assert!(read(Some("oauth:someone-else")).is_ok());
+    assert!(read(None).is_ok());
+
     // A tool block alone keeps the client from no server.
     assert!(!router.client_is_kept_from_a_server(key));
     let mut clients = std::collections::BTreeMap::new();
