@@ -91,6 +91,20 @@ pub(crate) struct RouterSnapshot {
 }
 
 impl RouterSnapshot {
+    /// Whether the tool listed as `name` only reads, so a watch may call it
+    /// again and again. What the server says about its own tool decides;
+    /// Plug's reading of the tool's name counts only when the server says
+    /// nothing, since a name like `get_and_clear` reads as harmless.
+    fn safe_to_repeat(&self, name: &str) -> bool {
+        let Some(risk) = self.tool_risk_inventory.get(name) else {
+            return false;
+        };
+        risk.upstream_declared
+            .read_only
+            .or(risk.effective.read_only)
+            .unwrap_or(false)
+    }
+
     /// Populate O(1) lookup indexes after routes/tools are finalized.
     pub(crate) fn with_indexes(mut self) -> Self {
         self.routes_lower = self
@@ -2928,11 +2942,7 @@ impl ToolRouter {
     pub fn own_tool(&self, merged_name: &str) -> Option<(String, bool)> {
         let snapshot = self.cache.load();
         let (_, own) = snapshot.resolve_route(merged_name)?.clone();
-        let read_only = snapshot
-            .tool_by_name(merged_name)
-            .and_then(|tool| tool.annotations.as_ref())
-            .and_then(|annotations| annotations.read_only_hint)
-            .unwrap_or(false);
+        let read_only = snapshot.safe_to_repeat(merged_name);
         Some((own, read_only))
     }
 
@@ -2945,13 +2955,7 @@ impl ToolRouter {
             .iter()
             .find(|(_, (route_server, route_tool))| route_server == server && route_tool == tool)
             .map(|(name, _)| name.clone())?;
-        let read_only = snapshot
-            .tools_by_name
-            .get(&name)
-            .and_then(|index| snapshot.tools_all.get(*index))
-            .and_then(|tool| tool.annotations.as_ref())
-            .and_then(|annotations| annotations.read_only_hint)
-            .unwrap_or(false);
+        let read_only = snapshot.safe_to_repeat(&name);
         Some((name, read_only))
     }
 

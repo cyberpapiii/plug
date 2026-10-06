@@ -196,6 +196,38 @@ fn a_listed_tool_gives_its_own_name_and_says_when_it_is_not_read_only() {
 }
 
 #[test]
+fn a_watch_takes_the_servers_word_over_the_tools_name() {
+    use rmcp::model::ToolAnnotations;
+    let hint = |read_only| {
+        let mut annotations = ToolAnnotations::default();
+        annotations.read_only_hint = Some(read_only);
+        annotations
+    };
+    let with = |declared: Option<bool>, effective: Option<bool>| {
+        let router = router_with_git_commit_tool();
+        let mut snapshot = (**router.cache.load()).clone();
+        snapshot.tool_risk_inventory.insert(
+            "git__commit".to_string(),
+            crate::ipc::IpcToolRiskInfo::from_annotations(
+                declared.map(hint).as_ref(),
+                None,
+                effective.map(hint).as_ref(),
+            ),
+        );
+        router.cache.store(Arc::new(snapshot));
+        router
+            .watched_tool("git", "commit")
+            .map(|(_, read_only)| read_only)
+    };
+    // The name reads as harmless, the server says the tool writes.
+    assert_eq!(with(Some(false), Some(true)), Some(false));
+    assert_eq!(with(Some(true), Some(true)), Some(true));
+    // A server that says nothing leaves it to the name.
+    assert_eq!(with(None, Some(true)), Some(true));
+    assert_eq!(with(None, None), Some(false));
+}
+
+#[test]
 fn get_info_returns_correct_server_info() {
     let sm = Arc::new(ServerManager::new());
     let handler = ProxyHandler::new(sm, test_router_config());

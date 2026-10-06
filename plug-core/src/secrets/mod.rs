@@ -216,7 +216,32 @@ pub fn looks_secret(key: &str) -> bool {
 
 /// The name Plug gives a secret it stores on a server's behalf: the server,
 /// a dot, and the field. Removing the server takes these with it.
+///
+/// A name that would lose something, a character Plug has to replace or a
+/// tail that does not fit, ends in a digest of the whole server and field,
+/// so two servers or two fields never share one.
 pub fn name_for(server: &str, field: &str) -> String {
+    let plain = format!("{server}.{field}");
+    let fits = |text: &str| {
+        text.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-'))
+    };
+    if fits(server) && fits(field) && plain.len() <= MAX_NAME {
+        return plain;
+    }
+    use sha2::{Digest, Sha256};
+    let digest = hex::encode(Sha256::digest(format!("{server}\0{field}")));
+    let mut name = readable_name(server, field);
+    name.truncate(MAX_NAME - NAME_DIGEST - 1);
+    format!("{name}.{}", &digest[..NAME_DIGEST])
+}
+
+const MAX_NAME: usize = 64;
+const NAME_DIGEST: usize = 12;
+
+/// The server and field with what a name cannot hold replaced, cut to fit.
+/// Names were once only this, so a stored secret may still go by it.
+fn readable_name(server: &str, field: &str) -> String {
     let safe = |text: &str| -> String {
         text.chars()
             .map(|c| {
@@ -229,8 +254,14 @@ pub fn name_for(server: &str, field: &str) -> String {
             .collect()
     };
     let mut name = format!("{}.{}", safe(server), safe(field));
-    name.truncate(64);
+    name.truncate(MAX_NAME);
     name
+}
+
+/// Whether `name` is one Plug made for `field` of `server`, now or under
+/// the older naming.
+fn made_for(server: &str, field: &str, name: &str) -> bool {
+    name == name_for(server, field) || name == readable_name(server, field)
 }
 
 /// A value a person typed, as opposed to a `$VAR`, a redaction placeholder,
@@ -423,6 +454,20 @@ impl Stores {
 
     /// [`Stores::keep`], into the store named `id` in place of the Keychain.
     pub fn keep_in(&self, id: &str, server_name: &str, server: &mut ServerConfig) -> Vec<String> {
+        self.keep_staged(id, server_name, server)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    }
+
+    /// [`Stores::keep_in`], also returning what each name held before, so a
+    /// change that is then refused can be undone with [`Stores::put_back`].
+    pub fn keep_staged(
+        &self,
+        id: &str,
+        server_name: &str,
+        server: &mut ServerConfig,
+    ) -> Vec<(String, Option<SecretString>)> {
         let Some(store) = self.get(id) else {
             return Vec::new();
         };
@@ -432,9 +477,18 @@ impl Stores {
                 return None;
             }
             let name = name_for(server_name, field);
+            // Without the old value there is no undoing this, so a store
+            // that cannot be read is not written to.
+            let before = match store.get(&name) {
+                Ok(before) => before,
+                Err(error) => {
+                    tracing::warn!(server = %server_name, %error, "secret stays in the config file");
+                    return None;
+                }
+            };
             match store.set(&name, &value.to_string().into()) {
                 Ok(()) => {
-                    kept.push(name.clone());
+                    kept.push((name.clone(), before));
                     Some(reference(id, &name))
                 }
                 Err(error) => {
@@ -458,25 +512,66 @@ impl Stores {
         kept
     }
 
-    /// Remove what [`Stores::keep`] stored for `server` and `now` no longer
-    /// refers to; `now` is `None` when the server is gone. A secret the
-    /// person named themselves may serve other servers, so it is left alone.
-    pub fn forget(&self, server_name: &str, server: &ServerConfig, now: Option<&ServerConfig>) {
-        fn values(server: &ServerConfig) -> impl Iterator<Item = &str> {
+    /// Undo [`Stores::keep_staged`] in the store named `id`: each name gets
+    /// back what it held, or is removed when it held nothing.
+    pub fn put_back(&self, id: &str, staged: Vec<(String, Option<SecretString>)>) {
+        let Some(store) = self.get(id) else {
+            return;
+        };
+        for (name, before) in staged {
+            let outcome = match &before {
+                Some(value) => store.set(&name, value),
+                None => store.remove(&name),
+            };
+            if let Err(error) = outcome {
+                tracing::warn!(secret = %name, %error, "could not undo a stored secret");
+            }
+        }
+    }
+
+    /// Remove what [`Stores::keep`] stored for `server` and no server in
+    /// `remaining`, the config as it now stands, refers to. A second account
+    /// refers to the secrets of the server it was copied from, and those
+    /// stay until the last of them is gone. A secret the person named
+    /// themselves may serve other servers, so it is left alone.
+    pub fn forget<'a>(
+        &self,
+        server_name: &str,
+        server: &ServerConfig,
+        remaining: impl IntoIterator<Item = &'a ServerConfig>,
+    ) {
+        fn fields(server: &ServerConfig) -> impl Iterator<Item = (&str, &str)> {
             server
                 .auth_token
                 .iter()
-                .map(|token| token.as_str())
-                .chain(server.env.values().map(String::as_str))
+                .map(|token| ("token", token.as_str()))
+                .chain(
+                    server
+                        .env
+                        .iter()
+                        .map(|(key, value)| (key.as_str(), value.as_str())),
+                )
         }
-        let prefix = name_for(server_name, "");
-        for value in values(server) {
-            if now.is_some_and(|now| values(now).any(|kept| kept == value)) {
+        let in_use: std::collections::HashSet<&str> = remaining
+            .into_iter()
+            .flat_map(|server| fields(server).map(|(_, value)| value))
+            .collect();
+        // An account copy is named `<server>-<account>` and holds the
+        // secrets made for `<server>`.
+        let owners = [
+            Some(server_name),
+            server_name.rsplit_once('-').map(|(base, _)| base),
+        ];
+        for (field, value) in fields(server) {
+            if in_use.contains(value) {
                 continue;
             }
             if let Some((id, name)) = self.parse(value)
                 && (id == KEYCHAIN || id == FILE)
-                && name.starts_with(&prefix)
+                && owners
+                    .iter()
+                    .flatten()
+                    .any(|owner| made_for(owner, field, name))
                 && let Some(store) = self.get(id)
                 && let Err(error) = store.remove(name)
             {
@@ -764,7 +859,7 @@ OPENAI_API_KEY = "keychain:mine"
 "#,
         );
         assert_eq!(stores.plaintext(&config), ["token", "GITHUB_TOKEN"]);
-        let mut kept = stores.keep("my server", &mut config);
+        let mut kept = stores.keep("my-server", &mut config);
         kept.sort();
         assert_eq!(kept, ["my-server.GITHUB_TOKEN", "my-server.token"]);
         assert_eq!(
@@ -784,17 +879,72 @@ OPENAI_API_KEY = "keychain:mine"
         );
         assert!(stores.plaintext(&config).is_empty());
         // A second pass has nothing left to move.
-        assert!(stores.keep("my server", &mut config).is_empty());
+        assert!(stores.keep("my-server", &mut config).is_empty());
 
         memory.set("mine", &"shared".to_string().into()).unwrap();
         let mut edited = config.clone();
         edited.auth_token = None;
-        stores.forget("my server", &config, Some(&edited));
+        stores.forget("my-server", &config, [&edited]);
         assert!(memory.get("my-server.token").unwrap().is_none());
         assert!(memory.get("my-server.GITHUB_TOKEN").unwrap().is_some());
-        stores.forget("my server", &config, None);
+        stores.forget("my-server", &config, []);
         assert!(memory.get("my-server.GITHUB_TOKEN").unwrap().is_none());
         assert!(memory.get("mine").unwrap().is_some());
+    }
+
+    #[test]
+    fn no_two_servers_or_fields_share_a_secret_name() {
+        // A plain name is kept as it is.
+        assert_eq!(name_for("github", "API_TOKEN"), "github.API_TOKEN");
+        // Names that read alike once punctuation is replaced.
+        assert_ne!(name_for("a.b", "token"), name_for("a-b", "token"));
+        assert_ne!(name_for("a b", "token"), name_for("a.b", "token"));
+        // A server name long enough to fill the whole name.
+        let long = "s".repeat(80);
+        let (one, two) = (name_for(&long, "API_TOKEN"), name_for(&long, "OTHER_KEY"));
+        assert_ne!(one, two);
+        for name in [one, two, name_for("a.b", "token")] {
+            assert!(valid_name(&name), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_secret_another_server_still_uses_is_not_removed() {
+        let memory = Arc::new(Memory::default());
+        let stores = Stores::default().with(KEYCHAIN, memory.clone());
+        let mut original = server("command = \"server\"\nauth_token = \"typed-token\"\n");
+        stores.keep("workspace", &mut original);
+        // A second account is a copy, references and all.
+        let copy = original.clone();
+
+        stores.forget("workspace", &original, [&copy]);
+        assert!(memory.get("workspace.token").unwrap().is_some());
+        // The copy is the last to go and takes the secret with it.
+        stores.forget("workspace-personal", &copy, []);
+        assert!(memory.get("workspace.token").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_stored_secret_can_be_put_back_as_it_was() {
+        let memory = Arc::new(Memory::default());
+        let stores = Stores::default().with(KEYCHAIN, memory.clone());
+        memory
+            .set("github.token", &"working".to_string().into())
+            .unwrap();
+        let mut config =
+            server("command = \"server\"\nauth_token = \"typed\"\n[env]\nAPI_KEY = \"new\"\n");
+        let staged = stores.keep_staged(KEYCHAIN, "github", &mut config);
+        assert_eq!(
+            memory.get("github.token").unwrap().unwrap().as_str(),
+            "typed"
+        );
+
+        stores.put_back(KEYCHAIN, staged);
+        assert_eq!(
+            memory.get("github.token").unwrap().unwrap().as_str(),
+            "working"
+        );
+        assert!(memory.get("github.API_KEY").unwrap().is_none());
     }
 
     #[test]

@@ -865,12 +865,24 @@ impl Engine {
         if ![crate::secrets::KEYCHAIN, crate::secrets::FILE].contains(&store) {
             anyhow::bail!("Plug cannot write keys to `{store}`; choose `keychain` or `file`");
         }
-        let (mutation, kept_for, before) = self
+        let (mutation, kept_for, before, staged) = self
             .keep_typed_secrets(config_path, mutation, store.to_string())
             .await;
         let (result, report) = {
             let _guard = self.reload_lock.lock().await;
-            let (_, result) = crate::operator::apply_operator_mutation(config_path, mutation)?;
+            let result = match crate::operator::apply_operator_mutation(config_path, mutation) {
+                Ok((_, result)) => result,
+                Err(error) => {
+                    // Nothing was saved, so the stores go back to what they
+                    // held: a refused change must not replace a working key.
+                    let store = store.to_string();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        crate::secrets::Stores::current().put_back(&store, staged);
+                    })
+                    .await;
+                    return Err(error);
+                }
+            };
             // The mutation persists the raw file, `$VAR` refs and all. Reload what the
             // daemon would load at startup, or every env-ref server looks changed.
             let config = crate::config::load_config(Some(&config_path.to_path_buf()))?;
@@ -878,9 +890,9 @@ impl Engine {
             (result, report)
         };
         if let Some((name, server)) = before {
-            let now = self.config.load().servers.get(&name).cloned();
+            let config = self.config.load_full();
             let _ = tokio::task::spawn_blocking(move || {
-                crate::secrets::Stores::current().forget(&name, &server, now.as_ref());
+                crate::secrets::Stores::current().forget(&name, &server, config.servers.values());
             })
             .await;
         }
@@ -916,13 +928,15 @@ impl Engine {
         crate::operator::OperatorMutation,
         Option<String>,
         Option<(String, ServerConfig)>,
+        Vec<(String, Option<crate::types::SecretString>)>,
     ) {
         use crate::operator::OperatorMutation;
         let keep = |name: String, mut server: ServerConfig| async move {
             let owner = name.clone();
             match tokio::task::spawn_blocking(move || {
-                let kept = crate::secrets::Stores::current().keep_in(&store, &owner, &mut server);
-                (server, !kept.is_empty())
+                let kept =
+                    crate::secrets::Stores::current().keep_staged(&store, &owner, &mut server);
+                (server, kept)
             })
             .await
             {
@@ -939,11 +953,16 @@ impl Engine {
         };
         match mutation {
             OperatorMutation::AddServer { name, server } => {
-                let server = match keep(name.clone(), server.clone()).await {
-                    Ok((_, kept, _)) => kept,
-                    Err(_) => server,
+                let (server, staged) = match keep(name.clone(), server.clone()).await {
+                    Ok((_, server, staged)) => (server, staged),
+                    Err(_) => (server, Vec::new()),
                 };
-                (OperatorMutation::AddServer { name, server }, None, None)
+                (
+                    OperatorMutation::AddServer { name, server },
+                    None,
+                    None,
+                    staged,
+                )
             }
             OperatorMutation::UpdateServer { name, mut server } => {
                 let before = before(&name);
@@ -953,24 +972,30 @@ impl Engine {
                 if let Ok(file) = crate::operator::load_editable_config(config_path) {
                     server.restore_redacted_secrets(file.servers.get(&name));
                 }
-                let (server, kept) = match keep(name.clone(), server.clone()).await {
-                    Ok((_, server, kept)) => (server, kept),
-                    Err(_) => (server, false),
+                let (server, staged) = match keep(name.clone(), server.clone()).await {
+                    Ok((_, server, staged)) => (server, staged),
+                    Err(_) => (server, Vec::new()),
                 };
                 (
                     OperatorMutation::UpdateServer {
                         name: name.clone(),
                         server,
                     },
-                    kept.then_some(name),
+                    (!staged.is_empty()).then_some(name),
                     before,
+                    staged,
                 )
             }
             OperatorMutation::RemoveServer { name } => {
                 let before = before(&name);
-                (OperatorMutation::RemoveServer { name }, None, before)
+                (
+                    OperatorMutation::RemoveServer { name },
+                    None,
+                    before,
+                    Vec::new(),
+                )
             }
-            other => (other, None, None),
+            other => (other, None, None, Vec::new()),
         }
     }
 
@@ -2194,6 +2219,30 @@ FROM_ENV = "$HOME"
             .await
             .unwrap();
         assert!(file.get("filed.API_TOKEN").unwrap().is_none());
+
+        // A second server of the same name is refused, and the key the
+        // first one works with is still the one stored.
+        engine
+            .apply_operator_mutation_keeping(&path, add("twice"), Some(crate::secrets::FILE))
+            .await
+            .unwrap();
+        let mut other = server();
+        other.env.insert("API_TOKEN".into(), "typed-again".into());
+        engine
+            .apply_operator_mutation_keeping(
+                &path,
+                crate::operator::OperatorMutation::AddServer {
+                    name: "twice".into(),
+                    server: other,
+                },
+                Some(crate::secrets::FILE),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            file.get("twice.API_TOKEN").unwrap().unwrap().as_str(),
+            "typed-for-the-file"
+        );
 
         // 1Password is read, never written, so it is not a place to keep a key.
         let error = engine
