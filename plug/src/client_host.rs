@@ -36,6 +36,9 @@ pub(crate) fn current() -> Option<ClientHost> {
             let mut host = describe(executable);
             if is_interpreter(executable) {
                 host.script = command_line(pid).as_deref().and_then(script_of);
+                if let Some(name) = host.script.as_deref().and_then(script_name) {
+                    host.name = name;
+                }
             }
             Some(host)
         })
@@ -93,6 +96,40 @@ fn script_of(command_line: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// File and folder names that say nothing about whose script it is.
+const PLAIN_NAMES: &[&str] = &[
+    "main", "index", "agent", "server", "app", "run", "cli", "start", "mcp", "__main__", "src",
+    "bin", "dist", "build", "lib", "scripts",
+];
+
+/// What to call a client known only by its script: `python3` names every
+/// script alike. The file's own name, or the nearest folder with a name of
+/// its own when the file is a `main.py`; for a module, its package.
+fn script_name(script: &str) -> Option<String> {
+    let mut parts = script.rsplit('/').filter(|part| !part.is_empty());
+    let file = parts.next()?;
+    let own = if script.contains('/') {
+        file.rsplit_once('.').map_or(file, |(stem, _)| stem)
+    } else {
+        // `-m package.module`, or a script named without a folder.
+        match file.rsplit_once('.') {
+            Some((package, last)) if PLAIN_NAMES.contains(&last) => {
+                package.split('.').next().unwrap_or(package)
+            }
+            Some((stem, "py" | "js" | "mjs" | "cjs" | "ts" | "rb" | "pl")) => stem,
+            Some((package, _)) => package.split('.').next().unwrap_or(package),
+            None => file,
+        }
+    };
+    let plain = |name: &str| PLAIN_NAMES.contains(&name) || name.starts_with('.');
+    let name = if plain(own) {
+        parts.find(|part| !plain(part)).unwrap_or(own)
+    } else {
+        own
+    };
+    (!name.is_empty()).then(|| name.to_string())
 }
 
 /// The host of `pid` in a `ps -axo pid=,ppid=,comm=` listing.
@@ -212,6 +249,24 @@ mod tests {
         );
         assert_eq!(script_of("node -e console.log(1)"), None);
         assert_eq!(script_of("python3"), None);
+    }
+
+    #[test]
+    fn a_script_is_called_by_its_own_name_not_its_interpreters() {
+        let name = |script| script_name(script).unwrap();
+        assert_eq!(
+            name("/Users/me/radar/housing-listing-radar.py"),
+            "housing-listing-radar"
+        );
+        // A `main.py` is named by the folder that holds it.
+        assert_eq!(name("/opt/hermes/agent.py"), "hermes");
+        assert_eq!(name("/Users/me/code/radar/src/main.ts"), "radar");
+        assert_eq!(name("/Users/me/.hermes/bin/hermes"), "hermes");
+        // A module is named by its package.
+        assert_eq!(name("hermes.agent"), "hermes");
+        assert_eq!(name("hermes.gateway.worker"), "hermes");
+        assert_eq!(name("main.ts"), "main");
+        assert_eq!(name("radar.py"), "radar");
     }
 
     #[test]

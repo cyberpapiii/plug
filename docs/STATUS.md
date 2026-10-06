@@ -15,12 +15,12 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Agreed with the owner on 2026-10-05. No release until the first four are in.
 Remove a line when it lands.
 
-1. Paper cuts. With the sidebar collapsed, the window's title and count
-   overlap the first column. Add others here as the owner reports them.
-2. Client audit. Remove clients that are stale or gone (Windsurf is one;
-   find where the app still shows it). Tell GrokBot from Cursor: the owner
-   has GrokBot make a few tool calls, and its id is read off them. Name the
-   connections that show as `python3` (Hermes Agent).
+1. Paper cuts. None open: the title and count were checked with the sidebar
+   collapsed on 2026-10-06 and fit the first column. Add others here as the
+   owner reports them.
+2. Client audit. Tell GrokBot from Cursor: the owner has GrokBot make a few
+   tool calls, and its id is read off them. Windsurf was looked for on
+   2026-10-06 and shows nowhere; it is Devin throughout.
 3. Naming layer, what is left of the check-up: an agent sees the account
    label the owner typed, not the address that is signed in, and renames
    are still config-only. Issue #301.
