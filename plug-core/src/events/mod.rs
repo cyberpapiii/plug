@@ -603,7 +603,15 @@ impl WatchEvents {
     /// `due` when it is next due. Does not wait for the checks: a tool that
     /// is slow to answer delays neither the watches due with it nor anyone's
     /// next round. A watch still being checked from last time is left alone.
-    fn check_due(self: &Arc<Self>, watches: &[WatchConfig], due: &mut HashMap<String, u64>) {
+    /// A check ends with `cancel`, and one that had to wait its turn runs
+    /// only if its watch is still configured as it was: a watch the owner
+    /// removed or changed meanwhile must not call its tool once more.
+    fn check_due(
+        self: &Arc<Self>,
+        watches: &[WatchConfig],
+        due: &mut HashMap<String, u64>,
+        cancel: &CancellationToken,
+    ) {
         for watch in watches {
             let event = watch.event_name();
             if due.get(&event).is_some_and(|at| *at > now()) {
@@ -622,13 +630,24 @@ impl WatchEvents {
                 event,
             };
             let watch = watch.clone();
+            let cancel = cancel.clone();
             tokio::spawn(async move {
                 let events = &checking.events;
-                let Ok(_slot) = events.check_slots.acquire().await else {
-                    return;
+                let check = async {
+                    let Ok(_slot) = events.check_slots.acquire().await else {
+                        return;
+                    };
+                    if !events.access.watches().contains(&watch) {
+                        return;
+                    }
+                    if let Err(error) = events.check(&watch).await {
+                        tracing::warn!(code = error.code, "watch paused");
+                    }
                 };
-                if let Err(error) = events.check(&watch).await {
-                    tracing::warn!(code = error.code, "watch paused");
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => {}
+                    _ = check => {}
                 }
             });
         }
@@ -836,6 +855,7 @@ impl WatchEvents {
         tokio::spawn(async move {
             // When each watch is next due. A watch added later is due at once.
             let mut due: HashMap<String, u64> = HashMap::new();
+            let checks = cancel.clone();
             loop {
                 tokio::select! {
                     biased;
@@ -846,7 +866,7 @@ impl WatchEvents {
                         if let Err(error) = events.prune().await {
                             tracing::warn!(code = error.code, "event state unavailable");
                         }
-                        events.check_due(&watches, &mut due);
+                        events.check_due(&watches, &mut due, &checks);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } => {}
                 }

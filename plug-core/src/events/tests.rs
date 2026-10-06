@@ -279,11 +279,13 @@ async fn a_tool_that_does_not_answer_does_not_hold_up_the_other_watches() {
     };
     *access.stuck.lock().unwrap() = Some("mail__search".into());
     let watches = vec![slow, watch()];
+    *access.watches.lock().unwrap() = watches.clone();
+    let cancel = CancellationToken::new();
     let mut due = HashMap::new();
     let settle = || tokio::time::sleep(Duration::from_millis(100));
 
     // Starting a round never waits on a tool.
-    events.check_due(&watches, &mut due);
+    events.check_due(&watches, &mut due, &cancel);
     settle().await;
     assert_eq!(access.calls.load(Ordering::SeqCst), 2);
     assert!(
@@ -297,8 +299,66 @@ async fn a_tool_that_does_not_answer_does_not_hold_up_the_other_watches() {
     // other watch gets its next check on time, and the stuck tool is not
     // called a second time on top of the first.
     due.clear();
-    events.check_due(&watches, &mut due);
+    events.check_due(&watches, &mut due, &cancel);
     settle().await;
     assert_eq!(access.calls.load(Ordering::SeqCst), 3);
     assert!(!due.contains_key("mail.slow"), "still on its first check");
+}
+
+/// Start a check of the one configured watch while every slot is taken, let
+/// `meanwhile` happen, free the slots, and say how often the tool was called.
+async fn calls_after_waiting_for_a_turn(
+    meanwhile: impl FnOnce(&FakeAccess, &CancellationToken),
+) -> u64 {
+    let (_dir, events, access, _sender) = fixture();
+    let cancel = CancellationToken::new();
+    let slots = events
+        .check_slots
+        .clone()
+        .acquire_many_owned(CHECKS_AT_ONCE as u32)
+        .await
+        .unwrap();
+    events.check_due(&[watch()], &mut HashMap::new(), &cancel);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(access.calls.load(Ordering::SeqCst), 0, "still waiting");
+    meanwhile(&access, &cancel);
+    drop(slots);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    access.calls.load(Ordering::SeqCst)
+}
+
+#[tokio::test]
+async fn a_watch_waiting_its_turn_runs_only_if_it_is_still_wanted() {
+    assert_eq!(calls_after_waiting_for_a_turn(|_, _| {}).await, 1);
+    // Removed while it waited.
+    let removed = |access: &FakeAccess, _: &CancellationToken| {
+        access.watches.lock().unwrap().clear();
+    };
+    assert_eq!(calls_after_waiting_for_a_turn(removed).await, 0);
+    // Changed while it waited: the old arguments are not called once more.
+    let changed = |access: &FakeAccess, _: &CancellationToken| {
+        let mut arguments = Map::new();
+        arguments.insert("folder".into(), json!("other"));
+        *access.watches.lock().unwrap() = vec![WatchConfig {
+            arguments,
+            ..watch()
+        }];
+    };
+    assert_eq!(calls_after_waiting_for_a_turn(changed).await, 0);
+    // Plug is shutting down.
+    let stopped = |_: &FakeAccess, cancel: &CancellationToken| cancel.cancel();
+    assert_eq!(calls_after_waiting_for_a_turn(stopped).await, 0);
+}
+
+#[tokio::test]
+async fn shutting_down_ends_a_check_that_is_under_way() {
+    let (_dir, events, access, _sender) = fixture();
+    *access.stuck.lock().unwrap() = Some("mail__unread".into());
+    let cancel = CancellationToken::new();
+    events.check_due(&[watch()], &mut HashMap::new(), &cancel);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(events.checking.lock().unwrap().len(), 1);
+    cancel.cancel();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(events.checking.lock().unwrap().is_empty());
 }

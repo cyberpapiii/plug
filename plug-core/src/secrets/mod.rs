@@ -261,22 +261,24 @@ fn readable_name(server: &str, field: &str) -> String {
 /// Whether `name` is one Plug made for `field` of `server`, now or under
 /// the older naming.
 fn made_for(server: &str, field: &str, name: &str) -> bool {
-    // An `env` entry called `token` once shared the bearer token's name.
-    let field_then = if field == ENV_TOKEN { "token" } else { field };
+    // An `env` entry stored under a marked name once went by its own.
+    let field_then = field.strip_prefix(ENV_MARK).unwrap_or(field);
     name == name_for(server, field) || name == readable_name(server, field_then)
 }
 
-/// The field an `env` entry is stored under: its own name, except the one
-/// name the bearer token already goes by.
+/// The field an `env` entry is stored under. Its own name, except that an
+/// entry called `token` would take the bearer token's name, so it is marked
+/// as an `env` entry. An entry whose name already starts with the mark is
+/// marked again, so no two entries can come out the same.
 fn env_field(key: &str) -> Cow<'_, str> {
-    if key == "token" {
-        Cow::Borrowed(ENV_TOKEN)
+    if key == "token" || key.starts_with(ENV_MARK) {
+        Cow::Owned(format!("{ENV_MARK}{key}"))
     } else {
         Cow::Borrowed(key)
     }
 }
 
-const ENV_TOKEN: &str = "env.token";
+const ENV_MARK: &str = "env.";
 
 /// A value a person typed, as opposed to a `$VAR`, a redaction placeholder,
 /// or nothing.
@@ -1000,6 +1002,34 @@ OPENAI_API_KEY = "keychain:mine"
         stores.forget("github", &config, []);
         assert_eq!(read("github.token"), None);
         assert_eq!(read(&env_name), None);
+    }
+
+    #[test]
+    fn no_two_fields_of_a_server_share_a_stored_name() {
+        let memory = Arc::new(Memory::default());
+        let stores = Stores::default().with(KEYCHAIN, memory.clone());
+        // An entry spelled like the name another entry is stored under.
+        let mut config = server(
+            "command = \"server\"\nauth_token = \"a\"\n[env]\ntoken = \"b\"\n\"env.token\" = \"c\"\n\"env.env.token\" = \"d\"\n",
+        );
+        let staged = stores.keep_staged(KEYCHAIN, "github", &mut config);
+        assert_eq!(staged.len(), 4);
+        let mut values: Vec<String> = [&config.auth_token.clone().unwrap().as_str().to_string()]
+            .into_iter()
+            .chain(config.env.values())
+            .map(|reference| {
+                let name = reference.split_once(':').unwrap().1;
+                memory.get(name).unwrap().unwrap().as_str().to_string()
+            })
+            .collect();
+        values.sort();
+        assert_eq!(values, ["a", "b", "c", "d"]);
+        stores.forget("github", &config, []);
+        assert!(
+            staged
+                .iter()
+                .all(|(name, _)| memory.get(name).unwrap().is_none())
+        );
     }
 
     #[test]

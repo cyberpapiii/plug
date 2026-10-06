@@ -192,6 +192,10 @@ impl StatefulSessionStore {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             if entry.last_activity.elapsed() > self.timeout {
                 remove_session = true;
+            } else if entry.still_allowed.as_ref().is_some_and(|check| !check()) {
+                drop(entry);
+                self.end(session_id);
+                return SessionSendOutcome::SessionNotFound;
             } else if let Some(sender) = entry.sse_sender.clone() {
                 let event = Self::next_event(&mut entry, message);
                 match sender.try_send(event.clone()) {
@@ -901,6 +905,27 @@ mod tests {
         // Nobody ended these sessions by name. Access went away underneath.
         allowed.store(false, Ordering::SeqCst);
         assert!(store.validate(&used).is_err(), "ended when next used");
+        // A message meant for one session alone is held back as well.
+        let sent_to = store.create_session().unwrap();
+        let (stream, mut events) = mpsc::channel(4);
+        store.set_sse_sender(&sent_to, stream, None).unwrap();
+        let allowed_too = Arc::clone(&allowed);
+        store
+            .set_access_check(
+                &sent_to,
+                Arc::new(move || allowed_too.load(Ordering::SeqCst)),
+            )
+            .unwrap();
+        let message = crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap();
+        assert!(matches!(
+            store.send_to_live_session(&sent_to, message),
+            SessionSendOutcome::SessionNotFound
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Err(mpsc::error::TryRecvError::Disconnected)
+        ));
+
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap(),
             crate::session::BroadcastKind::ToolList,
@@ -911,9 +936,9 @@ mod tests {
             "the idle one ended at the next send"
         );
         assert!(store.validate(&other).is_ok());
-        let mut cleaned = vec![rx.try_recv().unwrap(), rx.try_recv().unwrap()];
+        let mut cleaned: Vec<String> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         cleaned.sort();
-        let mut expected = vec![used, idle];
+        let mut expected = vec![used, idle, sent_to];
         expected.sort();
         assert_eq!(cleaned, expected);
     }
