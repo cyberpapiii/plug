@@ -10,6 +10,8 @@ struct FakeAccess {
     read_only: AtomicBool,
     permitted: AtomicBool,
     calls: AtomicU64,
+    /// A tool that never answers.
+    stuck: std::sync::Mutex<Option<String>>,
 }
 #[async_trait::async_trait]
 impl WatchAccess for FakeAccess {
@@ -28,8 +30,11 @@ impl WatchAccess for FakeAccess {
             self.read_only.load(Ordering::SeqCst),
         ))
     }
-    async fn call(&self, _: &str, _: Map<String, Value>) -> Option<Value> {
+    async fn call(&self, tool: &str, _: Map<String, Value>) -> Option<Value> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        if self.stuck.lock().unwrap().as_deref() == Some(tool) {
+            std::future::pending::<()>().await;
+        }
         self.result.lock().unwrap().clone()
     }
 }
@@ -82,6 +87,7 @@ fn fixture() -> (
         read_only: AtomicBool::new(true),
         permitted: AtomicBool::new(true),
         calls: AtomicU64::new(0),
+        stuck: std::sync::Mutex::new(None),
     });
     let sender = Arc::new(FakeDelivery::default());
     sender.status.store(200, Ordering::SeqCst);
@@ -261,4 +267,30 @@ fn config_rejects_bad_names_short_intervals_and_duplicates() {
         .validate()
         .is_empty()
     );
+}
+
+#[tokio::test]
+async fn a_tool_that_does_not_answer_does_not_hold_up_the_other_watches() {
+    let (_dir, events, access, _sender) = fixture();
+    let slow = WatchConfig {
+        name: "slow".into(),
+        tool: "search".into(),
+        ..watch()
+    };
+    *access.stuck.lock().unwrap() = Some("mail__search".into());
+    let watches = vec![slow, watch()];
+    let mut due = HashMap::new();
+
+    let round = events.check_due(&watches, &mut due);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(200), round)
+            .await
+            .is_err(),
+        "the stuck tool is still being waited on"
+    );
+    // The watch listed after the stuck one was checked all the same.
+    assert_eq!(access.calls.load(Ordering::SeqCst), 2);
+    let checked = events.checked.lock().unwrap();
+    assert!(checked["mail.inbox"].last_checked.is_some());
+    assert!(!checked.contains_key("mail.slow"));
 }

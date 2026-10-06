@@ -1479,8 +1479,20 @@ fn merge_json_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
 }
 
 fn merge_yaml_config(existing: &str, snippet: &str) -> anyhow::Result<String> {
-    let mut existing_yml: serde_norway::Value = serde_norway::from_str(existing)
-        .unwrap_or_else(|_| serde_norway::Value::Mapping(serde_norway::Mapping::new()));
+    // A file that cannot be read as YAML is left as it is: writing a fresh
+    // one over it would throw away whatever the person had there.
+    let mut existing_yml: serde_norway::Value = if existing.trim().is_empty() {
+        serde_norway::Value::Mapping(serde_norway::Mapping::new())
+    } else {
+        serde_norway::from_str(existing)
+            .ok()
+            .filter(serde_norway::Value::is_mapping)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "the client's config file is not valid YAML, so Plug left it alone; fix or move the file and try again"
+                )
+            })?
+    };
     let snippet_yml: serde_norway::Value = serde_norway::from_str(snippet)?;
 
     if let (Some(e_map), Some(s_map)) = (existing_yml.as_mapping_mut(), snippet_yml.as_mapping()) {
@@ -2418,6 +2430,18 @@ port = 4444
             unlink_yaml(existing, "extensions"),
             "extensions:\n  other:\n    type: stdio\n    command: other\n"
         );
+    }
+
+    #[test]
+    fn a_config_file_that_is_not_yaml_is_left_alone() {
+        let snippet = "extensions:\n  plug:\n    type: stdio\n";
+        for broken in ["extensions: [unclosed\n", "- a\n- list\n", "just text"] {
+            let error = merge_yaml_config(broken, snippet).unwrap_err();
+            assert!(error.to_string().contains("left it alone"), "{error}");
+        }
+        // No file yet, or an empty one, is a fresh start.
+        assert!(merge_yaml_config("", snippet).unwrap().contains("plug"));
+        assert!(merge_yaml_config("\n", snippet).unwrap().contains("plug"));
     }
 
     #[test]

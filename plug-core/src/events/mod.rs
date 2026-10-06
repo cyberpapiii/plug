@@ -576,6 +576,29 @@ impl WatchEvents {
         Ok(())
     }
 
+    /// Check each of `watches` whose time has come and note in `due` when it
+    /// is next due. Side by side, so one slow tool does not hold up the
+    /// watches that are due with it.
+    async fn check_due(&self, watches: &[WatchConfig], due: &mut HashMap<String, u64>) {
+        let ready: Vec<&WatchConfig> = watches
+            .iter()
+            .filter(|watch| {
+                let event = watch.event_name();
+                if due.get(&event).is_some_and(|at| *at > now()) {
+                    return false;
+                }
+                due.insert(event, now() + watch.every_secs.max(MIN_WATCH_SECS));
+                true
+            })
+            .collect();
+        let checks = ready.into_iter().map(|watch| self.check(watch));
+        for outcome in futures::future::join_all(checks).await {
+            if let Err(error) = outcome {
+                tracing::warn!(code = error.code, "watch paused");
+            }
+        }
+    }
+
     /// Call one watched tool and queue an event for each subscriber when its
     /// result differs from the last one. The first result is the baseline.
     async fn check(&self, watch: &WatchConfig) -> Result<(), EventError> {
@@ -788,16 +811,7 @@ impl WatchEvents {
                         if let Err(error) = events.prune().await {
                             tracing::warn!(code = error.code, "event state unavailable");
                         }
-                        for watch in &watches {
-                            let event = watch.event_name();
-                            if due.get(&event).is_some_and(|at| *at > now()) {
-                                continue;
-                            }
-                            due.insert(event, now() + watch.every_secs.max(MIN_WATCH_SECS));
-                            if let Err(error) = events.check(watch).await {
-                                tracing::warn!(code = error.code, "watch paused");
-                            }
-                        }
+                        events.check_due(&watches, &mut due).await;
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } => {}
                 }

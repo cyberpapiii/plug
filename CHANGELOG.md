@@ -73,6 +73,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Setting up a client whose config file is YAML that cannot be read leaves
+  the file alone and says so, where before Plug wrote a fresh file over it.
+- One watched tool that is slow to answer no longer holds up the other
+  watches that are due with it.
+- A secret store command that leaves a program running behind it no longer
+  hangs the read; it stops at the store's time limit.
 - A client kept from a tool can no longer read a large result of that tool
   that Plug set aside as a file.
 - An API server's key is not sent on when the API redirects to another port
