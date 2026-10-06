@@ -194,6 +194,13 @@ final class LinkableAppTests: XCTestCase {
         let local = try plug(AddClient.settingsEntry(command: "/Applications/Plug.app/Contents/Resources/plug"))
         XCTAssertEqual(local["command"] as? String, "/Applications/Plug.app/Contents/Resources/plug")
         XCTAssertEqual(local["args"] as? [String], ["connect"])
+
+        // A client the owner names connects under a key made from the name.
+        XCTAssertEqual(AddClient.customTarget(named: "  My Tool (v2)! "), "custom:my-tool-v2")
+        XCTAssertNil(AddClient.customTarget(named: " ?? "))
+        XCTAssertEqual(AddClient.customTarget(named: String(repeating: "a", count: 60))?.count, 47)
+        let named = try plug(AddClient.settingsEntry(command: "/plug", target: "custom:my-tool"))
+        XCTAssertEqual(named["args"] as? [String], ["connect", "--client", "custom:my-tool"])
         XCTAssertEqual(
             try plug(AddClient.settingsEntry(address: "https://plug.example.com/mcp"))["url"] as? String,
             "https://plug.example.com/mcp"
