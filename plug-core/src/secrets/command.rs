@@ -71,24 +71,43 @@ impl Command {
     }
 }
 
-/// Everything a pipe gives, read on its own thread so a full pipe never
-/// stalls the command.
 /// How long past the deadline a finished command's output may take to arrive.
 const PIPE_GRACE: Duration = Duration::from_millis(250);
 
-/// Read a pipe to its end on another thread. The bytes arrive on the
-/// channel, so the caller can stop waiting: a program the command started
-/// may hold the pipe open long after the command itself is done.
+/// The most a command may print. A key is small; anything near this is a
+/// command gone wrong, and Plug stops reading instead of holding it all.
+const MOST_OUTPUT: usize = 1024 * 1024;
+
+/// Read a pipe on another thread, up to one byte past [`MOST_OUTPUT`]. The
+/// bytes arrive on the channel, so the caller can stop waiting: a program
+/// the command started may hold the pipe open long after the command itself
+/// is done. Reading stops at the limit, which closes the pipe on whatever
+/// is still writing to it.
 fn drain(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<Vec<u8>> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         let mut bytes = Vec::new();
-        if let Some(mut pipe) = pipe {
-            let _ = pipe.read_to_end(&mut bytes);
+        if let Some(pipe) = pipe {
+            let _ = pipe.take(MOST_OUTPUT as u64 + 1).read_to_end(&mut bytes);
         }
         let _ = tx.send(bytes);
     });
     rx
+}
+
+/// Stop the command and everything it started. The command runs in its own
+/// process group, so this reaches a helper that would otherwise live on
+/// holding the pipes open.
+fn stop(child: &mut std::process::Child) {
+    #[cfg(unix)]
+    let _ = std::process::Command::new("/bin/kill")
+        .args(["-KILL", "--", &format!("-{}", child.id())])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl SecretStore for Command {
@@ -106,6 +125,8 @@ impl SecretStore for Command {
         if let Some(path) = LOGIN_PATH.get() {
             command.env("PATH", path);
         }
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 self.unavailable(format!("`{program}` is not installed"))
@@ -124,8 +145,7 @@ impl SecretStore for Command {
                     std::thread::sleep(Duration::from_millis(25));
                 }
                 Ok(None) => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    stop(&mut child);
                     return Err(SecretError::TimedOut {
                         store: self.id.clone(),
                     });
@@ -135,11 +155,16 @@ impl SecretStore for Command {
         };
         let left = || deadline.saturating_duration_since(Instant::now()) + PIPE_GRACE;
         let Ok(stdout) = stdout.recv_timeout(left()) else {
+            stop(&mut child);
             return Err(SecretError::TimedOut {
                 store: self.id.clone(),
             });
         };
         let stderr = stderr.recv_timeout(left()).unwrap_or_default();
+        if stdout.len() > MOST_OUTPUT {
+            stop(&mut child);
+            return Err(self.unavailable("the command printed far too much to be a key"));
+        }
 
         if !status.success() {
             // The tool's own first line says it best: locked, not signed in,
@@ -200,6 +225,44 @@ mod tests {
         );
         let silent = shell("true", Duration::from_secs(5));
         assert!(silent.get("github").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_command_that_prints_without_end_is_cut_off() {
+        let store = shell("yes", Duration::from_secs(5));
+        let started = Instant::now();
+        assert!(matches!(
+            store.get("github"),
+            Err(SecretError::Unavailable { .. } | SecretError::TimedOut { .. })
+        ));
+        assert!(started.elapsed() < Duration::from_secs(8));
+    }
+
+    #[test]
+    fn a_timed_out_command_takes_what_it_started_with_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid");
+        let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
+        let store = shell(&script, Duration::from_millis(400));
+        assert!(matches!(
+            store.get("github"),
+            Err(SecretError::TimedOut { .. })
+        ));
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        // `kill -0` asks only whether the process is still there.
+        let alive = || {
+            std::process::Command::new("/bin/kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        let gone_by = Instant::now() + Duration::from_secs(2);
+        while alive() && Instant::now() < gone_by {
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!alive(), "the helper outlived the command");
     }
 
     #[test]

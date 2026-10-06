@@ -33,6 +33,7 @@ struct SessionState {
     next_event_id: u64,
     client_type: crate::types::ClientType,
     grant: Option<String>,
+    still_allowed: Option<crate::session::AccessCheck>,
     broadcast_audience: crate::session::BroadcastAudience,
 }
 
@@ -157,8 +158,23 @@ impl StatefulSessionStore {
             self.remove_if_expired(session_id);
             return Err(HttpError::SessionNotFound);
         }
+        if entry.still_allowed.as_ref().is_some_and(|check| !check()) {
+            drop(entry);
+            self.end(session_id);
+            return Err(HttpError::SessionNotFound);
+        }
 
         Ok(f(&mut entry))
+    }
+
+    /// Remove a session and have the daemon release what it holds for it,
+    /// as for one that timed out.
+    fn end(&self, session_id: &str) -> bool {
+        let removed = self.sessions.remove(session_id).is_some();
+        if removed && let Some(tx) = &self.expiry_tx {
+            let _ = tx.send(session_id.to_owned());
+        }
+        removed
     }
 
     fn try_send_to_session(
@@ -396,6 +412,7 @@ impl SessionStore for StatefulSessionStore {
                 next_event_id: 1,
                 client_type: crate::types::ClientType::Unknown,
                 grant: None,
+                still_allowed: None,
                 broadcast_audience: crate::session::BroadcastAudience::default(),
             },
         );
@@ -454,6 +471,19 @@ impl SessionStore for StatefulSessionStore {
         Ok(())
     }
 
+    fn set_access_check(
+        &self,
+        session_id: &str,
+        check: crate::session::AccessCheck,
+    ) -> Result<(), HttpError> {
+        let mut entry = self
+            .sessions
+            .get_mut(session_id)
+            .ok_or(HttpError::SessionNotFound)?;
+        entry.still_allowed = Some(check);
+        Ok(())
+    }
+
     fn set_broadcast_audience(
         &self,
         session_id: &str,
@@ -483,7 +513,12 @@ impl SessionStore for StatefulSessionStore {
         removed
     }
 
-    fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
+    fn broadcast_where(
+        &self,
+        message: SseMessage,
+        kind: crate::session::BroadcastKind,
+        allowed: &dyn Fn(Option<&str>) -> bool,
+    ) {
         // Snapshot keys first so shard write locks are not held across every
         // try_send (DashMap `iter_mut` would pin the shard for the whole loop).
         let session_ids: Vec<String> = self
@@ -492,6 +527,7 @@ impl SessionStore for StatefulSessionStore {
             .map(|entry| entry.key().clone())
             .collect();
         let mut expired = Vec::new();
+        let mut ended = Vec::new();
         for session_id in session_ids {
             let Some(mut entry) = self.sessions.get_mut(&session_id) else {
                 continue;
@@ -500,9 +536,13 @@ impl SessionStore for StatefulSessionStore {
                 expired.push(session_id);
                 continue;
             }
+            if entry.still_allowed.as_ref().is_some_and(|check| !check()) {
+                ended.push(session_id);
+                continue;
+            }
             // Skipped before `next_event`, so a session that is not admitted
             // never burns an event id and its replay sequence stays dense.
-            if !entry.broadcast_audience.admits(kind) {
+            if !entry.broadcast_audience.admits(kind) || !allowed(entry.grant.as_deref()) {
                 continue;
             }
             let event = Self::next_event(&mut entry, message.clone());
@@ -521,6 +561,9 @@ impl SessionStore for StatefulSessionStore {
         }
         for session_id in expired {
             self.remove_if_expired(&session_id);
+        }
+        for session_id in ended {
+            self.end(&session_id);
         }
     }
 
@@ -588,15 +631,7 @@ impl SessionStore for StatefulSessionStore {
             .collect();
         ended
             .into_iter()
-            .filter(|session_id| {
-                let removed = self.sessions.remove(session_id).is_some();
-                // The listener releases what the daemon holds for the session,
-                // as it does for one that timed out.
-                if removed && let Some(tx) = &self.expiry_tx {
-                    let _ = tx.send(session_id.clone());
-                }
-                removed
-            })
+            .filter(|session_id| self.end(session_id))
             .count()
     }
 }
@@ -839,6 +874,79 @@ mod tests {
         assert_eq!(snapshot.timeout_seconds, 1800);
         assert!(snapshot.connected_seconds <= 1);
         assert!(snapshot.idle_seconds <= 1);
+    }
+
+    #[test]
+    fn a_session_ends_once_its_client_no_longer_has_access() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let used = store.create_session().unwrap();
+        let idle = store.create_session().unwrap();
+        let other = store.create_session().unwrap();
+        let allowed = Arc::new(AtomicBool::new(true));
+        for id in [&used, &idle] {
+            let allowed = Arc::clone(&allowed);
+            store
+                .set_access_check(id, Arc::new(move || allowed.load(Ordering::SeqCst)))
+                .unwrap();
+        }
+        for id in [&used, &idle, &other] {
+            store
+                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
+                .unwrap();
+        }
+        assert!(store.validate(&used).is_ok());
+
+        // Nobody ended these sessions by name. Access went away underneath.
+        allowed.store(false, Ordering::SeqCst);
+        assert!(store.validate(&used).is_err(), "ended when next used");
+        store.broadcast(
+            crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap(),
+            crate::session::BroadcastKind::ToolList,
+        );
+        assert_eq!(
+            store.session_count(),
+            1,
+            "the idle one ended at the next send"
+        );
+        assert!(store.validate(&other).is_ok());
+        let mut cleaned = vec![rx.try_recv().unwrap(), rx.try_recv().unwrap()];
+        cleaned.sort();
+        let mut expected = vec![used, idle];
+        expected.sort();
+        assert_eq!(cleaned, expected);
+    }
+
+    #[test]
+    fn a_message_goes_only_to_the_sessions_allowed_when_it_is_sent() {
+        let store = StatefulSessionStore::new(60, 100);
+        let theirs = store.create_session().unwrap();
+        let shared = store.create_session().unwrap();
+        store.set_grant(&theirs, "client-abc".to_string()).unwrap();
+        let mut streams = Vec::new();
+        for id in [&theirs, &shared] {
+            store
+                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
+                .unwrap();
+            let (stream, events) = mpsc::channel(4);
+            store.set_sse_sender(id, stream, None).unwrap();
+            streams.push(events);
+        }
+        let send = |blocked: Option<&str>| {
+            store.broadcast_where(
+                crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap(),
+                crate::session::BroadcastKind::Logging,
+                &|grant| grant != blocked || blocked.is_none(),
+            )
+        };
+        send(None);
+        assert!(streams[0].try_recv().is_ok());
+        assert!(streams[1].try_recv().is_ok());
+        // The rule changed while both streams were open.
+        send(Some("client-abc"));
+        assert!(streams[0].try_recv().is_err());
+        assert!(streams[1].try_recv().is_ok());
     }
 
     #[test]

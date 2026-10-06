@@ -132,6 +132,9 @@ impl BroadcastAudience {
     }
 }
 
+/// Whether a session's client still has the access it opened the session with.
+pub type AccessCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
 /// Transport type for a downstream client session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DownstreamTransport {
@@ -190,8 +193,23 @@ pub trait SessionStore: Send + Sync {
         session_id: &str,
         audience: BroadcastAudience,
     ) -> Result<(), HttpError>;
+    /// Give the session a check of whether its client still has access. A
+    /// session whose check says no is ended the next time it is used, sent
+    /// to, or kept alive, whatever took the access away.
+    fn set_access_check(&self, session_id: &str, check: AccessCheck) -> Result<(), HttpError>;
     fn remove(&self, session_id: &str) -> bool;
-    fn broadcast(&self, message: SseMessage, kind: BroadcastKind);
+    fn broadcast(&self, message: SseMessage, kind: BroadcastKind) {
+        self.broadcast_where(message, kind, &|_| true);
+    }
+    /// [`SessionStore::broadcast`] to the sessions `allowed` passes, asked
+    /// with the OAuth client that opened each one. Asked at delivery, so a
+    /// rule changed a moment ago already applies.
+    fn broadcast_where(
+        &self,
+        message: SseMessage,
+        kind: BroadcastKind,
+        allowed: &dyn Fn(Option<&str>) -> bool,
+    );
     fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome;
     fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey);
     fn spawn_cleanup_task(&self, cancel: CancellationToken);

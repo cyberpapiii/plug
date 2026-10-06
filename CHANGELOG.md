@@ -73,6 +73,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A remote client's open session ends when its sign-in does, however that
+  happened, including a removal whose save failed. A client newly kept from
+  a server stops getting log lines on a stream it already had open.
+- A watched tool that is slow to answer no longer delays the next check of
+  the other watches, and is not called again while still answering.
+- A secret command that runs past its time is stopped together with
+  anything it started, and one that prints without end is cut off.
+- Updated `rustls` to 0.23.45 or later for RUSTSEC-2026-0285.
 - A server's bearer token and an environment entry named `token` no longer
   share one stored key, and a refused change puts each key back exactly as
   it was. A whole server change, keys included, now happens one at a time,
