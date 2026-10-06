@@ -30,6 +30,15 @@ Remove a line when it lands.
 5. Single servers served on their own, beside the one Plug endpoint, so a
    client can mix its own connectors with only the servers it lacks. Comes
    out of the allow list. Issue #304.
+   Agents set up their own events (owner, 2026-10-06): Plug tools, and
+   the same in `plug events`, for a client to create, list, change, and
+   remove events for itself, on this Mac or remote, with no approval step.
+   Creating one subscribes its maker. Each tool says plainly what Plug can
+   deliver and what each way needs, so the agent fills in the rest; steps
+   outside Plug are the agent's. A tool for "what changed since I last
+   looked" serves a client that cannot be woken. Kept: a client cannot
+   watch a tool it is kept from, the floor on how often a watch runs, and
+   the Events tab showing who made each event with a switch to turn it off.
 6. Plug into Plug: several Plugs feeding one, each remote server shown as
    its own server and marked with its machine. Design first. Issue #302.
 
