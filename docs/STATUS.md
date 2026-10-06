@@ -15,10 +15,7 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 Agreed with the owner on 2026-10-05. No release until the first four are in.
 Remove a line when it lands.
 
-1. Paper cuts. One open: a script's client key holds the script's path as
-   it was typed, so two scripts started as `python3 main.py` from different
-   folders are one client to Plug and share a name, blocks, and allow list.
-   Add others here as the owner reports them.
+1. Paper cuts. None open. Add them here as the owner reports them.
 2. Client audit. Tell GrokBot from Cursor: the owner has GrokBot make a few
    tool calls, and its id is read off them. Windsurf was looked for on
    2026-10-06 and shows nowhere; it is Devin throughout.
@@ -27,7 +24,7 @@ Remove a line when it lands.
    are still config-only. Issue #301.
 4. Widening: the shared bearer token split into separate clients, and
    relaying events a server emits itself (#255). The allow list per client
-   is in (2026-10-06): New Servers on a client's page, `plug clients only`.
+   is in (2026-10-06): Settings on a client's page, `plug clients only`.
 5. Single servers served on their own, beside the one Plug endpoint, so a
    client can mix its own connectors with only the servers it lacks. Comes
    out of the allow list. Issue #304.
