@@ -390,22 +390,34 @@ pub fn prefix_for_server(prefix: &str, server_name: &str) -> String {
 /// The prefix each server gets for a prefix it shares, keyed by
 /// `(prefix, server)`. Server names that read the same once punctuation is
 /// dropped (`google-work`, `google_work`) are told apart by a number, given
-/// in name order so it does not move between refreshes.
+/// in name order so it does not move between refreshes. A number is passed
+/// over when the result is a prefix already in use, here or in `in_use`:
+/// `Git` numbered 2 must not land on a server called `git2`.
 pub fn prefixes_for_servers<'a>(
     claims: impl IntoIterator<Item = (&'a str, &'a str)>,
+    in_use: impl IntoIterator<Item = &'a str>,
 ) -> std::collections::HashMap<(String, String), String> {
     let claims: std::collections::BTreeSet<(&str, &str)> = claims.into_iter().collect();
-    let mut taken: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    // Every unnumbered prefix belongs to the first server that reads that way.
+    let unnumbered: std::collections::HashSet<String> = claims
+        .iter()
+        .map(|(prefix, server)| prefix_for_server(prefix, server))
+        .collect();
+    let mut taken: std::collections::HashSet<String> =
+        in_use.into_iter().map(str::to_string).collect();
     claims
         .into_iter()
         .map(|(prefix, server)| {
-            let qualified = prefix_for_server(prefix, server);
-            let count = taken.entry(qualified.clone()).or_insert(0);
-            *count += 1;
-            let qualified = match *count {
-                1 => qualified,
-                n => format!("{qualified}{n}"),
+            let unnumbered_prefix = prefix_for_server(prefix, server);
+            let qualified = if taken.contains(&unnumbered_prefix) {
+                (2usize..)
+                    .map(|n| format!("{unnumbered_prefix}{n}"))
+                    .find(|name| !taken.contains(name) && !unnumbered.contains(name))
+                    .unwrap_or(unnumbered_prefix)
+            } else {
+                unnumbered_prefix
             };
+            taken.insert(qualified.clone());
             ((prefix.to_string(), server.to_string()), qualified)
         })
         .collect()
@@ -573,16 +585,35 @@ mod tests {
     #[test]
     fn servers_whose_names_read_alike_still_get_their_own_prefix() {
         let key = |server: &str| ("Gmail".to_string(), server.to_string());
-        let prefixes = prefixes_for_servers([
-            ("Gmail", "workspace"),
-            ("Gmail", "google_work"),
-            ("Gmail", "google-work"),
-            ("Gmail", "google-work"),
-        ]);
+        let prefixes = prefixes_for_servers(
+            [
+                ("Gmail", "workspace"),
+                ("Gmail", "google_work"),
+                ("Gmail", "google-work"),
+                ("Gmail", "google-work"),
+            ],
+            [],
+        );
         assert_eq!(prefixes[&key("workspace")], "GmailWorkspace");
         // Numbered in name order, so a refresh gives the same answer.
         assert_eq!(prefixes[&key("google-work")], "GmailGoogleWork");
         assert_eq!(prefixes[&key("google_work")], "GmailGoogleWork2");
+    }
+
+    #[test]
+    fn a_number_never_lands_on_a_prefix_another_server_has() {
+        let key = |server: &str| ("Gmail".to_string(), server.to_string());
+        // `work` and `work_` read alike, and a third server reads as the
+        // name the second of them would be numbered to.
+        let prefixes = prefixes_for_servers(
+            [("Gmail", "work"), ("Gmail", "work_"), ("Gmail", "work2")],
+            ["GmailWork3"],
+        );
+        assert_eq!(prefixes[&key("work")], "GmailWork");
+        assert_eq!(prefixes[&key("work2")], "GmailWork2");
+        assert_eq!(prefixes[&key("work_")], "GmailWork4");
+        let all: std::collections::HashSet<_> = prefixes.values().collect();
+        assert_eq!(all.len(), 3);
     }
 
     #[test]
