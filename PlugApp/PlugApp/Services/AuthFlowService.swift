@@ -27,6 +27,23 @@ struct AuthFlowService: Sendable {
         try await run(["auth", "logout", "--server", server], failure: "Signing out did not complete.")
     }
 
+    /// Runs a client's own sign-in command. It goes through the owner's
+    /// shell, since that is where the client's command is found.
+    func signInClient(command: String) async throws {
+        let result = try await runner.run(
+            executable: URL(fileURLWithPath: "/bin/zsh"),
+            arguments: ["-lic", command],
+            timeout: Self.timeout
+        )
+        guard result.status == 0 else {
+            throw NSError(
+                domain: "Plug.Auth",
+                code: Int(result.status),
+                userInfo: [NSLocalizedDescriptionKey: detail(from: result, failure: "Sign-in did not complete.")]
+            )
+        }
+    }
+
     private func run(_ arguments: [String], failure: String) async throws {
         guard let executable else {
             throw CocoaError(.fileNoSuchFile, userInfo: [NSLocalizedDescriptionKey: "Plug is damaged. Download it again and replace this copy."])

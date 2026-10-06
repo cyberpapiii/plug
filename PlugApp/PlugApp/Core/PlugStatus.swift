@@ -242,6 +242,8 @@ enum PlugIntent: Equatable, Sendable {
     case reconnect
     case signIn(server: String)
     case cancelSignIn(server: String)
+    /// Runs a client's own command for signing in to Plug.
+    case signInClient(name: String, command: String)
     case restartServer(String)
     case setServerEnabled(String, Bool)
     case editServer(String)

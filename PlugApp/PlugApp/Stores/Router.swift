@@ -78,6 +78,8 @@ struct PlugIntentRunner {
             Task { await model.signIn(server: server) }
         case let .cancelSignIn(server):
             model.cancelSignIn(server: server)
+        case let .signInClient(name, command):
+            Task { await model.signInClient(name: name, command: command) }
         case let .restartServer(name):
             perform("restart \(name)") { .restartServer(authToken: $0, serverID: name) }
         case let .setServerEnabled(name, enabled):

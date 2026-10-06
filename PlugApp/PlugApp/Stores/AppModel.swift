@@ -751,6 +751,17 @@ final class AppModel {
         signInTasks[server]?.cancel()
     }
 
+    /// Runs a client's sign-in command. The client opens the browser, where
+    /// Plug asks the owner to approve it.
+    func signInClient(name: String, command: String) async {
+        do {
+            try await authFlow.signInClient(command: command)
+            await refresh()
+        } catch {
+            reportActionError("sign in \(name)", error)
+        }
+    }
+
     private func runSignIn(server: String) async {
         signingInServers.insert(server)
         defer { signingInServers.remove(server) }
