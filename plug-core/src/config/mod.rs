@@ -204,10 +204,38 @@ pub struct ClientSettings {
     /// it or callable by it.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub blocked_servers: Vec<String>,
-    /// Tools this client does not get, by the name Plug lists them under.
-    /// `*` matches any run of characters, as in `disabled_tools`.
+    /// Tools this client does not get. See [`ToolBlock`].
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub blocked_tools: Vec<String>,
+    pub blocked_tools: Vec<ToolBlock>,
+}
+
+/// One tool kept from a client.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ToolBlock {
+    /// A tool by its server and the name that server gives it, which no
+    /// rename or change of prefix touches. `*` in `tool` matches any run of
+    /// characters.
+    Of { server: String, tool: String },
+    /// A rule over the names Plug lists tools under, `*` matching any run of
+    /// characters, as in `disabled_tools`. A plain name written here is
+    /// turned into [`ToolBlock::Of`] once Plug has seen the tool.
+    Named(String),
+}
+
+impl From<&str> for ToolBlock {
+    fn from(name: &str) -> Self {
+        Self::Named(name.to_string())
+    }
+}
+
+impl std::fmt::Display for ToolBlock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Of { server, tool } => write!(f, "{tool} on {server}"),
+            Self::Named(name) => f.write_str(name),
+        }
+    }
 }
 
 impl ClientSettings {

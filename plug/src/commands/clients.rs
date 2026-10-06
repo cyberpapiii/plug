@@ -328,7 +328,12 @@ pub(crate) fn client_blocks_line(
         parts.push(format!("servers {}", settings.blocked_servers.join(", ")));
     }
     if !settings.blocked_tools.is_empty() {
-        parts.push(format!("tools {}", settings.blocked_tools.join(", ")));
+        let tools: Vec<String> = settings
+            .blocked_tools
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        parts.push(format!("tools {}", tools.join(", ")));
     }
     if parts.is_empty() {
         format!("{key} is kept from nothing.")

@@ -396,6 +396,10 @@ pub(crate) async fn apply_server_mutation(
         plug_core::operator::OperatorMutation::RemoveWatch { event } => {
             plug_core::ipc::IpcRequest::RemoveWatch { event, auth_token }
         }
+        // Plug does this itself, with whatever else it saves.
+        plug_core::operator::OperatorMutation::PinToolBlocks => {
+            anyhow::bail!("Plug stores tool blocks by server itself")
+        }
     };
     match crate::daemon::ipc_request(&request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),

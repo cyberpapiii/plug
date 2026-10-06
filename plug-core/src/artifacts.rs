@@ -33,6 +33,9 @@ pub struct ArtifactRecord {
     pub source_tool: String,
     /// The server the tool belongs to, when the result came from a call.
     pub source_server: Option<String>,
+    /// That server's own name for the tool. `source_tool` is the name Plug
+    /// listed it under at the time, which a rename changes.
+    pub source_own_tool: Option<String>,
     pub original_size_bytes: usize,
     pub created_at: SystemTime,
     pub expires_at: SystemTime,
@@ -54,6 +57,8 @@ struct ArtifactMetadata {
     source_tool: String,
     #[serde(default)]
     source_server: Option<String>,
+    #[serde(default)]
+    source_own_tool: Option<String>,
     original_size_bytes: usize,
     created_at_secs: u64,
     expires_at_secs: u64,
@@ -93,17 +98,19 @@ impl ArtifactStore {
             .await
     }
 
-    /// [`ArtifactStore::maybe_spill_tool_result`] for a call to `source_tool`
-    /// on `source_server`. The server is kept with the artifact, so who may
-    /// read it later does not depend on the tool still being listed.
+    /// [`ArtifactStore::maybe_spill_tool_result`] for a call to the tool
+    /// `source_server` calls `own_tool`, listed as `source_tool`. Both are
+    /// kept with the artifact, so who may read it later does not depend on
+    /// the tool still being listed, or listed under that name.
     pub async fn maybe_spill_result_of(
         &self,
         source_server: &str,
+        own_tool: &str,
         source_tool: &str,
         result: CallToolResult,
     ) -> Result<CallToolResult, McpError> {
         self.maybe_spill_tool_result_with_limit(
-            Some(source_server),
+            Some((source_server, own_tool)),
             source_tool,
             result,
             ARTIFACT_STORE_MAX_BYTES,
@@ -113,7 +120,7 @@ impl ArtifactStore {
 
     async fn maybe_spill_tool_result_with_limit(
         &self,
-        source_server: Option<&str>,
+        source: Option<(&str, &str)>,
         source_tool: &str,
         result: CallToolResult,
         max_store_bytes: u64,
@@ -169,7 +176,8 @@ impl ArtifactStore {
         let record = ArtifactRecord {
             id: id.clone(),
             source_tool: source_tool.to_string(),
-            source_server: source_server.map(str::to_string),
+            source_server: source.map(|(server, _)| server.to_string()),
+            source_own_tool: source.map(|(_, tool)| tool.to_string()),
             original_size_bytes: size,
             created_at,
             expires_at: created_at + ARTIFACT_RETENTION,
@@ -193,14 +201,22 @@ impl ArtifactStore {
 
     /// Hold a record for `source_tool` with nothing on disk behind it.
     #[cfg(test)]
-    pub(crate) fn insert_for_test(&self, id: &str, source_server: Option<&str>, source_tool: &str) {
+    pub(crate) fn insert_for_test(
+        &self,
+        id: &str,
+        source: Option<(&str, &str)>,
+        source_tool: &str,
+    ) {
         let now = SystemTime::now();
         self.records.insert(
             id.to_string(),
             ArtifactRecord {
                 id: id.to_string(),
                 source_tool: source_tool.to_string(),
-                source_server: source_server.map(str::to_string),
+                source_server: source.map(|(server, _)| server.to_string()),
+                source_own_tool: source
+                    .map(|(_, tool)| tool.to_string())
+                    .filter(|tool| !tool.is_empty()),
                 original_size_bytes: 0,
                 created_at: now,
                 expires_at: now + std::time::Duration::from_secs(60),
@@ -212,13 +228,18 @@ impl ArtifactStore {
         );
     }
 
-    /// The server and tool whose result the artifact at `uri` holds. The
-    /// server is unknown for a task's result and for an artifact kept
-    /// before servers were recorded.
-    pub fn source(&self, uri: &str) -> Option<(Option<String>, String)> {
+    /// Whose result the artifact at `uri` holds: the server, its own name
+    /// for the tool, and the name Plug listed the tool under. The server is
+    /// unknown for a task's result, and either can be for an artifact kept
+    /// before it was recorded.
+    pub fn source(&self, uri: &str) -> Option<(Option<String>, Option<String>, String)> {
         let request = parse_artifact_uri(uri)?;
         let record = self.records.get(&request.id)?;
-        Some((record.source_server.clone(), record.source_tool.clone()))
+        Some((
+            record.source_server.clone(),
+            record.source_own_tool.clone(),
+            record.source_tool.clone(),
+        ))
     }
 
     pub fn read(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
@@ -672,6 +693,7 @@ fn write_metadata(artifact_dir: &Path, record: &ArtifactRecord) -> anyhow::Resul
         id: record.id.clone(),
         source_tool: record.source_tool.clone(),
         source_server: record.source_server.clone(),
+        source_own_tool: record.source_own_tool.clone(),
         original_size_bytes: record.original_size_bytes,
         created_at_secs: to_unix_secs(record.created_at)?,
         expires_at_secs: to_unix_secs(record.expires_at)?,
@@ -707,6 +729,7 @@ fn load_record_from_dir(dir: &Path) -> Option<ArtifactRecord> {
             id: metadata.id,
             source_tool: metadata.source_tool,
             source_server: metadata.source_server,
+            source_own_tool: metadata.source_own_tool,
             original_size_bytes: metadata.original_size_bytes,
             created_at: from_unix_secs(metadata.created_at_secs),
             expires_at: from_unix_secs(metadata.expires_at_secs),
@@ -738,6 +761,7 @@ fn load_record_from_dir(dir: &Path) -> Option<ArtifactRecord> {
         id,
         source_tool: "unknown".to_string(),
         source_server: None,
+        source_own_tool: None,
         original_size_bytes: payload.len(),
         created_at: modified,
         expires_at: modified + ARTIFACT_RETENTION,
@@ -855,6 +879,7 @@ mod tests {
                 id: "expired-id".to_string(),
                 source_tool: "tool".to_string(),
                 source_server: None,
+                source_own_tool: None,
                 original_size_bytes: 2,
                 created_at: SystemTime::UNIX_EPOCH,
                 expires_at: SystemTime::UNIX_EPOCH,
@@ -888,6 +913,7 @@ mod tests {
                 id: "expired-read-id".to_string(),
                 source_tool: "tool".to_string(),
                 source_server: None,
+                source_own_tool: None,
                 original_size_bytes: 2,
                 created_at: SystemTime::UNIX_EPOCH,
                 expires_at: SystemTime::UNIX_EPOCH,
@@ -936,6 +962,7 @@ mod tests {
             id: "chunk-read-id".to_string(),
             source_tool: "tool".to_string(),
             source_server: None,
+            source_own_tool: None,
             original_size_bytes: content.len(),
             created_at: SystemTime::now(),
             expires_at: SystemTime::now() + Duration::from_secs(3600),

@@ -12,8 +12,13 @@ impl super::ToolRouter {
             if self
                 .artifact_store
                 .source(uri)
-                .is_some_and(|(server, tool)| {
-                    !self.client_may_read_result_of(client_key, server.as_deref(), &tool)
+                .is_some_and(|(server, tool, listed)| {
+                    !self.client_may_read_result_of(
+                        client_key,
+                        server.as_deref(),
+                        tool.as_deref(),
+                        &listed,
+                    )
                 })
             {
                 return Err(McpError::from(ProtocolError::InvalidRequest {

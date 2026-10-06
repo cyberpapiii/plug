@@ -73,6 +73,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A tool switched off for one client is stored by its server and that
+  server's own name for the tool, so renaming the tool or its server's
+  prefix cannot switch it back on. Blocks written the old way, by listed
+  name, are brought over the first time Plug sees the tool, and a rule
+  with `*` in it now also holds for a tool that was renamed out from under
+  it. A large result kept on disk follows the same block whatever the tool
+  was called when it was kept.
 - A client kept from a server no longer hears about that server's sign-in,
   and a local client kept from a server gets no log lines, as a remote one
   already did.
