@@ -33,6 +33,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A client that runs as several processes keeps its sign-in. Two of them
+  renewing with the same stored token in the same minute both get a new one;
+  before, the slower one was taken for a thief and the whole sign-in was
+  revoked, which signed Codex out. A second use after that minute still
+  revokes everything.
+- A stored sign-in renews after its client restarts. A client that had not
+  read Plug's addresses again posted the renewal to `/token` with no
+  resource, got nothing, and asked to be approved from scratch. Scripts
+  built on the MCP Python SDK failed this way an hour after signing in.
+- Activity shows a network client's icon and name. A call from a client
+  that says little about itself is pictured by the name on its sign-in, the
+  way the Clients list already did.
 - Ditto history and email-manager clients use Python icons while retaining
   their distinct workflow names.
 - HTTP-linked clients no longer have a redundant local configuration row

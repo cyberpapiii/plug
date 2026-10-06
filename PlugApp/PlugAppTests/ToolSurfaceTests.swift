@@ -587,6 +587,27 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(CallFacts(reported).caller, "Cursor")
     }
 
+    func testACallFromANetworkClientIsPicturedByItsSignIn() {
+        func call(_ type: String, grant: String?) -> CallFacts {
+            CallFacts(ActivityEvent(
+                sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
+                tool: "IMessage__get_messages", clientType: type, clientKey: "oauth:abc",
+                latencyMs: 1, outcome: "success"
+            ), grantName: grant)
+        }
+        // A client that says nothing useful about itself takes its sign-in's name.
+        let hermes = call("Unknown", grant: "Hermes Agent")
+        XCTAssertEqual(hermes.caller, "Hermes Agent")
+        XCTAssertEqual(hermes.callerTarget, "hermes")
+        // A script is pictured by its language, under its own name.
+        let script = call("mcp", grant: "Ditto email-manager")
+        XCTAssertEqual(script.caller, "Ditto email-manager")
+        XCTAssertEqual(script.callerIconName, "Python")
+        // What a known client reports still outranks its sign-in.
+        XCTAssertEqual(call("Cursor", grant: "Something").callerTarget, "cursor")
+        XCTAssertEqual(call("Unknown", grant: nil).caller, "Unknown client")
+    }
+
     func testCallFactsSplitTheServerPrefix() {
         let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"))
         XCTAssertEqual(call.server, "Figma")
