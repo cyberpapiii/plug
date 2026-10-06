@@ -1060,6 +1060,16 @@ impl ToolRouter {
         }
     }
 
+    /// Whether the client behind `client_key` is kept from any server.
+    pub fn client_is_kept_from_a_server(&self, client_key: Option<&str>) -> bool {
+        client_key.is_some_and(|key| {
+            self.client_access
+                .load()
+                .get(key)
+                .is_some_and(|access| !access.blocked_servers.is_empty())
+        })
+    }
+
     /// Whether the client behind `client_key` may see and call `tool_name`.
     /// A request with no key is Plug's own and is never blocked.
     pub fn client_may_use_tool(&self, client_key: Option<&str>, tool_name: &str) -> bool {

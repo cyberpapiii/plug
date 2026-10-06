@@ -950,6 +950,7 @@ async fn post_mcp(
     if !content_type.starts_with("application/json") {
         return Err(HttpError::InvalidContentType);
     }
+    session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
     // 2. Parse JSON-RPC message
     let mut raw_message: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
@@ -1436,11 +1437,13 @@ fn maybe_request_http_roots(state: Arc<HttpState>, session_id: String) {
 /// GET /mcp — open SSE stream for server-initiated notifications.
 async fn get_mcp(
     State(state): State<Arc<HttpState>>,
+    axum::Extension(auth_status): axum::Extension<AuthStatus>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     // 1. Validate session
     let session_id = extract_session_id(&headers)?;
     state.sessions.validate(&session_id)?;
+    session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
     // 2. Validate Accept header
     let accept = headers
@@ -1485,9 +1488,11 @@ async fn get_mcp(
 /// DELETE /mcp — terminate a session.
 async fn delete_mcp(
     State(state): State<Arc<HttpState>>,
+    axum::Extension(auth_status): axum::Extension<AuthStatus>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let session_id = extract_session_id(&headers)?;
+    session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
     if state.sessions.remove(&session_id) {
         state.teardown_session(&session_id).await;
@@ -1698,9 +1703,18 @@ async fn handle_request(
             // Record what this principal may observe on the shared SSE fan-out.
             // Not ignorable: until this lands the session denies every
             // broadcast, so a failure here would silently mute the client.
+            let mut audience = broadcast_audience_for(&policy_context);
+            // Log lines go to every session alike and do not say which
+            // server wrote them, so a client kept from a server gets none.
+            if state
+                .router
+                .client_is_kept_from_a_server(policy_context.client_key.as_deref())
+            {
+                audience.logging = false;
+            }
             state
                 .sessions
-                .set_broadcast_audience(&session_id, broadcast_audience_for(&policy_context))?;
+                .set_broadcast_audience(&session_id, audience)?;
 
             // Track roots capability for reverse-request roots fetching
             if init_req.params.capabilities.roots.is_some() {
@@ -2641,6 +2655,26 @@ fn extract_session_id(headers: &HeaderMap) -> Result<String, HttpError> {
         .ok_or(HttpError::SessionRequired)
 }
 
+/// A session opened with one client's token answers only to that client.
+/// Anyone else is told what they would be told about a session that does
+/// not exist.
+fn session_is_the_callers(
+    headers: &HeaderMap,
+    sessions: &dyn SessionStore,
+    auth_status: &AuthStatus,
+) -> Result<(), HttpError> {
+    let Ok(session_id) = extract_session_id(headers) else {
+        return Ok(());
+    };
+    let Some(owner) = sessions.grant_of(&session_id) else {
+        return Ok(());
+    };
+    match auth_status {
+        AuthStatus::Authenticated(Some(claims)) if claims.client_id == owner => Ok(()),
+        _ => Err(HttpError::SessionNotFound),
+    }
+}
+
 /// Validate that the session exists and is not expired.
 fn validate_session_header(
     headers: &HeaderMap,
@@ -3461,6 +3495,50 @@ mod tests {
             -32005,
             "legacy-era permission denial must encode as JSON-RPC -32005"
         );
+    }
+
+    #[tokio::test]
+    async fn a_session_answers_only_to_the_client_that_opened_it() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let access_token = issue_test_oauth_token(&manager, "tools:read").await;
+        let claims = match manager
+            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .await
+        {
+            AccessTokenValidation::Valid(claims) => claims,
+            other => panic!("issued token must validate, got {other:?}"),
+        };
+        let sessions = crate::session::StatefulSessionStore::new(60, 10);
+        let theirs = sessions.create_session().unwrap();
+        let someone_elses = sessions.create_session().unwrap();
+        let unowned = sessions.create_session().unwrap();
+        sessions
+            .set_grant(&theirs, claims.client_id.clone())
+            .unwrap();
+        sessions
+            .set_grant(&someone_elses, "another-client".to_string())
+            .unwrap();
+        let with = |session_id: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(
+                SESSION_ID_HEADER,
+                HeaderValue::from_str(session_id).unwrap(),
+            );
+            headers
+        };
+        let caller = AuthStatus::Authenticated(Some(claims));
+
+        assert!(session_is_the_callers(&with(&theirs), &sessions, &caller).is_ok());
+        assert!(session_is_the_callers(&with(&unowned), &sessions, &caller).is_ok());
+        assert!(session_is_the_callers(&HeaderMap::new(), &sessions, &caller).is_ok());
+        assert!(matches!(
+            session_is_the_callers(&with(&someone_elses), &sessions, &caller),
+            Err(HttpError::SessionNotFound)
+        ));
+        assert!(matches!(
+            session_is_the_callers(&with(&theirs), &sessions, &AuthStatus::NoAuthRequired),
+            Err(HttpError::SessionNotFound)
+        ));
     }
 
     #[tokio::test]

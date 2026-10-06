@@ -73,6 +73,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Removing a client's access ends the sessions it has open, where before an
+  open stream stayed up until it timed out. A session answers only to the
+  client that opened it.
+- A client kept from a server no longer receives the log lines servers send.
 - A server change that is refused, such as adding a server under a name
   already taken, no longer replaces the key the existing server works with.
 - Removing a server keeps a stored key that another account of it still

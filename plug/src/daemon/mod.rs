@@ -1651,9 +1651,14 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 };
             };
             match manager.revoke_client(client_id).await {
-                Ok(true) => IpcResponse::DownstreamClientRevoked {
-                    client_id: client_id.clone(),
-                },
+                Ok(true) => {
+                    if let Some(sessions) = ctx.http_sessions.as_ref() {
+                        sessions.end_sessions_of(client_id);
+                    }
+                    IpcResponse::DownstreamClientRevoked {
+                        client_id: client_id.clone(),
+                    }
+                }
                 Ok(false) => IpcResponse::Error {
                     code: "UNKNOWN_DOWNSTREAM_CLIENT".to_string(),
                     message: format!("registered client `{client_id}` was not found"),

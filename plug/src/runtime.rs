@@ -557,6 +557,7 @@ async fn operator_revoke_oauth_client(
     };
     match manager.revoke_client(&client_id).await {
         Ok(true) => {
+            state.http_state.sessions.end_sessions_of(&client_id);
             // Revocation is the durable-owner lifecycle boundary. The OAuth
             // manager rejects future token use before this point; task cleanup
             // then uses TaskStore's create guard/tombstone ledger so an

@@ -574,6 +574,31 @@ impl SessionStore for StatefulSessionStore {
     fn session_snapshots(&self) -> Vec<DownstreamSessionSnapshot> {
         self.list_sessions()
     }
+
+    fn grant_of(&self, session_id: &str) -> Option<String> {
+        self.sessions.get(session_id)?.grant.clone()
+    }
+
+    fn end_sessions_of(&self, client_id: &str) -> usize {
+        let ended: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.grant.as_deref() == Some(client_id))
+            .map(|entry| entry.key().clone())
+            .collect();
+        ended
+            .into_iter()
+            .filter(|session_id| {
+                let removed = self.sessions.remove(session_id).is_some();
+                // The listener releases what the daemon holds for the session,
+                // as it does for one that timed out.
+                if removed && let Some(tx) = &self.expiry_tx {
+                    let _ = tx.send(session_id.clone());
+                }
+                removed
+            })
+            .count()
+    }
 }
 
 /// Remove `session_id` only if it is still expired under the map's shard
@@ -814,6 +839,33 @@ mod tests {
         assert_eq!(snapshot.timeout_seconds, 1800);
         assert!(snapshot.connected_seconds <= 1);
         assert!(snapshot.idle_seconds <= 1);
+    }
+
+    #[test]
+    fn taking_a_clients_access_away_ends_its_sessions_and_only_its() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let theirs = store.create_session().unwrap();
+        let other = store.create_session().unwrap();
+        let unowned = store.create_session().unwrap();
+        store.set_grant(&theirs, "client-abc".to_string()).unwrap();
+        store.set_grant(&other, "client-xyz".to_string()).unwrap();
+        let (stream, mut events) = mpsc::channel(4);
+        store.set_sse_sender(&theirs, stream, None).unwrap();
+        assert_eq!(store.grant_of(&theirs).as_deref(), Some("client-abc"));
+        assert_eq!(store.grant_of(&unowned), None);
+
+        assert_eq!(store.end_sessions_of("client-abc"), 1);
+        assert!(store.validate(&theirs).is_err());
+        assert!(store.validate(&other).is_ok());
+        assert!(store.validate(&unowned).is_ok());
+        // The open stream closes and the daemon is told to clean up.
+        assert!(
+            events
+                .try_recv()
+                .is_err_and(|error| matches!(error, mpsc::error::TryRecvError::Disconnected))
+        );
+        assert_eq!(rx.try_recv().unwrap(), theirs);
     }
 
     #[test]

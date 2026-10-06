@@ -5120,6 +5120,20 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     assert!(!router.client_may_watch(key, "git", "commit"));
     blocked(&["other__commit"]);
     assert!(router.client_may_use_tool(key, "git__commit"));
+
+    // A tool block alone keeps the client from no server.
+    assert!(!router.client_is_kept_from_a_server(key));
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "oauth:watcher".to_string(),
+        crate::config::ClientSettings {
+            blocked_servers: vec!["git".to_string()],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+    assert!(router.client_is_kept_from_a_server(key));
+    assert!(!router.client_is_kept_from_a_server(None));
 }
 
 /// Two servers, each with a resource, a resource template, and a prompt.
