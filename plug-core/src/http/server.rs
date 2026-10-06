@@ -689,6 +689,10 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             post(oauth_owner_enroll_complete),
         )
         .route("/oauth/token", post(oauth_token))
+        // A client that renews before it has read the metadata again posts
+        // to the address older MCP clients assume. Without it a stored
+        // sign-in cannot renew after the client restarts.
+        .route("/token", post(oauth_token))
         .layer(DefaultBodyLimit::max(64 * 1024))
         .with_state(state.clone());
 
@@ -3355,6 +3359,45 @@ mod tests {
                 assert!(value.get("access_token").is_none());
             }
         }
+    }
+
+    #[tokio::test]
+    async fn a_restarted_client_renews_at_the_assumed_address_without_a_resource() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let (client_id, grant) = issue_test_oauth_grant(&manager, "tools:read").await;
+        let refresh_token = grant.refresh_token.expect("refresh token");
+        let app = build_router(oauth_test_state_with_manager(manager));
+        let post = |body: String| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/token")
+                .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+                .body(Body::from(body))
+                .unwrap()
+        };
+
+        let response = app
+            .clone()
+            .oneshot(post(format!(
+                "grant_type=refresh_token&client_id={client_id}&refresh_token={refresh_token}"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 10_000)
+            .await
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert!(value["access_token"].is_string());
+
+        // A first sign-in still has to say which resource it is for.
+        let response = app
+            .oneshot(post(format!(
+                "grant_type=authorization_code&client_id={client_id}&code=x&redirect_uri=x&code_verifier=x"
+            )))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[tokio::test]
@@ -8079,6 +8122,9 @@ mod tests {
         assert_eq!(before_replay.status(), StatusCode::OK);
         drop(before_replay);
 
+        // A second use within moments is the client racing itself; a replay
+        // is one that comes later.
+        manager.age_spent_refresh_tokens_for_tests().await;
         let replay = HttpRequest::builder()
             .method("POST")
             .uri("/oauth/token")

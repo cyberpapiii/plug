@@ -351,7 +351,11 @@ pub(super) async fn oauth_token(
     let Some(client_id) = params.get("client_id") else {
         return oauth_error_response(&DownstreamOauthError::InvalidClient);
     };
-    let Some(resource) = params.get("resource") else {
+    // A refresh token is already bound to this resource, and a client that
+    // renews before it has read the metadata again leaves the field out.
+    let renewing = params.get("grant_type").map(String::as_str) == Some("refresh_token");
+    let own_resource = manager.resource().to_string();
+    let Some(resource) = params.get("resource").or(renewing.then_some(&own_resource)) else {
         return oauth_error_response(&DownstreamOauthError::InvalidResource);
     };
     let result = match params.get("grant_type").map(String::as_str) {

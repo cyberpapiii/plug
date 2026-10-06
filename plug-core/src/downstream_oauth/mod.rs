@@ -34,6 +34,12 @@ const AUTH_REQUEST_LIFETIME_SECS: u64 = 300;
 const AUTH_CODE_LIFETIME_SECS: u64 = 300;
 const ACCESS_TOKEN_LIFETIME_SECS: u64 = 3600;
 const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
+/// How long after a refresh token is spent a second use of it is taken for
+/// the same client racing itself, not for a thief. A client that runs as
+/// several processes shares one stored token, and two of them renewing in the
+/// same moment both present it. Without this the slower one is a replay and
+/// the whole sign-in is revoked.
+const REFRESH_REUSE_LEEWAY_SECS: u64 = 60;
 const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
 const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
 const MAX_REGISTRATIONS: usize = 100;
@@ -781,6 +787,18 @@ impl DownstreamOauthManager {
             .await
             .pending_consents
             .contains_key(consent_id)
+    }
+
+    /// Make every spent refresh token look spent long ago, past the moment in
+    /// which a second use is a client racing itself.
+    #[cfg(test)]
+    pub(crate) async fn age_spent_refresh_tokens_for_tests(&self) {
+        let mut state = self.state.lock().await;
+        for spent in state.consumed_refresh_tokens.values_mut() {
+            spent.consumed_at = spent
+                .consumed_at
+                .saturating_sub(REFRESH_REUSE_LEEWAY_SECS + 1);
+        }
     }
 
     #[cfg(test)]
@@ -1539,6 +1557,35 @@ impl DownstreamOauthManager {
             // in someone else's hands, and whichever side is legitimate, the
             // family can no longer be trusted. RFC 9700 section 4.14.2.
             if let Some(consumed) = guard.consumed_refresh_tokens.get(refresh_token).cloned() {
+                // Spent a moment ago by this same client: a second process
+                // of it lost the race. It gets a pair of its own in the same
+                // family, so a later replay of any of them still revokes all.
+                let sibling = guard
+                    .refresh_tokens
+                    .values()
+                    .find(|live| {
+                        !consumed.family_id.is_empty()
+                            && live.family_id == consumed.family_id
+                            && live.client_id == client_id
+                            && live.resource == resource
+                    })
+                    .cloned();
+                if let Some(sibling) = sibling
+                    && consumed.client_id == client_id
+                    && epoch_secs().saturating_sub(consumed.consumed_at)
+                        <= REFRESH_REUSE_LEEWAY_SECS
+                {
+                    let mut next = guard.clone();
+                    let token = issue_token_pair(
+                        &mut next,
+                        client_id,
+                        &sibling.scopes,
+                        resource,
+                        &consumed.family_id,
+                    );
+                    self.commit_state(&mut guard, next)?;
+                    return Ok(token);
+                }
                 let mut next = guard.clone();
                 let revoked = revoke_token_family(&mut next, &consumed.family_id);
                 tracing::warn!(
@@ -4126,6 +4173,59 @@ mod tests {
         );
     }
 
+    async fn age_spent_refresh_tokens(manager: &DownstreamOauthManager) {
+        manager.age_spent_refresh_tokens_for_tests().await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_racing_itself_on_one_refresh_token_keeps_its_sign_in() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
+        let original = issue_tokens(&manager, &client).await;
+        let original_refresh = original.refresh_token.expect("original refresh token");
+        let resource = "https://plug.example.com/mcp";
+
+        let first = manager
+            .exchange_refresh_token(&client.client_id, &original_refresh, resource)
+            .await
+            .expect("the first process renews");
+        let second = manager
+            .exchange_refresh_token(&client.client_id, &original_refresh, resource)
+            .await
+            .expect("the second process, a moment later, renews too");
+        assert_ne!(first.refresh_token, second.refresh_token);
+        for pair in [&first, &second] {
+            assert!(matches!(
+                manager
+                    .validate_access_token_for(&pair.access_token, &[], resource)
+                    .await,
+                AccessTokenValidation::Valid(_)
+            ));
+        }
+
+        // Another client presenting the spent token is not that race.
+        let other = register(&manager, "Other", "http://localhost:8788/callback").await;
+        assert!(matches!(
+            manager
+                .exchange_refresh_token(&other.client_id, &original_refresh, resource)
+                .await,
+            Err(DownstreamOauthError::InvalidGrant)
+        ));
+
+        // Past the moment, a second use is a replay and ends every pair the
+        // race produced.
+        age_spent_refresh_tokens(&manager).await;
+        assert!(matches!(
+            manager
+                .exchange_refresh_token(&client.client_id, &original_refresh, resource)
+                .await,
+            Err(DownstreamOauthError::InvalidGrant)
+        ));
+        let state = manager.state.lock().await;
+        assert!(state.refresh_tokens.is_empty(), "no refresh token survives");
+        assert!(state.access_tokens.is_empty(), "no access token survives");
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn replaying_a_consumed_refresh_token_revokes_the_whole_family() {
         let (manager, _path) = test_manager();
@@ -4156,6 +4256,7 @@ mod tests {
         ));
 
         // Replay the token that was already spent.
+        age_spent_refresh_tokens(&manager).await;
         assert!(matches!(
             manager
                 .exchange_refresh_token(
@@ -4220,6 +4321,7 @@ mod tests {
             )
             .await
             .expect("rotation succeeds");
+        age_spent_refresh_tokens(&manager).await;
         assert!(matches!(
             manager
                 .exchange_refresh_token(
@@ -5305,6 +5407,7 @@ mod tests {
                 .await,
             AccessTokenValidation::Valid(_)
         ));
+        age_spent_refresh_tokens(&manager).await;
         assert_eq!(
             manager
                 .exchange_refresh_token(

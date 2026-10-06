@@ -159,7 +159,7 @@ private struct ActivityRow: View {
             // Who called what, as two pictures: the client's icon, then
             // the server's. A long list can be scanned without reading it.
             HStack(spacing: Metric.hairline) {
-                AppGlyph(target: call.callerTarget, name: call.caller)
+                AppGlyph(target: call.callerTarget, name: call.callerIconName)
                 if let server = call.server {
                     Image(systemName: "chevron.compact.right")
                         .font(.caption2)
@@ -239,7 +239,7 @@ private struct CallDetail: View {
             Section("Details") {
                 LabeledContent("Client") {
                     HStack(spacing: Metric.tight) {
-                        AppGlyph(target: call.callerTarget, name: call.caller, size: 16)
+                        AppGlyph(target: call.callerTarget, name: call.callerIconName, size: 16)
                         Text(call.caller).textSelection(.enabled)
                     }
                 }

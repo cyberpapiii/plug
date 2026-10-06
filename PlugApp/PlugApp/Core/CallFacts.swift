@@ -10,10 +10,15 @@ struct CallFacts: Equatable {
     let event: ActivityEvent
     /// What the owner called this client, when they named it.
     let ownerName: String?
+    /// The name on the client's sign-in, when it reached Plug over the
+    /// network. The owner approved it, so it outranks what the client says
+    /// about itself.
+    let grantName: String?
 
-    init(_ event: ActivityEvent, ownerName: String? = nil) {
+    init(_ event: ActivityEvent, ownerName: String? = nil, grantName: String? = nil) {
         self.event = event
         self.ownerName = ownerName
+        self.grantName = grantName
     }
 
     var succeeded: Bool { event.outcome == "success" }
@@ -43,20 +48,32 @@ struct CallFacts: Equatable {
     var tool: String { parts.tool }
     var server: String? { parts.server }
 
-    /// The icon to show for whoever called.
+    /// The icon to show for whoever called: the client its owner named it
+    /// as, else the client it reports, else the client its link or its
+    /// sign-in was written for. The Clients list pictures a client the same
+    /// way.
     var callerTarget: String {
         if let ownerName {
             let named = AppIcons.target(forClientType: ownerName)
             if AppIcons.displayName(forTarget: named) != nil { return named }
         }
-        return AppIcons.target(forClientType: event.clientType ?? "")
+        let reported = AppIcons.target(forClientType: event.clientType ?? "")
+        if AppIcons.displayName(forTarget: reported) != nil { return reported }
+        if let key = event.clientKey, AppIcons.displayName(forTarget: key) != nil { return key }
+        if let grantName, !grantName.isEmpty { return AppIcons.target(forClientType: grantName) }
+        return reported
     }
+
+    /// The name the caller's icon is looked up by. A script has no icon of
+    /// its own, so it shows the language it is written in.
+    var callerIconName: String { callerTarget == "python" ? "Python" : caller }
 
     /// The product name when Plug recognises the client; the client's own
     /// label otherwise. A raw client type is the last resort.
     var caller: String {
         if let ownerName, !ownerName.isEmpty { return ownerName }
         if let name = AppIcons.displayName(forTarget: callerTarget) { return name }
+        if let grantName, !grantName.isEmpty { return grantName }
         if let label = event.clientLabel, !label.isEmpty { return label }
         guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {
             return "Unknown client"
