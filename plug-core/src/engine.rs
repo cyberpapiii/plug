@@ -873,7 +873,12 @@ impl Engine {
             let (mutation, kept_for, before, staged) = self
                 .keep_typed_secrets(config_path, mutation, store.to_string())
                 .await;
-            let result = match crate::operator::apply_operator_mutation(config_path, mutation) {
+            let router = &self.tool_router;
+            let result = match crate::operator::apply_operator_mutation_knowing(
+                config_path,
+                mutation,
+                &|listed| router.tool_behind(listed),
+            ) {
                 Ok((_, result)) => result,
                 // The file can be in place and the save still report a
                 // failure after it. Its references then need their keys.
@@ -930,6 +935,28 @@ impl Engine {
             tracing::warn!(server = %name, %error, "new secret is used at the next restart");
         }
         Ok((result, report))
+    }
+
+    /// Store by server and tool the tool blocks that were written by listed
+    /// name before that was possible, now that the tools are known. Does
+    /// nothing, and writes nothing, when there are none.
+    pub async fn pin_tool_blocks(self: &Arc<Self>, config_path: &std::path::Path) {
+        let waiting = self.config.load().clients.values().any(|settings| {
+            settings.blocked_tools.iter().any(|block| {
+                matches!(block, crate::config::ToolBlock::Named(name)
+                    if !name.contains('*') && self.tool_router.tool_behind(name).is_some())
+            })
+        });
+        if waiting
+            && let Err(error) = self
+                .apply_operator_mutation(
+                    config_path,
+                    crate::operator::OperatorMutation::PinToolBlocks,
+                )
+                .await
+        {
+            tracing::warn!(%error, "tool blocks stay stored by listed name");
+        }
     }
 
     /// Before a server is written to the config file, move the credentials

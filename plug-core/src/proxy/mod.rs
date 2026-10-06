@@ -155,8 +155,65 @@ impl RouterSnapshot {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ClientAccess {
     blocked_servers: HashSet<String>,
-    /// Lowercased, as `is_disabled_tool` expects.
-    blocked_tools: Vec<String>,
+    /// A server, and a pattern over that server's own names for its tools.
+    /// Patterns here and below are lowercased, as `is_disabled_tool` expects.
+    blocked_tools: Vec<(String, String)>,
+    /// Rules over the names Plug lists tools under.
+    named_tools: Vec<String>,
+}
+
+impl ClientAccess {
+    fn blocks_any_tool(&self) -> bool {
+        !self.blocked_tools.is_empty() || !self.named_tools.is_empty()
+    }
+
+    /// Whether this client is kept from `tool` on `server`, which Plug lists
+    /// or listed as `listed`.
+    fn keeps_from(&self, server: &str, tool: Option<&str>, listed: &str, delimiter: &str) -> bool {
+        if self.blocked_servers.contains(server) {
+            return true;
+        }
+        let by_server = self
+            .blocked_tools
+            .iter()
+            .filter(|(blocked_server, _)| blocked_server == server);
+        match tool {
+            Some(tool) => {
+                if by_server
+                    .clone()
+                    .any(|(_, pattern)| is_disabled_tool(std::slice::from_ref(pattern), tool))
+                {
+                    return true;
+                }
+            }
+            // Which of the server's tools this was is not known, so any
+            // block on one of them covers it.
+            None => {
+                if by_server.clone().next().is_some() {
+                    return true;
+                }
+            }
+        }
+        if self.named_tools.is_empty() {
+            return false;
+        }
+        // A rule holds for the name the tool has, the name it has under the
+        // other naming of its server, and each of those with the server's
+        // own name for the tool in place of a renamed one.
+        let mut names = vec![listed.to_string()];
+        names.extend(crate::tool_naming::other_names(listed, server, delimiter));
+        if let Some(tool) = tool {
+            let unrenamed: Vec<String> = names
+                .iter()
+                .filter_map(|name| name.split_once(delimiter))
+                .map(|(prefix, _)| format!("{prefix}{delimiter}{tool}"))
+                .collect();
+            names.extend(unrenamed);
+        }
+        names
+            .iter()
+            .any(|name| is_disabled_tool(&self.named_tools, name))
+    }
 }
 
 /// Configuration for token efficiency and tool filtering.
@@ -1029,7 +1086,22 @@ impl ToolRouter {
                         blocked_tools: settings
                             .blocked_tools
                             .iter()
-                            .map(|pattern| pattern.to_ascii_lowercase())
+                            .filter_map(|block| match block {
+                                crate::config::ToolBlock::Of { server, tool } => {
+                                    Some((server.clone(), tool.to_ascii_lowercase()))
+                                }
+                                crate::config::ToolBlock::Named(_) => None,
+                            })
+                            .collect(),
+                        named_tools: settings
+                            .blocked_tools
+                            .iter()
+                            .filter_map(|block| match block {
+                                crate::config::ToolBlock::Named(name) => {
+                                    Some(name.to_ascii_lowercase())
+                                }
+                                crate::config::ToolBlock::Of { .. } => None,
+                            })
                             .collect(),
                     },
                 )
@@ -1077,34 +1149,51 @@ impl ToolRouter {
         let Some(access) = access.get(client_key) else {
             return true;
         };
-        if is_disabled_tool(&access.blocked_tools, tool_name) {
+        if is_disabled_tool(&access.named_tools, tool_name) {
             return false;
         }
-        if access.blocked_tools.is_empty() && access.blocked_servers.is_empty() {
-            return true;
-        }
         let cache = self.cache.load();
-        let Some((server_id, _)) = cache.resolve_route(tool_name) else {
+        let Some((server_id, own_name)) = cache.resolve_route(tool_name) else {
             return true;
         };
-        // A block written before a second account changed the tool's name,
-        // or while it had one, still holds.
-        !access.blocked_servers.contains(server_id)
-            && !crate::tool_naming::other_names(tool_name, server_id, &self.config.prefix_delimiter)
-                .iter()
-                .any(|name| is_disabled_tool(&access.blocked_tools, name))
+        !access.keeps_from(
+            server_id,
+            Some(own_name),
+            tool_name,
+            &self.config.prefix_delimiter,
+        )
     }
 
-    /// Whether the client behind `client_key` may read a result that
-    /// `tool_name` on `server` produced earlier. Asked of what was recorded
-    /// with the result, not of today's tool list: the tool may have been
-    /// renamed or its server removed since, and the block still holds. A
-    /// result of unknown origin is kept from any client with a block.
+    /// The server and the server's own name behind `listed`, a name Plug
+    /// lists a tool under. Plug's own tools have neither.
+    pub fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
+        let cache = self.cache.load();
+        cache
+            .routes
+            .get(listed)
+            .or_else(|| cache.routes_lower.get(&listed.to_ascii_lowercase()))
+            .filter(|(server, _)| server != "__plug_internal__")
+            .cloned()
+    }
+
+    /// The name Plug lists `tool` on `server` under, when it lists it.
+    pub fn listed_name(&self, server: &str, tool: &str) -> Option<String> {
+        self.watched_tool(server, tool).map(|(name, _)| name)
+    }
+
+    /// Whether the client behind `client_key` may read a result produced
+    /// earlier by `tool` on `server`, listed then as `listed`. Asked of what
+    /// was recorded with the result, not of today's tool list: the tool may
+    /// have been renamed or its server removed since, and the block still
+    /// holds. A result of unknown origin is kept from any client with a
+    /// block, and one whose tool was not recorded from any client with a
+    /// block on a tool of that server.
     pub fn client_may_read_result_of(
         &self,
         client_key: Option<&str>,
         server: Option<&str>,
-        tool_name: &str,
+        tool: Option<&str>,
+        listed: &str,
     ) -> bool {
         let Some(client_key) = client_key else {
             return true;
@@ -1113,17 +1202,13 @@ impl ToolRouter {
         let Some(access) = access.get(client_key) else {
             return true;
         };
-        if access.blocked_tools.is_empty() && access.blocked_servers.is_empty() {
+        if !access.blocks_any_tool() && access.blocked_servers.is_empty() {
             return true;
         }
         let Some(server) = server else {
             return false;
         };
-        !access.blocked_servers.contains(server)
-            && !is_disabled_tool(&access.blocked_tools, tool_name)
-            && !crate::tool_naming::other_names(tool_name, server, &self.config.prefix_delimiter)
-                .iter()
-                .any(|name| is_disabled_tool(&access.blocked_tools, name))
+        !access.keeps_from(server, tool, listed, &self.config.prefix_delimiter)
     }
 
     /// Whether the client behind `client_key` may be sent what a watch of
@@ -3639,7 +3724,7 @@ impl ToolRouter {
                         "proxy tool call completed"
                     );
                     self.artifact_store
-                        .maybe_spill_result_of(&server_id, tool_name, response)
+                        .maybe_spill_result_of(&server_id, &original_name, tool_name, response)
                         .await
                         .map(Into::into)
                 }

@@ -1631,8 +1631,14 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
     let startup = {
         let engine = engine.clone();
+        let config_path = config_path.clone();
         tokio::spawn(async move {
-            let _ = started_tx.send(engine.start().await);
+            let started = engine.start().await;
+            let ready = started.is_ok();
+            let _ = started_tx.send(started);
+            if ready {
+                engine.pin_tool_blocks(&config_path).await;
+            }
         })
     };
     let http_runtime = build_configured_http_runtime(&engine.config(), &engine)?;

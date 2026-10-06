@@ -6,7 +6,7 @@ use figment::Figment;
 use figment::providers::{Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ServerConfig, TransportType, validate_config};
+use crate::config::{Config, ServerConfig, ToolBlock, TransportType, validate_config};
 use crate::proxy::is_disabled_tool;
 
 #[derive(Debug, Clone)]
@@ -53,6 +53,9 @@ pub enum OperatorMutation {
         target: String,
         blocked: bool,
     },
+    /// Nothing of its own: the file is saved with every tool block that can
+    /// be stored by server and tool stored that way.
+    PinToolBlocks,
     /// Watch a tool for change. See `crate::events`.
     AddWatch {
         watch: crate::events::WatchConfig,
@@ -69,7 +72,9 @@ pub enum OperatorMutation {
 pub enum ClientBlockKind {
     /// A whole upstream server, by its name in the config.
     Server,
-    /// A tool, by the name Plug lists it under; `*` is a wildcard.
+    /// A tool, by the name Plug lists it under. It is stored by its server
+    /// and that server's name for it. A name with `*` in it, or one Plug
+    /// lists no tool under, is stored as a rule over listed names.
     Tool,
 }
 
@@ -124,7 +129,23 @@ pub fn apply_operator_mutation(
     path: &Path,
     mutation: OperatorMutation,
 ) -> anyhow::Result<(Config, OperatorMutationResult)> {
+    apply_operator_mutation_knowing(path, mutation, &|_| None)
+}
+
+/// The server and the server's own name behind a name Plug lists a tool
+/// under, when a tool is listed under it.
+pub type ToolBehind<'a> = &'a dyn Fn(&str) -> Option<(String, String)>;
+
+/// [`apply_operator_mutation`] by a caller that knows the tools: a tool block
+/// is stored by server and tool, and blocks written by listed name before
+/// that was possible are stored that way too.
+pub fn apply_operator_mutation_knowing(
+    path: &Path,
+    mutation: OperatorMutation,
+    tool_behind: ToolBehind<'_>,
+) -> anyhow::Result<(Config, OperatorMutationResult)> {
     let mut config = load_editable_config(path)?;
+    pin_tool_blocks(&mut config, tool_behind);
     let result = match mutation {
         OperatorMutation::AddServer { name, mut server } => {
             if config.servers.contains_key(&name) {
@@ -189,9 +210,10 @@ pub fn apply_operator_mutation(
             target,
             blocked,
         } => {
-            set_client_block(&mut config, &key, kind, &target, blocked)?;
+            set_client_block(&mut config, &key, kind, &target, blocked, tool_behind)?;
             OperatorMutationResult::server(None)
         }
+        OperatorMutation::PinToolBlocks => OperatorMutationResult::server(None),
         OperatorMutation::AddWatch { watch } => {
             config.events.watch.push(watch);
             // Only the event rules: the rest of the file was already accepted.
@@ -371,6 +393,7 @@ fn set_client_block(
     kind: ClientBlockKind,
     target: &str,
     blocked: bool,
+    tool_behind: ToolBehind<'_>,
 ) -> anyhow::Result<()> {
     let key = key.trim();
     let target = target.trim();
@@ -384,19 +407,64 @@ fn set_client_block(
         anyhow::bail!("no server is called `{target}`; run `plug servers` to see their names");
     }
     let settings = config.clients.entry(key.to_string()).or_default();
-    let list = match kind {
-        ClientBlockKind::Server => &mut settings.blocked_servers,
-        ClientBlockKind::Tool => &mut settings.blocked_tools,
-    };
-    list.retain(|existing| existing != target);
-    if blocked {
-        list.push(target.to_string());
-        list.sort();
+    match kind {
+        ClientBlockKind::Server => {
+            let list = &mut settings.blocked_servers;
+            list.retain(|existing| existing != target);
+            if blocked {
+                list.push(target.to_string());
+                list.sort();
+            }
+        }
+        ClientBlockKind::Tool => {
+            let named = ToolBlock::Named(target.to_string());
+            let block = pinned(&named, tool_behind).unwrap_or_else(|| named.clone());
+            // Either way of writing it goes, so unblocking a tool clears a
+            // block written before it was stored by server.
+            let list = &mut settings.blocked_tools;
+            list.retain(|existing| *existing != block && *existing != named);
+            if blocked {
+                list.push(block);
+                list.sort();
+            }
+        }
     }
     if settings.is_empty() {
         config.clients.remove(key);
     }
     Ok(())
+}
+
+/// `block` by server and tool, when it is a plain listed name and a tool is
+/// listed under it. A rule with `*` in it stays a rule.
+fn pinned(block: &ToolBlock, tool_behind: ToolBehind<'_>) -> Option<ToolBlock> {
+    let ToolBlock::Named(name) = block else {
+        return None;
+    };
+    if name.contains('*') {
+        return None;
+    }
+    let (server, tool) = tool_behind(name)?;
+    Some(ToolBlock::Of { server, tool })
+}
+
+/// Store by server and tool every block that was written by listed name and
+/// names a tool Plug lists. One it lists no tool under is left as written,
+/// and still holds by that name.
+fn pin_tool_blocks(config: &mut Config, tool_behind: ToolBehind<'_>) {
+    for settings in config.clients.values_mut() {
+        let mut changed = false;
+        for block in &mut settings.blocked_tools {
+            if let Some(by_server) = pinned(block, tool_behind) {
+                *block = by_server;
+                changed = true;
+            }
+        }
+        if changed {
+            settings.blocked_tools.sort();
+            settings.blocked_tools.dedup();
+        }
+    }
 }
 
 /// Atomically replace `path` with a pretty-printed `Config`.
@@ -842,7 +910,7 @@ API_KEY = "sk-live-123"
         block("pi", ClientBlockKind::Tool, "slack__*", true).unwrap();
         let (config, _) = block("cursor", ClientBlockKind::Tool, "git__push", true).unwrap();
         assert_eq!(config.clients["pi"].blocked_servers, ["git"]);
-        assert_eq!(config.clients["pi"].blocked_tools, ["slack__*"]);
+        assert_eq!(config.clients["pi"].blocked_tools, ["slack__*".into()]);
         assert_eq!(
             config.clients["cursor"].name.as_deref(),
             Some("Work Cursor")
@@ -862,6 +930,94 @@ API_KEY = "sk-live-123"
             Some("Work Cursor")
         );
         block("nobody", ClientBlockKind::Server, "gone", false).unwrap();
+    }
+
+    #[test]
+    fn a_tool_block_is_stored_by_server_and_tool_and_old_ones_are_brought_over() {
+        use crate::config::ToolBlock;
+
+        let path = fixture_path();
+        // Written by listed name, as every block was: one of a tool Plug
+        // lists, one of a tool it does not, one that is a rule, and one
+        // already by server.
+        std::fs::write(
+            &path,
+            r#"[servers.git]
+command = "git-mcp"
+
+[clients.pi]
+blocked_tools = ["Code__push", "gone__tool", "slack__*", { server = "git", tool = "tag" }]
+
+[clients.cursor]
+blocked_tools = ["code__push", "Code__push"]
+"#,
+        )
+        .unwrap();
+        // `Code__push` and `Code__send` are the same tool, before and after
+        // a rename.
+        let tool_behind = |listed: &str| {
+            ["code__push", "code__send"]
+                .contains(&listed.to_ascii_lowercase().as_str())
+                .then(|| ("git".to_string(), "push".to_string()))
+        };
+        let of = |tool: &str| ToolBlock::Of {
+            server: "git".to_string(),
+            tool: tool.to_string(),
+        };
+        let block = |key: &str, target: &str, blocked| {
+            apply_operator_mutation_knowing(
+                &path,
+                OperatorMutation::SetClientBlock {
+                    key: key.to_string(),
+                    kind: ClientBlockKind::Tool,
+                    target: target.to_string(),
+                    blocked,
+                },
+                &tool_behind,
+            )
+            .unwrap()
+            .0
+        };
+
+        // The file as it was still loads, and means what it says.
+        let loaded = crate::config::load_config(Some(&path)).unwrap();
+        assert_eq!(loaded.clients["pi"].blocked_tools.len(), 4);
+        assert_eq!(loaded.clients["pi"].blocked_tools[0], "Code__push".into());
+
+        // Saving anything brings the old blocks over.
+        let (config, _) =
+            apply_operator_mutation_knowing(&path, OperatorMutation::PinToolBlocks, &tool_behind)
+                .unwrap();
+        assert_eq!(
+            config.clients["pi"].blocked_tools,
+            [
+                of("push"),
+                of("tag"),
+                "gone__tool".into(),
+                "slack__*".into()
+            ]
+        );
+        assert_eq!(config.clients["cursor"].blocked_tools, [of("push")]);
+        let reloaded = crate::config::load_config(Some(&path)).unwrap();
+        assert_eq!(reloaded.clients, config.clients);
+        // Without the tools known, nothing is touched.
+        let (unknowing, _) =
+            apply_operator_mutation(&path, OperatorMutation::PinToolBlocks).unwrap();
+        assert_eq!(unknowing.clients, config.clients);
+
+        // A new block lands in the same form, whatever name the tool goes
+        // by that day, and unblocking under the other name clears it.
+        let config = block("codex", "Code__send", true);
+        assert_eq!(config.clients["codex"].blocked_tools, [of("push")]);
+        let config = block("codex", "Code__push", true);
+        assert_eq!(config.clients["codex"].blocked_tools, [of("push")]);
+        let config = block("codex", "code__push", false);
+        assert!(!config.clients.contains_key("codex"));
+        // A rule and an unknown name are kept as typed and removed as typed.
+        let config = block("codex", "code__*", true);
+        assert_eq!(config.clients["codex"].blocked_tools, ["code__*".into()]);
+        let config = block("codex", "code__*", false);
+        assert!(!config.clients.contains_key("codex"));
     }
 
     #[test]

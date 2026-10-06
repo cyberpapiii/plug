@@ -1636,7 +1636,20 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .map(|(key, settings)| plug_core::ipc::ClientBlocks {
                     key: key.clone(),
                     servers: settings.blocked_servers.clone(),
-                    tools: settings.blocked_tools.clone(),
+                    // By the name each tool is listed under now, which is
+                    // how the app and the command line know a tool.
+                    tools: settings
+                        .blocked_tools
+                        .iter()
+                        .map(|block| match block {
+                            plug_core::config::ToolBlock::Of { server, tool } => ctx
+                                .engine
+                                .tool_router()
+                                .listed_name(server, tool)
+                                .unwrap_or_else(|| block.to_string()),
+                            plug_core::config::ToolBlock::Named(name) => name.clone(),
+                        })
+                        .collect(),
                 })
                 .collect();
             let events = ctx.engine.event_statuses(&config).await;

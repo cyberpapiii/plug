@@ -12,7 +12,7 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## Next, in order
 
-Agreed with the owner on 2026-10-05. No release until the first five are in.
+Agreed with the owner on 2026-10-05. No release until the first four are in.
 Remove a line when it lands.
 
 1. Paper cuts. With the sidebar collapsed, the window's title and count
@@ -24,15 +24,13 @@ Remove a line when it lands.
 3. Naming layer, what is left of the check-up: an agent sees the account
    label the owner typed, not the address that is signed in, and renames
    are still config-only. Issue #301.
-4. Store a tool block by server and tool, not by the name clients see,
-   so no rename can loosen one. Before the allow list, which should start
-   on that form. Issue #324.
-5. Widening: an allow list per client, the shared bearer token split into
-   separate clients, and relaying events a server emits itself (#255).
-6. Single servers served on their own, beside the one Plug endpoint, so a
+4. Widening: an allow list per client, stored like a tool block is (by
+   server and the server's own tool name), the shared bearer token split
+   into separate clients, and relaying events a server emits itself (#255).
+5. Single servers served on their own, beside the one Plug endpoint, so a
    client can mix its own connectors with only the servers it lacks. Comes
    out of the allow list. Issue #304.
-7. Plug into Plug: several Plugs feeding one, each remote server shown as
+6. Plug into Plug: several Plugs feeding one, each remote server shown as
    its own server and marked with its machine. Design first. Issue #302.
 
 Unproven, to watch working along the way: an event watch delivering to a

@@ -4840,7 +4840,7 @@ fn router_with_client_blocks(config: RouterConfig) -> ToolRouter {
     clients.insert(
         "pi".to_string(),
         crate::config::ClientSettings {
-            blocked_tools: vec!["Slack__*".to_string()],
+            blocked_tools: vec!["Slack__*".into()],
             ..Default::default()
         },
     );
@@ -5026,7 +5026,7 @@ async fn the_meta_tools_do_not_reach_around_a_block() {
     clients.insert(
         "cursor".to_string(),
         crate::config::ClientSettings {
-            blocked_tools: vec!["plug__invoke_tool".to_string()],
+            blocked_tools: vec!["plug__invoke_tool".into()],
             ..Default::default()
         },
     );
@@ -5064,7 +5064,7 @@ fn clients_hear_about_a_block_changing_and_about_nothing_else() {
     assert!(notifications.try_recv().is_err());
 
     // A tool block changes the tool list and nothing else.
-    clients.get_mut("cursor").unwrap().blocked_tools = vec!["git__push".to_string()];
+    clients.get_mut("cursor").unwrap().blocked_tools = vec!["git__push".into()];
     router.set_client_access(&clients);
     assert_eq!(
         notifications.try_recv().expect("tool block added"),
@@ -5100,7 +5100,7 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
         clients.insert(
             "oauth:watcher".to_string(),
             crate::config::ClientSettings {
-                blocked_tools: tools.iter().map(|tool| tool.to_string()).collect(),
+                blocked_tools: tools.iter().map(|tool| (*tool).into()).collect(),
                 ..Default::default()
             },
         );
@@ -5126,9 +5126,9 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     // tool covers that too.
     blocked(&["git__commit"]);
     let store = &router.artifact_store;
-    store.insert_for_test("kept", Some("git"), "git__commit");
+    store.insert_for_test("kept", Some(("git", "commit")), "git__commit");
     // A result of a tool that is no longer listed, by any name.
-    store.insert_for_test("gone", Some("git"), "git__retired");
+    store.insert_for_test("gone", Some(("git", "retired")), "git__retired");
     store.insert_for_test("unknown", None, "task_result:1");
     let read = |id: &str, key| {
         let uri = format!("plug://artifact/{id}/manifest");
@@ -5158,6 +5158,52 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     // Kept from the server, so from every result it ever produced.
     assert!(!read("kept", key));
     assert!(!read("gone", key));
+
+    // Stored by server and tool, a block does not go by the listed name at
+    // all: it holds for a result kept while the tool had another name, and
+    // for one kept before the tool was recorded with it.
+    let by_server = |tool: &str| {
+        let mut clients = std::collections::BTreeMap::new();
+        clients.insert(
+            "oauth:watcher".to_string(),
+            crate::config::ClientSettings {
+                blocked_tools: vec![crate::config::ToolBlock::Of {
+                    server: "git".to_string(),
+                    tool: tool.to_string(),
+                }],
+                ..Default::default()
+            },
+        );
+        router.set_client_access(&clients);
+    };
+    by_server("commit");
+    assert!(!router.client_may_use_tool(key, "git__commit"));
+    assert!(!router.client_may_watch(key, "git", "commit"));
+    store.insert_for_test("renamed", Some(("git", "commit")), "git__save");
+    store.insert_for_test("old", Some(("git", "")), "git__anything");
+    assert!(!read("kept", key));
+    assert!(!read("renamed", key), "the same tool under an old name");
+    assert!(read("gone", key), "another tool of the server");
+    assert!(!read("old", key), "which tool is not known");
+    by_server("COM*");
+    assert!(!router.client_may_use_tool(key, "git__commit"), "a pattern");
+    by_server("push");
+    assert!(router.client_may_use_tool(key, "git__commit"));
+    assert!(read("renamed", key));
+    assert_eq!(
+        router.tool_behind("GIT__commit"),
+        Some(("git".to_string(), "commit".to_string()))
+    );
+    assert_eq!(router.tool_behind("git__nothing"), None);
+    assert_eq!(
+        router.listed_name("git", "commit").as_deref(),
+        Some("git__commit")
+    );
+
+    // A rule by listed name holds for the server's own name for a tool too,
+    // so renaming the tool does not take it out from under the rule.
+    blocked(&["git__com*"]);
+    assert!(!read("renamed", key));
     assert!(!router.client_is_kept_from_a_server(None));
 }
 
