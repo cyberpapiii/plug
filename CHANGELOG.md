@@ -9,8 +9,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
-- A client can be given only the servers you pick. Turn off New Servers on
-  a client's page and a server you add later stays off for that client
+- A client can be given only the servers you pick. Switch off "Turn On New
+  Servers" under Settings on a client's page and a server you add later stays off for that client
   until you turn it on; what the client gets today does not change. The
   same from the command line with `plug clients only <client> --server
   <name>` or `--tool <name>`, and `--off` to end it.
@@ -82,6 +82,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Two scripts started the same way from different folders, such as
+  `python3 main.py`, are two clients. They were one, sharing a name and
+  what they were kept from.
 - A script that connects on this Mac is called by its own name, or by its
   folder when the file is a `main.py`. It showed as `python3` or `node`,
   the same as every other script.

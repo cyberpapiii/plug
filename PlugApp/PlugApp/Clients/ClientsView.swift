@@ -1175,17 +1175,6 @@ private struct ClientDetail: View {
                         ForEach(access.servers) { server in
                             serverRow(server, access: access)
                         }
-                        Toggle(
-                            "New Servers",
-                            isOn: Binding(
-                                get: { !access.onlyAllowed },
-                                set: { run(.setClientAllowList(key: access.key, on: !$0)) }
-                            )
-                        )
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
-                        .disabled(!canMutate)
-                        .help("Whether a server you add later is on for this client")
                     }
                 } header: {
                     Text("Servers")
@@ -1200,6 +1189,23 @@ private struct ClientDetail: View {
                         LabeledContent(connection.place, value: connection.detail)
                             .help("Connection \(connection.id.prefix(8))")
                     }
+                }
+            }
+
+            if let access = entry.access, !access.servers.isEmpty {
+                Section {
+                    Toggle(
+                        "Turn On New Servers",
+                        isOn: Binding(
+                            get: { !access.onlyAllowed },
+                            set: { run(.setClientAllowList(key: access.key, on: !$0)) }
+                        )
+                    )
+                    .disabled(!canMutate)
+                } header: {
+                    Text("Settings")
+                } footer: {
+                    Text("When this is off, a server you add later stays off for this client until you turn it on above.")
                 }
             }
 
@@ -1364,7 +1370,7 @@ private struct ClientDetail: View {
 
     static func note(for access: ClientAccess) -> String {
         access.isRemote
-            ? "Turn a server off to keep this client from using its tools. Open a server to turn off single tools. With New Servers off, a server you add later stays off for this client until you turn it on."
-            : "Turn a server off to hide its tools from this client, or open it to hide single tools. With New Servers off, a server you add later stays off for this client until you turn it on. This tidies the list; it is not a security lock."
+            ? "Turn a server off to keep this client from using its tools. Open a server to turn off single tools."
+            : "Turn a server off to hide its tools from this client, or open it to hide single tools. This tidies the list; it is not a security lock."
     }
 }

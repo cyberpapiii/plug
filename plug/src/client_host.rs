@@ -35,7 +35,14 @@ pub(crate) fn current() -> Option<ClientHost> {
             let (pid, executable) = find_host(std::process::id(), &table)?;
             let mut host = describe(executable);
             if is_interpreter(executable) {
-                host.script = command_line(pid).as_deref().and_then(script_of);
+                host.script = command_line(pid).as_deref().and_then(|line| {
+                    let script = script_of(line)?;
+                    Some(if runs_a_module(line) {
+                        script
+                    } else {
+                        anchored(&script, working_folder(pid).as_deref())
+                    })
+                });
                 if let Some(name) = host.script.as_deref().and_then(script_name) {
                     host.name = name;
                 }
@@ -77,6 +84,50 @@ fn command_line(pid: u32) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The folder a process was started in, which a script named without one
+/// is found from.
+#[cfg(not(test))]
+fn working_folder(pid: u32) -> Option<String> {
+    let output = std::process::Command::new("/usr/sbin/lsof")
+        .args(["-a", "-p", &pid.to_string(), "-d", "cwd", "-Fn"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix('n'))
+        .filter(|folder| folder.starts_with('/'))
+        .map(str::to_string)
+}
+
+/// Whether the command line names a module with `-m`, not a file.
+fn runs_a_module(command_line: &str) -> bool {
+    command_line
+        .split_whitespace()
+        .skip(1)
+        .find(|word| !word.starts_with('-') || *word == "-m")
+        == Some("-m")
+}
+
+/// A script's whole path. Typed as `main.py` it is whichever `main.py` the
+/// folder holds, so two started that way from two folders are two clients.
+/// Left as typed when the folder cannot be read.
+fn anchored(script: &str, folder: Option<&str>) -> String {
+    let Some(folder) = folder.filter(|_| !script.starts_with('/')) else {
+        return script.to_string();
+    };
+    let mut parts: Vec<&str> = folder.split('/').filter(|part| !part.is_empty()).collect();
+    for part in script.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            part => parts.push(part),
+        }
+    }
+    format!("/{}", parts.join("/"))
 }
 
 /// What an interpreter's command line says it runs: the script path, or the
@@ -249,6 +300,31 @@ mod tests {
         );
         assert_eq!(script_of("node -e console.log(1)"), None);
         assert_eq!(script_of("python3"), None);
+    }
+
+    #[test]
+    fn a_script_typed_without_its_folder_is_found_from_where_it_was_started() {
+        assert_eq!(
+            anchored("main.py", Some("/work/radar")),
+            "/work/radar/main.py"
+        );
+        assert_eq!(
+            anchored("./tools/run.py", Some("/work/radar")),
+            "/work/radar/tools/run.py"
+        );
+        assert_eq!(
+            anchored("../other/main.py", Some("/work/radar")),
+            "/work/other/main.py"
+        );
+        assert_eq!(
+            anchored("/opt/agent.py", Some("/work/radar")),
+            "/opt/agent.py"
+        );
+        assert_eq!(anchored("main.py", None), "main.py");
+        // A module is not a file and stays as it is named.
+        assert!(runs_a_module("/usr/bin/python3 -u -m hermes.agent"));
+        assert!(!runs_a_module("python3 -u main.py -m fast"));
+        assert!(!runs_a_module("python3"));
     }
 
     #[test]
