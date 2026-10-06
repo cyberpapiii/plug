@@ -699,12 +699,12 @@ final class AppModel {
         }
     }
 
-    func setAppLinked(_ target: String, _ linked: Bool) async {
+    func setAppLinked(_ target: String, _ linked: Bool, overNetwork: Bool = false) async {
         guard busyApps.insert(target).inserted else { return }
         defer { busyApps.remove(target) }
         do {
             if linked {
-                try await appLinker.link(target: target)
+                try await appLinker.link(target: target, overNetwork: overNetwork)
             } else {
                 try await appLinker.unlink(target: target)
             }

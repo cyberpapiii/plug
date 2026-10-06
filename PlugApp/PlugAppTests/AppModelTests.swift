@@ -1229,7 +1229,7 @@ private struct FailingAppLinker: AppLinking {
     static let message = "Claude Code's settings file is read-only."
 
     func apps() async throws -> [LinkableApp] { [] }
-    func link(target: String) async throws {
+    func link(target: String, overNetwork: Bool) async throws {
         throw CocoaError(.fileWriteNoPermission, userInfo: [NSLocalizedDescriptionKey: Self.message])
     }
     func unlink(target: String) async throws {

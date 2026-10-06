@@ -59,7 +59,9 @@ enum AppLinkError: LocalizedError, Equatable {
 /// implementation rather than a second copy of that knowledge in Swift.
 protocol AppLinking: Sendable {
     func apps() async throws -> [LinkableApp]
-    func link(target: String) async throws
+    /// Over the network writes Plug's address; otherwise the client runs
+    /// Plug's own command on this Mac.
+    func link(target: String, overNetwork: Bool) async throws
     func unlink(target: String) async throws
 }
 
@@ -88,8 +90,9 @@ struct AppLinkService: AppLinking {
         }
     }
 
-    func link(target: String) async throws {
-        _ = try await run(["link", target, "--yes", "--output", "json"])
+    func link(target: String, overNetwork: Bool) async throws {
+        let transport = overNetwork ? "http" : "stdio"
+        _ = try await run(["link", target, "--yes", "--transport", transport, "--output", "json"])
     }
 
     func unlink(target: String) async throws {
