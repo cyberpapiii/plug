@@ -21,8 +21,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   of) and how it connects, on this Mac or over the network. Plug sets up a
   client it finds with one button; for any other it shows the command or
   address to paste, alone or as a whole settings entry. A client Plug has never
-  heard of can be given a name there, which it shows under from its first
-  connection.
+  heard of can be given a name and an icon there, which it shows under from
+  its first connection.
 - A client whose sign-in to Plug ended says "Needs sign-in" in Clients, with
   how to sign it in again, and Plug sends a notification when it happens.
   `plug auth clients list` says so too.

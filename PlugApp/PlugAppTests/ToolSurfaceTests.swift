@@ -198,6 +198,11 @@ final class LinkableAppTests: XCTestCase {
         // A client the owner names connects under a key made from the name.
         XCTAssertEqual(AddClient.customTarget(named: "  My Tool (v2)! "), "custom:my-tool-v2")
         XCTAssertNil(AddClient.customTarget(named: " ?? "))
+        // Each made-up client keeps its own icon, apart from any other's.
+        XCTAssertNotEqual(
+            IconStore.key(client: "custom:my-tool-v2"),
+            IconStore.key(client: "custom:my-tool")
+        )
         XCTAssertEqual(AddClient.customTarget(named: String(repeating: "a", count: 60))?.count, 47)
         let named = try plug(AddClient.settingsEntry(command: "/plug", target: "custom:my-tool"))
         XCTAssertEqual(named["args"] as? [String], ["connect", "--client", "custom:my-tool"])
@@ -420,7 +425,8 @@ final class AppRosterTests: XCTestCase {
             from: Data(
                 """
                 [{"session_id":"g1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:abc"},
-                 {"session_id":"c1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"}]
+                 {"session_id":"c1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"},
+                 {"session_id":"m1","client_type":"Cursor","visible_tool_count":3,"client_key":"custom:my-tool"}]
                 """.utf8
             )
         )
@@ -432,9 +438,12 @@ final class AppRosterTests: XCTestCase {
         let live = try sessions(
             """
             [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1}]
+             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
+             {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1}]
             """
         )
+        // One the owner made up keeps its own icon, whatever it reports.
+        XCTAssertEqual(names.target(of: live[2]), "custom:my-tool")
         XCTAssertEqual(names.target(of: live[0]), "grok-bot")
         // A name Plug does not know leaves the icon to what the client reports.
         XCTAssertEqual(names.target(of: live[1]), "cursor")
