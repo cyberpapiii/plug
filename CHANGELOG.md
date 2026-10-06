@@ -16,6 +16,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Settings has a Permissions section: whether macOS lets Plug run in the
   background, open at login, and send notifications, with the way to System
   Settings beside anything that was turned off there.
+- Each server's page has a Settings row that says where the server's own
+  settings are and takes you there: the app it runs from, a file its
+  arguments name, the page it gave for itself, or Plug's own form. Plug
+  only uses what it already holds and never searches the disk.
 - Clients has an Add Client button. Pick any client (one on this Mac, one on
   the web such as ChatGPT, one Plug cannot find, or one it has never heard
   of) and how it connects, on this Mac or over the network. Plug sets up a

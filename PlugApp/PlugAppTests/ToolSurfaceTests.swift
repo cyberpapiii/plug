@@ -417,6 +417,38 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(named[1].host?.app)
     }
 
+    func testAServersSettingsPlaceIsOnlyWhatPlugAlreadyKnows() {
+        let home = "/Users/someone"
+        let onDisk: Set<String> = [
+            "/Applications/Figma.app", "/Users/someone/tools/server.py", "/Users/someone/notes/config.toml",
+        ]
+        func place(_ config: ServerConfig, website: String? = nil) -> ServerSettingsPlace {
+            ServerSettingsPlace.find(config: config, website: website, home: home, exists: onDisk.contains)
+        }
+        // The app a command runs from comes first.
+        let fromApp = place(.command("/Applications/Figma.app/Contents/MacOS/mcp", args: ["~/tools/server.py"]))
+        XCTAssertEqual(fromApp, .app(path: "/Applications/Figma.app"))
+        XCTAssertEqual(fromApp.label(home: home), "In Figma")
+        XCTAssertEqual(fromApp.actionTitle, "Open Figma")
+        // Then a file its arguments name, bare or behind an option.
+        let fromFile = place(.command("uv", args: ["run", "~/tools/server.py"]), website: "https://example.com")
+        XCTAssertEqual(fromFile, .file(path: "/Users/someone/tools/server.py"))
+        XCTAssertEqual(fromFile.label(home: home), "~/tools/server.py")
+        XCTAssertEqual(
+            place(.command("node", args: ["--config=/Users/someone/notes/config.toml"])),
+            .file(path: "/Users/someone/notes/config.toml")
+        )
+        // A path that is not there, or an app that is gone, is not offered.
+        XCTAssertEqual(place(.command("/Applications/Gone.app/Contents/MacOS/x", args: ["/nowhere/x.py"])), .plug)
+        // Then the page the server gave, when it is a safe one.
+        XCTAssertEqual(
+            place(.remote("https://mcp.example.com/mcp"), website: "https://example.com/docs"),
+            .page(URL(string: "https://example.com/docs")!)
+        )
+        XCTAssertEqual(place(.remote("https://mcp.example.com/mcp"), website: "http://example.com"), .plug)
+        XCTAssertEqual(place(.command("npx", args: ["-y", "some-server"])).actionTitle, "Edit…")
+    }
+
     func testAClientNamedAsOnePlugKnowsTakesThatClientsIcon() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
