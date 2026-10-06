@@ -199,4 +199,23 @@ pub trait SessionStore: Send + Sync {
 
     /// Return a read-only snapshot of currently tracked HTTP sessions.
     fn session_snapshots(&self) -> Vec<DownstreamSessionSnapshot>;
+
+    /// The OAuth client whose token opened `session_id`, when one did.
+    fn grant_of(&self, session_id: &str) -> Option<String> {
+        self.session_snapshots()
+            .into_iter()
+            .find(|session| session.session_id == session_id)
+            .and_then(|session| session.grant)
+    }
+
+    /// End every session `client_id` opened, as when its access is taken
+    /// away: an open stream closes and the session id stops working. Returns
+    /// how many ended.
+    fn end_sessions_of(&self, client_id: &str) -> usize {
+        self.session_snapshots()
+            .into_iter()
+            .filter(|session| session.grant.as_deref() == Some(client_id))
+            .filter(|session| self.remove(&session.session_id))
+            .count()
+    }
 }

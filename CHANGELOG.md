@@ -73,6 +73,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Removing a client's access ends the sessions it has open, where before an
+  open stream stayed up until it timed out. A session answers only to the
+  client that opened it.
+- A client kept from a server no longer receives the log lines servers send.
 - A client that runs as several processes keeps its sign-in. Two of them
   renewing with the same stored token in the same minute both get a new one;
   before, the slower one was taken for a thief and the whole sign-in was
