@@ -24,9 +24,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Two servers that would give a tool the same name no longer leave only one
   of them. Each gets its own name added to the prefix, so two Google servers
   show as `GmailWorkspace__…` and `GmailGoogleWork__…`.
-- Clients are grouped by where they run. Plug fills in This Mac, On the Web
-  and Elsewhere from what it can tell; a client's page has a Runs On menu
-  to say otherwise or to type a place of your own, such as "Work laptop".
+- Codex CLI can be signed in again from its page in Plug: a Sign In button
+  runs its sign-in and opens the approval in your browser. Other clients
+  still sign in from inside themselves, and their page says how.
+- A client can be given a place: the computer it runs on, such as "Work
+  laptop". Its page has a Runs On menu for it, and clients with a place are
+  listed under it. The rest stay under On This Mac and Over the Network.
   Activity and `plug clients` show the place beside the client's name, and
   `plug clients place <client> <place>` sets it from the command line.
 - Each server's page has a Settings row that says where the server's own

@@ -140,6 +140,12 @@ enum AddClient {
 /// How a client that lost its sign-in gets it back. Only the client can start
 /// one, so the app says where.
 enum ClientSignIn {
+    /// The command that signs a client in to Plug, for a client that has
+    /// one. Plug can run it; every other client signs in from inside itself.
+    static func command(target: String) -> String? {
+        target == "codex-cli" ? "codex mcp login plug" : nil
+    }
+
     static func steps(target: String, name: String) -> String {
         switch target {
         case "codex-cli": "In Terminal, run codex mcp login plug."
@@ -150,8 +156,8 @@ enum ClientSignIn {
 
     static func about(target: String, name: String) -> String {
         "Its sign-in ended, so it cannot use Plug until it signs in again. "
-            + steps(target: target, name: name)
-            + " Plug then asks you to approve it. Turn this off to remove it instead."
+            + (command(target: target) == nil ? steps(target: target, name: name) : "Press Sign In.")
+            + " Plug then asks you to approve it in your browser. Turn this off to remove it instead."
     }
 }
 

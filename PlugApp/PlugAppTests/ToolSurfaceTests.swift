@@ -221,6 +221,10 @@ final class LinkableAppTests: XCTestCase {
         XCTAssertEqual(ClientStatus.grant(connections: 1, needsSignIn: true, limit: nil).text, "Connected")
         XCTAssertTrue(ClientSignIn.steps(target: "codex-cli", name: "Codex CLI").contains("codex mcp login plug"))
         XCTAssertEqual(ClientSignIn.steps(target: "devin", name: "Devin"), "Open Devin and use Plug from there.")
+        // Plug offers a Sign In button only where the client has a command.
+        XCTAssertEqual(ClientSignIn.command(target: "codex-cli"), "codex mcp login plug")
+        XCTAssertNil(ClientSignIn.command(target: "claude-code"))
+        XCTAssertTrue(ClientSignIn.about(target: "codex-cli", name: "Codex CLI").contains("Press Sign In."))
 
         // A daemon older than the field says nothing, which is signed in.
         let decoder = JSONDecoder()
@@ -429,25 +433,20 @@ final class AppRosterTests: XCTestCase {
     }
 
     func testClientsAreGroupedByWhereTheyRun() throws {
-        // What the owner said wins. Otherwise Plug says only what it can tell.
-        XCTAssertEqual(ClientPlaces.place(owners: "Work laptop", isRemote: false), "Work laptop")
-        XCTAssertEqual(ClientPlaces.place(owners: nil, isRemote: false), ClientPlaces.thisMac)
-        XCTAssertEqual(ClientPlaces.place(owners: "", isRemote: true), ClientPlaces.elsewhere)
-        XCTAssertEqual(ClientPlaces.place(owners: nil, isRemote: true, site: "chatgpt.com"), ClientPlaces.web)
-        XCTAssertEqual(
-            ClientPlaces.place(owners: nil, isRemote: true, setUpHere: true),
-            ClientPlaces.thisMac
-        )
+        // A client sits under how it reaches Plug until the owner says
+        // where it runs. One that does not use Plug has no place.
+        XCTAssertEqual(ClientPlaces.place(owners: nil, group: .onThisMac), "On This Mac")
+        XCTAssertEqual(ClientPlaces.place(owners: "", group: .network), "Over the Network")
+        XCTAssertEqual(ClientPlaces.place(owners: "Work laptop", group: .network), "Work laptop")
+        XCTAssertEqual(ClientPlaces.place(owners: "Work laptop", group: .notUsing), "No Local Plug Configuration")
 
         XCTAssertEqual(
             ClientPlaces.ordered([
-                ClientPlaces.notUsing, "Work laptop", ClientPlaces.elsewhere, "Cloud",
-                ClientPlaces.thisMac, ClientPlaces.web, "Cloud",
+                "No Local Plug Configuration", "Work laptop", "Over the Network", "Cloud", "On This Mac", "Cloud",
             ]),
-            [ClientPlaces.thisMac, "Cloud", "Work laptop", ClientPlaces.web, ClientPlaces.elsewhere, ClientPlaces.notUsing]
+            ["On This Mac", "Cloud", "Work laptop", "Over the Network", "No Local Plug Configuration"]
         )
         XCTAssertEqual(ClientPlaces.ordered(["Cloud"]), ["Cloud"])
-        XCTAssertEqual(ClientPlaces.choices(owners: ["Cloud", "This Mac"]), ["This Mac", "Cloud"])
 
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
