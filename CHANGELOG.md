@@ -73,8 +73,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
-- A watch waiting its turn does not call its tool after the watch was
-  removed or changed, or after Plug began shutting down.
 - A client kept from a server no longer hears about that server's sign-in,
   and a local client kept from a server gets no log lines, as a remote one
   already did.
@@ -83,6 +81,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A secret command's helper left holding only the error output is stopped.
 - An environment entry named like another entry's stored key (`env.token`
   beside `token`) gets its own stored key.
+- A watch check that was waiting its turn no longer runs after the watch is
+  removed or while Plug is shutting down.
 - Servers whose names read alike are numbered around names already in use,
   so a numbered name can no longer land on another server and hide its tool.
 - A remote client's open session ends when its sign-in does, however that

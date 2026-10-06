@@ -603,9 +603,8 @@ impl WatchEvents {
     /// `due` when it is next due. Does not wait for the checks: a tool that
     /// is slow to answer delays neither the watches due with it nor anyone's
     /// next round. A watch still being checked from last time is left alone.
-    /// A check ends with `cancel`, and one that had to wait its turn runs
-    /// only if its watch is still configured as it was: a watch the owner
-    /// removed or changed meanwhile must not call its tool once more.
+    /// A check that waited its turn asks again whether the watch is still
+    /// configured, and `cancel` stops every check, waiting or under way.
     fn check_due(
         self: &Arc<Self>,
         watches: &[WatchConfig],
@@ -637,6 +636,8 @@ impl WatchEvents {
                     let Ok(_slot) = events.check_slots.acquire().await else {
                         return;
                     };
+                    // Removed, changed, or its server switched off while
+                    // this check waited for a slot.
                     if !events.access.watches().contains(&watch) {
                         return;
                     }
@@ -855,7 +856,7 @@ impl WatchEvents {
         tokio::spawn(async move {
             // When each watch is next due. A watch added later is due at once.
             let mut due: HashMap<String, u64> = HashMap::new();
-            let checks = cancel.clone();
+            let check_cancel = cancel.clone();
             loop {
                 tokio::select! {
                     biased;
@@ -866,7 +867,7 @@ impl WatchEvents {
                         if let Err(error) = events.prune().await {
                             tracing::warn!(code = error.code, "event state unavailable");
                         }
-                        events.check_due(&watches, &mut due, &checks);
+                        events.check_due(&watches, &mut due, &check_cancel);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } => {}
                 }
