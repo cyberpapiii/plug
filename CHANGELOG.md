@@ -24,6 +24,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Two servers that would give a tool the same name no longer leave only one
   of them. Each gets its own name added to the prefix, so two Google servers
   show as `GmailWorkspace__…` and `GmailGoogleWork__…`.
+- A client kept from a tool is no longer sent that tool's results through
+  an event watch. Listing, subscribing and delivery all check the tool, and
+  an event already queued is dropped when the tool is blocked.
+- A tool switched off, or kept from a client, stays that way when a second
+  account changes its name (`Gmail__…` to `GmailWorkspace__…`) and when that
+  account is removed again.
+- Two servers whose names differ only in punctuation (`google-work`,
+  `google_work`) each get their own tool names; one is numbered. If two
+  servers still claim one name, the second is left out and the log says so,
+  instead of one silently replacing the other.
 - Codex CLI can be signed in again from its page in Plug: a Sign In button
   runs its sign-in and opens the approval in your browser. Other clients
   still sign in from inside themselves, and their page says how.

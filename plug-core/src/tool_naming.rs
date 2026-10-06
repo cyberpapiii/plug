@@ -387,6 +387,50 @@ pub fn prefix_for_server(prefix: &str, server_name: &str) -> String {
     qualified
 }
 
+/// The prefix each server gets for a prefix it shares, keyed by
+/// `(prefix, server)`. Server names that read the same once punctuation is
+/// dropped (`google-work`, `google_work`) are told apart by a number, given
+/// in name order so it does not move between refreshes.
+pub fn prefixes_for_servers<'a>(
+    claims: impl IntoIterator<Item = (&'a str, &'a str)>,
+) -> std::collections::HashMap<(String, String), String> {
+    let claims: std::collections::BTreeSet<(&str, &str)> = claims.into_iter().collect();
+    let mut taken: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    claims
+        .into_iter()
+        .map(|(prefix, server)| {
+            let qualified = prefix_for_server(prefix, server);
+            let count = taken.entry(qualified.clone()).or_insert(0);
+            *count += 1;
+            let qualified = match *count {
+                1 => qualified,
+                n => format!("{qualified}{n}"),
+            };
+            ((prefix.to_string(), server.to_string()), qualified)
+        })
+        .collect()
+}
+
+/// The names a tool has under the other naming of its server: without the
+/// server added to its prefix, and with it. A tool switched off or kept from
+/// a client under one name stays so under the other, so adding or removing a
+/// second account does not turn it back on.
+pub fn other_names(wire_name: &str, server_name: &str, delimiter: &str) -> Vec<String> {
+    let Some((prefix, rest)) = wire_name.split_once(delimiter) else {
+        return Vec::new();
+    };
+    let suffix = prefix_for_server("", server_name);
+    if suffix.is_empty() {
+        return Vec::new();
+    }
+    let mut names = vec![format!("{prefix}{suffix}{delimiter}{rest}")];
+    let unnumbered = prefix.trim_end_matches(|c: char| c.is_ascii_digit());
+    if let Some(base) = unnumbered.strip_suffix(&suffix).filter(|b| !b.is_empty()) {
+        names.push(format!("{base}{delimiter}{rest}"));
+    }
+    names
+}
+
 /// Classify a workspace tool into a Google sub-service using built-in defaults.
 /// Returns (&'static str, String) = (sub_service_prefix, original_tool_name)
 ///
@@ -524,6 +568,45 @@ mod tests {
         );
         assert_eq!(prefix_for_server("Gmail", "google-work"), "GmailGoogleWork");
         assert_eq!(prefix_for_server("Gmail", "workspace"), "GmailWorkspace");
+    }
+
+    #[test]
+    fn servers_whose_names_read_alike_still_get_their_own_prefix() {
+        let key = |server: &str| ("Gmail".to_string(), server.to_string());
+        let prefixes = prefixes_for_servers([
+            ("Gmail", "workspace"),
+            ("Gmail", "google_work"),
+            ("Gmail", "google-work"),
+            ("Gmail", "google-work"),
+        ]);
+        assert_eq!(prefixes[&key("workspace")], "GmailWorkspace");
+        // Numbered in name order, so a refresh gives the same answer.
+        assert_eq!(prefixes[&key("google-work")], "GmailGoogleWork");
+        assert_eq!(prefixes[&key("google_work")], "GmailGoogleWork2");
+    }
+
+    #[test]
+    fn a_tool_is_known_by_its_name_with_and_without_the_server() {
+        // Before a second account: the name it would get.
+        assert_eq!(
+            other_names("Gmail__send_message", "workspace", "__"),
+            ["GmailWorkspace__send_message"]
+        );
+        // After: the name it had, numbered or not.
+        assert!(
+            other_names("GmailWorkspace__send_message", "workspace", "__")
+                .contains(&"Gmail__send_message".to_string())
+        );
+        assert!(
+            other_names("GmailGoogleWork2__send_message", "google_work", "__")
+                .contains(&"Gmail__send_message".to_string())
+        );
+        // A prefix that is only the server's name has nothing under it.
+        assert_eq!(
+            other_names("Slack__users_search", "slack", "__"),
+            ["SlackSlack__users_search"]
+        );
+        assert!(other_names("unprefixed", "slack", "__").is_empty());
     }
 
     #[test]

@@ -185,10 +185,11 @@ struct Checked {
 pub trait WatchAccess: Send + Sync {
     /// The watches in the current config. Empty when events are not possible.
     fn watches(&self) -> Vec<WatchConfig>;
-    /// Whether `client_id` is not kept from `server`.
-    fn may_use(&self, client_id: &str, server: &str) -> bool;
-    /// Whether `client_id` holds the event scope and is not kept from `server`.
-    async fn permits(&self, client_id: &str, server: &str) -> bool;
+    /// Whether `client_id` is kept from neither the watch's server nor the
+    /// tool it watches. An event carries that tool's result.
+    fn may_use(&self, client_id: &str, watch: &WatchConfig) -> bool;
+    /// Whether `client_id` holds the event scope and may use the watch.
+    async fn permits(&self, client_id: &str, watch: &WatchConfig) -> bool;
     /// The name the tool is called by, and whether its server marks it read-only.
     fn tool(&self, watch: &WatchConfig) -> Option<(String, bool)>;
     /// The tool's result, or `None` when the call failed or returned an error.
@@ -320,7 +321,7 @@ impl WatchEvents {
         self.access
             .watches()
             .iter()
-            .filter(|watch| self.access.may_use(client_id, &watch.server))
+            .filter(|watch| self.access.may_use(client_id, watch))
             .map(|watch| {
                 json!({
                     "name": watch.event_name(),
@@ -417,7 +418,7 @@ impl WatchEvents {
         Ok(Subscribing {
             id: format!("sub_{}", hex::encode(Sha256::digest(key))),
             event,
-            server: watch.server,
+            watch,
             url: url.to_owned(),
         })
     }
@@ -446,7 +447,7 @@ impl WatchEvents {
             return Err(invalid("minimum supported ttlMs is 1000"));
         }
         let _gate = self.delivery_gate.write().await;
-        if !self.access.permits(client_id, &target.server).await {
+        if !self.access.permits(client_id, &target.watch).await {
             return Err(denied());
         }
         let current = {
@@ -692,18 +693,16 @@ impl WatchEvents {
                 .cloned();
             (subscription, pending)
         };
-        let server = subscription
-            .as_ref()
-            .and_then(|s| self.watch(&s.event))
-            .map(|watch| watch.server);
-        let permitted = match (&subscription, &server) {
-            (Some(subscription), Some(server)) => {
-                self.access.permits(&subscription.client_id, server).await
+        let watch = subscription.as_ref().and_then(|s| self.watch(&s.event));
+        let permitted = match (&subscription, &watch) {
+            (Some(subscription), Some(watch)) => {
+                self.access.permits(&subscription.client_id, watch).await
             }
             _ => false,
         };
         let Some(subscription) = subscription.filter(|_| permitted) else {
-            // Expired, removed, revoked, or kept from the server since.
+            // Expired, removed, revoked, or kept from the server or the
+            // tool since.
             let mut state = self.state.lock().await;
             let mut next = state.clone();
             next.subscriptions
@@ -810,6 +809,6 @@ impl WatchEvents {
 struct Subscribing {
     id: String,
     event: String,
-    server: String,
+    watch: WatchConfig,
     url: String,
 }

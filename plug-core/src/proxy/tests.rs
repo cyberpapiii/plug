@@ -5059,6 +5059,37 @@ fn clients_hear_about_a_block_changing_and_about_nothing_else() {
     assert!(router.client_may_use_tool(Some("cursor"), "git__commit"));
 }
 
+#[test]
+fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
+    let router = router_with_git_commit_tool();
+    let blocked = |tools: &[&str]| {
+        let mut clients = std::collections::BTreeMap::new();
+        clients.insert(
+            "oauth:watcher".to_string(),
+            crate::config::ClientSettings {
+                blocked_tools: tools.iter().map(|tool| tool.to_string()).collect(),
+                ..Default::default()
+            },
+        );
+        router.set_client_access(&clients);
+    };
+    let key = Some("oauth:watcher");
+
+    assert!(router.client_may_watch(key, "git", "commit"));
+    // An event carries the tool's result, so a block on the tool covers it.
+    blocked(&["git__commit"]);
+    assert!(!router.client_may_watch(key, "git", "commit"));
+    assert!(router.client_may_watch(None, "git", "commit"), "Plug's own");
+
+    // The name the tool has once a second server shares its prefix, and the
+    // name it goes back to: a block under either holds under both.
+    blocked(&["gitGit__commit"]);
+    assert!(!router.client_may_use_tool(key, "git__commit"));
+    assert!(!router.client_may_watch(key, "git", "commit"));
+    blocked(&["other__commit"]);
+    assert!(router.client_may_use_tool(key, "git__commit"));
+}
+
 /// Two servers, each with a resource, a resource template, and a prompt.
 /// `cursor` is kept from `git`.
 fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {

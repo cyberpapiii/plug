@@ -16,10 +16,10 @@ impl WatchAccess for FakeAccess {
     fn watches(&self) -> Vec<WatchConfig> {
         self.watches.lock().unwrap().clone()
     }
-    fn may_use(&self, _: &str, _: &str) -> bool {
+    fn may_use(&self, _: &str, _: &WatchConfig) -> bool {
         self.permitted.load(Ordering::SeqCst)
     }
-    async fn permits(&self, _: &str, _: &str) -> bool {
+    async fn permits(&self, _: &str, _: &WatchConfig) -> bool {
         self.permitted.load(Ordering::SeqCst)
     }
     fn tool(&self, watch: &WatchConfig) -> Option<(String, bool)> {
