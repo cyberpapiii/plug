@@ -19,6 +19,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Clients distinguish missing local configuration from hosted access. Network
+  authorization details show the local HTTP clients represented by that row,
+  including Codex CLI, without implying an active connection.
+
 - A client you name after one Plug knows takes that client's icon: a second
   Cursor sign-in renamed "GrokBot" shows Grok Bot's icon, not Cursor's.
 - Activity shows each call under the name you gave the client that made

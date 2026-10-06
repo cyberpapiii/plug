@@ -512,7 +512,7 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(ClientStatus.app(list[0], connections: 2, limit: nil).text, "2 connections")
         XCTAssertEqual(ClientStatus.app(list[0], connections: 1, limit: "1 server off").text, "Connected · 1 server off")
         XCTAssertEqual(ClientStatus.app(list[0], connections: 0, limit: nil).text, "Not open")
-        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "Not using Plug")
+        XCTAssertEqual(ClientStatus.app(list[1], connections: 0, limit: nil).text, "No local Plug configuration")
         XCTAssertEqual(ClientStatus.app(list[2], connections: 0, limit: nil).text, "Not found on this Mac")
     }
 

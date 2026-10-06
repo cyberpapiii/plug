@@ -534,7 +534,7 @@ struct ClientsView: View {
         } else if app.linked {
             "Plug is in this client's settings. Restart the client after changing this."
         } else {
-            "Turn this on to add Plug to the client's settings, then restart the client."
+            "No direct Plug entry in this client's local settings. A hosted connector may already provide access; see its network authorization above."
         }
         return Entry(
             id: "app:\(app.target)",
@@ -592,6 +592,10 @@ struct ClientsView: View {
     /// client has to ask again, so the app asks first.
     private func grantEntry(_ grant: DownstreamClient, sessions: [LiveSession]) -> Entry {
         let name = names.name(forKey: grant.clientKey) ?? grant.clientName
+        let linkedNames = allApps.filter {
+            ClientStatus.hasNetworkRepresentation($0, grantNames: [grant.clientName])
+        }.map(\.name).sorted()
+        let linkedDetail = linkedNames.isEmpty ? "" : " Local HTTP configuration: \(linkedNames.joined(separator: ", "))."
         let access = access(key: grant.clientKey, name: name)
         let host = URL(string: grant.clientId)?.host()
         // A client Plug registered gets a short id, since two can share a
@@ -618,7 +622,7 @@ struct ClientsView: View {
             setOn: { allowed in
                 if !allowed { revoking = Revoking(id: grant.clientId, name: name) }
             },
-            about: "You allowed this client to use Plug over the network. Turn this off to remove its access.",
+            about: "This is an OAuth authorization, not a separate app installation.\(linkedDetail) Authorized does not mean connected now. Turn this off to remove access.",
             access: access,
             connections: sessions.map(connection),
             renameKey: grant.clientKey,
@@ -713,7 +717,7 @@ struct ClientStatus: Equatable {
         } else if !app.detected {
             state = "Not found on this Mac"
         } else if !app.linked {
-            state = "Not using Plug"
+            state = "No local Plug configuration"
         } else {
             state = app.transport?.lowercased() == "http" ? "Uses Plug over the network" : "Not open"
         }
@@ -727,7 +731,7 @@ struct ClientEntry: Identifiable {
     enum Group: String {
         case onThisMac = "On This Mac"
         case network = "Over the Network"
-        case notUsing = "Not Using Plug"
+        case notUsing = "No Local Plug Configuration"
     }
 
     enum Glyph {
