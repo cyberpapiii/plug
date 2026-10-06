@@ -73,6 +73,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The menu bar panel and Activity show a client's icon wherever the
+  Clients list does: a network client that says nothing about itself is
+  pictured by its sign-in's name in the panel too, and ChatGPT is found by
+  the app OpenAI ships now, whatever the owner named it.
 - A tool switched off for one client is stored by its server and that
   server's own name for the tool, so renaming the tool or its server's
   prefix cannot switch it back on. Blocks written the old way, by listed

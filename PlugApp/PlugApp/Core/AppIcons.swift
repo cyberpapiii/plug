@@ -47,6 +47,13 @@ enum AppIcons {
         "chatgpt": "com.openai.chat",
     ]
 
+    /// A second app that stands for a target. OpenAI ships one Mac app,
+    /// ChatGPT.app, under Codex's identifier; the older ChatGPT app had its
+    /// own.
+    private static let otherBundleIdentifiers: [String: String] = [
+        "chatgpt": "com.openai.codex",
+    ]
+
     /// Targets that are command line tools. They have no icon to show, and a
     /// terminal glyph says more about them than a generic app square would.
     private static let commandLineTargets: Set<String> = [
@@ -99,9 +106,11 @@ enum AppIcons {
     /// The app's real icon, when this Mac has the app.
     @MainActor
     static func image(target: String, name: String, appPath: String? = nil) -> NSImage? {
-        if let identifier = bundleIdentifiers[target.lowercased()],
-           let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
-            return NSWorkspace.shared.icon(forFile: url.path)
+        let target = target.lowercased()
+        for identifier in [bundleIdentifiers[target], otherBundleIdentifiers[target]].compactMap({ $0 }) {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+                return NSWorkspace.shared.icon(forFile: url.path)
+            }
         }
         // A client Plug has no entry for, started by an app that is right here.
         if let appPath, FileManager.default.fileExists(atPath: appPath) {
@@ -245,6 +254,7 @@ enum AppIcons {
         case "claude-desktop": return "Claude Desktop"
         case "claude-code": return "Claude Code"
         case "codex", "codex-cli": return "Codex CLI"
+        case "chatgpt": return "ChatGPT"
         case "cursor": return "Cursor"
         case "devin": return "Devin"
         case "copilot-cli": return "GitHub Copilot CLI"
