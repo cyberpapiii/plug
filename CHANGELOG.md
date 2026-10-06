@@ -73,6 +73,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Servers whose names read alike are numbered around names already in use,
+  so a numbered name can no longer land on another server and hide its tool.
 - A remote client's open session ends when its sign-in does, however that
   happened, including a removal whose save failed. A client newly kept from
   a server stops getting log lines on a stream it already had open.

@@ -2380,6 +2380,10 @@ impl ToolRouter {
                     .iter()
                     .filter(|c| shared.contains(&c.prefix))
                     .map(|c| (c.prefix.as_str(), c.server_name.as_str())),
+                classified
+                    .iter()
+                    .filter(|c| !shared.contains(&c.prefix))
+                    .map(|c| c.prefix.as_str()),
             );
             for c in &mut classified {
                 if let Some(prefix) = qualified.get(&(c.prefix.clone(), c.server_name.clone())) {
