@@ -73,6 +73,16 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A server change that is refused, such as adding a server under a name
+  already taken, no longer replaces the key the existing server works with.
+- Removing a server keeps a stored key that another account of it still
+  uses; the key goes when the last one does.
+- Two servers whose names differ only in punctuation, or a server with a
+  very long name, no longer share one stored key. Keys already stored keep
+  their names.
+- Watching a tool for change follows what the server says about it: a tool
+  the server marks as writing is not called on a timer because its name
+  reads as harmless.
 - A client that runs as several processes keeps its sign-in. Two of them
   renewing with the same stored token in the same minute both get a new one;
   before, the slower one was taken for a thief and the whole sign-in was
