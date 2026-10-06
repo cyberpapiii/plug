@@ -102,8 +102,16 @@ struct ClientNames: Equatable {
     private let names: [String: String]
     /// The name each remote client registered its grant under.
     private let grantNames: [String: String]
+    /// Where the owner says each client runs.
+    private let places: [String: String]
 
-    init(visibility: [ClientVisibility], names: [ClientName], grants: [DownstreamClient] = []) {
+    init(
+        visibility: [ClientVisibility],
+        names: [ClientName],
+        grants: [DownstreamClient] = [],
+        places: [ClientPlace] = []
+    ) {
+        self.places = Dictionary(places.map { ($0.key, $0.place) }, uniquingKeysWith: { first, _ in first })
         keys = Dictionary(
             visibility.compactMap { entry in entry.clientKey.map { (entry.sessionId, $0) } },
             uniquingKeysWith: { first, _ in first }
@@ -119,7 +127,8 @@ struct ClientNames: Equatable {
         self.init(
             visibility: snapshot.clientVisibility,
             names: snapshot.clientNames ?? [],
-            grants: snapshot.downstreamClients
+            grants: snapshot.downstreamClients,
+            places: snapshot.clientPlaces ?? []
         )
     }
 
@@ -128,6 +137,14 @@ struct ClientNames: Equatable {
     func key(of session: LiveSession) -> String? { keys[session.sessionId] }
 
     func name(forKey key: String?) -> String? { key.flatMap { names[$0] } }
+
+    /// Where the owner says the client runs.
+    func place(forKey key: String?) -> String? { key.flatMap { places[$0] } }
+
+    /// Every place the owner has typed, in order.
+    var ownerPlaces: [String] {
+        Set(places.values).sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+    }
 
     /// The owner's name first, then a product Plug knows. A remote session
     /// Plug does not know takes the name on its grant, which the owner
@@ -194,6 +211,39 @@ struct ClientNames: Equatable {
                 appPath: session.host?.app
             )
         }
+    }
+}
+
+/// Where clients run, which is what the Clients column is grouped by. The
+/// owner says where; Plug fills in only what it can tell for itself.
+enum ClientPlaces {
+    static let thisMac = "This Mac"
+    static let web = "On the Web"
+    static let elsewhere = "Elsewhere"
+    static let notUsing = ClientEntry.Group.notUsing.rawValue
+
+    /// Where a client runs: what the owner said, else what Plug can tell.
+    /// `site` is the web site a network client signed in from, and
+    /// `setUpHere` says Plug wrote this client's settings on this Mac.
+    static func place(owners: String?, isRemote: Bool, site: String? = nil, setUpHere: Bool = false) -> String {
+        if let owners, !owners.isEmpty { return owners }
+        if !isRemote || setUpHere { return thisMac }
+        return site == nil ? elsewhere : web
+    }
+
+    /// The order the sections show in: this Mac, the owner's places by
+    /// name, then the ones Plug made up, then clients that do not use Plug.
+    static func ordered(_ places: [String]) -> [String] {
+        let last = [web, elsewhere, notUsing]
+        let present = Set(places)
+        let owners = present.subtracting(last + [thisMac])
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        return ([thisMac] + owners + last).filter(present.contains)
+    }
+
+    /// What the Runs On menu offers besides typing a new one.
+    static func choices(owners: [String]) -> [String] {
+        [thisMac] + owners.filter { $0 != thisMac }
     }
 }
 
@@ -447,13 +497,19 @@ struct ClientsView: View {
                             ProblemNote(title: "Plug could not look for clients on this Mac", reason: error)
                                 .selectionDisabled()
                         }
-                        group(.onThisMac, in: entries)
-                        group(.network, in: entries)
-                        group(.notUsing, in: entries)
+                        ForEach(ClientPlaces.ordered(entries.map(\.place)), id: \.self) { place in
+                            group(place, in: entries)
+                        }
                     }
                 } detail: {
                     if let selected = entries.first(where: { $0.id == router.selectedClient }) {
-                        ClientDetail(entry: selected, tools: model.toolCatalog, canMutate: model.canMutate, run: run)
+                        ClientDetail(
+                            entry: selected,
+                            tools: model.toolCatalog,
+                            places: ClientPlaces.choices(owners: names.ownerPlaces),
+                            canMutate: model.canMutate,
+                            run: run
+                        )
                             .id(selected.id)
                     } else {
                         NoSelection(item: "Client", symbol: AppSection.clients.symbol)
@@ -508,10 +564,10 @@ struct ClientsView: View {
     }
 
     @ViewBuilder
-    private func group(_ group: Entry.Group, in entries: [Entry]) -> some View {
-        let rows = entries.filter { $0.group == group }
+    private func group(_ place: String, in entries: [Entry]) -> some View {
+        let rows = entries.filter { $0.place == place }
         if !rows.isEmpty {
-            ListGroupHeader(group.rawValue)
+            ListGroupHeader(place)
             ForEach(rows) { entry in
                 ClientRow(entry: entry, canMutate: model.canMutate).tag(entry.id)
             }
@@ -577,6 +633,9 @@ struct ClientsView: View {
         return Entry(
             id: "app:\(app.target)",
             group: !app.linked && sessions.isEmpty ? .notUsing : .onThisMac,
+            place: !app.linked && sessions.isEmpty
+                ? ClientPlaces.notUsing
+                : ClientPlaces.place(owners: names.place(forKey: app.target), isRemote: false),
             name: name,
             originalName: app.name,
             status: ClientStatus.app(app, connections: sessions.count, limit: access?.summary),
@@ -590,7 +649,8 @@ struct ClientsView: View {
             about: about,
             access: access,
             connections: sessions.map(connection),
-            renameKey: access?.key
+            renameKey: access?.key,
+            placeKey: app.target
         )
     }
 
@@ -604,6 +664,7 @@ struct ClientsView: View {
         return Entry(
             id: id,
             group: Self.isRemote(first) ? .network : .onThisMac,
+            place: ClientPlaces.place(owners: names.place(forKey: names.key(of: first)), isRemote: Self.isRemote(first)),
             name: name,
             originalName: names.originalName(first),
             status: ClientStatus(
@@ -621,6 +682,7 @@ struct ClientsView: View {
             access: choices,
             connections: sessions.map(connection),
             renameKey: names.key(of: first),
+            placeKey: names.key(of: first),
             disambiguator: String(first.sessionId.prefix(4))
         )
     }
@@ -646,6 +708,12 @@ struct ClientsView: View {
         return Entry(
             id: "grant:\(grant.clientId)",
             group: .network,
+            place: ClientPlaces.place(
+                owners: names.place(forKey: grant.clientKey),
+                isRemote: true,
+                site: host,
+                setUpHere: !linkedNames.isEmpty
+            ),
             name: name,
             originalName: grant.clientName,
             status: ClientStatus.grant(
@@ -666,6 +734,7 @@ struct ClientsView: View {
             access: access,
             connections: sessions.map(connection),
             renameKey: grant.clientKey,
+            placeKey: grant.clientKey,
             disambiguator: host ?? shortID,
             website: host,
             shortID: host == nil ? shortID : nil,
@@ -813,6 +882,8 @@ struct ClientEntry: Identifiable {
 
     let id: String
     let group: Group
+    /// Where it runs, which is the section it shows under.
+    let place: String
     let name: String
     /// What the client is called when the owner has not named it.
     let originalName: String
@@ -831,6 +902,9 @@ struct ClientEntry: Identifiable {
     let connections: [Connection]
     /// Nil when Plug has nothing to store a name under.
     let renameKey: String?
+    /// The key its place is stored under. An app set up on this Mac has one
+    /// even when it reaches Plug over the network and cannot be renamed.
+    let placeKey: String?
     /// A few words that tell this client from another with the same name.
     /// Nil when its name is the only one like it.
     var disambiguator: String?
@@ -943,16 +1017,27 @@ private struct ClientSwitch: View {
 private struct ClientDetail: View {
     let entry: ClientEntry
     let tools: ToolCatalog
+    /// The places the Runs On menu offers.
+    let places: [String]
     let canMutate: Bool
     let run: (PlugIntent) -> Void
     /// The name being typed. Empty means the client's own name.
     @State private var draft: String
+    /// A place being typed, while the sheet that asks for it is up.
+    @State private var newPlace: String?
     /// The servers whose tools are showing.
     @State private var opened: Set<String> = []
 
-    init(entry: ClientEntry, tools: ToolCatalog, canMutate: Bool, run: @escaping (PlugIntent) -> Void) {
+    init(
+        entry: ClientEntry,
+        tools: ToolCatalog,
+        places: [String],
+        canMutate: Bool,
+        run: @escaping (PlugIntent) -> Void
+    ) {
         self.entry = entry
         self.tools = tools
+        self.places = places
         self.canMutate = canMutate
         self.run = run
         _draft = State(initialValue: entry.name == entry.originalName ? "" : entry.name)
@@ -995,7 +1080,7 @@ private struct ClientDetail: View {
                 }
             }
 
-            if entry.renameKey != nil || entry.website != nil || entry.shortID != nil {
+            if entry.renameKey != nil || entry.placeKey != nil || entry.website != nil || entry.shortID != nil {
                 Section {
                     if let key = entry.renameKey {
                         TextField("Name", text: $draft, prompt: Text(entry.originalName))
@@ -1005,6 +1090,9 @@ private struct ClientDetail: View {
                                 ))
                             }
                             .disabled(!canMutate)
+                    }
+                    if let key = entry.placeKey {
+                        runsOn(key: key)
                     }
                     if let website = entry.website {
                         LabeledContent("Website", value: website)
@@ -1023,6 +1111,35 @@ private struct ClientDetail: View {
                     }
                 }
             }
+        }
+    }
+
+    /// Where the client runs: the places already in use, or a new one.
+    private func runsOn(key: String) -> some View {
+        LabeledContent("Runs On") {
+            Menu(entry.place) {
+                ForEach(places, id: \.self) { place in
+                    Button(place) { run(.setClientPlace(key: key, place: place)) }
+                }
+                Divider()
+                Button("New Place…") { newPlace = "" }
+                Button("Let Plug Decide") { run(.setClientPlace(key: key, place: "")) }
+            }
+            .fixedSize()
+            .disabled(!canMutate)
+        }
+        .alert("Where does \(entry.name) run?", isPresented: Binding(
+            get: { newPlace != nil },
+            set: { if !$0 { newPlace = nil } }
+        )) {
+            TextField("Work laptop", text: Binding(get: { newPlace ?? "" }, set: { newPlace = $0 }))
+            Button("Save") {
+                let place = (newPlace ?? "").trimmingCharacters(in: .whitespaces)
+                if !place.isEmpty { run(.setClientPlace(key: key, place: place)) }
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("Clients are grouped by where they run.")
         }
     }
 

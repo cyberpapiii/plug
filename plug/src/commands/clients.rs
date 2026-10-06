@@ -70,6 +70,9 @@ pub(crate) struct LiveSessionView {
     /// The name the owner gave this client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) name: Option<String>,
+    /// Where the owner says this client runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) place: Option<String>,
     /// The name a remote client signed in under.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) grant_name: Option<String>,
@@ -117,6 +120,14 @@ pub(crate) enum ClientCommands {
         client: String,
         /// The new name
         name: String,
+    },
+    /// Say where a client runs, such as "Work laptop" ("" takes it back)
+    Place {
+        /// The client: its key from `plug clients -v`, or the name it shows
+        /// under while connected
+        client: String,
+        /// Where it runs, in your own words
+        place: String,
     },
     /// Keep a client from a server or from single tools
     Block {
@@ -225,6 +236,34 @@ pub(crate) async fn cmd_client_rename(
         print_info_line(format!("{key} goes by the name Plug works out again."));
     } else {
         print_info_line(format!("{key} is now called {name}."));
+    }
+    Ok(())
+}
+
+pub(crate) async fn cmd_client_place(
+    config_path: Option<&PathBuf>,
+    client: String,
+    place: String,
+) -> anyhow::Result<()> {
+    let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
+    let config = plug_core::config::load_config(config_path).ok();
+    let key = resolve_client_key(
+        &client,
+        &live_session_views(&live, config.as_ref(), &downstream_grants().await),
+    )?;
+    let place = place.trim().to_string();
+    crate::commands::servers::apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::SetClientPlace {
+            key: key.clone(),
+            place: place.clone(),
+        },
+    )
+    .await?;
+    if place.is_empty() {
+        print_info_line(format!("{key} no longer says where it runs."));
+    } else {
+        print_info_line(format!("{key} runs on {place}."));
     }
     Ok(())
 }
@@ -859,6 +898,9 @@ pub(crate) fn live_session_views(
             name: key
                 .as_ref()
                 .and_then(|key| config?.clients.get(key)?.name.clone()),
+            place: key
+                .as_ref()
+                .and_then(|key| config?.clients.get(key)?.place.clone()),
             grant_name: key.as_ref().and_then(|key| {
                 grants
                     .iter()

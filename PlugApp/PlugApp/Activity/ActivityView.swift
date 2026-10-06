@@ -198,7 +198,7 @@ private struct ActivityRow: View {
 
     /// Which server, then who called.
     private var context: String {
-        [call.server, call.caller].compactMap { $0 }.joined(separator: " · ")
+        [call.server, call.callerAndPlace].compactMap { $0 }.joined(separator: " · ")
     }
 
     private var time: String {
@@ -240,7 +240,7 @@ private struct CallDetail: View {
                 LabeledContent("Client") {
                     HStack(spacing: Metric.tight) {
                         AppGlyph(target: call.callerTarget, name: call.callerIconName, size: 16)
-                        Text(call.caller).textSelection(.enabled)
+                        Text(call.callerAndPlace).textSelection(.enabled)
                     }
                 }
                 if let server = call.server {

@@ -117,6 +117,12 @@ public struct ClientName: Codable, Equatable, Sendable {
     public let name: String
 }
 
+/// Where the owner says a client runs.
+public struct ClientPlace: Codable, Equatable, Sendable {
+    public let key: String
+    public let place: String
+}
+
 /// What the owner keeps a client from. A list the daemon left out is empty.
 public struct ClientBlocks: Codable, Equatable, Sendable {
     public let key: String
@@ -310,6 +316,8 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let downstreamClients: [DownstreamClient]
     /// Names the owner gave clients. Absent when there are none.
     public var clientNames: [ClientName]?
+    /// Where the owner says each client runs. Absent when none is said.
+    public var clientPlaces: [ClientPlace]?
     /// What each client is kept from. Absent when nobody is kept from anything.
     public var clientBlocks: [ClientBlocks]?
     /// The events clients can subscribe to. Absent when there are none.
@@ -576,6 +584,8 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case revokeClient(authToken: String, clientID: String)
     /// An empty name goes back to the name Plug works out.
     case renameClient(authToken: String, key: String, name: String)
+    /// An empty place goes back to the place Plug works out.
+    case setClientPlace(authToken: String, key: String, place: String)
     /// Keep a client from a server, or let it back in.
     case setClientServerBlocked(authToken: String, key: String, server: String, blocked: Bool)
     /// Keep a client from one tool, by the name Plug lists it under.
@@ -588,7 +598,7 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
-        case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked
+        case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked, place
         case watch, event, account, spec, secretStore
     }
 
@@ -647,6 +657,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .renameClient(token, key, name):
             try c.encode("RenameClient", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode(name, forKey: .name)
+        case let .setClientPlace(token, key, place):
+            try c.encode("SetClientPlace", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode(place, forKey: .place)
         case let .setClientServerBlocked(token, key, server, blocked):
             try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode("server", forKey: .kind)

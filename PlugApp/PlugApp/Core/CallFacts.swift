@@ -14,11 +14,20 @@ struct CallFacts: Equatable {
     /// network. The owner approved it, so it outranks what the client says
     /// about itself.
     let grantName: String?
+    /// Where the owner says this client runs.
+    let place: String?
 
-    init(_ event: ActivityEvent, ownerName: String? = nil, grantName: String? = nil) {
+    init(_ event: ActivityEvent, ownerName: String? = nil, grantName: String? = nil, place: String? = nil) {
         self.event = event
         self.ownerName = ownerName
         self.grantName = grantName
+        self.place = place
+    }
+
+    /// The caller, with where it runs when the owner has said.
+    var callerAndPlace: String {
+        guard let place, !place.isEmpty else { return caller }
+        return "\(caller) (\(place))"
     }
 
     var succeeded: Bool { event.outcome == "success" }

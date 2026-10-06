@@ -16,6 +16,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Settings has a Permissions section: whether macOS lets Plug run in the
   background, open at login, and send notifications, with the way to System
   Settings beside anything that was turned off there.
+- Clients are grouped by where they run. Plug fills in This Mac, On the Web
+  and Elsewhere from what it can tell; a client's page has a Runs On menu
+  to say otherwise or to type a place of your own, such as "Work laptop".
+  Activity and `plug clients` show the place beside the client's name, and
+  `plug clients place <client> <place>` sets it from the command line.
 - Each server's page has a Settings row that says where the server's own
   settings are and takes you there: the app it runs from, a file its
   arguments name, the page it gave for itself, or Plug's own form. Plug
