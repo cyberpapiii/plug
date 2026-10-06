@@ -83,12 +83,15 @@ run_xcodebuild() {
 # purpose: this step answers "does it compile", and a generic destination has no
 # provisioning to sign against.
 
+# The build goes under the hidden `.build`, not Xcode's own folder, so Spotlight
+# does not offer the test host as a second Plug.app.
 # `${skip[@]+...}` because macOS still ships bash 3.2, where expanding an empty
 # array under `set -u` is an error rather than nothing.
 run_xcodebuild "test" test \
   -project PlugApp/PlugApp.xcodeproj \
   -scheme PlugApp \
   -destination 'platform=macOS' \
+  -derivedDataPath PlugApp/.build/tests \
   -only-testing:PlugAppTests \
   ${skip[@]+"${skip[@]}"} \
   "${test_settings[@]}"

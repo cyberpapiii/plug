@@ -277,6 +277,21 @@ final class AppRosterTests: XCTestCase {
         XCTAssertTrue(roster.other.isEmpty)
     }
 
+    func testASessionItsOwnerNamedIsNotTheClientItReports() throws {
+        let live = try sessions(
+            """
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","connected_secs":1},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","connected_secs":1}]
+            """
+        )
+        let roster = AppRoster(
+            apps: try apps(#"[{"target":"cursor","linked":true,"detected":true}]"#),
+            sessions: live
+        ) { $0.sessionId == "g1" ? "grok-bot" : nil }
+        XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["c1"])
+        XCTAssertEqual(roster.other.map(\.sessionId), ["g1"])
+    }
+
     func testASessionFromNoKnownAppIsKeptApart() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true}]"#),

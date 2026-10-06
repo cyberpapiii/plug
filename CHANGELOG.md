@@ -22,7 +22,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Clients distinguish missing local configuration from hosted access. Network
   authorization details show the local HTTP clients represented by that row,
   including Codex CLI, without implying an active connection.
-
 - A client you name after one Plug knows takes that client's icon: a second
   Cursor sign-in renamed "GrokBot" shows Grok Bot's icon, not Cursor's.
 - Activity shows each call under the name you gave the client that made
@@ -34,10 +33,15 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
-- Ditto history and email-manager clients use Python icons while retaining their distinct workflow names.
+- Ditto history and email-manager clients use Python icons while retaining
+  their distinct workflow names.
 - HTTP-linked clients no longer have a redundant local configuration row
   beside their network authorization. Existing local sessions remain visible;
   clients not using Plug have their own section.
+- Clients follows links made outside the app, such as `plug link` in a
+  terminal, within a few seconds. It read them once, when the tab opened.
+- Running the app's tests no longer leaves a second Plug.app where Spotlight
+  finds it.
 - Native OAuth clients such as Claude Code can sign in using temporary
   loopback callback ports. Callback host, path, and query remain checked.
 - With the sidebar hidden, the window's title and count no longer run past

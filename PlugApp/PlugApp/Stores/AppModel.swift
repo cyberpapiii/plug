@@ -686,8 +686,11 @@ final class AppModel {
             hasLoadedConnectableApps = true
         }
         do {
-            connectableApps = try await appLinker.apps()
-            connectableAppsError = nil
+            // Assigned only when it differs: the list is read every few
+            // seconds while shown, and an equal value should redraw nothing.
+            let apps = try await appLinker.apps()
+            if apps != connectableApps { connectableApps = apps }
+            if connectableAppsError != nil { connectableAppsError = nil }
         } catch {
             connectableAppsError = error.localizedDescription
         }

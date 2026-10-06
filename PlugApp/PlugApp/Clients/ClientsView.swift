@@ -17,12 +17,22 @@ struct AppRoster: Equatable {
     /// Open sessions from something Plug has no app entry for.
     let other: [LiveSession]
 
-    init(apps: [LinkableApp], sessions: [LiveSession]) {
+    /// `named` is the client a session's owner named it as, when that is a
+    /// client Plug knows. It outranks what the session reports: a sign-in
+    /// named Grok Bot is not Cursor's, though it says Cursor.
+    init(
+        apps: [LinkableApp],
+        sessions: [LiveSession],
+        named: (LiveSession) -> String? = { _ in nil }
+    ) {
         var claimed = Set<String>()
         var connected: [Connected] = []
         var idle: [LinkableApp] = []
         for app in apps {
-            let own = sessions.filter { Self.targets(of: $0).contains(app.target) }
+            let own = sessions.filter { session in
+                if let target = named(session) { return target == app.target }
+                return Self.targets(of: session).contains(app.target)
+            }
             claimed.formUnion(own.map(\.sessionId))
             if !own.isEmpty {
                 connected.append(Connected(app: app, sessions: own))
@@ -300,7 +310,12 @@ struct ClientsView: View {
     /// Every app is placed against all sessions, then search narrows what
     /// shows, so a session never leaves its app's row because the app was
     /// filtered out.
-    private var roster: AppRoster { AppRoster(apps: allApps, sessions: sessions) }
+    private var roster: AppRoster {
+        let names = self.names
+        return AppRoster(apps: allApps, sessions: sessions) {
+            names.knownTarget(named: names.name(forKey: names.key(of: $0)))
+        }
+    }
     private var connectedApps: [AppRoster.Connected] {
         roster.connected.filter { matches($0.app.name) || matches($0.app.target) }
     }
@@ -455,7 +470,14 @@ struct ClientsView: View {
         } message: { _ in
             Text("It can no longer use Plug and leaves this list. To come back, it has to ask you again.")
         }
-        .task { await model.loadConnectableApps() }
+        // Links change outside the app too (`plug link`, another tool editing
+        // a client's settings), so the list is read again while it is shown.
+        .task {
+            while !Task.isCancelled {
+                await model.loadConnectableApps()
+                try? await Task.sleep(for: .seconds(5))
+            }
+        }
     }
 
     /// NSTableView is still finishing its own update when the list changes, so
