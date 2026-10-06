@@ -79,6 +79,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   watches that are due with it.
 - A secret store command that leaves a program running behind it no longer
   hangs the read; it stops at the store's time limit.
+- A client kept from a tool can no longer read a large result of that tool
+  that Plug set aside as a file.
+- An API server's key is not sent on when the API redirects to another port
+  or from HTTPS to plain HTTP on the same host. Plug also stops reading an
+  API response, or an API description, once it passes the size limit, where
+  before it read the whole thing first.
 - Removing a client's access ends the sessions it has open, where before an
   open stream stayed up until it timed out. A session answers only to the
   client that opened it.

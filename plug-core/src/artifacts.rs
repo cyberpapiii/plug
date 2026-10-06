@@ -167,6 +167,32 @@ impl ArtifactStore {
         ))
     }
 
+    /// Hold a record for `source_tool` with nothing on disk behind it.
+    #[cfg(test)]
+    pub(crate) fn insert_for_test(&self, id: &str, source_tool: &str) {
+        let now = SystemTime::now();
+        self.records.insert(
+            id.to_string(),
+            ArtifactRecord {
+                id: id.to_string(),
+                source_tool: source_tool.to_string(),
+                original_size_bytes: 0,
+                created_at: now,
+                expires_at: now + std::time::Duration::from_secs(60),
+                payload_path: self.base_dir.join(id).join(PAYLOAD_FILE),
+                materialized_path: None,
+                chunk_count: 0,
+                preview: String::new(),
+            },
+        );
+    }
+
+    /// The tool whose result the artifact at `uri` holds.
+    pub fn source_tool(&self, uri: &str) -> Option<String> {
+        let request = parse_artifact_uri(uri)?;
+        Some(self.records.get(&request.id)?.source_tool.clone())
+    }
+
     pub fn read(&self, uri: &str) -> Result<ReadResourceResult, McpError> {
         let request = parse_artifact_uri(uri).ok_or_else(|| {
             McpError::from(ProtocolError::InvalidRequest {

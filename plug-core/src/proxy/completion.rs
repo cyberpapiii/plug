@@ -7,6 +7,17 @@ impl super::ToolRouter {
         client_key: Option<&str>,
     ) -> Result<ReadResourceResult, McpError> {
         if uri.starts_with("plug://artifact/") {
+            // An artifact is a tool's result, so whoever is kept from the
+            // tool is kept from it.
+            if self
+                .artifact_store
+                .source_tool(uri)
+                .is_some_and(|tool| !self.client_may_use_tool(client_key, &tool))
+            {
+                return Err(McpError::from(ProtocolError::InvalidRequest {
+                    detail: format!("artifact not found: {uri}"),
+                }));
+            }
             return self.artifact_store.read(uri);
         }
 

@@ -253,16 +253,39 @@ async fn read_document(spec: &str, timeout: Duration) -> anyhow::Result<String> 
         status.is_success(),
         "could not fetch OpenAPI document '{spec}': HTTP {status}"
     );
-    let bytes = response
-        .bytes()
+    let (bytes, more) = read_up_to(response, MAX_DOCUMENT_BYTES)
         .await
         .map_err(|e| anyhow::anyhow!("could not read OpenAPI document '{spec}': {e}"))?;
-    anyhow::ensure!(
-        bytes.len() <= MAX_DOCUMENT_BYTES,
-        "OpenAPI document '{spec}' is larger than 16 MB"
-    );
-    String::from_utf8(bytes.to_vec())
+    anyhow::ensure!(!more, "OpenAPI document '{spec}' is larger than 16 MB");
+    String::from_utf8(bytes)
         .map_err(|_| anyhow::anyhow!("OpenAPI document '{spec}' is not UTF-8 text"))
+}
+
+/// Read a response body, stopping once it passes `limit` so a body of any
+/// size is never held whole. Returns at most `limit` bytes and whether there
+/// was more.
+async fn read_up_to(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<(Vec<u8>, bool), reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        body.extend_from_slice(&chunk);
+        if body.len() > limit {
+            body.truncate(limit);
+            return Ok((body, true));
+        }
+    }
+    Ok((body, false))
+}
+
+/// Whether a redirect from `from` to `to` stays on the same scheme, host
+/// and port. A credential sent to one is not sent on to anything else: not
+/// another port on the host, and not the same address without TLS.
+fn same_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
+    from.scheme() == to.scheme()
+        && from.host_str() == to.host_str()
+        && from.port_or_known_default() == to.port_or_known_default()
 }
 
 fn expand_home(path: &str) -> std::path::PathBuf {
@@ -278,13 +301,13 @@ fn http_client() -> reqwest::Client {
     crate::tls::ensure_rustls_provider_installed();
     reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        // A redirect may not carry a request, and its credential, to another
-        // host than the one the server is configured for.
+        // A redirect may not carry a request, and its credential, anywhere
+        // but the address the server is configured for.
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             let same_host = attempt
                 .previous()
                 .last()
-                .is_some_and(|previous| previous.host_str() == attempt.url().host_str());
+                .is_some_and(|previous| same_origin(previous, attempt.url()));
             if same_host && attempt.previous().len() < 5 {
                 attempt.follow()
             } else {
@@ -913,27 +936,31 @@ impl OpenApiServer {
             .and_then(|value| value.to_str().ok())
             .unwrap_or_default()
             .to_string();
-        let bytes = match response.bytes().await {
-            Ok(bytes) => bytes,
+        let length = response.content_length();
+        let (bytes, more) = match read_up_to(response, MAX_RESPONSE_BYTES).await {
+            Ok(read) => read,
             Err(_) => {
                 return CallToolResult::error(vec![ContentBlock::text(format!(
                     "HTTP {status}: the response could not be read"
                 ))]);
             }
         };
-
+        // A cut can land inside a character; what came before it is still text.
         let text = match std::str::from_utf8(&bytes) {
-            Ok(text) if text.len() > MAX_RESPONSE_BYTES => {
-                let mut end = MAX_RESPONSE_BYTES;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                format!(
-                    "{}\n\n[cut off: the response is {} bytes]",
-                    &text[..end],
-                    text.len()
-                )
+            Err(error) if more && error.error_len().is_none() => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()])
             }
+            other => other,
+        };
+
+        let text = match text {
+            Ok(text) if more => format!(
+                "{text}\n\n[cut off: the response is {}]",
+                match length {
+                    Some(length) => format!("{length} bytes"),
+                    None => format!("more than {MAX_RESPONSE_BYTES} bytes"),
+                }
+            ),
             Ok(text) => text.to_string(),
             Err(_) => format!(
                 "[{} bytes of {}]",
@@ -1015,6 +1042,38 @@ impl ServerHandler for OpenApiServer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_redirect_keeps_the_scheme_host_and_port() {
+        let url = |text: &str| reqwest::Url::parse(text).unwrap();
+        let api = url("https://api.example.com/v1/items");
+        assert!(same_origin(&api, &url("https://api.example.com/v2/items")));
+        assert!(same_origin(&api, &url("https://api.example.com:443/v2")));
+        // Another port on the host is another program.
+        assert!(!same_origin(&api, &url("https://api.example.com:8443/v1")));
+        // The same address without TLS would send the key in the clear.
+        assert!(!same_origin(&api, &url("http://api.example.com/v1/items")));
+        assert!(!same_origin(&api, &url("https://example.com/v1/items")));
+    }
+
+    #[tokio::test]
+    async fn a_response_is_read_only_up_to_the_limit() {
+        let response = |body: &'static str| reqwest::Response::from(http::Response::new(body));
+        assert_eq!(
+            read_up_to(response("short"), 16).await.unwrap(),
+            (b"short".to_vec(), false)
+        );
+        assert_eq!(
+            read_up_to(response("exactly-16-bytes"), 16).await.unwrap(),
+            (b"exactly-16-bytes".to_vec(), false)
+        );
+        assert_eq!(
+            read_up_to(response("longer than the limit"), 6)
+                .await
+                .unwrap(),
+            (b"longer".to_vec(), true)
+        );
+    }
 
     const PETSTORE: &str = r##"{
         "openapi": "3.0.3",
