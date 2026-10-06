@@ -575,7 +575,12 @@ async fn operator_revoke_oauth_client(
             StatusCode::NO_CONTENT
         }
         Ok(false) => StatusCode::NOT_FOUND,
-        Err(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        Err(_) => {
+            // The grant stopped working before the save was tried, so its
+            // sessions end even though the save failed.
+            state.http_state.sessions.end_sessions_of(&client_id);
+            StatusCode::INTERNAL_SERVER_ERROR
+        }
     }
 }
 

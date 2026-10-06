@@ -251,6 +251,27 @@ pub struct WatchEvents {
     wake: Notify,
     /// How each watch's last check went. Not persisted: it describes this run.
     checked: std::sync::Mutex<HashMap<String, Checked>>,
+    /// Watches with a check under way, so a slow one is not started twice.
+    checking: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// How many watched tools may be called at once.
+    check_slots: Arc<tokio::sync::Semaphore>,
+}
+
+/// How many watched tools are called at once. The rest wait their turn.
+const CHECKS_AT_ONCE: usize = 8;
+
+/// Marks a watch as no longer being checked, however its check ended.
+struct Checking {
+    events: Arc<WatchEvents>,
+    event: String,
+}
+
+impl Drop for Checking {
+    fn drop(&mut self) {
+        if let Ok(mut checking) = self.events.checking.lock() {
+            checking.remove(&self.event);
+        }
+    }
 }
 
 impl WatchEvents {
@@ -292,6 +313,8 @@ impl WatchEvents {
             degraded: AtomicBool::new(false),
             wake: Notify::new(),
             checked: std::sync::Mutex::new(HashMap::new()),
+            checking: std::sync::Mutex::default(),
+            check_slots: Arc::new(tokio::sync::Semaphore::new(CHECKS_AT_ONCE)),
         }))
     }
 
@@ -576,26 +599,38 @@ impl WatchEvents {
         Ok(())
     }
 
-    /// Check each of `watches` whose time has come and note in `due` when it
-    /// is next due. Side by side, so one slow tool does not hold up the
-    /// watches that are due with it.
-    async fn check_due(&self, watches: &[WatchConfig], due: &mut HashMap<String, u64>) {
-        let ready: Vec<&WatchConfig> = watches
-            .iter()
-            .filter(|watch| {
-                let event = watch.event_name();
-                if due.get(&event).is_some_and(|at| *at > now()) {
-                    return false;
-                }
-                due.insert(event, now() + watch.every_secs.max(MIN_WATCH_SECS));
-                true
-            })
-            .collect();
-        let checks = ready.into_iter().map(|watch| self.check(watch));
-        for outcome in futures::future::join_all(checks).await {
-            if let Err(error) = outcome {
-                tracing::warn!(code = error.code, "watch paused");
+    /// Start a check of each of `watches` whose time has come and note in
+    /// `due` when it is next due. Does not wait for the checks: a tool that
+    /// is slow to answer delays neither the watches due with it nor anyone's
+    /// next round. A watch still being checked from last time is left alone.
+    fn check_due(self: &Arc<Self>, watches: &[WatchConfig], due: &mut HashMap<String, u64>) {
+        for watch in watches {
+            let event = watch.event_name();
+            if due.get(&event).is_some_and(|at| *at > now()) {
+                continue;
             }
+            if !self
+                .checking
+                .lock()
+                .is_ok_and(|mut checking| checking.insert(event.clone()))
+            {
+                continue;
+            }
+            due.insert(event.clone(), now() + watch.every_secs.max(MIN_WATCH_SECS));
+            let checking = Checking {
+                events: Arc::clone(self),
+                event,
+            };
+            let watch = watch.clone();
+            tokio::spawn(async move {
+                let events = &checking.events;
+                let Ok(_slot) = events.check_slots.acquire().await else {
+                    return;
+                };
+                if let Err(error) = events.check(&watch).await {
+                    tracing::warn!(code = error.code, "watch paused");
+                }
+            });
         }
     }
 
@@ -811,7 +846,7 @@ impl WatchEvents {
                         if let Err(error) = events.prune().await {
                             tracing::warn!(code = error.code, "event state unavailable");
                         }
-                        events.check_due(&watches, &mut due).await;
+                        events.check_due(&watches, &mut due);
                         tokio::time::sleep(Duration::from_secs(5)).await;
                     } => {}
                 }

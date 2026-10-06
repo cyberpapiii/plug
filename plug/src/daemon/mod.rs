@@ -1663,10 +1663,17 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     code: "UNKNOWN_DOWNSTREAM_CLIENT".to_string(),
                     message: format!("registered client `{client_id}` was not found"),
                 },
-                Err(error) => IpcResponse::Error {
-                    code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
-                    message: error.to_string(),
-                },
+                Err(error) => {
+                    // The grant stopped working before the save was tried,
+                    // so its sessions end even though the save failed.
+                    if let Some(sessions) = ctx.http_sessions.as_ref() {
+                        sessions.end_sessions_of(client_id);
+                    }
+                    IpcResponse::Error {
+                        code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
+                        message: error.to_string(),
+                    }
+                }
             }
         }
         IpcRequest::ValidateServer { name, server, .. } => {

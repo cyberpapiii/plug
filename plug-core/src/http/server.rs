@@ -610,9 +610,25 @@ impl HttpState {
                         match recv {
                             Ok(notif @ ProtocolNotification::LoggingMessage { .. }) => {
                                 if let Some(message) = notification_to_sse_message(&notif) {
-                                    log_state.sessions.broadcast(
+                                    // A log line does not say which server
+                                    // wrote it, so a client kept from any
+                                    // server gets none. Asked per line: a
+                                    // block added to an open stream applies
+                                    // to the next one.
+                                    let router = &log_state.router;
+                                    log_state.sessions.broadcast_where(
                                         message,
                                         crate::session::BroadcastKind::Logging,
+                                        &|grant| {
+                                            let key = match grant {
+                                                Some(client_id) => {
+                                                    crate::ipc::grant_client_key(client_id)
+                                                }
+                                                None => crate::ipc::SHARED_REMOTE_CLIENT_KEY
+                                                    .to_string(),
+                                            };
+                                            !router.client_is_kept_from_a_server(Some(&key))
+                                        },
                                     );
                                 }
                             }
@@ -1698,23 +1714,21 @@ async fn handle_request(
                 let _ = state
                     .sessions
                     .set_grant(&session_id, claims.client_id.clone());
+                // The session lives only while the grant does. Asked of the
+                // grant itself, so it holds however the grant ended: removed,
+                // expired, or removed with the save failing afterward.
+                let lifecycle = claims.principal_lifecycle.clone();
+                let _ = state
+                    .sessions
+                    .set_access_check(&session_id, Arc::new(move || lifecycle.is_active()));
             }
 
             // Record what this principal may observe on the shared SSE fan-out.
             // Not ignorable: until this lands the session denies every
             // broadcast, so a failure here would silently mute the client.
-            let mut audience = broadcast_audience_for(&policy_context);
-            // Log lines go to every session alike and do not say which
-            // server wrote them, so a client kept from a server gets none.
-            if state
-                .router
-                .client_is_kept_from_a_server(policy_context.client_key.as_deref())
-            {
-                audience.logging = false;
-            }
             state
                 .sessions
-                .set_broadcast_audience(&session_id, audience)?;
+                .set_broadcast_audience(&session_id, broadcast_audience_for(&policy_context))?;
 
             // Track roots capability for reverse-request roots fetching
             if init_req.params.capabilities.roots.is_some() {
@@ -4431,8 +4445,21 @@ mod tests {
             self.inner.remove(session_id)
         }
 
-        fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
-            self.inner.broadcast(message, kind);
+        fn set_access_check(
+            &self,
+            session_id: &str,
+            check: crate::session::AccessCheck,
+        ) -> Result<(), HttpError> {
+            self.inner.set_access_check(session_id, check)
+        }
+
+        fn broadcast_where(
+            &self,
+            message: SseMessage,
+            kind: crate::session::BroadcastKind,
+            allowed: &dyn Fn(Option<&str>) -> bool,
+        ) {
+            self.inner.broadcast_where(message, kind, allowed);
         }
 
         fn send_to_live_session(

@@ -280,17 +280,25 @@ async fn a_tool_that_does_not_answer_does_not_hold_up_the_other_watches() {
     *access.stuck.lock().unwrap() = Some("mail__search".into());
     let watches = vec![slow, watch()];
     let mut due = HashMap::new();
+    let settle = || tokio::time::sleep(Duration::from_millis(100));
 
-    let round = events.check_due(&watches, &mut due);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(200), round)
-            .await
-            .is_err(),
-        "the stuck tool is still being waited on"
-    );
-    // The watch listed after the stuck one was checked all the same.
+    // Starting a round never waits on a tool.
+    events.check_due(&watches, &mut due);
+    settle().await;
     assert_eq!(access.calls.load(Ordering::SeqCst), 2);
-    let checked = events.checked.lock().unwrap();
-    assert!(checked["mail.inbox"].last_checked.is_some());
-    assert!(!checked.contains_key("mail.slow"));
+    assert!(
+        events.checked.lock().unwrap()["mail.inbox"]
+            .last_checked
+            .is_some()
+    );
+    assert!(!events.checked.lock().unwrap().contains_key("mail.slow"));
+
+    // Both come due again while the slow tool still has not answered. The
+    // other watch gets its next check on time, and the stuck tool is not
+    // called a second time on top of the first.
+    due.clear();
+    events.check_due(&watches, &mut due);
+    settle().await;
+    assert_eq!(access.calls.load(Ordering::SeqCst), 3);
+    assert!(!due.contains_key("mail.slow"), "still on its first check");
 }
