@@ -154,6 +154,26 @@ pub(crate) enum ClientCommands {
         #[arg(long = "tool", value_name = "TOOL")]
         tools: Vec<String>,
     },
+    /// Give a client only the servers and tools you name, and nothing added
+    /// later
+    Only {
+        /// The client: its key from `plug clients -v`, or the name it shows
+        /// under while connected
+        client: String,
+        /// A server it gets, by its name in `plug servers`
+        #[arg(long = "server", value_name = "SERVER")]
+        servers: Vec<String>,
+        /// A single tool it gets, by the name in `plug tools`
+        #[arg(long = "tool", value_name = "TOOL")]
+        tools: Vec<String>,
+        /// Take the named servers and tools off the list instead
+        #[arg(long, conflicts_with = "off")]
+        remove: bool,
+        /// End the list. The client keeps what it gets now, and gets
+        /// servers added later
+        #[arg(long)]
+        off: bool,
+    },
 }
 
 /// Work out which client `plug clients rename` means.
@@ -316,6 +336,92 @@ pub(crate) async fn cmd_client_block(
         );
     }
     Ok(())
+}
+
+/// `plug clients only`: put servers and tools on a client's allow list, take
+/// them off, or drop the list.
+pub(crate) async fn cmd_client_only(
+    config_path: Option<&PathBuf>,
+    client: String,
+    servers: Vec<String>,
+    tools: Vec<String>,
+    remove: bool,
+    off: bool,
+) -> anyhow::Result<()> {
+    use plug_core::operator::ClientBlockKind;
+
+    if !off && servers.is_empty() && tools.is_empty() {
+        anyhow::bail!("say what with --server <name> or --tool <name>, or end the list with --off");
+    }
+    let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
+    let config = plug_core::config::load_config(config_path).ok();
+    let key = resolve_client_access_key(
+        &client,
+        &live_session_views(&live, config.as_ref(), &downstream_grants().await),
+    )?;
+    let targets: Vec<(ClientBlockKind, String)> = if off {
+        vec![(ClientBlockKind::AllowList, "*".to_string())]
+    } else {
+        servers
+            .into_iter()
+            .map(|server| (ClientBlockKind::AllowedServer, server))
+            .chain(
+                tools
+                    .into_iter()
+                    .map(|tool| (ClientBlockKind::AllowedTool, tool)),
+            )
+            .collect()
+    };
+    for (kind, target) in targets {
+        crate::commands::servers::apply_server_mutation(
+            config_path,
+            plug_core::operator::OperatorMutation::SetClientBlock {
+                key: key.clone(),
+                kind,
+                target,
+                blocked: !remove && !off,
+            },
+        )
+        .await?;
+    }
+
+    let settings = plug_core::config::load_config(config_path)
+        .ok()
+        .and_then(|config| config.clients.get(&key).cloned())
+        .unwrap_or_default();
+    print_info_line(client_allow_line(&key, &settings));
+    if !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty() {
+        print_info_line(client_blocks_line(&key, &settings));
+    }
+    if !key.starts_with("oauth:") {
+        print_info_line(
+            style("This keeps the tool list tidy. It is not a security boundary: only a remote client's grant is verified.").dim(),
+        );
+    }
+    Ok(())
+}
+
+/// One line saying what a client's allow list lets in.
+pub(crate) fn client_allow_line(key: &str, settings: &plug_core::config::ClientSettings) -> String {
+    let mut parts = Vec::new();
+    if !settings.allowed_servers.is_empty() {
+        parts.push(format!("servers {}", settings.allowed_servers.join(", ")));
+    }
+    if !settings.allowed_tools.is_empty() {
+        let tools: Vec<String> = settings
+            .allowed_tools
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        parts.push(format!("tools {}", tools.join(", ")));
+    }
+    if parts.is_empty() && settings.has_allow_list() {
+        format!("{key} gets nothing: its list is empty.")
+    } else if parts.is_empty() {
+        format!("{key} gets every server, and each one added later.")
+    } else {
+        format!("{key} gets only {}.", parts.join("; "))
+    }
 }
 
 /// One line saying what a client is kept from.

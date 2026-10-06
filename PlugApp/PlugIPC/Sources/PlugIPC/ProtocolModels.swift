@@ -128,6 +128,12 @@ public struct ClientBlocks: Codable, Equatable, Sendable {
     public let key: String
     public var servers: [String]?
     public var tools: [String]?
+    /// The client gets only what the two lists below name.
+    public var onlyAllowed: Bool?
+    public var allowedServers: [String]?
+    public var allowedTools: [String]?
+    /// The servers those single tools belong to.
+    public var partlyAllowedServers: [String]?
 }
 
 public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
@@ -590,6 +596,11 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case setClientServerBlocked(authToken: String, key: String, server: String, blocked: Bool)
     /// Keep a client from one tool, by the name Plug lists it under.
     case setClientToolBlocked(authToken: String, key: String, tool: String, blocked: Bool)
+    /// Put a server or a tool on a client's allow list, or take it off.
+    case setClientServerAllowed(authToken: String, key: String, server: String, allowed: Bool)
+    case setClientToolAllowed(authToken: String, key: String, tool: String, allowed: Bool)
+    /// Start or end a client's allow list, leaving what it gets as it is.
+    case setClientAllowList(authToken: String, key: String, on: Bool)
     /// Start watching a tool. The daemon checks the tool before it saves.
     case addWatch(authToken: String, watch: WatchConfig)
     /// Stop watching, by event name.
@@ -668,6 +679,20 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
             try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode("tool", forKey: .kind)
             try c.encode(tool, forKey: .target); try c.encode(blocked, forKey: .blocked)
+        // The daemon reads all three as a client block of another kind,
+        // with `blocked` meaning on the list.
+        case let .setClientServerAllowed(token, key, server, allowed):
+            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode("allowed_server", forKey: .kind)
+            try c.encode(server, forKey: .target); try c.encode(allowed, forKey: .blocked)
+        case let .setClientToolAllowed(token, key, tool, allowed):
+            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode("allowed_tool", forKey: .kind)
+            try c.encode(tool, forKey: .target); try c.encode(allowed, forKey: .blocked)
+        case let .setClientAllowList(token, key, on):
+            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(key, forKey: .key); try c.encode("allow_list", forKey: .kind)
+            try c.encode("*", forKey: .target); try c.encode(on, forKey: .blocked)
         case let .addWatch(token, watch):
             try c.encode("AddWatch", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(watch, forKey: .watch)

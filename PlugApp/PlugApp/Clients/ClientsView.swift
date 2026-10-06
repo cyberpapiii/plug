@@ -281,6 +281,14 @@ struct ClientAccess: Equatable {
     /// them. A name with `*` in it is a rule and covers every tool it fits.
     let blockedTools: [String]
     var blockedToolCount: Int { blockedTools.count }
+    /// The client gets only the servers and tools on its list, so a server
+    /// added later is off for it until it is turned on.
+    let onlyAllowed: Bool
+    let allowedServers: Set<String>
+    /// Servers of which only single tools are on the list.
+    let partlyAllowedServers: Set<String>
+    /// Those tools, lowercased.
+    let allowedTools: Set<String>
 
     init(key: String, name: String, servers: [ConfiguredServer], blocks: [ClientBlocks]) {
         self.key = key
@@ -291,6 +299,30 @@ struct ClientAccess: Equatable {
         // A block on a server that is gone does nothing and is not counted.
         blockedServers = Set(blocks?.servers ?? []).intersection(servers.map(\.name))
         blockedTools = (blocks?.tools ?? []).map { $0.lowercased() }
+        onlyAllowed = blocks?.onlyAllowed ?? false
+        allowedServers = Set(blocks?.allowedServers ?? [])
+        partlyAllowedServers = Set(blocks?.partlyAllowedServers ?? []).subtracting(allowedServers)
+        allowedTools = Set((blocks?.allowedTools ?? []).map { $0.lowercased() })
+    }
+
+    /// Whether the client gets anything of `server`.
+    func isOn(server: String) -> Bool {
+        if blockedServers.contains(server) { return false }
+        return !onlyAllowed || allowedServers.contains(server) || partlyAllowedServers.contains(server)
+    }
+
+    /// The servers the client gets nothing of.
+    var offServers: [String] { servers.map(\.name).filter { !isOn(server: $0) } }
+
+    /// Whether this tool's switch puts it on the list or takes it off: its
+    /// server is not on the list whole. Otherwise the switch is a block.
+    func isListedSingly(_ tool: ToolFacts) -> Bool {
+        onlyAllowed && !allowedServers.contains(tool.server)
+    }
+
+    func state(of tool: ToolFacts) -> ToolState {
+        if isListedSingly(tool), !allowedTools.contains(tool.name.lowercased()) { return .off }
+        return state(ofTool: tool.name)
     }
 
     /// How a tool stands for this client.
@@ -313,7 +345,7 @@ struct ClientAccess: Equatable {
 
     /// How many of these tools the client is kept from.
     func offCount(among tools: [ToolFacts]) -> Int {
-        tools.filter { state(ofTool: $0.name) != .on }.count
+        tools.filter { state(of: $0) != .on }.count
     }
 
     /// Whether `text` fits a rule in which `*` stands for any run of
@@ -336,14 +368,14 @@ struct ClientAccess: Equatable {
         return true
     }
 
-    var isLimited: Bool { !blockedServers.isEmpty || blockedToolCount > 0 }
+    var isLimited: Bool { !offServers.isEmpty || blockedToolCount > 0 }
 
     /// What the status line says when something is off for the client.
     var summary: String? {
         guard isLimited else { return nil }
         var parts: [String] = []
-        if !blockedServers.isEmpty {
-            let count = blockedServers.count
+        if !offServers.isEmpty {
+            let count = offServers.count
             parts.append(count == 1 ? "1 server" : "\(count) servers")
         }
         if blockedToolCount > 0 {
@@ -1143,6 +1175,17 @@ private struct ClientDetail: View {
                         ForEach(access.servers) { server in
                             serverRow(server, access: access)
                         }
+                        Toggle(
+                            "New Servers",
+                            isOn: Binding(
+                                get: { !access.onlyAllowed },
+                                set: { run(.setClientAllowList(key: access.key, on: !$0)) }
+                            )
+                        )
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+                        .disabled(!canMutate)
+                        .help("Whether a server you add later is on for this client")
                     }
                 } header: {
                     Text("Servers")
@@ -1228,7 +1271,7 @@ private struct ClientDetail: View {
     /// One server's switch for this client, and under it, when opened, a
     /// switch for each of its tools.
     @ViewBuilder private func serverRow(_ server: ConfiguredServer, access: ClientAccess) -> some View {
-        let serverOn = !access.blockedServers.contains(server.name)
+        let serverOn = access.isOn(server: server.name)
         let own = tools.tools(for: server.name).filter(\.isOn)
         let off = access.offCount(among: own)
         let isOpen = opened.contains(server.name) && server.enabled && serverOn && !own.isEmpty
@@ -1261,7 +1304,11 @@ private struct ClientDetail: View {
                 isOn: Binding(
                     get: { serverOn },
                     set: {
-                        run(.setClientServerBlocked(key: access.key, server: server.name, blocked: !$0))
+                        run(
+                            access.onlyAllowed
+                                ? .setClientServerAllowed(key: access.key, server: server.name, allowed: $0)
+                                : .setClientServerBlocked(key: access.key, server: server.name, blocked: !$0)
+                        )
                     }
                 )
             )
@@ -1279,7 +1326,7 @@ private struct ClientDetail: View {
     }
 
     private func toolRow(_ tool: ToolFacts, access: ClientAccess) -> some View {
-        let state = access.state(ofTool: tool.name)
+        let state = access.state(of: tool)
         return HStack(spacing: Metric.tight) {
             Text(tool.shortName)
                 .foregroundStyle(state == .on ? .primary : .secondary)
@@ -1297,7 +1344,13 @@ private struct ClientDetail: View {
                     tool.shortName,
                     isOn: Binding(
                         get: { state == .on },
-                        set: { run(.setClientToolBlocked(key: access.key, tool: tool.name, blocked: !$0)) }
+                        set: {
+                            run(
+                                access.isListedSingly(tool)
+                                    ? .setClientToolAllowed(key: access.key, tool: tool.name, allowed: $0)
+                                    : .setClientToolBlocked(key: access.key, tool: tool.name, blocked: !$0)
+                            )
+                        }
                     )
                 )
                 .labelsHidden()
@@ -1311,7 +1364,7 @@ private struct ClientDetail: View {
 
     static func note(for access: ClientAccess) -> String {
         access.isRemote
-            ? "Turn a server off to keep this client from using its tools. Open a server to turn off single tools."
-            : "Turn a server off to hide its tools from this client, or open it to hide single tools. This tidies the list; it is not a security lock."
+            ? "Turn a server off to keep this client from using its tools. Open a server to turn off single tools. With New Servers off, a server you add later stays off for this client until you turn it on."
+            : "Turn a server off to hide its tools from this client, or open it to hide single tools. With New Servers off, a server you add later stays off for this client until you turn it on. This tidies the list; it is not a security lock."
     }
 }

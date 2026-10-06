@@ -154,6 +154,35 @@ final class FrameCodecTests: XCTestCase {
         )
     }
 
+    func testAnAllowListIsSentAsAClientBlockOfItsOwnKind() throws {
+        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
+        func sent(_ request: IPCRequest) throws -> NSDictionary? {
+            let frame = try FrameCodec.encode(request, encoder: encoder)
+            return try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
+        }
+        XCTAssertEqual(
+            try sent(.setClientServerAllowed(authToken: "secret", key: "pi", server: "notion", allowed: true)),
+            [
+                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
+                "kind": "allowed_server", "target": "notion", "blocked": true,
+            ] as NSDictionary
+        )
+        XCTAssertEqual(
+            try sent(.setClientToolAllowed(authToken: "secret", key: "pi", tool: "notion__search", allowed: false)),
+            [
+                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
+                "kind": "allowed_tool", "target": "notion__search", "blocked": false,
+            ] as NSDictionary
+        )
+        XCTAssertEqual(
+            try sent(.setClientAllowList(authToken: "secret", key: "pi", on: true)),
+            [
+                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
+                "kind": "allow_list", "target": "*", "blocked": true,
+            ] as NSDictionary
+        )
+    }
+
     func testKeepingAClientFromAToolIsSentAsTheDaemonReadsIt() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
         let request = IPCRequest.setClientToolBlocked(

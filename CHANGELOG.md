@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Added
 
+- A client can be given only the servers you pick. Turn off New Servers on
+  a client's page and a server you add later stays off for that client
+  until you turn it on; what the client gets today does not change. The
+  same from the command line with `plug clients only <client> --server
+  <name>` or `--tool <name>`, and `--off` to end it.
 - Clients lists a client that connects, makes its calls, and leaves again,
   such as a script on a timer. It shows where it runs, with "Last used" and
   the time, and can be named, given an icon, and kept from servers and tools
