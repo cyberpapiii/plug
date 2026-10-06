@@ -512,14 +512,19 @@ test.describe("downstream OAuth owner passkey", () => {
     expect(rotated.refresh_token).not.toBe(tokens.refresh_token);
     plug.trackSensitive(rotated.access_token, rotated.refresh_token);
 
-    const refreshReplay = await exchangeToken(plug, {
+    // A second process of the same client, a moment behind the first, is
+    // given a pair of its own. A use after that moment is a replay and
+    // revokes the family; the Rust tests hold that, since it needs time to pass.
+    const refreshRace = await exchangeToken(plug, {
       grant_type: "refresh_token",
       client_id: registration.client_id,
       refresh_token: tokens.refresh_token,
       resource: RESOURCE,
     });
-    expect(refreshReplay.status).toBe(400);
-    expect((await refreshReplay.json()).error).toBe("invalid_grant");
+    expect(refreshRace.status).toBe(200);
+    const raced = await refreshRace.json();
+    expect(raced.refresh_token).not.toBe(rotated.refresh_token);
+    plug.trackSensitive(raced.access_token, raced.refresh_token);
 
     await plug.cli("auth", "clients", "revoke", registration.client_id, "--yes");
     const revoked = await mcpRequest(plug, rotated.access_token, {
