@@ -43,6 +43,7 @@
         "redirect_uris": [
           "https://example.com/callback"
         ],
+        "signed_in": true,
         "source": "dynamic_registration"
       }
     ],

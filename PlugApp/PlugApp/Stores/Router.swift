@@ -28,6 +28,7 @@ final class Router {
     enum Sheet: Identifiable, Equatable, Sendable {
         case guide
         case addServer
+        case addClient
         case importServers
         case addWatch
         /// A server's settings, open for editing.
@@ -39,6 +40,7 @@ final class Router {
             switch self {
             case .guide: "guide"
             case .addServer: "addServer"
+            case .addClient: "addClient"
             case .importServers: "importServers"
             case .addWatch: "addWatch"
             case let .editServer(name): "editServer:\(name)"
@@ -114,6 +116,10 @@ struct PlugIntentRunner {
         case .addServer:
             router.section = .servers
             router.sheet = .addServer
+            showWindow()
+        case .addClient:
+            router.section = .clients
+            router.sheet = .addClient
             showWindow()
         case .addWatch:
             router.section = .events

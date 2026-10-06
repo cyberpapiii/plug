@@ -225,7 +225,7 @@ struct PlugPopover: View {
     /// floating window can remain above the sheet or inspector it opened.
     private func send(_ intent: PlugIntent) {
         switch intent {
-        case .addServer, .importServers, .editServer, .openWindow, .openSettings, .checkup,
+        case .addServer, .addClient, .importServers, .editServer, .openWindow, .openSettings, .checkup,
              .openCurrentWindow, .reveal, .showRepairLog, .signIn:
             dismiss()
         default:

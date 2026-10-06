@@ -744,6 +744,16 @@ final class AppModelTests: XCTestCase {
             postedIDs,
             ["upstream-reauth-alpha", "downstream-client-client-1"]
         )
+
+        // A sign-in that ends is said once, and only for a client seen
+        // signed in before.
+        let signedOut = makeNotificationSnapshot(
+            authenticated: false, includeClient: true, clientSignedIn: false
+        )
+        service.observe(signedOut)
+        service.observe(signedOut)
+        XCTAssertEqual(postedIDs.last, "downstream-sign-in-client-1")
+        XCTAssertEqual(postedIDs.count, 3)
     }
 
     /// A failed press used to be cleared by the next successful poll, two
@@ -1134,10 +1144,11 @@ final class AppModelTests: XCTestCase {
     @MainActor
     private func makeNotificationSnapshot(
         authenticated: Bool = true,
-        includeClient: Bool = false
+        includeClient: Bool = false,
+        clientSignedIn: Bool = true
     ) -> OperatorSnapshot {
         let clientJSON = includeClient
-            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test"}]"#
+            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn)}]"#
             : "[]"
         let payload = """
         {

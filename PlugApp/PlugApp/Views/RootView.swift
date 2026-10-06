@@ -100,6 +100,8 @@ struct RootView: View {
                 }
             case .addServer:
                 AddServerView(model: model, router: router)
+            case .addClient:
+                AddClientView(model: model)
             case .importServers:
                 ImportServersView(model: model, router: router)
             case .addWatch:

@@ -75,6 +75,19 @@ final class NotificationService {
             ))
         }
 
+        // A sign-in that ends is silent everywhere else: the client only
+        // finds out the next time it tries.
+        let signedOut = Set(previous.downstreamClients.filter(\.needsSignIn).map(\.clientId))
+        let known = Set(previous.downstreamClients.map(\.clientId))
+        for client in snapshot.downstreamClients
+        where client.needsSignIn && known.contains(client.clientId) && !signedOut.contains(client.clientId) {
+            post(Note(
+                id: "downstream-sign-in-\(client.clientId)",
+                title: "\(client.clientName) needs sign-in",
+                body: "Its sign-in to Plug ended. Open Plug's Clients to see how to sign it in again."
+            ))
+        }
+
         let oldClients = Set(previous.downstreamClients.map(\.clientId))
         for client in snapshot.downstreamClients where !oldClients.contains(client.clientId) {
             post(Note(

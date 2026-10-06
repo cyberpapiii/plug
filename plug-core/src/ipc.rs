@@ -172,6 +172,10 @@ pub struct OperatorSnapshot {
     /// running its last good config, and `configured_servers` then lists that.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub config_error: Option<String>,
+    /// The address a client that is not on the list of known ones is given to
+    /// reach Plug: the public one when there is one, else this Mac's own.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_address: Option<String>,
 }
 
 /// Requests sent from CLI → daemon over Unix socket.
@@ -2609,11 +2613,13 @@ mod tests {
                         created_at: 1_700_000_000,
                         last_used_at: None,
                         expires_at: 1_800_000_000,
+                        signed_in: true,
                     }],
                     client_names: Vec::new(),
                     client_blocks: Vec::new(),
                     events: Vec::new(),
                     config_error: None,
+                    client_address: None,
                 }),
             }
         }

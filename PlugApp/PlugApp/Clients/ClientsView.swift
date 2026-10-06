@@ -293,6 +293,7 @@ struct ClientsView: View {
     @Bindable var router: Router
     @Binding var search: String
     let run: (PlugIntent) -> Void
+    @Environment(\.splitPane) private var pane
 
     /// Keep rarely used legacy integrations out of the default inventory. If
     /// one is still linked or live, it remains visible so status is never
@@ -429,8 +430,10 @@ struct ClientsView: View {
                         title: "No Clients",
                         message: "A client is an app that uses your servers, such as Claude or Cursor. When Plug finds one on this Mac, it shows here with a switch.",
                         symbol: AppSection.clients.symbol,
-                        actionTitle: "How Plug Works",
-                        actionIntent: .showGuide,
+                        actionTitle: "Add Client…",
+                        actionIntent: .addClient,
+                        secondaryTitle: "How Plug Works",
+                        secondaryIntent: .showGuide,
                         run: run
                     )
                 } else {
@@ -458,6 +461,18 @@ struct ClientsView: View {
             }
         }
         .navigationSubtitle(connectionSummary ?? "")
+        .toolbar {
+            // The window draws a section once per column; the button goes
+            // above the list.
+            if pane != .detail {
+                ToolbarItem(placement: .primaryAction) {
+                    Button { run(.addClient) } label: {
+                        Label("Add Client", systemImage: "plus")
+                    }
+                    .help("Add a client")
+                }
+            }
+        }
         .onChange(of: entries.map(\.id), initial: true) { keepSelectionVisible() }
         .confirmationDialog(
             "Remove \(revoking?.name ?? "")'s access?",
@@ -625,15 +640,15 @@ struct ClientsView: View {
         let short = grant.clientId.hasPrefix("plug_")
             ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
         let shortID = String(short.prefix(8))
+        // A client with a connection open is plainly signed in.
+        let needsSignIn = grant.needsSignIn && sessions.isEmpty
         return Entry(
             id: "grant:\(grant.clientId)",
             group: .network,
             name: name,
             originalName: grant.clientName,
-            status: ClientStatus(
-                state: sessions.isEmpty
-                    ? "Allowed over the network" : ClientStatus.connected(sessions.count),
-                limit: access.summary
+            status: ClientStatus.grant(
+                connections: sessions.count, needsSignIn: grant.needsSignIn, limit: access.summary
             ),
             isLive: !sessions.isEmpty,
             dimmed: false,
@@ -644,14 +659,17 @@ struct ClientsView: View {
             setOn: { allowed in
                 if !allowed { revoking = Revoking(id: grant.clientId, name: name) }
             },
-            about: "This is an OAuth authorization, not a separate app installation.\(linkedDetail) Authorized does not mean connected now. Turn this off to remove access.",
+            about: needsSignIn
+                ? ClientSignIn.about(target: AppIcons.target(forClientType: names.picturedName(forGrant: grant)), name: name)
+                : "This is an OAuth authorization, not a separate app installation.\(linkedDetail) Authorized does not mean connected now. Turn this off to remove access.",
             access: access,
             connections: sessions.map(connection),
             renameKey: grant.clientKey,
             disambiguator: host ?? shortID,
             website: host,
             shortID: host == nil ? shortID : nil,
-            grantID: grant.clientId
+            grantID: grant.clientId,
+            needsSignIn: needsSignIn
         )
     }
 
@@ -731,6 +749,19 @@ struct ClientStatus: Equatable {
         connections == 1 ? "Connected" : "\(connections) connections"
     }
 
+    /// A client allowed in over the network. One with no sign-in left says
+    /// so, because nothing else about it looks different.
+    static func grant(connections: Int, needsSignIn: Bool, limit: String?) -> ClientStatus {
+        let state = if connections > 0 {
+            connected(connections)
+        } else if needsSignIn {
+            "Needs sign-in"
+        } else {
+            "Allowed over the network"
+        }
+        return ClientStatus(state: state, limit: limit)
+    }
+
     /// A client on this Mac: connected, ready, or not using Plug.
     static func app(_ app: LinkableApp, connections: Int, limit: String?) -> ClientStatus {
         let state: String
@@ -808,6 +839,8 @@ struct ClientEntry: Identifiable {
     var shortID: String?
     /// Set for a client allowed in over the network.
     var grantID: String?
+    /// Its sign-in ended and it has to sign in again.
+    var needsSignIn = false
 }
 
 private typealias Entry = ClientEntry
@@ -854,6 +887,12 @@ private struct ClientRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
+            if entry.needsSignIn {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+                    .help("Needs sign-in")
+                    .accessibilityLabel("Needs sign-in")
+            }
             if entry.isLive {
                 Circle()
                     .fill(.green)
