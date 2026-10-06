@@ -417,6 +417,17 @@ final class AppRosterTests: XCTestCase {
         XCTAssertNil(named[1].host?.app)
     }
 
+    func testAServersToolGroupsAreReadFromItsToolNames() {
+        XCTAssertEqual(
+            ToolCatalog.groups(ofNames: [
+                "Gmail__search_messages", "GoogleDrive__list_items", "Gmail__send_message", "Workspace__start",
+            ]),
+            ["Gmail", "GoogleDrive", "Workspace"]
+        )
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Slack__channels_list", "Slack__users_search"]), ["Slack"])
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["unprefixed"]), [])
+    }
+
     func testClientsAreGroupedByWhereTheyRun() throws {
         // What the owner said wins. Otherwise Plug says only what it can tell.
         XCTAssertEqual(ClientPlaces.place(owners: "Work laptop", isRemote: false), "Work laptop")

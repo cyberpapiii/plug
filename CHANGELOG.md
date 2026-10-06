@@ -16,6 +16,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Settings has a Permissions section: whether macOS lets Plug run in the
   background, open at login, and send notifications, with the way to System
   Settings beside anything that was turned off there.
+- A server whose tools Plug splits into groups says so on its page: a
+  Clients See row lists the groups, such as Gmail, GoogleDrive, GoogleSheets.
 - A Google Workspace server gets its Gmail, GoogleDrive and other groups
   under any name you give it, not only `workspace`: Plug goes by what the
   server says it is.
