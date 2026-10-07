@@ -5,9 +5,9 @@
 #   scripts/release.sh 0.9.0      release a specific version
 #
 # One command covers the whole path: version bump, changelog, pull request,
-# auto-merge, tag, the release build, the signed install, and the build-cache
-# sweep afterwards. It waits for each stage rather than handing back a set of
-# steps to run later.
+# auto-merge, tag, the release build, and the signed install. It waits for
+# each stage rather than handing back a set of steps to run later. The build
+# cache is kept in check by scripts/dev-install.sh.
 #
 # It ships tracked modifications the way scripts/ship.sh does and never stages
 # untracked files. Write the changelog entries under `## [Unreleased]` before
@@ -20,7 +20,7 @@ cd "$repo_root"
 
 case "${1:-}" in
   -h | --help)
-    sed -n '2,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 0
     ;;
 esac
