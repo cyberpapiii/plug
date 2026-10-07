@@ -5,7 +5,7 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.11.0] - 2026-10-07
 
 ### Added
 
@@ -82,7 +82,6 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
-- Codex CLI no longer loses its sign-in every so often. It runs as several processes that share one saved sign-in, and one of them renewing with the copy another had already used was taken for theft, which signed all of them out. That is now allowed for a week after the first use.
 - Two scripts started the same way from different folders, such as
   `python3 main.py`, are two clients. They were one, sharing a name and
   what they were kept from.
@@ -162,11 +161,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Watching a tool for change follows what the server says about it: a tool
   the server marks as writing is not called on a timer because its name
   reads as harmless.
-- A client that runs as several processes keeps its sign-in. Two of them
-  renewing with the same stored token in the same minute both get a new one;
-  before, the slower one was taken for a thief and the whole sign-in was
-  revoked, which signed Codex out. A second use after that minute still
-  revokes everything.
+- A client that runs as several processes keeps its sign-in. Each holds
+  the copy of the stored token it started with, so one renews and another
+  presents the used copy later; before, that one was taken for a thief and
+  the whole sign-in was revoked, which kept signing Codex CLI out. A used
+  copy from the same client is now accepted for a week. After that, or from
+  another client, it still revokes everything.
 - A stored sign-in renews after its client restarts. A client that had not
   read Plug's addresses again posted the renewal to `/token` with no
   resource, got nothing, and asked to be approved from scratch. Scripts
