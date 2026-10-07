@@ -82,6 +82,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Codex CLI no longer loses its sign-in every so often. It runs as several processes that share one saved sign-in, and one of them renewing with the copy another had already used was taken for theft, which signed all of them out. That is now allowed for a week after the first use.
 - Two scripts started the same way from different folders, such as
   `python3 main.py`, are two clients. They were one, sharing a name and
   what they were kept from.
