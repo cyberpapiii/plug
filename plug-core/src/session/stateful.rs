@@ -37,6 +37,13 @@ struct SessionState {
     broadcast_audience: crate::session::BroadcastAudience,
 }
 
+impl SessionState {
+    /// Whether the sign-in this session was opened under no longer holds.
+    fn access_ended(&self) -> bool {
+        self.still_allowed.as_ref().is_some_and(|check| !check())
+    }
+}
+
 impl StatefulSessionStore {
     /// Return a transport-aware snapshot of tracked HTTP sessions.
     pub fn list_sessions(&self) -> Vec<DownstreamSessionSnapshot> {
@@ -158,7 +165,7 @@ impl StatefulSessionStore {
             self.remove_if_expired(session_id);
             return Err(HttpError::SessionNotFound);
         }
-        if entry.still_allowed.as_ref().is_some_and(|check| !check()) {
+        if entry.access_ended() {
             drop(entry);
             self.end(session_id);
             return Err(HttpError::SessionNotFound);
@@ -192,7 +199,7 @@ impl StatefulSessionStore {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             if entry.last_activity.elapsed() > self.timeout {
                 remove_session = true;
-            } else if entry.still_allowed.as_ref().is_some_and(|check| !check()) {
+            } else if entry.access_ended() {
                 drop(entry);
                 self.end(session_id);
                 return SessionSendOutcome::SessionNotFound;
@@ -540,7 +547,7 @@ impl SessionStore for StatefulSessionStore {
                 expired.push(session_id);
                 continue;
             }
-            if entry.still_allowed.as_ref().is_some_and(|check| !check()) {
+            if entry.access_ended() {
                 ended.push(session_id);
                 continue;
             }

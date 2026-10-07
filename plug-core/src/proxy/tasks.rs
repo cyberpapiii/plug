@@ -448,7 +448,14 @@ impl super::ToolRouter {
         // detaching the future, which kept running and kept holding its
         // server's `max_concurrent` semaphore permit.) No await is held
         // across this scope other than acquiring the lock itself.
-        let behind = self.tool_behind(tool_name);
+        // The way the call itself routes, so a tool called by its server's
+        // own name is recorded too.
+        let behind = self
+            .cache
+            .load()
+            .resolve_route(tool_name)
+            .filter(|(server, _)| server != "__plug_internal__")
+            .cloned();
         let created = {
             let mut store = self.task_store.lock().await;
             let task = match task_quota_lease {

@@ -77,15 +77,21 @@ pub(super) fn spawn(cancel: CancellationToken) {
                 _ = cancel.cancelled() => return,
                 _ = ticker.tick() => {}
             }
-            let Ok(ps) = tokio::process::Command::new("/bin/ps")
-                .args(["-axo", "comm="])
-                .output()
-                .await
-            else {
-                continue;
+            // Hidden by its owner: nothing to reopen, so nothing to look for.
+            let hidden = hidden_marker().exists();
+            let running = if hidden {
+                false
+            } else {
+                let Ok(ps) = tokio::process::Command::new("/bin/ps")
+                    .args(["-axo", "comm="])
+                    .output()
+                    .await
+                else {
+                    continue;
+                };
+                app_is_running(&String::from_utf8_lossy(&ps.stdout), &app_exe)
             };
-            let running = app_is_running(&String::from_utf8_lossy(&ps.stdout), &app_exe);
-            if !watch.look(running, hidden_marker().exists()) || cancel.is_cancelled() {
+            if !watch.look(running, hidden) || cancel.is_cancelled() {
                 continue;
             }
             tracing::info!(app = %bundle.display(), "opening Plug.app again: it was closed while the daemon is serving");

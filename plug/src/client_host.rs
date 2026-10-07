@@ -37,7 +37,8 @@ pub(crate) fn current() -> Option<ClientHost> {
             if is_interpreter(executable) {
                 host.script = command_line(pid).as_deref().and_then(|line| {
                     let script = script_of(line)?;
-                    Some(if runs_a_module(line) {
+                    // Only a script typed without its folder needs it.
+                    Some(if runs_a_module(line) || script.starts_with('/') {
                         script
                     } else {
                         anchored(&script, working_folder(pid).as_deref())

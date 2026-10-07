@@ -186,6 +186,14 @@ pub fn apply_operator_mutation_knowing(
             if config.servers.remove(&name).is_none() {
                 anyhow::bail!("unknown server `{name}`");
             }
+            // Off every allow list too, so a server added later under the
+            // same name is a new one and no client gets it unasked.
+            for settings in config.clients.values_mut() {
+                // A list this empties still holds: nothing, not everything.
+                settings.only_allowed = settings.has_allow_list();
+                settings.allowed_servers.retain(|server| *server != name);
+                settings.allowed_tools.retain(|tool| tool.server != name);
+            }
             OperatorMutationResult::server(None)
         }
         OperatorMutation::AddAccount { server, account } => {
@@ -1091,6 +1099,28 @@ API_KEY = "sk-live-123"
         // Taking off what was never on starts no list.
         let (config, _) = allow(ClientBlockKind::AllowedServer, "git", false).unwrap();
         assert!(!config.clients.contains_key("radar"));
+    }
+
+    #[test]
+    fn removing_a_server_takes_it_off_every_allow_list() {
+        let path = fixture_path();
+        std::fs::write(
+            &path,
+            "[servers.git]\ncommand = \"git-mcp\"\n\n[clients.radar]\nallowed_servers = [\"git\"]\n",
+        )
+        .unwrap();
+        let (config, _) = apply_operator_mutation_knowing(
+            &path,
+            OperatorMutation::RemoveServer {
+                name: "git".to_string(),
+            },
+            &|_| None,
+        )
+        .unwrap();
+        // A server added later under the same name is not one it gets, and
+        // the emptied list still holds.
+        assert!(config.clients["radar"].allowed_servers.is_empty());
+        assert!(config.clients["radar"].has_allow_list());
     }
 
     #[test]

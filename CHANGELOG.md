@@ -5,6 +5,27 @@ All notable changes to plug are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- Server icons no longer turn into a letter in a colored square after a disk
+  cleaner runs. Found icons are kept with Plug's own files, not in the
+  system cache a cleaner empties, and a search cut short while Plug starts
+  is no longer remembered as "this site has no icon" for a day.
+- A client with an allow list keeps Plug's own search tool, so it can still
+  find the tools it is allowed when Plug serves tools by search.
+- Removing a server takes it off every client's allow list, so a server
+  added later under the same name is not handed to those clients unasked.
+- A sign-in ended because its renewal token was used twice stays ended even
+  when Plug could not save the change.
+- An allowed tool Plug no longer lists is shown as `server/tool`, the form
+  `plug clients only --remove --tool` takes.
+- A watch on a tool Plug does not list right now is hidden from a client
+  whose allow list does not name that tool.
+- The large result of a task called by its server's own tool name is no
+  longer kept from the client that ran it.
+
 ## [0.11.0] - 2026-10-07
 
 ### Added

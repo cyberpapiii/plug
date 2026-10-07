@@ -58,7 +58,7 @@ impl WatchAccess for RuntimeWatchAccess {
     fn may_use(&self, client_id: &str, watch: &WatchConfig) -> bool {
         self.engine.upgrade().is_some_and(|engine| {
             engine.tool_router().client_may_watch(
-                Some(&format!("oauth:{client_id}")),
+                Some(&crate::ipc::grant_client_key(client_id)),
                 &watch.server,
                 &watch.tool,
             )

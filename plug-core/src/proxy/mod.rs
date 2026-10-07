@@ -1193,7 +1193,8 @@ impl ToolRouter {
         }
     }
 
-    /// Whether the client behind `client_key` is kept from any server.
+    /// Whether the client behind `client_key` is kept from any server, so the
+    /// lists it is served need filtering at all.
     pub fn client_is_kept_from_a_server(&self, client_key: Option<&str>) -> bool {
         client_key.is_some_and(|key| {
             self.client_access
@@ -1220,6 +1221,11 @@ impl ToolRouter {
         let Some((server_id, own_name)) = cache.resolve_route(tool_name) else {
             return true;
         };
+        // Plug's own tools are how a client finds the rest. What they hand
+        // back is filtered for the client, so no list keeps them from it.
+        if server_id == "__plug_internal__" {
+            return true;
+        }
         !access.keeps_from(
             server_id,
             Some(own_name),
@@ -1280,9 +1286,12 @@ impl ToolRouter {
     /// the tool's result, so a block on the tool covers it.
     pub fn client_may_watch(&self, client_key: Option<&str>, server: &str, tool: &str) -> bool {
         self.client_may_use_server(client_key, server)
-            && self
-                .watched_tool(server, tool)
-                .is_none_or(|(name, _)| self.client_may_use_tool(client_key, &name))
+            && match self.watched_tool(server, tool) {
+                Some((name, _)) => self.client_may_use_tool(client_key, &name),
+                // Not listed now, so asked the way a kept result is: by
+                // server and the server's own name for the tool.
+                None => self.client_may_read_result_of(client_key, Some(server), Some(tool), ""),
+            }
     }
 
     /// Whether the client behind `client_key` may see `server_id` at all.
@@ -1318,17 +1327,6 @@ impl ToolRouter {
             }
             _ => true,
         }
-    }
-
-    /// Whether the client behind `client_key` is kept from any server, so the
-    /// lists it is served need filtering at all.
-    pub(crate) fn client_has_blocked_servers(&self, client_key: Option<&str>) -> bool {
-        client_key.is_some_and(|client_key| {
-            self.client_access
-                .load()
-                .get(client_key)
-                .is_some_and(ClientAccess::keeps_from_a_server)
-        })
     }
 
     fn ensure_client_may_use_tool(
@@ -2618,14 +2616,15 @@ impl ToolRouter {
 
             // A tool switched off stays off when a second account changes
             // its name, or when the account that changed it is removed.
-            if is_disabled_tool(&self.config.disabled_tools, &prefixed_name)
-                || crate::tool_naming::other_names(
-                    &prefixed_name,
-                    &c.server_name,
-                    &self.config.prefix_delimiter,
-                )
-                .iter()
-                .any(|name| is_disabled_tool(&self.config.disabled_tools, name))
+            if !self.config.disabled_tools.is_empty()
+                && (is_disabled_tool(&self.config.disabled_tools, &prefixed_name)
+                    || crate::tool_naming::other_names(
+                        &prefixed_name,
+                        &c.server_name,
+                        &self.config.prefix_delimiter,
+                    )
+                    .iter()
+                    .any(|name| is_disabled_tool(&self.config.disabled_tools, name)))
             {
                 continue;
             }

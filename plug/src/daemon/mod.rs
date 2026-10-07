@@ -1657,7 +1657,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                             ctx.engine
                                 .tool_router()
                                 .listed_name(&allowed.server, &allowed.tool)
-                                .unwrap_or_else(|| allowed.to_string())
+                                // The form `plug clients only --remove`
+                                // takes for a tool Plug no longer lists.
+                                .unwrap_or_else(|| format!("{}/{}", allowed.server, allowed.tool))
                         })
                         .collect(),
                     // By the name each tool is listed under now, which is
