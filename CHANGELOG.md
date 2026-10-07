@@ -9,6 +9,13 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The menu bar icon opens its panel after Plug was closed by a quit-all and
+  came back by itself. It came back hidden, and a hidden app shows nothing.
+- Codex CLI keeps its sign-in when one of its processes sat idle for more
+  than a week before renewing with a copy another had already used. The
+  allowance is now thirty days, as long as Plug remembers a used copy.
+- A client allowed single tools of a server gets those tools only, not the
+  server's resources and prompts.
 - Server icons no longer turn into a letter in a colored square after a disk
   cleaner runs. Found icons are kept with Plug's own files, not in the
   system cache a cleaner empties, and a search cut short while Plug starts

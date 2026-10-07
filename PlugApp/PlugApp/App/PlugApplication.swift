@@ -6,6 +6,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
+        // The daemon opens Plug hidden so no window comes up. A hidden app
+        // cannot show its menu bar panel either, so it is hidden only until
+        // it has finished opening.
+        if NSApp.isHidden { NSApp.unhide(nil) }
         NotificationService.shared.install()
         MenuBarPresence.standard.appDidOpen()
         installSnapshotHook()

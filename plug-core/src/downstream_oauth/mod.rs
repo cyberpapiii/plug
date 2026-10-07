@@ -40,8 +40,9 @@ const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 /// read when it started: one renews, and another presents the spent copy
 /// when its own access token runs out, an hour later or after sitting idle
 /// for days. Codex CLI does this. Without this the later one is a replay and
-/// the whole sign-in is revoked for every process.
-const REFRESH_REUSE_LEEWAY_SECS: u64 = 7 * 24 * 3600;
+/// the whole sign-in is revoked for every process. As long as a spent token
+/// is remembered at all, so a process idle for weeks does not end it either.
+const REFRESH_REUSE_LEEWAY_SECS: u64 = REFRESH_TOKEN_LIFETIME_SECS;
 const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
 const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
 const MAX_REGISTRATIONS: usize = 100;
