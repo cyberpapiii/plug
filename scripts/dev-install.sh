@@ -26,6 +26,9 @@ esac
 
 # shellcheck source=scripts/lib/install-app.sh
 source "$repo_root/scripts/lib/install-app.sh"
+# shellcheck source=scripts/lib/trim-build-cache.sh
+source "$repo_root/scripts/lib/trim-build-cache.sh"
+trim_build_cache
 
 # The Developer ID certificate with the latest expiry. Naming it by title is
 # ambiguous once a renewed certificate sits beside the old one.
