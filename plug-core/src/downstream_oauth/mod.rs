@@ -35,11 +35,13 @@ const AUTH_CODE_LIFETIME_SECS: u64 = 300;
 const ACCESS_TOKEN_LIFETIME_SECS: u64 = 3600;
 const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 /// How long after a refresh token is spent a second use of it is taken for
-/// the same client racing itself, not for a thief. A client that runs as
-/// several processes shares one stored token, and two of them renewing in the
-/// same moment both present it. Without this the slower one is a replay and
-/// the whole sign-in is revoked.
-const REFRESH_REUSE_LEEWAY_SECS: u64 = 60;
+/// the same client's other process, not for a thief. A client that runs as
+/// several processes shares one stored token, and each keeps the copy it
+/// read when it started: one renews, and another presents the spent copy
+/// when its own access token runs out, an hour later or after sitting idle
+/// for days. Codex CLI does this. Without this the later one is a replay and
+/// the whole sign-in is revoked for every process.
+const REFRESH_REUSE_LEEWAY_SECS: u64 = 7 * 24 * 3600;
 const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
 const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
 const MAX_REGISTRATIONS: usize = 100;
@@ -1613,9 +1615,9 @@ impl DownstreamOauthManager {
             // in someone else's hands, and whichever side is legitimate, the
             // family can no longer be trusted. RFC 9700 section 4.14.2.
             if let Some(consumed) = guard.consumed_refresh_tokens.get(refresh_token).cloned() {
-                // Spent a moment ago by this same client: a second process
-                // of it lost the race. It gets a pair of its own in the same
-                // family, so a later replay of any of them still revokes all.
+                // Spent not long ago by this same client: another process of
+                // it still holds the old copy. It gets a pair of its own in
+                // the same family, so a replay past the leeway revokes all.
                 let sibling = guard
                     .refresh_tokens
                     .values()
@@ -4334,6 +4336,25 @@ mod tests {
                 AccessTokenValidation::Valid(_)
             ));
         }
+
+        // A third process that sat idle for an hour still holds the first
+        // copy, and renews with it when its access token runs out.
+        {
+            let mut state = manager.state.lock().await;
+            for spent in state.consumed_refresh_tokens.values_mut() {
+                spent.consumed_at = spent.consumed_at.saturating_sub(3600);
+            }
+        }
+        manager
+            .exchange_refresh_token(&client.client_id, &original_refresh, resource)
+            .await
+            .expect("the idle process, an hour later, renews too");
+        assert!(matches!(
+            manager
+                .validate_access_token_for(&first.access_token, &[], resource)
+                .await,
+            AccessTokenValidation::Valid(_)
+        ));
 
         // Another client presenting the spent token is not that race.
         let other = register(&manager, "Other", "http://localhost:8788/callback").await;
