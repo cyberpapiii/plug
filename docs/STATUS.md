@@ -12,23 +12,21 @@ line here when it lands. Anything bigger than a line belongs in a GitHub issue.
 
 ## Next, in order
 
-Agreed with the owner on 2026-10-05. No release until the first four are in.
+Agreed with the owner on 2026-10-05. Reordered with the owner on 2026-10-06.
+No release until the first two are in.
 Remove a line when it lands.
 
 1. Paper cuts. None open. Add them here as the owner reports them.
 2. Client audit. Tell GrokBot from Cursor: the owner has GrokBot make a few
    tool calls, and its id is read off them. Windsurf was looked for on
    2026-10-06 and shows nowhere; it is Devin throughout.
-3. Naming layer, what is left of the check-up: an agent sees the account
-   label the owner typed, not the address that is signed in, and renames
-   are still config-only. Issue #301.
-4. Widening: the shared bearer token split into separate clients, and
-   relaying events a server emits itself (#255). The allow list per client
-   is in (2026-10-06): Settings on a client's page, `plug clients only`.
-5. Single servers served on their own, beside the one Plug endpoint, so a
+3. Single servers served on their own, beside the one Plug endpoint, so a
    client can mix its own connectors with only the servers it lacks. Comes
    out of the allow list. Issue #304.
-   Agents set up their own events (owner, 2026-10-06): Plug tools, and
+4. Plug into Plug: several Plugs feeding one, each remote server shown as
+   its own server and marked with its machine. Design first. Issue #302.
+5. Agents set up their own events (owner, 2026-10-06; parked by the owner
+   until the lines above are in): Plug tools, and
    the same in `plug events`, for a client to create, list, change, and
    remove events for itself, on this Mac or remote, with no approval step.
    Creating one subscribes its maker. Each tool says plainly what Plug can
@@ -37,8 +35,8 @@ Remove a line when it lands.
    looked" serves a client that cannot be woken. Kept: a client cannot
    watch a tool it is kept from, the floor on how often a watch runs, and
    the Events tab showing who made each event with a switch to turn it off.
-6. Plug into Plug: several Plugs feeding one, each remote server shown as
-   its own server and marked with its machine. Design first. Issue #302.
+   Relaying events a server emits itself (#255) goes with it, once a
+   server emits any.
 
 Unproven, to watch working along the way: an event watch delivering to a
 real subscriber, Slack renewing its subscription unattended, and one of
@@ -106,6 +104,11 @@ Amp, OpenClaw, LM Studio, or Muse Code on a real install.
 Wanted, not started, in this order. Listed so none is forgotten. Move a line
 up to Open before starting it.
 
+- Clients on the shared bearer token told apart. The one token stays as it
+  is: every client on it is one client, `remote:shared`, and a setting for
+  it applies to all of them. Wanted for someone who uses it and still wants
+  a setting per client: a token for each. Decided 2026-10-06: not now,
+  since sign-in already gives that.
 - GraphQL APIs as servers. Decided 2026-10-04: not now. Build the small
   built-in form described on #263 on the day a GraphQL API with no MCP
   server is needed. OpenAPI servers are done: CLI and app, bearer token or
