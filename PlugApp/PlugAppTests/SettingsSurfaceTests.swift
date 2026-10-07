@@ -385,6 +385,23 @@ final class FoundIconTests: XCTestCase {
         XCTAssertNil(IconStore(chosenDirectory: directory, cacheDirectory: directory).image(forServer: "No Such Server"))
     }
 
+    /// The servers change while icons are being looked for at launch, which
+    /// cancels the search. That used to be remembered as "no icon" for a day.
+    @MainActor
+    func testACancelledIconSearchIsNotRememberedAsNoIcon() async throws {
+        let directory = FileManager.default.temporaryDirectory.appending(path: "plug-icons-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let found = directory.appending(path: "found")
+        let store = IconStore(chosenDirectory: directory, cacheDirectory: found)
+        let search = Task { @MainActor in
+            await store.load([IconSource(name: "nowhere", address: "https://icons.invalid/mcp")])
+        }
+        search.cancel()
+        await search.value
+        let kept = (try? FileManager.default.contentsOfDirectory(atPath: found.path)) ?? []
+        XCTAssertEqual(kept, [], "nothing is remembered about a search that was cut short")
+    }
+
     func testTheStatusAnswerCarriesWhatAServerSaysAboutItself() throws {
         let json = """
         {"type":"Status","servers":[

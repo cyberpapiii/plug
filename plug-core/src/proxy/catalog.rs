@@ -846,7 +846,7 @@ impl super::ToolRouter {
     /// what belongs to a server it is kept from.
     pub fn list_resources_for_client(&self, client_key: Option<&str>) -> Arc<Vec<Resource>> {
         let snapshot = self.cache.load();
-        if !self.client_has_blocked_servers(client_key) {
+        if !self.client_is_kept_from_a_server(client_key) {
             return Arc::clone(&snapshot.resources_all);
         }
         Arc::new(
@@ -891,7 +891,7 @@ impl super::ToolRouter {
         client_key: Option<&str>,
     ) -> Arc<Vec<ResourceTemplate>> {
         let snapshot = self.cache.load();
-        if !self.client_has_blocked_servers(client_key) {
+        if !self.client_is_kept_from_a_server(client_key) {
             return Arc::clone(&snapshot.resource_templates_all);
         }
         Arc::new(
@@ -935,7 +935,7 @@ impl super::ToolRouter {
 
     pub fn list_prompts_for_client(&self, client_key: Option<&str>) -> Arc<Vec<Prompt>> {
         let snapshot = self.cache.load();
-        if !self.client_has_blocked_servers(client_key) {
+        if !self.client_is_kept_from_a_server(client_key) {
             return Arc::clone(&snapshot.prompts_all);
         }
         Arc::new(

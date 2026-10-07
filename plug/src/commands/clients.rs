@@ -169,7 +169,7 @@ pub(crate) enum ClientCommands {
         /// Take the named servers and tools off the list instead
         #[arg(long, conflicts_with = "off")]
         remove: bool,
-        /// End the list. The client keeps what it gets now, and gets
+        /// End the list. The client keeps the servers on it, and gets
         /// servers added later
         #[arg(long)]
         off: bool,

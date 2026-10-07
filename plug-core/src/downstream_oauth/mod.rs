@@ -1646,7 +1646,9 @@ impl DownstreamOauthManager {
                 }
                 // Before the save, as for a removed client: if the save
                 // fails, what is already open under this sign-in still ends.
-                if let Some((_, sign_in)) = self.family_ended.remove(&consumed.family_id) {
+                // The entry stays, so a token the failed save left behind
+                // opens nothing new either.
+                if let Some(sign_in) = self.family_ended.get(&consumed.family_id) {
                     sign_in.ended.store(true, Ordering::SeqCst);
                 }
                 let mut next = guard.clone();

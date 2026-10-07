@@ -440,10 +440,9 @@ final class IconStore {
     init(chosenDirectory: URL? = nil, cacheDirectory: URL? = nil) {
         self.chosenDirectory = chosenDirectory
             ?? PlugIPCClient.defaultSocketURL.deletingLastPathComponent().appending(path: "icons")
-        self.cacheDirectory = cacheDirectory
-            ?? FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0]
-            .appending(path: Bundle.main.bundleIdentifier ?? "com.cyberpapiii.plug")
-            .appending(path: "icons")
+        // Beside the chosen icons, not under Caches: a disk cleaner empties
+        // Caches, and every icon was then looked for again the next day.
+        self.cacheDirectory = cacheDirectory ?? self.chosenDirectory.appending(path: "found")
         let files = (try? FileManager.default.contentsOfDirectory(atPath: self.chosenDirectory.path)) ?? []
         for file in files where file.hasSuffix(".png") {
             chosen[String(file.dropLast(4))] = NSImage(contentsOf: self.chosenDirectory.appending(path: file))
@@ -573,7 +572,10 @@ final class IconStore {
                     switch kept(key) {
                     case let .found(image): advertised[source.name] = image
                     case .missing: break
-                    case .unknown: advertised[source.name] = keep(await SiteIcon.image(at: url), as: key)
+                    case .unknown:
+                        let data = await SiteIcon.image(at: url)
+                        guard !stopped(asking: [key]) else { return }
+                        advertised[source.name] = keep(data, as: key)
                     }
                 }
             }
@@ -610,9 +612,19 @@ final class IconStore {
             for await (index, data) in group { answers[index] = data }
             return answers
         }
+        guard !stopped(asking: asking.map(\.key)) else { return }
         for (index, want) in asking.enumerated() {
             if let image = keep(answers[index], as: want.key) { sites[want.name] = image }
         }
+    }
+
+    /// Whether this search was cancelled, as it is when the servers change
+    /// while it runs. A cancelled request comes back empty, which is not a
+    /// site without an icon: nothing is remembered and `keys` are asked again.
+    private func stopped(asking keys: [String]) -> Bool {
+        guard Task.isCancelled else { return false }
+        searched.subtract(keys)
+        return true
     }
 
     private enum Kept {

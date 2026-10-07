@@ -5109,6 +5109,32 @@ async fn the_meta_tools_do_not_reach_around_a_block() {
 }
 
 #[test]
+fn an_allow_list_leaves_a_client_the_tool_it_searches_with() {
+    let mut config = test_router_config();
+    config.meta_tool_mode = true;
+    let router = router_with_client_blocks(config);
+    let mut clients = std::collections::BTreeMap::new();
+    clients.insert(
+        "radar".to_string(),
+        crate::config::ClientSettings {
+            allowed_servers: vec!["slack".to_string()],
+            ..Default::default()
+        },
+    );
+    router.set_client_access(&clients);
+
+    let names =
+        tool_names(&router.list_tools_for_client_session(ClientType::Unknown, None, Some("radar")));
+    assert!(
+        names.contains(&"plug__search_tools".to_string()),
+        "{names:?}"
+    );
+    assert!(router.client_may_use_tool(Some("radar"), "plug__search_tools"));
+    // What it finds is still only what is on the list.
+    assert!(!router.client_may_use_tool(Some("radar"), "git__commit"));
+}
+
+#[test]
 fn clients_hear_about_a_block_changing_and_about_nothing_else() {
     let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
     let mut notifications = router.subscribe_notifications();
