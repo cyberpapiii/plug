@@ -1305,6 +1305,22 @@ impl ToolRouter {
             .is_none_or(|access| !access.keeps_from_server(server_id))
     }
 
+    /// Whether the client behind `client_key` gets what `server_id` has
+    /// besides tools: its resources and prompts. A list that names single
+    /// tools of a server gives those tools and nothing else of it.
+    pub fn client_may_use_all_of_server(&self, client_key: Option<&str>, server_id: &str) -> bool {
+        let Some(client_key) = client_key else {
+            return true;
+        };
+        self.client_access
+            .load()
+            .get(client_key)
+            .is_none_or(|access| {
+                !access.keeps_from_server(server_id)
+                    && (!access.has_allow_list() || access.allowed_servers.contains(server_id))
+            })
+    }
+
     /// Whether the client behind `client_key` may be sent `notification`, by
     /// the rules as they stand now. Asked at every delivery on every path,
     /// so a block added while a client is connected applies to the next

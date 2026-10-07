@@ -857,7 +857,9 @@ impl super::ToolRouter {
                     snapshot
                         .resource_routes
                         .get(&resource.uri)
-                        .is_none_or(|server_id| self.client_may_use_server(client_key, server_id))
+                        .is_none_or(|server_id| {
+                            self.client_may_use_all_of_server(client_key, server_id)
+                        })
                 })
                 .cloned()
                 .collect(),
@@ -902,7 +904,9 @@ impl super::ToolRouter {
                     snapshot
                         .resource_routes
                         .get(&template.uri_template)
-                        .is_none_or(|server_id| self.client_may_use_server(client_key, server_id))
+                        .is_none_or(|server_id| {
+                            self.client_may_use_all_of_server(client_key, server_id)
+                        })
                 })
                 .cloned()
                 .collect(),
@@ -947,7 +951,7 @@ impl super::ToolRouter {
                         .prompt_routes
                         .get(prompt.name.as_str())
                         .is_none_or(|(server_id, _)| {
-                            self.client_may_use_server(client_key, server_id)
+                            self.client_may_use_all_of_server(client_key, server_id)
                         })
                 })
                 .cloned()

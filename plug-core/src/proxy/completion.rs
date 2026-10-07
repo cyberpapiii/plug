@@ -38,7 +38,7 @@ impl super::ToolRouter {
                     .map(str::to_string)
             })
             .or_else(|| skills::only_server(&snapshot.resource_routes, uri))
-            .filter(|server_id| self.client_may_use_server(client_key, server_id))
+            .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
                     detail: format!("resource not found: {uri}"),
@@ -84,7 +84,7 @@ impl super::ToolRouter {
         let (server_id, prompt_name) = snapshot
             .prompt_routes
             .get(name)
-            .filter(|(server_id, _)| self.client_may_use_server(client_key, server_id))
+            .filter(|(server_id, _)| self.client_may_use_all_of_server(client_key, server_id))
             .cloned()
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
@@ -136,7 +136,9 @@ impl super::ToolRouter {
                 let (sid, original_name) = snapshot
                     .prompt_routes
                     .get(&prompt_ref.name)
-                    .filter(|(server_id, _)| self.client_may_use_server(client_key, server_id))
+                    .filter(|(server_id, _)| {
+                        self.client_may_use_all_of_server(client_key, server_id)
+                    })
                     .cloned()
                     .ok_or_else(|| {
                         McpError::from(ProtocolError::InvalidRequest {
@@ -155,7 +157,7 @@ impl super::ToolRouter {
                     .or_else(|| {
                         resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri)
                     })
-                    .filter(|server_id| self.client_may_use_server(client_key, server_id))
+                    .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
                     .ok_or_else(|| {
                         McpError::from(ProtocolError::InvalidRequest {
                             detail: format!("resource not found: {}", resource_ref.uri),

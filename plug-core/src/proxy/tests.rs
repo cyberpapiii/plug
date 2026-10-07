@@ -4916,6 +4916,13 @@ fn a_client_with_an_allow_list_gets_only_what_is_on_it() {
     assert!(!router.client_may_use_server(Some("radar"), "notion"));
     assert!(router.client_is_kept_from_a_server(Some("radar")));
 
+    // Single tools of a server are those tools, not its resources or
+    // prompts.
+    assert!(router.client_may_use_server(Some("bot"), "git"));
+    assert!(!router.client_may_use_all_of_server(Some("bot"), "git"));
+    assert!(router.client_may_use_all_of_server(Some("radar"), "slack"));
+    assert!(router.client_may_use_all_of_server(Some("other"), "git"));
+
     // A result is read by the same rule, and one whose tool was not
     // recorded is not on a list of single tools.
     assert!(router.client_may_read_result_of(Some("bot"), Some("git"), Some("commit"), "x"));

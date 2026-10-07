@@ -1407,7 +1407,7 @@ impl super::ToolRouter {
         let server_id = snapshot
             .resource_routes
             .get(uri)
-            .filter(|server_id| self.client_may_use_server(client_key, server_id))
+            .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
             .cloned()
             .ok_or_else(|| {
                 McpError::from(ProtocolError::InvalidRequest {
@@ -1592,7 +1592,7 @@ impl super::ToolRouter {
         for target in subscribers {
             if let Some(server_id) = &server_id
                 && let Some(client_key) = self.subscriber_client_keys.get(&target)
-                && !self.client_may_use_server(Some(client_key.as_str()), server_id)
+                && !self.client_may_use_all_of_server(Some(client_key.as_str()), server_id)
             {
                 continue;
             }
