@@ -10,6 +10,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Fixed
 
 - A client that leaves the `MCP-Protocol-Version` label off its requests, as Grok Bot does, is served. Plug refused every one of its calls.
+- Plug's log says when it refuses a request from a client and why. A refused client left no trace.
 - The menu bar icon opens its panel after Plug was closed by a quit-all and
   came back by itself. It came back hidden, and a hidden app shows nothing.
 - Codex CLI keeps its sign-in when one of its processes sat idle for more

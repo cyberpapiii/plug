@@ -59,6 +59,14 @@ pub enum HttpError {
 
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
+        // A refusal is the only trace a client's broken request leaves here.
+        // Sign-in challenges are routine and stay out of the log.
+        if !matches!(
+            self,
+            HttpError::Unauthorized | HttpError::UnauthorizedWithMetadata { .. }
+        ) {
+            tracing::warn!(reason = %self, "refused an HTTP request");
+        }
         // SECURITY: Do NOT include session IDs or internal details in error bodies.
         let (status, message) = match &self {
             HttpError::Unauthorized => {
