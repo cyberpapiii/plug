@@ -1011,7 +1011,7 @@ async fn post_mcp(
         }
     })?;
 
-    validate_protocol_version_for_post(&headers, &message, era)?;
+    validate_protocol_version_for_post(&headers, era)?;
     let mirrored = if era == crate::protocol::ProtocolEra::Modern {
         validate_required_mirrored_headers(&headers, &message)
     } else {
@@ -1204,18 +1204,11 @@ fn header_mismatch_response(
 
 fn validate_protocol_version_for_post(
     headers: &HeaderMap,
-    message: &ClientJsonRpcMessage,
     era: crate::protocol::ProtocolEra,
 ) -> Result<(), HttpError> {
     if era == crate::protocol::ProtocolEra::Modern {
         return Ok(());
     }
-    let require_header = !matches!(
-        message,
-        JsonRpcMessage::Request(req)
-            if matches!(req.request, ClientRequest::InitializeRequest(_))
-    );
-
     match headers.get(PROTOCOL_VERSION_HEADER) {
         Some(value) => {
             let version = value
@@ -1226,7 +1219,8 @@ fn validate_protocol_version_for_post(
             }
             Ok(())
         }
-        None if require_header => Err(HttpError::MissingProtocolVersion),
+        // A client that leaves the header out is on the version its session
+        // settled at `initialize`. Some clients never send it.
         None => Ok(()),
     }
 }
@@ -5228,7 +5222,7 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
 
-        // 3. ping with session
+        // 3. ping with session, and no MCP-Protocol-Version header
         let app = build_router(state.clone());
         let body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -5240,11 +5234,14 @@ mod tests {
             .uri("/mcp")
             .header("content-type", "application/json")
             .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
             .body(Body::from(serde_json::to_vec(&body).unwrap()))
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "a request without MCP-Protocol-Version must be served"
+        );
 
         // 4. DELETE session
         let app = build_router(state.clone());
