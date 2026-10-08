@@ -371,6 +371,13 @@ pub(crate) async fn apply_server_mutation(
                 auth_token,
             }
         }
+        plug_core::operator::OperatorMutation::MoveClientSettings { from, to } => {
+            plug_core::ipc::IpcRequest::MoveClientSettings {
+                from,
+                to,
+                auth_token,
+            }
+        }
         plug_core::operator::OperatorMutation::SetClientPlace { key, place } => {
             plug_core::ipc::IpcRequest::SetClientPlace {
                 key,

@@ -22,7 +22,13 @@ pub struct StatefulSessionStore {
     /// Optional channel to notify when sessions are implicitly removed (expiry).
     /// The receiver should clean up any subscription state for the expired session.
     expiry_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Sessions their own client closed, newest last. These stay closed; any
+    /// other session Plug no longer has may be reopened.
+    closed: std::sync::Mutex<VecDeque<String>>,
 }
+
+/// How many closed sessions are remembered.
+const CLOSED_SESSIONS_KEPT: usize = 512;
 
 struct SessionState {
     last_activity: Instant,
@@ -81,7 +87,27 @@ impl StatefulSessionStore {
             max_sessions,
             timeout: Duration::from_secs(timeout_secs),
             expiry_tx: None,
+            closed: std::sync::Mutex::new(VecDeque::new()),
         }
+    }
+
+    fn insert_new(&self, session_id: String) {
+        let now = Instant::now();
+        self.sessions.insert(
+            session_id,
+            SessionState {
+                last_activity: now,
+                created_at: now,
+                sse_sender: None,
+                pending_notifications: VecDeque::new(),
+                replay_events: VecDeque::new(),
+                next_event_id: 1,
+                client_type: crate::types::ClientType::Unknown,
+                grant: None,
+                still_allowed: None,
+                broadcast_audience: crate::session::BroadcastAudience::default(),
+            },
+        );
     }
 
     /// Set a channel that receives session IDs when sessions are implicitly removed
@@ -411,25 +437,39 @@ impl SessionStore for StatefulSessionStore {
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
-        let now = Instant::now();
-        self.sessions.insert(
-            session_id.clone(),
-            SessionState {
-                last_activity: now,
-                created_at: now,
-                sse_sender: None,
-                pending_notifications: VecDeque::new(),
-                replay_events: VecDeque::new(),
-                next_event_id: 1,
-                client_type: crate::types::ClientType::Unknown,
-                grant: None,
-                still_allowed: None,
-                broadcast_audience: crate::session::BroadcastAudience::default(),
-            },
-        );
+        self.insert_new(session_id.clone());
 
         tracing::debug!(session_id = %session_id, "session created");
         Ok(session_id)
+    }
+
+    fn reopen_session(&self, session_id: &str) -> Result<bool, HttpError> {
+        // Plug only ever hands out UUIDs, so nothing else can be one it lost.
+        if uuid::Uuid::parse_str(session_id).is_err() {
+            return Err(HttpError::SessionNotFound);
+        }
+        let _guard = self
+            .admission_lock
+            .lock()
+            .expect("session admission mutex poisoned");
+        self.prune_expired_sessions();
+        if self.sessions.contains_key(session_id) {
+            return Ok(false);
+        }
+        if self
+            .closed
+            .lock()
+            .expect("closed sessions mutex poisoned")
+            .iter()
+            .any(|closed| closed == session_id)
+        {
+            return Err(HttpError::SessionNotFound);
+        }
+        if self.sessions.len() >= self.max_sessions {
+            return Err(HttpError::TooManySessions);
+        }
+        self.insert_new(session_id.to_owned());
+        Ok(true)
     }
 
     fn validate(&self, session_id: &str) -> Result<(), HttpError> {
@@ -520,6 +560,11 @@ impl SessionStore for StatefulSessionStore {
         let removed = self.sessions.remove(session_id).is_some();
         if removed {
             tracing::debug!(session_id = %session_id, "session removed");
+            let mut closed = self.closed.lock().expect("closed sessions mutex poisoned");
+            if closed.len() == CLOSED_SESSIONS_KEPT {
+                closed.pop_front();
+            }
+            closed.push_back(session_id.to_owned());
         }
         removed
     }
@@ -735,6 +780,59 @@ mod tests {
         assert!(rx.try_recv().is_err());
         assert!(store.validate(&live).is_ok());
         assert!(store.validate(&expired).is_err());
+    }
+
+    #[test]
+    fn a_session_plug_lost_reopens_under_the_same_id() {
+        let store = StatefulSessionStore::new(1800, 10);
+        let lost = uuid::Uuid::new_v4().to_string();
+
+        assert!(store.reopen_session(&lost).unwrap());
+        assert!(store.validate(&lost).is_ok());
+        // Already open: nothing to do, and nothing is replaced.
+        assert!(!store.reopen_session(&lost).unwrap());
+        assert_eq!(store.session_count(), 1);
+    }
+
+    #[test]
+    fn a_session_that_timed_out_reopens() {
+        let store = StatefulSessionStore::new(60, 10);
+        let id = store.create_session().unwrap();
+        backdate(&store, &id);
+
+        assert!(store.reopen_session(&id).unwrap());
+        assert!(store.validate(&id).is_ok());
+    }
+
+    #[test]
+    fn a_session_its_client_closed_stays_closed() {
+        let store = StatefulSessionStore::new(1800, 10);
+        let id = store.create_session().unwrap();
+        assert!(store.remove(&id));
+
+        assert!(matches!(
+            store.reopen_session(&id),
+            Err(HttpError::SessionNotFound)
+        ));
+    }
+
+    #[test]
+    fn only_an_id_plug_could_have_issued_reopens() {
+        let store = StatefulSessionStore::new(1800, 10);
+        assert!(matches!(
+            store.reopen_session("not-a-session"),
+            Err(HttpError::SessionNotFound)
+        ));
+    }
+
+    #[test]
+    fn reopening_respects_the_session_cap() {
+        let store = StatefulSessionStore::new(1800, 1);
+        store.create_session().unwrap();
+        assert!(matches!(
+            store.reopen_session(&uuid::Uuid::new_v4().to_string()),
+            Err(HttpError::TooManySessions)
+        ));
     }
 
     #[test]

@@ -258,11 +258,53 @@ enum ClientPlaces {
     /// name, over the network, then clients that do not use Plug.
     static func ordered(_ places: [String]) -> [String] {
         let groups = ClientEntry.Group.self
-        let last = [groups.network.rawValue, groups.notUsing.rawValue]
+        let last = [groups.network.rawValue, groups.notUsing.rawValue, groups.unfinished.rawValue]
         let present = Set(places)
         let owners = present.subtracting(last + [groups.onThisMac.rawValue])
             .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
         return ([groups.onThisMac.rawValue] + owners + last).filter(present.contains)
+    }
+}
+
+/// Telling one sign-in over the network from another by when it happened.
+/// Pure values so the wording and the matching can be tested.
+enum SignInFacts {
+    /// How long a new sign-in keeps asking which client it is.
+    static let newFor: TimeInterval = 14 * 86_400
+
+    static func day(_ seconds: UInt64, now: Date = Date()) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(seconds))
+        if Calendar.current.isDate(date, inSameDayAs: now) { return "today" }
+        return date.formatted(.dateTime.month(.abbreviated).day())
+    }
+
+    /// What an unfinished sign-in's row says in place of a switch.
+    static func goneIn(expiresAt: UInt64?, now: Date = Date()) -> String {
+        guard let expiresAt else { return "" }
+        let left = TimeInterval(expiresAt) - now.timeIntervalSince1970
+        if left < 60 { return "gone soon" }
+        if left < 3_600 { return "gone in \(Int(left / 60)) min" }
+        return "gone in \(Int(left / 3_600)) hr"
+    }
+
+    /// The earlier sign-ins a new one may be replacing: the ones that gave
+    /// the same name. Empty once the owner has named the new one or answered.
+    static func earlier(
+        than grant: DownstreamClient,
+        among grants: [DownstreamClient],
+        ownerNamed: Bool,
+        answered: Set<String>,
+        now: Date = Date()
+    ) -> [DownstreamClient] {
+        guard let created = grant.createdAt, !grant.needsSignIn, !ownerNamed,
+              !answered.contains(grant.clientId),
+              now.timeIntervalSince1970 - TimeInterval(created) < newFor
+        else { return [] }
+        return grants.filter {
+            $0.clientId != grant.clientId && !$0.isUnfinished
+                && $0.clientName.caseInsensitiveCompare(grant.clientName) == .orderedSame
+                && ($0.createdAt ?? 0) <= created
+        }
     }
 }
 
@@ -467,6 +509,18 @@ struct ClientsView: View {
     /// The network client whose access is being removed, while the app asks
     /// first.
     @State private var revoking: Revoking?
+    /// The new sign-ins the owner has said which client they are, one id per
+    /// line.
+    @AppStorage("answeredClientSignIns") private var answeredSignIns = ""
+
+    private var answered: Set<String> { Set(answeredSignIns.split(separator: "\n").map(String.init)) }
+
+    /// Keeps the ids of clients that still exist, so the list cannot grow
+    /// without end.
+    private func answer(_ id: String) {
+        let live = Set(model.snapshot.downstreamClients.map(\.clientId))
+        answeredSignIns = answered.intersection(live).union([id]).sorted().joined(separator: "\n")
+    }
 
     private struct Revoking {
         let id: String
@@ -713,7 +767,6 @@ struct ClientsView: View {
             setOn: { run($0 ? .linkApp(app.target) : .unlinkApp(app.target)) },
             about: about,
             access: access,
-            connections: sessions.map(connection),
             renameKey: access?.key,
             placeKey: app.target
         )
@@ -748,7 +801,6 @@ struct ClientsView: View {
             setOn: { _ in },
             about: "Plug does not recognize this client, so it has no switch. It shows here while it is connected.",
             access: choices,
-            connections: sessions.map(connection),
             renameKey: names.key(of: first),
             placeKey: names.key(of: first),
             disambiguator: String(first.sessionId.prefix(4))
@@ -783,7 +835,6 @@ struct ClientsView: View {
             setOn: { _ in },
             about: "Not connected now. This client connects when it has something to do and leaves when it is done, so Plug lists it by its last call. It stays here while that call is in Activity.",
             access: choices,
-            connections: [],
             renameKey: choices == nil ? nil : key,
             placeKey: choices == nil ? nil : key
         )
@@ -793,20 +844,18 @@ struct ClientsView: View {
     /// Its switch is its permission: off takes the permission away, and the
     /// client has to ask again, so the app asks first.
     private func grantEntry(_ grant: DownstreamClient, sessions: [LiveSession]) -> Entry {
-        let name = names.name(forKey: grant.clientKey) ?? grant.clientName
-        let linkedNames = allApps.filter {
-            ClientStatus.hasNetworkRepresentation($0, grantNames: [grant.clientName])
-        }.map(\.name).sorted()
-        let linkedDetail = linkedNames.isEmpty ? "" : " Local HTTP configuration: \(linkedNames.joined(separator: ", "))."
+        let owned = names.name(forKey: grant.clientKey)
+        let name = owned ?? grant.clientName
+        if grant.isUnfinished { return unfinishedEntry(grant, name: name) }
         let access = access(key: grant.clientKey, name: name)
         let host = URL(string: grant.clientId)?.host()
-        // A client Plug registered gets a short id, since two can share a
-        // name.
-        let short = grant.clientId.hasPrefix("plug_")
-            ? grant.clientId.dropFirst(5) : Substring(grant.clientId)
-        let shortID = String(short.prefix(8))
+        let since = grant.createdAt.map { SignInFacts.day($0) }
         // A client with a connection open is plainly signed in.
         let needsSignIn = grant.needsSignIn && sessions.isEmpty
+        let target = AppIcons.target(forClientType: names.picturedName(forGrant: grant))
+        let earlier = SignInFacts.earlier(
+            than: grant, among: model.snapshot.downstreamClients, ownerNamed: owned != nil, answered: answered
+        )
         return Entry(
             id: "grant:\(grant.clientId)",
             group: .network,
@@ -826,30 +875,61 @@ struct ClientsView: View {
                 if !allowed { revoking = Revoking(id: grant.clientId, name: name) }
             },
             about: needsSignIn
-                ? ClientSignIn.about(target: AppIcons.target(forClientType: names.picturedName(forGrant: grant)), name: name)
-                : "This is an OAuth authorization, not a separate app installation.\(linkedDetail) Authorized does not mean connected now. Turn this off to remove access.",
+                ? ClientSignIn.about(target: target, name: name)
+                : [since.map { "Signed in \($0)." }, "Turn this off to remove its access."]
+                    .compactMap { $0 }.joined(separator: " "),
             access: access,
-            connections: sessions.map(connection),
             renameKey: grant.clientKey,
             placeKey: grant.clientKey,
-            disambiguator: host ?? shortID,
-            website: host,
-            shortID: host == nil ? shortID : nil,
+            disambiguator: host ?? since.map { $0 == "today" ? $0 : "since \($0)" },
             grantID: grant.clientId,
             needsSignIn: needsSignIn,
-            signInCommand: needsSignIn
-                ? ClientSignIn.command(target: AppIcons.target(forClientType: names.picturedName(forGrant: grant)))
-                : nil
+            signInCommand: needsSignIn ? ClientSignIn.command(target: target) : nil,
+            asking: earlier.isEmpty ? nil : Entry.Asking(
+                when: since ?? "",
+                choices: earlier.map { other in
+                    Entry.Asking.Choice(
+                        id: other.clientId,
+                        name: names.name(forKey: other.clientKey)
+                            ?? [other.clientName, other.createdAt.map { "since \(SignInFacts.day($0))" }]
+                                .compactMap { $0 }.joined(separator: ", ")
+                    )
+                },
+                replace: { run(.replaceClient(oldID: $0, newID: grant.clientId)); answer(grant.clientId) },
+                keep: { answer(grant.clientId) }
+            )
         )
     }
 
-    private func connection(_ session: LiveSession) -> Entry.Connection {
-        Entry.Connection(
-            id: session.sessionId,
-            place: place(session),
-            detail: [duration(session.connectedSecs), toolsText(session)]
-                .filter { !$0.isEmpty }
-                .joined(separator: " · ")
+    /// Something asked to be let in and nobody finished the sign-in. It has
+    /// no access, so there is nothing to choose for it; its switch forgets
+    /// it now.
+    private func unfinishedEntry(_ grant: DownstreamClient, name: String) -> Entry {
+        let until = grant.expiresAt.map {
+            Date(timeIntervalSince1970: TimeInterval($0)).formatted(date: .omitted, time: .shortened)
+        }
+        return Entry(
+            id: "grant:\(grant.clientId)",
+            group: .unfinished,
+            place: Entry.Group.unfinished.rawValue,
+            name: name,
+            originalName: grant.clientName,
+            status: ClientStatus(state: "Sign-in never finished", limit: nil),
+            isLive: false,
+            dimmed: true,
+            glyph: .grant(name: name),
+            isBusy: false,
+            switchLabel: "Access",
+            isOn: nil,
+            setOn: { _ in },
+            about: "Something asked to use Plug under this name, and the sign-in was never finished. It cannot use anything."
+                + (until.map { " Plug forgets it at \($0)." } ?? ""),
+            access: nil,
+            renameKey: nil,
+            placeKey: nil,
+            grantID: grant.clientId,
+            note: SignInFacts.goneIn(expiresAt: grant.expiresAt),
+            forget: { run(.revokeClient(id: grant.clientId)) }
         )
     }
 
@@ -871,32 +951,6 @@ struct ClientsView: View {
     /// The target whose icon a session shows: the client it reports, else the
     /// client its link was written for.
     private func sessionTarget(_ session: LiveSession) -> String { names.target(of: session) }
-
-    /// Says how it reached Plug in words, not transport identifiers.
-    private func place(_ session: LiveSession) -> String {
-        switch session.transport.lowercased() {
-        case "stdio", "ipc", "daemon_proxy": Entry.Group.onThisMac.rawValue
-        case "http", "streamable_http", "sse": Entry.Group.network.rawValue
-        default: session.transport.replacingOccurrences(of: "_", with: " ").capitalized
-        }
-    }
-
-    /// How long a session has been connected.
-    private func duration(_ seconds: UInt64) -> String {
-        if seconds < 60 { return "just now" }
-        if seconds < 3_600 { return "\(seconds / 60) min" }
-        if seconds < 86_400 { return "\(seconds / 3_600) hr" }
-        let days = seconds / 86_400
-        return days == 1 ? "1 day" : "\(days) days"
-    }
-
-    private func toolsText(_ session: LiveSession) -> String {
-        guard let count = model.snapshot.clientVisibility
-            .first(where: { $0.sessionId == session.sessionId })?
-            .visibleToolCount
-        else { return "" }
-        return count == 1 ? "1 tool" : "\(count) tools"
-    }
 }
 
 /// The one line under a client's name in its detail. Pure value so the
@@ -955,6 +1009,7 @@ struct ClientEntry: Identifiable {
         case onThisMac = "On This Mac"
         case network = "Over the Network"
         case notUsing = "No Local Plug Configuration"
+        case unfinished = "Unfinished Sign-Ins"
     }
 
     enum Glyph {
@@ -971,13 +1026,22 @@ struct ClientEntry: Identifiable {
         }
     }
 
-    /// One open connection of a client.
-    struct Connection: Identifiable {
-        let id: String
-        /// On this Mac, or over the network.
-        let place: String
-        /// How long it has been open and how many tools it sees.
-        let detail: String
+    /// A new sign-in that gave a name earlier ones gave, and the question
+    /// that settles which client it is.
+    struct Asking {
+        struct Choice: Identifiable {
+            /// The earlier sign-in's client id.
+            let id: String
+            let name: String
+        }
+
+        /// The day it signed in, as the row says it.
+        let when: String
+        let choices: [Choice]
+        /// It is this earlier client, signed in again.
+        let replace: (String) -> Void
+        /// It is a client of its own.
+        let keep: () -> Void
     }
 
     let id: String
@@ -999,7 +1063,6 @@ struct ClientEntry: Identifiable {
     let about: String
     /// Nil when there are no server choices to offer for this client.
     let access: ClientAccess?
-    let connections: [Connection]
     /// Nil when Plug has nothing to store a name under.
     let renameKey: String?
     /// The key its place is stored under. An app set up on this Mac has one
@@ -1010,16 +1073,18 @@ struct ClientEntry: Identifiable {
     /// A few words that tell this client from another with the same name.
     /// Nil when its name is the only one like it.
     var disambiguator: String?
-    /// The site a client allowed in over the network came from.
-    var website: String?
-    /// The start of a network client's id, when it has no site to show.
-    var shortID: String?
     /// Set for a client allowed in over the network.
     var grantID: String?
     /// Its sign-in ended and it has to sign in again.
     var needsSignIn = false
     /// What Plug runs to sign it in again, when the client has a command.
     var signInCommand: String?
+    /// Set while a new sign-in has not been told apart from earlier ones.
+    var asking: Asking?
+    /// A few words a row says in place of a switch.
+    var note: String?
+    /// Forgets an unfinished sign-in now.
+    var forget: (() -> Void)?
 }
 
 private typealias Entry = ClientEntry
@@ -1066,6 +1131,19 @@ private struct ClientRow: View {
                     .lineLimit(1)
             }
             Spacer(minLength: Metric.tight)
+            if entry.asking != nil {
+                Text("New")
+                    .font(.caption.weight(.medium))
+                    .padding(.horizontal, Metric.tight)
+                    .background(.tint.opacity(0.2), in: Capsule())
+                    .accessibilityLabel("New sign-in")
+            }
+            if let note = entry.note {
+                Text(note)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
             if entry.needsSignIn {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange)
@@ -1086,7 +1164,10 @@ private struct ClientRow: View {
                 Divider()
             }
             IconMenu(key: entry.glyph.iconKey)
-            if entry.grantID != nil, canMutate {
+            if let forget = entry.forget, canMutate {
+                Divider()
+                Button("Forget Now", role: .destructive, action: forget)
+            } else if entry.grantID != nil, canMutate {
                 Divider()
                 Button("Remove Access…", role: .destructive) { entry.setOn(false) }
             }
@@ -1116,8 +1197,8 @@ private struct ClientSwitch: View {
     }
 }
 
-/// Everything about one client: its switch, the servers it can use, what it
-/// has open, and its name.
+/// Everything about one client. Its icon, its name, its switch and its two
+/// settings are the first thing on the page; the servers it can use follow.
 private struct ClientDetail: View {
     let entry: ClientEntry
     let tools: ToolCatalog
@@ -1125,8 +1206,9 @@ private struct ClientDetail: View {
     let places: [String]
     let canMutate: Bool
     let run: (PlugIntent) -> Void
-    /// The name being typed. Empty means the client's own name.
+    /// The name as it is being typed.
     @State private var draft: String
+    @FocusState private var naming: Bool
     /// A place being typed, while the sheet that asks for it is up.
     @State private var newPlace: String?
     /// The servers whose tools are showing.
@@ -1144,17 +1226,19 @@ private struct ClientDetail: View {
         self.places = places
         self.canMutate = canMutate
         self.run = run
-        _draft = State(initialValue: entry.name == entry.originalName ? "" : entry.name)
+        _draft = State(initialValue: entry.name)
     }
 
     var body: some View {
         DetailForm {
-            Section {
-                DetailHeader(title: entry.name, subtitle: entry.status.text) {
-                    ClientGlyph(glyph: entry.glyph, large: true)
-                } controls: {
-                    ClientSwitch(entry: entry, canMutate: canMutate)
+            if let asking = entry.asking {
+                Section {
+                    question(asking)
                 }
+            }
+
+            Section {
+                header
                 if let command = entry.signInCommand {
                     ProblemNote(
                         title: "\(entry.name) needs to sign in again.",
@@ -1162,6 +1246,24 @@ private struct ClientDetail: View {
                         action: { run(.signInClient(name: entry.name, command: command)) }
                     )
                     .disabled(!canMutate)
+                }
+                if let key = entry.placeKey, entry.group != .notUsing {
+                    runsOn(key: key)
+                }
+                if let access = entry.access, !access.servers.isEmpty {
+                    Toggle(
+                        "New Servers",
+                        isOn: Binding(
+                            get: { !access.onlyAllowed },
+                            set: { run(.setClientAllowList(key: access.key, on: !$0)) }
+                        )
+                    )
+                    .disabled(!canMutate)
+                    .help("When this is off, a server you add later stays off for this client until you turn it on below.")
+                }
+                if let forget = entry.forget {
+                    Button("Forget Now", role: .destructive, action: forget)
+                        .disabled(!canMutate)
                 }
             } footer: {
                 Text(entry.about)
@@ -1182,64 +1284,83 @@ private struct ClientDetail: View {
                     Text(Self.note(for: access))
                 }
             }
+        }
+    }
 
-            if !entry.connections.isEmpty {
-                Section("Connected Now") {
-                    ForEach(entry.connections) { connection in
-                        LabeledContent(connection.place, value: connection.detail)
-                            .help("Connection \(connection.id.prefix(8))")
-                    }
-                }
+    /// The icon is a menu and the name is a field, so both change where they
+    /// are shown.
+    private var header: some View {
+        HStack(spacing: Metric.snug) {
+            Menu {
+                IconMenu(key: entry.glyph.iconKey)
+            } label: {
+                ClientGlyph(glyph: entry.glyph, large: true)
             }
-
-            if let access = entry.access, !access.servers.isEmpty {
-                Section {
-                    Toggle(
-                        "Adopt Newly Added Servers",
-                        isOn: Binding(
-                            get: { !access.onlyAllowed },
-                            set: { run(.setClientAllowList(key: access.key, on: !$0)) }
-                        )
-                    )
-                    .disabled(!canMutate)
-                } header: {
-                    Text("Settings")
-                } footer: {
-                    Text("When this is off, a server you add later stays off for this client until you turn it on above.")
-                }
-            }
-
-            if entry.renameKey != nil || entry.placeKey != nil || entry.website != nil || entry.shortID != nil {
-                Section {
-                    if let key = entry.renameKey {
+            .menuStyle(.borderlessButton)
+            .menuIndicator(.hidden)
+            .fixedSize()
+            .frame(width: Metric.glyphSlot, height: Metric.glyphSlot)
+            .help("Change the icon")
+            .accessibilityLabel("Icon of \(entry.name)")
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                if let key = entry.renameKey {
+                    HStack(spacing: Metric.tight) {
                         TextField("Name", text: $draft, prompt: Text(entry.originalName))
-                            .onSubmit {
-                                run(.renameClient(
-                                    key: key, name: draft.trimmingCharacters(in: .whitespaces)
-                                ))
-                            }
+                            .textFieldStyle(.plain)
+                            .labelsHidden()
+                            .font(.title3.weight(.semibold))
+                            .focused($naming)
+                            .onSubmit { rename(key) }
+                            .onChange(of: naming) { if !naming { rename(key) } }
                             .disabled(!canMutate)
+                            .help("Click to rename. Only Plug shows this name.")
+                        Image(systemName: "pencil")
+                            .foregroundStyle(.tertiary)
+                            .accessibilityHidden(true)
                     }
-                    if let key = entry.placeKey, entry.group != .notUsing {
-                        runsOn(key: key)
-                    }
-                    if let website = entry.website {
-                        LabeledContent("Website", value: website)
-                    } else if let shortID = entry.shortID {
-                        LabeledContent("ID") {
-                            Text(shortID)
-                                .font(.body.monospaced())
-                                .textSelection(.enabled)
-                        }
-                    }
-                } header: {
-                    Text("Details")
-                } footer: {
-                    if entry.renameKey != nil {
-                        Text("Only Plug shows this name. Leave it empty to use the client's own name.")
-                    }
+                } else {
+                    Text(entry.name)
+                        .font(.title3.weight(.semibold))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
                 }
+                Text(entry.status.text)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
+            .layoutPriority(1)
+            Spacer(minLength: Metric.tight)
+            ClientSwitch(entry: entry, canMutate: canMutate)
+        }
+    }
+
+    /// An empty name, or the client's own, goes back to the client's own.
+    private func rename(_ key: String) {
+        let typed = draft.trimmingCharacters(in: .whitespaces)
+        let name = typed == entry.originalName ? "" : typed
+        if typed.isEmpty { draft = entry.originalName }
+        guard (name.isEmpty ? entry.originalName : name) != entry.name else { return }
+        run(.renameClient(key: key, name: name))
+    }
+
+    /// One question, asked once: a new sign-in gave a name that earlier ones
+    /// gave, and only the owner knows whether it is one of them.
+    private func question(_ asking: ClientEntry.Asking) -> some View {
+        VStack(alignment: .leading, spacing: Metric.tight) {
+            Text("New sign-in \(asking.when). Which client is this?")
+                .font(.callout.weight(.medium))
+            Text("It calls itself \(entry.originalName), like others here. Pick one and this sign-in takes over its name and choices, and the old sign-in is removed.")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            HStack {
+                ForEach(asking.choices) { choice in
+                    Button(choice.name) { asking.replace(choice.id) }
+                }
+                Button("A New Client", action: asking.keep)
+            }
+            .disabled(!canMutate)
         }
     }
 

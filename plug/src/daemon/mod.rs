@@ -1858,6 +1858,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             )
             .await
         }
+        IpcRequest::MoveClientSettings { from, to, .. } => {
+            dispatch_operator_mutation(
+                ctx,
+                plug_core::operator::OperatorMutation::MoveClientSettings {
+                    from: from.clone(),
+                    to: to.clone(),
+                },
+            )
+            .await
+        }
         IpcRequest::SetClientPlace { key, place, .. } => {
             dispatch_operator_mutation(
                 ctx,

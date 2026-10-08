@@ -156,10 +156,20 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     /// False when the client holds no token that still works. Absent from a
     /// daemon older than the field, which is read as signed in.
     public var signedIn: Bool?
+    /// When the client asked to be let in, in seconds since 1970.
+    public var createdAt: UInt64?
+    /// When it last signed in or renewed. Nil for one that never has.
+    public var lastUsedAt: UInt64?
+    /// When Plug forgets it unless it signs in again before then.
+    public var expiresAt: UInt64?
 
     /// Its sign-in ran out or was revoked, and only the client can start
     /// another.
     public var needsSignIn: Bool { signedIn == false }
+
+    /// It asked to be let in and nobody finished the sign-in. Plug forgets
+    /// it at `expiresAt`.
+    public var isUnfinished: Bool { signedIn == false && lastUsedAt == nil && createdAt != nil }
 
     /// What this client's settings are stored under. Matches the daemon's
     /// `grant_client_key`.
@@ -590,6 +600,8 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case revokeClient(authToken: String, clientID: String)
     /// An empty name goes back to the name Plug works out.
     case renameClient(authToken: String, key: String, name: String)
+    /// Hand one client's settings to another, replacing what that one had.
+    case moveClientSettings(authToken: String, from: String, to: String)
     /// An empty place goes back to the place Plug works out.
     case setClientPlace(authToken: String, key: String, place: String)
     /// Keep a client from a server, or let it back in.
@@ -610,7 +622,7 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
         case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked, place
-        case watch, event, account, spec, secretStore
+        case watch, event, account, spec, secretStore, from, to
     }
 
     public func encode(to encoder: Encoder) throws {
@@ -668,6 +680,9 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
         case let .renameClient(token, key, name):
             try c.encode("RenameClient", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode(name, forKey: .name)
+        case let .moveClientSettings(token, from, to):
+            try c.encode("MoveClientSettings", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(from, forKey: .from); try c.encode(to, forKey: .to)
         case let .setClientPlace(token, key, place):
             try c.encode("SetClientPlace", forKey: .type); try c.encode(token, forKey: .authToken)
             try c.encode(key, forKey: .key); try c.encode(place, forKey: .place)

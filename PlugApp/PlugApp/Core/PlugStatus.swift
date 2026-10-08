@@ -255,6 +255,9 @@ enum PlugIntent: Equatable, Sendable {
     case unlinkApp(String)
     case revokeClient(id: String)
     case renameClient(key: String, name: String)
+    /// A client signed in again under a new id: it takes over the settings
+    /// of the sign-in it replaces, and that one loses its access.
+    case replaceClient(oldID: String, newID: String)
     case setClientPlace(key: String, place: String)
     case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case setClientToolBlocked(key: String, tool: String, blocked: Bool)
@@ -277,6 +280,8 @@ enum PlugIntent: Equatable, Sendable {
     case checkup
     case openCurrentWindow
     case reveal(server: String)
+    /// Open the Clients page on one client allowed in over the network.
+    case revealClient(id: String)
     case checkForUpdates
     /// Restart the background service through the same path the installer
     /// uses. Nothing in the app ever kills it directly.

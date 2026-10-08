@@ -172,6 +172,13 @@ pub struct DownstreamSessionSnapshot {
 /// marks the seam where a stateless or external-backed implementation would fit.
 pub trait SessionStore: Send + Sync {
     fn create_session(&self) -> Result<String, HttpError>;
+    /// Open a session again under the id its client still holds, after Plug
+    /// restarted or the session timed out. `Ok(true)` when this call opened
+    /// it, `Ok(false)` when it was open already. A session its client closed
+    /// is not reopened.
+    fn reopen_session(&self, _session_id: &str) -> Result<bool, HttpError> {
+        Err(HttpError::SessionNotFound)
+    }
     fn validate(&self, session_id: &str) -> Result<(), HttpError>;
     fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError>;
     fn set_sse_sender(

@@ -1002,6 +1002,10 @@ async fn post_mcp(
         }
     } else {
         crate::protocol::rewrite_legacy_request(&mut raw_message);
+        // `initialize` opens a session of its own.
+        if raw_message.get("method").and_then(|method| method.as_str()) != Some("initialize") {
+            reopen_lost_session(&state, &headers, &auth_status);
+        }
     }
     let message: ClientJsonRpcMessage = serde_json::from_value(raw_message).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
@@ -1446,6 +1450,7 @@ async fn get_mcp(
 ) -> Result<Response, HttpError> {
     // 1. Validate session
     let session_id = extract_session_id(&headers)?;
+    reopen_lost_session(&state, &headers, &auth_status);
     state.sessions.validate(&session_id)?;
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
@@ -1696,27 +1701,7 @@ async fn handle_request(
             );
             // Store client type in session
             let _ = state.sessions.set_client_type(&session_id, client_type);
-            // The grant is what Plug verified. The name above is only what the
-            // client said, so settings for a remote client hang on the grant.
-            if let AuthStatus::Authenticated(Some(claims)) = &auth_status {
-                let _ = state
-                    .sessions
-                    .set_grant(&session_id, claims.client_id.clone());
-                // The session lives only while the grant does. Asked of the
-                // grant itself, so it holds however the grant ended: removed,
-                // expired, or removed with the save failing afterward.
-                let lifecycle = claims.principal_lifecycle.clone();
-                let _ = state
-                    .sessions
-                    .set_access_check(&session_id, Arc::new(move || lifecycle.is_active()));
-            }
-
-            // Record what this principal may observe on the shared SSE fan-out.
-            // Not ignorable: until this lands the session denies every
-            // broadcast, so a failure here would silently mute the client.
-            state
-                .sessions
-                .set_broadcast_audience(&session_id, broadcast_audience_for(&policy_context))?;
+            bind_session_to_caller(state, &session_id, &auth_status, &policy_context)?;
 
             // Track roots capability for reverse-request roots fetching
             if init_req.params.capabilities.roots.is_some() {
@@ -2689,6 +2674,65 @@ fn session_is_the_callers(
         AuthStatus::Authenticated(Some(claims)) if claims.client_id == owner => Ok(()),
         _ => Err(HttpError::SessionNotFound),
     }
+}
+
+/// Tie a session to the caller that proved who it is.
+fn bind_session_to_caller(
+    state: &HttpState,
+    session_id: &str,
+    auth_status: &AuthStatus,
+    policy_context: &DownstreamCallContext,
+) -> Result<(), HttpError> {
+    // The grant is what Plug verified. The name a client gives is only what
+    // it said, so settings for a remote client hang on the grant.
+    if let AuthStatus::Authenticated(Some(claims)) = auth_status {
+        let _ = state
+            .sessions
+            .set_grant(session_id, claims.client_id.clone());
+        // The session lives only while the grant does. Asked of the grant
+        // itself, so it holds however the grant ended: removed, expired, or
+        // removed with the save failing afterward.
+        let lifecycle = claims.principal_lifecycle.clone();
+        let _ = state
+            .sessions
+            .set_access_check(session_id, Arc::new(move || lifecycle.is_active()));
+    }
+
+    // Record what this principal may observe on the shared SSE fan-out. Not
+    // ignorable: until this lands the session denies every broadcast, so a
+    // failure here would silently mute the client.
+    state
+        .sessions
+        .set_broadcast_audience(session_id, broadcast_audience_for(policy_context))
+}
+
+/// A client that was connected when Plug restarted, or that stayed quiet past
+/// the session timeout, goes on sending the session it was given. Many never
+/// start a new one when told theirs is gone, and fail every call from then
+/// on. The caller has already proved who it is, so its session is opened
+/// again under the same id, as its own. What it said about itself at
+/// `initialize` is not known again until it next initializes.
+fn reopen_lost_session(state: &HttpState, headers: &HeaderMap, auth_status: &AuthStatus) {
+    let Ok(session_id) = extract_session_id(headers) else {
+        return;
+    };
+    if !matches!(state.sessions.reopen_session(&session_id), Ok(true)) {
+        return;
+    }
+    let policy_context = legacy_http_policy_context(
+        state,
+        auth_status,
+        RequestId::Number(0),
+        Arc::<str>::from(extract_trace_id(headers)),
+    );
+    if bind_session_to_caller(state, &session_id, auth_status, &policy_context).is_err() {
+        state.sessions.remove(&session_id);
+        return;
+    }
+    tracing::info!(
+        session = %session_id,
+        "reopened a session this client still held and Plug no longer had"
+    );
 }
 
 /// Validate that the session exists and is not expired.
@@ -4434,6 +4478,10 @@ mod tests {
             self.inner.create_session()
         }
 
+        fn reopen_session(&self, session_id: &str) -> Result<bool, HttpError> {
+            self.inner.reopen_session(session_id)
+        }
+
         fn validate(&self, session_id: &str) -> Result<(), HttpError> {
             if self.validate_calls.fetch_add(1, Ordering::SeqCst) == 1 {
                 self.second_validate_notify.notify_one();
@@ -4771,6 +4819,42 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.contains("Mcp-Name"))
         );
+    }
+
+    #[tokio::test]
+    async fn a_client_holding_a_session_plug_lost_is_served() {
+        let state = test_state();
+        let lost = uuid::Uuid::new_v4().to_string();
+        let list = |id: u32, session: &str| {
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("content-type", "application/json")
+                .header(SESSION_ID_HEADER, session)
+                .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
+                .body(Body::from(
+                    serde_json::to_vec(&serde_json::json!({
+                        "jsonrpc": "2.0",
+                        "id": id,
+                        "method": "tools/list"
+                    }))
+                    .unwrap(),
+                ))
+                .unwrap()
+        };
+
+        let resp = build_router(state.clone())
+            .oneshot(list(1, &lost))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert!(state.sessions.validate(&lost).is_ok());
+
+        let resp = build_router(state)
+            .oneshot(list(2, "never-issued"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

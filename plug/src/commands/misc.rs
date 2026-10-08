@@ -816,8 +816,20 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         })
         .await;
         if let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) = snapshot {
+            // A registration the owner named is one they know about.
+            let named = plug_core::config::load_config(None)
+                .map(|config| {
+                    config
+                        .clients
+                        .into_iter()
+                        .filter(|(_, settings)| settings.name.is_some())
+                        .filter_map(|(key, _)| key.strip_prefix("oauth:").map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_default();
             checks.extend(duplicate_downstream_client_check(
                 &snapshot.downstream_clients,
+                &named,
             ));
         }
     }
@@ -828,12 +840,18 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
 /// Remote apps that sign in through dynamic registration make a new client
 /// each time, and every old one keeps its grants until it expires 90 days
 /// after its last use. Several registrations under one name are usually
-/// leftovers worth revoking.
+/// leftovers worth revoking. One the owner gave a name of its own is not a
+/// leftover, and one whose sign-in never finished goes by itself in an hour.
 fn duplicate_downstream_client_check(
     clients: &[plug_core::downstream_oauth::RegisteredClientSummary],
+    named: &std::collections::BTreeSet<String>,
 ) -> Option<plug_core::doctor::CheckResult> {
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     for client in clients {
+        let unfinished = !client.signed_in && client.last_used_at.is_none();
+        if unfinished || named.contains(&client.client_id) {
+            continue;
+        }
         *counts.entry(client.client_name.as_str()).or_default() += 1;
     }
     let duplicates = counts
@@ -848,11 +866,11 @@ fn duplicate_downstream_client_check(
         name: "downstream_oauth_clients".to_string(),
         status: plug_core::doctor::CheckStatus::Warn,
         message: format!(
-            "Remote apps registered more than once: {}. Each old registration keeps its access until 90 days after its last use",
+            "Clients signed in more than once: {}. Each old sign-in keeps its access until 90 days after its last use",
             duplicates.join(", ")
         ),
         fix_suggestion: Some(
-            "Run `plug auth clients list`, then `plug auth clients revoke <client_id>` for registrations you no longer use; an app whose registration you revoke just signs in again".to_string(),
+            "Open Clients in Plug and turn off the ones you no longer use, or give each one you keep a name of its own. From a terminal: `plug auth clients list`, then `plug auth clients revoke <client_id>`".to_string(),
         ),
     })
 }
@@ -2058,14 +2076,17 @@ mod tests {
 
     #[test]
     fn duplicate_client_registrations_warn_by_name() {
-        let check = duplicate_downstream_client_check(&[
-            registered("Claude", "a"),
-            registered("Cursor", "b"),
-            registered("Cursor", "c"),
-            registered("Devin", "d"),
-            registered("Devin", "e"),
-            registered("Devin", "f"),
-        ])
+        let check = duplicate_downstream_client_check(
+            &[
+                registered("Claude", "a"),
+                registered("Cursor", "b"),
+                registered("Cursor", "c"),
+                registered("Devin", "d"),
+                registered("Devin", "e"),
+                registered("Devin", "f"),
+            ],
+            &Default::default(),
+        )
         .expect("duplicates warn");
         assert_eq!(check.status, CheckStatus::Warn);
         assert!(
@@ -2085,10 +2106,29 @@ mod tests {
     #[test]
     fn unique_client_registrations_add_no_check() {
         assert!(
-            duplicate_downstream_client_check(&[
-                registered("Claude", "a"),
-                registered("Cursor", "b")
-            ])
+            duplicate_downstream_client_check(
+                &[registered("Claude", "a"), registered("Cursor", "b")],
+                &Default::default()
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn named_and_unfinished_registrations_are_not_duplicates() {
+        let mut unfinished = registered("Cursor", "c");
+        unfinished.signed_in = false;
+        unfinished.last_used_at = None;
+        let named = ["b".to_string()].into_iter().collect();
+        assert!(
+            duplicate_downstream_client_check(
+                &[
+                    registered("Cursor", "a"),
+                    registered("Cursor", "b"),
+                    unfinished
+                ],
+                &named
+            )
             .is_none()
         );
     }
