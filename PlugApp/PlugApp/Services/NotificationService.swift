@@ -13,6 +13,9 @@ final class NotificationService {
         let title: String
         let body: String
         var server: String?
+        /// Set when it is about one client allowed in over the network; a
+        /// click opens that client.
+        var client: String?
     }
 
     typealias NotificationSink = @MainActor @Sendable (Note) -> Void
@@ -20,6 +23,7 @@ final class NotificationService {
     nonisolated static let signInCategory = "plug.server.sign-in"
     nonisolated static let signInAction = "plug.server.sign-in.action"
     nonisolated static let serverKey = "server"
+    nonisolated static let clientKey = "client"
 
     private let sink: NotificationSink
     private var previous: OperatorSnapshot?
@@ -88,12 +92,17 @@ final class NotificationService {
             ))
         }
 
-        let oldClients = Set(previous.downstreamClients.map(\.clientId))
-        for client in snapshot.downstreamClients where !oldClients.contains(client.clientId) {
+        // Asking to be let in is not news; being let in is. A client that
+        // was already signed in when it was first seen counts too.
+        let wasIn = Set(previous.downstreamClients.filter { !$0.needsSignIn }.map(\.clientId))
+        let hadSignedIn = Set(previous.downstreamClients.filter { !$0.isUnfinished }.map(\.clientId))
+        for client in snapshot.downstreamClients
+        where !client.needsSignIn && !wasIn.contains(client.clientId) && !hadSignedIn.contains(client.clientId) {
             post(Note(
                 id: "downstream-client-\(client.clientId)",
-                title: "New client connected",
-                body: "\(client.clientName) can now use Plug."
+                title: "\(client.clientName) signed in to Plug",
+                body: "It can now use your servers. Click to name it or choose what it can use.",
+                client: client.clientId
             ))
         }
     }
@@ -101,7 +110,10 @@ final class NotificationService {
     /// What a click on a server's notification does: the body opens that
     /// server, the Sign In button starts its sign-in, and a dismissal does
     /// nothing.
-    nonisolated static func intent(forAction action: String, server: String?) -> PlugIntent? {
+    nonisolated static func intent(forAction action: String, server: String?, client: String? = nil) -> PlugIntent? {
+        if let client {
+            return action == UNNotificationDefaultActionIdentifier ? .revealClient(id: client) : nil
+        }
         guard let server else { return nil }
         switch action {
         case signInAction: return .signIn(server: server)
@@ -110,8 +122,8 @@ final class NotificationService {
         }
     }
 
-    func handle(action: String, server: String?) {
-        guard let intent = Self.intent(forAction: action, server: server) else { return }
+    func handle(action: String, server: String?, client: String? = nil) {
+        guard let intent = Self.intent(forAction: action, server: server, client: client) else { return }
         if let perform { perform(intent) } else { pendingIntent = intent }
     }
 
@@ -136,6 +148,8 @@ final class NotificationService {
         if let server = note.server {
             content.categoryIdentifier = signInCategory
             content.userInfo = [serverKey: server]
+        } else if let client = note.client {
+            content.userInfo = [clientKey: client]
         }
         let request = UNNotificationRequest(identifier: note.id, content: content, trigger: nil)
         UNUserNotificationCenter.current().add(request)
@@ -150,7 +164,11 @@ private final class NotificationResponder: NSObject, UNUserNotificationCenterDel
         didReceive response: UNNotificationResponse
     ) async {
         let action = response.actionIdentifier
-        let server = response.notification.request.content.userInfo[NotificationService.serverKey] as? String
-        await NotificationService.shared.handle(action: action, server: server)
+        let info = response.notification.request.content.userInfo
+        await NotificationService.shared.handle(
+            action: action,
+            server: info[NotificationService.serverKey] as? String,
+            client: info[NotificationService.clientKey] as? String
+        )
     }
 }

@@ -863,6 +863,11 @@ final class AppModelTests: XCTestCase {
         )
         XCTAssertNil(NotificationService.intent(forAction: UNNotificationDismissActionIdentifier, server: "alpha"))
         XCTAssertNil(NotificationService.intent(forAction: UNNotificationDefaultActionIdentifier, server: nil))
+        // A client that signed in opens on its own page.
+        XCTAssertEqual(
+            NotificationService.intent(forAction: UNNotificationDefaultActionIdentifier, server: nil, client: "client-1"),
+            .revealClient(id: "client-1")
+        )
 
         let defaults = UserDefaults.standard
         let previous = defaults.object(forKey: NotificationService.preferenceKey)

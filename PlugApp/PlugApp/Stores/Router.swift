@@ -53,6 +53,11 @@ final class Router {
         section = .servers
         selectedServer = server
     }
+
+    func reveal(clientID: String) {
+        section = .clients
+        selectedClient = "grant:\(clientID)"
+    }
 }
 
 /// The single place an interface action turns into work. Views name a
@@ -107,6 +112,8 @@ struct PlugIntentRunner {
             perform("remove that client's access") { .revokeClient(authToken: $0, clientID: id) }
         case let .renameClient(key, name):
             perform("rename the client") { .renameClient(authToken: $0, key: key, name: name) }
+        case let .replaceClient(oldID, newID):
+            Task { await model.replaceClient(oldID: oldID, newID: newID) }
         case let .setClientPlace(key, place):
             perform("say where the client runs") { .setClientPlace(authToken: $0, key: key, place: place) }
         case let .setClientServerBlocked(key, server, blocked):
@@ -164,6 +171,9 @@ struct PlugIntentRunner {
             showWindow()
         case let .reveal(server):
             router.reveal(server: server)
+            showWindow()
+        case let .revealClient(id):
+            router.reveal(clientID: id)
             showWindow()
         case .checkForUpdates:
             UpdateService.shared.checkForUpdates()

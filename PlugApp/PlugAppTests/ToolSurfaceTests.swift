@@ -955,4 +955,42 @@ final class PopoverRecentTests: XCTestCase {
             "Could not add a, b, c, and 2 more. The reason is under each one."
         )
     }
+
+    /// A new sign-in under a name others gave asks which one it is, once.
+    func testANewSignInAsksAboutEarlierOnesWithItsName() {
+        let now = Date(timeIntervalSince1970: 2_000_000)
+        func grant(_ id: String, _ name: String, at created: UInt64, used: UInt64? = 1) -> DownstreamClient {
+            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"signed_in":true}"#
+            let decoder = JSONDecoder()
+            decoder.keyDecodingStrategy = .convertFromSnakeCase
+            var client = try! decoder.decode(DownstreamClient.self, from: Data(json.utf8))
+            client.lastUsedAt = used
+            return client
+        }
+        let old = grant("old", "Cursor", at: 1_000_000)
+        let new = grant("new", "cursor", at: 1_990_000)
+        var unfinished = grant("half", "Cursor", at: 1_500_000, used: nil)
+        unfinished.signedIn = false
+        let all = [old, new, unfinished, grant("other", "Claude", at: 1_000_000)]
+
+        XCTAssertTrue(unfinished.isUnfinished)
+        XCTAssertEqual(
+            SignInFacts.earlier(than: new, among: all, ownerNamed: false, answered: [], now: now).map(\.clientId),
+            ["old"]
+        )
+        XCTAssertTrue(SignInFacts.earlier(than: old, among: all, ownerNamed: false, answered: [], now: now).isEmpty)
+        XCTAssertTrue(SignInFacts.earlier(than: new, among: all, ownerNamed: true, answered: [], now: now).isEmpty)
+        XCTAssertTrue(SignInFacts.earlier(than: new, among: all, ownerNamed: false, answered: ["new"], now: now).isEmpty)
+        let later = now.addingTimeInterval(SignInFacts.newFor)
+        XCTAssertTrue(SignInFacts.earlier(than: new, among: all, ownerNamed: false, answered: [], now: later).isEmpty)
+    }
+
+    func testAnUnfinishedSignInSaysWhenItGoes() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_000_030, now: now), "gone soon")
+        XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_001_500, now: now), "gone in 25 min")
+        XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_007_300, now: now), "gone in 2 hr")
+        XCTAssertEqual(SignInFacts.goneIn(expiresAt: nil, now: now), "")
+        XCTAssertEqual(SignInFacts.day(1_000_000, now: now), "today")
+    }
 }

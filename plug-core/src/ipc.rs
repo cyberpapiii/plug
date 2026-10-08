@@ -289,6 +289,12 @@ pub enum IpcRequest {
         key: String,
         name: String,
     },
+    /// Hand one client's settings to another by editing `clients`.
+    MoveClientSettings {
+        auth_token: String,
+        from: String,
+        to: String,
+    },
     /// Say where a client runs by editing `clients`. An empty place removes
     /// it.
     SetClientPlace {
@@ -514,6 +520,12 @@ impl fmt::Debug for IpcRequest {
                 .field("auth_token", &"[REDACTED]")
                 .field("key", key)
                 .field("name", name)
+                .finish(),
+            Self::MoveClientSettings { from, to, .. } => f
+                .debug_struct("MoveClientSettings")
+                .field("auth_token", &"[REDACTED]")
+                .field("from", from)
+                .field("to", to)
                 .finish(),
             Self::SetClientPlace { key, place, .. } => f
                 .debug_struct("SetClientPlace")
@@ -1269,6 +1281,7 @@ pub fn requires_auth(request: &IpcRequest) -> bool {
             | IpcRequest::SetServerEnabled { .. }
             | IpcRequest::SetToolEnabled { .. }
             | IpcRequest::RenameClient { .. }
+            | IpcRequest::MoveClientSettings { .. }
             | IpcRequest::SetClientPlace { .. }
             | IpcRequest::SetClientBlock { .. }
             | IpcRequest::AddWatch { .. }
@@ -1295,6 +1308,7 @@ pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
         | IpcRequest::SetServerEnabled { auth_token, .. }
         | IpcRequest::SetToolEnabled { auth_token, .. }
         | IpcRequest::RenameClient { auth_token, .. }
+        | IpcRequest::MoveClientSettings { auth_token, .. }
         | IpcRequest::SetClientPlace { auth_token, .. }
         | IpcRequest::SetClientBlock { auth_token, .. }
         | IpcRequest::AddWatch { auth_token, .. }

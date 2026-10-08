@@ -9,6 +9,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A client that was connected when Plug restarted, or that sat quiet for half an hour, is taken back the next time it calls. Plug used to answer "session not found" to every call from then on, and some clients, several Grok Bot bots among them, never recovered until they were set up again.
+- A client's page starts with everything you change about it: click its icon to pick another, click its name to rename it, and its switch, where it runs and whether it gets new servers sit right below. The Details, Settings and Connected Now sections are gone.
+- Plug sends a notification when a client signs in, and clicking it opens that client.
+- A new sign-in under a name other clients already use is marked New and asks which client it is. Pick one and it takes over that client's name, place and server choices, and the old sign-in is removed.
+- A sign-in that was started and never finished is listed under Unfinished Sign-Ins, says when Plug will forget it, and can be forgotten right away.
+- The checkup no longer warns about clients signed in more than once when you have given each one its own name, and it points to the Clients page instead of a terminal command.
 - A client that leaves the `MCP-Protocol-Version` label off its requests, as Grok Bot does, is served. Plug refused every one of its calls.
 - Plug's log says when it refuses a request from a client and why. A refused client left no trace.
 - The menu bar icon opens its panel after Plug was closed by a quit-all and

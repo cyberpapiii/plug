@@ -46,6 +46,13 @@ pub enum OperatorMutation {
         key: String,
         place: String,
     },
+    /// Hand one client's settings to another, replacing what that one had.
+    /// A client that signs in again arrives under a new key; this is how it
+    /// keeps its name, its place and its server choices.
+    MoveClientSettings {
+        from: String,
+        to: String,
+    },
     /// Keep a client from a server or a tool, or let it back in.
     SetClientBlock {
         key: String,
@@ -225,6 +232,10 @@ pub fn apply_operator_mutation_knowing(
             label_client(&mut config, &key, &place, ClientLabel::Place)?;
             OperatorMutationResult::server(None)
         }
+        OperatorMutation::MoveClientSettings { from, to } => {
+            move_client_settings(&mut config, &from, &to)?;
+            OperatorMutationResult::server(None)
+        }
         OperatorMutation::SetClientBlock {
             key,
             kind,
@@ -348,6 +359,26 @@ fn set_tool_enabled(config: &mut Config, tool: &str, enabled: bool) -> anyhow::R
 
 /// The longest name a client can be given. Long enough for any product name,
 /// short enough to fit a row.
+fn move_client_settings(config: &mut Config, from: &str, to: &str) -> anyhow::Result<()> {
+    let (from, to) = (from.trim(), to.trim());
+    if from.is_empty() || to.is_empty() {
+        anyhow::bail!("client key is required");
+    }
+    if from == to {
+        anyhow::bail!("a client cannot take over its own settings");
+    }
+    match config.clients.remove(from) {
+        Some(settings) => {
+            config.clients.insert(to.to_string(), settings);
+        }
+        // The old client had nothing of its own, so neither does the new one.
+        None => {
+            config.clients.remove(to);
+        }
+    }
+    Ok(())
+}
+
 const CLIENT_NAME_MAX_CHARS: usize = 60;
 
 /// Name a client, or with an empty name go back to the one Plug works out.
@@ -617,6 +648,32 @@ pub fn persist_config_atomic(path: &Path, config: &Config) -> anyhow::Result<()>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_that_signs_in_again_takes_over_its_old_settings() {
+        let mut config = Config::default();
+        label_client(&mut config, "oauth:old", "GrokBot", ClientLabel::Name).unwrap();
+        label_client(&mut config, "oauth:old", "Cloud", ClientLabel::Place).unwrap();
+        label_client(&mut config, "oauth:new", "Cursor 2", ClientLabel::Name).unwrap();
+
+        move_client_settings(&mut config, "oauth:old", "oauth:new").unwrap();
+
+        assert!(!config.clients.contains_key("oauth:old"));
+        let moved = &config.clients["oauth:new"];
+        assert_eq!(moved.name.as_deref(), Some("GrokBot"));
+        assert_eq!(moved.place.as_deref(), Some("Cloud"));
+    }
+
+    #[test]
+    fn taking_over_a_client_with_no_settings_leaves_none() {
+        let mut config = Config::default();
+        label_client(&mut config, "oauth:new", "Cursor 2", ClientLabel::Name).unwrap();
+
+        move_client_settings(&mut config, "oauth:old", "oauth:new").unwrap();
+
+        assert!(config.clients.is_empty());
+        assert!(move_client_settings(&mut config, "oauth:new", "oauth:new").is_err());
+    }
 
     fn fixture_path() -> PathBuf {
         tempfile::tempdir().unwrap().keep().join("config.toml")

@@ -633,6 +633,17 @@ final class AppModel {
         } catch { reportActionError(doing, error) }
     }
 
+    /// The settings move first: if that fails, the old sign-in keeps both its
+    /// settings and its access.
+    func replaceClient(oldID: String, newID: String) async {
+        do {
+            try await performOperation {
+                .moveClientSettings(authToken: $0, from: "oauth:\(oldID)", to: "oauth:\(newID)")
+            }
+            try await performOperation { .revokeClient(authToken: $0, clientID: oldID) }
+        } catch { reportActionError("replace the old sign-in", error) }
+    }
+
     /// Shows a failed press until it is dismissed. A newer failure replaces
     /// it. It does not leave by itself: a message that vanishes while it is
     /// being read is no message.
