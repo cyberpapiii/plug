@@ -154,6 +154,23 @@ final class DaemonServiceManagerTests: XCTestCase {
         ])
     }
 
+    func testARegistrationThatFailsOnceIsTriedAgain() async throws {
+        let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector([.appManagedStale(stale), .appManagedCurrent(current)])
+        let backend = FakeDaemonBackend(enabled: true, handshakes: [handshake("0.6.4"), handshake("0.7.0")])
+        backend.registerFailuresLeft = 1
+        let manager = makeManager(inspector: inspector, backend: backend)
+
+        let result = try await manager.replaceStaleAppService(
+            snapshot: snapshot(.appManagedStale(stale), version: "0.6.4", executable: stale.programURL),
+            expectedVersion: "0.7.0"
+        )
+
+        XCTAssertEqual(result.daemonVersion, "0.7.0")
+        XCTAssertEqual(backend.events.filter { $0 == .register }.count, 2)
+    }
+
     func testConnectorsResumeWhenReplacementFails() async throws {
         let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
         let inspector = SequenceLaunchdInspector([.appManagedStale(stale)])
@@ -379,12 +396,12 @@ final class DaemonServiceManagerTests: XCTestCase {
 
     func testTimedOutHandshakeRemainsBoundedByReplacementRetryLimit() async throws {
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
-        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
+        let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 9))
         let backend = FakeDaemonBackend(
             enabled: true,
             handshakeFailures: Array(
                 repeating: PlugIPCError.systemCall("read", ETIMEDOUT),
-                count: 4
+                count: 7
             )
         )
         let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 3)
@@ -396,12 +413,15 @@ final class DaemonServiceManagerTests: XCTestCase {
             XCTAssertEqual(error, .verificationFailed(expectedVersion: "0.7.0", actualVersion: nil))
         }
 
-        XCTAssertEqual(backend.events.filter { $0 == .handshake }.count, 4)
-        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 1)
+        // One look, one window waiting for the silent daemon, then one
+        // replacement with its own window.
+        XCTAssertEqual(backend.events.filter { $0 == .handshake }.count, 7)
+        XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 2)
+        XCTAssertEqual(backend.events.filter { $0 == .unregister }.count, 1)
         XCTAssertEqual(backend.events.last, .resume([101, 102]))
     }
 
-    func testColdStartIsKickstartedOnceWhileHandshakeBecomesReady() async throws {
+    func testADaemonStillStartingIsWaitedForAndNotReplaced() async throws {
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
         let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
         let backend = FakeDaemonBackend(
@@ -420,7 +440,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         XCTAssertEqual(result.daemonVersion, "0.7.0")
         XCTAssertEqual(backend.events.filter { $0 == .kickstart }.count, 1)
         XCTAssertEqual(backend.events.filter { $0 == .sleep }.count, 3)
-        XCTAssertEqual(backend.events.last, .resume([101, 102]))
+        XCTAssertFalse(backend.events.contains(.unregister), "a daemon that is only slow is left alone")
     }
 
     private func makeManager(
@@ -506,6 +526,7 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
     var events: [Event] = []
     var strandedResumes = 0
     var registerError: Error?
+    var registerFailuresLeft = 0
     private var handshakes: [OperatorHandshake]
     private var handshakeFailures: [Error]
 
@@ -543,6 +564,10 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
 
     func registerAgent() throws {
         events.append(.register)
+        if registerFailuresLeft > 0 {
+            registerFailuresLeft -= 1
+            throw TestFailure.register
+        }
         if let registerError { throw registerError }
         enabled = true
     }

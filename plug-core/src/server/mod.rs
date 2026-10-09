@@ -1843,6 +1843,7 @@ impl ServerManager {
                         .ok_or_else(|| anyhow::anyhow!("HTTP transport requires a URL"))?;
 
                     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
+                    transport_config.retry_config = Arc::new(CappedStreamRetry);
 
                     // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
                     if let Some(token) = resolve_upstream_auth(name, url, config).await? {
@@ -2995,6 +2996,26 @@ fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
+/// How long to wait before reopening an HTTP server's event stream.
+///
+/// rmcp's own policy doubles without a ceiling, so a server that was away for
+/// ten minutes is next tried after seventeen more, and after thirty-two tries
+/// the doubling overflows. This one doubles from one second and stops at a
+/// minute.
+#[derive(Debug)]
+struct CappedStreamRetry;
+
+impl CappedStreamRetry {
+    const LONGEST: Duration = Duration::from_secs(60);
+}
+
+impl rmcp::transport::common::client_side_sse::SseRetryPolicy for CappedStreamRetry {
+    fn retry(&self, current_times: usize) -> Option<Duration> {
+        let doubled = 1u64.checked_shl(current_times as u32).unwrap_or(u64::MAX);
+        Some(Duration::from_secs(doubled).min(Self::LONGEST))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -3011,6 +3032,17 @@ mod tests {
     use axum::{Json, Router};
 
     use super::*;
+
+    #[test]
+    fn the_wait_to_reopen_a_stream_doubles_and_stops_at_a_minute() {
+        use rmcp::transport::common::client_side_sse::SseRetryPolicy;
+        let policy = CappedStreamRetry;
+        assert_eq!(policy.retry(0), Some(Duration::from_secs(1)));
+        assert_eq!(policy.retry(3), Some(Duration::from_secs(8)));
+        assert_eq!(policy.retry(6), Some(Duration::from_secs(60)));
+        assert_eq!(policy.retry(64), Some(Duration::from_secs(60)));
+        assert_eq!(policy.retry(usize::MAX), Some(Duration::from_secs(60)));
+    }
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
 

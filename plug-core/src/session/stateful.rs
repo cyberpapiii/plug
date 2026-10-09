@@ -137,6 +137,45 @@ impl StatefulSessionStore {
         prune_expired_sessions(&self.sessions, self.timeout, self.expiry_tx.as_ref())
     }
 
+    /// Whether there is room for one more session, after dropping expired ones
+    /// and, when still full, the one that has been quiet the longest. A
+    /// session with an open stream, or one used in the last minute, is never
+    /// dropped. A client whose session went this way is taken back under the
+    /// same id the next time it calls.
+    fn make_room(&self) -> bool {
+        const QUIET_FOR: Duration = Duration::from_secs(60);
+        self.prune_expired_sessions();
+        if self.sessions.len() < self.max_sessions {
+            return true;
+        }
+        let quietest = self
+            .sessions
+            .iter()
+            .filter(|entry| {
+                entry
+                    .sse_sender
+                    .as_ref()
+                    .is_none_or(|sender| sender.is_closed())
+                    && entry.last_activity.elapsed() >= QUIET_FOR
+            })
+            .min_by_key(|entry| entry.last_activity)
+            .map(|entry| (entry.key().clone(), entry.last_activity));
+        let Some((session_id, seen)) = quietest else {
+            return false;
+        };
+        let removed = self
+            .sessions
+            .remove_if(&session_id, |_, state| state.last_activity == seen)
+            .is_some();
+        if removed {
+            tracing::info!(session = %session_id, "dropped the quietest session to make room");
+            if let Some(tx) = &self.expiry_tx {
+                let _ = tx.send(session_id);
+            }
+        }
+        self.sessions.len() < self.max_sessions
+    }
+
     fn enqueue_pending(entry: &mut SessionState, event: SseEvent) {
         const PENDING_LIMIT: usize = 32;
         if entry.pending_notifications.len() >= PENDING_LIMIT {
@@ -435,8 +474,7 @@ impl SessionStore for StatefulSessionStore {
             .admission_lock
             .lock()
             .expect("session admission mutex poisoned");
-        self.prune_expired_sessions();
-        if self.sessions.len() >= self.max_sessions {
+        if !self.make_room() {
             return Err(HttpError::TooManySessions);
         }
 
@@ -469,7 +507,7 @@ impl SessionStore for StatefulSessionStore {
         {
             return Err(HttpError::SessionNotFound);
         }
-        if self.sessions.len() >= self.max_sessions {
+        if !self.make_room() {
             return Err(HttpError::TooManySessions);
         }
         self.insert_new(session_id.to_owned());
@@ -883,6 +921,37 @@ mod tests {
             store.reopen_session(&uuid::Uuid::new_v4().to_string()),
             Err(HttpError::TooManySessions)
         ));
+    }
+
+    #[test]
+    fn a_full_store_drops_its_quietest_session_and_takes_it_back_later() {
+        let store = StatefulSessionStore::new(1800, 2);
+        let quiet_since = |id: &str, secs: u64| {
+            store.sessions.get_mut(id).unwrap().last_activity =
+                Instant::now() - Duration::from_secs(secs);
+        };
+        let quiet = store.create_session().unwrap();
+        let streaming = store.create_session().unwrap();
+        let (tx, _rx) = mpsc::channel(1);
+        store.set_sse_sender(&streaming, tx, None).unwrap();
+        quiet_since(&quiet, 90);
+        quiet_since(&streaming, 600);
+
+        // Full. The quiet one goes; the one with a stream open stays.
+        let newcomer = store.create_session().unwrap();
+        assert!(store.validate(&quiet).is_err());
+        assert!(store.validate(&streaming).is_ok());
+
+        // Nothing quiet enough is left, so the store is honestly full.
+        assert!(matches!(
+            store.create_session(),
+            Err(HttpError::TooManySessions)
+        ));
+
+        // The dropped client calls again and gets its session back.
+        quiet_since(&newcomer, 90);
+        assert!(store.reopen_session(&quiet).unwrap());
+        assert!(store.validate(&newcomer).is_err());
     }
 
     #[test]

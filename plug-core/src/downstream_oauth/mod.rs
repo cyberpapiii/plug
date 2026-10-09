@@ -771,6 +771,18 @@ impl DownstreamOauthManager {
     }
 
     fn ensure_durable(&self) -> Result<(), DownstreamOauthError> {
+        // What was uncertain is whether the directory entry reached the disk.
+        // Memory already matches the file, so a sync that now succeeds
+        // settles it, and nobody has to restart Plug to sign in again.
+        if self.durability_degraded()
+            && self
+                .state_path
+                .parent()
+                .is_some_and(|dir| sync_parent_dir(dir).is_ok())
+        {
+            self.durability_degraded.store(false, Ordering::SeqCst);
+            tracing::info!("downstream OAuth state is durable again");
+        }
         if self.durability_degraded() {
             Err(DownstreamOauthError::Persistence(
                 "downstream OAuth durability is uncertain; restart and reconcile persisted state"
@@ -4616,6 +4628,8 @@ mod tests {
                 .await,
             AccessTokenValidation::Invalid
         );
+        // While the directory still cannot be synced, nothing new is issued.
+        fail_next_parent_dir_sync_attempts_for_tests(1);
         assert!(matches!(
             manager
                 .exchange_refresh_token(
@@ -4626,6 +4640,9 @@ mod tests {
                 .await,
             Err(DownstreamOauthError::Persistence(_))
         ));
+        // Once it can, Plug recovers by itself.
+        assert!(manager.ensure_durable().is_ok());
+        assert!(!manager.durability_degraded());
         drop(manager);
 
         let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path)

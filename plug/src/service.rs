@@ -460,11 +460,10 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     let verified_app = crate::install::resolve_verified_app()?;
     match startup_action(verified_app.is_some(), state.ownership) {
         StartupAction::KickstartApp => {
-            launchctl(&[
-                "kickstart".into(),
-                "-k".into(),
-                format!("gui/{uid}/{LABEL}"),
-            ])?;
+            // No `-k`: a daemon that started a moment ago and has not taken
+            // the runtime lock yet would be killed in the middle of starting.
+            // Without it launchd starts the job only if it is not running.
+            launchctl(&["kickstart".into(), format!("gui/{uid}/{LABEL}")])?;
         }
         StartupAction::RepairCli => {
             if state.loaded {

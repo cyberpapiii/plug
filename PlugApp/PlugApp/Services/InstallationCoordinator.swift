@@ -9,6 +9,9 @@ enum ReconciliationTrigger: Equatable, Sendable {
     case explicitAdoption
     /// The coordinator's own follow-up after a command timed out.
     case automaticRetry
+    /// The coordinator's own later attempt after a failure it could not get
+    /// past, so nobody has to press Try Again.
+    case laterRetry
 }
 
 @MainActor
@@ -55,6 +58,7 @@ final class InstallationCoordinator {
     private let openURL: (URL) -> Void
     private let retryDelay: Duration
     private let transientRetryLimit: Int
+    private let laterRetryDelay: Duration?
     private let sleep: @Sendable (Duration) async -> Void
     private let logWriter: (URL, String) -> Void
     private var inFlight: Task<Void, Never>?
@@ -78,6 +82,7 @@ final class InstallationCoordinator {
         openURL: @escaping (URL) -> Void = { NSWorkspace.shared.open($0) },
         retryDelay: Duration = .seconds(5),
         transientRetryLimit: Int = 6,
+        laterRetryDelay: Duration? = nil,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
         logWriter: @escaping (URL, String) -> Void = ReconciliationLog.append
     ) {
@@ -90,6 +95,7 @@ final class InstallationCoordinator {
         self.openURL = openURL
         self.retryDelay = retryDelay
         self.transientRetryLimit = max(0, transientRetryLimit)
+        self.laterRetryDelay = laterRetryDelay
         self.sleep = sleep
         self.logWriter = logWriter
     }
@@ -103,6 +109,8 @@ final class InstallationCoordinator {
             transientFailures = 0
             scheduledRetry?.cancel()
             scheduledRetry = nil
+        } else if trigger == .laterRetry {
+            transientFailures = 0
         }
 
         if let inFlight {
@@ -156,7 +164,7 @@ final class InstallationCoordinator {
     private func shouldStart(trigger: ReconciliationTrigger) -> Bool {
         switch state {
         case .blocked:
-            return trigger == .retry || trigger == .explicitAdoption
+            return trigger == .retry || trigger == .explicitAdoption || trigger == .laterRetry
         case .adoptionRequired:
             return trigger == .explicitAdoption
         case .healthy, .reconcilingUpdate, .repairableDrift:
@@ -690,6 +698,7 @@ final class InstallationCoordinator {
                     logURL: logURL
                 )
             )
+            scheduleLaterRetry()
             return
         }
         log("timed out (attempt \(attempt) of \(transientRetryLimit)); retrying in \(retryDelay)")
@@ -702,6 +711,24 @@ final class InstallationCoordinator {
             await self.reconcile(trigger: .automaticRetry)
             // The slot stays occupied until the retry has actually finished,
             // and a newer retry scheduled from inside it keeps the slot.
+            if self.retryGeneration == generation {
+                self.scheduledRetry = nil
+            }
+        }
+    }
+
+    /// A failure that stopped the check is tried again later without being
+    /// asked: most are a slow login or a command that failed once. States
+    /// that wait on a person's decision never come through here.
+    private func scheduleLaterRetry() {
+        guard let laterRetryDelay else { return }
+        log("trying again in \(laterRetryDelay)")
+        retryGeneration += 1
+        let generation = retryGeneration
+        scheduledRetry = Task { @MainActor [weak self, sleep] in
+            await sleep(laterRetryDelay)
+            guard !Task.isCancelled, let self else { return }
+            await self.reconcile(trigger: .laterRetry)
             if self.retryGeneration == generation {
                 self.scheduledRetry = nil
             }
@@ -765,6 +792,7 @@ final class InstallationCoordinator {
                 logURL: logURL
             )
         )
+        scheduleLaterRetry()
     }
 
     /// The detail lands in the menu bar panel, so it has to read as a

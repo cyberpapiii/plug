@@ -156,7 +156,7 @@ final class AppModel {
 
     init(
         ipc: PlugIPCClient? = nil,
-        coordinator: any InstallationCoordinating = InstallationCoordinator(),
+        coordinator: (any InstallationCoordinating)? = nil,
         clientVersion: String = AppModel.defaultClientVersion,
         tokenURL: URL = PlugIPCClient.defaultTokenURL,
         appLinker: any AppLinking = AppLinkService(),
@@ -168,7 +168,9 @@ final class AppModel {
     ) {
         self.clientVersion = clientVersion
         self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
-        self.coordinator = coordinator
+        // Built here and not as the default argument: Swift 6.1 crashes
+        // compiling that call in a default argument.
+        self.coordinator = coordinator ?? InstallationCoordinator(laterRetryDelay: .seconds(300))
         self.tokenURL = tokenURL
         self.appLinker = appLinker
         self.foregroundPollInterval = foregroundPollInterval

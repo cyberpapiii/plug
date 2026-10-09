@@ -9,6 +9,17 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A call in flight while Plug renews a server's sign-in is answered. Renewing swapped the connection out from under the call, which came back as "disconnected before answering".
+- Servers are checked within ten seconds of the network coming back or changing, such as a new Wi-Fi network or a VPN. Each one used to wait out its own timer, up to a minute.
+- A tool call that runs longer than about a minute and a half through the tunnel is answered. The tunnel used to cut it off after a hundred seconds of silence, so Plug now keeps the reply open with a heartbeat.
+- A call made at the moment Plug restarts is sent to the new copy when it had not gone out yet. It used to come back as an error asking for a retry.
+- A full session list makes room by dropping the session that has been quiet longest, where a new client was refused.
+- Client sign-ins recover by themselves after a disk write problem clears. They used to stay refused until Plug restarted.
+- The live stream from a network server that went away is retried at most a minute apart. The wait used to double without limit, so a server gone for ten minutes was next tried seventeen minutes later.
+- Opening Plug while it is still starting its servers waits for it, where it was stopped and started again from scratch.
+- A setup check that fails is tried again five minutes later by itself, and a registration that fails once is tried a second time. Both used to wait for someone to press Try Again.
+- `plug start` no longer stops a copy of Plug that started a moment earlier.
+- Logs keep being written after a disk cleaner empties the log folder. Nothing was recorded until the next day.
 - A call is no longer sent twice when a server drops the connection before answering. Plug used to reconnect and send it again, so a message could go out twice. The caller is now told the server disconnected and the call may or may not have gone through. Calls a server marks as read-only or safe to repeat are still retried.
 - A local server that quits is noticed at once and started again. It could sit dead for up to a minute, until the next call failed.
 - Servers are checked right after the Mac wakes from sleep, where each one waited out its own timer, up to a minute.

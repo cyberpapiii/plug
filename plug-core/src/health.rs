@@ -408,15 +408,30 @@ fn slept_through(wall_elapsed: Duration) -> bool {
     wall_elapsed > WAKE_WATCH_TICK + Duration::from_secs(20)
 }
 
-/// Have every server checked the moment the Mac wakes. Connections that died
-/// while it slept are found and replaced at once instead of at each server's
-/// next tick or on the first call that fails.
+/// The address this Mac would reach the internet from, or `None` when it has
+/// no route out. Connecting a UDP socket picks the route and sends nothing.
+fn outbound_address() -> Option<std::net::IpAddr> {
+    let socket = std::net::UdpSocket::bind(("0.0.0.0", 0)).ok()?;
+    socket.connect(("1.1.1.1", 53)).ok()?;
+    Some(socket.local_addr().ok()?.ip())
+}
+
+/// Whether the network came back or moved: there is a way out now, and it is
+/// not the one there was a moment ago.
+fn network_changed(before: Option<std::net::IpAddr>, now: Option<std::net::IpAddr>) -> bool {
+    now.is_some() && now != before
+}
+
+/// Have every server checked the moment the Mac wakes or its network comes
+/// back. Connections that died in the meantime are found and replaced at once
+/// instead of at each server's next tick or on the first call that fails.
 pub fn spawn_wake_watch(
     server_manager: Arc<ServerManager>,
     cancel: CancellationToken,
     tracker: &TaskTracker,
 ) {
     tracker.spawn(async move {
+        let mut address = outbound_address();
         loop {
             let before = std::time::SystemTime::now();
             tokio::select! {
@@ -425,13 +440,18 @@ pub fn spawn_wake_watch(
                 _ = tokio::time::sleep(WAKE_WATCH_TICK) => {}
             }
             let wall_elapsed = before.elapsed().unwrap_or_default();
+            let address_now = outbound_address();
             if slept_through(wall_elapsed) {
                 tracing::info!(
                     asleep_secs = wall_elapsed.as_secs(),
                     "the Mac woke; checking every server now"
                 );
                 server_manager.check_servers_now();
+            } else if network_changed(address, address_now) {
+                tracing::info!("the network came back or changed; checking every server now");
+                server_manager.check_servers_now();
             }
+            address = address_now;
         }
     });
 }
@@ -539,6 +559,17 @@ mod tests {
             super::WAKE_WATCH_TICK + Duration::from_secs(5)
         ));
         assert!(super::slept_through(Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn a_network_that_returns_or_moves_is_a_change_and_one_that_leaves_is_not() {
+        let home = Some("192.168.1.5".parse().unwrap());
+        let cafe = Some("10.0.0.9".parse().unwrap());
+        assert!(super::network_changed(None, home));
+        assert!(super::network_changed(home, cafe));
+        assert!(!super::network_changed(home, home));
+        assert!(!super::network_changed(home, None));
+        assert!(!super::network_changed(None, None));
     }
 
     /// A server that failed to start must be retried without first waiting out a
