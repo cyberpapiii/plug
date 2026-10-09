@@ -499,6 +499,9 @@ pub(crate) async fn run_daemon_with_lock(
                     }
                     Err(e) => {
                         tracing::error!(error = %e, "failed to accept IPC connection");
+                        // Out of file handles is the usual cause, and it does
+                        // not clear by asking again at once.
+                        tokio::time::sleep(Duration::from_millis(100)).await;
                     }
                 }
             }

@@ -20,6 +20,7 @@ protocol DaemonServiceBackend: AnyObject {
     var enabled: Bool { get }
     func pauseConnectors() async -> [Int32]
     func resumeConnectors(_ pids: [Int32])
+    func resumeStrandedConnectors() async
     func bootOut(_ record: LaunchdJobRecord) async throws
     func unregisterAgent() async throws
     func registerAgent() throws
@@ -39,6 +40,7 @@ final class DaemonServiceManager {
     private let backend: any DaemonServiceBackend
     private let legacyPaths: Set<URL>
     private let retryLimit: Int
+    private var resumedStrandedConnectors = false
 
     init(
         appInspector: any AppInstallationInspecting = AppInstallationInspector(),
@@ -67,7 +69,13 @@ final class DaemonServiceManager {
         canonical: VerifiedAppInstallation,
         legacyPaths: Set<URL>
     ) async throws -> DaemonServiceSnapshot {
-        try await inspectWithHandshake(canonical: canonical, legacyPaths: legacyPaths).snapshot
+        if !resumedStrandedConnectors {
+            // An app that died in the middle of a swap left every connector
+            // stopped, and nothing else would ever wake them.
+            resumedStrandedConnectors = true
+            await backend.resumeStrandedConnectors()
+        }
+        return try await inspectWithHandshake(canonical: canonical, legacyPaths: legacyPaths).snapshot
     }
 
     func bootOutRecognizedLegacy(_ snapshot: DaemonServiceSnapshot) async throws {
@@ -492,6 +500,10 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
         for pid in pids { _ = kill(pid, SIGCONT) }
     }
 
+    func resumeStrandedConnectors() async {
+        resumeConnectors(DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()))
+    }
+
     func bootOut(_ record: LaunchdJobRecord) async throws {
         guard record.programURL != nil else { throw DaemonServiceError.invalidJobEvidence }
         switch try await probe.verify(record) {
@@ -583,6 +595,7 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
 }
 
 extension DaemonServiceBackend {
+    func resumeStrandedConnectors() async {}
     var backgroundItemAllowance: SystemAllowance { enabled ? .allowed : .notAsked }
 }
 

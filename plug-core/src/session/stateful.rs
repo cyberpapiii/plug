@@ -41,6 +41,9 @@ struct SessionState {
     grant: Option<String>,
     still_allowed: Option<crate::session::AccessCheck>,
     broadcast_audience: crate::session::BroadcastAudience,
+    /// Opened again under an id Plug had lost: the event ids the client
+    /// remembers were issued by the session that is gone.
+    reopened: bool,
 }
 
 impl SessionState {
@@ -106,6 +109,7 @@ impl StatefulSessionStore {
                 grant: None,
                 still_allowed: None,
                 broadcast_audience: crate::session::BroadcastAudience::default(),
+                reopened: false,
             },
         );
     }
@@ -469,6 +473,9 @@ impl SessionStore for StatefulSessionStore {
             return Err(HttpError::TooManySessions);
         }
         self.insert_new(session_id.to_owned());
+        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+            entry.reopened = true;
+        }
         Ok(true)
     }
 
@@ -496,6 +503,13 @@ impl SessionStore for StatefulSessionStore {
         entry.sse_sender = Some(sender);
         // Clone before mut borrow: send_replay_events may clear sse_sender on fail.
         let active_sender = entry.sse_sender.clone().expect("sse sender just installed");
+        // An id this session never issued says nothing about what the client
+        // has seen. Honouring it would hold back everything queued for it.
+        let last_event_id = if std::mem::take(&mut entry.reopened) {
+            None
+        } else {
+            last_event_id.filter(|id| *id < entry.next_event_id)
+        };
         Self::send_replay_events(&mut entry, &active_sender, last_event_id);
         Ok(())
     }
@@ -792,6 +806,42 @@ mod tests {
         // Already open: nothing to do, and nothing is replaced.
         assert!(!store.reopen_session(&lost).unwrap());
         assert_eq!(store.session_count(), 1);
+    }
+
+    #[test]
+    fn a_reopened_session_ignores_event_ids_it_never_issued() {
+        let store = StatefulSessionStore::new(1800, 10);
+        let lost = uuid::Uuid::new_v4().to_string();
+        assert!(store.reopen_session(&lost).unwrap());
+        let message = || SseMessage::from_json_value(serde_json::json!({"n": 1})).unwrap();
+        store.send_to_live_session(&lost, message());
+        store.send_to_live_session(&lost, message());
+
+        // The client remembers an id from the session Plug lost.
+        let (tx, mut rx) = mpsc::channel(8);
+        store.set_sse_sender(&lost, tx, Some(1)).unwrap();
+        assert_eq!(rx.try_recv().unwrap().id, 1);
+        assert_eq!(rx.try_recv().unwrap().id, 2);
+
+        // After that the ids are this session's own, and are honoured.
+        let (tx, mut rx) = mpsc::channel(8);
+        store.set_sse_sender(&lost, tx, Some(1)).unwrap();
+        assert_eq!(rx.try_recv().unwrap().id, 2);
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn an_event_id_from_the_future_is_treated_as_none() {
+        let store = StatefulSessionStore::new(1800, 10);
+        let id = store.create_session().unwrap();
+        store.send_to_live_session(
+            &id,
+            SseMessage::from_json_value(serde_json::json!({"n": 1})).unwrap(),
+        );
+
+        let (tx, mut rx) = mpsc::channel(8);
+        store.set_sse_sender(&id, tx, Some(500)).unwrap();
+        assert_eq!(rx.try_recv().unwrap().id, 1);
     }
 
     #[test]

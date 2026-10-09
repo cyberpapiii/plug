@@ -2192,23 +2192,45 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let result = engine
-        .tool_router()
-        .call_tool(
-            "Mock__echo",
-            Some(
-                serde_json::json!({"input": "recover"})
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-            ),
-        )
-        .await;
+    let call = || async {
+        engine
+            .tool_router()
+            .call_tool(
+                "Mock__echo",
+                Some(
+                    serde_json::json!({"input": "recover"})
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                ),
+            )
+            .await
+    };
+
+    // The server dies with the call in hand. The tool may have run, so the
+    // call is not sent a second time: the caller is told the outcome is
+    // unknown.
+    let dropped = call()
+        .await
+        .expect_err("a call the server died on is not re-sent");
     assert!(
-        result.is_ok(),
-        "tool call should recover after upstream restart: {result:?}"
+        dropped.message.contains("may or may not have completed"),
+        "unexpected error: {dropped:?}"
     );
-    let rendered = format!("{:?}", result.unwrap());
+
+    // The server is brought back without anyone asking, and the next call
+    // works.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(60);
+    let rendered = loop {
+        match call().await {
+            Ok(result) => break format!("{result:?}"),
+            Err(error) if tokio::time::Instant::now() < deadline => {
+                let _ = error;
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+            Err(error) => panic!("server did not come back: {error:?}"),
+        }
+    };
     assert!(
         rendered.contains("recover"),
         "unexpected result: {rendered}"

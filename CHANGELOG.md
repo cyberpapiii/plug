@@ -9,6 +9,18 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A call is no longer sent twice when a server drops the connection before answering. Plug used to reconnect and send it again, so a message could go out twice. The caller is now told the server disconnected and the call may or may not have gone through. Calls a server marks as read-only or safe to repeat are still retried.
+- A local server that quits is noticed at once and started again. It could sit dead for up to a minute, until the next call failed.
+- Servers are checked right after the Mac wakes from sleep, where each one waited out its own timer, up to a minute.
+- A server that fails to start after a config change keeps being retried, and one that needs a sign-in says so. It used to stay down until Plug restarted.
+- A server busy with a long call is no longer judged unresponsive and restarted in the middle of it.
+- Reading a resource or a prompt from a server that hangs gives up after the call timeout, where it waited forever.
+- A client in regular use keeps its sign-in. A registration ended ninety days after it was made no matter how often the client was used.
+- A client that reconnects after Plug restarted is told to read its tool list again, over the network and on this Mac, and gets the notices waiting for it. It could keep a stale list and miss every change after that.
+- Plug can hold 4096 open files, up from 256. With many servers and clients it could run out, and then nothing new could connect.
+- A Slack events secret that cannot be read leaves Slack events off and everything else working. It used to stop Plug from serving network clients at all.
+- Clients paused for an update are woken when Plug.app next opens, in case the app quit before it could wake them.
+- The log no longer warns every minute about a server that has no resources or prompts.
 - A client that was connected when Plug restarted, or that sat quiet for half an hour, is taken back the next time it calls. Plug used to answer "session not found" to every call from then on, and some clients, several Grok Bot bots among them, never recovered until they were set up again.
 - A client's page starts with everything you change about it: click its icon to pick another, click its name to rename it, and its switch, where it runs and whether it gets new servers sit right below. The Details, Settings and Connected Now sections are gone.
 - Plug sends a notification when a client signs in, and clicking it opens that client.

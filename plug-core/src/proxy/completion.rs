@@ -55,23 +55,48 @@ impl super::ToolRouter {
                 })
             })?;
 
-        let mut result = upstream
-            .client
-            .peer()
-            .read_resource(ReadResourceRequestParams::new(
-                skills::inward(&server_id, uri).into_owned(),
-            ))
-            .await
-            .map_err(|error| match error {
-                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                other => McpError::internal_error(other.to_string(), None),
-            })?;
+        let mut result = self
+            .bounded_read(
+                &server_id,
+                upstream.config.call_timeout_secs,
+                upstream
+                    .client
+                    .peer()
+                    .read_resource(ReadResourceRequestParams::new(
+                        skills::inward(&server_id, uri).into_owned(),
+                    )),
+            )
+            .await?;
         admit_catalog_meta(&mut result.meta, "resource-read-result");
         for contents in &mut result.contents {
             skills::outward_contents(&server_id, contents);
             admit_resource_contents_meta(contents);
         }
         Ok(result)
+    }
+
+    /// Wait for a read from a server no longer than a tool call may take, and
+    /// reconnect the server when its connection turns out to be gone. Reads
+    /// used to wait with no limit, so a server that took the request and
+    /// never answered held the client forever.
+    async fn bounded_read<T>(
+        &self,
+        server_id: &str,
+        timeout_secs: u64,
+        read: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+    ) -> Result<T, McpError> {
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+        match tokio::time::timeout(timeout, read).await {
+            Ok(Ok(result)) => Ok(result),
+            Ok(Err(rmcp::service::ServiceError::McpError(error))) => Err(error),
+            Ok(Err(error)) => {
+                if matches!(error, rmcp::service::ServiceError::TransportClosed) {
+                    self.reconnect_server_in_background(server_id.to_string());
+                }
+                Err(McpError::internal_error(error.to_string(), None))
+            }
+            Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: timeout })),
+        }
     }
 
     pub async fn get_prompt(
@@ -107,15 +132,13 @@ impl super::ToolRouter {
             request = request.with_arguments(arguments);
         }
 
-        let mut result = upstream
-            .client
-            .peer()
-            .get_prompt(request)
-            .await
-            .map_err(|error| match error {
-                rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                other => McpError::internal_error(other.to_string(), None),
-            })?;
+        let mut result = self
+            .bounded_read(
+                &server_id,
+                upstream.config.call_timeout_secs,
+                upstream.client.peer().get_prompt(request),
+            )
+            .await?;
         admit_catalog_meta(&mut result.meta, "prompt-result");
         for message in &mut result.messages {
             admit_content_block_meta(&mut message.content);

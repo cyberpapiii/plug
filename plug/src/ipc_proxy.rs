@@ -1089,7 +1089,31 @@ impl IpcProxyHandler {
             reconnectable: true,
         });
         Self::replay_session_state_locked(shared, conn).await;
+        Self::catch_the_host_up(shared);
         Ok(())
+    }
+
+    /// The daemon behind a fresh session may serve different servers than the
+    /// one the host last read from, and knows none of the host's roots. The
+    /// host is told to read its lists again and its roots are sent over. Runs
+    /// on its own task: the caller holds `shared.conn`, which the roots round
+    /// trip needs.
+    fn catch_the_host_up(shared: &SharedConnection) {
+        let (Some(shared), Some(peer)) = (shared.self_ref.upgrade(), shared.peer.get().cloned())
+        else {
+            return;
+        };
+        tokio::spawn(async move {
+            let _ = peer.notify_tool_list_changed().await;
+            let _ = peer.notify_resource_list_changed().await;
+            let _ = peer.notify_prompt_list_changed().await;
+            if shared
+                .roots_supported
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                refresh_roots_via_daemon(&shared, &peer).await;
+            }
+        });
     }
 
     /// Replay `ReplayState` onto a fresh session. Caller already holds

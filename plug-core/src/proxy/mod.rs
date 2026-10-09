@@ -3505,6 +3505,14 @@ impl ToolRouter {
 
             let server_id = server_id.clone();
             let original_name = original_name.to_string();
+            // A call that reached the server and lost its answer is sent
+            // again only when the tool says a second run does no harm.
+            let safe_to_repeat = cache
+                .tool_by_name(tool_name)
+                .and_then(|tool| tool.annotations.as_ref())
+                .is_some_and(|hints| {
+                    hints.read_only_hint == Some(true) || hints.idempotent_hint == Some(true)
+                });
             drop(cache);
 
             if enforce_lazy_visibility {
@@ -3611,6 +3619,27 @@ impl ToolRouter {
                     call_id,
                     armed: true,
                 });
+            }
+
+            // A server whose connection already ended (its process exited
+            // between calls) is reconnected before the call is sent. Nothing
+            // has left Plug yet, so this can never run a tool twice. A failed
+            // reconnect falls through to the ordinary unavailable error.
+            if !is_retry
+                && self
+                    .server_manager
+                    .get_upstream(&server_id)
+                    .is_some_and(|upstream| upstream.client.is_transport_closed())
+            {
+                tracing::info!(
+                    server = %server_id,
+                    tool = %original_name,
+                    call_id,
+                    "server connection had ended; reconnecting before the call"
+                );
+                if let Err(error) = self.reconnect_server_now(&server_id).await {
+                    tracing::warn!(server = %server_id, error = %error, "reconnect before the call failed");
+                }
             }
 
             // Reserve the downstream key before waiting for upstream
@@ -3821,6 +3850,28 @@ impl ToolRouter {
                         "proxy tool call round requires input"
                     );
                     Ok(CallToolResponse::InputRequired(response))
+                }
+                Err(e) if is_session_error(&e) && !(never_reached_server(&e) || safe_to_repeat) => {
+                    // The connection dropped after the call was sent. The
+                    // tool may have run, so Plug does not send it again: a
+                    // second message or a second record is worse than an
+                    // error. The server is reconnected for the next call.
+                    tracing::warn!(
+                        server = %server_id,
+                        tool = %original_name,
+                        call_id,
+                        trace_id = %trace_id,
+                        error = %e,
+                        "server connection dropped mid-call; not sending the call again"
+                    );
+                    finish(None, Some(false));
+                    self.reconnect_server_in_background(server_id.clone());
+                    Err(McpError::internal_error(
+                        format!(
+                            "{server_id} disconnected before answering. The call may or may not have completed; check before trying again."
+                        ),
+                        None,
+                    ))
                 }
                 Err(e)
                     if is_session_error(&e)
@@ -4376,6 +4427,21 @@ fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
         // Timeout = slow tool, not a server failure
         // Cancelled = task cancelled
         // UnexpectedResponse = wrong response type
+        _ => false,
+    }
+}
+
+/// Whether a session error proves the server never took the call: it refused
+/// the connection or no longer knew the session. A closed, reset, or broken
+/// connection proves nothing, since the call may have arrived first.
+fn never_reached_server(e: &rmcp::service::ServiceError) -> bool {
+    match e {
+        rmcp::service::ServiceError::TransportSend(error) => {
+            let msg = error.to_string().to_lowercase();
+            msg.contains("404")
+                || msg.contains("session not found")
+                || msg.contains("connection refused")
+        }
         _ => false,
     }
 }

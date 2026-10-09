@@ -1454,6 +1454,14 @@ fn is_session_error_transport_closed() {
 }
 
 #[test]
+fn a_closed_connection_does_not_prove_the_call_never_arrived() {
+    use rmcp::service::ServiceError;
+    // The server may have taken the call before the connection closed, so
+    // this alone never licenses sending a tool call a second time.
+    assert!(!never_reached_server(&ServiceError::TransportClosed));
+}
+
+#[test]
 fn is_session_error_mcp_error_not_session() {
     use rmcp::service::ServiceError;
     // Application-level MCP error should NOT trigger reconnect
