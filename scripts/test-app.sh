@@ -71,7 +71,9 @@ run_xcodebuild() {
   shift
   if ! xcodebuild "$@" >"$log" 2>&1; then
     echo "$label failed:" >&2
-    grep -E 'error:|failed \(|\*\* .* FAILED \*\*' "$log" | head -40 >&2 || true
+    # A crash or a hang fails the run without an `error:` line, so those are
+    # matched too; otherwise CI shows a failure with no reason.
+    grep -E 'error:|failed \(|\*\* .* FAILED \*\*|[Cc]rashed|Restarting after|encountered an error|Fatal error|recorded an issue' "$log" | head -40 >&2 || true
     echo "full log: $log" >&2
     trap - EXIT
     exit 1
