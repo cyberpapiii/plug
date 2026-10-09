@@ -3702,7 +3702,10 @@ impl ToolRouter {
             let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
             let transport_type = upstream.config.transport.clone();
             let peer = upstream.client.peer().clone();
-            drop(upstream);
+            // Held until the call is answered. A server replaced meanwhile,
+            // as a token refresh does, retires its old connection at once
+            // when nothing else holds it, which cut this call off.
+            let _held_through_the_call = upstream;
 
             let mut options = PeerRequestOptions::default();
             options.timeout = Some(timeout_duration);

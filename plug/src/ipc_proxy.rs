@@ -372,6 +372,7 @@ impl DaemonMux {
         let payload = ipc::encode_tagged(ipc_id, request).map_err(|e| TransportFailure {
             message: format!("failed to encode IPC request: {e}"),
             reconnectable: false,
+            never_sent: false,
         })?;
         if payload.len() > ipc::MAX_FRAME_SIZE as usize {
             return Err(TransportFailure {
@@ -381,6 +382,7 @@ impl DaemonMux {
                     ipc::MAX_FRAME_SIZE
                 ),
                 reconnectable: false,
+                never_sent: false,
             });
         }
 
@@ -391,6 +393,7 @@ impl DaemonMux {
                 return Err(TransportFailure {
                     message: reason.clone(),
                     reconnectable: true,
+                    never_sent: true,
                 });
             }
             if state.pending.is_empty() {
@@ -403,6 +406,7 @@ impl DaemonMux {
             self.close(TransportFailure {
                 message: "IPC write failed: connection writer stopped".to_string(),
                 reconnectable: true,
+                never_sent: false,
             });
         }
 
@@ -416,6 +420,7 @@ impl DaemonMux {
                     return Err(TransportFailure {
                         message: "daemon connection closed".to_string(),
                         reconnectable: true,
+                        never_sent: false,
                     });
                 }
                 Err(_elapsed) => {
@@ -432,6 +437,7 @@ impl DaemonMux {
                                 self.ceiling.as_secs()
                             ),
                             reconnectable: false,
+                            never_sent: false,
                         });
                     }
                     if now < self.last_activity().max(started) + watchdog {
@@ -447,6 +453,7 @@ impl DaemonMux {
                             watchdog.as_secs()
                         ),
                         reconnectable: true,
+                        never_sent: false,
                     };
                     self.close(failure.clone());
                     return Err(failure);
@@ -498,6 +505,7 @@ impl DaemonMux {
                     break TransportFailure {
                         message: "daemon closed connection".to_string(),
                         reconnectable: true,
+                        never_sent: false,
                     };
                 }
                 Err(error) => break IpcProxyHandler::transport_failure("IPC read failed", error),
@@ -587,6 +595,7 @@ fn decode_daemon_frame(
         serde_json::from_slice(frame).map_err(|e| TransportFailure {
             message: format!("invalid envelope message: {e}"),
             reconnectable: false,
+            never_sent: false,
         })?;
     match daemon_msg {
         // Never sent by the current daemon; decoded for tolerance.
@@ -602,6 +611,7 @@ fn decode_daemon_frame(
             let invalid = |message: String| TransportFailure {
                 message,
                 reconnectable: false,
+                never_sent: false,
             };
             if chunk_count == 0 {
                 *chunks = ChunkAssembler::default();
@@ -640,6 +650,7 @@ fn decode_reply(bytes: &[u8], context: &str) -> Result<DaemonFrame, TransportFai
     let response = serde_json::from_slice(bytes).map_err(|e| TransportFailure {
         message: format!("{context}: {e}"),
         reconnectable: false,
+        never_sent: false,
     })?;
     Ok(DaemonFrame::Reply {
         ipc_id: ipc::FrameIds::peek(bytes).ipc_id,
@@ -760,6 +771,9 @@ enum RetryPolicy {
 struct TransportFailure {
     message: String,
     reconnectable: bool,
+    /// The request never reached the wire, so sending it again cannot run it
+    /// twice.
+    never_sent: bool,
 }
 
 impl IpcProxyHandler {
@@ -952,6 +966,13 @@ impl IpcProxyHandler {
             Err(failure) if failure.reconnectable => {
                 tracing::warn!(error = %failure.message, "daemon IPC connection lost; reconnecting");
                 let (session_id, mux) = Self::reconnect_after(shared, &mux).await?;
+                // A request that found the connection already closed was
+                // never written, so it is sent now whatever its policy.
+                let retry_policy = if failure.never_sent {
+                    RetryPolicy::SafeToRetry
+                } else {
+                    retry_policy
+                };
                 match retry_policy {
                     RetryPolicy::SafeToRetry => mux
                         .round_trip(&build_request(&session_id))
@@ -1087,6 +1108,7 @@ impl IpcProxyHandler {
         replaced.mux.close(TransportFailure {
             message: "daemon session replaced by reconnect".to_string(),
             reconnectable: true,
+            never_sent: false,
         });
         Self::replay_session_state_locked(shared, conn).await;
         Self::catch_the_host_up(shared);
@@ -1191,6 +1213,7 @@ impl IpcProxyHandler {
         TransportFailure {
             message: format!("{context}: {error}"),
             reconnectable,
+            never_sent: false,
         }
     }
 }
@@ -4240,6 +4263,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_call_that_was_never_sent_is_sent_after_the_reconnect() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("retry-never-sent");
+        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let listener = bind_fake_daemon_socket();
+        let daemon_task = tokio::spawn(async move {
+            let (stream1, _) = listener.accept().await.expect("accept 1");
+            let _first = fake_daemon_handshake(stream1, "fake-session-1").await;
+
+            let (stream2, _) = listener.accept().await.expect("accept 2");
+            let (mut reader2, mut writer2, _seen2) =
+                fake_daemon_handshake(stream2, "fake-session-2").await;
+            let frame = ipc::read_frame(&mut reader2)
+                .await
+                .expect("read the request")
+                .expect("connection open");
+            let req: IpcRequest = serde_json::from_slice(&frame).expect("parse the request");
+            assert!(matches!(req, IpcRequest::Ping { .. }));
+            ipc::send_response(&mut writer2, &IpcResponse::Pong)
+                .await
+                .expect("send pong");
+        });
+
+        let session = crate::runtime::establish_daemon_proxy_session(
+            None,
+            "client-retry-never-sent".to_string(),
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
+        let proxy = IpcProxyHandler::new(session, None);
+        proxy.heartbeat.abort();
+
+        // The connection is known dead before the request is made.
+        let mux = Arc::clone(&proxy.shared.conn.lock().await.mux);
+        mux.close(TransportFailure {
+            message: "daemon connection closed".to_string(),
+            reconnectable: true,
+            never_sent: false,
+        });
+
+        let response = proxy
+            .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| IpcRequest::Ping {
+                session_id: session_id.to_string(),
+            })
+            .await
+            .expect("a request that never left is sent on the new connection");
+        assert!(matches!(response, IpcResponse::Pong));
+
+        daemon_task.await.expect("daemon task join");
+
+        clear_test_runtime_paths();
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    #[tokio::test]
     async fn retry_policy_unsafe_surfaces_retry_error() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("retry-unsafe");
@@ -4248,7 +4328,11 @@ mod tests {
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream1, _) = listener.accept().await.expect("accept 1");
-            let (reader1, writer1, _seen1) = fake_daemon_handshake(stream1, "fake-session-1").await;
+            let (mut reader1, writer1, _seen1) =
+                fake_daemon_handshake(stream1, "fake-session-1").await;
+            // Take the request before dropping the connection, so it was
+            // really sent and may have run.
+            let _ = ipc::read_frame(&mut reader1).await;
             drop(reader1);
             drop(writer1);
 
@@ -4668,6 +4752,7 @@ mod tests {
         mux.writes_failed(&TransportFailure {
             message: "IPC write failed: broken pipe".to_string(),
             reconnectable: true,
+            never_sent: false,
         });
         ipc::send_chunked_response_with_id(&mut daemon_writer, ipc_id, &IpcResponse::Pong)
             .await

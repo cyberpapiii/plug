@@ -201,6 +201,19 @@ final class DaemonServiceManager {
             {
                 return handshake
             }
+            // The registration is right and nothing answered: a daemon still
+            // starting its servers has no socket yet, and one that stopped
+            // only needs starting. Replacing it here would kill the first and
+            // is more than the second needs.
+            if inspection.handshake == nil {
+                try? await backend.kickstartAgent()
+                let (proven, _) = try await awaitProof(
+                    canonical: canonical,
+                    expectedVersion: expectedVersion,
+                    inspectionPaths: legacyPaths
+                )
+                if let proven { return proven }
+            }
             return try await replaceAppOwned(
                 snapshot: inspection.snapshot,
                 record: record,
@@ -372,7 +385,18 @@ final class DaemonServiceManager {
             }
             if backend.enabled { try await backend.unregisterAgent() }
         }
-        if !backend.enabled { try backend.registerAgent() }
+        if !backend.enabled {
+            do {
+                try backend.registerAgent()
+            } catch {
+                // The old registration is already gone, so a failure here
+                // leaves no daemon at all. The system is sometimes still
+                // settling from the unregister; a second try a moment later
+                // gets past that.
+                await backend.waitBeforeRetry()
+                try backend.registerAgent()
+            }
+        }
         guard backend.enabled else { throw DaemonServiceError.registrationDisabled }
 
         // Starting every configured upstream can take tens of seconds. A
@@ -381,6 +405,25 @@ final class DaemonServiceManager {
         // restart cycle. Start exactly once, then give the same process a
         // bounded window to prove its version and executable.
         try await backend.kickstartAgent()
+        let (proven, actualVersion) = try await awaitProof(
+            canonical: canonical,
+            expectedVersion: expectedVersion,
+            inspectionPaths: inspectionPaths
+        )
+        if let proven { return proven }
+        throw DaemonServiceError.verificationFailed(
+            expectedVersion: expectedVersion,
+            actualVersion: actualVersion
+        )
+    }
+
+    /// Gives the running daemon a bounded window to prove its version and
+    /// executable. Returns the last version it reported when it never does.
+    private func awaitProof(
+        canonical: VerifiedAppInstallation,
+        expectedVersion: String,
+        inspectionPaths: Set<URL>
+    ) async throws -> (OperatorHandshake?, String?) {
         var actualVersion: String?
         for _ in 0..<retryLimit {
             await backend.waitBeforeRetry()
@@ -398,13 +441,10 @@ final class DaemonServiceManager {
                    expectedVersion: expectedVersion
                )
             {
-                return handshake
+                return (handshake, actualVersion)
             }
         }
-        throw DaemonServiceError.verificationFailed(
-            expectedVersion: expectedVersion,
-            actualVersion: actualVersion
-        )
+        return (nil, actualVersion)
     }
 
     private func replaceAppOwned(

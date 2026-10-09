@@ -1862,35 +1862,27 @@ async fn handle_request(
                     serde_json::json!({}),
                 );
             }
-            let response_msg =
-                match crate::dispatch::dispatch_tools_call(&state.router, &ctx, params).await {
-                    Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
-                        ServerJsonRpcMessage::response(
-                            ServerResult::CallToolResult(result),
-                            request_id,
-                        )
-                    }
-                    Ok(crate::dispatch::ToolCallOutcome::InputRequired(result)) => {
-                        ServerJsonRpcMessage::response(
-                            ServerResult::InputRequiredResult(result),
-                            request_id,
-                        )
-                    }
-                    Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
-                        let result = if modern_tasks {
-                            ServerResult::CreateTaskResult(rmcp::model::CreateTaskResult::new(
-                                (&result.task).into(),
-                            ))
-                        } else {
-                            ServerResult::CustomResult(CustomResult::new(
-                                serde_json::to_value(result)
-                                    .expect("legacy task result serializes"),
-                            ))
-                        };
-                        ServerJsonRpcMessage::response(result, request_id)
-                    }
-                    Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
+            // A call through a tunnel dies if nothing is sent for too long.
+            // A client that reads event streams gets one once the call runs
+            // long, kept open until the answer is ready.
+            if !modern
+                && headers
+                    .get(header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|accept| accept.contains("text/event-stream"))
+            {
+                let router = Arc::clone(&state.router);
+                let call = async move {
+                    let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params).await;
+                    tool_call_message(outcome, request_id, false)
                 };
+                return answer_or_keep_open(call, LONG_CALL_AFTER).await;
+            }
+            let response_msg = tool_call_message(
+                crate::dispatch::dispatch_tools_call(&state.router, &ctx, params).await,
+                request_id,
+                modern_tasks,
+            );
             cancellation_guard.disarm();
             if let Some(receiver) = modern_notifications.as_mut() {
                 let notifications = drain_targeted_notifications(receiver, &downstream_target);
@@ -2853,6 +2845,79 @@ fn drain_targeted_notifications(
         }
     }
     notifications
+}
+
+/// How long a legacy tool call may run before its reply becomes an event
+/// stream. Tunnels and proxies drop a request that is silent for about a
+/// hundred seconds.
+const LONG_CALL_AFTER: Duration = Duration::from_secs(45);
+
+/// How often a held-open reply says it is still there.
+const LONG_CALL_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+fn tool_call_message(
+    outcome: Result<crate::dispatch::ToolCallOutcome, McpError>,
+    request_id: RequestId,
+    modern_tasks: bool,
+) -> ServerJsonRpcMessage {
+    match outcome {
+        Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
+            ServerJsonRpcMessage::response(ServerResult::CallToolResult(result), request_id)
+        }
+        Ok(crate::dispatch::ToolCallOutcome::InputRequired(result)) => {
+            ServerJsonRpcMessage::response(ServerResult::InputRequiredResult(result), request_id)
+        }
+        Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
+            let result = if modern_tasks {
+                ServerResult::CreateTaskResult(rmcp::model::CreateTaskResult::new(
+                    (&result.task).into(),
+                ))
+            } else {
+                ServerResult::CustomResult(CustomResult::new(
+                    serde_json::to_value(result).expect("legacy task result serializes"),
+                ))
+            };
+            ServerJsonRpcMessage::response(result, request_id)
+        }
+        Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
+    }
+}
+
+/// Answer a legacy request with plain JSON when it finishes within `patience`.
+/// Past that the reply becomes an event stream that carries keep-alives until
+/// the one message is ready, so nothing between Plug and the client gives up
+/// on a call that is still running.
+async fn answer_or_keep_open(
+    call: impl Future<Output = ServerJsonRpcMessage> + Send + 'static,
+    patience: Duration,
+) -> Result<Response, HttpError> {
+    use axum::response::sse::{Event, KeepAlive, Sse};
+
+    let mut call = Box::pin(call);
+    tokio::select! {
+        message = &mut call => return json_response(&message),
+        _ = tokio::time::sleep(patience) => {}
+    }
+    let stream = futures::stream::once(async move {
+        let message = call.await;
+        let mut value = serde_json::to_value(&message).unwrap_or(serde_json::Value::Null);
+        crate::protocol::rewrite_legacy_response(&mut value, false);
+        Ok::<Event, Infallible>(Event::default().data(value.to_string()))
+    });
+    let mut response = Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(LONG_CALL_KEEP_ALIVE))
+        .into_response();
+    response
+        .headers_mut()
+        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    response
+        .headers_mut()
+        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response.headers_mut().insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 
 /// Return modern server notifications and the final JSON-RPC response on one
@@ -4888,6 +4953,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    async fn pong(after: Duration) -> ServerJsonRpcMessage {
+        tokio::time::sleep(after).await;
+        ServerJsonRpcMessage::response(
+            ServerResult::EmptyResult(EmptyObject {}),
+            RequestId::Number(7),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_quick_call_is_answered_with_plain_json() {
+        let resp = answer_or_keep_open(pong(Duration::from_secs(1)), LONG_CALL_AFTER)
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "application/json");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_long_call_is_held_open_and_still_answered() {
+        let resp = answer_or_keep_open(pong(Duration::from_secs(600)), LONG_CALL_AFTER)
+            .await
+            .unwrap();
+        assert_eq!(resp.headers()[header::CONTENT_TYPE], "text/event-stream");
+        let body = axum::body::to_bytes(resp.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        // Keep-alives while it ran, then the one answer.
+        assert!(body.matches(":\n").count() >= 30, "{body}");
+        assert!(
+            body.contains("data: {") && body.contains("\"id\":7"),
+            "{body}"
+        );
     }
 
     #[tokio::test]

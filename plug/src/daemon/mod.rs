@@ -2562,7 +2562,7 @@ pub fn setup_file_logging(
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     ensure_dir(log_directory)?;
 
-    let file_appender = daily_log_appender(log_directory)?;
+    let file_appender = ReopeningLog::open(log_directory, LOG_FILE_CHECK_EVERY)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
     let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
@@ -2591,6 +2591,67 @@ fn daily_log_appender(
         .filename_prefix("plug.log")
         .max_log_files(LOG_FILES_KEPT)
         .build(log_directory)?)
+}
+
+/// How often the log writer checks that its file is still on disk.
+const LOG_FILE_CHECK_EVERY: Duration = Duration::from_secs(30);
+
+/// The daily log, reopened when its file is deleted underneath it.
+///
+/// A disk cleaner that empties the log folder leaves the daemon writing to a
+/// file that no longer has a name, so nothing it logs can be read until the
+/// next midnight rollover. This notices within [`LOG_FILE_CHECK_EVERY`] and
+/// starts a new file.
+struct ReopeningLog {
+    directory: std::path::PathBuf,
+    appender: tracing_appender::rolling::RollingFileAppender,
+    check_every: Duration,
+    checked: std::time::Instant,
+}
+
+impl ReopeningLog {
+    fn open(directory: &std::path::Path, check_every: Duration) -> anyhow::Result<Self> {
+        Ok(Self {
+            directory: directory.to_path_buf(),
+            appender: daily_log_appender(directory)?,
+            check_every,
+            checked: std::time::Instant::now(),
+        })
+    }
+
+    fn has_a_file(&self) -> bool {
+        std::fs::read_dir(&self.directory).is_ok_and(|entries| {
+            entries
+                .flatten()
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("plug.log"))
+        })
+    }
+
+    fn reopen_if_deleted(&mut self) {
+        if self.checked.elapsed() < self.check_every {
+            return;
+        }
+        self.checked = std::time::Instant::now();
+        if self.has_a_file() {
+            return;
+        }
+        if ensure_dir(&self.directory).is_ok()
+            && let Ok(appender) = daily_log_appender(&self.directory)
+        {
+            self.appender = appender;
+        }
+    }
+}
+
+impl std::io::Write for ReopeningLog {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.reopen_if_deleted();
+        self.appender.write(buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.appender.flush()
+    }
 }
 
 // ──────────────────────── Client helpers ──────────────────────────────────────
@@ -2660,6 +2721,28 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_log_starts_a_new_file_when_its_folder_is_emptied() {
+        use std::io::Write;
+        let dir = std::env::temp_dir().join(format!("plug-log-reopen-{}", uuid::Uuid::new_v4()));
+        let mut log = ReopeningLog::open(&dir, Duration::ZERO).expect("open the log");
+        log.write_all(b"before\n").expect("write");
+        log.flush().expect("flush");
+
+        std::fs::remove_dir_all(&dir).expect("empty the log folder");
+        log.write_all(b"after\n").expect("write");
+        log.flush().expect("flush");
+
+        let file = std::fs::read_dir(&dir)
+            .expect("the folder is back")
+            .flatten()
+            .next()
+            .expect("a new log file");
+        let text = std::fs::read_to_string(file.path()).expect("read the new file");
+        assert_eq!(text, "after\n");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     /// One server advertising a large icon can outweigh every other server in
     /// the snapshot, and the snapshot is polled every couple of seconds.

@@ -552,6 +552,50 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(calls, 3, "two timeouts, then one pass with nothing to change")
     }
 
+    func testAFailedCheckIsTriedAgainLaterWithoutBeingAsked() async {
+        let events = EventLog()
+        let current = LaunchdJobRecord(
+            label: "com.plug.daemon",
+            programURL: canonical.executableURL,
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: canonical.buildVersion,
+            loaded: true
+        )
+        let service = DaemonServiceSnapshot(
+            ownership: .appManagedCurrent(current),
+            daemonVersion: canonical.appVersion,
+            daemonExecutable: canonical.executableURL
+        )
+        let app = FlakyAppInspector(
+            events: events,
+            failures: 1,
+            error: TestFailure.operational,
+            value: canonical
+        )
+        let coordinator = InstallationCoordinator(
+            appInspector: app,
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events, inspections: [service]),
+            openURL: { _ in },
+            laterRetryDelay: .zero,
+            sleep: { _ in },
+            logWriter: { _, _ in }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+        guard case .blocked = coordinator.state else {
+            return XCTFail("Expected blocked state, got \(coordinator.state)")
+        }
+        while let retry = coordinator.scheduledRetry {
+            await retry.value
+        }
+
+        guard case .healthy = coordinator.state else {
+            return XCTFail("Expected healthy state after the later retry, got \(coordinator.state)")
+        }
+    }
+
     func testTimeoutsBeyondTheBudgetBlockWithAReadableDetailAndALog() async throws {
         let events = EventLog()
         let logURL = FileManager.default.temporaryDirectory

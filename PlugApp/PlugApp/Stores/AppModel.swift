@@ -156,7 +156,7 @@ final class AppModel {
 
     init(
         ipc: PlugIPCClient? = nil,
-        coordinator: any InstallationCoordinating = InstallationCoordinator(),
+        coordinator: any InstallationCoordinating = InstallationCoordinator(laterRetryDelay: .seconds(300)),
         clientVersion: String = AppModel.defaultClientVersion,
         tokenURL: URL = PlugIPCClient.defaultTokenURL,
         appLinker: any AppLinking = AppLinkService(),
