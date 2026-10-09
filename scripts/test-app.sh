@@ -74,6 +74,8 @@ run_xcodebuild() {
     # A crash or a hang fails the run without an `error:` line, so those are
     # matched too; otherwise CI shows a failure with no reason.
     grep -E 'error:|failed \(|\*\* .* FAILED \*\*|[Cc]rashed|Restarting after|encountered an error|Fatal error|recorded an issue' "$log" | head -40 >&2 || true
+    # A compiler crash prints a stack dump and no `error:` line.
+    grep -E -A25 'Stack dump|Please submit a bug report|error: |fatal error|Segmentation|Abort trap|unable to|cannot ' "$log" | cut -c1-600 | head -80 >&2 || true
     # Some failures match none of those, so the end of the log is shown too.
     grep -vE '^[[:space:]]*$|^Test Case .* (started|passed)' "$log" | tail -40 >&2 || true
     echo "full log: $log" >&2
