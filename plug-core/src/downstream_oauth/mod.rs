@@ -1689,6 +1689,14 @@ impl DownstreamOauthManager {
             resource,
             &refresh.family_id,
         );
+        // A client in use keeps its registration. It used to run out ninety
+        // days after the owner last approved it, however often it was used,
+        // and the client then needed the owner to sign it in again.
+        if let Some(client) = next.clients.get_mut(client_id) {
+            let now = epoch_secs();
+            client.last_used_at = Some(now);
+            client.expires_at = now + REGISTRATION_LIFETIME_SECS;
+        }
         self.commit_state(&mut guard, next)?;
         // What is open under this sign-in lasts as long as the new pair.
         if let Some(sign_in) = self.family_ended.get(&refresh.family_id) {
@@ -4305,6 +4313,33 @@ mod tests {
             sign_in.until.load(Ordering::SeqCst) >= epoch_secs() + REFRESH_TOKEN_LIFETIME_SECS - 5
         );
         assert!(open.principal_lifecycle.is_active());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_client_in_use_keeps_its_registration() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let refresh = tokens.refresh_token.expect("refresh token");
+        // Eighty-nine days after the owner approved it.
+        let nearly_out = epoch_secs() + 24 * 3600;
+        manager
+            .state
+            .lock()
+            .await
+            .clients
+            .get_mut(&client.client_id)
+            .expect("registered client")
+            .expires_at = nearly_out;
+
+        manager
+            .exchange_refresh_token(&client.client_id, &refresh, "https://plug.example.com/mcp")
+            .await
+            .expect("renews");
+
+        let state = manager.state.lock().await;
+        let expires_at = state.clients[&client.client_id].expires_at;
+        assert!(expires_at >= epoch_secs() + REGISTRATION_LIFETIME_SECS - 5);
     }
 
     #[tokio::test(flavor = "current_thread")]

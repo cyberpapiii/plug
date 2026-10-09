@@ -752,34 +752,39 @@ fn build_configured_http_runtime(
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
 
-    let slack_events = if let Some(event_config) = &config.http.slack_events {
-        let oauth = downstream_oauth
-            .clone()
-            .ok_or_else(|| anyhow::anyhow!("Slack events require OAuth"))?;
-        let secret = plug_core::slack_events::credentials::SigningCredential::new(
-            &event_config.team_id,
-            &event_config.app_id,
-        )?
-        .load(&plug_core::slack_events::credentials::KeychainSigningSecrets)?;
-        let key = plug_core::slack_events::state_key(event_config)?;
-        let events = plug_core::slack_events::SlackEvents::open(
-            event_config.clone(),
-            secret,
-            &plug_core::config::config_dir()
-                .join("slack-events")
-                .join(key),
-            Arc::new(plug_core::slack_events::RuntimeAccess::new(
-                engine,
-                oauth,
+    // Slack events are one feature among many: a secret that cannot be read
+    // or state that cannot be opened leaves them off, and everything else on.
+    let slack_events = config.http.slack_events.as_ref().and_then(|event_config| {
+        let open = || -> anyhow::Result<_> {
+            let oauth = downstream_oauth
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("Slack events require OAuth"))?;
+            let secret = plug_core::slack_events::credentials::SigningCredential::new(
+                &event_config.team_id,
+                &event_config.app_id,
+            )?
+            .load(&plug_core::slack_events::credentials::KeychainSigningSecrets)?;
+            let key = plug_core::slack_events::state_key(event_config)?;
+            plug_core::slack_events::SlackEvents::open(
                 event_config.clone(),
-            )),
-            Arc::new(plug_core::slack_events::HttpsDelivery),
-        )?;
+                secret,
+                &plug_core::config::config_dir()
+                    .join("slack-events")
+                    .join(key),
+                Arc::new(plug_core::slack_events::RuntimeAccess::new(
+                    engine,
+                    oauth,
+                    event_config.clone(),
+                )),
+                Arc::new(plug_core::slack_events::HttpsDelivery),
+            )
+        };
+        let events = open()
+            .inspect_err(|error| tracing::error!(%error, "Slack events unavailable"))
+            .ok()?;
         events.spawn(engine.cancel_token().clone());
         Some(events)
-    } else {
-        None
-    };
+    });
 
     // Opened whenever OAuth is on, so a watch added by a reload needs no restart.
     // A watch is a convenience: failing to open its state must not stop Plug.

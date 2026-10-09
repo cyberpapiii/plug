@@ -312,10 +312,17 @@ pub async fn apply_reload(
                 }
             }
             Err(error) => {
-                if action.config.auth.as_deref() == Some("oauth") {
-                    server_manager.mark_auth_required(&action.name);
-                } else {
-                    server_manager.mark_start_failure(&action.name);
+                // Only a real sign-in failure asks the owner to sign in; a
+                // network failure on a server that signs in is retried like
+                // any other. Either way the server gets its health task, so
+                // one that could not start during the reload is retried.
+                server_manager.record_start_failure(
+                    &action.name,
+                    &action.config,
+                    &anyhow::anyhow!("{error}"),
+                );
+                if action.config.enabled {
+                    spawn_after_swap.push((action.name.clone(), action.config.clone()));
                 }
                 let verb = match action.kind {
                     ReloadStartKind::Restart => "restart",

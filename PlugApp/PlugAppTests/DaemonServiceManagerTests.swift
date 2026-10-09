@@ -292,6 +292,21 @@ final class DaemonServiceManagerTests: XCTestCase {
         XCTAssertEqual(snapshot.daemonExecutable, handshakeExecutable)
     }
 
+    func testConnectorsAnEarlierAppLeftStoppedAreWokenOnce() async throws {
+        let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
+        let inspector = SequenceLaunchdInspector([.appManagedCurrent(current), .appManagedCurrent(current)])
+        let backend = FakeDaemonBackend(
+            enabled: true,
+            handshakes: [handshake("0.7.0"), handshake("0.7.0")]
+        )
+        let manager = makeManager(inspector: inspector, backend: backend)
+
+        _ = try await manager.inspect(canonical: canonical, legacyPaths: [])
+        _ = try await manager.inspect(canonical: canonical, legacyPaths: [])
+
+        XCTAssertEqual(backend.strandedResumes, 1)
+    }
+
     func testUnknownJobIsRefusedWithoutBootoutOrRegistration() async throws {
         let unknown = record(label: "com.plug.daemon", path: "/tmp/not-plug", build: nil)
         let inspector = SequenceLaunchdInspector([.unknown([unknown])])
@@ -489,6 +504,7 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
 
     var enabled: Bool
     var events: [Event] = []
+    var strandedResumes = 0
     var registerError: Error?
     private var handshakes: [OperatorHandshake]
     private var handshakeFailures: [Error]
@@ -510,6 +526,10 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
 
     func resumeConnectors(_ pids: [Int32]) {
         events.append(.resume(pids))
+    }
+
+    func resumeStrandedConnectors() async {
+        strandedResumes += 1
     }
 
     func bootOut(_ record: LaunchdJobRecord) async throws {

@@ -1287,6 +1287,10 @@ pub struct ServerManager {
     shutdown_signal: tokio::sync::watch::Sender<bool>,
     /// Live, reloadable safety gate for modern upstream negotiation.
     modern_upstream_gate_state: AtomicU64,
+    /// Wakes every health task and every waiting recovery at once. Signalled
+    /// when a server's process stops and when the Mac wakes or its network
+    /// changes, the moments a wait until the next tick is wasted time.
+    check_now: Arc<tokio::sync::Notify>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1321,7 +1325,12 @@ impl ServerManager {
         }
     }
 
-    fn record_start_failure(&self, name: &str, config: &ServerConfig, error: &anyhow::Error) {
+    pub(crate) fn record_start_failure(
+        &self,
+        name: &str,
+        config: &ServerConfig,
+        error: &anyhow::Error,
+    ) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
         if config.auth.as_deref() == Some("oauth")
@@ -1353,6 +1362,7 @@ impl ServerManager {
             tool_router: std::sync::RwLock::new(None),
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             shutdown_signal,
+            check_now: Arc::new(tokio::sync::Notify::new()),
             modern_upstream_gate_state: AtomicU64::new(0),
         }
     }
@@ -1776,7 +1786,14 @@ impl ServerManager {
                             .map_err(|e| spawn_error(command, &e, path_source))?;
                     let child_pid = transport.id();
                     let stderr_tail = stderr.map(|stderr| {
-                        StderrTail::capture(name, stderr, failure::config_secrets(config))
+                        StderrTail::capture(
+                            name,
+                            stderr,
+                            failure::config_secrets(config),
+                            tool_router
+                                .upgrade()
+                                .map(|router| router.server_manager().check_now_signal()),
+                        )
                     });
                     if let Some(tail) = &stderr_tail {
                         let _ = stderr_slot.set(Arc::clone(tail));
@@ -2192,6 +2209,14 @@ impl ServerManager {
                     .await
                     {
                         Ok(Ok(resources)) => ListingOutcome::Fresh(resources),
+                        // A server without this list has an empty one. It
+                        // is not a failure, and warning on every refresh
+                        // buried the real ones.
+                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
+                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+                        {
+                            ListingOutcome::Fresh(Vec::new())
+                        }
                         Ok(Err(error)) => {
                             tracing::warn!(server = %server_name, error = %error, "failed to list resources; carrying last-known-good");
                             ListingOutcome::Unavailable
@@ -2267,6 +2292,14 @@ impl ServerManager {
                     .await
                     {
                         Ok(Ok(templates)) => ListingOutcome::Fresh(templates),
+                        // A server without this list has an empty one. It
+                        // is not a failure, and warning on every refresh
+                        // buried the real ones.
+                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
+                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+                        {
+                            ListingOutcome::Fresh(Vec::new())
+                        }
                         Ok(Err(error)) => {
                             tracing::warn!(server = %server_name, error = %error, "failed to list resource templates; carrying last-known-good");
                             ListingOutcome::Unavailable
@@ -2339,6 +2372,14 @@ impl ServerManager {
                     .await
                     {
                         Ok(Ok(prompts)) => ListingOutcome::Fresh(prompts),
+                        // A server without this list has an empty one. It
+                        // is not a failure, and warning on every refresh
+                        // buried the real ones.
+                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
+                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
+                        {
+                            ListingOutcome::Fresh(Vec::new())
+                        }
                         Ok(Err(error)) => {
                             tracing::warn!(server = %server_name, error = %error, "failed to list prompts; carrying last-known-good");
                             ListingOutcome::Unavailable
@@ -2583,6 +2624,23 @@ impl ServerManager {
 
     /// Record that a configured server failed during startup so it appears in
     /// status output and becomes eligible for proactive recovery.
+    /// Whether every call slot of `name` is taken by a running call.
+    pub(crate) fn busy_with_a_call(&self, name: &str) -> bool {
+        self.semaphores
+            .get(name)
+            .is_some_and(|semaphore| semaphore.available_permits() == 0)
+    }
+
+    /// Have every server checked now, and every server that is down retried
+    /// now from the shortest wait.
+    pub fn check_servers_now(&self) {
+        self.check_now.notify_waiters();
+    }
+
+    pub(crate) fn check_now_signal(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.check_now)
+    }
+
     pub fn mark_start_failure(&self, name: &str) {
         self.health.insert(
             name.to_string(),

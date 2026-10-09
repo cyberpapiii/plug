@@ -154,6 +154,7 @@ impl StderrTail {
         server: &str,
         stderr: impl AsyncRead + Unpin + Send + 'static,
         secrets: Vec<String>,
+        stopped: Option<Arc<tokio::sync::Notify>>,
     ) -> Arc<Self> {
         let (closed, _) = tokio::sync::watch::channel(false);
         let tail = Arc::new(Self {
@@ -174,6 +175,11 @@ impl StderrTail {
                     stderr = %text,
                     "stdio server stopped on its own"
                 );
+                // Its health task looks at it now instead of at the next
+                // tick, so it is back before most callers notice.
+                if let Some(stopped) = stopped {
+                    stopped.notify_waiters();
+                }
             }
         });
         tail
@@ -321,7 +327,7 @@ mod tests {
     #[tokio::test]
     async fn tail_keeps_the_last_lines_within_its_bound() {
         let (mut writer, reader) = tokio::io::duplex(64 * 1024);
-        let tail = StderrTail::capture("test", reader, Vec::new());
+        let tail = StderrTail::capture("test", reader, Vec::new(), None);
         let mut input = String::new();
         for index in 0..1000 {
             input.push_str(&format!("line {index}\n"));
@@ -348,7 +354,7 @@ mod tests {
     #[tokio::test]
     async fn explain_adds_the_last_stderr_line_and_redacts_it() {
         let (mut writer, reader) = tokio::io::duplex(1024);
-        let tail = StderrTail::capture("figma", reader, secrets(&["figd_secret_value"]));
+        let tail = StderrTail::capture("figma", reader, secrets(&["figd_secret_value"]), None);
         tokio::io::AsyncWriteExt::write_all(
             &mut writer,
             b"starting\nenv: node: No such file or directory token=figd_secret_value\n",
@@ -370,7 +376,7 @@ mod tests {
     #[tokio::test]
     async fn explain_leaves_the_error_alone_without_stderr() {
         let (writer, reader) = tokio::io::duplex(1024);
-        let tail = StderrTail::capture("quiet", reader, Vec::new());
+        let tail = StderrTail::capture("quiet", reader, Vec::new(), None);
         drop(writer);
         let error = tail.explain("quiet", anyhow::anyhow!("timed out")).await;
         assert_eq!(error.to_string(), "timed out");

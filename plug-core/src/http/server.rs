@@ -2712,7 +2712,7 @@ fn bind_session_to_caller(
 /// on. The caller has already proved who it is, so its session is opened
 /// again under the same id, as its own. What it said about itself at
 /// `initialize` is not known again until it next initializes.
-fn reopen_lost_session(state: &HttpState, headers: &HeaderMap, auth_status: &AuthStatus) {
+fn reopen_lost_session(state: &Arc<HttpState>, headers: &HeaderMap, auth_status: &AuthStatus) {
     let Ok(session_id) = extract_session_id(headers) else {
         return;
     };
@@ -2728,6 +2728,29 @@ fn reopen_lost_session(state: &HttpState, headers: &HeaderMap, auth_status: &Aut
     if bind_session_to_caller(state, &session_id, auth_status, &policy_context).is_err() {
         state.sessions.remove(&session_id);
         return;
+    }
+    // The client will not say `initialized` again, so the session is wired for
+    // notifications here, and told its lists may have changed while it was
+    // gone: what it holds was read from a Plug that no longer exists.
+    let session_arc = Arc::<str>::from(session_id.as_str());
+    state.router.register_downstream_bridge(
+        NotificationTarget::Http {
+            session_id: Arc::clone(&session_arc),
+        },
+        Arc::new(HttpBridge {
+            state: Arc::clone(state),
+            session_id: session_arc,
+            capabilities: Default::default(),
+        }),
+    );
+    for notification in [
+        ProtocolNotification::ToolListChanged,
+        ProtocolNotification::ResourceListChanged,
+        ProtocolNotification::PromptListChanged,
+    ] {
+        if let Some(message) = notification_to_sse_message(&notification) {
+            state.sessions.send_to_live_session(&session_id, message);
+        }
     }
     tracing::info!(
         session = %session_id,
@@ -4849,6 +4872,16 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert!(state.sessions.validate(&lost).is_ok());
+        // It is told to read its lists again: what it holds came from a Plug
+        // that is gone.
+        let (stream, mut events) = tokio::sync::mpsc::channel(8);
+        state.sessions.set_sse_sender(&lost, stream, None).unwrap();
+        let mut told = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            told.push(format!("{:?}", event.message));
+        }
+        assert_eq!(told.len(), 3, "{told:?}");
+        assert!(told[0].contains("tools/list_changed"), "{told:?}");
 
         let resp = build_router(state)
             .oneshot(list(2, "never-issued"))

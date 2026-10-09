@@ -354,6 +354,9 @@ pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String
   <!-- Shutdown lets running tool calls finish for up to eight seconds, and
        launchd's own default kills an agent about five seconds after SIGTERM. -->
   <key>ExitTimeOut</key><integer>20</integer>
+  <!-- Every server, client and stream holds a file handle, and the default
+       of 256 runs out on a busy day, after which nothing new connects. -->
+  <key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>4096</integer></dict>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
 </dict></plist>
@@ -864,6 +867,8 @@ arguments = {
         // Room for the shutdown drain; without it launchd kills the daemon
         // while running calls are still finishing.
         const EXIT_TIMEOUT: &str = "<key>ExitTimeOut</key><integer>20</integer>";
+        // launchd's default of 256 file handles runs out with many servers.
+        const FILE_LIMIT: &str = "<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>4096</integer></dict>";
 
         let cli = render_cli_plist(Path::new("/tmp/plug"), None);
         assert!(
@@ -874,6 +879,7 @@ arguments = {
             cli.contains(EXIT_TIMEOUT),
             "CLI plist lost its exit timeout"
         );
+        assert!(cli.contains(FILE_LIMIT), "CLI plist lost its file limit");
 
         let app_plist = Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../PlugApp/PlugApp/Resources/com.plug.daemon.plist");
@@ -887,6 +893,7 @@ arguments = {
             app.contains(EXIT_TIMEOUT),
             "app plist lost its exit timeout"
         );
+        assert!(app.contains(FILE_LIMIT), "app plist lost its file limit");
     }
 
     /// A daemon that claimed the runtime lock and then exited without binding a

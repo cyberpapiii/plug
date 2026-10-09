@@ -233,6 +233,12 @@ impl Engine {
             &self.tracker,
         );
 
+        crate::health::spawn_wake_watch(
+            self.server_manager.clone(),
+            self.cancel.clone(),
+            &self.tracker,
+        );
+
         spawn_refresh_loops(
             Arc::clone(self),
             self.cancel.clone(),
@@ -2422,6 +2428,10 @@ HOME_DIR = "$HOME"
         assert!(
             !report.errors.is_empty(),
             "expected reload failure for invalid command"
+        );
+        assert!(
+            engine.current_health_task_generation("broken").is_some(),
+            "a server that could not start during a reload is still watched, so it is retried"
         );
 
         let statuses = engine.server_statuses();

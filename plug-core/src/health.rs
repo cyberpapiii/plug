@@ -92,6 +92,7 @@ pub fn spawn_health_check(
             tick.tick().await;
         }
 
+        let check_now = server_manager.check_now_signal();
         loop {
             tokio::select! {
                 biased;
@@ -99,7 +100,12 @@ pub fn spawn_health_check(
                     tracing::debug!(server = %name, "health check task shutting down");
                     break;
                 }
-                _ = tick.tick() => {
+                _ = async {
+                    tokio::select! {
+                        _ = tick.tick() => {}
+                        _ = check_now.notified() => {}
+                    }
+                } => {
                     if engine.current_health_task_generation(&name) != Some(generation) {
                         tracing::debug!(server = %name, "health check generation superseded");
                         break;
@@ -133,6 +139,20 @@ pub fn spawn_health_check(
                         .is_some_and(|entry| entry.health == ServerHealth::Failed);
 
                     if missing_upstream && startup_failed {
+                        trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
+                        continue;
+                    }
+
+                    // A connection that has ended cannot answer a ping, so
+                    // there is nothing to count toward: the server is down
+                    // now. Its tools leave the list until it is back.
+                    let connection_ended = server_manager
+                        .get_upstream(&name)
+                        .is_some_and(|upstream| upstream.client.is_transport_closed());
+                    if connection_ended {
+                        tracing::warn!(server = %name, "server connection ended; reconnecting");
+                        server_manager.mark_start_failure(&name);
+                        router.schedule_tool_list_changed_refresh();
                         trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
                         continue;
                     }
@@ -299,6 +319,7 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
     tracing::info!(server = %server_name, "starting proactive recovery");
     let started = tokio::time::Instant::now();
     let mut backoff = RecoveryBackoff::default();
+    let check_now = engine.server_manager().check_now_signal();
 
     loop {
         let result = tokio::select! {
@@ -364,6 +385,11 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
                 return;
             }
             _ = tokio::time::sleep(delay + jitter) => {}
+            _ = check_now.notified() => {
+                // The Mac woke or its network changed: what kept the server
+                // down may be gone, so start again from the shortest wait.
+                backoff = RecoveryBackoff::default();
+            }
         }
 
         if !recovery_still_needed(engine, server_name) {
@@ -371,6 +397,43 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
             return;
         }
     }
+}
+
+/// How often the wake watch looks at the clock.
+const WAKE_WATCH_TICK: Duration = Duration::from_secs(10);
+
+/// Whether the Mac slept during a wait of `WAKE_WATCH_TICK`: the wall clock
+/// moved well past it while the timer, which stops during sleep, did not.
+fn slept_through(wall_elapsed: Duration) -> bool {
+    wall_elapsed > WAKE_WATCH_TICK + Duration::from_secs(20)
+}
+
+/// Have every server checked the moment the Mac wakes. Connections that died
+/// while it slept are found and replaced at once instead of at each server's
+/// next tick or on the first call that fails.
+pub fn spawn_wake_watch(
+    server_manager: Arc<ServerManager>,
+    cancel: CancellationToken,
+    tracker: &TaskTracker,
+) {
+    tracker.spawn(async move {
+        loop {
+            let before = std::time::SystemTime::now();
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(WAKE_WATCH_TICK) => {}
+            }
+            let wall_elapsed = before.elapsed().unwrap_or_default();
+            if slept_through(wall_elapsed) {
+                tracing::info!(
+                    asleep_secs = wall_elapsed.as_secs(),
+                    "the Mac woke; checking every server now"
+                );
+                server_manager.check_servers_now();
+            }
+        }
+    });
 }
 
 /// Ping a single upstream server and update its health state.
@@ -399,6 +462,14 @@ async fn health_check_server(
     .await;
 
     let success = matches!(result, Ok(Ok(_)));
+
+    // A server that works on one call at a time and is busy with one cannot
+    // answer the ping until it is done. Silence then is not a fault, and
+    // counting it would restart the server under a long call.
+    if result.is_err() && mgr.busy_with_a_call(name) {
+        tracing::debug!(server = %name, "health ping unanswered while a call is running; not counted");
+        return None;
+    }
 
     // Clone-and-drop pattern: extract state, drop guard, then use data.
     let mut entry = mgr.health.entry(name.to_string()).or_default();
@@ -459,6 +530,15 @@ mod tests {
             operations: Vec::new(),
             token_in: None,
         }
+    }
+
+    #[test]
+    fn only_a_long_gap_in_the_wall_clock_counts_as_sleep() {
+        assert!(!super::slept_through(super::WAKE_WATCH_TICK));
+        assert!(!super::slept_through(
+            super::WAKE_WATCH_TICK + Duration::from_secs(5)
+        ));
+        assert!(super::slept_through(Duration::from_secs(3600)));
     }
 
     /// A server that failed to start must be retried without first waiting out a
