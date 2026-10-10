@@ -31,6 +31,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Plug no longer keeps the processor busy with its window closed. After being opened and closed a few times, the menu bar icon could start redrawing without stopping. Settings also opens faster.
 - The bar at the top of the window holds still when the sidebar is hidden or shown. The add button sits beside search at the far end, and the sidebar button sits beside the page's title. Before, the add button did not fit above the list once the sidebar was hidden, so it jumped and left a stray divider behind, the sidebar button vanished behind a "more" arrow while the sidebar slid back, and an empty piece of glass sat next to search.
 - The app no longer quits if the daemon ever lists the same server twice. It shows the first and carries on.
 - Plug keeps checking on itself when the menu bar panel or the window is closed in the first moments after launch. Before, it could stop checking until you turned Plug off and on.
