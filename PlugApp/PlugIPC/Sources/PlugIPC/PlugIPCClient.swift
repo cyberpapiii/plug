@@ -183,7 +183,13 @@ public actor PlugIPCClient {
             throw PlugIPCError.systemCall("fcntl", code)
         }
         // Keep O_NONBLOCK: readiness polling cannot bound a subsequent blocking syscall.
-        var (address, addressLength) = try unixSocketAddress(path: path)
+        var address: sockaddr_un
+        let addressLength: socklen_t
+        do { (address, addressLength) = try unixSocketAddress(path: path) }
+        catch {
+            Darwin.close(fd)
+            throw error
+        }
         let result = withUnsafePointer(to: &address) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
                 Darwin.connect(fd, $0, addressLength)
