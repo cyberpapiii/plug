@@ -109,12 +109,12 @@ enum AppIcons {
         let target = target.lowercased()
         for identifier in [bundleIdentifiers[target], otherBundleIdentifiers[target]].compactMap({ $0 }) {
             if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
-                return NSWorkspace.shared.icon(forFile: url.path)
+                return fileIcon(url.path)
             }
         }
         // A client Plug has no entry for, started by an app that is right here.
         if let appPath, FileManager.default.fileExists(atPath: appPath) {
-            return NSWorkspace.shared.icon(forFile: appPath)
+            return fileIcon(appPath)
         }
         return installedIcon(named: name)
     }
@@ -182,11 +182,24 @@ enum AppIcons {
         return found
     }()
 
+    /// A file's icon, read from disk once. Rows ask for theirs every time
+    /// they are drawn.
+    @MainActor
+    private static let fileIcons = NSCache<NSString, NSImage>()
+
+    @MainActor
+    private static func fileIcon(_ path: String) -> NSImage {
+        if let kept = fileIcons.object(forKey: path as NSString) { return kept }
+        let icon = NSWorkspace.shared.icon(forFile: path)
+        fileIcons.setObject(icon, forKey: path as NSString)
+        return icon
+    }
+
     @MainActor
     private static func installedIcon(named name: String) -> NSImage? {
         let key = lookupKey(name)
         guard !key.isEmpty, let path = installedApps[key] else { return nil }
-        return NSWorkspace.shared.icon(forFile: path)
+        return fileIcon(path)
     }
 
     /// Match a live session's reported client type to a known target, so a
