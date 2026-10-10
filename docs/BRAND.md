@@ -45,17 +45,48 @@ Rules:
 The tile is always the blue gradient, top to bottom, with the character in
 white. Inside the app the character has no tile and takes one flat colour.
 In the menu bar panel it is Plug blue, and its face says how Plug is. In the
-window it takes the colour of what it is saying:
+window's banner it takes the colour of what it is saying. In the menu bar it
+takes the menu bar's own colour, like every other menu bar icon.
 
-| Plug is | Colour |
+### Status colours
+
+Four colours say how something is, and each means one thing everywhere: a
+server's dot, the banner, the wash behind a card, the mark beside the
+character. In the app they are named once, in `StatusColor`.
+
+| Colour | Means |
 |---|---|
-| Working well | Green |
-| Starting, or off | Grey |
-| Needs you | Orange |
-| Stopped by something | Red |
+| Green | Working |
+| Grey | Starting, or off |
+| Orange | Needs you: sign in, allow, reload |
+| Red | Stopped or failed |
 
-In the menu bar it takes the menu bar's own colour, like every other menu bar
-icon.
+Blue is not a status. It is Plug itself, and the one button to press.
+
+Rules:
+
+- Colour is never the only signal. Beside every coloured dot or wash there
+  are words, a shape, or a face that say the same thing.
+- One blue button on a screen at most: the single thing to press. When
+  several things each have a fix, none is blue.
+- A card that reports trouble takes a light wash of the worst status in it,
+  orange or red. A card that only invites, such as adding a first server,
+  takes none.
+- The character in the panel stays Plug blue whatever happens. Only the
+  small mark beside it takes a status colour, orange or red. The "z"s when
+  Plug is off are grey.
+
+## Layout in the panel
+
+- Things are set apart by space, not lines. The panel has one divider, above
+  its controls. A card may have one hairline, above its last line.
+- Every gap is a step of the app's one spacing scale (`Metric`).
+- A fix sits at the end of the row it fixes, never in a list of its own.
+- A plain line that says something and offers a button starts with one
+  small grey line icon, drawn for Plug in one weight (`PanelIcon`), that fits
+  both the words and the button: a stethoscope beside Run Checkup, a plug
+  with a loose cord beside Start Plug, a server's tile with a plus beside
+  Add Server. No stock symbols there.
 
 ## Faces
 
@@ -78,9 +109,11 @@ is not sure.
 | Thinking | A page has been loading for a while | Leans over and looks up, lids half down, one prong up |
 | Loading | A page is loading | The two prongs and the body become three dots that hop in turn |
 | Needs you | Sign in, or allow something | Eyes round, prongs up, and a dot beside it |
-| Not sure | Some servers run and others do not | One eye narrow, one prong down |
-| Worried | A server stopped, or Plug needs repair | Shakes its head once. Lids slant in, prongs down and apart. |
-| Alert | Plug itself is stopped | The prongs and the body become an exclamation mark that hops now and then |
+| Not sure | Only when you play with it | One eye narrow, one prong down, and a "?" beside it |
+| Dizzy | Several servers need something at once | Its eyes are two swirls that turn together, it sways from its feet, and a "?" sits beside it |
+| Worried | A server stopped, or Plug needs repair | Shakes its head once. Lids slant in, prongs down and apart, and a dot beside it. |
+| Alert | Plug cannot finish setting up | The prongs and the body become an exclamation mark that hops now and then |
+| Out | Plug itself is stopped | Keels over with crosses for eyes and a "!" beside it. Only this state gets the crosses. |
 | Asleep | Plug is off | Leans further over, eyes shut, breathes slowly, and "z"s drift up |
 | Tucked away | Only when you play with it | The three parts become one dot |
 
@@ -118,7 +151,7 @@ Rules:
 |---|---|
 | App icon, Dock, notifications, updates | The tile |
 | Menu bar | The character alone, with a small badge when something is happening or wrong |
-| Menu bar panel | The character in Plug blue, at the start of the top row, beside the one line Plug says about itself and the switch |
+| Menu bar panel | The character in Plug blue, at the start of the top row, beside the one line Plug says about itself and the switch. Under it: a card for whatever needs you, the servers that are fine as a shelf of icons, who is connected, and the last tool call. |
 | Window banner | The character, in the colour of what it says, beside the one sentence Plug says about itself |
 | A page Plug cannot fill | The character, large, above the reason |
 | A page that is loading | The character as three dots, then thinking if it takes a while |

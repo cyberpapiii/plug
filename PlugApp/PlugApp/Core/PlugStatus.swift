@@ -122,6 +122,17 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
             : "Plug could not reach this server."
     }
 
+    /// What is wrong, in a few words under the server's name.
+    var reason: String {
+        switch health {
+        case .signInNeeded: isSigningIn ? "Finish signing in with your browser" : "Needs sign-in"
+        case .down: error ?? "Stopped"
+        case .notLoaded: "Not loaded yet"
+        case .unknown: "Not responding"
+        case .working, .starting, .off: health.label
+        }
+    }
+
     /// Stops a sign-in that is open in the browser.
     var cancelSignIn: Verdict.Button? {
         isSigningIn ? .init("Cancel", .cancelSignIn(server: name)) : nil
@@ -217,6 +228,19 @@ struct PlugSituation: Equatable, Sendable {
     var troubledServers: [ServerFacts] { activeServers.filter(\.health.needsAttention) }
     var workingServers: [ServerFacts] { activeServers.filter { $0.health == .working } }
     var totalTools: Int { activeServers.reduce(0) { $0 + $1.toolCount } }
+
+    /// The servers with nothing wrong: running, or on their way up.
+    var settledServers: [ServerFacts] { activeServers.filter { !$0.health.needsAttention } }
+
+    /// The line under the menu bar panel's servers: how many are up and what
+    /// they offer, or how far along they are while they start.
+    func runningSummary(stale: Bool) -> String {
+        let running = workingServers.count
+        let summary = activeServers.contains(where: \.health.isSettling)
+            ? "\(running) of \(activeServers.count) ready"
+            : "\(running) running · \(totalTools) \(totalTools == 1 ? "tool" : "tools")"
+        return stale ? "Last known · \(summary)" : summary
+    }
 
     /// Every server in one order for every list: the ones that are on, then
     /// the ones that are off.
@@ -423,6 +447,7 @@ enum PlugVerdict {
         case .stopped:
             return Verdict(
                 tone: .blocked,
+                mood: .out,
                 title: "Plug is not running",
                 detail: "Your clients cannot reach any servers until Plug starts.",
                 primary: .init("Start Plug", .reconnect),
@@ -491,7 +516,7 @@ enum PlugVerdict {
                 : "\(situation.workingServers.count) of \(active.count) servers running."
             return Verdict(
                 tone: .attention,
-                mood: signIns == troubled.count ? .needsYou : .unsure,
+                mood: signIns == troubled.count ? .needsYou : .dizzy,
                 title: "\(troubled.count) servers need attention",
                 detail: detail,
                 secondary: .init("Run Checkup", .checkup)
