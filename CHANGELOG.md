@@ -10,7 +10,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Changed
 
 - Plug has a new icon, a plug with a face, in the app, the menu bar, the README, and the icon clients show for Plug. In the menu bar it is awake when Plug is on and asleep when Plug is off, and it blinks now and then. Beside everything Plug says about itself, in the menu bar panel and the window, it blinks when all is well, looks from side to side while Plug starts, shakes its head when something is wrong, hops when that is fixed, and dozes when Plug is off. It holds still when Reduce Motion is on. The rules for the icon, its colours and its motion are in `docs/BRAND.md`.
-- The README is rewritten around what Plug is today, with diagrams, and the settings file has its own page, `docs/SETTINGS.md`. Stale lines in the other docs are corrected.
+- The README is rewritten around what Plug is today, with diagrams, and the settings file has its own page, `docs/SETTINGS.md`. Stale lines in the other docs are corrected. The README now says who Plug is for and why it exists, with a picture of every client wired to every server without Plug, what you can do with it, what Plug takes care of, and answers to common questions.
 - The setup guide the app hands to an agent now sends keys to the Keychain with `plug secret set`, where it said to use an environment variable.
 
 ### Fixed
