@@ -1,4 +1,5 @@
 import AppKit
+import ServiceManagement
 import SwiftUI
 import UserNotifications
 
@@ -7,32 +8,52 @@ import UserNotifications
 /// this. One page, so nothing is behind a tab.
 struct SettingsView: View {
     let model: AppModel
-    @Bindable var router: Router
+    let router: Router
     let run: (PlugIntent) -> Void
     var checkups: any CheckupRunning = CheckupService()
 
     // The login item lives in macOS, not in this app's defaults, so the toggle
-    // starts from what SMAppService reports and the task below re-reads it.
-    @State private var launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
+    // starts from what macOS last said and the task below asks again.
+    @State private var loginItems = LoginItems.last
     @AppStorage(NotificationService.preferenceKey) private var notify = false
     @State private var loginItemFailed = false
+    /// Goes up when the switch is used, so an answer asked for before then
+    /// does not undo it.
+    @State private var loginItemEdits = 0
     @State private var notificationsDenied = false
+    // This page is made when the app opens, and reading this is what starts
+    // the updater then. Keep it here.
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
     @State private var keepsInMenuBar = MenuBarPresence.standard.keeps
-    @State private var backgroundItem = DaemonServiceManager.shared.backgroundItemAllowance
-    @State private var loginItem = DaemonServiceManager.shared.loginItemAllowance
     @State private var notifications = SystemAllowance.notAsked
 
-    @State private var checkup: Checkup?
+    @State private var checkup: CheckupReport?
     @State private var checking = false
     @State private var checkupError: String?
     @State private var showsPassingChecks = false
     @State private var configURL: URL?
 
+    /// A closed Settings window is kept, with every view in it still
+    /// running. While it is closed nothing here animates or asks macOS
+    /// anything.
+    @State private var windowOpen = true
+    @State private var activations = 0
+
+    /// What sends the page back to macOS for the state of its permissions.
+    private struct SystemRead: Equatable {
+        let windowOpen: Bool
+        let serviceEnabled: Bool
+        let activations: Int
+    }
+
     var body: some View {
         Form {
             Section {
-                PlugHeadline(model: model, run: run)
+                if windowOpen {
+                    PlugHeadline(model: model, run: run)
+                } else {
+                    Color.clear.frame(height: 40)
+                }
             }
             plug
             general
@@ -43,18 +64,26 @@ struct SettingsView: View {
         .formStyle(.grouped)
         .frame(width: Metric.settingsWidth)
         .frame(height: Metric.settingsHeight)
+        .background {
+            WindowOpenReader(isOpen: $windowOpen)
+                .frame(width: 0, height: 0)
+                .accessibilityHidden(true)
+        }
         .task {
-            readLoginItem()
-            await readPermissions()
-            configURL = await checkups.configPath()
+            if configURL == nil { configURL = await checkups.configPath() }
         }
-        // Allowing the login item happens in System Settings, so look again
-        // when the person comes back.
+        // Read when the window opens, when Plug is turned on or off, and when
+        // the person comes back from System Settings, where the login item
+        // is allowed.
+        .task(id: SystemRead(
+            windowOpen: windowOpen, serviceEnabled: model.serviceEnabled, activations: activations
+        )) {
+            guard windowOpen else { return }
+            await readSystem()
+        }
         .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
-            readLoginItem()
-            Task { await readPermissions() }
+            if windowOpen { activations += 1 }
         }
-        .task(id: model.serviceEnabled) { await readPermissions() }
         // A problem elsewhere in the app can send a person here with the
         // checkup already asked for.
         .task(id: router.checkupRequests) {
@@ -67,7 +96,7 @@ struct SettingsView: View {
     private var general: some View {
         Section(heading: "General") {
             Toggle("Open at Login", isOn: Binding(
-                get: { launchAtLogin },
+                get: { loginItems.opensAtLogin },
                 set: { setLoginItem($0) }
             ))
             if loginItemFailed {
@@ -97,7 +126,7 @@ struct SettingsView: View {
                     let allowed = await NotificationService.shared.requestAuthorization()
                     notificationsDenied = !allowed
                     if !allowed { notify = false }
-                    await readPermissions()
+                    await readSystem()
                 }
             }
             Toggle("Check for updates automatically", isOn: $automaticUpdates)
@@ -111,22 +140,7 @@ struct SettingsView: View {
 
     private var plug: some View {
         Section {
-            if model.serviceEnabled {
-                LabeledContent("Status") {
-                    HStack(spacing: Metric.tight) {
-                        if serviceIsSettling {
-                            WaitingDots()
-                        } else {
-                            PlugIcon(serviceIcon)
-                                .foregroundStyle(serviceColor)
-                        }
-                        Text(serviceStatus)
-                        Button("Restart") { run(.restartService) }
-                            .help("Reconnects every server. Clients pick Plug back up on their own.")
-                            .disabled(model.isRestartingService || model.isChangingService)
-                    }
-                }
-            }
+            ServiceStatusRow(model: model, run: run, animates: windowOpen)
             checkupRows
         } header: {
             SectionLabel(text: "Plug")
@@ -141,17 +155,11 @@ struct SettingsView: View {
     /// nothing to fix says so and offers nothing.
     private var permissions: some View {
         Section {
-            PermissionRow(
-                title: "Run in the Background",
-                detail: "Keeps Plug serving when its window is closed.",
-                allowance: model.serviceEnabled ? backgroundItem : nil,
-                idle: "Not needed while Plug is off",
-                fix: "Open Login Items…"
-            ) { DaemonServiceManager.shared.openLoginItemSettings() }
+            BackgroundItemRow(model: model, allowance: loginItems.background)
             PermissionRow(
                 title: "Open at Login",
                 detail: "Puts Plug in the menu bar when you log in.",
-                allowance: loginItem == .turnedOff || launchAtLogin ? loginItem : nil,
+                allowance: loginItems.login == .turnedOff || loginItems.opensAtLogin ? loginItems.login : nil,
                 idle: "Off",
                 fix: "Open Login Items…"
             ) { DaemonServiceManager.shared.openLoginItemSettings() }
@@ -178,12 +186,12 @@ struct SettingsView: View {
     @ViewBuilder private var checkupRows: some View {
         LabeledContent {
             HStack(spacing: Metric.tight) {
-                if checking { WaitingDots() }
+                if checking, windowOpen { WaitingDots() }
                 Button("Run Checkup") { Task { await runCheckup() } }
                     .disabled(checking)
             }
         } label: {
-            if let checkup {
+            if let checkup = checkup?.checkup {
                 Label {
                     Text(checkup.headline)
                 } icon: {
@@ -200,15 +208,15 @@ struct SettingsView: View {
         }
 
         if let checkup {
-            ForEach(problemChecks(in: checkup)) { check in
+            ForEach(checkup.troubled) { check in
                 CheckRow(check: check)
             }
-            if !passingChecks(in: checkup).isEmpty {
+            if !checkup.passed.isEmpty {
                 DisclosureGroup(
                     passingChecksTitle(in: checkup),
                     isExpanded: $showsPassingChecks
                 ) {
-                    ForEach(passingChecks(in: checkup)) { check in
+                    ForEach(checkup.passed) { check in
                         CheckRow(check: check)
                     }
                 }
@@ -222,9 +230,7 @@ struct SettingsView: View {
         Section {
             LabeledContent("Settings file") {
                 HStack(spacing: Metric.tight) {
-                    Button("Reload") { run(.reloadConfiguration) }
-                        .help("Reload after you edit the settings file by hand")
-                        .disabled(!model.canMutate)
+                    ReloadButton(model: model, run: run)
                     Button("Show in Finder") {
                         if let configURL {
                             NSWorkspace.shared.activateFileViewerSelecting([configURL])
@@ -262,8 +268,7 @@ struct SettingsView: View {
             }
             LabeledContent("Version") {
                 HStack(spacing: Metric.tight) {
-                    Text(model.displayVersion)
-                        .textSelection(.enabled)
+                    VersionText(model: model)
                     Button("Check for Updates…") { run(.checkForUpdates) }
                         .disabled(!UpdateService.shared.canCheckForUpdates)
                 }
@@ -271,24 +276,30 @@ struct SettingsView: View {
         }
     }
 
-    private func readPermissions() async {
-        backgroundItem = DaemonServiceManager.shared.backgroundItemAllowance
-        loginItem = DaemonServiceManager.shared.loginItemAllowance
+    /// Asks macOS where the login items and notifications stand. Each answer
+    /// is a round trip to another process, so none of it waits on the main
+    /// thread.
+    private func readSystem() async {
+        let edits = loginItemEdits
+        let items = await Task.detached(priority: .userInitiated) { LoginItems.read() }.value
         // The settings object cannot cross to the main actor; only what it
         // says does.
-        notifications = await withCheckedContinuation { done in
+        let allowance = await withCheckedContinuation { done in
             UNUserNotificationCenter.current().getNotificationSettings {
                 done.resume(returning: SystemAllowance($0.authorizationStatus))
             }
         }
+        // Something newer has been asked for, and its answer is on the way.
+        guard !Task.isCancelled else { return }
+        if edits == loginItemEdits {
+            LoginItems.last = items
+            if items != loginItems { loginItems = items }
+            if items.opensAtLogin, loginItemFailed { loginItemFailed = false }
+        }
+        if allowance != notifications { notifications = allowance }
     }
 
     // MARK: Login item
-
-    private func readLoginItem() {
-        launchAtLogin = DaemonServiceManager.shared.mainAppAtLoginEnabled
-        if launchAtLogin { loginItemFailed = false }
-    }
 
     /// The switch only moves when macOS agrees. When it does not, the row
     /// under it says where to allow it; System Settings is not opened for the
@@ -296,14 +307,162 @@ struct SettingsView: View {
     private func setLoginItem(_ enabled: Bool) {
         do {
             try DaemonServiceManager.shared.setMainAppAtLogin(enabled)
-            launchAtLogin = enabled
+            loginItems.opensAtLogin = enabled
+            loginItemEdits += 1
             loginItemFailed = false
         } catch {
             loginItemFailed = true
         }
     }
 
-    // MARK: Status
+    // MARK: Checkup results
+
+    private func headlineIcon(for checkup: Checkup) -> PlugIcon.Kind {
+        if !checkup.problems.isEmpty { return .stopped }
+        return checkup.isClean ? .worked : .needsYou
+    }
+
+    private func headlineColor(for checkup: Checkup) -> Color {
+        if !checkup.problems.isEmpty { return StatusColor.stopped }
+        return checkup.isClean ? StatusColor.working : StatusColor.needsYou
+    }
+
+    private func runCheckup() async {
+        checking = true
+        checkupError = nil
+        showsPassingChecks = false
+        do {
+            let result = try await checkups.run()
+            // A checkup that checked nothing did not run.
+            if result.checks.isEmpty { throw CheckupError.unreadable }
+            checkup = CheckupReport(result)
+        } catch {
+            checkup = nil
+            checkupError = error.localizedDescription
+        }
+        checking = false
+    }
+
+    private func passingChecksTitle(in report: CheckupReport) -> String {
+        report.checkup.isClean ? "Details" : "\(report.passed.count) passed"
+    }
+}
+
+/// What macOS says about Plug opening at login and running in the
+/// background. Asking is a round trip to another process each time, so the
+/// last answer is kept and a new one is asked for off the main thread.
+private struct LoginItems: Equatable, Sendable {
+    var opensAtLogin: Bool
+    var background: SystemAllowance
+    var login: SystemAllowance
+
+    /// The last answer. The first is read as the app opens, so the page
+    /// never opens showing a guess.
+    @MainActor static var last = read()
+
+    /// The background item is the daemon's job, under the name
+    /// `DaemonServiceManager` registers it with.
+    static func read() -> LoginItems {
+        let app = SMAppService.mainApp.status
+        return LoginItems(
+            opensAtLogin: app == .enabled,
+            background: SystemAllowance(SMAppService.agent(plistName: "com.plug.daemon.plist").status),
+            login: SystemAllowance(app)
+        )
+    }
+}
+
+/// A finished checkup with its rows already split into what needs a person
+/// and what passed, so drawing the page does not sort them again.
+private struct CheckupReport {
+    let checkup: Checkup
+    /// Problems, then warnings.
+    let troubled: [Check]
+    let passed: [Check]
+
+    init(_ checkup: Checkup) {
+        let ordered = checkup.ordered
+        self.checkup = checkup
+        troubled = ordered.filter { $0.result != .pass }
+        passed = ordered.filter { $0.result == .pass }
+    }
+}
+
+/// Tells the page whether its window is open. Closing says no; coming back
+/// on screen says yes.
+private struct WindowOpenReader: NSViewRepresentable {
+    @Binding var isOpen: Bool
+
+    func makeNSView(context: Context) -> WindowProbe {
+        let probe = WindowProbe()
+        let binding = $isOpen
+        probe.report = { open in
+            if binding.wrappedValue != open { binding.wrappedValue = open }
+        }
+        return probe
+    }
+
+    func updateNSView(_ probe: WindowProbe, context: Context) {}
+}
+
+private final class WindowProbe: NSView {
+    var report: ((Bool) -> Void)?
+
+    private static let watched = [
+        NSWindow.willCloseNotification,
+        NSWindow.didBecomeKeyNotification,
+        NSWindow.didChangeOcclusionStateNotification,
+    ]
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        let center = NotificationCenter.default
+        for name in Self.watched { center.removeObserver(self, name: name, object: nil) }
+        guard let window else { return }
+        center.addObserver(self, selector: #selector(closed(_:)), name: NSWindow.willCloseNotification, object: window)
+        center.addObserver(self, selector: #selector(shown(_:)), name: NSWindow.didBecomeKeyNotification, object: window)
+        center.addObserver(
+            self, selector: #selector(occlusionChanged(_:)),
+            name: NSWindow.didChangeOcclusionStateNotification, object: window
+        )
+    }
+
+    @objc private func closed(_ note: Notification) { report?(false) }
+
+    @objc private func shown(_ note: Notification) { report?(true) }
+
+    @objc private func occlusionChanged(_ note: Notification) {
+        if window?.occlusionState.contains(.visible) == true { report?(true) }
+    }
+}
+
+/// Whether Plug is running, and the button that restarts it. Shown only
+/// while Plug is on. It reads the model itself, so a change in Plug's state
+/// redraws this row and not the whole page.
+private struct ServiceStatusRow: View {
+    let model: AppModel
+    let run: (PlugIntent) -> Void
+    /// False while the window is closed.
+    let animates: Bool
+
+    var body: some View {
+        if model.serviceEnabled {
+            LabeledContent("Status") {
+                HStack(spacing: Metric.tight) {
+                    if serviceIsSettling, animates {
+                        WaitingDots()
+                    } else {
+                        PlugIcon(serviceIcon)
+                            .foregroundStyle(serviceColor)
+                    }
+                    Text(serviceStatus)
+                    Button("Restart") { run(.restartService) }
+                        .help("Reconnects every server. Clients pick Plug back up on their own.")
+                        .disabled(model.isRestartingService || model.isChangingService)
+                }
+            }
+        }
+    }
 
     /// Only read while Plug is on; the Status row is hidden when it is off.
     private var serviceIsSettling: Bool {
@@ -340,45 +499,41 @@ struct SettingsView: View {
         case .ready, .connecting, .reconnecting: StatusColor.working
         }
     }
+}
 
-    // MARK: Checkup results
+/// The first permission row, which is idle while Plug is off.
+private struct BackgroundItemRow: View {
+    let model: AppModel
+    let allowance: SystemAllowance
 
-    private func headlineIcon(for checkup: Checkup) -> PlugIcon.Kind {
-        if !checkup.problems.isEmpty { return .stopped }
-        return checkup.isClean ? .worked : .needsYou
+    var body: some View {
+        PermissionRow(
+            title: "Run in the Background",
+            detail: "Keeps Plug serving when its window is closed.",
+            allowance: model.serviceEnabled ? allowance : nil,
+            idle: "Not needed while Plug is off",
+            fix: "Open Login Items…"
+        ) { DaemonServiceManager.shared.openLoginItemSettings() }
     }
+}
 
-    private func headlineColor(for checkup: Checkup) -> Color {
-        if !checkup.problems.isEmpty { return StatusColor.stopped }
-        return checkup.isClean ? StatusColor.working : StatusColor.needsYou
+private struct ReloadButton: View {
+    let model: AppModel
+    let run: (PlugIntent) -> Void
+
+    var body: some View {
+        Button("Reload") { run(.reloadConfiguration) }
+            .help("Reload after you edit the settings file by hand")
+            .disabled(!model.canMutate)
     }
+}
 
-    private func runCheckup() async {
-        checking = true
-        checkupError = nil
-        showsPassingChecks = false
-        do {
-            let result = try await checkups.run()
-            // A checkup that checked nothing did not run.
-            if result.checks.isEmpty { throw CheckupError.unreadable }
-            checkup = result
-        } catch {
-            checkup = nil
-            checkupError = error.localizedDescription
-        }
-        checking = false
-    }
+private struct VersionText: View {
+    let model: AppModel
 
-    private func problemChecks(in checkup: Checkup) -> [Check] {
-        checkup.ordered.filter { $0.result != .pass }
-    }
-
-    private func passingChecks(in checkup: Checkup) -> [Check] {
-        checkup.ordered.filter { $0.result == .pass }
-    }
-
-    private func passingChecksTitle(in checkup: Checkup) -> String {
-        checkup.isClean ? "Details" : "\(passingChecks(in: checkup).count) passed"
+    var body: some View {
+        Text(model.displayVersion)
+            .textSelection(.enabled)
     }
 }
 
