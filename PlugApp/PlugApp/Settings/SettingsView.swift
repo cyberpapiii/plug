@@ -246,6 +246,19 @@ struct SettingsView: View {
 
     private var about: some View {
         Section("About") {
+            HStack(spacing: Metric.snug) {
+                Image(nsImage: NSApp.applicationIconImage)
+                    .resizable()
+                    .frame(width: 48, height: 48)
+                    .accessibilityHidden(true)
+                VStack(alignment: .leading, spacing: Metric.hairline) {
+                    Text("Plug").font(.headline)
+                    Text("One place on your Mac that holds every tool and gives it to every client.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
             LabeledContent("Version") {
                 HStack(spacing: Metric.tight) {
                     Text(model.displayVersion)

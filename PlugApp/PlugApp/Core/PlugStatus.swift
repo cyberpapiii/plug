@@ -141,10 +141,10 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     }
 }
 
-/// What the menu bar icon is made of: a plug symbol and the badge on its
-/// corner, if any.
+/// What the menu bar icon is made of: Plug's mark, awake or asleep, and the
+/// badge on its corner, if any.
 struct MenuBarMark: Hashable, Sendable {
-    let plug: String
+    let awake: Bool
     let badge: String?
 }
 
@@ -323,7 +323,6 @@ struct Verdict: Equatable, Sendable {
     }
 
     let tone: Tone
-    let symbol: String
     let title: String
     let detail: String?
     let primary: Button?
@@ -331,14 +330,12 @@ struct Verdict: Equatable, Sendable {
 
     init(
         tone: Tone,
-        symbol: String,
         title: String,
         detail: String? = nil,
         primary: Button? = nil,
         secondary: Button? = nil
     ) {
         self.tone = tone
-        self.symbol = symbol
         self.title = title
         self.detail = detail
         self.primary = primary
@@ -365,7 +362,6 @@ enum PlugVerdict {
         case .settingUp:
             return Verdict(
                 tone: .busy,
-                symbol: "powerplug.portrait",
                 title: "Setting up…",
                 detail: "Finishing installation."
             )
@@ -374,7 +370,6 @@ enum PlugVerdict {
             // LEFTOVER_LAUNCHD_ADOPT_SENTENCE, not this verdict.
             return Verdict(
                 tone: .attention,
-                symbol: "key",
                 title: "Plug needs permission to run in the background",
                 detail: "Without it, your clients cannot reach any servers.",
                 primary: .init("Allow", .allowBackgroundRunning)
@@ -382,7 +377,6 @@ enum PlugVerdict {
         case let .needsRepair(detail):
             return Verdict(
                 tone: .attention,
-                symbol: "exclamationmark.triangle",
                 title: "Plug needs repair",
                 detail: detail,
                 primary: .init("Repair", .repairInstallation)
@@ -390,7 +384,6 @@ enum PlugVerdict {
         case let .blocked(detail, hasLog):
             return Verdict(
                 tone: .blocked,
-                symbol: "exclamationmark.triangle",
                 title: "Setup incomplete",
                 detail: detail,
                 primary: .init("Try Again", .repairInstallation),
@@ -406,28 +399,24 @@ enum PlugVerdict {
         case .starting:
             return Verdict(
                 tone: .busy,
-                symbol: "powerplug.portrait",
                 title: "Starting…",
                 detail: "Connecting to servers."
             )
         case .reconnecting:
             return Verdict(
                 tone: .busy,
-                symbol: "powerplug.portrait",
                 title: "Reconnecting…",
                 detail: "Waiting for Plug to start."
             )
         case .restarting:
             return Verdict(
                 tone: .busy,
-                symbol: "powerplug.portrait",
                 title: "Restarting…",
                 detail: "Connected clients pick Plug back up on their own."
             )
         case .stopped:
             return Verdict(
                 tone: .blocked,
-                symbol: "power",
                 title: "Plug is not running",
                 detail: "Your clients cannot reach any servers until Plug starts.",
                 primary: .init("Start Plug", .reconnect),
@@ -436,7 +425,6 @@ enum PlugVerdict {
         case .off:
             return Verdict(
                 tone: .quiet,
-                symbol: "power",
                 title: "Plug is off",
                 detail: "Turn Plug on to make tools available to your clients.",
                 primary: .init("Turn On", .setServiceEnabled(true))
@@ -444,7 +432,6 @@ enum PlugVerdict {
         case .versionMismatch:
             return Verdict(
                 tone: .attention,
-                symbol: "arrow.clockwise",
                 title: "Restart Plug to finish updating",
                 detail: "The new version is installed.",
                 primary: .init("Restart Plug", .reconnect)
@@ -459,7 +446,6 @@ enum PlugVerdict {
         if active.isEmpty {
             return Verdict(
                 tone: .attention,
-                symbol: "powerplug.portrait",
                 title: "No servers yet",
                 detail: "Add a server to make tools available.",
                 primary: .init("Add Server…", .addServer)
@@ -471,7 +457,6 @@ enum PlugVerdict {
             case .signInNeeded:
                 return Verdict(
                     tone: .attention,
-                    symbol: "key",
                     title: "\(only.name) needs sign-in",
                     detail: only.isSigningIn
                         ? "Finish signing in with your browser."
@@ -482,7 +467,6 @@ enum PlugVerdict {
             default:
                 return Verdict(
                     tone: .attention,
-                    symbol: "exclamationmark.triangle",
                     title: "\(only.name) is \(only.health.label.lowercased())",
                     detail: only.health == .notLoaded
                         ? only.problem
@@ -499,7 +483,6 @@ enum PlugVerdict {
                 : "\(situation.workingServers.count) of \(active.count) servers running."
             return Verdict(
                 tone: .attention,
-                symbol: "exclamationmark.triangle",
                 title: "\(troubled.count) servers need attention",
                 detail: detail,
                 secondary: .init("Run Checkup", .checkup)
@@ -509,7 +492,6 @@ enum PlugVerdict {
         if active.contains(where: \.health.isSettling) {
             return Verdict(
                 tone: .busy,
-                symbol: "powerplug.portrait",
                 title: "Starting servers…",
                 detail: "\(situation.workingServers.count) of \(active.count) ready."
             )
@@ -517,7 +499,6 @@ enum PlugVerdict {
 
         return Verdict(
             tone: .good,
-            symbol: "powerplug.portrait.fill",
             title: "All servers running",
             detail: readyDetail(for: situation)
         )
@@ -532,16 +513,16 @@ enum PlugVerdict {
         return "\(servers) \(serverWord) · \(tools) \(toolWord)"
     }
 
-    /// The menu bar icon: a plug, and a badge on its corner when something
-    /// is happening or wrong. Shape carries the state, not colour, so it
+    /// The menu bar icon: Plug's mark, asleep when Plug is off, and a badge on
+    /// its corner when something is happening or wrong. Shape carries the state, not colour, so it
     /// stays readable in a monochrome menu bar and for colour-blind eyes.
     static func menuBarMark(for verdict: Verdict) -> MenuBarMark {
         switch verdict.tone {
-        case .good: MenuBarMark(plug: "powerplug.portrait.fill", badge: nil)
-        case .quiet: MenuBarMark(plug: "powerplug.portrait", badge: nil)
-        case .busy: MenuBarMark(plug: "powerplug.portrait.fill", badge: "ellipsis.circle.fill")
-        case .attention: MenuBarMark(plug: "powerplug.portrait.fill", badge: "exclamationmark.circle.fill")
-        case .blocked: MenuBarMark(plug: "powerplug.portrait.fill", badge: "xmark.circle.fill")
+        case .good: MenuBarMark(awake: true, badge: nil)
+        case .quiet: MenuBarMark(awake: false, badge: nil)
+        case .busy: MenuBarMark(awake: true, badge: "ellipsis.circle.fill")
+        case .attention: MenuBarMark(awake: true, badge: "exclamationmark.circle.fill")
+        case .blocked: MenuBarMark(awake: true, badge: "xmark.circle.fill")
         }
     }
 }

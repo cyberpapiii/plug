@@ -36,6 +36,7 @@
 		62A674116B71E58C151041D4 /* EditServerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 588717CF2790EF93C4710EE6 /* EditServerView.swift */; };
 		62FB2A2B8196D3C86DAF8E9E /* SettingsView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */; };
 		6467183EF2D0B0C1FB4A3500 /* ActivityView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 85E7D46276FEA5FFCB9BB8F2 /* ActivityView.swift */; };
+		665F76B78C2AF5A88B338A7B /* PlugCharacter.swift in Sources */ = {isa = PBXBuildFile; fileRef = 150CFC4C7A8D42C0BE993F0E /* PlugCharacter.swift */; };
 		667266B29E20821D05DE3B64 /* FirstRunGuide.swift in Sources */ = {isa = PBXBuildFile; fileRef = AC08658F0B6AA141C8835368 /* FirstRunGuide.swift */; };
 		6BD4B241EB8557471C018CB5 /* AppModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = B8B2BC9F43EB4287115C47DA /* AppModel.swift */; };
 		6C3A2ACAD67159A496C5DC58 /* RootView.swift in Sources */ = {isa = PBXBuildFile; fileRef = E823B05501E7735EEA26993A /* RootView.swift */; };
@@ -101,6 +102,7 @@
 		0D6D45CA7CC68B42373033BE /* ToolDetailView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolDetailView.swift; sourceTree = "<group>"; };
 		0D96A945383702097BA4CCEA /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		0F74CE97E0DF2E6BB479555A /* ClientsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientsView.swift; sourceTree = "<group>"; };
+		150CFC4C7A8D42C0BE993F0E /* PlugCharacter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugCharacter.swift; sourceTree = "<group>"; };
 		17049C687463885E5E5C1CF0 /* PlugIPC */ = {isa = PBXFileReference; lastKnownFileType = folder; name = PlugIPC; path = PlugIPC; sourceTree = SOURCE_ROOT; };
 		1AF840C78BD0F5BEF851DA45 /* ServerSettingsPlace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerSettingsPlace.swift; sourceTree = "<group>"; };
 		1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppIcons.swift; sourceTree = "<group>"; };
@@ -339,6 +341,7 @@
 			children = (
 				2BB10ED3645727B693E33897 /* AppChrome.swift */,
 				75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */,
+				150CFC4C7A8D42C0BE993F0E /* PlugCharacter.swift */,
 				E823B05501E7735EEA26993A /* RootView.swift */,
 				00F9BAFB363C8A2D0C0D4CEA /* SheetFrame.swift */,
 			);
@@ -640,6 +643,7 @@
 				C00B622B2B1DD43541965CC6 /* LegacyInstallMigrator.swift in Sources */,
 				B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */,
 				DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */,
+				665F76B78C2AF5A88B338A7B /* PlugCharacter.swift in Sources */,
 				12A35C74598F87BEC6396C64 /* PlugPaths.swift in Sources */,
 				F762470FA24AB181FB13685B /* PlugPopover.swift in Sources */,
 				2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */,

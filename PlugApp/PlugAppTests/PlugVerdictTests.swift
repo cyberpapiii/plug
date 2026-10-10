@@ -193,6 +193,14 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(server("a", tools: 12).toolCountText, "12 tools")
     }
 
+    func testCharacterMovesTheWayTheVerdictReads() {
+        XCTAssertEqual(PlugCharacter.Mood(.good), .awake)
+        XCTAssertEqual(PlugCharacter.Mood(.quiet), .asleep)
+        XCTAssertEqual(PlugCharacter.Mood(.busy), .working)
+        XCTAssertEqual(PlugCharacter.Mood(.attention), .troubled)
+        XCTAssertEqual(PlugCharacter.Mood(.blocked), .troubled)
+    }
+
     func testMenuBarIconChangesShapeNotJustColour() {
         let symbols = [
             PlugVerdict.menuBarMark(for: PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: [server("a")]))),
@@ -203,7 +211,7 @@ final class PlugVerdictTests: XCTestCase {
         // Every state has a mark of its own.
         let tones: [Verdict.Tone] = [.good, .quiet, .busy, .attention, .blocked]
         let marks = tones.map {
-            PlugVerdict.menuBarMark(for: Verdict(tone: $0, symbol: "", title: "", detail: ""))
+            PlugVerdict.menuBarMark(for: Verdict(tone: $0, title: "", detail: ""))
         }
         XCTAssertEqual(Set(marks).count, tones.count)
     }

@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/assets/plug-icon-128.png" width="96" alt="">
+  <img src="docs/assets/plug-icon-animated.svg" width="96" alt="">
 </p>
 <h1 align="center">Plug</h1>
 <p align="center">
@@ -137,6 +137,7 @@ Most people never open the settings file. It is described in
 | [docs/OPERATOR-GUIDE.md](docs/OPERATOR-GUIDE.md) | Remote access and sign-in |
 | [docs/events.md](docs/events.md) | Events |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | How it is built |
+| [docs/BRAND.md](docs/BRAND.md) | The icon, its colours, and how it moves |
 | [CONTRIBUTING.md](CONTRIBUTING.md) | Build it and change it |
 | [SECURITY.md](SECURITY.md) | Report a security problem |
 

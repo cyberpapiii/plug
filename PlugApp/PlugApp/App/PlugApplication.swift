@@ -72,7 +72,7 @@ struct PlugApplication: App {
             // The label is the one view that exists from launch, so the
             // runtime connection starts here rather than in a window that may
             // never be opened.
-            Image(nsImage: MenuBarIcon.image(for: model.menuBarMark))
+            MenuBarLabel(mark: model.menuBarMark)
                 .accessibilityLabel("Plug: \(model.verdict.title)")
                 .task {
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
@@ -162,32 +162,55 @@ struct PlugApplication: App {
     }
 }
 
-/// Draws the menu bar icon. The system has a plug symbol but none with a
-/// badge, so the badge is drawn on: a gap is cut from the plug around it, the
-/// way the system's own badged symbols are made.
+/// The menu bar icon. Awake, it blinks now and then, unless Reduce Motion is on.
+private struct MenuBarLabel: View {
+    let mark: MenuBarMark
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+    @State private var blinking = false
+
+    private var blinks: Bool { mark.awake && !reduceMotion }
+
+    var body: some View {
+        Image(nsImage: MenuBarIcon.image(for: mark, blinking: blinking && blinks))
+            .task(id: blinks) {
+                guard blinks else { return }
+                while !Task.isCancelled {
+                    try? await Task.sleep(for: .seconds(.random(in: 6...14)))
+                    blinking = true
+                    try? await Task.sleep(for: .seconds(0.13))
+                    blinking = false
+                }
+            }
+    }
+}
+
+/// Draws the menu bar icon: Plug's own mark, the plug with a face. A gap is
+/// cut from it around the badge, the way the system's badged symbols are made.
 enum MenuBarIcon {
-    @MainActor private static var drawn: [MenuBarMark: NSImage] = [:]
+    private struct Drawing: Hashable {
+        let mark: MenuBarMark
+        let blinking: Bool
+    }
+
+    @MainActor private static var drawn: [Drawing: NSImage] = [:]
 
     @MainActor
-    static func image(for mark: MenuBarMark) -> NSImage {
-        if let image = drawn[mark] { return image }
+    static func image(for mark: MenuBarMark, blinking: Bool = false) -> NSImage {
+        let drawing = Drawing(mark: mark, blinking: blinking)
+        if let image = drawn[drawing] { return image }
         // A plain plug takes no more room than it needs.
-        let width: CGFloat = mark.badge == nil ? 16 : 22
+        let width: CGFloat = mark.badge == nil ? 16 : 25
         let image = NSImage(size: NSSize(width: width, height: 18), flipped: false) { rect in
-            guard let plug = symbol(mark.plug, points: 14, weight: .medium) else { return false }
-            // A badged plug sits a little left so the pair stays centred.
-            let shift: CGFloat = mark.badge == nil ? 0 : 1.5
-            plug.draw(
-                at: NSPoint(
-                    x: (rect.width - plug.size.width) / 2 - shift,
-                    y: (rect.height - plug.size.height) / 2
-                ),
-                from: .zero, operation: .sourceOver, fraction: 1
+            guard let context = NSGraphicsContext.current?.cgContext else { return false }
+            // A badged plug sits at the left, so the badge clears its eyes.
+            let middle: CGFloat = mark.badge == nil ? rect.midX : 8
+            drawPlug(
+                awake: mark.awake, eyesOpen: mark.awake && !blinking,
+                centre: CGPoint(x: middle, y: rect.midY), in: context
             )
-            guard let name = mark.badge, let badge = symbol(name, points: 8.5, weight: .bold),
-                  let context = NSGraphicsContext.current?.cgContext else { return true }
+            guard let name = mark.badge, let badge = symbol(name, points: 8.5, weight: .bold) else { return true }
             let size = badge.size
-            let origin = NSPoint(x: rect.width / 2 + 5 - size.width / 2, y: 5 - size.height / 2)
+            let origin = NSPoint(x: rect.width - 5.5 - size.width / 2, y: 5 - size.height / 2)
             context.setBlendMode(.destinationOut)
             context.fillEllipse(in: CGRect(origin: origin, size: size).insetBy(dx: -1.2, dy: -1.2))
             context.setBlendMode(.normal)
@@ -196,8 +219,34 @@ enum MenuBarIcon {
         }
         // A template takes the menu bar's own colour, light or dark.
         image.isTemplate = true
-        drawn[mark] = image
+        drawn[drawing] = image
         return image
+    }
+
+    /// Awake the mark is solid; asleep it is an outline with its eyes shut.
+    private static func drawPlug(awake: Bool, eyesOpen: Bool, centre: CGPoint, in context: CGContext) {
+        let scale = 15 / PlugMark.height
+        var placement = PlugMark.placement(centre: centre, scale: scale, yUp: true)
+        func add(_ path: Path) {
+            if let placed = path.cgPath.copy(using: &placement) { context.addPath(placed) }
+        }
+        context.setFillColor(.black)
+        add(PlugMark.silhouette)
+        context.fillPath()
+
+        let line = 1.3 / scale
+        context.setBlendMode(.destinationOut)
+        if !awake {
+            add(Path(
+                roundedRect: PlugMark.body.insetBy(dx: line, dy: line),
+                cornerRadius: PlugMark.bodyCorner - line
+            ))
+            context.fillPath()
+            context.setBlendMode(.normal)
+        }
+        add(PlugMark.eyes(open: eyesOpen ? 1 : 0, lid: line))
+        context.fillPath()
+        context.setBlendMode(.normal)
     }
 
     private static func symbol(_ name: String, points: CGFloat, weight: NSFont.Weight) -> NSImage? {

@@ -75,7 +75,6 @@ struct PlugPopover: View {
         guard verdict.primary?.intent == .setServiceEnabled(true) else { return verdict }
         return Verdict(
             tone: verdict.tone,
-            symbol: verdict.symbol,
             title: verdict.title,
             detail: verdict.detail,
             primary: nil,
