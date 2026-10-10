@@ -62,6 +62,21 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertNotNil(model.actionError)
     }
+    /// The marker can be gone by the time Plug is turned on: a second copy of
+    /// the app, or a person, removed it. That is no reason to stay off.
+    @MainActor
+    func testTurningOnDoesNotNeedTheOffMarker() async throws {
+        let marker = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: marker) }
+        let coordinator = RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents())
+        let model = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        await model.setServiceEnabled(false)
+        try FileManager.default.removeItem(at: marker)
+        await model.setServiceEnabled(true)
+        XCTAssertTrue(model.serviceEnabled)
+        XCTAssertNil(model.actionError)
+    }
+
     /// The surface that starts the model can go away before launch is over.
     /// Its task is cancelled then, and Plug must still watch the daemon.
     @MainActor

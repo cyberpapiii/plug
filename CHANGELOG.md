@@ -32,6 +32,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 - The app no longer quits if the daemon ever lists the same server twice. It shows the first and carries on.
 - Plug keeps checking on itself when the menu bar panel or the window is closed in the first moments after launch. Before, it could stop checking until you turned Plug off and on.
+- Turning Plug on no longer fails with an error when the file that records it as off has already been removed.
 - A call in flight while Plug renews a server's sign-in is answered. Renewing swapped the connection out from under the call, which came back as "disconnected before answering".
 - Servers are checked within ten seconds of the network coming back or changing, such as a new Wi-Fi network or a VPN. Each one used to wait out its own timer, up to a minute.
 - A tool call that runs longer than about a minute and a half through the tunnel is answered. The tunnel used to cut it off after a hundred seconds of silence, so Plug now keeps the reply open with a heartbeat.

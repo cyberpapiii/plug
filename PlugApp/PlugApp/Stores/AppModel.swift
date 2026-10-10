@@ -466,7 +466,8 @@ final class AppModel {
         if let refreshTask { await refreshTask.value }
         do {
             if enabled {
-                try FileManager.default.removeItem(at: serviceDisabledURL)
+                do { try FileManager.default.removeItem(at: serviceDisabledURL) }
+                catch CocoaError.fileNoSuchFile {}
                 serviceEnabled = true
                 connectionState = .connecting
                 // Turning on is explicit consent to register our own agent.
