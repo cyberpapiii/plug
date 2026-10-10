@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Plug has its own icons. The pages in the sidebar, a server's status, the result of a tool call, and buttons such as add, edit and dismiss are drawn for Plug in one line weight, in place of stock system symbols. Status colours come from one set everywhere.
 - Stacked client icons and the status dot on a server's icon no longer carry a grey outline on glass. The gap around them is now the panel showing through.
 - The menu bar panel never cuts a client's name short, shows the last tool call's name the way code is shown in a message, stacks connected clients' icons at the size of a server's, and has more space between its groups.
 - The menu bar panel has more room and larger text. It has headings for Servers, Clients, Events and Activity, shows servers that are off as dimmed icons, and names the clients that are connected.

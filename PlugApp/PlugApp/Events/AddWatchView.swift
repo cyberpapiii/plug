@@ -162,8 +162,8 @@ struct AddWatchView: View {
                                 Text(#"Arguments have to be one JSON object, like { "query": "is:unread" }."#)
                                     .foregroundStyle(.secondary)
                             } icon: {
-                                Image(systemName: "exclamationmark.triangle.fill")
-                                    .foregroundStyle(.orange)
+                                PlugIcon(.needsYou)
+                                    .foregroundStyle(StatusColor.needsYou)
                             }
                             .font(.caption)
                         } else {

@@ -85,7 +85,7 @@ struct EventsView: View {
                             }
                             .id(selected.name)
                         } else {
-                            NoSelection(item: "Event", symbol: AppSection.events.symbol)
+                            NoSelection(item: "Event", icon: .events)
                         }
                     }
                 }
@@ -98,7 +98,7 @@ struct EventsView: View {
             if pane != .detail {
                 ToolbarItem(placement: .primaryAction) {
                     Button { run(.addWatch) } label: {
-                        Label("Watch a Tool", systemImage: "plus")
+                        Label("Watch a Tool", icon: .add)
                     }
                     .help("Watch a tool and send an event when its result changes")
                     .disabled(!model.canMutate)
@@ -150,31 +150,19 @@ private struct EventGlyph: View {
     var body: some View {
         Group {
             if health.needsAttention {
-                symbol("exclamationmark.triangle.fill").foregroundStyle(.orange)
+                PlugIcon(.needsYou, size: size).foregroundStyle(StatusColor.needsYou)
             } else if health == .waiting {
-                symbol("circle.dotted").foregroundStyle(.secondary)
+                PlugIcon(.starting, size: size).foregroundStyle(StatusColor.quiet)
             } else {
-                ZStack {
-                    Circle()
-                        .fill(Color.green.opacity(0.12))
-                        .frame(width: large ? 28 : 14, height: large ? 28 : 14)
-                    Circle()
-                        .fill(Color.green)
-                        .frame(width: large ? 12 : 7, height: large ? 12 : 7)
-                }
+                PlugIcon(.working, size: size).foregroundStyle(StatusColor.working)
             }
         }
         .frame(width: large ? Metric.glyphSlot : 18, height: large ? Metric.glyphSlot : 18)
         .accessibilityHidden(true)
     }
 
-    private func symbol(_ name: String) -> some View {
-        Image(systemName: name)
-            .font(large ? .title2 : .body)
-            .symbolRenderingMode(.hierarchical)
-    }
+    private var size: CGFloat { large ? 28 : 18 }
 }
-
 private struct EventRow: View {
     let event: EventFacts
 
@@ -241,7 +229,7 @@ private struct EventDetail: View {
                         Text(event.server)
                         if let showServer {
                             Button(action: showServer) {
-                                Image(systemName: "arrow.right.circle")
+                                PlugIcon(.show)
                             }
                             .buttonStyle(.borderless)
                             .foregroundStyle(.secondary)

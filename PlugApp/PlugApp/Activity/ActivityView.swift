@@ -63,7 +63,7 @@ struct ActivityView: View {
                         )
                         .id(selected.sequence)
                     } else {
-                        NoSelection(item: "Call", symbol: AppSection.activity.symbol)
+                        NoSelection(item: "Call", icon: .activity)
                     }
                 }
             }
@@ -180,9 +180,8 @@ private struct ActivityRow: View {
             // A failure is marked beside the time, so it shows at a glance.
             // A call the client stopped is not a failure.
             if call.failed {
-                Image(systemName: "xmark.circle.fill")
-                    .foregroundStyle(.red)
-                    .symbolRenderingMode(.hierarchical)
+                PlugIcon(.stopped)
+                    .foregroundStyle(StatusColor.stopped)
             }
             Text(time)
                 .font(.callout.monospacedDigit())
@@ -249,7 +248,7 @@ private struct CallDetail: View {
                             Text(server).textSelection(.enabled)
                             if canShowServer, let name = call.event.server {
                                 Button { run(.reveal(server: name)) } label: {
-                                    Image(systemName: "arrow.right.circle")
+                                    PlugIcon(.show)
                                 }
                                 .buttonStyle(.borderless)
                                 .foregroundStyle(.secondary)
@@ -278,11 +277,11 @@ private struct CallDetail: View {
 
     @ViewBuilder private var glyph: some View {
         if call.succeeded {
-            Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+            PlugIcon(.worked).foregroundStyle(StatusColor.working)
         } else if call.cancelled {
-            Image(systemName: "minus.circle.fill").foregroundStyle(.secondary)
+            PlugIcon(.skipped).foregroundStyle(StatusColor.quiet)
         } else {
-            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+            PlugIcon(.stopped).foregroundStyle(StatusColor.stopped)
         }
     }
 }

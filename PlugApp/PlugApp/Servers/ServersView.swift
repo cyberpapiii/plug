@@ -43,7 +43,7 @@ struct ServersView: View {
             if pane != .detail {
                 ToolbarItem(placement: .primaryAction) {
                     Button { run(.addServer) } label: {
-                        Label("Add Server", systemImage: "plus")
+                        Label("Add Server", icon: .add)
                     }
                     .help("Add a server")
                     .disabled(!model.canMutate)
@@ -98,7 +98,7 @@ struct ServersView: View {
                 )
                 .id(selected.name)
             } else {
-                NoSelection(item: "Server", symbol: AppSection.servers.symbol)
+                NoSelection(item: "Server", icon: .servers)
             }
         }
     }

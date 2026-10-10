@@ -616,7 +616,7 @@ struct ClientsView: View {
                         )
                             .id(selected.id)
                     } else {
-                        NoSelection(item: "Client", symbol: AppSection.clients.symbol)
+                        NoSelection(item: "Client", icon: .clients)
                     }
                 }
             }
@@ -628,7 +628,7 @@ struct ClientsView: View {
             if pane != .detail {
                 ToolbarItem(placement: .primaryAction) {
                     Button { run(.addClient) } label: {
-                        Label("Add Client", systemImage: "plus")
+                        Label("Add Client", icon: .add)
                     }
                     .help("Add a client")
                 }
@@ -1144,14 +1144,14 @@ private struct ClientRow: View {
                     .lineLimit(1)
             }
             if entry.needsSignIn {
-                Image(systemName: "exclamationmark.triangle.fill")
-                    .foregroundStyle(.orange)
+                PlugIcon(.needsYou)
+                    .foregroundStyle(StatusColor.needsYou)
                     .help("Needs sign-in")
                     .accessibilityLabel("Needs sign-in")
             }
             if entry.isLive {
                 Circle()
-                    .fill(.green)
+                    .fill(StatusColor.working)
                     .frame(width: Self.liveDot, height: Self.liveDot)
                     .accessibilityLabel("Connected")
             }
@@ -1313,7 +1313,7 @@ private struct ClientDetail: View {
                             .onChange(of: naming) { if !naming { rename(key) } }
                             .disabled(!canMutate)
                             .help("Click to rename. Only Plug shows this name.")
-                        Image(systemName: "pencil")
+                        PlugIcon(.edit, size: 14)
                             .foregroundStyle(.tertiary)
                             .accessibilityHidden(true)
                     }
@@ -1461,7 +1461,7 @@ private struct ClientDetail: View {
                 .help(tool.summary ?? tool.shortName)
             Spacer(minLength: Metric.tight)
             if case let .offByRule(rule) = state {
-                Label("Off by Rule", systemImage: "lock.fill")
+                Label("Off by Rule", icon: .locked)
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .help("A rule in the settings file (\(rule)) keeps this tool from this client. Remove the rule to turn it back on.")

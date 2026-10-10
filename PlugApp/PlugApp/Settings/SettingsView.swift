@@ -115,9 +115,8 @@ struct SettingsView: View {
                         if serviceIsSettling {
                             ProgressView().controlSize(.small)
                         } else {
-                            Image(systemName: serviceSymbol)
+                            PlugIcon(serviceIcon)
                                 .foregroundStyle(serviceColor)
-                                .accessibilityHidden(true)
                         }
                         Text(serviceStatus)
                         Button("Restart") { run(.restartService) }
@@ -186,7 +185,7 @@ struct SettingsView: View {
                 Label {
                     Text(checkup.headline)
                 } icon: {
-                    Image(systemName: headlineSymbol(for: checkup))
+                    PlugIcon(headlineIcon(for: checkup))
                         .foregroundStyle(headlineColor(for: checkup))
                 }
             } else {
@@ -324,32 +323,32 @@ struct SettingsView: View {
         }
     }
 
-    private var serviceSymbol: String {
+    private var serviceIcon: PlugIcon.Kind {
         switch model.connectionState {
-        case .incompatible: "exclamationmark.triangle.fill"
-        case .disconnected: "xmark.circle.fill"
-        case .ready, .connecting, .reconnecting: "checkmark.circle.fill"
+        case .incompatible: .needsYou
+        case .disconnected: .stopped
+        case .ready, .connecting, .reconnecting: .worked
         }
     }
 
     private var serviceColor: Color {
         switch model.connectionState {
-        case .incompatible: .orange
-        case .disconnected: .red
-        case .ready, .connecting, .reconnecting: .green
+        case .incompatible: StatusColor.needsYou
+        case .disconnected: StatusColor.stopped
+        case .ready, .connecting, .reconnecting: StatusColor.working
         }
     }
 
     // MARK: Checkup results
 
-    private func headlineSymbol(for checkup: Checkup) -> String {
-        if !checkup.problems.isEmpty { return "xmark.circle.fill" }
-        return checkup.isClean ? "checkmark.circle.fill" : "exclamationmark.triangle.fill"
+    private func headlineIcon(for checkup: Checkup) -> PlugIcon.Kind {
+        if !checkup.problems.isEmpty { return .stopped }
+        return checkup.isClean ? .worked : .needsYou
     }
 
     private func headlineColor(for checkup: Checkup) -> Color {
-        if !checkup.problems.isEmpty { return .red }
-        return checkup.isClean ? .green : .orange
+        if !checkup.problems.isEmpty { return StatusColor.stopped }
+        return checkup.isClean ? StatusColor.working : StatusColor.needsYou
     }
 
     private func runCheckup() async {
@@ -397,13 +396,13 @@ private struct PermissionRow: View {
             HStack(spacing: Metric.tight) {
                 switch allowance {
                 case .allowed:
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                    PlugIcon(.worked)
+                        .foregroundStyle(StatusColor.working)
                         .accessibilityHidden(true)
                     Text("Allowed")
                 case .turnedOff:
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
+                    PlugIcon(.needsYou)
+                        .foregroundStyle(StatusColor.needsYou)
                         .accessibilityHidden(true)
                     Text("Turned off")
                     Button(fix, action: open)
@@ -442,10 +441,8 @@ private struct CheckRow: View {
                 }
             }
         } icon: {
-            Image(systemName: symbol)
+            PlugIcon(icon)
                 .foregroundStyle(color)
-                .symbolRenderingMode(.hierarchical)
-                .accessibilityHidden(true)
         }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("\(check.title), \(spokenResult). \(check.message)\(fix.map { " \($0)" } ?? "")")
@@ -456,19 +453,19 @@ private struct CheckRow: View {
         check.result == .pass ? nil : check.fix
     }
 
-    private var symbol: String {
+    private var icon: PlugIcon.Kind {
         switch check.result {
-        case .pass: "checkmark.circle.fill"
-        case .warn: "exclamationmark.triangle.fill"
-        case .fail: "xmark.circle.fill"
+        case .pass: .worked
+        case .warn: .needsYou
+        case .fail: .stopped
         }
     }
 
     private var color: Color {
         switch check.result {
-        case .pass: .green
-        case .warn: .orange
-        case .fail: .red
+        case .pass: StatusColor.working
+        case .warn: StatusColor.needsYou
+        case .fail: StatusColor.stopped
         }
     }
 

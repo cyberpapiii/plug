@@ -123,8 +123,8 @@ struct AddServerView: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 } icon: {
-                    Image(systemName: "checkmark.circle.fill")
-                        .foregroundStyle(.green)
+                    PlugIcon(.worked)
+                        .foregroundStyle(StatusColor.working)
                 }
                 .font(.callout)
             }

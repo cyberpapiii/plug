@@ -118,14 +118,14 @@ extension ServerHealth {
     var pulses: Bool { isSettling }
 
     /// Shape, not just colour, carries the state.
-    var symbol: String {
+    var icon: PlugIcon.Kind {
         switch self {
-        case .working: "circle.fill"
-        case .starting: "circle.dotted"
-        case .signInNeeded: "person.badge.key.fill"
-        case .down, .unknown: "xmark.circle.fill"
-        case .notLoaded: "exclamationmark.triangle.fill"
-        case .off: "circle.slash"
+        case .working: .working
+        case .starting: .starting
+        case .signInNeeded: .signIn
+        case .down, .unknown: .stopped
+        case .notLoaded: .needsYou
+        case .off: .off
         }
     }
 }
@@ -142,25 +142,21 @@ struct StatusGlyph: View {
 
     var body: some View {
         Group {
-            if health == .working {
-                ZStack {
-                    Circle()
-                        .fill(health.color.opacity(0.12))
-                        .frame(width: large ? 28 : 14, height: large ? 28 : 14)
-                    Circle()
-                        .fill(health.color)
-                        .frame(width: large ? 12 : 7, height: large ? 12 : 7)
-                }
+            if health.pulses, !reduceMotion {
+                mark.phaseAnimator([1.0, 0.45]) { mark, opacity in
+                    mark.opacity(opacity)
+                } animation: { _ in .easeInOut(duration: 1) }
             } else {
-                Image(systemName: health.symbol)
-                    .font(large ? .title2 : .body)
-                    .foregroundStyle(health.color)
-                    .symbolRenderingMode(.hierarchical)
-                    .symbolEffect(.pulse, options: .repeating, isActive: health.pulses && !reduceMotion)
+                mark
             }
         }
         .frame(width: large ? Metric.glyphSlot : 18, height: large ? Metric.glyphSlot : 18)
         .accessibilityLabel(health.label)
+    }
+
+    private var mark: some View {
+        PlugIcon(health.icon, size: large ? 28 : 18)
+            .foregroundStyle(health.color)
     }
 }
 

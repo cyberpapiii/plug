@@ -62,11 +62,15 @@ struct ImportServersView: View {
             .padding(.horizontal, Metric.roomy)
         } else if let scan {
             if scan.isEmpty {
-                ContentUnavailableView(
-                    "Nothing New to Import",
-                    systemImage: "checkmark.circle",
-                    description: Text("Every server your other clients use is already in Plug.")
-                )
+                ContentUnavailableView {
+                    Label {
+                        Text("Nothing New to Import")
+                    } icon: {
+                        PlugIcon(.worked, size: 44)
+                    }
+                } description: {
+                    Text("Every server your other clients use is already in Plug.")
+                }
             } else {
                 found(scan)
             }

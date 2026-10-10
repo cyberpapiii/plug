@@ -291,17 +291,17 @@ struct PanelView<Power: View>: View {
     private var footer: some View {
         HStack(spacing: Metric.tight) {
             Button { send(.openCurrentWindow) } label: {
-                Label("Open Plug", systemImage: "macwindow")
+                Label("Open Plug", icon: .show)
             }
             Spacer(minLength: 0)
             Button { send(.openSettings) } label: {
-                Label("Settings…", systemImage: "gearshape")
+                Label("Settings…", icon: .settings)
             }
             .labelStyle(.iconOnly)
             .keyboardShortcut(",", modifiers: .command)
             .help("Settings")
             Button(action: quit) {
-                Label("Quit Plug", systemImage: "power")
+                Label("Quit Plug", icon: .quit)
             }
             .labelStyle(.iconOnly)
             .keyboardShortcut("q", modifiers: .command)
@@ -324,7 +324,7 @@ struct PanelTrouble: Equatable {
 
     var servers: [ServerFacts] = []
     var note: String?
-    var icon: PanelIcon.Kind?
+    var icon: PlugIcon.Kind?
     /// The one button to press, in Plug blue.
     var primary: Verdict.Button?
     var secondary: Verdict.Button?
@@ -414,7 +414,8 @@ private struct TroubleCard: View {
     private var summary: some View {
         HStack(spacing: Metric.snug) {
             if let icon = trouble.icon {
-                PanelIcon(kind: icon)
+                PlugIcon(icon)
+                    .foregroundStyle(.secondary)
                     .frame(width: Metric.panelTile, height: Metric.panelTile)
             }
             if let note = trouble.note {
@@ -492,74 +493,6 @@ private struct TroubleRow: View {
             }
             .disabled(!canFix)
             .accessibilityLabel("\(fix.title), \(server.name)")
-        }
-    }
-}
-
-/// The small picture at the start of a plain line in the panel. Each is drawn
-/// here, in one weight, and fits both the words and the button beside it.
-struct PanelIcon: View {
-    enum Kind: Equatable, Sendable {
-        /// A stethoscope, for a checkup.
-        case checkup
-        /// A plug with its cord loose, for Plug not running.
-        case plug
-        /// A server's tile with a plus, for adding one.
-        case addServer
-    }
-
-    let kind: Kind
-
-    var body: some View {
-        Mark(kind: kind)
-            .stroke(.secondary, style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
-            .frame(width: 18, height: 18)
-            .accessibilityHidden(true)
-    }
-
-    /// Drawn on a 16 by 16 grid.
-    private struct Mark: Shape {
-        let kind: Kind
-
-        func path(in rect: CGRect) -> Path {
-            var path = Path()
-            switch kind {
-            case .checkup:
-                path.move(to: CGPoint(x: 3.5, y: 2.5))
-                path.addLine(to: CGPoint(x: 3.5, y: 6.5))
-                path.addRelativeArc(center: CGPoint(x: 6, y: 6.5), radius: 2.5, startAngle: .degrees(180), delta: .degrees(-180))
-                path.addLine(to: CGPoint(x: 8.5, y: 2.5))
-                path.move(to: CGPoint(x: 6, y: 9))
-                path.addLine(to: CGPoint(x: 6, y: 10.5))
-                path.addRelativeArc(center: CGPoint(x: 9.25, y: 10.5), radius: 3.25, startAngle: .degrees(180), delta: .degrees(-180))
-                path.addLine(to: CGPoint(x: 12.5, y: 9.6))
-                path.addEllipse(in: CGRect(x: 10.7, y: 5.9, width: 3.6, height: 3.6))
-            case .plug:
-                for x in [6.2, 9.8] {
-                    path.move(to: CGPoint(x: x, y: 2.5))
-                    path.addLine(to: CGPoint(x: x, y: 5.5))
-                }
-                path.move(to: CGPoint(x: 4.5, y: 5.5))
-                path.addLine(to: CGPoint(x: 11.5, y: 5.5))
-                path.addLine(to: CGPoint(x: 11.5, y: 7.5))
-                path.addRelativeArc(center: CGPoint(x: 8, y: 7.5), radius: 3.5, startAngle: .degrees(0), delta: .degrees(180))
-                path.closeSubpath()
-                path.move(to: CGPoint(x: 8, y: 11))
-                path.addLine(to: CGPoint(x: 8, y: 11.8))
-                path.addCurve(
-                    to: CGPoint(x: 4.8, y: 14),
-                    control1: CGPoint(x: 8, y: 13.4), control2: CGPoint(x: 4.8, y: 12.2)
-                )
-            case .addServer:
-                path.addRoundedRect(
-                    in: CGRect(x: 2.5, y: 2.5, width: 11, height: 11), cornerSize: CGSize(width: 3.4, height: 3.4)
-                )
-                path.move(to: CGPoint(x: 8, y: 5.8))
-                path.addLine(to: CGPoint(x: 8, y: 10.2))
-                path.move(to: CGPoint(x: 5.8, y: 8))
-                path.addLine(to: CGPoint(x: 10.2, y: 8))
-            }
-            return path.applying(CGAffineTransform(scaleX: rect.width / 16, y: rect.height / 16))
         }
     }
 }

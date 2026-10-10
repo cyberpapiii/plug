@@ -345,7 +345,7 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     func testWorkingHealthUsesLiveDotInsteadOfCompletionCheckmark() {
-        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).symbol, "circle.fill")
+        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).icon, .working)
     }
 
     /// Only a state that is changing moves. A running server used to pulse,

@@ -74,7 +74,7 @@ struct ServerDetailView: View {
                 Divider()
                 Button("Remove Server…", role: .destructive, action: onRemove)
             } label: {
-                Label("More", systemImage: "ellipsis")
+                Label("More", icon: .more)
             }
             .labelStyle(.iconOnly)
             .menuIndicator(.hidden)
@@ -152,8 +152,8 @@ struct ServerDetailView: View {
                 Label {
                     Text(warning)
                 } icon: {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .foregroundStyle(.orange)
+                    PlugIcon(.needsYou)
+                        .foregroundStyle(StatusColor.needsYou)
                 }
                 .fixedSize(horizontal: false, vertical: true)
             }
@@ -198,8 +198,8 @@ struct ServerDetailView: View {
                         Label {
                             Text(call.result).foregroundStyle(.secondary)
                         } icon: {
-                            Image(systemName: call.failed ? "xmark.circle.fill" : "minus.circle.fill")
-                                .foregroundStyle(call.failed ? Color.red : Color.secondary)
+                            PlugIcon(call.failed ? .stopped : .skipped)
+                                .foregroundStyle(call.failed ? StatusColor.stopped : StatusColor.quiet)
                         }
                         .font(.callout)
                         .lineLimit(1)

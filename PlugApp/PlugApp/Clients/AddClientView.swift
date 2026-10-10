@@ -273,7 +273,7 @@ struct AddClientView: View {
                     : "\(name) uses Plug. Restart it to see your servers.")
                     .fixedSize(horizontal: false, vertical: true)
             } icon: {
-                Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                PlugIcon(.worked).foregroundStyle(StatusColor.working)
             }
         case .command:
             paste(
