@@ -455,19 +455,18 @@ struct ClientsView: View {
     /// Every app is placed against all sessions, then search narrows what
     /// shows, so a session never leaves its app's row because the app was
     /// filtered out.
-    private var roster: AppRoster {
+    ///
+    /// The body builds this once for each time it is drawn and hands it to
+    /// whatever needs it.
+    private func roster(of apps: [LinkableApp]) -> AppRoster {
         let names = self.names
-        return AppRoster(apps: allApps, sessions: sessions) {
+        return AppRoster(apps: apps, sessions: sessions) {
             names.knownTarget(named: names.name(forKey: names.key(of: $0)))
         }
     }
-    private var connectedApps: [AppRoster.Connected] {
-        roster.connected.filter { matches($0.app.name) || matches($0.app.target) }
-    }
-    private var idleApps: [LinkableApp] {
-        roster.idle.filter { matches($0.name) || matches($0.target) }
-    }
-    private var names: ClientNames { ClientNames(snapshot: model.snapshot) }
+    /// Kept by the model and built once per snapshot. Every row asks it
+    /// about every session.
+    private var names: ClientNames { model.clientNames }
     private var grants: [DownstreamClient] {
         model.snapshot.downstreamClients.filter {
             matches(names.name(forKey: $0.clientKey) ?? "") || matches($0.clientName)
@@ -484,7 +483,8 @@ struct ClientsView: View {
         var clients: [(id: String, sessions: [LiveSession])] = []
     }
 
-    private var unclaimed: Unclaimed {
+    private func unclaimed(in roster: AppRoster) -> Unclaimed {
+        let names = self.names
         let grantKeys = Set(model.snapshot.downstreamClients.map(\.clientKey))
         var result = Unclaimed()
         var index: [String: Int] = [:]
@@ -561,13 +561,16 @@ struct ClientsView: View {
     }
 
     var body: some View {
-        let entries = self.entries
+        let apps = allApps
+        let roster = self.roster(of: apps)
+        let unclaimed = self.unclaimed(in: roster)
+        let entries = self.entries(apps: apps, roster: roster, unclaimed: unclaimed)
         return Group {
             if model.isLoadingInitialData {
                 LoadingPage(message: "Loading clients")
             } else if model.initialDataUnavailable {
                 UnavailablePage(verdict: model.verdict, run: run)
-            } else if model.isLoadingConnectableApps && entries.isEmpty {
+            } else if entries.isEmpty && model.isLoadingConnectableApps {
                 LoadingPage(message: "Loading clients")
             } else if entries.isEmpty {
                 if let error = model.connectableAppsError {
@@ -621,7 +624,7 @@ struct ClientsView: View {
                 }
             }
         }
-        .pageSubtitle(connectionSummary)
+        .pageSubtitle(connectionSummary(roster: roster, unclaimed: unclaimed))
         .toolbar {
             // The window draws a section once per column; the button sits
             // beside search. Above the list it did not fit once the sidebar
@@ -635,7 +638,7 @@ struct ClientsView: View {
                 }
             }
         }
-        .onChange(of: entries.map(\.id), initial: true) { keepSelectionVisible() }
+        .onChange(of: entries.map(\.id), initial: true) { _, ids in keepSelectionVisible(ids) }
         .confirmationDialog(
             "Remove \(revoking?.name ?? "")'s access?",
             isPresented: Binding(get: { revoking != nil }, set: { if !$0 { revoking = nil } }),
@@ -652,15 +655,14 @@ struct ClientsView: View {
         .task {
             while !Task.isCancelled {
                 await model.loadConnectableApps()
-                try? await Task.sleep(for: .seconds(5))
+                try? await Task.sleep(for: .seconds(5), tolerance: .seconds(1))
             }
         }
     }
 
     /// NSTableView is still finishing its own update when the list changes, so
     /// the selection moves on the next main-actor turn.
-    private func keepSelectionVisible() {
-        let ids = entries.map(\.id)
+    private func keepSelectionVisible(_ ids: [String]) {
         if let current = router.selectedClient, ids.contains(current) { return }
         Task { @MainActor in
             await Task.yield()
@@ -674,7 +676,9 @@ struct ClientsView: View {
         if !rows.isEmpty {
             ListGroupHeader(place)
             ForEach(rows) { entry in
-                ClientRow(entry: entry, canMutate: model.canMutate).tag(entry.id)
+                ClientRow(entry: entry, face: entry.face, canMutate: model.canMutate)
+                    .equatable()
+                    .tag(entry.id)
             }
             .listRowSeparator(.hidden)
         }
@@ -684,8 +688,9 @@ struct ClientsView: View {
 
     /// Every client the list shows, in the order it shows them. The list and
     /// the detail beside it both read from here, so they cannot disagree.
-    private var entries: [Entry] {
-        let unclaimed = self.unclaimed
+    private func entries(apps allApps: [LinkableApp], roster: AppRoster, unclaimed: Unclaimed) -> [Entry] {
+        let names = self.names
+        let sessions = self.sessions
         let others = unclaimed.clients
             .filter { client in
                 client.sessions.contains {
@@ -696,8 +701,14 @@ struct ClientsView: View {
         let represented = Set(allApps.filter { app in
             ClientStatus.hasNetworkRepresentation(app, grantNames: model.snapshot.downstreamClients.map(\.clientName))
         }.map(\.target))
-        let apps = connectedApps.filter { !represented.contains($0.app.target) }.map { appEntry($0.app, sessions: $0.sessions) }
-        let idle = idleApps.filter { !represented.contains($0.target) }.map { appEntry($0, sessions: []) }
+        let apps = roster.connected
+            .filter { matches($0.app.name) || matches($0.app.target) }
+            .filter { !represented.contains($0.app.target) }
+            .map { appEntry($0.app, sessions: $0.sessions) }
+        let idle = roster.idle
+            .filter { matches($0.name) || matches($0.target) }
+            .filter { !represented.contains($0.target) }
+            .map { appEntry($0, sessions: []) }
         let granted = grants.map { grant in
             let target = AppIcons.target(forClientType: grant.clientName)
             var own = sessions.filter { names.key(of: $0) == grant.clientKey }
@@ -938,9 +949,8 @@ struct ClientsView: View {
         return query.isEmpty || value.localizedCaseInsensitiveContains(query)
     }
 
-    private var connectionSummary: String? {
+    private func connectionSummary(roster: AppRoster, unclaimed: Unclaimed) -> String? {
         guard model.hasLoadedSnapshot else { return nil }
-        let unclaimed = self.unclaimed
         let count = roster.connected.count + unclaimed.clients.count + unclaimed.byGrant.count
         let summary = count == 0 ? "None connected" : "\(count) connected"
         return model.dataIsStale ? "Last known · \(summary)" : summary
@@ -955,7 +965,7 @@ struct ClientsView: View {
 
 /// The one line under a client's name in its detail. Pure value so the
 /// wording can be tested.
-struct ClientStatus: Equatable {
+struct ClientStatus: Equatable, Sendable {
     let text: String
 
     static func hasNetworkRepresentation(_ app: LinkableApp, grantNames: [String]) -> Bool {
@@ -1012,7 +1022,7 @@ struct ClientEntry: Identifiable {
         case unfinished = "Unfinished Sign-Ins"
     }
 
-    enum Glyph {
+    enum Glyph: Equatable, Sendable {
         case app(target: String, name: String, appPath: String?)
         /// A client allowed in over the network, by the name it gave.
         case grant(name: String)
@@ -1085,6 +1095,47 @@ struct ClientEntry: Identifiable {
     var note: String?
     /// Forgets an unfinished sign-in now.
     var forget: (() -> Void)?
+
+    /// Everything a row in the list shows, as a value that can be compared.
+    /// An entry's actions are closures and cannot be; each is made from
+    /// what is here, so an equal face means the same actions.
+    struct Face: Equatable, Sendable {
+        let id: String
+        let name: String
+        let status: ClientStatus
+        let isLive: Bool
+        let dimmed: Bool
+        let glyph: Glyph
+        let isBusy: Bool
+        let switchLabel: String
+        let isOn: Bool?
+        let disambiguator: String?
+        let grantID: String?
+        let needsSignIn: Bool
+        let isAsking: Bool
+        let note: String?
+        let canForget: Bool
+    }
+
+    var face: Face {
+        Face(
+            id: id,
+            name: name,
+            status: status,
+            isLive: isLive,
+            dimmed: dimmed,
+            glyph: glyph,
+            isBusy: isBusy,
+            switchLabel: switchLabel,
+            isOn: isOn,
+            disambiguator: disambiguator,
+            grantID: grantID,
+            needsSignIn: needsSignIn,
+            isAsking: asking != nil,
+            note: note,
+            canForget: forget != nil
+        )
+    }
 }
 
 private typealias Entry = ClientEntry
@@ -1107,10 +1158,17 @@ private struct ClientGlyph: View {
 }
 
 /// One client: its icon, its name, and one switch. The switch works without
-/// selecting the row.
-private struct ClientRow: View {
+/// selecting the row. Equal while what it shows is the same, so one client
+/// changing does not redraw every row.
+private struct ClientRow: View, Equatable {
     let entry: ClientEntry
+    /// What the row shows, kept beside the entry so two rows can be compared.
+    let face: ClientEntry.Face
     let canMutate: Bool
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.face == rhs.face && lhs.canMutate == rhs.canMutate
+    }
 
     private static let liveDot: CGFloat = 7
 

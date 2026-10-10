@@ -15,7 +15,8 @@ struct EventsView: View {
     @State private var stoppingName = ""
 
     private var all: [EventFacts] { (model.snapshot.events ?? []).map(EventFacts.init(_:)) }
-    private var events: [EventFacts] {
+    /// The events the search leaves.
+    private func matching(in all: [EventFacts]) -> [EventFacts] {
         let query = search.trimmingCharacters(in: .whitespaces)
         guard !query.isEmpty else { return all }
         return all.filter {
@@ -24,7 +25,7 @@ struct EventsView: View {
         }
     }
 
-    private var summary: String? {
+    private static func summary(of all: [EventFacts]) -> String? {
         guard !all.isEmpty else { return nil }
         let trouble = all.filter(\.health.needsAttention).count
         let count = all.count == 1 ? "1 event" : "\(all.count) events"
@@ -34,7 +35,12 @@ struct EventsView: View {
     private var serverNames: Set<String> { Set(model.situation.servers.map(\.name)) }
 
     var body: some View {
-        Group {
+        // Read once for each time the page is drawn; the list, the detail
+        // and the count line all use the same result.
+        let all = self.all
+        let events = matching(in: all)
+        let selected = events.first { $0.name == router.selectedEvent }
+        return Group {
             if model.isLoadingInitialData {
                 LoadingPage(message: "Loading events")
             } else if model.initialDataUnavailable {
@@ -58,6 +64,7 @@ struct EventsView: View {
                         List(selection: $router.selectedEvent) {
                             ForEach(events) { event in
                                 EventRow(event: event)
+                                    .equatable()
                                     .tag(event.name)
                                     .listRowSeparator(.hidden)
                                     .contextMenu {
@@ -91,7 +98,7 @@ struct EventsView: View {
                 }
             }
         }
-        .pageSubtitle(summary)
+        .pageSubtitle(Self.summary(of: all))
         .toolbar {
             // The window draws a section once per column; the button sits
             // beside search. Above the list it did not fit once the sidebar
@@ -106,7 +113,7 @@ struct EventsView: View {
                 }
             }
         }
-        .onChange(of: events.map(\.name), initial: true) { keepSelectionVisible() }
+        .onChange(of: events.map(\.name), initial: true) { _, names in keepSelectionVisible(names) }
         .confirmationDialog(
             "Stop watching \(stoppingName)?",
             isPresented: Binding(get: { stopping != nil }, set: { if !$0 { stopping = nil } }),
@@ -120,15 +127,12 @@ struct EventsView: View {
         }
     }
 
-    private var selected: EventFacts? { events.first { $0.name == router.selectedEvent } }
-
     private func askToStop(_ event: EventFacts) {
         stoppingName = event.name
         stopping = event
     }
 
-    private func keepSelectionVisible() {
-        let names = events.map(\.name)
+    private func keepSelectionVisible(_ names: [String]) {
         if let current = router.selectedEvent, names.contains(current) { return }
         Task { @MainActor in
             await Task.yield()
@@ -164,8 +168,13 @@ private struct EventGlyph: View {
 
     private var size: CGFloat { large ? 28 : 18 }
 }
-private struct EventRow: View {
+
+/// Equal while the event is the same, so one event changing does not redraw
+/// the others.
+private struct EventRow: View, Equatable {
     let event: EventFacts
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool { lhs.event == rhs.event }
 
     var body: some View {
         HStack(spacing: Metric.tight) {
