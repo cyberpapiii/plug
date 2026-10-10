@@ -39,6 +39,10 @@ struct RootView: View {
     @State private var firstMoment: FirstRunGuide.Step?
 
     @State private var columns = NavigationSplitViewVisibility.all
+    /// Follows the sidebar, but late on the way back: a second line under
+    /// the title while the sidebar is still sliding in does not fit, and the
+    /// bar folds its buttons into a "more" button until it does.
+    @State private var showsSubtitle = true
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -51,6 +55,11 @@ struct RootView: View {
             }
             .safeAreaInset(edge: .top, spacing: 0) { sidebarTop }
             .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
+            // The bar's own button lives over the sidebar. While the sidebar
+            // slides back in there is no room for it there, so it vanished
+            // behind a "more" button and then jumped back. Plug's own sits
+            // over the list and moves with it.
+            .toolbar(removing: .sidebarToggle)
         } content: {
             section
                 .environment(\.splitPane, .list)
@@ -58,14 +67,32 @@ struct RootView: View {
                 // resizes while the sidebar slides makes the slide stutter.
                 // Without the sidebar the window's buttons sit over this
                 // column, so the title drops its second line to fit.
-                .environment(\.showsPageSubtitle, columns == .all)
+                .environment(\.showsPageSubtitle, showsSubtitle)
+                .task(id: columns == .all) {
+                    guard columns == .all else {
+                        showsSubtitle = false
+                        return
+                    }
+                    try? await Task.sleep(for: .milliseconds(450))
+                    if !Task.isCancelled { showsSubtitle = true }
+                }
                 .navigationSplitViewColumnWidth(min: 240, ideal: Metric.listWidth, max: 420)
                 .navigationTitle(router.section.rawValue)
+                .toolbar {
+                    ToolbarItem(placement: .navigation) {
+                        Button {
+                            withAnimation { columns = columns == .all ? .doubleColumn : .all }
+                        } label: {
+                            Label(columns == .all ? "Hide Sidebar" : "Show Sidebar", systemImage: "sidebar.leading")
+                        }
+                        .help(columns == .all ? "Hide Sidebar" : "Show Sidebar")
+                    }
+                }
         } detail: {
             section
                 .environment(\.splitPane, .detail)
                 .toolbar {
-                    ToolbarItem { Spacer() }
+                    trailingSpace
                     searchItem
                 }
             .topBanner(
@@ -133,6 +160,20 @@ struct RootView: View {
         .task { await model.loadConnectableApps() }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    /// Pushes search to the far end of the bar. A plain spacer in an item of
+    /// its own is drawn as an empty piece of glass beside it.
+    @ToolbarContentBuilder private var trailingSpace: some ToolbarContent {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            ToolbarSpacer(.flexible)
+        } else {
+            ToolbarItem { Spacer() }
+        }
+#else
+        ToolbarItem { Spacer() }
+#endif
     }
 
     /// The search control draws its own glass, so the bar's is turned off
