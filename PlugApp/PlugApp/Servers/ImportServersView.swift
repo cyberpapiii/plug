@@ -57,7 +57,8 @@ struct ImportServersView: View {
                 title: "Plug could not read your other clients' settings.",
                 reason: failure,
                 actionTitle: "Try Again",
-                action: { Task { await load() } }
+                action: { Task { await load() } },
+                failed: true
             )
             .padding(.horizontal, Metric.roomy)
         } else if let scan {

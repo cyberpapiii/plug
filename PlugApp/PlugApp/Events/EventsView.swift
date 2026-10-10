@@ -171,8 +171,8 @@ private struct EventRow: View {
             EventGlyph(health: event.health)
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(event.name)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
                 Text(event.stateWord)
                     .font(.callout)
                     .foregroundStyle(.secondary)
@@ -248,7 +248,7 @@ private struct EventDetail: View {
                         .textSelection(.enabled)
                 }
             } header: {
-                Text("Details")
+                SectionLabel(text: "Details")
             } footer: {
                 Text("Clients connected over the network can listen for this event. Plug sends the new result each time it changes.")
             }

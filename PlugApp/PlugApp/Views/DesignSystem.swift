@@ -27,6 +27,31 @@ struct ServicePowerToggle: View {
     }
 }
 
+/// Plug's top row, the same in the menu bar panel, the window and Settings:
+/// the character with how Plug is on its face, one line that says it, and
+/// the switch.
+struct PlugHeadline: View {
+    let model: AppModel
+    let run: (PlugIntent) -> Void
+    var characterSize: CGFloat = 40
+
+    var body: some View {
+        let verdict = model.verdict
+        HStack(spacing: Metric.panelGap) {
+            PlugCharacter(mood: verdict.mood, mark: verdict.tone == .blocked ? StatusColor.stopped : StatusColor.needsYou)
+                .foregroundStyle(.tint)
+                .frame(width: characterSize, height: characterSize)
+            Text(verdict.title)
+                .font(PanelType.title)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+                .accessibilityAddTraits(.isHeader)
+            Spacer(minLength: Metric.tight)
+            ServicePowerToggle(model: model, run: run).labelsHidden()
+        }
+    }
+}
+
 // MARK: - Metrics
 
 /// One spacing scale for the whole app. Every gap in Plug is one of these.
@@ -203,6 +228,13 @@ struct SectionLabel: View {
             }
         }
         .accessibilityAddTraits(.isHeader)
+    }
+}
+
+extension Section where Parent == SectionLabel, Content: View, Footer == EmptyView {
+    /// A group in a form, named in the one heading style.
+    init(heading: String, @ViewBuilder content: () -> Content) {
+        self.init(content: content, header: { SectionLabel(text: heading) })
     }
 }
 

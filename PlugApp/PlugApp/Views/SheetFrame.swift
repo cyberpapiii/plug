@@ -56,7 +56,7 @@ struct SheetFrame<Content: View, Extra: View>: View {
                 extra
                 Spacer(minLength: 0)
                 if busy {
-                    ProgressView().controlSize(.small)
+                    WaitingDots()
                 }
                 if let confirmTitle {
                     Button(cancelTitle) { dismiss() }

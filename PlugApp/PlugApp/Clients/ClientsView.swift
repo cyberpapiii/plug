@@ -598,7 +598,7 @@ struct ClientsView: View {
                 ListDetail {
                     List(selection: $router.selectedClient) {
                         if let error = model.connectableAppsError {
-                            ProblemNote(title: "Plug could not look for clients on this Mac", reason: error)
+                            ProblemNote(title: "Plug could not look for clients on this Mac", reason: error, failed: true)
                                 .selectionDisabled()
                         }
                         ForEach(ClientPlaces.ordered(entries.map(\.place)), id: \.self) { place in
@@ -1118,8 +1118,8 @@ private struct ClientRow: View {
             ClientGlyph(glyph: entry.glyph)
                 .opacity(entry.dimmed ? 0.4 : 1)
             Text(entry.name)
-                .lineLimit(1)
-                .truncationMode(.middle)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
                 .foregroundStyle(entry.dimmed ? .secondary : .primary)
                 .layoutPriority(1)
                 .accessibilityLabel("\(entry.name), \(entry.status.text)")
@@ -1278,7 +1278,7 @@ private struct ClientDetail: View {
                         }
                     }
                 } header: {
-                    Text("Servers")
+                    SectionLabel(text: "Servers")
                 } footer: {
                     Text(Self.note(for: access))
                 }
@@ -1320,8 +1320,8 @@ private struct ClientDetail: View {
                 } else {
                     Text(entry.name)
                         .font(.title3.weight(.semibold))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                        .lineLimit(3)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 Text(entry.status.text)
                     .font(.callout)

@@ -480,7 +480,7 @@ private struct TroubleRow: View {
 
     @ViewBuilder private var fixControl: some View {
         if let cancel = server.cancelSignIn {
-            ProgressView().controlSize(.small)
+            WaitingDots()
             Button(cancel.title) { run(cancel.intent) }
                 .accessibilityLabel("\(cancel.title), \(server.name)")
         } else if let fix = server.fix {

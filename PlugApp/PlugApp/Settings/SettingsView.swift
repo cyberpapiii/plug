@@ -31,8 +31,11 @@ struct SettingsView: View {
 
     var body: some View {
         Form {
-            general
+            Section {
+                PlugHeadline(model: model, run: run)
+            }
             plug
+            general
             permissions
             files
             about
@@ -62,7 +65,7 @@ struct SettingsView: View {
     // MARK: General
 
     private var general: some View {
-        Section("General") {
+        Section(heading: "General") {
             Toggle("Open at Login", isOn: Binding(
                 get: { launchAtLogin },
                 set: { setLoginItem($0) }
@@ -108,12 +111,11 @@ struct SettingsView: View {
 
     private var plug: some View {
         Section {
-            ServicePowerToggle(model: model, run: run)
             if model.serviceEnabled {
                 LabeledContent("Status") {
                     HStack(spacing: Metric.tight) {
                         if serviceIsSettling {
-                            ProgressView().controlSize(.small)
+                            WaitingDots()
                         } else {
                             PlugIcon(serviceIcon)
                                 .foregroundStyle(serviceColor)
@@ -127,7 +129,7 @@ struct SettingsView: View {
             }
             checkupRows
         } header: {
-            Text("Plug")
+            SectionLabel(text: "Plug")
         } footer: {
             Text("Plug keeps serving your clients after you close the window or quit. To stop it, turn Plug off.")
         }
@@ -165,9 +167,9 @@ struct SettingsView: View {
                 }
             }
         } header: {
-            Text("Permissions")
+            SectionLabel(text: "Permissions")
         } footer: {
-            Text("Plug keeps sign-ins and keys in your Keychain; when macOS asks, choose Always Allow. A server that reads your Mac's data, such as messages or contacts, has permissions of its own under Privacy & Security, which Plug cannot see or grant.")
+            Text("Plug keeps sign-ins and keys in your Keychain. When macOS asks, choose Always Allow. A server that reads your Mac's data has its own permissions under Privacy & Security.")
         }
     }
 
@@ -176,7 +178,7 @@ struct SettingsView: View {
     @ViewBuilder private var checkupRows: some View {
         LabeledContent {
             HStack(spacing: Metric.tight) {
-                if checking { ProgressView().controlSize(.small) }
+                if checking { WaitingDots() }
                 Button("Run Checkup") { Task { await runCheckup() } }
                     .disabled(checking)
             }
@@ -194,7 +196,7 @@ struct SettingsView: View {
         }
 
         if let checkupError {
-            ProblemNote(title: "The checkup could not run", reason: checkupError)
+            ProblemNote(title: "The checkup could not run", reason: checkupError, failed: true)
         }
 
         if let checkup {
@@ -235,7 +237,7 @@ struct SettingsView: View {
                 Button("Show in Finder") { run(.openLogs) }
             }
         } header: {
-            Text("Files")
+            SectionLabel(text: "Files")
         } footer: {
             Text("Plug saves your servers and clients here. Reload after editing the file by hand.")
         }
@@ -244,7 +246,7 @@ struct SettingsView: View {
     // MARK: About
 
     private var about: some View {
-        Section("About") {
+        Section(heading: "About") {
             HStack(spacing: Metric.snug) {
                 Image(nsImage: NSApp.applicationIconImage)
                     .resizable()

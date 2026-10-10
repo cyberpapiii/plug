@@ -48,7 +48,8 @@ struct RootView: View {
                         .tag(section)
                 }
             }
-            .navigationSplitViewColumnWidth(min: 150, ideal: 170, max: 220)
+            .safeAreaInset(edge: .top, spacing: 0) { sidebarTop }
+            .navigationSplitViewColumnWidth(min: 170, ideal: 190, max: 240)
         } content: {
             section
                 .environment(\.splitPane, .list)
@@ -129,6 +130,34 @@ struct RootView: View {
         .task { await model.loadConnectableApps() }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    /// Plug itself at the top of the sidebar: the character, the switch, and
+    /// the one line the menu bar panel says.
+    private var sidebarTop: some View {
+        let verdict = model.verdict
+        return VStack(alignment: .leading, spacing: Metric.tight) {
+            HStack(spacing: Metric.tight) {
+                PlugCharacter(mood: verdict.mood, mark: verdict.tone == .blocked ? StatusColor.stopped : StatusColor.needsYou)
+                    .foregroundStyle(.tint)
+                    .frame(width: 30, height: 30)
+                Text("Plug")
+                    .font(PanelType.title)
+                Spacer(minLength: Metric.tight)
+                ServicePowerToggle(model: model, run: run)
+                    .labelsHidden()
+                    .controlSize(.small)
+            }
+            Text(verdict.title)
+                .font(PanelType.small)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        .padding(.horizontal, Metric.panelInset)
+        .padding(.top, Metric.rowGap)
+        .padding(.bottom, Metric.snug)
+        .accessibilityElement(children: .contain)
     }
 
     /// The section in view. The window draws it in two columns, the rows in

@@ -257,7 +257,7 @@ struct AddClientView: View {
                 caption("Plug adds itself to \(name)'s settings.")
                 Spacer(minLength: 0)
                 if model.busyApps.contains(target) {
-                    ProgressView().controlSize(.small)
+                    WaitingDots()
                 } else {
                     Button("Add to \(name)") {
                         Task { await model.setAppLinked(target, true, overNetwork: chosenWay == .network) }
