@@ -26,6 +26,23 @@ struct FirstRunGuide: Equatable, Sendable {
                 "Ask your client to do something. The call shows up in Activity."
             }
         }
+
+        /// What Plug says the first time this step is done.
+        var firstTitle: String {
+            switch self {
+            case .server: "Your first server is in"
+            case .client: "Your first client is connected"
+            case .activity: "That was your first tool call"
+            }
+        }
+
+        var firstDetail: String {
+            switch self {
+            case .server: "Connect a client and it can use these tools."
+            case .client: "It can use every server in Plug."
+            case .activity: "Plug is all set. You will find it in the menu bar."
+            }
+        }
     }
 
     let serverCount: Int
@@ -56,5 +73,46 @@ struct FirstRunGuide: Equatable, Sendable {
     static var agentPrompt: String? {
         guard let url = Bundle.main.url(forResource: "agent-setup", withExtension: "md") else { return nil }
         return try? String(contentsOf: url, encoding: .utf8)
+    }
+}
+
+/// The first time each step is done on a new setup, Plug marks it, once.
+/// This remembers which steps have had their moment.
+struct FirstMoments: Equatable, Sendable {
+    /// The steps already marked or passed over. Nil until the first look.
+    private(set) var marked: Set<FirstRunGuide.Step>?
+
+    init(stored: String?) {
+        marked = stored.map { Set($0.split(separator: ",").compactMap { FirstRunGuide.Step(rawValue: String($0)) }) }
+    }
+
+    /// What to keep between launches.
+    var stored: String? {
+        marked.map { steps in FirstRunGuide.Step.allCases.filter(steps.contains).map(\.rawValue).joined(separator: ",") }
+    }
+
+    /// Looks at where the setup is now and returns the step to mark, if one
+    /// was just done. A Mac that already had servers at the first look is
+    /// not new, so nothing is ever marked there.
+    mutating func observe(_ guide: FirstRunGuide) -> FirstRunGuide.Step? {
+        let done = Set(FirstRunGuide.Step.allCases.filter(guide.isDone))
+        guard let marked else {
+            self.marked = guide.serverCount > 0 ? Set(FirstRunGuide.Step.allCases) : done
+            return nil
+        }
+        self.marked = marked.union(done)
+        // Two at once say the later one.
+        return FirstRunGuide.Step.allCases.last { done.contains($0) && !marked.contains($0) }
+    }
+}
+
+extension AppModel {
+    /// Where this Mac is in the three steps.
+    var firstRunGuide: FirstRunGuide {
+        FirstRunGuide(
+            serverCount: snapshot.configuredServers.count,
+            clientCount: connectableApps.filter { $0.linked || $0.live }.count + snapshot.downstreamClients.count,
+            hasActivity: !activities.isEmpty
+        )
     }
 }

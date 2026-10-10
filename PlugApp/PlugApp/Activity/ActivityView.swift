@@ -31,15 +31,14 @@ struct ActivityView: View {
             } else if model.activities.isEmpty {
                 EmptyPage(
                     title: "No Activity",
-                    message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked.",
-                    symbol: AppSection.activity.symbol
+                    message: "Each time a client uses a tool, it shows here with the client, the server, the time, and whether it worked."
                 )
             } else if visible.isEmpty {
                 if scope == .problems, search.trimmingCharacters(in: .whitespaces).isEmpty {
                     EmptyPage(
                         title: "No Problems",
                         message: "No recent call failed.",
-                        symbol: "checkmark.circle"
+                        mood: .awake
                     )
                 } else {
                     NoSearchResults(text: search)

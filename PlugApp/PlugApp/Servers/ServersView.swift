@@ -24,7 +24,6 @@ struct ServersView: View {
                 EmptyPage(
                     title: "No Servers",
                     message: "Add one and every client connected to Plug can use it right away.",
-                    symbol: AppSection.servers.symbol,
                     actionTitle: "Add Server…",
                     actionIntent: .addServer,
                     secondaryTitle: "Import Servers…",

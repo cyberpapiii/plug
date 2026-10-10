@@ -43,7 +43,6 @@ struct EventsView: View {
                 EmptyPage(
                     title: "No Events",
                     message: "Plug can watch a tool and tell a client when its result changes.",
-                    symbol: AppSection.events.symbol,
                     actionTitle: model.canMutate ? "Watch a Tool…" : nil,
                     actionIntent: model.canMutate ? .addWatch : nil,
                     run: run

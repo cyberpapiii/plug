@@ -53,12 +53,16 @@ enum PlugMark {
 
 /// Plug's mark, moving the way its state reads. It blinks and glances about
 /// when all is well, looks from side to side while it works, shakes its head
-/// once when something is wrong, hops when that passes, and dozes when Plug
-/// is off. It hops when clicked, too. With Reduce Motion on it holds still.
+/// once when something is wrong, hops when that passes, dozes when Plug is
+/// off, and tilts its head on a page with nothing on it yet. It hops when
+/// clicked, too, and sparks when it is cheered. With Reduce Motion on it
+/// holds still.
 /// It takes the foreground style it is given.
 struct PlugCharacter: View {
     enum Mood: Equatable {
         case awake, working, troubled, asleep
+        /// Waiting for a first something, on a page with nothing on it yet.
+        case curious
 
         init(_ tone: Verdict.Tone) {
             switch tone {
@@ -71,7 +75,8 @@ struct PlugCharacter: View {
     }
 
     let mood: Mood
-    /// Each time this goes up, the character hops, as when a step is done.
+    /// Each time this goes up, the character hops and sparks fly off its
+    /// prongs, as when a step is done.
     var cheers = 0
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
@@ -80,6 +85,8 @@ struct PlugCharacter: View {
     @State private var lean = PlugMark.lean
     @State private var breathing = false
     @State private var lift: CGFloat = 0
+    /// Whole numbers are rest. Each cheer runs it up to the next one.
+    @State private var sparks: CGFloat = 0
     @State private var shown: Mood?
 
     var body: some View {
@@ -91,9 +98,10 @@ struct PlugCharacter: View {
         .compositingGroup()
         .scaleEffect(breathing ? 1.06 : 1)
         .visualEffect { [lift] content, proxy in content.offset(y: lift * proxy.size.height) }
+        .overlay { Sparks(progress: sparks - sparks.rounded(.down)) }
         .task(id: Script(mood: mood, still: reduceMotion)) { try? await perform() }
         .onChange(of: cheers) { old, new in
-            if new > old { Task { try? await hop() } }
+            if new > old { Task { try? await cheer() } }
         }
         .contentShape(Rectangle())
         .onTapGesture { Task { try? await hop() } }
@@ -139,6 +147,16 @@ struct PlugCharacter: View {
                 try await pause(.random(in: 3...6))
                 try await blink()
             }
+        case .curious:
+            try await pause(0.9)
+            while true {
+                withAnimation(.smooth(duration: 0.35)) { lean = Self.tilt }
+                try await pause(1.4)
+                withAnimation(.smooth(duration: 0.35)) { lean = PlugMark.lean }
+                try await pause(.random(in: 3...6))
+                try await blink()
+                try await pause(.random(in: 2...4))
+            }
         case .awake:
             while true {
                 try await pause(.random(in: 2.5...6))
@@ -150,6 +168,15 @@ struct PlugCharacter: View {
                 withAnimation(.smooth(duration: 0.3)) { gaze = 0 }
             }
         }
+    }
+
+    /// The other way from its lean, as a head tilts at a question.
+    private static let tilt: CGFloat = 6
+
+    private func cheer() async throws {
+        guard !reduceMotion else { return }
+        withAnimation(.easeOut(duration: 0.6)) { sparks = sparks.rounded(.down) + 1 }
+        try await hop()
     }
 
     private func hop() async throws {
@@ -193,6 +220,34 @@ struct PlugCharacter: View {
             )
             return (eyes ? PlugMark.eyes(open: open, gaze: gaze) : PlugMark.silhouette).applying(placement)
         }
+    }
+}
+
+/// What flies off the prongs when the character is cheered: five short bars
+/// that leave, stretch, and are gone. At rest there is nothing to draw.
+private struct Sparks: Shape {
+    /// From just leaving (0) to gone (1).
+    var progress: CGFloat
+
+    var animatableData: CGFloat {
+        get { progress }
+        set { progress = newValue }
+    }
+
+    func path(in rect: CGRect) -> Path {
+        guard progress > 0, progress < 1 else { return Path() }
+        let size = min(rect.width, rect.height)
+        let near = size * (0.5 + 0.28 * progress)
+        let far = near + size * 0.16 * sin(progress * .pi)
+        var path = Path()
+        // Fanned around the way the prongs point.
+        for degrees in [-60.0, -30, 0, 30, 60] {
+            let angle = (degrees + PlugMark.lean - 90) * .pi / 180
+            let direction = CGPoint(x: cos(angle), y: sin(angle))
+            path.move(to: CGPoint(x: rect.midX + direction.x * near, y: rect.midY + direction.y * near))
+            path.addLine(to: CGPoint(x: rect.midX + direction.x * far, y: rect.midY + direction.y * far))
+        }
+        return path.strokedPath(StrokeStyle(lineWidth: size * 0.07 * (1 - 0.5 * progress), lineCap: .round))
     }
 }
 
