@@ -162,23 +162,48 @@ struct PlugApplication: App {
     }
 }
 
-/// The menu bar icon. Awake, it blinks now and then, unless Reduce Motion is on.
+/// The menu bar icon. Awake, it blinks now and then; while Plug is busy it
+/// looks from side to side. With Reduce Motion on it holds still.
 private struct MenuBarLabel: View {
+    private enum Motion { case still, blinking, looking }
+
     let mark: MenuBarMark
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var blinking = false
+    @State private var gaze = 0
 
-    private var blinks: Bool { mark.awake && !reduceMotion }
+    private var motion: Motion {
+        guard mark.awake, !reduceMotion else { return .still }
+        return mark.working ? .looking : .blinking
+    }
 
     var body: some View {
-        Image(nsImage: MenuBarIcon.image(for: mark, blinking: blinking && blinks))
-            .task(id: blinks) {
-                guard blinks else { return }
-                while !Task.isCancelled {
-                    try? await Task.sleep(for: .seconds(.random(in: 6...14)))
-                    blinking = true
-                    try? await Task.sleep(for: .seconds(0.13))
+        Image(nsImage: MenuBarIcon.image(for: mark, blinking: blinking, gaze: gaze))
+            .task(id: motion) {
+                blinking = false
+                gaze = 0
+                do {
+                    switch motion {
+                    case .still:
+                        return
+                    case .blinking:
+                        while true {
+                            try await Task.sleep(for: .seconds(.random(in: 6...14)))
+                            blinking = true
+                            try await Task.sleep(for: .seconds(0.13))
+                            blinking = false
+                        }
+                    case .looking:
+                        while true {
+                            for side in [1, -1] {
+                                gaze = side
+                                try await Task.sleep(for: .seconds(0.8))
+                            }
+                        }
+                    }
+                } catch {
                     blinking = false
+                    gaze = 0
                 }
             }
     }
@@ -190,13 +215,15 @@ enum MenuBarIcon {
     private struct Drawing: Hashable {
         let mark: MenuBarMark
         let blinking: Bool
+        let gaze: Int
     }
 
     @MainActor private static var drawn: [Drawing: NSImage] = [:]
 
     @MainActor
-    static func image(for mark: MenuBarMark, blinking: Bool = false) -> NSImage {
-        let drawing = Drawing(mark: mark, blinking: blinking)
+    /// `gaze` is -1, 0 or 1: looking left, ahead, or right.
+    static func image(for mark: MenuBarMark, blinking: Bool = false, gaze: Int = 0) -> NSImage {
+        let drawing = Drawing(mark: mark, blinking: blinking, gaze: gaze)
         if let image = drawn[drawing] { return image }
         // A plain plug takes no more room than it needs.
         let width: CGFloat = mark.badge == nil ? 16 : 25
@@ -205,7 +232,7 @@ enum MenuBarIcon {
             // A badged plug sits at the left, so the badge clears its eyes.
             let middle: CGFloat = mark.badge == nil ? rect.midX : 8
             drawPlug(
-                awake: mark.awake, eyesOpen: mark.awake && !blinking,
+                awake: mark.awake, eyesOpen: mark.awake && !blinking, gaze: gaze,
                 centre: CGPoint(x: middle, y: rect.midY), in: context
             )
             guard let name = mark.badge, let badge = symbol(name, points: 8.5, weight: .bold) else { return true }
@@ -224,7 +251,9 @@ enum MenuBarIcon {
     }
 
     /// Awake the mark is solid; asleep it is an outline with its eyes shut.
-    private static func drawPlug(awake: Bool, eyesOpen: Bool, centre: CGPoint, in context: CGContext) {
+    private static func drawPlug(
+        awake: Bool, eyesOpen: Bool, gaze: Int, centre: CGPoint, in context: CGContext
+    ) {
         let scale = 15 / PlugMark.height
         var placement = PlugMark.placement(centre: centre, scale: scale, yUp: true)
         func add(_ path: Path) {
@@ -244,7 +273,7 @@ enum MenuBarIcon {
             context.fillPath()
             context.setBlendMode(.normal)
         }
-        add(PlugMark.eyes(open: eyesOpen ? 1 : 0, lid: line))
+        add(PlugMark.eyes(open: eyesOpen ? 1 : 0, gaze: CGFloat(gaze) * 5, lid: line))
         context.fillPath()
         context.setBlendMode(.normal)
     }

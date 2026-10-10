@@ -242,9 +242,11 @@ struct LoadingPage: View {
 
     var body: some View {
         PagePane {
-            ProgressView()
-                .controlSize(.small)
+            PlugCharacter(mood: .working)
+                .foregroundStyle(.secondary)
+                .frame(width: 44, height: 44)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .accessibilityElement()
                 .accessibilityLabel(message)
         }
     }

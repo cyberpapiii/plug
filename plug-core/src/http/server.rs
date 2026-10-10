@@ -26,8 +26,9 @@ use super::error::HttpError;
 use super::oauth::{
     get_oauth_authorization_server_metadata, get_oauth_protected_resource_metadata,
     oauth_authorize, oauth_consent_challenge, oauth_consent_decision, oauth_consent_javascript,
-    oauth_enroll_javascript, oauth_owner_enroll, oauth_owner_enroll_challenge,
-    oauth_owner_enroll_complete, oauth_register, oauth_token, protected_resource_metadata_url,
+    oauth_enroll_javascript, oauth_icon, oauth_owner_enroll, oauth_owner_enroll_challenge,
+    oauth_owner_enroll_complete, oauth_register, oauth_stylesheet, oauth_token,
+    protected_resource_metadata_url,
 };
 use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_oauth::{AccessTokenClaims, AccessTokenValidation, resource_scopes};
@@ -690,6 +691,8 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .route("/oauth/consent/decision", post(oauth_consent_decision))
         .route("/oauth/owner/enroll", get(oauth_owner_enroll))
         .route("/oauth/assets/enroll.js", get(oauth_enroll_javascript))
+        .route("/oauth/assets/plug.css", get(oauth_stylesheet))
+        .route("/oauth/assets/plug-icon.svg", get(oauth_icon))
         .route(
             "/oauth/owner/enroll/challenge",
             post(oauth_owner_enroll_challenge),
@@ -6896,7 +6899,7 @@ mod tests {
                 .get("Content-Security-Policy")
                 .and_then(|value| value.to_str().ok()),
             Some(
-                "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'"
             )
         );
         let body = axum::body::to_bytes(response.into_body(), 10_000)
@@ -6910,7 +6913,7 @@ mod tests {
             (header::CACHE_CONTROL.as_str(), "no-store"),
             (
                 "content-security-policy",
-                "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
             ),
             ("referrer-policy", "no-referrer"),
             ("x-content-type-options", "nosniff"),
@@ -7470,12 +7473,29 @@ mod tests {
         use sha2::Digest as _;
 
         let app = build_router(oauth_test_state());
-        for path in ["/oauth/assets/consent.js", "/oauth/assets/enroll.js"] {
-            let source = match path {
-                "/oauth/assets/consent.js" => crate::http::oauth_ui::CONSENT_JAVASCRIPT,
-                "/oauth/assets/enroll.js" => crate::http::oauth_ui::ENROLL_JAVASCRIPT,
-                _ => unreachable!("test only covers embedded OAuth assets"),
-            };
+        use crate::http::oauth_ui;
+        for (path, source, content_type) in [
+            (
+                "/oauth/assets/consent.js",
+                oauth_ui::CONSENT_JAVASCRIPT,
+                oauth_ui::JAVASCRIPT_TYPE,
+            ),
+            (
+                "/oauth/assets/enroll.js",
+                oauth_ui::ENROLL_JAVASCRIPT,
+                oauth_ui::JAVASCRIPT_TYPE,
+            ),
+            (
+                "/oauth/assets/plug.css",
+                oauth_ui::STYLESHEET,
+                oauth_ui::STYLESHEET_TYPE,
+            ),
+            (
+                "/oauth/assets/plug-icon.svg",
+                oauth_ui::ICON,
+                oauth_ui::ICON_TYPE,
+            ),
+        ] {
             let expected_etag = format!(
                 "\"plug-{}\"",
                 hex::encode(sha2::Sha256::digest(source.as_bytes()))
@@ -7493,7 +7513,7 @@ mod tests {
                     .headers()
                     .get(header::CONTENT_TYPE)
                     .and_then(|value| value.to_str().ok()),
-                Some("application/javascript; charset=utf-8")
+                Some(content_type)
             );
             assert_eq!(
                 response
@@ -7512,7 +7532,7 @@ mod tests {
             for (name, expected) in [
                 (
                     "content-security-policy",
-                    "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
+                    "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'",
                 ),
                 ("referrer-policy", "no-referrer"),
                 ("x-content-type-options", "nosniff"),
@@ -7530,8 +7550,8 @@ mod tests {
             let body = axum::body::to_bytes(response.into_body(), 128 * 1024)
                 .await
                 .expect("asset body");
-            let body = String::from_utf8(body.to_vec()).expect("JavaScript asset");
-            assert!(body.contains("navigator.credentials"));
+            let body = String::from_utf8(body.to_vec()).expect("text asset");
+            assert_eq!(body, source);
             assert!(!body.contains("operator_token"));
             assert!(!body.contains("127.0.0.1"));
             assert!(!body.contains("localhost"));

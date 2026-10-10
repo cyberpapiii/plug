@@ -17,7 +17,7 @@ const CLIENT_ORIGIN = "https://client.test";
 const CALLBACK_URL = `${CLIENT_ORIGIN}/callback`;
 const RESOURCE = `${PUBLIC_ORIGIN}/mcp`;
 const PROTOCOL_VERSION = "2025-11-25";
-const OAUTH_CSP = "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const OAUTH_CSP = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 
 async function freePort() {
   return await new Promise((resolvePort, reject) => {
