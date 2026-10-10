@@ -69,7 +69,10 @@ final class NotificationService {
         defer { previous = snapshot }
         guard let previous else { return }
 
-        let oldAuth = Dictionary(uniqueKeysWithValues: previous.upstreamAuth.map { ($0.name, $0.authenticated) })
+        let oldAuth = Dictionary(
+            previous.upstreamAuth.map { ($0.name, $0.authenticated) },
+            uniquingKeysWith: { first, _ in first }
+        )
         for server in snapshot.upstreamAuth where !server.authenticated && oldAuth[server.name] == true {
             post(Note(
                 id: "upstream-reauth-\(server.name)",
