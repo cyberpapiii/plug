@@ -12,6 +12,24 @@ enum SplitPane {
 
 extension EnvironmentValues {
     @Entry var splitPane: SplitPane = .whole
+    /// False while the list column sits under the window's buttons.
+    @Entry var showsPageSubtitle = true
+}
+
+extension View {
+    /// The count under a section's title, when there is room for it.
+    func pageSubtitle(_ text: String?) -> some View {
+        modifier(PageSubtitle(text: text))
+    }
+}
+
+private struct PageSubtitle: ViewModifier {
+    let text: String?
+    @Environment(\.showsPageSubtitle) private var shows
+
+    func body(content: Content) -> some View {
+        content.navigationSubtitle(shows ? text ?? "" : "")
+    }
 }
 
 /// A section's rows and the selected row in full. Every section is laid out

@@ -91,7 +91,7 @@ struct EventsView: View {
                 }
             }
         }
-        .navigationSubtitle(summary ?? "")
+        .pageSubtitle(summary)
         .toolbar {
             // The window draws a section once per column; the button goes
             // above the list.

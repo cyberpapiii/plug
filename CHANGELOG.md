@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Search in the window is a magnifying glass in the bar until you press it, the way Finder shows it. Hiding and showing the sidebar is smooth: the list beside it keeps one width, where it used to resize while the sidebar moved.
 - The window and Settings open with Plug itself, as the menu bar panel does: Plug's character, one line saying how Plug is, and the switch. In the window they sit at the top of the sidebar; in Settings they are the first row, and the Plug section comes before General. A note about a problem is washed orange when it asks for something and red when something failed. Headings inside a page all look the same. A long server, client or event name wraps to a second line where it used to be cut in the middle. Short waits show Plug's three dots in place of a spinner.
 - In the window, a tool's name is shown as code wherever it appears, the way the menu bar panel shows it. No text is smaller than 12 points. A tool's row no longer has an info button: click the tool's name or description to see its details.
 - Plug has its own icons. The pages in the sidebar, a server's status, the result of a tool call, and buttons such as add, edit and dismiss are drawn for Plug in one line weight, in place of stock system symbols. Status colours come from one set everywhere.

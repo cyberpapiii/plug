@@ -68,7 +68,7 @@ struct ActivityView: View {
                 }
             }
         }
-        .navigationSubtitle(model.activitySummary ?? "")
+        .pageSubtitle(model.activitySummary)
         .toolbar {
             // The window draws a section once per column; the filter sits
             // beside the search field.
