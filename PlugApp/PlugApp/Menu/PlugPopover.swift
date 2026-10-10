@@ -51,14 +51,16 @@ struct PlugPopover: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: Metric.snug) {
-            HStack {
-                Text("Plug").font(.headline)
-                Spacer()
-                ServicePowerToggle(model: model, run: run)
-                    .labelsHidden()
-                    .controlSize(.small)
-            }
-            VerdictView(verdict: heroVerdict, style: .hero, run: send)
+            VerdictView(
+                verdict: heroVerdict,
+                style: .hero,
+                accessory: AnyView(
+                    ServicePowerToggle(model: model, run: run)
+                        .labelsHidden()
+                        .controlSize(.small)
+                ),
+                run: send
+            )
             if let error = model.actionError {
                 ProblemNote(error) { send(.dismissActionError) }
             }
@@ -75,6 +77,7 @@ struct PlugPopover: View {
         guard verdict.primary?.intent == .setServiceEnabled(true) else { return verdict }
         return Verdict(
             tone: verdict.tone,
+            mood: verdict.mood,
             title: verdict.title,
             detail: verdict.detail,
             primary: nil,
