@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Stacked client icons and the status dot on a server's icon no longer carry a grey outline on glass. The gap around them is now the panel showing through.
 - The menu bar panel never cuts a client's name short, shows the last tool call's name the way code is shown in a message, stacks connected clients' icons at the size of a server's, and has more space between its groups.
 - The menu bar panel has more room and larger text. It has headings for Servers, Clients, Events and Activity, shows servers that are off as dimmed icons, and names the clients that are connected.
 - Plug's character has seventeen faces where it had five, and it changes shape from one to the next on springs: its prongs move like ears, and its three parts pull apart into three dots while a page loads, an exclamation mark when Plug is stopped, and back. It looks happy for a moment when trouble passes, worried when a server stops, unsure when some servers run and others do not, and it waits beside a dot when it needs you. Click it and it winks; keep clicking and it goes through every face. The faces are listed in `docs/BRAND.md`.
