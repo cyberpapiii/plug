@@ -378,13 +378,15 @@ final class AppModel {
         // pass before asking the daemon anything kept a healthy Plug on
         // "Starting…" for seconds.
         let readsDuringLaunch = isOnlyInspecting
-        let launch = Task { await reconcile(trigger: .applicationLaunch) }
-        if readsDuringLaunch { await refresh() }
-        await launch.value
-        guard !Task.isCancelled else { return }
-        await refresh()
-        guard !Task.isCancelled else { return }
-        startMonitoring()
+        // A task of the model's own: the surface that asked may go away before
+        // launch is over, and Plug must still end up watching the daemon.
+        await Task {
+            let launch = Task { await reconcile(trigger: .applicationLaunch) }
+            if readsDuringLaunch { await refresh() }
+            await launch.value
+            await refresh()
+            startMonitoring()
+        }.value
     }
 
     private func startMonitoring() {
