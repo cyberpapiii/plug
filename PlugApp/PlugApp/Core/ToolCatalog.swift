@@ -20,6 +20,9 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
     let ownName: String?
     /// The server says calling this tool changes nothing.
     let isReadOnly: Bool
+    /// The name without its server prefix, which the surrounding group already
+    /// states. The full name when there is no prefix to drop.
+    let shortName: String
 
     init(
         name: String,
@@ -37,16 +40,12 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
         self.lockedByPattern = lockedByPattern
         self.ownName = ownName
         self.isReadOnly = isReadOnly
-    }
-
-    /// The name without its server prefix, which the surrounding group already
-    /// states. Falls back to the full name when there is no prefix to drop.
-    var shortName: String {
         let prefix = "\(server)__"
-        guard name.count > prefix.count,
-              name.lowercased().hasPrefix(prefix.lowercased())
-        else { return name }
-        return String(name.dropFirst(prefix.count))
+        if name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased()) {
+            shortName = String(name.dropFirst(prefix.count))
+        } else {
+            shortName = name
+        }
     }
 
     var canToggle: Bool { lockedByPattern == nil }
@@ -80,10 +79,16 @@ struct ToolGroup: Identifiable, Equatable, Sendable {
 /// what a search matches and how groups are ordered can be tested directly.
 struct ToolCatalog: Equatable, Sendable {
     let tools: [ToolFacts]
+    /// Each server's tools in the order they are shown. Every row of a server
+    /// asks for these, so they are sorted once, when the list arrives.
+    private let byServer: [String: [ToolFacts]]
 
     init(_ tools: [ToolFacts] = []) {
         self.tools = tools
+        byServer = Dictionary(grouping: tools, by: \.server).mapValues { $0.sorted(by: ToolFacts.inNameOrder) }
     }
+
+    static func == (lhs: ToolCatalog, rhs: ToolCatalog) -> Bool { lhs.tools == rhs.tools }
 
     var isEmpty: Bool { tools.isEmpty }
 
@@ -108,9 +113,7 @@ struct ToolCatalog: Equatable, Sendable {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let matched = needle.isEmpty ? tools : tools.filter { $0.matches(needle) }
         return Dictionary(grouping: matched, by: \.server)
-            .map { server, tools in
-                ToolGroup(server: server, tools: tools.sorted { $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending })
-            }
+            .map { server, tools in ToolGroup(server: server, tools: tools.sorted(by: ToolFacts.inNameOrder)) }
             .sorted { $0.server.localizedStandardCompare($1.server) == .orderedAscending }
     }
 
@@ -118,12 +121,10 @@ struct ToolCatalog: Equatable, Sendable {
     /// off without being named, so the panel that explains one has to be able
     /// to list what else it took.
     func tools(coveredBy pattern: String) -> [ToolFacts] {
-        tools.filter { $0.lockedByPattern == pattern }.sorted { $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending }
+        tools.filter { $0.lockedByPattern == pattern }.sorted(by: ToolFacts.inNameOrder)
     }
 
-    func tools(for server: String) -> [ToolFacts] {
-        tools.filter { $0.server == server }.sorted { $0.shortName.localizedStandardCompare($1.shortName) == .orderedAscending }
-    }
+    func tools(for server: String) -> [ToolFacts] { byServer[server] ?? [] }
 
     /// One server's tools that match a query, by the same rule as `groups`:
     /// a query naming the server keeps all of its tools.
@@ -143,6 +144,10 @@ struct ToolCatalog: Equatable, Sendable {
 }
 
 private extension ToolFacts {
+    static func inNameOrder(_ one: ToolFacts, _ other: ToolFacts) -> Bool {
+        one.shortName.localizedStandardCompare(other.shortName) == .orderedAscending
+    }
+
     func matches(_ needle: String) -> Bool {
         name.lowercased().contains(needle)
             || server.lowercased().contains(needle)
