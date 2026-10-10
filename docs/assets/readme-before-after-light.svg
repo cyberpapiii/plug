@@ -1,0 +1,59 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 430" width="1200" height="430" role="img" aria-label="Without Plug, every client is wired to every server on its own. With Plug, every client reaches every server through Plug.">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f6f8fb"/><stop offset="1" stop-color="#eaf1fb"/></linearGradient>
+  <linearGradient id="plug" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#3d9bff"/><stop offset="1" stop-color="#0a6ee6"/></linearGradient>
+</defs>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .name { font-size: 17px; font-weight: 600; fill: #1b2330; }
+  .head { font-size: 13px; font-weight: 700; letter-spacing: 2px; fill: #5d6b7e; }
+  .sub { font-size: 16px; fill: #5d6b7e; }
+  .wire { fill: none; stroke-width: 2; }
+  .tangle { stroke: #d9a3a3; }
+  .hubwire { stroke: #0a6ee6; stroke-width: 2.5; }
+</style>
+<rect x="1" y="1" width="1198" height="428" rx="22" fill="url(#bg)" stroke="#d6deea"/>
+<rect x="20" y="20" width="570" height="390" rx="18" fill="#ffffff80" stroke="#d6deea"/>
+<text class="head" x="305.0" y="62" text-anchor="middle">WITHOUT PLUG</text>
+<path class="wire tangle" d="M188 117.0 C 278 117.0, 332 145.0, 422 145.0"/>
+<path class="wire tangle" d="M188 117.0 C 278 117.0, 332 201.0, 422 201.0"/>
+<path class="wire tangle" d="M188 117.0 C 278 117.0, 332 257.0, 422 257.0"/>
+<path class="wire tangle" d="M188 173.0 C 278 173.0, 332 145.0, 422 145.0"/>
+<path class="wire tangle" d="M188 173.0 C 278 173.0, 332 201.0, 422 201.0"/>
+<path class="wire tangle" d="M188 173.0 C 278 173.0, 332 257.0, 422 257.0"/>
+<path class="wire tangle" d="M188 229.0 C 278 229.0, 332 145.0, 422 145.0"/>
+<path class="wire tangle" d="M188 229.0 C 278 229.0, 332 201.0, 422 201.0"/>
+<path class="wire tangle" d="M188 229.0 C 278 229.0, 332 257.0, 422 257.0"/>
+<path class="wire tangle" d="M188 285.0 C 278 285.0, 332 145.0, 422 145.0"/>
+<path class="wire tangle" d="M188 285.0 C 278 285.0, 332 201.0, 422 201.0"/>
+<path class="wire tangle" d="M188 285.0 C 278 285.0, 332 257.0, 422 257.0"/>
+<rect x="48" y="96" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="68" cy="117.0" r="6" fill="#f5a524"/><text class="name" x="84" y="123.0">Claude</text>
+<rect x="48" y="152" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="68" cy="173.0" r="6" fill="#17b26a"/><text class="name" x="84" y="179.0">ChatGPT</text>
+<rect x="48" y="208" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="68" cy="229.0" r="6" fill="#8b5cf6"/><text class="name" x="84" y="235.0">Codex</text>
+<rect x="48" y="264" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="68" cy="285.0" r="6" fill="#ef4444"/><text class="name" x="84" y="291.0">Cursor</text>
+<rect x="422" y="124" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="442" cy="145.0" r="6" fill="#8b5cf6"/><text class="name" x="458" y="151.0">Slack</text>
+<rect x="422" y="180" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="442" cy="201.0" r="6" fill="#ef4444"/><text class="name" x="458" y="207.0">Notion</text>
+<rect x="422" y="236" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="442" cy="257.0" r="6" fill="#f5a524"/><text class="name" x="458" y="263.0">Messages</text>
+<text class="sub" x="305.0" y="344" text-anchor="middle">Every client keeps its own list of servers,</text>
+<text class="sub" x="305.0" y="368" text-anchor="middle">runs its own copy, and signs in again.</text>
+<rect x="610" y="20" width="570" height="390" rx="18" fill="#ffffff80" stroke="#d6deea"/>
+<text class="head" x="895.0" y="62" text-anchor="middle">WITH PLUG</text>
+<path class="wire hubwire" d="M778 117.0 C 828 117.0, 809.0 200, 859.0 200"/>
+<path class="wire hubwire" d="M778 173.0 C 828 173.0, 809.0 200, 859.0 200"/>
+<path class="wire hubwire" d="M778 229.0 C 828 229.0, 809.0 200, 859.0 200"/>
+<path class="wire hubwire" d="M778 285.0 C 828 285.0, 809.0 200, 859.0 200"/>
+<path class="wire hubwire" d="M931.0 200 C 981.0 200, 962 145.0, 1012 145.0"/>
+<path class="wire hubwire" d="M931.0 200 C 981.0 200, 962 201.0, 1012 201.0"/>
+<path class="wire hubwire" d="M931.0 200 C 981.0 200, 962 257.0, 1012 257.0"/>
+<g transform="translate(859.0 164.0) scale(0.6000)"><rect width="120" height="120" rx="27" fill="url(#plug)"/><g transform="translate(59.36 56.92) rotate(-10) translate(-60 -55.5)" fill="#fff"><rect x="39" y="17" width="14" height="37" rx="7"/><rect x="67" y="17" width="14" height="37" rx="7"/><rect x="24" y="40" width="72" height="54" rx="18"/><g fill="#0a5fd0"><rect x="46.88" y="53.86" width="9.24" height="22.28" rx="4.62"/><rect x="71.88" y="53.86" width="9.24" height="22.28" rx="4.62"/></g></g></g>
+<text class="name" x="895.0" y="262" text-anchor="middle">Plug</text>
+<rect x="638" y="96" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="658" cy="117.0" r="6" fill="#f5a524"/><text class="name" x="674" y="123.0">Claude</text>
+<rect x="638" y="152" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="658" cy="173.0" r="6" fill="#17b26a"/><text class="name" x="674" y="179.0">ChatGPT</text>
+<rect x="638" y="208" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="658" cy="229.0" r="6" fill="#8b5cf6"/><text class="name" x="674" y="235.0">Codex</text>
+<rect x="638" y="264" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="658" cy="285.0" r="6" fill="#ef4444"/><text class="name" x="674" y="291.0">Cursor</text>
+<rect x="1012" y="124" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="1032" cy="145.0" r="6" fill="#8b5cf6"/><text class="name" x="1048" y="151.0">Slack</text>
+<rect x="1012" y="180" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="1032" cy="201.0" r="6" fill="#ef4444"/><text class="name" x="1048" y="207.0">Notion</text>
+<rect x="1012" y="236" width="140" height="42" rx="12" fill="#ffffff" stroke="#d6deea"/><circle cx="1032" cy="257.0" r="6" fill="#f5a524"/><text class="name" x="1048" y="263.0">Messages</text>
+<text class="sub" x="895.0" y="344" text-anchor="middle">One list. One copy of each server.</text>
+<text class="sub" x="895.0" y="368" text-anchor="middle">One sign-in. Every client gets it all.</text>
+</svg>
