@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// The shapes of Plug's mark, the plug with a face, in the units of
@@ -134,10 +135,26 @@ struct PlugCharacter: View {
     /// character's own.
     var mark: Color?
 
+    /// The drawing gets a surface of its own, so a frame of movement redraws
+    /// the character and nothing else in its window. Off, it is drawn in
+    /// with everything around it, and moves even when its window is unseen.
+    private static let ownSurface = true
+
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var puppet: PlugPuppet
     /// Nothing is moving, so nothing is redrawn.
     @State private var idle = false
+    /// Its window is on screen. Unseen, it holds still.
+    @State private var seen = true
+    /// Goes up each time something happens to the character, so it is drawn
+    /// again and the watch over it starts again.
+    @State private var nudges = 0
+
+    /// What the watch over the character starts again for.
+    private struct Watch: Equatable {
+        var moves: Bool
+        var nudges: Int
+    }
 
     init(mood: Mood, cheers: Int = 0, mark: Color? = nil) {
         self.mood = mood
@@ -147,12 +164,17 @@ struct PlugCharacter: View {
     }
 
     var body: some View {
-        GeometryReader { proxy in
+        let moves = !reduceMotion && seen
+        return GeometryReader { proxy in
             let side = min(proxy.size.width, proxy.size.height)
-            TimelineView(.animation(paused: idle || reduceMotion)) { timeline in
-                let frame = puppet.frame(at: timeline.date, moving: !reduceMotion)
-                Canvas { context, size in
-                    PlugDrawing.draw(frame, side: side, mark: mark, in: &context, size: size)
+            let stage = PlugStage(
+                puppet: puppet, side: side, mark: mark, moving: moves, paused: idle || !moves, nudges: nudges
+            )
+            Group {
+                if Self.ownSurface {
+                    PlugStageHost(stage: stage, seen: $seen)
+                } else {
+                    stage
                 }
             }
             // Room around the character for a hop, the sparks and the "z"s.
@@ -160,29 +182,146 @@ struct PlugCharacter: View {
             .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
             .allowsHitTesting(false)
         }
-        .task(id: reduceMotion) {
+        .task(id: Watch(moves: moves, nudges: nudges)) {
+            guard moves else { return }
             while !Task.isCancelled {
-                let resting = reduceMotion || puppet.isResting
-                if resting != idle { idle = resting }
-                try? await Task.sleep(for: .seconds(PlugPuppet.lookAhead * 0.8))
+                if let due = puppet.restsUntil {
+                    if !idle { idle = true }
+                    // A face that holds still waits to be nudged.
+                    guard due.isFinite else { return }
+                    // One sleep until the next blink or glance.
+                    let wait = max(0, due - Date.now.timeIntervalSinceReferenceDate)
+                    try? await Task.sleep(for: .seconds(wait), tolerance: .seconds(PlugPuppet.early))
+                    if Task.isCancelled { return }
+                    idle = false
+                } else if idle {
+                    idle = false
+                }
+                // While it moves, look now and then for it to come to rest.
+                try? await Task.sleep(for: .seconds(0.2), tolerance: .seconds(0.1))
             }
         }
         .onChange(of: mood) { _, new in
             puppet.show(new, moving: !reduceMotion)
-            idle = false
+            wake()
         }
         .onChange(of: cheers) { old, new in
             guard new > old, !reduceMotion else { return }
             puppet.cheer()
-            idle = false
+            wake()
         }
         .contentShape(Rectangle())
         .onTapGesture {
             guard !reduceMotion else { return }
             puppet.tap()
-            idle = false
+            wake()
         }
         .accessibilityHidden(true)
+    }
+
+    private func wake() {
+        idle = false
+        nudges &+= 1
+    }
+}
+
+/// The drawing itself: all that is redrawn for a frame of movement.
+private struct PlugStage: View {
+    let puppet: PlugPuppet
+    let side: CGFloat
+    let mark: Color?
+    let moving: Bool
+    let paused: Bool
+    /// Different each time the character changes, so a paused drawing is
+    /// drawn again.
+    let nudges: Int
+
+    var body: some View {
+        TimelineView(.animation(paused: paused)) { timeline in
+            let frame = puppet.frame(at: timeline.date, moving: moving)
+            Canvas { context, size in
+                PlugDrawing.draw(frame, side: side, mark: mark, in: &context, size: size)
+            }
+        }
+    }
+}
+
+/// The drawing on its own surface, in the colours of the place it was put.
+private struct PlugHostedStage: View {
+    let stage: PlugStage
+    let environment: EnvironmentValues
+
+    var body: some View {
+        stage
+            .environment(\.self, environment)
+            .ignoresSafeArea()
+    }
+}
+
+/// Puts the drawing on a surface of its own, and says whether the window it
+/// is in is on screen.
+private struct PlugStageHost: NSViewRepresentable {
+    let stage: PlugStage
+    @Binding var seen: Bool
+    @Environment(\.self) private var environment
+
+    func makeNSView(context: Context) -> PlugStageView {
+        let view = PlugStageView(rootView: PlugHostedStage(stage: stage, environment: environment))
+        // Its size is the one it is given, so a frame never asks the window
+        // to lay itself out again.
+        view.sizingOptions = []
+        view.safeAreaRegions = []
+        report(from: view)
+        return view
+    }
+
+    func updateNSView(_ view: PlugStageView, context: Context) {
+        view.rootView = PlugHostedStage(stage: stage, environment: environment)
+        report(from: view)
+    }
+
+    func sizeThatFits(_ proposal: ProposedViewSize, nsView: PlugStageView, context: Context) -> CGSize? {
+        proposal.replacingUnspecifiedDimensions()
+    }
+
+    private func report(from view: PlugStageView) {
+        let seen = $seen
+        view.onSeen = { now in
+            if seen.wrappedValue != now { seen.wrappedValue = now }
+        }
+    }
+}
+
+private final class PlugStageView: NSHostingView<PlugHostedStage> {
+    var onSeen: ((Bool) -> Void)?
+
+    // Clicks pass through to the character, which takes them.
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override var acceptsFirstResponder: Bool { false }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        let centre = NotificationCenter.default
+        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        if let newWindow {
+            centre.addObserver(
+                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
+            )
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        look()
+    }
+
+    /// Closed, covered, minimized or on another desktop, the window is not
+    /// on screen. Said a moment later, never in the middle of an update.
+    @objc private func look() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.onSeen?(self.window?.occlusionState.contains(.visible) ?? false)
+        }
     }
 }
 
@@ -340,6 +479,26 @@ struct PlugPose: Equatable, Sendable {
                 .with([.lean: 0, .stretchX: swell, .stretchY: swell])
         }
     }
+
+    /// When the face for `mood` next changes by itself, in seconds after it
+    /// began, looking from `time`. Never, for a face that holds still. Keep
+    /// it in step with `pose` above.
+    static func nextChange(for mood: PlugCharacter.Mood, after time: TimeInterval) -> TimeInterval {
+        /// The next start or end of a pulse.
+        func edge(_ shift: TimeInterval, every: TimeInterval, lasts: TimeInterval) -> TimeInterval {
+            let phase = (time + shift).truncatingRemainder(dividingBy: every)
+            return time + (phase < lasts ? lasts : every) - phase
+        }
+        switch mood {
+        case .awake: return edge(2, every: 7, lasts: 1.2)
+        case .curious: return edge(5.5, every: 6, lasts: 1.8)
+        case .alert: return edge(0.3, every: 2.6, lasts: 0.14)
+        case .working: return edge(0, every: 0.8, lasts: 0.8)
+        case .cheering, .wink, .surprised, .needsYou, .unsure, .worried, .out: return .infinity
+        // These never stop for long, so look again in a quarter of a second.
+        case .happy, .thinking, .loading, .dizzy, .asleep, .tucked: return time + 0.25
+        }
+    }
 }
 
 /// What to draw this instant.
@@ -489,8 +648,21 @@ final class PlugPuppet {
         )
     }
 
+    /// How long before a movement is due the character is woken for it, in
+    /// seconds.
+    static let early: TimeInterval = 0.05
+
+    /// Nil while anything is moving or about to. At rest, when to wake for
+    /// the next blink or change of face: never, when none is coming.
+    var restsUntil: TimeInterval? {
+        guard isResting else { return nil }
+        var due = since + PlugPose.nextChange(for: mood, after: max(0, Self.now - since))
+        if mood.blinks { due = min(due, nextBlink) }
+        return due - Self.early
+    }
+
     /// Nothing is moving and nothing is about to.
-    var isResting: Bool {
+    private var isResting: Bool {
         let now = Self.now
         guard act == nil, now - sparkedAt > Self.sparkTime, now - blinkedAt > Self.blinkTime,
               !(showing.blinks && now + Self.lookAhead > nextBlink), pose[.snore] < 0.02
