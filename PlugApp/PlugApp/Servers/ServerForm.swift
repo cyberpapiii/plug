@@ -258,8 +258,8 @@ struct InlineWarning: View {
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
         } icon: {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
+            PlugIcon(.needsYou)
+                .foregroundStyle(StatusColor.needsYou)
         }
     }
 }

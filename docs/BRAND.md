@@ -98,10 +98,30 @@ Rules:
 - A server's tile is 28 points. A server that is off stays on the shelf,
   grey and dimmed, with no dot.
 - A plain line that says something and offers a button starts with one
-  small grey line icon, drawn for Plug in one weight (`PanelIcon`), that fits
-  both the words and the button: a stethoscope beside Run Checkup, a plug
-  with a loose cord beside Start Plug, a server's tile with a plus beside
-  Add Server. No stock symbols there.
+  small grey icon that fits both the words and the button: a stethoscope
+  beside Run Checkup, a plug with a loose cord beside Start Plug, a server's
+  tile with a plus beside Add Server.
+
+## Icons
+
+Plug draws its own icons (`PlugIcon`). Each is a few strokes on a 16 by 16
+grid, in one line weight with round ends, and takes the colour of the text
+around it.
+
+| Group | Icons |
+|---|---|
+| Pages | Servers is a socket, Clients a window, Events a bell that leans the way Plug leans, Activity a pulse, Settings two sliders |
+| Status | Working is a dot in a faint ring, starting is Plug's three dots, needs you is a circled "!", sign in is a key, stopped is a circled cross, off is a moon, off by rule is a padlock |
+| Tool calls | Worked is a circled tick, stopped by the client a circled dash, failed the circled cross |
+| Actions | Add, dismiss, edit, more, show, copy, quit |
+
+Rules:
+
+- A status icon takes its status colour. Every other icon is the colour of
+  its words, or grey.
+- Stock system symbols stay only for what macOS draws itself: switches, the
+  search field, window buttons, small chevrons, and the numbers in the guide.
+- A new icon uses the same pen and as few strokes as it can.
 
 ## Faces
 

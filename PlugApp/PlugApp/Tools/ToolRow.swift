@@ -41,7 +41,7 @@ struct ToolRow: View {
     /// not shift.
     @ViewBuilder private var trailing: some View {
         if let pattern = tool.lockedByPattern {
-            Label("Off by Rule", systemImage: "lock.fill")
+            Label("Off by Rule", icon: .locked)
                 .font(.callout)
                 .foregroundStyle(.secondary)
                 .help("A rule in the settings file (\(pattern)) keeps this tool off. Remove the rule to turn it back on.")

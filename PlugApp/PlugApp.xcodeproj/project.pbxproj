@@ -23,6 +23,7 @@
 		273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E1C65673D42038754E140C /* ProcessRunnerTests.swift */; };
 		2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */ = {isa = PBXBuildFile; fileRef = FBC2D67DE9038B09D240E689 /* PlugStatus.swift */; };
 		2C730DB265AF0C768DE18BAF /* Router.swift in Sources */ = {isa = PBXBuildFile; fileRef = 246CCC51D3BBEE0246E4E96F /* Router.swift */; };
+		2EAA9E7402A70B152C0C8051 /* PlugIcon.swift in Sources */ = {isa = PBXBuildFile; fileRef = 4F9B87F63F82D2FBB678B606 /* PlugIcon.swift */; };
 		3033A18407F2E2063809099D /* ServerDetailView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8AF46523DEE1BB787D58EAEA /* ServerDetailView.swift */; };
 		30CD76E3B3CFFB219A05A76A /* AppIcons.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */; };
 		35AA6667AB3B76728E5FB385 /* Explain.swift in Sources */ = {isa = PBXBuildFile; fileRef = 8ED784B5E25355F76D511A51 /* Explain.swift */; };
@@ -124,6 +125,7 @@
 		454D77CEE12C1DA103BB4BCD /* ServerForm.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ServerForm.swift; sourceTree = "<group>"; };
 		46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EventSurfaceTests.swift; sourceTree = "<group>"; };
 		4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = legacy_plug_programs.json; sourceTree = "<group>"; };
+		4F9B87F63F82D2FBB678B606 /* PlugIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugIcon.swift; sourceTree = "<group>"; };
 		588717CF2790EF93C4710EE6 /* EditServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerView.swift; sourceTree = "<group>"; };
 		59D35A236F003E96A80E9E08 /* ToolSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolSurfaceTests.swift; sourceTree = "<group>"; };
 		64E2869334004AD1B34ADA93 /* InstallationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationState.swift; sourceTree = "<group>"; };
@@ -342,6 +344,7 @@
 				2BB10ED3645727B693E33897 /* AppChrome.swift */,
 				75C0205F3E2FDFD46A7086E1 /* DesignSystem.swift */,
 				150CFC4C7A8D42C0BE993F0E /* PlugCharacter.swift */,
+				4F9B87F63F82D2FBB678B606 /* PlugIcon.swift */,
 				E823B05501E7735EEA26993A /* RootView.swift */,
 				00F9BAFB363C8A2D0C0D4CEA /* SheetFrame.swift */,
 			);
@@ -644,6 +647,7 @@
 				B44B53C90279B089D31E3A2C /* NotificationService.swift in Sources */,
 				DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */,
 				665F76B78C2AF5A88B338A7B /* PlugCharacter.swift in Sources */,
+				2EAA9E7402A70B152C0C8051 /* PlugIcon.swift in Sources */,
 				12A35C74598F87BEC6396C64 /* PlugPaths.swift in Sources */,
 				F762470FA24AB181FB13685B /* PlugPopover.swift in Sources */,
 				2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */,

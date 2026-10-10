@@ -44,14 +44,14 @@ struct GuideView: View {
     /// Plug's two sides, as the one picture a newcomer needs.
     private var sides: some View {
         HStack(spacing: Metric.snug) {
-            side("Servers", "provide tools") { sideSymbol(AppSection.servers.symbol) }
-            Image(systemName: "arrow.right").foregroundStyle(.tertiary)
+            side("Servers", "provide tools") { sideIcon(.servers) }
+            PlugIcon(.show).foregroundStyle(.tertiary)
             side("Plug", "holds them all") {
                 // It hops and sparks each time a step below is done.
                 PlugCharacter(mood: .awake, cheers: doneSteps).foregroundStyle(.tint).frame(width: 30)
             }
-            Image(systemName: "arrow.right").foregroundStyle(.tertiary)
-            side("Clients", "use tools") { sideSymbol(AppSection.clients.symbol) }
+            PlugIcon(.show).foregroundStyle(.tertiary)
+            side("Clients", "use tools") { sideIcon(.clients) }
         }
         .frame(maxWidth: .infinity)
         .padding(Metric.regular)
@@ -60,9 +60,8 @@ struct GuideView: View {
         .accessibilityLabel("Servers provide tools. Plug holds them all. Clients use tools.")
     }
 
-    private func sideSymbol(_ name: String) -> some View {
-        Image(systemName: name)
-            .font(.title2)
+    private func sideIcon(_ kind: PlugIcon.Kind) -> some View {
+        PlugIcon(kind, size: 26)
             .foregroundStyle(.secondary)
     }
 
@@ -78,10 +77,16 @@ struct GuideView: View {
     private func row(_ step: FirstRunGuide.Step, number: Int) -> some View {
         let done = guide.isDone(step)
         return HStack(alignment: .top, spacing: Metric.snug) {
-            Image(systemName: done ? "checkmark.circle.fill" : "\(number).circle")
-                .font(.title3)
-                .foregroundStyle(done ? AnyShapeStyle(.green) : AnyShapeStyle(.secondary))
-                .frame(width: Self.markWidth)
+            Group {
+                if done {
+                    PlugIcon(.worked, size: 22).foregroundStyle(StatusColor.working)
+                } else {
+                    Image(systemName: "\(number).circle")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .frame(width: Self.markWidth)
                 .accessibilityLabel(done ? "Done" : "Step \(number)")
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(step.title).font(.body.weight(.medium))
@@ -147,7 +152,7 @@ struct GuideView: View {
             .layoutPriority(1)
             Spacer(minLength: Metric.snug)
             Button { copyPrompt() } label: {
-                Label("Copy Setup Prompt", systemImage: copied ? "checkmark" : "doc.on.doc")
+                Label("Copy Setup Prompt", icon: copied ? .worked : .copy)
             }
             .contentTransition(.symbolEffect(.replace))
             .fixedSize()

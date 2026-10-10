@@ -141,10 +141,16 @@ struct DetailHeader<Glyph: View, Controls: View>: View {
 /// The right side when no row is selected.
 struct NoSelection: View {
     let item: String
-    let symbol: String
+    let icon: PlugIcon.Kind
 
     var body: some View {
-        ContentUnavailableView("No \(item) Selected", systemImage: symbol)
+        ContentUnavailableView {
+            Label {
+                Text("No \(item) Selected")
+            } icon: {
+                PlugIcon(icon, size: 44)
+            }
+        }
     }
 }
 
@@ -162,10 +168,8 @@ struct ProblemNote: View {
 
     var body: some View {
         HStack(alignment: .top, spacing: Metric.snug) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.orange)
-                .symbolRenderingMode(.hierarchical)
-                .accessibilityHidden(true)
+            PlugIcon(.needsYou)
+                .foregroundStyle(StatusColor.needsYou)
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(title)
                     .font(.callout.weight(.medium))
@@ -192,8 +196,7 @@ struct ProblemNote: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             if let dismiss {
                 Button(action: dismiss) {
-                    Image(systemName: "xmark")
-                        .imageScale(.small)
+                    PlugIcon(.dismiss, size: 14)
                         .frame(width: 20, height: 20)
                         .contentShape(Rectangle())
                 }
@@ -231,7 +234,7 @@ struct ErrorToast: View {
             .frame(maxWidth: 460)
             .padding(.horizontal, Metric.regular)
             .padding(.vertical, Metric.snug)
-            .nativeGlassSurface(tint: .orange.opacity(0.08))
+            .nativeGlassSurface(tint: StatusColor.needsYou.opacity(0.08))
             .padding(Metric.regular)
     }
 }

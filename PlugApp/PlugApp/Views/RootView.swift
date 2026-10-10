@@ -11,12 +11,12 @@ enum AppSection: String, CaseIterable, Identifiable, Sendable {
 
     var id: Self { self }
 
-    var symbol: String {
+    var icon: PlugIcon.Kind {
         switch self {
-        case .servers: "shippingbox"
-        case .clients: "macwindow.on.rectangle"
-        case .events: "bell"
-        case .activity: "clock"
+        case .servers: .servers
+        case .clients: .clients
+        case .events: .events
+        case .activity: .activity
         }
     }
 }
@@ -43,7 +43,7 @@ struct RootView: View {
         NavigationSplitView(columnVisibility: $columns) {
             List(selection: sidebarSelection) {
                 ForEach(AppSection.allCases) { section in
-                    Label(section.rawValue, systemImage: section.symbol)
+                    Label(section.rawValue, icon: section.icon)
                         .badge(badge(for: section))
                         .tag(section)
                 }
