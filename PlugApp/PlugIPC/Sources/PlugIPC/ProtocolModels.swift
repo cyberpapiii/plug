@@ -90,8 +90,8 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     /// The program that started a local connector. The daemon reads it from
     /// the process table, so the client cannot choose it.
     public let host: ClientHost?
-    public let connectedSecs: UInt64
-    public let lastActivitySecs: UInt64?
+    public var connectedSecs: UInt64
+    public var lastActivitySecs: UInt64?
 }
 
 public struct ClientHost: Codable, Equatable, Sendable {
@@ -143,7 +143,7 @@ public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
     public let authenticated: Bool
     public let health: String
     public let scopes: [String]?
-    public let tokenExpiresInSecs: UInt64?
+    public var tokenExpiresInSecs: UInt64?
     public let warnings: [String]
 }
 
@@ -318,7 +318,7 @@ public struct WatchConfig: Encodable, Equatable, Sendable {
 
 public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let runtimeVersion: String
-    public let uptimeSecs: UInt64
+    public var uptimeSecs: UInt64
     /// Changes when the daemon's tool list would answer differently. The
     /// snapshot is cheap and polled often; the tool list is nearly a megabyte
     /// and almost never changes between two polls.
@@ -326,9 +326,9 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let ownership: String
     public let configuredServers: [ConfiguredServer]
     public let servers: [ServerStatus]
-    public let liveSessions: [LiveSession]
+    public var liveSessions: [LiveSession]
     public let clientVisibility: [ClientVisibility]
-    public let upstreamAuth: [AuthServer]
+    public var upstreamAuth: [AuthServer]
     public let downstreamClients: [DownstreamClient]
     /// Names the owner gave clients. Absent when there are none.
     public var clientNames: [ClientName]?
@@ -346,6 +346,28 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
         configuredServers: [], servers: [], liveSessions: [], clientVisibility: [],
         upstreamAuth: [], downstreamClients: []
     )
+}
+
+public extension OperatorSnapshot {
+    /// The same snapshot with its clocks rounded down, so two reads a moment
+    /// apart are equal unless something happened. Every count of seconds in
+    /// it ticks on its own, and a reader that redraws on any difference
+    /// would redraw on every read.
+    func steadied() -> OperatorSnapshot {
+        var steady = self
+        // A reader asks one thing of the first minute: whether it is over.
+        steady.uptimeSecs = uptimeSecs > 60 ? max(61, uptimeSecs / 60 * 60) : 0
+        for index in steady.liveSessions.indices {
+            steady.liveSessions[index].connectedSecs = liveSessions[index].connectedSecs / 60 * 60
+            steady.liveSessions[index].lastActivitySecs = liveSessions[index].lastActivitySecs.map { $0 / 60 * 60 }
+        }
+        for index in steady.upstreamAuth.indices {
+            steady.upstreamAuth[index].tokenExpiresInSecs = upstreamAuth[index].tokenExpiresInSecs.map {
+                $0 >= 3_600 ? $0 / 3_600 * 3_600 : $0 / 60 * 60
+            }
+        }
+        return steady
+    }
 }
 
 public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
