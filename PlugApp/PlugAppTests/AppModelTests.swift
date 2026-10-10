@@ -62,6 +62,31 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
         XCTAssertNotNil(model.actionError)
     }
+    /// The surface that starts the model can go away before launch is over.
+    /// Its task is cancelled then, and Plug must still watch the daemon.
+    @MainActor
+    func testAStartCutShortStillWatchesTheDaemon() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+        let model = AppModel(
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator,
+            tokenURL: try makeFixtureTokenURL(),
+            backgroundPollInterval: .milliseconds(20)
+        )
+        let surface = Task { await model.start() }
+        surface.cancel()
+        await surface.value
+        try await Task.sleep(for: .milliseconds(500))
+
+        let snapshots = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
+        XCTAssertGreaterThan(snapshots, 3)
+    }
+
     /// A model that has not asked yet reports `.connecting`, not
     /// `.disconnected`. The difference is what the menu bar says while Plug
     /// starts: "Starting…" rather than "Plug is not running".
