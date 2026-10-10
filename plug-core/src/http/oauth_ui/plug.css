@@ -68,3 +68,4 @@ button:disabled { opacity: 0.5; cursor: default; }
 button:focus-visible { outline: 3px solid color-mix(in srgb, var(--blue) 45%, transparent); outline-offset: 2px; }
 #status { margin-top: 16px; text-align: center; color: var(--muted); }
 #status:empty { display: none; }
+[hidden] { display: none; }
