@@ -53,17 +53,22 @@ struct RootView: View {
         } content: {
             section
                 .environment(\.splitPane, .list)
-                // Without the sidebar the window's buttons and title sit over
-                // this column, and a narrow one lets the title run past its edge.
-                .navigationSplitViewColumnWidth(
-                    min: columns == .all ? 240 : Metric.listWidthUnderTitle,
-                    ideal: columns == .all ? Metric.listWidth : Metric.listWidthUnderTitle,
-                    max: 420
-                )
+                // One width whether the sidebar shows or not: a column that
+                // resizes while the sidebar slides makes the slide stutter.
+                // Without the sidebar the window's buttons sit over this
+                // column, so the title drops its second line to fit.
+                .environment(\.showsPageSubtitle, columns == .all)
+                .navigationSplitViewColumnWidth(min: 240, ideal: Metric.listWidth, max: 420)
                 .navigationTitle(router.section.rawValue)
         } detail: {
             section
                 .environment(\.splitPane, .detail)
+                .toolbar {
+                    ToolbarItem { Spacer() }
+                    ToolbarItem(placement: .primaryAction) {
+                        SearchControl(text: $search, prompt: searchPrompt)
+                    }
+                }
             .topBanner(
                 isShown: showsBanner,
                 transition: reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity)
@@ -91,7 +96,6 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actionError?.id)
         }
         .plainWindowBar()
-        .searchable(text: $search, placement: .toolbar, prompt: searchPrompt)
         .onChange(of: router.section) {
             search = ""
         }
@@ -229,7 +233,68 @@ struct RootView: View {
     }
 }
 
+/// Search in the window's bar: a magnifying glass until it is pressed, then
+/// a field, the way Finder shows it. It folds away again once it is empty
+/// and the cursor has left it.
+private struct SearchControl: View {
+    @Binding var text: String
+    let prompt: String
+    @State private var open = false
+    @FocusState private var focused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    var body: some View {
+        if !open {
+            Button(action: show) {
+                Label("Search", icon: .search)
+            }
+            .keyboardShortcut("f")
+            .help("Search")
+        } else {
+            HStack(spacing: Metric.tight) {
+                PlugIcon(.search)
+                    .foregroundStyle(.secondary)
+                    .accessibilityHidden(true)
+                TextField(prompt, text: $text)
+                    .textFieldStyle(.plain)
+                    .focused($focused)
+                    .frame(width: 180)
+                    .onExitCommand(perform: close)
+                if !text.isEmpty {
+                    Button(action: close) {
+                        PlugIcon(.dismiss, size: 14)
+                    }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .help("Clear")
+                    .accessibilityLabel("Clear")
+                }
+            }
+            .padding(.horizontal, Metric.snug)
+            .onChange(of: focused) { if !focused, text.isEmpty { fold() } }
+            // A section change empties the search.
+            .onChange(of: text) { if text.isEmpty, !focused { fold() } }
+        }
+    }
+
+    private func show() {
+        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { open = true }
+        focused = true
+    }
+
+    private func fold() {
+        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { open = false }
+    }
+
+    private func close() {
+        text = ""
+        focused = false
+        fold()
+    }
+}
+
 private extension View {
+
     /// No bar background behind the window's toolbar. With one, macOS fades
     /// a line in under each column's bar whenever the pointer is over it.
     @ViewBuilder

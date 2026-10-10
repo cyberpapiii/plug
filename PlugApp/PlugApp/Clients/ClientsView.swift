@@ -621,7 +621,7 @@ struct ClientsView: View {
                 }
             }
         }
-        .navigationSubtitle(connectionSummary ?? "")
+        .pageSubtitle(connectionSummary)
         .toolbar {
             // The window draws a section once per column; the button goes
             // above the list.

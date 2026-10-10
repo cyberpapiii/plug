@@ -41,6 +41,8 @@ struct PlugIcon: View {
         case show
         case copy
         case quit
+        /// A magnifying glass.
+        case search
 
         // Beside a line that offers a button
         /// A stethoscope, for a checkup.
@@ -190,6 +192,9 @@ struct PlugIcon: View {
             case .quit:
                 path.addRelativeArc(center: CGPoint(x: 8, y: 8.33), radius: 5.2, startAngle: .degrees(229.17), delta: .degrees(-278.34))
                 path.line(8, 2.4, 8, 7.4)
+            case .search:
+                path.circle(7, 7, 4.3)
+                path.line(10.2, 10.2, 13.4, 13.4)
             case .checkup:
                 path.move(to: CGPoint(x: 3.5, y: 2.5))
                 path.addLine(to: CGPoint(x: 3.5, y: 6.5))

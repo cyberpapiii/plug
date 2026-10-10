@@ -78,8 +78,6 @@ enum Metric {
     static let panelTileGap: CGFloat = 8
     /// The list beside a detail, the same width in every section.
     static let listWidth: CGFloat = 270
-    /// Room for the window buttons, the sidebar button, and a title with its count.
-    static let listWidthUnderTitle: CGFloat = 350
     /// A detail reads best as a column, not stretched across a wide window.
     static let detailMaxWidth: CGFloat = 680
     static let settingsWidth: CGFloat = 520

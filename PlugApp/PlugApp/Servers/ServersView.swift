@@ -36,7 +36,7 @@ struct ServersView: View {
                 list
             }
         }
-        .navigationSubtitle(serverSummary ?? "")
+        .pageSubtitle(serverSummary)
         .toolbar {
             // The window draws a section once per column; the button goes
             // above the list.
