@@ -50,42 +50,46 @@ How to read it:
 
 ## After
 
-One run of `scripts/perf-app.sh` on the branch's last build but one. The 30
-minute session was not run again.
+One run of `scripts/perf-app.sh` on the branch's last build. The 30 minute
+session was not run again.
 
-| Measure | Plug 0.11.0, build 1791667863 |
+| Measure | Plug 0.11.0, build 1791669506 |
 | --- | --- |
-| Size: Plug.app | 24.0 MB |
-| Size: the app itself | 13.9 MB |
+| Size: Plug.app | 24.5 MB |
+| Size: the app itself | 14.4 MB |
 | Size: the daemon inside it | 7.1 MB |
 | Size: the updater (Sparkle) | 2.8 MB |
-| Launch: menu bar icon shows | 183 ms typical, 192 ms worst of 3 |
-| Open the window: on screen | 497 ms typical, 502 ms worst of 3 |
-| Open the window: usable | 578 ms typical, 586 ms worst of 3 |
-| Idle CPU, app, window open | 12.55 % (see below) |
-| Idle wakeups, app, window open | 110.5 per second (see below) |
-| Memory, app, window open | 310 MB |
-| Idle CPU, daemon, window open | 0.43 % |
-| Idle wakeups, daemon, window open | 3.8 per second |
-| Memory, daemon, window open | 24 MB |
-| Idle CPU, app, window closed | 19.07 % (see below) |
-| Idle wakeups, app, window closed | 206.5 per second (see below) |
-| Memory, app, window closed | 305 MB |
-| Idle CPU, daemon, window closed | 0.11 % |
-| Idle wakeups, daemon, window closed | 3.8 per second |
-| Memory, daemon, window closed | 24 MB |
-| Switch section | 152 ms typical, 772 ms worst; longest freeze 60 ms typical, 149 ms worst; 3 dropped frames typical, 11 worst |
-| Select a server | 153 ms typical, 793 ms worst; longest freeze 86 ms typical, 521 ms worst; 6 dropped frames typical, 33 worst |
-| Select the largest server | 531 ms typical, 659 ms worst; longest freeze 382 ms typical, 476 ms worst; 30 dropped frames typical, 31 worst |
-| Hide or show the sidebar | 477 ms typical, 498 ms worst; longest freeze 53 ms typical, 96 ms worst; 5 dropped frames typical, 10 worst |
-| Resize the window, 24 steps on the largest server | 25 ms blocked per step, longest 27 ms, 11 dropped frames in all |
-| Scroll the largest server, 21 steps | 11 ms blocked per step, longest 13 ms, 0 dropped frames in all |
-| Open Settings | 531 ms typical, 736 ms worst; longest freeze 147 ms typical, 244 ms worst; 8 dropped frames typical, 14 worst |
-| Open the menu bar panel | 136 ms typical, 692 ms worst; longest freeze 101 ms typical, 102 ms worst; 6 dropped frames typical, 6 worst |
+| Launch: menu bar icon shows | 192 ms typical, 202 ms worst of 3 |
+| Open the window: on screen | 495 ms typical, 530 ms worst of 3 |
+| Open the window: usable | 568 ms typical, 645 ms worst of 3 |
+| Idle CPU, app, window open | 7.41 % |
+| Idle wakeups, app, window open | 66.5 per second |
+| Memory, app, window open | 300 MB |
+| Idle CPU, daemon, window open | 0.59 % |
+| Idle wakeups, daemon, window open | 3.9 per second |
+| Memory, daemon, window open | 25 MB |
+| Idle CPU, app, window closed | 0.33 % |
+| Idle wakeups, app, window closed | 1.3 per second |
+| Memory, app, window closed | 71 MB |
+| Idle CPU, daemon, window closed | 0.47 % |
+| Idle wakeups, daemon, window closed | 4.2 per second |
+| Memory, daemon, window closed | 25 MB |
+| Switch section | 259 ms typical, 869 ms worst; longest freeze 119 ms typical, 192 ms worst; 7 dropped frames typical, 15 worst |
+| Select a server | 333 ms typical, 903 ms worst; longest freeze 103 ms typical, 605 ms worst; 6 dropped frames typical, 39 worst |
+| Select the largest server | 632 ms typical, 641 ms worst; longest freeze 355 ms typical, 523 ms worst; 36 dropped frames typical, 36 worst |
+| Hide or show the sidebar | 492 ms typical, 879 ms worst; longest freeze 50 ms typical, 56 ms worst; 6 dropped frames typical, 8 worst |
+| Resize the window, 24 steps on the largest server | 24 ms blocked per step, longest 25 ms, 8 dropped frames in all |
+| Scroll the largest server, 21 steps | 11 ms blocked per step, longest 14 ms, 0 dropped frames in all |
+| Open Settings | 113 ms typical, 673 ms worst; longest freeze 101 ms typical, 186 ms worst; 6 dropped frames typical, 11 worst |
+| Open the menu bar panel | 683 ms typical, 858 ms worst; longest freeze 101 ms typical, 102 ms worst; 6 dropped frames typical, 6 worst |
 
-The idle CPU rows are not a like-for-like reading. Plug has a fault, present
-before this branch and not fixed by it, where the menu bar icon starts
-redrawing in a loop after the app has been opened and closed a few times, and
-then holds 20 to 35 % CPU until Plug is quit. In this run it started during
-the launch step, before idle was read. A fresh launch of the same branch with
-the window open reads 8.1 %, the same as before.
+The "typical" time of a click swings between about 150 ms and about 700 ms
+from run to run, because it includes waiting for the window to settle. A second
+run of the click-through on this build read 127 ms for Switch section, 148 ms
+for Select a server and 491 ms for the menu bar panel. The longest freeze is
+the steadier number.
+
+An earlier build of this branch (1791667863) had the menu bar icon redrawing
+in a loop after the app had been opened and closed a few times, holding 12 to
+35 % CPU. That fault was there before the branch. On this build the same run
+reads 0.33 % with the window closed.
