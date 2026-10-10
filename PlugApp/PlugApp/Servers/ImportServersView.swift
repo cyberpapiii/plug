@@ -92,7 +92,7 @@ struct ImportServersView: View {
                 InlineWarning(
                     "Plug could not read \(scan.unreadable.joined(separator: ", ")), so anything set up there is not listed."
                 )
-                .font(.caption)
+                .font(PanelType.small)
             }
         }
         .padding(.horizontal, Metric.roomy)
@@ -122,13 +122,13 @@ struct ImportServersView: View {
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(server.name).font(.body)
                 Text(serverDescription(server))
-                    .font(.caption)
+                    .font(PanelType.small)
                     .foregroundStyle(.secondary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let reason = refused[server.id] {
                     InlineWarning("Not added: \(reason)")
-                        .font(.caption)
+                        .font(PanelType.small)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

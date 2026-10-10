@@ -572,17 +572,7 @@ private struct LatestCallLine: View {
                 .frame(width: 8, height: 8)
                 .frame(width: AppIconStack.size)
             if let call {
-                // Set the way code is in a message, so it reads as a tool's name.
-                Text(call.tool)
-                    .font(PanelType.code)
-                    .foregroundStyle(call.failed ? StatusColor.stopped : Color.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .padding(.horizontal, Metric.tight)
-                    .padding(.vertical, Metric.hairline)
-                    .background(
-                        Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous)
-                    )
+                ToolName(call.tool, failed: call.failed)
                 if let server = call.server {
                     Text(server)
                         .font(PanelType.small)

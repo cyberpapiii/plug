@@ -52,7 +52,7 @@ struct ListGroupHeader: View {
 
     var body: some View {
         Text(title)
-            .font(.subheadline.weight(.semibold))
+            .font(PanelType.small.weight(.semibold))
             .foregroundStyle(.secondary)
             .padding(.top, Metric.snug)
             .selectionDisabled()
@@ -176,7 +176,7 @@ struct ProblemNote: View {
                     .fixedSize(horizontal: false, vertical: true)
                 if let reason, !reason.isEmpty, reason != title {
                     Text(reason)
-                        .font(.caption)
+                        .font(PanelType.small)
                         .foregroundStyle(.secondary)
                         .lineLimit(4)
                         .fixedSize(horizontal: false, vertical: true)
@@ -184,7 +184,7 @@ struct ProblemNote: View {
                 }
                 if let advice, !advice.isEmpty {
                     Text(advice)
-                        .font(.caption)
+                        .font(PanelType.small)
                         .fixedSize(horizontal: false, vertical: true)
                 }
                 if let actionTitle, let action {

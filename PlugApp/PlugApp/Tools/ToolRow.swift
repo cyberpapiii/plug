@@ -10,27 +10,22 @@ struct ToolRow: View {
 
     var body: some View {
         HStack(spacing: Metric.snug) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text(tool.shortName)
-                    .font(.body)
-                    .foregroundStyle(tool.isOn ? .primary : .secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                if let summary = tool.summary, !summary.isEmpty {
-                    Text(summary)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.tail)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
+            // The words are the way in to a tool's details.
             Button(action: onSelect) {
-                Label("Show Details", systemImage: "info.circle")
+                VStack(alignment: .leading, spacing: Metric.rowGap) {
+                    ToolName(tool.shortName, dimmed: !tool.isOn)
+                    if let summary = tool.summary, !summary.isEmpty {
+                        Text(summary)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
             }
-            .labelStyle(.iconOnly)
-            .buttonStyle(.borderless)
-            .foregroundStyle(.secondary)
+            .buttonStyle(.plain)
             .help("Show Details")
             trailing
         }
