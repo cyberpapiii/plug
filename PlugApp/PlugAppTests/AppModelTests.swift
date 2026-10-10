@@ -1188,6 +1188,7 @@ final class AppModelTests: XCTestCase {
 
     /// The daemon names each server once. If it ever does not, the app shows
     /// the first and keeps running.
+    @MainActor
     func testAServerNamedTwiceDoesNotStopTheApp() {
         let twice = """
         {"name":"alpha","url":null,"authenticated":true,"health":"Healthy","scopes":null,"tokenExpiresInSecs":null,"warnings":[]}
