@@ -15,14 +15,7 @@ struct GuideView: View {
     /// Every row's buttons share one column, so the text beside them lines up.
     private static let actionWidth: CGFloat = 140
 
-    private var guide: FirstRunGuide {
-        FirstRunGuide(
-            serverCount: model.snapshot.configuredServers.count,
-            clientCount: model.connectableApps.filter { $0.linked || $0.live }.count
-                + model.snapshot.downstreamClients.count,
-            hasActivity: !model.activities.isEmpty
-        )
-    }
+    private var guide: FirstRunGuide { model.firstRunGuide }
 
     var body: some View {
         SheetFrame(
@@ -54,7 +47,7 @@ struct GuideView: View {
             side("Servers", "provide tools") { sideSymbol(AppSection.servers.symbol) }
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
             side("Plug", "holds them all") {
-                // It hops each time a step below is done.
+                // It hops and sparks each time a step below is done.
                 PlugCharacter(mood: .awake, cheers: doneSteps).foregroundStyle(.tint).frame(width: 30)
             }
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)

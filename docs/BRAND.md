@@ -68,7 +68,9 @@ One state, one movement, and the movement is small.
 | Fixed | Hops once, then goes back to blinking. | Up in 0.14 seconds, a springy landing |
 | Off | Leans further over, shuts its eyes, and breathes slowly. | 2.6 seconds in, 2.6 out |
 | Loading a page | Looks left, then right, in place of a spinner. | 0.8 seconds each way |
-| A first-run step done | Hops once. | As above |
+| A page with nothing on it yet | Tilts its head the other way, as at a question, then back. | A tilt of about 1.4 seconds, every 5 to 10 seconds, with a blink between |
+| A first-run step done | Hops once, and five sparks fly off its prongs. | Sparks gone in 0.6 seconds |
+| The first server, the first client, the first tool call | The same hop and sparks, beside one sentence at the foot of the window. The first tool call gets a second hop. | Once each, ever, and only on a new setup |
 | Clicked | Hops once. | As above |
 
 In the menu bar it blinks every 6 to 14 seconds while Plug is on, and looks
@@ -79,6 +81,8 @@ Rules:
 - Motion follows state. If the state has not changed, nothing new happens.
 - Only the eyes, the lean, and a small hop or breath ever move. The shape
   never stretches, spins, or changes colour mid-movement.
+- Sparks are for firsts. They are the one thing that moves outside the
+  character, and nothing that happens every day earns them.
 - Nothing loops faster than once a second.
 - With Reduce Motion on, the character holds still in the pose for its state.
 
@@ -91,6 +95,8 @@ Rules:
 | Menu bar panel and window banner | The character, moving, beside the one sentence Plug says about itself |
 | A page Plug cannot fill | The character, large, above the reason |
 | A page that is loading | The character, looking from side to side |
+| A page with nothing on it yet | The character, tilting its head, above what would be here and the button that adds it |
+| The foot of the window, at a first | The character, sparking, beside what just became true |
 | First-run guide | The character between Servers and Clients |
 | Settings, About | The tile |
 | README and docs | The tile; in the big picture it blinks |

@@ -26,6 +26,34 @@ final class FirstRunGuideTests: XCTestCase {
         XCTAssertFalse(FirstRunGuide.opensByItself(seen: false, loaded: true, serverCount: 3))
     }
 
+    func testEachFirstIsMarkedOnceOnANewSetup() {
+        var firsts = FirstMoments(stored: nil)
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 0, clientCount: 0, hasActivity: false)))
+        XCTAssertEqual(firsts.observe(FirstRunGuide(serverCount: 1, clientCount: 0, hasActivity: false)), .server)
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 2, clientCount: 0, hasActivity: false)))
+        // What was marked is remembered across launches.
+        firsts = FirstMoments(stored: firsts.stored)
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 2, clientCount: 0, hasActivity: false)))
+        // Two at once say the later one, and neither comes back.
+        XCTAssertEqual(firsts.observe(FirstRunGuide(serverCount: 2, clientCount: 1, hasActivity: true)), .activity)
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 2, clientCount: 1, hasActivity: true)))
+        // Removing the only server and adding one again is not a first.
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 0, clientCount: 1, hasActivity: true)))
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 1, clientCount: 1, hasActivity: true)))
+    }
+
+    func testNothingIsMarkedOnAMacThatAlreadyHadServers() {
+        var firsts = FirstMoments(stored: nil)
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 3, clientCount: 0, hasActivity: false)))
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 3, clientCount: 1, hasActivity: true)))
+    }
+
+    func testAClientLinkedBeforeAnyServerIsNotMarkedLater() {
+        var firsts = FirstMoments(stored: nil)
+        XCTAssertNil(firsts.observe(FirstRunGuide(serverCount: 0, clientCount: 1, hasActivity: false)))
+        XCTAssertEqual(firsts.observe(FirstRunGuide(serverCount: 1, clientCount: 1, hasActivity: false)), .server)
+    }
+
     func testTheAgentPromptShipsInTheApp() throws {
         let prompt = try XCTUnwrap(FirstRunGuide.agentPrompt)
         XCTAssertTrue(prompt.contains("plug import --dry-run"))

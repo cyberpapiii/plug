@@ -585,7 +585,6 @@ struct ClientsView: View {
                     EmptyPage(
                         title: "No Clients",
                         message: "A client is an app that uses your servers, such as Claude or Cursor. When Plug finds one on this Mac, it shows here with a switch.",
-                        symbol: AppSection.clients.symbol,
                         actionTitle: "Add Client…",
                         actionIntent: .addClient,
                         secondaryTitle: "How Plug Works",

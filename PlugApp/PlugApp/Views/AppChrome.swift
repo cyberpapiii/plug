@@ -236,6 +236,53 @@ struct ErrorToast: View {
     }
 }
 
+/// A first, marked once: the character sparks and says what just became
+/// true. It leaves by itself, or when clicked.
+struct FirstMomentToast: View {
+    let step: FirstRunGuide.Step
+    let dismiss: () -> Void
+    @State private var cheers = 0
+
+    var body: some View {
+        HStack(spacing: Metric.regular) {
+            PlugCharacter(mood: .awake, cheers: cheers)
+                .foregroundStyle(.tint)
+                .frame(width: 40, height: 40)
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(step.firstTitle).font(.callout.weight(.semibold))
+                Text(step.firstDetail)
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.leading, Metric.regular)
+        .padding(.trailing, Metric.roomy)
+        // Room above for the sparks.
+        .padding(.top, Metric.regular)
+        .padding(.bottom, Metric.snug)
+        .nativeGlassSurface(tint: Color.accentColor.opacity(0.08))
+        .contentShape(Rectangle())
+        .onTapGesture(perform: dismiss)
+        .padding(Metric.regular)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isButton)
+        .accessibilityHint("Dismiss")
+        .task {
+            AccessibilityNotification.Announcement("\(step.firstTitle). \(step.firstDetail)").post()
+            try? await Task.sleep(for: .seconds(0.45))
+            cheers += 1
+            // The last of the three gets a second hop.
+            if step == .activity {
+                try? await Task.sleep(for: .seconds(0.75))
+                cheers += 1
+            }
+            try? await Task.sleep(for: .seconds(7))
+            if !Task.isCancelled { dismiss() }
+        }
+    }
+}
+
 /// A page that is still loading. The words are for VoiceOver only.
 struct LoadingPage: View {
     let message: String
@@ -292,11 +339,12 @@ struct UnavailablePage: View {
     }
 }
 
-/// The empty state for a whole page: says what would be here and how to get it.
+/// The empty state for a whole page: says what would be here and how to get
+/// it. The character waits there, since an empty page is Plug's to explain.
 struct EmptyPage: View {
     let title: String
     let message: String
-    let symbol: String
+    var mood = PlugCharacter.Mood.curious
     var actionTitle: String?
     var actionIntent: PlugIntent?
     /// A quieter second way out of an empty page, when there is more than one.
@@ -307,7 +355,7 @@ struct EmptyPage: View {
     var body: some View {
         PagePane {
             ContentUnavailableView {
-                Label(title, systemImage: symbol)
+                PlugCharacterLabel(title: title, mood: mood)
             } description: {
                 Text(message)
             } actions: {

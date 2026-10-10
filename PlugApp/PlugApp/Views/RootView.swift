@@ -34,6 +34,9 @@ struct RootView: View {
 
     static let guideSeenKey = "guideSeen"
 
+    @AppStorage("firstMoments") private var storedFirsts: String?
+    @State private var firstMoment: FirstRunGuide.Step?
+
     @State private var columns = NavigationSplitViewVisibility.all
 
     var body: some View {
@@ -75,8 +78,14 @@ struct RootView: View {
                     ErrorToast(error: error) { run(.dismissActionError) }
                         .id(error.id)
                         .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
+                } else if let firstMoment, router.sheet == nil {
+                    FirstMomentToast(step: firstMoment) { self.firstMoment = nil }
+                        .id(firstMoment)
+                        .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
                 }
             }
+            .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: firstMoment)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: router.sheet)
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: showsBanner)
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actionError?.id)
         }
@@ -116,6 +125,8 @@ struct RootView: View {
         .onChange(of: guideOpensByItself, initial: true) {
             if guideOpensByItself, router.sheet == nil { router.sheet = .guide }
         }
+        .onChange(of: firstsToLookAt, initial: true) { lookForFirsts() }
+        .task { await model.loadConnectableApps() }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
     }
@@ -163,6 +174,19 @@ struct RootView: View {
             loaded: !model.isLoadingInitialData && !model.initialDataUnavailable,
             serverCount: model.snapshot.configuredServers.count
         )
+    }
+
+    /// Where the setup is, once both halves of it have been read. Before
+    /// that an empty list does not mean nothing is there.
+    private var firstsToLookAt: FirstRunGuide? {
+        model.hasLoadedSnapshot && model.hasLoadedConnectableApps ? model.firstRunGuide : nil
+    }
+
+    private func lookForFirsts() {
+        guard let guide = firstsToLookAt else { return }
+        var firsts = FirstMoments(stored: storedFirsts)
+        if let step = firsts.observe(guide) { firstMoment = step }
+        if firsts.stored != storedFirsts { storedFirsts = firsts.stored }
     }
 
     /// Tools are searched from Servers, so its field says so.
