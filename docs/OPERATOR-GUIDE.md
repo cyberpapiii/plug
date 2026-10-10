@@ -4,7 +4,7 @@ This guide is for running Plug as shared infrastructure: a local daemon for dail
 
 ## Installation boundary
 
-On macOS, install one `Plug.app` from the signed DMG on the Plug website or
+On macOS, install one `Plug.app` from the signed DMG on
 [GitHub Releases](https://github.com/cyberpapiii/plug/releases), or install the
 same app with the Homebrew Cask:
 
@@ -16,7 +16,9 @@ Open Plug.app once. First launch needs a logged-in GUI session for
 ServiceManagement and Keychain consent. Plug.app owns the GUI, `plug` command,
 background daemon, client links, and updates. Headless macOS is unsupported.
 
-Linux builds from source with `cargo install`. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
+Plug is a Mac product. The code also compiles on Linux
+(`cargo install --git https://github.com/cyberpapiii/plug plug-mcp`), but
+nothing there starts or keeps the daemon running for you. Source development runs `./scripts/dev-install.sh`, which builds a Developer ID signed `Plug.app` from the working tree and installs it in place.
 
 ## Runtime Model
 
@@ -24,7 +26,7 @@ Plug has one configured upstream set and many downstream clients.
 
 - One shared daemon owns the IPC listener and the HTTP server. On macOS
   Plug.app starts and restarts it; use the app's on/off switch and Restart
-  control. On Linux, `plug start` starts it.
+  control.
 - `plug connect` is the stdio adapter most local clients use.
 - `/mcp` is the Streamable HTTP endpoint for HTTP-capable clients.
 - `/events/slack` exists only when Slack event delivery is configured.
@@ -35,7 +37,7 @@ Useful files:
 - macOS config and runtime: `~/Library/Application Support/plug/`
 - macOS logs: `~/Library/Logs/plug/`
 - Linux config: `~/.config/plug/`
-- Linux logs/state: `~/.local/state/plug/`
+- Linux logs: `~/.local/state/plug/logs/`
 
 Prefer `--output json` for automation:
 
@@ -181,9 +183,9 @@ require Plug's exact local listener authority and reject forwarded requests.
 Optional. Plug can receive Slack's Events API and deliver filtered messages to
 one authorized remote client as an MCP event. It needs OAuth mode, the modern
 downstream gate, an enabled `slack` upstream, and a signing secret stored with
-`plug auth slack-events set`. It is Slack-only; no other server's events are
-forwarded. Setup, limits, and shutdown are in
-[slack-mcp-events.md](slack-mcp-events.md).
+`plug auth slack-events set`. Setup, limits, and shutdown are in
+[slack-mcp-events.md](slack-mcp-events.md). Watching any server's tool for a
+change is the other event source; see [events.md](events.md).
 
 ## Upstream OAuth
 
@@ -221,11 +223,8 @@ plug servers
 plug tools
 ```
 
-For logs:
-
-```sh
-RUST_LOG=plug=debug,plug_core=debug plug start
-```
+The daemon's log is in `~/Library/Logs/plug/`. For more detail from one
+command, add `-v` or `-vv` to it.
 
 HTTP tracing:
 
@@ -278,7 +277,7 @@ Current distribution names:
 
 - GitHub repo: `cyberpapiii/plug`
 - macOS app: signed `Plug.app` DMG and `plug-app` Homebrew Cask
-- Linux: source build only (`cargo install --git https://github.com/cyberpapiii/plug plug-mcp`)
+- Linux: source build only, with no background service
 - Source development: `./scripts/dev-install.sh`
 
 `./scripts/release.sh <version>` runs the whole release; see `docs/RELEASING.md`.

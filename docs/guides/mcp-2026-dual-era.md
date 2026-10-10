@@ -106,8 +106,8 @@ clients cannot call that modern upstream's tools.
    plug config check
    ```
 
-4. Let the running daemon's configuration watcher apply the change, or restart
-   Plug through your normal service workflow if the watcher is not active.
+4. Plug applies the change by itself. If it does not, use Settings, Files,
+   Reload in the app.
 5. Check health and the selected protocol:
 
    ```sh

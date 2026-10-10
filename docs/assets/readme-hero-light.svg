@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1200 470" width="1200" height="470" role="img" aria-label="Clients on the left connect through Plug to servers on the right">
+<defs>
+  <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="#f6f8fb"/><stop offset="1" stop-color="#eaf1fb"/></linearGradient>
+  <linearGradient id="plug" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="#2f9bff"/><stop offset="1" stop-color="#0a6ee6"/></linearGradient>
+  <filter id="glow" x="-50%" y="-50%" width="200%" height="200%"><feGaussianBlur stdDeviation="18"/></filter>
+</defs>
+<style>
+  text { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif; }
+  .name { font-size: 19px; font-weight: 600; fill: #1b2330; }
+  .head { font-size: 13px; font-weight: 700; letter-spacing: 2px; fill: #5d6b7e; }
+  .sub { font-size: 15px; fill: #5d6b7e; }
+  .wire { fill: none; stroke: #b9c7da; stroke-width: 2; }
+  .flow { fill: none; stroke: #0a6ee6; stroke-width: 4; stroke-linecap: round; stroke-dasharray: 1 26; animation: run 1.6s linear infinite; }
+  .pulse { animation: pulse 3.2s ease-in-out infinite; transform-origin: 600px 254px; }
+  @keyframes run { to { stroke-dashoffset: -27; } }
+  @keyframes pulse { 0%,100% { opacity: .35; transform: scale(1); } 50% { opacity: .6; transform: scale(1.12); } }
+  @media (prefers-reduced-motion: reduce) { .flow, .pulse { animation: none; } }
+</style>
+<rect x="1" y="1" width="1198" height="468" rx="22" fill="url(#bg)" stroke="#d6deea"/>
+<text class="head" x="60" y="62">CLIENTS</text><text class="sub" x="60" y="84">use tools</text>
+<text class="head" x="1140" y="62" text-anchor="end">SERVERS</text><text class="sub" x="1140" y="84" text-anchor="end">provide tools</text>
+<path class="wire" d="M320 118 C 430 118, 440 254, 554 254"/><path class="flow" d="M320 118 C 430 118, 440 254, 554 254" style="animation-delay:-0.00s"/>
+<path class="wire" d="M880 118 C 770 118, 760 254, 646 254"/><path class="flow" d="M880 118 C 770 118, 760 254, 646 254" style="animation-direction:reverse;animation-delay:-0.00s"/>
+<path class="wire" d="M320 186 C 430 186, 440 254, 554 254"/><path class="flow" d="M320 186 C 430 186, 440 254, 554 254" style="animation-delay:-0.31s"/>
+<path class="wire" d="M880 186 C 770 186, 760 254, 646 254"/><path class="flow" d="M880 186 C 770 186, 760 254, 646 254" style="animation-direction:reverse;animation-delay:-0.31s"/>
+<path class="wire" d="M320 254 C 430 254, 440 254, 554 254"/><path class="flow" d="M320 254 C 430 254, 440 254, 554 254" style="animation-delay:-0.62s"/>
+<path class="wire" d="M880 254 C 770 254, 760 254, 646 254"/><path class="flow" d="M880 254 C 770 254, 760 254, 646 254" style="animation-direction:reverse;animation-delay:-0.62s"/>
+<path class="wire" d="M320 322 C 430 322, 440 254, 554 254"/><path class="flow" d="M320 322 C 430 322, 440 254, 554 254" style="animation-delay:-0.93s"/>
+<path class="wire" d="M880 322 C 770 322, 760 254, 646 254"/><path class="flow" d="M880 322 C 770 322, 760 254, 646 254" style="animation-direction:reverse;animation-delay:-0.93s"/>
+<path class="wire" d="M320 390 C 430 390, 440 254, 554 254"/><path class="flow" d="M320 390 C 430 390, 440 254, 554 254" style="animation-delay:-1.24s"/>
+<path class="wire" d="M880 390 C 770 390, 760 254, 646 254"/><path class="flow" d="M880 390 C 770 390, 760 254, 646 254" style="animation-direction:reverse;animation-delay:-1.24s"/>
+<rect x="60" y="92" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="86" cy="118" r="7" fill="#f5a524"/><text class="name" x="106" y="124.5">Claude</text>
+<rect x="880" y="92" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="906" cy="118" r="7" fill="#8b5cf6"/><text class="name" x="926" y="124.5">Slack</text>
+<rect x="60" y="160" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="86" cy="186" r="7" fill="#17b26a"/><text class="name" x="106" y="192.5">ChatGPT</text>
+<rect x="880" y="160" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="906" cy="186" r="7" fill="#ef4444"/><text class="name" x="926" y="192.5">Notion</text>
+<rect x="60" y="228" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="86" cy="254" r="7" fill="#8b5cf6"/><text class="name" x="106" y="260.5">Codex</text>
+<rect x="880" y="228" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="906" cy="254" r="7" fill="#0a6ee6"/><text class="name" x="926" y="260.5">Google Workspace</text>
+<rect x="60" y="296" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="86" cy="322" r="7" fill="#ef4444"/><text class="name" x="106" y="328.5">Cursor</text>
+<rect x="880" y="296" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="906" cy="322" r="7" fill="#f5a524"/><text class="name" x="926" y="328.5">Messages</text>
+<rect x="60" y="364" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="86" cy="390" r="7" fill="#0a6ee6"/><text class="name" x="106" y="396.5">Your own script</text>
+<rect x="880" y="364" width="260" height="52" rx="14" fill="#ffffff" stroke="#d6deea"/><circle cx="906" cy="390" r="7" fill="#17b26a"/><text class="name" x="926" y="396.5">Anything else</text>
+<circle class="pulse" cx="600" cy="254" r="72" fill="#2f9bff" filter="url(#glow)"/>
+<g transform="translate(534 188) scale(1.1)"><rect width="120" height="120" rx="27" fill="url(#plug)"/><g fill="none" stroke="#fff" stroke-width="10" stroke-linecap="round"><path d="M81 45A29 29 0 1 1 39 45"/><path d="M52 24V54M68 24V54"/></g></g>
+<text class="name" x="600" y="354" text-anchor="middle">Plug</text>
+<text class="sub" x="600" y="376" text-anchor="middle">on your Mac</text>
+</svg>

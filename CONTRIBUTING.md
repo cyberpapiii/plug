@@ -1,6 +1,6 @@
 # Contributing
 
-Plug is a Rust MCP multiplexer with a macOS app that owns the daemon. The
+Plug is a Rust MCP gateway with a macOS app that owns the daemon. The
 layout, the commands, and the rules are in `AGENTS.md`; it is short and it is
 written for people as much as for agents.
 
@@ -43,7 +43,7 @@ Every user-visible change adds a line under `[Unreleased]` in `CHANGELOG.md`.
 
 - Behavior changes come with tests. Protocol, config, auth, routing, IPC, and
   transport changes need focused coverage.
-- Plug is a multiplexer, not a leaf server. Keep capability synthesis,
+- Plug is a gateway, not a leaf server. Keep capability synthesis,
   namespaced routing, reverse-request routing, and daemon IPC intact; do not
   swap them for SDK defaults.
 - A change that can break a documented client (Claude Code, Claude Desktop,

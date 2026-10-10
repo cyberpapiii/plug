@@ -32,7 +32,7 @@ The first member creates remote state and the last member drains it. Acknowledge
 ### Shared daemon runtime
 The Plug service runtime that owns reusable upstream connections and serves local downstream sessions, allowing multiple clients to share one configured MCP runtime.
 
-It normally runs in the background, but the same shared runtime can run interactively. It is distinct from the per-client standalone fallback created when a downstream cannot connect to the shared service; operator status should identify which runtime supplied each observation.
+It normally runs in the background, but the same shared runtime can run interactively. A downstream that cannot reach it gets an error, never a private runtime of its own.
 
 ### Runtime truth
 An observation obtained from the live runtime that owns the relevant state, including explicit scope or unavailability when the complete runtime cannot be queried.
@@ -44,7 +44,7 @@ Runtime truth takes precedence over configuration inference for health, sessions
 ### Upstream
 A backend MCP server that `plug` connects to and proxies on behalf of downstream clients; the unit of configuration, health, routing, and supervision.
 
-An upstream is reached over one of three transports (a stdio subprocess, HTTP, or legacy SSE). It is *routable* only while its health permits routing; an unroutable upstream is skipped during tool routing but may still be recovered.
+An upstream is reached over one of four transports (a stdio subprocess, HTTP, legacy SSE, or an HTTP API described by an OpenAPI document). It is *routable* only while its health permits routing; an unroutable upstream is skipped during tool routing but may still be recovered.
 
 ### Server health
 The connection-liveness state of an upstream, advanced by periodic health-check probes: healthy, degraded, failed, or auth-required. Distinct from Availability, which describes the catalog rather than the connection.
