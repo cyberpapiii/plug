@@ -6,7 +6,7 @@ import PlugIPC
 /// The Activity list, the menu bar panel, and a server's recent calls all show
 /// the same call. They read it from here, so the name, the caller, the time it
 /// took, and the result never differ between them.
-struct CallFacts: Equatable {
+struct CallFacts: Equatable, Sendable {
     let event: ActivityEvent
     /// What the owner called this client, when they named it.
     let ownerName: String?

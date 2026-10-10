@@ -23,7 +23,11 @@ struct ActivityView: View {
     private var scope: Scope { router.activityScope }
 
     var body: some View {
-        Group {
+        // Filtered and sorted once for each time the page is drawn; the
+        // list, its groups and the selection all read the same result.
+        let visible = self.visible
+        let selected = visible.first { $0.sequence == router.selectedCall }
+        return Group {
             if model.isLoadingInitialData {
                 LoadingPage(message: "Loading activity")
             } else if model.initialDataUnavailable {
@@ -46,10 +50,12 @@ struct ActivityView: View {
             } else {
                 ListDetail {
                     List(selection: $router.selectedCall) {
-                        ForEach(groups, id: \.title) { group in
+                        ForEach(Self.groups(of: visible), id: \.title) { group in
                             ListGroupHeader(group.title)
                             ForEach(group.events) { event in
-                                ActivityRow(call: model.call(event)).tag(event.sequence)
+                                ActivityRow(call: model.call(event))
+                                    .equatable()
+                                    .tag(event.sequence)
                             }
                             .listRowSeparator(.hidden)
                         }
@@ -126,7 +132,7 @@ struct ActivityView: View {
     }
 
     /// Grouped by day so a long list stays legible without a date column.
-    private var groups: [DayGroup] {
+    private static func groups(of visible: [ActivityEvent]) -> [DayGroup] {
         let calendar = Calendar.current
         var order: [String] = []
         var buckets: [String: [ActivityEvent]] = [:]
@@ -150,8 +156,12 @@ struct ActivityView: View {
     }
 }
 
-private struct ActivityRow: View {
+/// Equal while the call is the same, so a new call at the top of the list
+/// does not redraw the rows under it.
+private struct ActivityRow: View, Equatable {
     let call: CallFacts
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool { lhs.call == rhs.call }
 
     var body: some View {
         HStack(spacing: Metric.tight) {
