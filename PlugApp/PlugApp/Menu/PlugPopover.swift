@@ -690,8 +690,8 @@ private struct LatestCallLine: View {
 /// size of a server's tile.
 private struct AppIconStack: View {
     static let size = Metric.panelTile
-    private static let overlap: CGFloat = 10
-    private static let ring: CGFloat = 2
+    private static let overlap: CGFloat = 11
+    private static let gap: CGFloat = 1
 
     let clients: [ConnectedClient]
 
@@ -700,16 +700,24 @@ private struct AppIconStack: View {
         HStack(spacing: -Self.overlap) {
             ForEach(shown, id: \.offset) { index, client in
                 AppGlyph(target: client.target, name: client.name, appPath: client.appPath, size: Self.size)
-                    // A ring in the panel's own colour parts each icon from the one under it.
-                    .padding(Self.ring)
-                    .background(
-                        .background,
-                        in: RoundedRectangle(cornerRadius: Self.size * 0.28 + Self.ring, style: .continuous)
-                    )
+                    .mask { if index == 0 { Rectangle() } else { cutout } }
                     .zIndex(Double(shown.count - index))
             }
         }
-        .padding(-Self.ring)
         .accessibilityHidden(true)
+    }
+
+    /// Everything but the corner the icon in front covers, and a sliver
+    /// more. The gap between two icons is the panel itself showing through,
+    /// so it is right on any background, glass included.
+    private var cutout: some View {
+        Rectangle()
+            .overlay(alignment: .leading) {
+                RoundedRectangle(cornerRadius: Self.size * 0.26, style: .continuous)
+                    .frame(width: Self.size + Self.gap * 2, height: Self.size + Self.gap * 2)
+                    .offset(x: Self.overlap - Self.size - Self.gap)
+                    .blendMode(.destinationOut)
+            }
+            .compositingGroup()
     }
 }

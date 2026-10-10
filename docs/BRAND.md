@@ -92,6 +92,9 @@ Rules:
   shows code.
 - Connected clients are up to three icons the size of a server's tile, each
   over the edge of the next.
+- A gap between two overlapping things (stacked icons, a status dot on an
+  icon) is cut out of the one behind, never painted in a background colour.
+  A painted ring shows as a grey outline on glass.
 - A server's tile is 28 points. A server that is off stays on the shelf,
   grey and dimmed, with no dot.
 - A plain line that says something and offers a button starts with one

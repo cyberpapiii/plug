@@ -315,6 +315,8 @@ struct ServerGlyph: View {
     /// app shows a contact's presence. Nil draws no dot.
     var status: Color?
 
+    private var dot: CGFloat { max(7, size * 0.32) }
+
     var body: some View {
         Group {
             if let icon = IconStore.shared.image(forServer: name) {
@@ -326,13 +328,25 @@ struct ServerGlyph: View {
             }
         }
         .frame(width: size, height: size)
+        // The gap around the dot is cut out of the icon, not painted over it,
+        // so it is right on any background, glass included.
+        .mask {
+            Rectangle()
+                .overlay(alignment: .bottomTrailing) {
+                    if status != nil {
+                        Circle()
+                            .frame(width: dot * 1.4, height: dot * 1.4)
+                            .offset(x: dot * 0.35, y: dot * 0.35)
+                            .blendMode(.destinationOut)
+                    }
+                }
+                .compositingGroup()
+        }
         .overlay(alignment: .bottomTrailing) {
             if let status {
-                let dot = max(7, size * 0.32)
                 Circle()
                     .fill(status)
                     .frame(width: dot, height: dot)
-                    .overlay(Circle().stroke(.background, lineWidth: dot * 0.2))
                     .offset(x: dot * 0.15, y: dot * 0.15)
             }
         }
