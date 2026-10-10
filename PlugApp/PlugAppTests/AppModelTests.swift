@@ -1146,6 +1146,27 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(missing.health, .notLoaded, "the daemon's uptime reaches the row")
     }
 
+    /// The daemon names each server once. If it ever does not, the app shows
+    /// the first and keeps running.
+    func testAServerNamedTwiceDoesNotStopTheApp() {
+        let twice = """
+        {"name":"alpha","url":null,"authenticated":true,"health":"Healthy","scopes":null,"tokenExpiresInSecs":null,"warnings":[]}
+        """
+        let payload = """
+        {
+          "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "ownership": "app_managed",
+          "configuredServers": [], "servers": [], "liveSessions": [], "clientVisibility": [],
+          "upstreamAuth": [\(twice), \(twice)], "downstreamClients": []
+        }
+        """
+        let snapshot = try! JSONDecoder().decode(OperatorSnapshot.self, from: Data(payload.utf8))
+        var posted: [String] = []
+        let service = NotificationService { posted.append($0.id) }
+        service.observe(snapshot)
+        service.observe(snapshot)
+        XCTAssertTrue(posted.isEmpty)
+    }
+
     @MainActor
     private func makeNotificationSnapshot(
         authenticated: Bool = true,

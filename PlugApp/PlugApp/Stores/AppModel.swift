@@ -198,7 +198,7 @@ final class AppModel {
     private var readsAllowed: Bool { serviceEnabled && !isChangingService && (!reconciliationInFlight || isOnlyInspecting) }
 
     var visibleServers: [ServerPresentation] {
-        let runtimeByName = Dictionary(uniqueKeysWithValues: snapshot.servers.map { ($0.serverId, $0) })
+        let runtimeByName = Dictionary(snapshot.servers.map { ($0.serverId, $0) }, uniquingKeysWith: { first, _ in first })
         return Self.displayOrder(snapshot.configuredServers.map {
             ServerPresentation(
                 configured: $0,
