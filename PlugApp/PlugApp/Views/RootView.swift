@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// What the window is for. Signing in to a server used to be its own section,
@@ -65,9 +66,7 @@ struct RootView: View {
                 .environment(\.splitPane, .detail)
                 .toolbar {
                     ToolbarItem { Spacer() }
-                    ToolbarItem(placement: .primaryAction) {
-                        SearchControl(text: $search, prompt: searchPrompt)
-                    }
+                    searchItem
                 }
             .topBanner(
                 isShown: showsBanner,
@@ -134,6 +133,27 @@ struct RootView: View {
         .task { await model.loadConnectableApps() }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    /// The search control draws its own glass, so the bar's is turned off
+    /// behind it.
+    @ToolbarContentBuilder private var searchItem: some ToolbarContent {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            ToolbarItem(placement: .primaryAction) {
+                SearchControl(text: $search, prompt: searchPrompt)
+            }
+            .sharedBackgroundVisibility(.hidden)
+        } else {
+            ToolbarItem(placement: .primaryAction) {
+                SearchControl(text: $search, prompt: searchPrompt)
+            }
+        }
+#else
+        ToolbarItem(placement: .primaryAction) {
+            SearchControl(text: $search, prompt: searchPrompt)
+        }
+#endif
     }
 
     /// Plug itself at the top of the sidebar: the character, the switch, and
@@ -234,56 +254,78 @@ struct RootView: View {
 }
 
 /// Search in the window's bar: a magnifying glass until it is pressed, then
-/// a field, the way Finder shows it. It folds away again once it is empty
-/// and the cursor has left it.
+/// a field, the way Finder shows it. It is one capsule that grows, inside a
+/// slot of fixed width, so the bar itself never has to lay out again. It
+/// folds away once it is empty and the click or the cursor goes elsewhere.
 private struct SearchControl: View {
     @Binding var text: String
     let prompt: String
     @State private var open = false
+    @State private var clicks = ClickAway()
     @FocusState private var focused: Bool
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
+    private static let fieldWidth: CGFloat = 170
+    private static let height: CGFloat = 36
+
     var body: some View {
-        if !open {
+        HStack(spacing: Metric.tight) {
             Button(action: show) {
-                Label("Search", icon: .search)
+                PlugIcon(.search)
+                    .frame(width: open ? 18 : Self.height, height: Self.height)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
             .keyboardShortcut("f")
             .help("Search")
-        } else {
-            HStack(spacing: Metric.tight) {
-                PlugIcon(.search)
-                    .foregroundStyle(.secondary)
-                    .accessibilityHidden(true)
+            .accessibilityLabel("Search")
+            if open {
                 TextField(prompt, text: $text)
                     .textFieldStyle(.plain)
                     .focused($focused)
-                    .frame(width: 180)
+                    .frame(width: Self.fieldWidth)
                     .onExitCommand(perform: close)
-                if !text.isEmpty {
-                    Button(action: close) {
-                        PlugIcon(.dismiss, size: 14)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(.secondary)
-                    .help("Clear")
-                    .accessibilityLabel("Clear")
+                    .transition(.opacity)
+                Button(action: close) {
+                    PlugIcon(.dismiss, size: 14)
                 }
+                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
+                .opacity(text.isEmpty ? 0 : 1)
+                .help("Clear")
+                .accessibilityLabel("Clear")
+                .accessibilityHidden(text.isEmpty)
             }
-            .padding(.horizontal, Metric.snug)
-            .onChange(of: focused) { if !focused, text.isEmpty { fold() } }
-            // A section change empties the search.
-            .onChange(of: text) { if text.isEmpty, !focused { fold() } }
         }
+        .padding(.horizontal, open ? Metric.snug : 0)
+        .frame(height: Self.height)
+        .barCapsule()
+        .background(ClickAwayAnchor(clicks: clicks))
+        .frame(width: Self.fieldWidth + 80, alignment: .trailing)
+        .onChange(of: open) {
+            clicks.onOutside = open ? { leave() } : nil
+        }
+        .onChange(of: focused) { if !focused, text.isEmpty { fold() } }
+        // A section change empties the search.
+        .onChange(of: text) { if text.isEmpty, !focused { fold() } }
+        .onDisappear { clicks.onOutside = nil }
     }
 
+    private var motion: Animation? { reduceMotion ? nil : .snappy(duration: 0.28, extraBounce: 0.05) }
+
     private func show() {
-        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { open = true }
+        withAnimation(motion) { open = true }
         focused = true
     }
 
     private func fold() {
-        withAnimation(reduceMotion ? nil : .snappy(duration: 0.2)) { open = false }
+        withAnimation(motion) { open = false }
+    }
+
+    /// A click elsewhere: the cursor leaves, and an empty field folds.
+    private func leave() {
+        focused = false
+        if text.isEmpty { fold() }
     }
 
     private func close() {
@@ -293,7 +335,61 @@ private struct SearchControl: View {
     }
 }
 
+/// Watches for a click outside one view while it is asked to. A text field
+/// on the Mac keeps the cursor when the click lands on something that takes
+/// no keyboard, so nothing else says the person has moved on.
+@MainActor
+private final class ClickAway {
+    weak var view: NSView?
+    private var monitor: Any?
+
+    var onOutside: (() -> Void)? {
+        didSet {
+            if let monitor { NSEvent.removeMonitor(monitor) }
+            monitor = nil
+            guard onOutside != nil else { return }
+            monitor = NSEvent.addLocalMonitorForEvents(matching: .leftMouseDown) { [weak self] event in
+                MainActor.assumeIsolated {
+                    guard let self, let view = self.view, event.window == view.window else { return }
+                    if !view.bounds.contains(view.convert(event.locationInWindow, from: nil)) {
+                        self.onOutside?()
+                    }
+                }
+                return event
+            }
+        }
+    }
+}
+
+private struct ClickAwayAnchor: NSViewRepresentable {
+    let clicks: ClickAway
+
+    func makeNSView(context: Context) -> NSView {
+        let view = NSView()
+        clicks.view = view
+        return view
+    }
+
+    func updateNSView(_ view: NSView, context: Context) {
+        clicks.view = view
+    }
+}
+
 private extension View {
+    /// The bar's own glass, as a capsule.
+    @ViewBuilder
+    func barCapsule() -> some View {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            glassEffect(.regular.interactive(), in: .capsule)
+        } else {
+            background(.quaternary, in: Capsule())
+        }
+#else
+        background(.quaternary, in: Capsule())
+#endif
+    }
+
 
     /// No bar background behind the window's toolbar. With one, macOS fades
     /// a line in under each column's bar whenever the pointer is over it.

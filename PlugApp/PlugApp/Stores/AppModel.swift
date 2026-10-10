@@ -220,8 +220,38 @@ final class AppModel {
     }
 
     /// Everything the interface needs to describe Plug, as one plain value.
+    ///
+    /// Built once per change. A page reads it a dozen times each time it is
+    /// drawn, and building it walks every server and every session.
     var situation: PlugSituation {
-        PlugSituation(
+        let key = SituationKey(
+            revision: snapshotRevision,
+            setup: setupState,
+            runtime: runtimeState,
+            signingIn: signingInServers
+        )
+        // Read so a view that only ever sees the kept value still follows
+        // the snapshot.
+        _ = snapshot.runtimeVersion
+        if let kept = keptSituation, kept.key == key { return kept.value }
+        let value = buildSituation()
+        keptSituation = (key, value)
+        return value
+    }
+
+    private struct SituationKey: Equatable {
+        let revision: Int
+        let setup: PlugSituation.Setup
+        let runtime: PlugSituation.Runtime
+        let signingIn: Set<String>
+    }
+
+    @ObservationIgnored private var snapshotRevision = 0
+    @ObservationIgnored private var keptSituation: (key: SituationKey, value: PlugSituation)?
+
+    private func buildSituation() -> PlugSituation {
+        let connectedClients = connectedClients
+        return PlugSituation(
             setup: setupState,
             runtime: runtimeState,
             servers: serverFacts,
@@ -561,6 +591,7 @@ final class AppModel {
         }
         let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
         let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
+        snapshotRevision += 1
         snapshot = value
         hasLoadedSnapshot = true
         snapshotDidLoad?(value)
