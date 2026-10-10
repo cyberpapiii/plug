@@ -43,6 +43,7 @@ struct RootView: View {
     /// the title while the sidebar is still sliding in does not fit, and the
     /// bar folds its buttons into a "more" button until it does.
     @State private var showsSubtitle = true
+    @State private var subtitle: String?
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columns) {
@@ -87,7 +88,13 @@ struct RootView: View {
                         }
                         .help(columns == .all ? "Hide Sidebar" : "Show Sidebar")
                     }
+                    titleItem
                 }
+                // The bar's own title keeps room for a second line it is not
+                // showing. With the sidebar hidden that pushed the divider
+                // between the columns out into the bar, away from the columns.
+                .withoutBarTitle()
+                .onPreferenceChange(PageSubtitleKey.self) { subtitle = $0 }
         } detail: {
             section
                 .environment(\.splitPane, .detail)
@@ -160,6 +167,38 @@ struct RootView: View {
         .task { await model.loadConnectableApps() }
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    private var pageTitle: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(router.section.rawValue)
+                .font(.headline)
+            if showsSubtitle, let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .lineLimit(1)
+        .fixedSize()
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(.isHeader)
+    }
+
+    /// The page's title, beside the sidebar button, with no glass behind it.
+    @ToolbarContentBuilder private var titleItem: some ToolbarContent {
+#if compiler(>=6.2)
+        if #available(macOS 26.0, *) {
+            ToolbarItem(placement: .navigation) { pageTitle }
+                .sharedBackgroundVisibility(.hidden)
+        } else if #available(macOS 15.0, *) {
+            ToolbarItem(placement: .navigation) { pageTitle }
+        }
+#else
+        if #available(macOS 15.0, *) {
+            ToolbarItem(placement: .navigation) { pageTitle }
+        }
+#endif
     }
 
     /// Pushes search to the far end of the bar. A plain spacer in an item of
@@ -431,6 +470,16 @@ private extension View {
 #endif
     }
 
+
+    /// Takes the bar's own title away where Plug draws it. Before macOS 15
+    /// the bar keeps its own.
+    @ViewBuilder func withoutBarTitle() -> some View {
+        if #available(macOS 15.0, *) {
+            toolbar(removing: .title)
+        } else {
+            self
+        }
+    }
 
     /// No bar background behind the window's toolbar. With one, macOS fades
     /// a line in under each column's bar whenever the pointer is over it.

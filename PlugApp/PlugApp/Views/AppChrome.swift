@@ -28,7 +28,18 @@ private struct PageSubtitle: ViewModifier {
     @Environment(\.showsPageSubtitle) private var shows
 
     func body(content: Content) -> some View {
-        content.navigationSubtitle(shows ? text ?? "" : "")
+        content
+            .navigationSubtitle(shows ? text ?? "" : "")
+            .preference(key: PageSubtitleKey.self, value: text)
+    }
+}
+
+/// The count under a section's title, handed up to the window, which draws
+/// the title in its bar itself.
+struct PageSubtitleKey: PreferenceKey {
+    static let defaultValue: String? = nil
+    static func reduce(value: inout String?, nextValue: () -> String?) {
+        value = value ?? nextValue()
     }
 }
 
