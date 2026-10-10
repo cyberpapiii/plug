@@ -207,12 +207,101 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(mood([server("a")]), .awake)
         XCTAssertEqual(mood([server("a", health: .signInNeeded), server("b")]), .needsYou)
         XCTAssertEqual(mood([server("a", health: .down), server("b")]), .worried)
-        XCTAssertEqual(mood([server("a", health: .down), server("b", health: .signInNeeded)]), .unsure)
+        XCTAssertEqual(mood([server("a", health: .down), server("b", health: .signInNeeded)]), .dizzy)
         XCTAssertEqual(
             mood([server("a", health: .signInNeeded), server("b", health: .signInNeeded)]), .needsYou
         )
         XCTAssertEqual(PlugVerdict.verdict(for: PlugSituation(runtime: .off)).mood, .asleep)
-        XCTAssertEqual(PlugVerdict.verdict(for: PlugSituation(runtime: .stopped)).mood, .alert)
+        XCTAssertEqual(PlugVerdict.verdict(for: PlugSituation(runtime: .stopped)).mood, .out)
+    }
+
+    private func trouble(_ situation: PlugSituation) -> PanelTrouble? {
+        PanelTrouble.trouble(for: situation, verdict: PlugVerdict.verdict(for: situation))
+    }
+
+    func testPanelHasNoCardWhenNothingNeedsYou() {
+        XCTAssertNil(trouble(PlugSituation(runtime: .running, servers: [server("a")])))
+        XCTAssertNil(trouble(PlugSituation(runtime: .running, servers: [server("a", health: .starting)])))
+        XCTAssertNil(trouble(PlugSituation(runtime: .off)))
+        XCTAssertNil(trouble(PlugSituation(runtime: .starting)))
+    }
+
+    func testOneTroubledServerIsTheOneBlueButton() throws {
+        let card = try XCTUnwrap(trouble(PlugSituation(
+            runtime: .running, servers: [server("Notion", health: .signInNeeded), server("b")]
+        )))
+        XCTAssertEqual(card.servers.map(\.name), ["Notion"])
+        XCTAssertTrue(card.fixIsPrimary)
+        XCTAssertNil(card.note)
+        XCTAssertNil(card.primary)
+        XCTAssertEqual(card.wash, .attention)
+
+        let down = try XCTUnwrap(trouble(PlugSituation(runtime: .running, servers: [server("Figma", health: .down)])))
+        XCTAssertEqual(down.wash, .blocked)
+    }
+
+    func testSeveralTroubledServersShareOneCheckupAndNoBlueButton() throws {
+        let card = try XCTUnwrap(trouble(PlugSituation(runtime: .running, servers: [
+            server("a", health: .signInNeeded), server("b", health: .down), server("c"),
+        ])))
+        XCTAssertEqual(card.servers.map(\.name), ["a", "b"])
+        XCTAssertFalse(card.fixIsPrimary)
+        XCTAssertNil(card.primary)
+        XCTAssertEqual(card.secondary?.intent, .checkup)
+        XCTAssertEqual(card.note, "1 of 3 servers running")
+        XCTAssertEqual(card.icon, .checkup)
+        XCTAssertEqual(card.wash, .blocked)
+    }
+
+    func testPanelShowsThreeTroubledServersAndCountsTheRest() throws {
+        let servers = ["a", "b", "c", "d", "e"].map { server($0, health: .signInNeeded) } + [server("f")]
+        let card = try XCTUnwrap(trouble(PlugSituation(runtime: .running, servers: servers)))
+        XCTAssertEqual(card.servers.map(\.name), ["a", "b", "c"])
+        XCTAssertEqual(card.note, "and 2 more · 1 of 6 servers running")
+        XCTAssertEqual(card.wash, .attention)
+    }
+
+    func testStoppedPlugOffersOnlyStartPlug() throws {
+        let card = try XCTUnwrap(trouble(PlugSituation(runtime: .stopped, servers: [server("a", health: .down)])))
+        XCTAssertTrue(card.servers.isEmpty)
+        XCTAssertEqual(card.primary?.intent, .reconnect)
+        XCTAssertNil(card.secondary)
+        XCTAssertEqual(card.icon, .plug)
+        XCTAssertEqual(card.wash, .blocked)
+    }
+
+    func testNoServersInvitesTheFirstOneWithoutAlarm() throws {
+        let card = try XCTUnwrap(trouble(PlugSituation(runtime: .running)))
+        XCTAssertEqual(card.primary?.intent, .addServer)
+        XCTAssertEqual(card.note, "Add your first one")
+        XCTAssertEqual(card.icon, .addServer)
+        XCTAssertNil(card.wash)
+    }
+
+    func testPlugNeedingSomethingPutsItsOwnButtonInTheCard() throws {
+        let card = try XCTUnwrap(trouble(PlugSituation(setup: .needsPermission, runtime: .stopped)))
+        XCTAssertEqual(card.primary?.intent, .allowBackgroundRunning)
+        XCTAssertEqual(card.wash, .attention)
+    }
+
+    func testTroubledServerSaysWhatIsWrongInAFewWords() {
+        XCTAssertEqual(server("a", health: .signInNeeded).reason, "Needs sign-in")
+        XCTAssertEqual(
+            server("a", health: .signInNeeded, signingIn: true).reason, "Finish signing in with your browser"
+        )
+        XCTAssertEqual(server("a", health: .down).reason, "Stopped")
+        XCTAssertEqual(server("a", health: .down, error: "connection refused").reason, "connection refused")
+    }
+
+    func testRunningSummaryCountsWhatIsUpOrHowFarAlong() {
+        let up = PlugSituation(runtime: .running, servers: [
+            server("a", tools: 3), server("b", tools: 4), server("c", health: .down, tools: 0),
+        ])
+        XCTAssertEqual(up.runningSummary(stale: false), "2 running · 7 tools")
+        XCTAssertEqual(up.runningSummary(stale: true), "Last known · 2 running · 7 tools")
+        let starting = PlugSituation(runtime: .running, servers: [server("a"), server("b", health: .starting)])
+        XCTAssertEqual(starting.runningSummary(stale: false), "1 of 2 ready")
+        XCTAssertEqual(starting.settledServers.map(\.name), ["a", "b"])
     }
 
     /// A face that never came to rest would redraw for ever, and one that

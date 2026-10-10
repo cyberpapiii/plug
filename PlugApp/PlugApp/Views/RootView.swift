@@ -67,7 +67,7 @@ struct RootView: View {
                 isShown: showsBanner,
                 transition: reduceMotion ? .opacity : .move(edge: .top).combined(with: .opacity)
             ) {
-                VerdictView(verdict: model.verdict, style: .compact, run: run)
+                VerdictView(verdict: model.verdict, run: run)
                     .padding(.horizontal, Metric.roomy)
                     .padding(.vertical, Metric.snug)
             }

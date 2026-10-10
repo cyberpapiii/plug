@@ -46,8 +46,6 @@ enum Metric {
     static let glyphSlot: CGFloat = 32
     static let popoverWidth: CGFloat = 340
     static let popoverRowHeight: CGFloat = 34
-    /// Whole rows shown before the list scrolls.
-    static let popoverVisibleRows = 7
     /// The list beside a detail, the same width in every section.
     static let listWidth: CGFloat = 270
     /// Room for the window buttons, the sidebar button, and a title with its count.
@@ -61,14 +59,27 @@ enum Metric {
 
 // MARK: - Tone
 
+/// The colours that say how something is. Every status colour in Plug is one
+/// of these, and each means one thing. Blue is not a status: it is Plug
+/// itself, and the one button to press.
+enum StatusColor {
+    static let working = Color.green
+    /// Starting, or off.
+    static let quiet = Color.secondary
+    static let needsYou = Color.orange
+    /// Stopped, or failed.
+    static let stopped = Color.red
+    /// How strong the wash is behind a card that reports trouble.
+    static let wash = 0.11
+}
+
 extension Verdict.Tone {
     var color: Color {
         switch self {
-        case .good: .green
-        case .quiet: .secondary
-        case .busy: .secondary
-        case .attention: .orange
-        case .blocked: .red
+        case .good: StatusColor.working
+        case .quiet, .busy: StatusColor.quiet
+        case .attention: StatusColor.needsYou
+        case .blocked: StatusColor.stopped
         }
     }
 }
@@ -76,11 +87,10 @@ extension Verdict.Tone {
 extension ServerHealth {
     var color: Color {
         switch self {
-        case .working: .green
-        case .starting: .secondary
-        case .signInNeeded, .notLoaded: .orange
-        case .down, .unknown: .red
-        case .off: .secondary
+        case .working: StatusColor.working
+        case .starting, .off: StatusColor.quiet
+        case .signInNeeded, .notLoaded: StatusColor.needsYou
+        case .down, .unknown: StatusColor.stopped
         }
     }
 
@@ -156,119 +166,46 @@ struct SectionLabel: View {
     }
 }
 
-/// The headline. One row at the top of the popover with Plug's character,
-/// compact in the window banner, but always the same words, so the app
-/// cannot contradict itself.
+/// The headline in the window's banner: Plug's character in the colour of
+/// what it says, the one sentence, and its buttons. The menu bar panel says
+/// the same words in its own top row, so the app cannot contradict itself.
 struct VerdictView: View {
-    enum Style { case hero, compact }
-
     let verdict: Verdict
-    let style: Style
-    /// What sits at the end of the hero's row: the popover's switch.
-    var accessory: AnyView?
     let run: (PlugIntent) -> Void
 
-    private var compact: Bool { style == .compact }
-
     var body: some View {
-        Group {
-            switch style {
-            case .hero:
-                // The buttons get their own line, so a long title is not
-                // squeezed in the narrow panel.
-                VStack(alignment: .leading, spacing: Metric.snug) {
-                    HStack(spacing: Metric.snug) {
-                        icon
-                        heroLine
-                        Spacer(minLength: Metric.tight)
-                        accessory
-                    }
-                    if verdict.primary != nil || verdict.secondary != nil {
-                        buttons.padding(.leading, Self.heroIconSize + Metric.snug)
-                    }
-                }
-            case .compact:
-                HStack(spacing: Metric.snug) {
-                    icon
-                    textColumn
-                    Spacer(minLength: Metric.tight)
-                    buttons
-                }
-            }
-        }
-        .accessibilityElement(children: .contain)
-        .accessibilityLabel("\(verdict.title). \(verdict.detail ?? "")")
-    }
-
-    private static let heroIconSize: CGFloat = 30
-
-    /// The title, then the detail after it in the same line. When all is
-    /// well that is one line, and the detail goes when there is no room for
-    /// it; trouble takes the room it needs to be read.
-    @ViewBuilder private var heroLine: some View {
-        let title = Text(verdict.title).font(.headline).foregroundStyle(.primary)
-        if let detail = verdict.detail {
-            let whole = Text("\(title)  \(Text(detail).font(.subheadline).foregroundStyle(.secondary))")
-            switch verdict.tone {
-            case .good, .quiet, .busy:
-                ViewThatFits(in: .horizontal) {
-                    whole.lineLimit(1)
-                    title.lineLimit(1)
-                }
-            case .attention, .blocked:
-                whole.lineLimit(4).fixedSize(horizontal: false, vertical: true)
-            }
-        } else {
-            title.lineLimit(2).fixedSize(horizontal: false, vertical: true)
-        }
-    }
-
-    private var textColumn: some View {
-        VStack(alignment: .leading, spacing: Metric.hairline) {
-            Text(verdict.title)
-                .font(titleFont)
-                .foregroundStyle(.primary)
-                .lineLimit(2)
-                .fixedSize(horizontal: false, vertical: true)
-            if let detail = verdict.detail {
-                Text(detail)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-        }
-    }
-
-    private var titleFont: Font { .callout.weight(.medium) }
-
-    @ViewBuilder private var icon: some View {
-        switch style {
-        case .hero:
-            // In the panel the character is Plug's own blue, and its face
-            // says how Plug is.
-            PlugCharacter(mood: verdict.mood)
-                .foregroundStyle(.tint)
-                .frame(width: Self.heroIconSize, height: Self.heroIconSize)
-                .accessibilityHidden(true)
-        case .compact:
+        HStack(spacing: Metric.snug) {
             PlugCharacter(mood: verdict.mood)
                 .foregroundStyle(verdict.tone.color)
                 .frame(width: 22, height: 22)
-        }
-    }
-
-    @ViewBuilder private var buttons: some View {
-        HStack(spacing: Metric.tight) {
-            if let secondary = verdict.secondary {
-                Button(secondary.title) { run(secondary.intent) }
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(verdict.title)
+                    .font(.callout.weight(.medium))
+                    .foregroundStyle(.primary)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = verdict.detail {
+                    Text(detail)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
             }
-            if let primary = verdict.primary {
-                Button(primary.title) { run(primary.intent) }
-                    .buttonStyle(.borderedProminent)
+            Spacer(minLength: Metric.tight)
+            HStack(spacing: Metric.tight) {
+                if let secondary = verdict.secondary {
+                    Button(secondary.title) { run(secondary.intent) }
+                }
+                if let primary = verdict.primary {
+                    Button(primary.title) { run(primary.intent) }
+                        .buttonStyle(.borderedProminent)
+                }
             }
+            .controlSize(.small)
         }
-        .controlSize(compact ? .small : .regular)
+        .accessibilityElement(children: .contain)
+        .accessibilityLabel("\(verdict.title). \(verdict.detail ?? "")")
     }
 }
 

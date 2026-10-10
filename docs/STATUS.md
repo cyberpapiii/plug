@@ -109,6 +109,16 @@ up to Open before starting it.
   built-in form described on #263 on the day a GraphQL API with no MCP
   server is needed. OpenAPI servers are done: CLI and app, bearer token or
   API key, operations chosen in either.
+- Web APIs and events made as easy to find in the app as servers. Both work
+  today, but neither is offered by name. A web API is added through Add
+  Server: paste its address and a "A Server / A Web API" choice appears only
+  then, so nothing on the Servers page says an API can be added. An event is
+  set up on the Events page with "Watch a Tool". Wanted: someone who has
+  never used Plug can add an API or set up an event without being told
+  where to look. Also left from the menu bar panel rebuild: an event that
+  needs attention does not show in the panel's card, and the panel's
+  activity line shows tool calls only, because the daemon's activity feed
+  carries no event deliveries.
 - Skills (#262). Done: `skill://` resources carry their server's name
   everywhere a URI crosses Plug. Left, when a client Plug's owner uses calls
   them: `skills/list` and `skills/get` on the 2026-07-28 path with the
