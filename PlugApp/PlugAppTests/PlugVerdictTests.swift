@@ -193,12 +193,38 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(server("a", tools: 12).toolCountText, "12 tools")
     }
 
-    func testCharacterMovesTheWayTheVerdictReads() {
+    func testCharacterWearsTheFaceTheVerdictReads() {
         XCTAssertEqual(PlugCharacter.Mood(.good), .awake)
         XCTAssertEqual(PlugCharacter.Mood(.quiet), .asleep)
         XCTAssertEqual(PlugCharacter.Mood(.busy), .working)
-        XCTAssertEqual(PlugCharacter.Mood(.attention), .troubled)
-        XCTAssertEqual(PlugCharacter.Mood(.blocked), .troubled)
+        XCTAssertEqual(PlugCharacter.Mood(.attention), .needsYou)
+        XCTAssertEqual(PlugCharacter.Mood(.blocked), .alert)
+
+        func mood(_ servers: [ServerFacts]) -> PlugCharacter.Mood {
+            PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: servers)).mood
+        }
+        XCTAssertEqual(mood([]), .curious)
+        XCTAssertEqual(mood([server("a")]), .awake)
+        XCTAssertEqual(mood([server("a", health: .signInNeeded), server("b")]), .needsYou)
+        XCTAssertEqual(mood([server("a", health: .down), server("b")]), .worried)
+        XCTAssertEqual(mood([server("a", health: .down), server("b", health: .signInNeeded)]), .unsure)
+        XCTAssertEqual(
+            mood([server("a", health: .signInNeeded), server("b", health: .signInNeeded)]), .needsYou
+        )
+        XCTAssertEqual(PlugVerdict.verdict(for: PlugSituation(runtime: .off)).mood, .asleep)
+        XCTAssertEqual(PlugVerdict.verdict(for: PlugSituation(runtime: .stopped)).mood, .alert)
+    }
+
+    /// A face that never came to rest would redraw for ever, and one that
+    /// moved a part out of sight would not be the character.
+    func testEveryFaceHoldsStillAsAWholeCharacter() {
+        for mood in PlugCharacter.Mood.allCases {
+            let pose = PlugPose.pose(for: mood, at: 0, moving: false)
+            XCTAssertEqual(pose, PlugPose.pose(for: mood, at: 3.7, moving: false), "\(mood)")
+            for part in [PlugPose.Part.bodyWidth, .bodyHeight, .leftProngHeight, .rightProngHeight] {
+                XCTAssertGreaterThan(pose[part], 0, "\(mood) \(part)")
+            }
+        }
     }
 
     func testMenuBarIconChangesShapeNotJustColour() {

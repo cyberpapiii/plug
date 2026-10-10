@@ -283,18 +283,25 @@ struct FirstMomentToast: View {
     }
 }
 
-/// A page that is still loading. The words are for VoiceOver only.
+/// A page that is still loading: Plug's three parts as three dots, which
+/// come back together into a face that thinks when it takes a while. The
+/// words are for VoiceOver only.
 struct LoadingPage: View {
     let message: String
+    @State private var slow = false
 
     var body: some View {
         PagePane {
-            PlugCharacter(mood: .working)
+            PlugCharacter(mood: slow ? .thinking : .loading)
                 .foregroundStyle(.secondary)
                 .frame(width: 44, height: 44)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .accessibilityElement()
                 .accessibilityLabel(message)
+                .task {
+                    try? await Task.sleep(for: .seconds(4))
+                    if !Task.isCancelled { slow = true }
+                }
         }
     }
 }
@@ -321,7 +328,7 @@ struct UnavailablePage: View {
     var body: some View {
         PagePane {
             ContentUnavailableView {
-                PlugCharacterLabel(title: verdict.title, mood: PlugCharacter.Mood(verdict.tone))
+                PlugCharacterLabel(title: verdict.title, mood: verdict.mood)
             } description: {
                 if let detail = verdict.detail {
                     Text(detail)

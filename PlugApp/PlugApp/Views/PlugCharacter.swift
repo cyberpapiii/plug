@@ -51,203 +51,578 @@ enum PlugMark {
     }
 }
 
-/// Plug's mark, moving the way its state reads. It blinks and glances about
-/// when all is well, looks from side to side while it works, shakes its head
-/// once when something is wrong, hops when that passes, dozes when Plug is
-/// off, and tilts its head on a page with nothing on it yet. It hops when
-/// clicked, too, and sparks when it is cheered. With Reduce Motion on it
-/// holds still.
+/// Plug's mark, with a face for each thing Plug can be: awake, working,
+/// worried, asleep and the rest of `Mood`. Going from one face to the next it
+/// changes shape on springs; nothing is swapped. The prongs move like ears,
+/// and the two prongs and the body can pull apart into three dots, an
+/// exclamation mark, or one dot.
+/// Cheered, it hops and sparks. Clicked, it winks, and clicked again it goes
+/// through every face it has. With Reduce Motion on it holds still in the
+/// face for its state.
 /// It takes the foreground style it is given.
 struct PlugCharacter: View {
-    enum Mood: Equatable {
-        case awake, working, troubled, asleep
+    enum Mood: Equatable, Sendable, CaseIterable {
+        /// Everything is working.
+        case awake
+        /// Something just came right.
+        case happy
+        /// A first: a server, a client, a tool call, a step done.
+        case cheering
+        /// It was clicked.
+        case wink
         /// Waiting for a first something, on a page with nothing on it yet.
         case curious
+        case surprised
+        /// Starting or busy.
+        case working
+        /// Something is taking a while.
+        case thinking
+        /// A page is loading: the three parts are three dots.
+        case loading
+        /// Sign in, or allow something.
+        case needsYou
+        /// Some of it works and some does not.
+        case unsure
+        /// Something stopped.
+        case worried
+        /// Plug itself is stopped: the three parts are an exclamation mark.
+        case alert
+        /// Plug is off.
+        case asleep
+        /// Out of the way: the three parts are one dot.
+        case tucked
 
+        /// The face for a tone when nothing says more.
         init(_ tone: Verdict.Tone) {
             switch tone {
             case .good: self = .awake
             case .quiet: self = .asleep
             case .busy: self = .working
-            case .attention, .blocked: self = .troubled
+            case .attention: self = .needsYou
+            case .blocked: self = .alert
+            }
+        }
+
+        /// Coming out of one of these into all-is-well is a relief.
+        fileprivate var isTrouble: Bool {
+            switch self {
+            case .working, .thinking, .needsYou, .unsure, .worried, .alert: true
+            default: false
+            }
+        }
+
+        fileprivate var blinks: Bool {
+            switch self {
+            case .awake, .happy, .curious, .thinking, .needsYou: true
+            default: false
             }
         }
     }
 
     let mood: Mood
-    /// Each time this goes up, the character hops and sparks fly off its
-    /// prongs, as when a step is done.
+    /// Each time this goes up, the character cheers: it hops and sparks fly
+    /// off its prongs, as when a step is done.
     var cheers = 0
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
-    @State private var open: CGFloat = 1
-    @State private var gaze: CGFloat = 0
-    @State private var lean = PlugMark.lean
-    @State private var breathing = false
-    @State private var lift: CGFloat = 0
-    /// Whole numbers are rest. Each cheer runs it up to the next one.
-    @State private var sparks: CGFloat = 0
-    @State private var shown: Mood?
+    @State private var puppet: PlugPuppet
+    /// Nothing is moving, so nothing is redrawn.
+    @State private var idle = false
+
+    init(mood: Mood, cheers: Int = 0) {
+        self.mood = mood
+        self.cheers = cheers
+        _puppet = State(initialValue: PlugPuppet(mood))
+    }
 
     var body: some View {
-        ZStack {
-            Part(eyes: false, open: open, gaze: gaze, lean: lean)
-            Part(eyes: true, open: open, gaze: gaze, lean: lean)
-                .blendMode(.destinationOut)
-        }
-        .compositingGroup()
-        .scaleEffect(breathing ? 1.06 : 1)
-        .visualEffect { [lift] content, proxy in content.offset(y: lift * proxy.size.height) }
-        .overlay { Sparks(progress: sparks - sparks.rounded(.down)) }
-        .task(id: Script(mood: mood, still: reduceMotion)) { try? await perform() }
-        .onChange(of: cheers) { old, new in
-            if new > old { Task { try? await cheer() } }
-        }
-        .contentShape(Rectangle())
-        .onTapGesture { Task { try? await hop() } }
-        .accessibilityHidden(true)
-    }
-
-    private struct Script: Equatable {
-        let mood: Mood
-        let still: Bool
-    }
-
-    private func perform() async throws {
-        let asleep = mood == .asleep
-        // Coming out of work or trouble into all-is-well earns a small hop.
-        let relieved = mood == .awake && (shown == .working || shown == .troubled)
-        shown = mood
-        withAnimation(reduceMotion ? nil : .smooth(duration: 0.4)) {
-            open = asleep ? 0 : 1
-            gaze = 0
-            lean = asleep ? -18 : PlugMark.lean
-            breathing = false
-            lift = 0
-        }
-        guard !reduceMotion else { return }
-        if relieved { try await hop() }
-        switch mood {
-        case .asleep:
-            withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: true)) { breathing = true }
-        case .working:
-            while true {
-                for side in [3.5, -3.5] {
-                    withAnimation(.easeInOut(duration: 0.5)) { gaze = side }
-                    try await pause(0.8)
+        GeometryReader { proxy in
+            let side = min(proxy.size.width, proxy.size.height)
+            TimelineView(.animation(paused: idle || reduceMotion)) { timeline in
+                let frame = puppet.frame(at: timeline.date, moving: !reduceMotion)
+                Canvas { context, size in
+                    PlugDrawing.draw(frame, side: side, in: &context, size: size)
                 }
             }
-        case .troubled:
-            try await pause(0.4)
-            for angle in [-17.0, -3, -15, PlugMark.lean] {
-                withAnimation(.easeInOut(duration: 0.11)) { lean = angle }
-                try await pause(0.11)
+            // Room around the character for a hop, the sparks and the "z"s.
+            .frame(width: side * PlugDrawing.room, height: side * PlugDrawing.room)
+            .position(x: proxy.size.width / 2, y: proxy.size.height / 2)
+            .allowsHitTesting(false)
+        }
+        .task(id: reduceMotion) {
+            while !Task.isCancelled {
+                let resting = reduceMotion || puppet.isResting
+                if resting != idle { idle = resting }
+                try? await Task.sleep(for: .seconds(PlugPuppet.lookAhead * 0.8))
             }
-            while true {
-                try await pause(.random(in: 3...6))
-                try await blink()
-            }
-        case .curious:
-            try await pause(0.9)
-            while true {
-                withAnimation(.smooth(duration: 0.35)) { lean = Self.tilt }
-                try await pause(1.4)
-                withAnimation(.smooth(duration: 0.35)) { lean = PlugMark.lean }
-                try await pause(.random(in: 3...6))
-                try await blink()
-                try await pause(.random(in: 2...4))
-            }
+        }
+        .onChange(of: mood) { _, new in
+            puppet.show(new, moving: !reduceMotion)
+            idle = false
+        }
+        .onChange(of: cheers) { old, new in
+            guard new > old, !reduceMotion else { return }
+            puppet.cheer()
+            idle = false
+        }
+        .contentShape(Rectangle())
+        .onTapGesture {
+            guard !reduceMotion else { return }
+            puppet.tap()
+            idle = false
+        }
+        .accessibilityHidden(true)
+    }
+}
+
+/// Where every part of the character is, for one face at one moment.
+struct PlugPose: Equatable, Sendable {
+    enum Part: Int, CaseIterable, Sendable {
+        case lean, lift, stretchX, stretchY
+        case leftProngX, leftProngY, leftProngWidth, leftProngHeight, leftProngTurn, leftProngShown
+        case rightProngX, rightProngY, rightProngWidth, rightProngHeight, rightProngTurn, rightProngShown
+        case bodyX, bodyY, bodyWidth, bodyHeight, bodyCorner, bodyShown
+        /// The eyes shrink to nothing when the parts stop being a face.
+        case eyeScale, gazeX, gazeY
+        case leftEyeWidth, leftEyeHeight, leftLid, leftLidTurn, leftCheek
+        case rightEyeWidth, rightEyeHeight, rightLid, rightLidTurn, rightCheek
+        case badge, snore
+    }
+
+    fileprivate var values: [CGFloat]
+
+    subscript(part: Part) -> CGFloat {
+        get { values[part.rawValue] }
+        set { values[part.rawValue] = newValue }
+    }
+
+    static let still = PlugPose(values: Array(repeating: 0, count: Part.allCases.count))
+
+    /// The mark as `docs/assets/plug-icon.svg` draws it.
+    static let rest = still.with([
+        .lean: PlugMark.lean, .stretchX: 1, .stretchY: 1,
+        .leftProngX: 46, .leftProngY: 35.5, .leftProngWidth: 14, .leftProngHeight: 37, .leftProngShown: 1,
+        .rightProngX: 74, .rightProngY: 35.5, .rightProngWidth: 14, .rightProngHeight: 37, .rightProngShown: 1,
+        .bodyX: 60, .bodyY: 67, .bodyWidth: 72, .bodyHeight: 54, .bodyCorner: PlugMark.bodyCorner, .bodyShown: 1,
+        .eyeScale: 1,
+        .leftEyeWidth: 9.24, .leftEyeHeight: 22.28, .rightEyeWidth: 9.24, .rightEyeHeight: 22.28,
+    ])
+
+    func with(_ changes: [Part: CGFloat]) -> PlugPose {
+        var pose = self
+        for (part, value) in changes { pose[part] = value }
+        return pose
+    }
+
+    /// Prongs of these lengths, standing on the body and leaning apart.
+    func prongs(_ left: CGFloat, _ right: CGFloat, apart: CGFloat = 0) -> PlugPose {
+        with([
+            .leftProngHeight: left, .leftProngY: 54 - left / 2, .leftProngTurn: -apart,
+            .rightProngHeight: right, .rightProngY: 54 - right / 2, .rightProngTurn: apart,
+        ])
+    }
+
+    /// Both eyes the same.
+    func eyes(
+        width: CGFloat? = nil, height: CGFloat? = nil, lid: CGFloat? = nil, cheek: CGFloat? = nil
+    ) -> PlugPose {
+        var pose = self
+        if let width { pose[.leftEyeWidth] = width; pose[.rightEyeWidth] = width }
+        if let height { pose[.leftEyeHeight] = height; pose[.rightEyeHeight] = height }
+        if let lid { pose[.leftLid] = lid; pose[.rightLid] = lid }
+        if let cheek { pose[.leftCheek] = cheek; pose[.rightCheek] = cheek }
+        return pose
+    }
+
+    /// The three parts as three round things of one size.
+    func dots(size: CGFloat, left: CGPoint, body: CGPoint, right: CGPoint, stem: CGFloat? = nil) -> PlugPose {
+        with([
+            .eyeScale: 0,
+            .leftProngX: left.x, .leftProngY: left.y, .leftProngWidth: size, .leftProngHeight: stem ?? size,
+            .rightProngX: right.x, .rightProngY: right.y, .rightProngWidth: size, .rightProngHeight: stem ?? size,
+            .bodyX: body.x, .bodyY: body.y, .bodyWidth: size, .bodyHeight: size, .bodyCorner: size / 2,
+        ])
+    }
+
+    /// The face for `mood`, `time` seconds after it began. `moving` is false
+    /// for the one pose a face holds when nothing may move.
+    static func pose(for mood: PlugCharacter.Mood, at time: TimeInterval, moving: Bool) -> PlugPose {
+        let t = moving ? CGFloat(time) : 0
+        /// True for `lasts` seconds out of every `every`.
+        func pulse(_ shift: CGFloat, every: CGFloat, lasts: CGFloat) -> Bool {
+            moving && (t + shift).truncatingRemainder(dividingBy: every) < lasts
+        }
+        switch mood {
         case .awake:
-            while true {
-                try await pause(.random(in: 2.5...6))
-                try await blink()
-                guard Int.random(in: 0..<3) == 0 else { continue }
-                try await pause(0.5)
-                withAnimation(.smooth(duration: 0.3)) { gaze = Bool.random() ? 3.5 : -3.5 }
-                try await pause(1.1)
-                withAnimation(.smooth(duration: 0.3)) { gaze = 0 }
-            }
-        }
-    }
-
-    /// The other way from its lean, as a head tilts at a question.
-    private static let tilt: CGFloat = 6
-
-    private func cheer() async throws {
-        guard !reduceMotion else { return }
-        withAnimation(.easeOut(duration: 0.6)) { sparks = sparks.rounded(.down) + 1 }
-        try await hop()
-    }
-
-    private func hop() async throws {
-        guard !reduceMotion else { return }
-        withAnimation(.easeOut(duration: 0.14)) { lift = -0.12 }
-        try await pause(0.14)
-        withAnimation(.spring(duration: 0.4, bounce: 0.55)) { lift = 0 }
-    }
-
-    private func blink() async throws {
-        withAnimation(.easeIn(duration: 0.07)) { open = 0 }
-        try await pause(0.11)
-        withAnimation(.easeOut(duration: 0.12)) { open = 1 }
-    }
-
-    private func pause(_ seconds: Double) async throws {
-        try await Task.sleep(for: .seconds(seconds))
-    }
-
-    /// The silhouette or the eyes, as one shape whose face can move.
-    private struct Part: Shape {
-        let eyes: Bool
-        var open: CGFloat
-        var gaze: CGFloat
-        var lean: CGFloat
-
-        var animatableData: AnimatablePair<CGFloat, AnimatablePair<CGFloat, CGFloat>> {
-            get { AnimatablePair(open, AnimatablePair(gaze, lean)) }
-            set {
-                open = newValue.first
-                gaze = newValue.second.first
-                lean = newValue.second.second
-            }
-        }
-
-        func path(in rect: CGRect) -> Path {
-            // A little room, so a head shake stays inside the frame.
-            let scale = min(rect.width, rect.height) / (PlugMark.height + 8)
-            let placement = PlugMark.placement(
-                centre: CGPoint(x: rect.midX, y: rect.midY), scale: scale, lean: lean
-            )
-            return (eyes ? PlugMark.eyes(open: open, gaze: gaze) : PlugMark.silhouette).applying(placement)
+            guard pulse(2, every: 7, lasts: 1.2) else { return rest }
+            return rest.with([.gazeX: Int(t / 7) % 2 == 0 ? -3.5 : 3.5])
+        case .happy:
+            return rest.eyes(height: 20, cheek: 0.6).prongs(41, 41)
+                .with([.lift: moving ? -0.025 * max(0, sin(t * 5)) : 0])
+        case .cheering:
+            return rest.eyes(height: 20, cheek: 0.7).prongs(44, 44, apart: 5)
+        case .wink:
+            return rest.prongs(40, 36)
+                .with([.rightEyeHeight: 5, .rightEyeWidth: 13, .leftCheek: 0.35, .lean: -6])
+        case .curious:
+            // Still, it holds the tilt: that is the face.
+            guard !moving || pulse(5.5, every: 6, lasts: 1.8) else { return rest }
+            return rest.prongs(44, 32).with([.lean: 6, .gazeX: 2])
+        case .surprised:
+            return rest.eyes(width: 13, height: 24).prongs(46, 46, apart: 4).with([.gazeY: -1])
+        case .working:
+            // The prongs take turns, and the eyes follow.
+            let right = moving && Int(t / 0.8) % 2 == 1
+            return rest.prongs(right ? 42 : 33, right ? 33 : 42).with([.gazeX: right ? 3.5 : -3.5])
+        case .thinking:
+            return rest.eyes(lid: 0.3).prongs(34, 43)
+                .with([.lean: -15, .gazeX: 4 + (moving ? sin(t * 1.3) * 1.5 : 0), .gazeY: -4])
+        case .loading:
+            /// Each dot in turn, a beat after the one before.
+            func beat(_ index: CGFloat) -> CGFloat { moving ? max(0, sin(t * 4.2 - index * 0.9)) : 1 }
+            return rest.dots(
+                size: 17,
+                left: CGPoint(x: 36, y: 60 - 5 * beat(0) * beat(0)),
+                body: CGPoint(x: 60, y: 60 - 5 * beat(1) * beat(1)),
+                right: CGPoint(x: 84, y: 60 - 5 * beat(2) * beat(2))
+            ).with([
+                .lean: 0,
+                .leftProngShown: 0.4 + 0.6 * beat(0), .bodyShown: 0.4 + 0.6 * beat(1),
+                .rightProngShown: 0.4 + 0.6 * beat(2),
+            ])
+        case .needsYou:
+            return rest.eyes(width: 14, height: 17).prongs(43, 43).with([.lean: -6, .badge: 1])
+        case .unsure:
+            return rest.prongs(42, 31)
+                .with([.lean: -4, .rightEyeHeight: 5, .rightEyeWidth: 15, .leftEyeHeight: 21, .gazeX: 2])
+        case .worried:
+            return rest.eyes(height: 21, lid: 0.34).prongs(31, 31, apart: 9)
+                .with([.leftLidTurn: -18, .rightLidTurn: 18, .gazeY: 2, .lean: -13])
+        case .alert:
+            let stem = CGPoint(x: 60, y: 42)
+            return rest.dots(size: 17, left: stem, body: CGPoint(x: 60, y: 87), right: stem, stem: 50)
+                .with([.lean: 7, .lift: pulse(0.3, every: 2.6, lasts: 0.14) ? -0.09 : 0])
+        case .asleep:
+            let breath = moving ? sin(t * 1.2) : 0
+            return rest.eyes(width: 13, height: 5).prongs(31, 29, apart: 3)
+                .with([.lean: -18, .snore: 1, .stretchY: 1 + 0.035 * breath, .stretchX: 1 - 0.02 * breath])
+        case .tucked:
+            let middle = CGPoint(x: 60, y: 60)
+            let swell = 1 + (moving ? 0.06 * sin(t * 2.4) : 0)
+            return rest.dots(size: 24, left: middle, body: middle, right: middle)
+                .with([.lean: 0, .stretchX: swell, .stretchY: swell])
         }
     }
 }
 
-/// What flies off the prongs when the character is cheered: five short bars
-/// that leave, stretch, and are gone. At rest there is nothing to draw.
-private struct Sparks: Shape {
-    /// From just leaving (0) to gone (1).
-    var progress: CGFloat
+/// What to draw this instant.
+struct PlugFrame: Sendable {
+    var pose: PlugPose
+    /// From open (0) to shut (1).
+    var blink: CGFloat
+    /// From just leaving (0) to gone (1), or nil when there are none.
+    var sparks: CGFloat?
+    var time: TimeInterval
+}
 
-    var animatableData: CGFloat {
-        get { progress }
-        set { progress = newValue }
+/// Moves the character: each part is on a spring toward where the face of
+/// the moment puts it, so a change of face is a change of shape.
+@MainActor
+final class PlugPuppet {
+    /// How far ahead `isResting` looks for the next movement, in seconds.
+    static let lookAhead: TimeInterval = 0.25
+
+    private var mood: PlugCharacter.Mood
+    private var since: TimeInterval
+    /// A face put on for a moment, over the one for the state.
+    private var act: (mood: PlugCharacter.Mood, since: TimeInterval, until: TimeInterval)?
+    private var pose: PlugPose
+    private var speed = PlugPose.still
+    private var last: TimeInterval?
+    private var sparkedAt = -TimeInterval.infinity
+    private var blinkedAt = -TimeInterval.infinity
+    private var nextBlink: TimeInterval
+    private var tappedAt = -TimeInterval.infinity
+
+    init(_ mood: PlugCharacter.Mood) {
+        let now = Self.now
+        self.mood = mood
+        since = now
+        nextBlink = now + 2
+        pose = PlugPose.pose(for: mood, at: 0, moving: false)
     }
 
-    func path(in rect: CGRect) -> Path {
-        guard progress > 0, progress < 1 else { return Path() }
-        let size = min(rect.width, rect.height)
-        let near = size * (0.5 + 0.28 * progress)
-        let far = near + size * 0.16 * sin(progress * .pi)
+    private static var now: TimeInterval { Date.now.timeIntervalSinceReferenceDate }
+    private static let sparkTime: TimeInterval = 0.6
+    private static let blinkTime: TimeInterval = 0.22
+
+    private var showing: PlugCharacter.Mood { act?.mood ?? mood }
+
+    private func goal(at time: TimeInterval, moving: Bool = true) -> PlugPose {
+        PlugPose.pose(for: showing, at: time - (act?.since ?? since), moving: moving)
+    }
+
+    func show(_ new: PlugCharacter.Mood, moving: Bool) {
+        guard new != mood else { return }
+        let relieved = new == .awake && mood.isTrouble
+        mood = new
+        since = Self.now
+        act = nil
+        guard moving else { return }
+        enter(new)
+        if relieved {
+            perform(.happy, for: 2.4)
+            hop(0.8)
+        }
+    }
+
+    func cheer() { perform(.cheering, for: 1.6) }
+
+    /// A click is a wink. Keep clicking and it goes through every face.
+    func tap() {
+        let now = Self.now
+        let faces = PlugCharacter.Mood.allCases
+        if now - tappedAt < 3, let act, let index = faces.firstIndex(of: act.mood) {
+            perform(faces[(index + 1) % faces.count], for: 3)
+        } else {
+            perform(.wink, for: 0.9)
+        }
+        tappedAt = now
+    }
+
+    private func perform(_ mood: PlugCharacter.Mood, for seconds: TimeInterval) {
+        let now = Self.now
+        act = (mood, now, now + seconds)
+        enter(mood)
+    }
+
+    /// How a face arrives, beyond changing shape.
+    private func enter(_ mood: PlugCharacter.Mood) {
+        switch mood {
+        case .cheering:
+            hop(1.3)
+            sparkedAt = Self.now
+        case .wink: hop(0.6)
+        case .surprised:
+            speed[.stretchY] = 1.6
+            speed[.stretchX] = -1
+            hop(0.5)
+        case .needsYou: hop(0.7)
+        // A shake of the head.
+        case .worried: speed[.lean] = 260
+        case .alert: hop(0.9)
+        default: break
+        }
+    }
+
+    private func hop(_ strength: CGFloat) {
+        speed[.lift] = -2.1 * strength
+        speed[.stretchY] += 1.2 * strength
+    }
+
+    /// Stiffness and damping. The lean and the hop are loose, the rest firm.
+    private static func spring(_ part: PlugPose.Part) -> (CGFloat, CGFloat) {
+        switch part {
+        case .lean: (210, 15)
+        case .lift: (300, 13)
+        case .stretchX, .stretchY: (300, 16)
+        default: (190, 23)
+        }
+    }
+
+    func frame(at date: Date, moving: Bool) -> PlugFrame {
+        let now = date.timeIntervalSinceReferenceDate
+        // A long gap is a pause, not a leap.
+        let step = CGFloat(min(1.0 / 30, max(0, now - (last ?? now))))
+        last = now
+        if let act, now >= act.until { self.act = nil }
+        guard moving else {
+            pose = goal(at: now, moving: false)
+            speed = .still
+            return PlugFrame(pose: pose, blink: 0, sparks: nil, time: now)
+        }
+        let goal = goal(at: now)
+        for part in PlugPose.Part.allCases {
+            let (stiffness, damping) = Self.spring(part)
+            speed[part] += (stiffness * (goal[part] - pose[part]) - damping * speed[part]) * step
+            pose[part] += speed[part] * step
+        }
+        if showing.blinks, now > nextBlink {
+            blinkedAt = now
+            nextBlink = now + .random(in: 2.5...6)
+        }
+        let blink = max(0, 1 - abs((now - blinkedAt) / (Self.blinkTime / 2) - 1))
+        let sparks = (now - sparkedAt) / Self.sparkTime
+        return PlugFrame(
+            pose: pose, blink: blink, sparks: sparks > 0 && sparks < 1 ? sparks : nil, time: now
+        )
+    }
+
+    /// Nothing is moving and nothing is about to.
+    var isResting: Bool {
+        let now = Self.now
+        guard act == nil, now - sparkedAt > Self.sparkTime, now - blinkedAt > Self.blinkTime,
+              !(showing.blinks && now + Self.lookAhead > nextBlink), pose[.snore] < 0.02
+        else { return false }
+        let goals = [goal(at: now), goal(at: now + Self.lookAhead)]
+        return PlugPose.Part.allCases.allSatisfy { part in
+            abs(speed[part]) < 0.02 && goals.allSatisfy { abs($0[part] - pose[part]) < 0.005 }
+        }
+    }
+}
+
+/// Draws one frame of the character.
+enum PlugDrawing {
+    /// How many times the character's own frame the drawing gets.
+    static let room: CGFloat = 3
+
+    static func draw(_ frame: PlugFrame, side: CGFloat, in context: inout GraphicsContext, size: CGSize) {
+        let pose = frame.pose
+        // The same fit as the still mark, with a little room around it.
+        let scale = side / (PlugMark.height + 8)
+        var grid = context
+        grid.translateBy(x: size.width / 2 - 2.04 * scale, y: size.height / 2 - 0.48 * scale)
+        grid.scaleBy(x: scale, y: scale)
+        grid.translateBy(x: -60, y: -55.5)
+
+        var whole = grid
+        whole.translateBy(x: 0, y: pose[.lift] * 120)
+        // It stretches and squashes from its feet.
+        whole.translateBy(x: 60, y: 94)
+        whole.scaleBy(x: pose[.stretchX], y: pose[.stretchY])
+        whole.translateBy(x: -60, y: -94)
+        whole.translateBy(x: 60, y: 55.5)
+        whole.rotate(by: .degrees(pose[.lean]))
+        whole.translateBy(x: -60, y: -55.5)
+
+        let badge = CGPoint(x: 98, y: 38)
+        let badgeSize = max(0, 10 * pose[.badge])
+        whole.drawLayer { layer in
+            for part in parts(of: pose) {
+                layer.opacity = min(1, max(0, part.shown))
+                layer.fill(part.path, with: .foreground)
+            }
+            layer.opacity = 1
+            layer.blendMode = .destinationOut
+            layer.fill(eyes(of: pose, blink: frame.blink), with: .color(.black))
+        }
+        // The dot that says "look here" is the character's own colour, a
+        // little apart from it.
+        if badgeSize > 0.5 { whole.fill(circle(at: badge, radius: badgeSize - 2), with: .foreground) }
+
+        if let sparks = frame.sparks { grid.fill(Self.sparks(sparks), with: .foreground) }
+        if pose[.snore] > 0.02 {
+            for index in [0.0, 1] {
+                // Each "z" drifts up and away, growing, and fades at both ends.
+                let drift = CGFloat((frame.time * 0.35 + index * 0.5).truncatingRemainder(dividingBy: 1))
+                grid.opacity = pose[.snore] * sin(drift * .pi)
+                grid.fill(
+                    letterZ(at: CGPoint(x: 92 + drift * 14 + index * 4, y: 30 - drift * 26), size: 7 + drift * 6),
+                    with: .foreground
+                )
+            }
+        }
+    }
+
+    private static func circle(at centre: CGPoint, radius: CGFloat) -> Path {
+        Path(ellipseIn: CGRect(x: centre.x - radius, y: centre.y - radius, width: radius * 2, height: radius * 2))
+    }
+
+    /// The two prongs and the body, each a rounded bar.
+    private static func parts(of pose: PlugPose) -> [(path: Path, shown: CGFloat)] {
+        func bar(
+            _ x: PlugPose.Part, _ y: PlugPose.Part, _ width: PlugPose.Part, _ height: PlugPose.Part,
+            corner: CGFloat, turn: CGFloat
+        ) -> Path {
+            let width = max(0, pose[width]), height = max(0, pose[height])
+            let radius = min(corner, width / 2, height / 2)
+            // A prong turns where it meets the body.
+            let foot = CGPoint(x: pose[x], y: pose[y] + height / 2)
+            return Path(
+                roundedRect: CGRect(x: pose[x] - width / 2, y: pose[y] - height / 2, width: width, height: height),
+                cornerRadius: radius
+            )
+            .applying(
+                CGAffineTransform(translationX: foot.x, y: foot.y)
+                    .rotated(by: turn * .pi / 180)
+                    .translatedBy(x: -foot.x, y: -foot.y)
+            )
+        }
+        return [
+            (bar(.leftProngX, .leftProngY, .leftProngWidth, .leftProngHeight,
+                 corner: .infinity, turn: pose[.leftProngTurn]), pose[.leftProngShown]),
+            (bar(.rightProngX, .rightProngY, .rightProngWidth, .rightProngHeight,
+                 corner: .infinity, turn: pose[.rightProngTurn]), pose[.rightProngShown]),
+            (bar(.bodyX, .bodyY, .bodyWidth, .bodyHeight, corner: pose[.bodyCorner], turn: 0), pose[.bodyShown]),
+        ]
+    }
+
+    /// The eyes, cut out of the body. A lid comes down from above and a cheek
+    /// pushes up from below, which is all the expression they have.
+    private static func eyes(of pose: PlugPose, blink: CGFloat) -> Path {
+        // They shrink with the body, so they are gone before it is a dot.
+        let scale = max(0, pose[.eyeScale]) * min(1, pose[.bodyWidth] / 72)
+        var path = Path()
+        guard scale > 0.02 else { return path }
+        let sides: [(CGFloat, PlugPose.Part, PlugPose.Part, PlugPose.Part, PlugPose.Part, PlugPose.Part)] = [
+            (-8.5, .leftEyeWidth, .leftEyeHeight, .leftLid, .leftLidTurn, .leftCheek),
+            (16.5, .rightEyeWidth, .rightEyeHeight, .rightLid, .rightLidTurn, .rightCheek),
+        ]
+        for (offset, width, height, lid, lidTurn, cheek) in sides {
+            let width = max(0, pose[width] * scale)
+            let height = max(4 * scale, pose[height] * scale * (1 - 0.85 * blink))
+            var eye = Path(
+                roundedRect: CGRect(x: -width / 2, y: -height / 2, width: width, height: height),
+                cornerRadius: min(width, height) / 2
+            )
+            if pose[lid] > 0.001 {
+                let edge = -height / 2 - 2 + pose[lid] * (height + 2)
+                eye = eye.subtracting(
+                    Path(CGRect(x: -40, y: edge - 60, width: 80, height: 60)).applying(
+                        CGAffineTransform(translationX: 0, y: edge)
+                            .rotated(by: pose[lidTurn] * .pi / 180)
+                            .translatedBy(x: 0, y: -edge)
+                    )
+                )
+            }
+            if pose[cheek] > 0.001 {
+                let radius = width * 1.4
+                let middle = height / 2 + radius + 2 - pose[cheek] * (height * 0.55 + 2)
+                eye = eye.subtracting(circle(at: CGPoint(x: 0, y: middle), radius: radius))
+            }
+            path.addPath(eye.applying(CGAffineTransform(
+                translationX: pose[.bodyX] + (offset + pose[.gazeX]) * scale,
+                y: pose[.bodyY] - 2 + pose[.gazeY] * scale
+            )))
+        }
+        return path
+    }
+
+    /// What flies off the prongs when the character is cheered: five short
+    /// bars that leave, stretch, and are gone.
+    private static func sparks(_ progress: CGFloat) -> Path {
+        let eased = 1 - (1 - progress) * (1 - progress)
+        let size = PlugMark.height + 8
+        let near = size * (0.5 + 0.28 * eased)
+        let far = near + size * 0.16 * sin(eased * .pi)
+        let centre = CGPoint(x: 62.04, y: 55.98)
         var path = Path()
         // Fanned around the way the prongs point.
         for degrees in [-60.0, -30, 0, 30, 60] {
             let angle = (degrees + PlugMark.lean - 90) * .pi / 180
-            let direction = CGPoint(x: cos(angle), y: sin(angle))
-            path.move(to: CGPoint(x: rect.midX + direction.x * near, y: rect.midY + direction.y * near))
-            path.addLine(to: CGPoint(x: rect.midX + direction.x * far, y: rect.midY + direction.y * far))
+            path.move(to: CGPoint(x: centre.x + cos(angle) * near, y: centre.y + sin(angle) * near))
+            path.addLine(to: CGPoint(x: centre.x + cos(angle) * far, y: centre.y + sin(angle) * far))
         }
-        return path.strokedPath(StrokeStyle(lineWidth: size * 0.07 * (1 - 0.5 * progress), lineCap: .round))
+        return path.strokedPath(StrokeStyle(lineWidth: size * 0.07 * (1 - 0.5 * eased), lineCap: .round))
+    }
+
+    private static func letterZ(at corner: CGPoint, size: CGFloat) -> Path {
+        var path = Path()
+        path.move(to: CGPoint(x: corner.x, y: corner.y - size))
+        path.addLine(to: CGPoint(x: corner.x + size, y: corner.y - size))
+        path.addLine(to: CGPoint(x: corner.x, y: corner.y))
+        path.addLine(to: CGPoint(x: corner.x + size, y: corner.y))
+        return path.strokedPath(StrokeStyle(lineWidth: size * 0.26, lineCap: .round, lineJoin: .round))
     }
 }
 

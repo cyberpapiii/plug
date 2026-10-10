@@ -71,18 +71,6 @@ extension Verdict.Tone {
         case .blocked: .red
         }
     }
-
-    /// The soft field behind the headline icon. Green stays a whisper so the
-    /// healthy panel reads calm; trouble is allowed to be louder.
-    var tint: Color {
-        switch self {
-        case .good: .green.opacity(0.14)
-        case .quiet: .secondary.opacity(0.12)
-        case .busy: .secondary.opacity(0.12)
-        case .attention: .orange.opacity(0.18)
-        case .blocked: .red.opacity(0.18)
-        }
-    }
 }
 
 extension ServerHealth {
@@ -168,13 +156,16 @@ struct SectionLabel: View {
     }
 }
 
-/// The headline. Rendered as a hero in the popover, compact in the window
-/// banner, but always the same words, so the app cannot contradict itself.
+/// The headline. One row at the top of the popover with Plug's character,
+/// compact in the window banner, but always the same words, so the app
+/// cannot contradict itself.
 struct VerdictView: View {
     enum Style { case hero, compact }
 
     let verdict: Verdict
     let style: Style
+    /// What sits at the end of the hero's row: the popover's switch.
+    var accessory: AnyView?
     let run: (PlugIntent) -> Void
 
     private var compact: Bool { style == .compact }
@@ -186,13 +177,14 @@ struct VerdictView: View {
                 // The buttons get their own line, so a long title is not
                 // squeezed in the narrow panel.
                 VStack(alignment: .leading, spacing: Metric.snug) {
-                    HStack(spacing: Metric.regular) {
+                    HStack(spacing: Metric.snug) {
                         icon
-                        textColumn
-                        Spacer(minLength: 0)
+                        heroLine
+                        Spacer(minLength: Metric.tight)
+                        accessory
                     }
                     if verdict.primary != nil || verdict.secondary != nil {
-                        buttons.padding(.leading, Self.heroIconSize + Metric.regular)
+                        buttons.padding(.leading, Self.heroIconSize + Metric.snug)
                     }
                 }
             case .compact:
@@ -208,7 +200,28 @@ struct VerdictView: View {
         .accessibilityLabel("\(verdict.title). \(verdict.detail ?? "")")
     }
 
-    private static let heroIconSize: CGFloat = 40
+    private static let heroIconSize: CGFloat = 30
+
+    /// The title, then the detail after it in the same line. When all is
+    /// well that is one line, and the detail goes when there is no room for
+    /// it; trouble takes the room it needs to be read.
+    @ViewBuilder private var heroLine: some View {
+        let title = Text(verdict.title).font(.headline).foregroundStyle(.primary)
+        if let detail = verdict.detail {
+            let whole = Text("\(title)  \(Text(detail).font(.subheadline).foregroundStyle(.secondary))")
+            switch verdict.tone {
+            case .good, .quiet, .busy:
+                ViewThatFits(in: .horizontal) {
+                    whole.lineLimit(1)
+                    title.lineLimit(1)
+                }
+            case .attention, .blocked:
+                whole.lineLimit(4).fixedSize(horizontal: false, vertical: true)
+            }
+        } else {
+            title.lineLimit(2).fixedSize(horizontal: false, vertical: true)
+        }
+    }
 
     private var textColumn: some View {
         VStack(alignment: .leading, spacing: Metric.hairline) {
@@ -219,35 +232,27 @@ struct VerdictView: View {
                 .fixedSize(horizontal: false, vertical: true)
             if let detail = verdict.detail {
                 Text(detail)
-                    .font(compact ? .caption : .subheadline)
+                    .font(.caption)
                     .foregroundStyle(.secondary)
-                    .lineLimit(compact ? 2 : 3)
+                    .lineLimit(2)
                     .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
 
-    private var titleFont: Font {
-        switch style {
-        case .hero: .title3.weight(.semibold)
-        case .compact: .callout.weight(.medium)
-        }
-    }
+    private var titleFont: Font { .callout.weight(.medium) }
 
     @ViewBuilder private var icon: some View {
         switch style {
         case .hero:
-            ZStack {
-                RoundedRectangle(cornerRadius: Metric.corner, style: .continuous)
-                    .fill(verdict.tone.tint)
-                PlugCharacter(mood: PlugCharacter.Mood(verdict.tone))
-                    .foregroundStyle(verdict.tone.color)
-                    .padding(Metric.tight)
-            }
-            .frame(width: Self.heroIconSize, height: Self.heroIconSize)
-            .accessibilityHidden(true)
+            // In the panel the character is Plug's own blue, and its face
+            // says how Plug is.
+            PlugCharacter(mood: verdict.mood)
+                .foregroundStyle(.tint)
+                .frame(width: Self.heroIconSize, height: Self.heroIconSize)
+                .accessibilityHidden(true)
         case .compact:
-            PlugCharacter(mood: PlugCharacter.Mood(verdict.tone))
+            PlugCharacter(mood: verdict.mood)
                 .foregroundStyle(verdict.tone.color)
                 .frame(width: 22, height: 22)
         }

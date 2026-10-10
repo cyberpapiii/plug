@@ -328,15 +328,19 @@ struct Verdict: Equatable, Sendable {
     let detail: String?
     let primary: Button?
     let secondary: Button?
+    /// The face Plug's character wears while it says this.
+    let mood: PlugCharacter.Mood
 
     init(
         tone: Tone,
+        mood: PlugCharacter.Mood? = nil,
         title: String,
         detail: String? = nil,
         primary: Button? = nil,
         secondary: Button? = nil
     ) {
         self.tone = tone
+        self.mood = mood ?? PlugCharacter.Mood(tone)
         self.title = title
         self.detail = detail
         self.primary = primary
@@ -378,6 +382,7 @@ enum PlugVerdict {
         case let .needsRepair(detail):
             return Verdict(
                 tone: .attention,
+                mood: .worried,
                 title: "Plug needs repair",
                 detail: detail,
                 primary: .init("Repair", .repairInstallation)
@@ -447,6 +452,7 @@ enum PlugVerdict {
         if active.isEmpty {
             return Verdict(
                 tone: .attention,
+                mood: .curious,
                 title: "No servers yet",
                 detail: "Add a server to make tools available.",
                 primary: .init("Add Server…", .addServer)
@@ -468,6 +474,7 @@ enum PlugVerdict {
             default:
                 return Verdict(
                     tone: .attention,
+                    mood: .worried,
                     title: "\(only.name) is \(only.health.label.lowercased())",
                     detail: only.health == .notLoaded
                         ? only.problem
@@ -484,6 +491,7 @@ enum PlugVerdict {
                 : "\(situation.workingServers.count) of \(active.count) servers running."
             return Verdict(
                 tone: .attention,
+                mood: signIns == troubled.count ? .needsYou : .unsure,
                 title: "\(troubled.count) servers need attention",
                 detail: detail,
                 secondary: .init("Run Checkup", .checkup)

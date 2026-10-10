@@ -9,7 +9,8 @@ how to draw it, colour it, and move it.
 ## The character
 
 Two prongs, a rounded body, two tall eyes. It leans 10 degrees to the left
-and looks straight ahead. Nothing else: no mouth, no arms, no cord.
+and looks straight ahead. Nothing else: no mouth, no arms, no cord. This is
+the character at rest; its other faces are under [Faces](#faces).
 
 The one drawing everything comes from is `docs/assets/plug-icon.svg`, on a
 120 by 120 grid:
@@ -42,8 +43,9 @@ Rules:
 | White | `#ffffff` | The character, on the tile |
 
 The tile is always the blue gradient, top to bottom, with the character in
-white. Inside the app the character has no tile and takes one flat colour:
-the colour of what it is saying.
+white. Inside the app the character has no tile and takes one flat colour.
+In the menu bar panel it is Plug blue, and its face says how Plug is. In the
+window it takes the colour of what it is saying:
 
 | Plug is | Colour |
 |---|---|
@@ -55,36 +57,60 @@ the colour of what it is saying.
 In the menu bar it takes the menu bar's own colour, like every other menu bar
 icon.
 
+## Faces
+
+The character has a face for each thing Plug can be. It has no mouth, so a
+face is made of four things: how long each prong is and how far the two lean
+apart, how big each eye is, a lid that comes down over an eye from above, and
+a cheek that pushes up into it from below. The prongs work like ears: up when
+it is pleased, down and apart when it is worried, one up and one down when it
+is not sure.
+
+| Face | When | What it looks like |
+|---|---|---|
+| Awake | Everything is working | The icon. It blinks, and now and then glances to one side. |
+| Happy | Something just came right | Cheeks up under the eyes, prongs up, a small bounce. Then back to Awake. |
+| Cheering | A first, or a first-run step done | Happy, with a hop, and five sparks fly off its prongs |
+| Wink | You clicked it | One eye shut, a small hop |
+| Curious | A page with nothing on it yet, or no servers yet | Tilts its head the other way, one prong up and one down, then back |
+| Surprised | Only when you play with it | Wide eyes, prongs straight up |
+| Working | Starting or busy | The prongs take turns going up, and the eyes follow |
+| Thinking | A page has been loading for a while | Leans over and looks up, lids half down, one prong up |
+| Loading | A page is loading | The two prongs and the body become three dots that hop in turn |
+| Needs you | Sign in, or allow something | Eyes round, prongs up, and a dot beside it |
+| Not sure | Some servers run and others do not | One eye narrow, one prong down |
+| Worried | A server stopped, or Plug needs repair | Shakes its head once. Lids slant in, prongs down and apart. |
+| Alert | Plug itself is stopped | The prongs and the body become an exclamation mark that hops now and then |
+| Asleep | Plug is off | Leans further over, eyes shut, breathes slowly, and "z"s drift up |
+| Tucked away | Only when you play with it | The three parts become one dot |
+
+Click the character and it winks. Keep clicking and it goes through every
+face it has, then goes back to the one for how Plug is.
+
 ## Motion
 
 The character moves to say what state Plug is in. It never moves to decorate.
-One state, one movement, and the movement is small.
 
-| Plug is | The character | Timing |
-|---|---|---|
-| Working well | Blinks. Now and then it glances to one side and back. | A blink every 2.5 to 6 seconds, about 0.2 seconds long. A glance after one blink in three. |
-| Starting or busy | Looks left, then right, and keeps going. | 0.8 seconds each way |
-| Wrong | Shakes its head once, then blinks. | Four quick turns, about half a second in all |
-| Fixed | Hops once, then goes back to blinking. | Up in 0.14 seconds, a springy landing |
-| Off | Leans further over, shuts its eyes, and breathes slowly. | 2.6 seconds in, 2.6 out |
-| Loading a page | Looks left, then right, in place of a spinner. | 0.8 seconds each way |
-| A page with nothing on it yet | Tilts its head the other way, as at a question, then back. | A tilt of about 1.4 seconds, every 5 to 10 seconds, with a blink between |
-| A first-run step done | Hops once, and five sparks fly off its prongs. | Sparks gone in 0.6 seconds |
-| The first server, the first client, the first tool call | The same hop and sparks, beside one sentence at the foot of the window. The first tool call gets a second hop. | Once each, ever, and only on a new setup |
-| Clicked | Hops once. | As above |
+Going from one face to the next, it changes shape: the prongs grow or
+shrink, the eyes change size, the three parts slide apart into dots and back.
+Nothing is ever swapped for something else. Every part rides a spring, so it
+arrives with a little overshoot and settles.
 
 In the menu bar it blinks every 6 to 14 seconds while Plug is on, and looks
 left and right while Plug is busy. Off, it is an outline with its eyes shut.
+The menu bar icon keeps the icon's shape; the faces are for inside the app.
 
 Rules:
 
-- Motion follows state. If the state has not changed, nothing new happens.
-- Only the eyes, the lean, and a small hop or breath ever move. The shape
-  never stretches, spins, or changes colour mid-movement.
-- Sparks are for firsts. They are the one thing that moves outside the
-  character, and nothing that happens every day earns them.
-- Nothing loops faster than once a second.
-- With Reduce Motion on, the character holds still in the pose for its state.
+- Motion follows state. If the state has not changed, nothing new happens,
+  beyond a blink, a glance, or a breath.
+- Shape changes, never swaps. A new face is the same three parts and two
+  eyes, moved.
+- One colour at a time. The character never changes colour mid-movement.
+- Sparks are for firsts. Nothing that happens every day earns them.
+- Nothing loops faster than once a second, except the three dots while a
+  page loads.
+- With Reduce Motion on, the character holds still in the face for its state.
 
 ## Where it goes
 
@@ -92,9 +118,10 @@ Rules:
 |---|---|
 | App icon, Dock, notifications, updates | The tile |
 | Menu bar | The character alone, with a small badge when something is happening or wrong |
-| Menu bar panel and window banner | The character, moving, beside the one sentence Plug says about itself |
+| Menu bar panel | The character in Plug blue, at the start of the top row, beside the one line Plug says about itself and the switch |
+| Window banner | The character, in the colour of what it says, beside the one sentence Plug says about itself |
 | A page Plug cannot fill | The character, large, above the reason |
-| A page that is loading | The character, looking from side to side |
+| A page that is loading | The character as three dots, then thinking if it takes a while |
 | A page with nothing on it yet | The character, tilting its head, above what would be here and the button that adds it |
 | The foot of the window, at a first | The character, sparking, beside what just became true |
 | First-run guide | The character between Servers and Clients |
@@ -120,7 +147,7 @@ The character is called Plug. The words Plug uses are in
 | `docs/assets/plug-icon-*.png` | Sizes for docs and the MCP server icon |
 | `docs/assets/social-preview.png` | The picture for links to the repository |
 | `PlugApp/PlugApp/Assets.xcassets/AppIcon.appiconset/` | The Mac app icon |
-| `PlugApp/PlugApp/Views/PlugCharacter.swift` | The character in the app: its shapes and its motion |
+| `PlugApp/PlugApp/Views/PlugCharacter.swift` | The character in the app: its shapes, its faces and its motion |
 | `plug-core/src/http/oauth_ui/plug.css` | The look of the sign-in pages |
 
 After changing the source drawing, run `./scripts/render-icons.sh` to redraw

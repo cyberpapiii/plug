@@ -573,7 +573,7 @@ struct ClientsView: View {
                 if let error = model.connectableAppsError {
                     PagePane {
                         ContentUnavailableView {
-                            PlugCharacterLabel(title: "Clients Unavailable", mood: .troubled)
+                            PlugCharacterLabel(title: "Clients Unavailable", mood: .worried)
                         } description: {
                             Text(error)
                         } actions: {
