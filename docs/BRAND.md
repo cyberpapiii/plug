@@ -88,6 +88,10 @@ Rules:
 - Each group has a heading in the 12 size, semibold and grey: Servers,
   Clients, Events, Activity. The heading opens that page in the window.
   Events appears only once there is an event.
+- A tool's name is set as code on a faint rounded field, the way a message
+  shows code.
+- Connected clients are up to three icons the size of a server's tile, each
+  over the edge of the next.
 - A server's tile is 28 points. A server that is off stays on the shelf,
   grey and dimmed, with no dot.
 - A plain line that says something and offers a button starts with one
