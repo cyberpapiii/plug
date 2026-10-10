@@ -224,7 +224,8 @@ private struct CallDetail: View {
                     ProblemNote(
                         title: call.reason == nil ? "No reason was recorded" : "The server reported an error",
                         reason: call.reason,
-                        advice: call.advice
+                        advice: call.advice,
+                        failed: true
                     )
                 }
             } footer: {
@@ -232,7 +233,7 @@ private struct CallDetail: View {
                     Text(advice)
                 }
             }
-            Section("Details") {
+            Section(heading: "Details") {
                 LabeledContent("Client") {
                     HStack(spacing: Metric.tight) {
                         AppGlyph(target: call.callerTarget, name: call.callerIconName, size: 16)

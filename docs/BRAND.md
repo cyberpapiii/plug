@@ -188,13 +188,16 @@ Rules:
 | App icon, Dock, notifications, updates | The tile |
 | Menu bar | The character alone, with a small badge when something is happening or wrong |
 | Menu bar panel | The character in Plug blue, at the start of the top row, beside the one line Plug says about itself and the switch. Under it: a card for whatever needs you, the servers that are fine as a shelf of icons, who is connected, and the last tool call. |
+| Window sidebar | The character in Plug blue at the top, beside the word Plug and the switch, over the one line Plug says about itself |
+| Settings | The same top row as the menu bar panel: the character, the one line, the switch |
+| A short wait beside a line of text, or in a sheet | The character as three dots |
 | Window banner | The character, in the colour of what it says, beside the one sentence Plug says about itself |
 | A page Plug cannot fill | The character, large, above the reason |
 | A page that is loading | The character as three dots, then thinking if it takes a while |
 | A page with nothing on it yet | The character, tilting its head, above what would be here and the button that adds it |
 | The foot of the window, at a first | The character, sparking, beside what just became true |
 | First-run guide | The character between Servers and Clients |
-| Settings, About | The tile |
+| About, in Settings | The tile |
 | README and docs | The tile; in the big picture it blinks |
 | MCP server icon that clients show | The tile |
 | Sign-in pages in the browser | The tile at the top and in the tab, over a white card with Plug blue buttons |

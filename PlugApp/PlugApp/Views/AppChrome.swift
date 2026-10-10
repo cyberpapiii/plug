@@ -120,8 +120,8 @@ struct DetailHeader<Glyph: View, Controls: View>: View {
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(title)
                     .font(.title3.weight(.semibold))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
                     .textSelection(.enabled)
                     .help(title)
                 if let subtitle {
@@ -165,11 +165,17 @@ struct ProblemNote: View {
     var actionTitle: String?
     var action: (() -> Void)?
     var dismiss: (() -> Void)?
+    /// Orange asks for something; red says something failed.
+    var failed = false
+    /// Off where the note already sits on a tinted surface.
+    var washed = true
+
+    private var tone: Color { failed ? StatusColor.stopped : StatusColor.needsYou }
 
     var body: some View {
         HStack(alignment: .top, spacing: Metric.snug) {
-            PlugIcon(.needsYou)
-                .foregroundStyle(StatusColor.needsYou)
+            PlugIcon(failed ? .stopped : .needsYou)
+                .foregroundStyle(tone)
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(title)
                     .font(.callout.weight(.medium))
@@ -206,20 +212,30 @@ struct ProblemNote: View {
                 .accessibilityLabel("Dismiss")
             }
         }
+        .padding(washed ? Metric.snug : 0)
+        .background {
+            if washed {
+                RoundedRectangle(cornerRadius: Metric.corner, style: .continuous)
+                    .fill(tone.opacity(StatusColor.wash))
+            }
+        }
         .accessibilityElement(children: .contain)
         .accessibilityLabel("Problem. \(title) \(reason ?? "") \(advice ?? "")")
     }
 }
 
 extension ProblemNote {
-    init(_ error: ActionError, dismiss: (() -> Void)? = nil) {
-        self.init(title: error.title, reason: error.message, advice: error.advice, dismiss: dismiss)
+    init(_ error: ActionError, washed: Bool = true, dismiss: (() -> Void)? = nil) {
+        self.init(
+            title: error.title, reason: error.message, advice: error.advice,
+            dismiss: dismiss, failed: true, washed: washed
+        )
     }
 
     /// A failure inside a sheet, where the sheet's title already says what
     /// was being done: the reason leads, and the next step follows.
     init(reason: String) {
-        self.init(title: reason, advice: Explain.advice(forReason: reason))
+        self.init(title: reason, advice: Explain.advice(forReason: reason), failed: true)
     }
 }
 
@@ -230,11 +246,11 @@ struct ErrorToast: View {
     let dismiss: () -> Void
 
     var body: some View {
-        ProblemNote(error, dismiss: dismiss)
+        ProblemNote(error, washed: false, dismiss: dismiss)
             .frame(maxWidth: 460)
             .padding(.horizontal, Metric.regular)
             .padding(.vertical, Metric.snug)
-            .nativeGlassSurface(tint: StatusColor.needsYou.opacity(0.08))
+            .nativeGlassSurface(tint: StatusColor.stopped.opacity(0.08))
             .padding(Metric.regular)
     }
 }
@@ -309,15 +325,27 @@ struct LoadingPage: View {
     }
 }
 
+/// A short wait beside a line of text: Plug's three dots.
+struct WaitingDots: View {
+    var body: some View {
+        PlugCharacter(mood: .loading)
+            .foregroundStyle(.secondary)
+            .frame(width: 18, height: 18)
+            .accessibilityHidden(true)
+    }
+}
+
 /// The same wait inside a sheet, holding the height the content will take.
 struct SheetLoading: View {
     let label: String
     var height: CGFloat = 160
 
     var body: some View {
-        ProgressView()
-            .controlSize(.small)
+        PlugCharacter(mood: .loading)
+            .foregroundStyle(.secondary)
+            .frame(width: 36, height: 36)
             .frame(maxWidth: .infinity, minHeight: height)
+            .accessibilityElement()
             .accessibilityLabel(label)
     }
 }

@@ -45,7 +45,8 @@ struct EditServerView: View {
                     reason: failure,
                     advice: model.canReadServerConfig ? Explain.advice(forReason: failure) : nil,
                     actionTitle: model.canReadServerConfig ? "Try Again" : nil,
-                    action: { Task { await load() } }
+                    action: { Task { await load() } },
+                    failed: true
                 )
                 .padding(.horizontal, Metric.roomy)
             } else {

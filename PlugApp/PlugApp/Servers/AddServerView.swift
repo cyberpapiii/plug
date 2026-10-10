@@ -258,7 +258,7 @@ struct AddServerView: View {
                     SheetLoading(label: "Reading the document", height: Self.understoodHeight)
                 }
             } header: {
-                Text("Tools")
+                SectionLabel(text: "Tools")
             } footer: {
                 if let problem = choice?.problem {
                     InlineWarning(problem)

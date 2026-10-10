@@ -29,7 +29,8 @@ struct ServerDetailView: View {
                         title: server.problem,
                         reason: server.error,
                         actionTitle: fix.title,
-                        action: { run(fix.intent) }
+                        action: { run(fix.intent) },
+                        failed: server.health == .down || server.health == .unknown
                     )
                 }
             }
@@ -125,7 +126,7 @@ struct ServerDetailView: View {
     // MARK: - Details
 
     private var details: some View {
-        Section("Details") {
+        Section(heading: "Details") {
             LabeledContent("Runs", value: server.transportLabel)
             if let settingsPlace {
                 LabeledContent("Settings") {
@@ -186,7 +187,7 @@ struct ServerDetailView: View {
     }
 
     private var recent: some View {
-        Section("Recent Activity") {
+        Section(heading: "Recent Activity") {
             ForEach(recentCalls) { event in
                 let call = model.call(event)
                 HStack(spacing: Metric.tight) {
@@ -258,9 +259,12 @@ struct ServerDetailView: View {
         } header: {
             HStack(spacing: Metric.snug) {
                 Text("Tools")
+                    .font(PanelType.small.weight(.semibold))
+                    .foregroundStyle(.secondary)
                 if let toolsSummary {
                     Text(toolsSummary)
-                        .monospacedDigit()
+                        .font(PanelType.small.monospacedDigit())
+                        .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
                 if !allTools.isEmpty {

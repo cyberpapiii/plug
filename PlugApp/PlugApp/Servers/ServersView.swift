@@ -184,8 +184,8 @@ private struct ServerListRow: View {
             ServerGlyph(name: server.name)
                 .opacity(server.enabled ? 1 : 0.4)
             Text(server.name)
-                .lineLimit(1)
-                .truncationMode(.middle)
+                .lineLimit(2)
+                .fixedSize(horizontal: false, vertical: true)
                 .foregroundStyle(server.enabled ? .primary : .secondary)
             Spacer(minLength: Metric.tight)
             if server.enabled, server.health != .working {
