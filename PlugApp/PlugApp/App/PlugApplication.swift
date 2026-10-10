@@ -71,9 +71,10 @@ struct PlugApplication: App {
         } label: {
             // The label is the one view that exists from launch, so the
             // runtime connection starts here rather than in a window that may
-            // never be opened.
-            MenuBarLabel(mark: model.menuBarMark)
-                .accessibilityLabel("Plug: \(model.verdict.title)")
+            // never be opened. Nothing in this scene reads the model's state:
+            // a scene that did would be rebuilt on every refresh, and the
+            // system redraws the whole menu bar item each time that happens.
+            MenuBarStatus(model: model)
                 .task {
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
                     NotificationService.shared.perform = { runner.run($0) }
@@ -101,17 +102,21 @@ struct PlugApplication: App {
             }
             CommandGroup(replacing: .newItem) {
                 // One sheet at a time: these wait while another is open.
-                Button("Add Server…") { runner.run(.addServer) }
-                    .keyboardShortcut("n", modifiers: .command)
-                    .disabled(!model.canMutate || router.sheet != nil)
-                Button("Add Client…") { runner.run(.addClient) }
-                    .disabled(router.sheet != nil)
-                Button("Import Servers…") { runner.run(.importServers) }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(!model.canMutate || router.sheet != nil)
-                Button("Watch a Tool…") { runner.run(.addWatch) }
-                    .keyboardShortcut("n", modifiers: [.command, .shift])
-                    .disabled(!model.canMutate || router.sheet != nil)
+                SheetCommand(
+                    title: "Add Server…", shortcut: KeyboardShortcut("n", modifiers: .command),
+                    model: model, router: router
+                ) { runner.run(.addServer) }
+                SheetCommand(title: "Add Client…", mutates: false, model: model, router: router) {
+                    runner.run(.addClient)
+                }
+                SheetCommand(
+                    title: "Import Servers…", shortcut: KeyboardShortcut("i", modifiers: [.command, .shift]),
+                    model: model, router: router
+                ) { runner.run(.importServers) }
+                SheetCommand(
+                    title: "Watch a Tool…", shortcut: KeyboardShortcut("n", modifiers: [.command, .shift]),
+                    model: model, router: router
+                ) { runner.run(.addWatch) }
             }
             CommandGroup(replacing: .appTermination) {
                 Button("Quit Plug") { runner.run(.quit) }
@@ -162,15 +167,52 @@ struct PlugApplication: App {
     }
 }
 
+/// A menu command that opens a sheet. It reads the model and the router here,
+/// in its own body, so a change to either redraws this one menu item and not
+/// the whole scene.
+private struct SheetCommand: View {
+    let title: LocalizedStringKey
+    var shortcut: KeyboardShortcut?
+    /// Whether the command changes Plug's setup, which needs a ready runtime.
+    var mutates = true
+    let model: AppModel
+    let router: Router
+    let action: () -> Void
+
+    var body: some View {
+        Button(title, action: action)
+            .keyboardShortcut(shortcut)
+            .disabled((mutates && !model.canMutate) || router.sheet != nil)
+    }
+}
+
+/// Reads what the menu bar icon shows out of the model. The model changes far
+/// more often than the icon does, so the label below is compared before it is
+/// rebuilt.
+private struct MenuBarStatus: View {
+    let model: AppModel
+
+    var body: some View {
+        MenuBarLabel(mark: model.menuBarMark, title: model.verdict.title)
+            .equatable()
+    }
+}
+
 /// The menu bar icon. Awake, it blinks now and then; while Plug is busy it
 /// looks from side to side. With Reduce Motion on it holds still.
-private struct MenuBarLabel: View {
+private struct MenuBarLabel: View, Equatable {
     private enum Motion { case still, blinking, looking }
 
     let mark: MenuBarMark
+    /// What VoiceOver reads for the icon.
+    let title: String
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var blinking = false
     @State private var gaze = 0
+
+    nonisolated static func == (lhs: MenuBarLabel, rhs: MenuBarLabel) -> Bool {
+        lhs.mark == rhs.mark && lhs.title == rhs.title
+    }
 
     private var motion: Motion {
         guard mark.awake, !reduceMotion else { return .still }
@@ -206,6 +248,7 @@ private struct MenuBarLabel: View {
                     gaze = 0
                 }
             }
+            .accessibilityLabel("Plug: \(title)")
     }
 }
 
@@ -226,28 +269,53 @@ enum MenuBarIcon {
         let drawing = Drawing(mark: mark, blinking: blinking, gaze: gaze)
         if let image = drawn[drawing] { return image }
         // A plain plug takes no more room than it needs.
-        let width: CGFloat = mark.badge == nil ? 16 : 25
-        let image = NSImage(size: NSSize(width: width, height: 18), flipped: false) { rect in
-            guard let context = NSGraphicsContext.current?.cgContext else { return false }
-            // A badged plug sits at the left, so the badge clears its eyes.
-            let middle: CGFloat = mark.badge == nil ? rect.midX : 8
-            drawPlug(
-                awake: mark.awake, eyesOpen: mark.awake && !blinking, gaze: gaze,
-                centre: CGPoint(x: middle, y: rect.midY), in: context
-            )
-            guard let name = mark.badge, let badge = symbol(name, points: 8.5, weight: .bold) else { return true }
-            let size = badge.size
-            let origin = NSPoint(x: rect.width - 5.5 - size.width / 2, y: 5 - size.height / 2)
-            context.setBlendMode(.destinationOut)
-            context.fillEllipse(in: CGRect(origin: origin, size: size).insetBy(dx: -1.2, dy: -1.2))
-            context.setBlendMode(.normal)
-            badge.draw(at: origin, from: .zero, operation: .sourceOver, fraction: 1)
-            return true
+        let size = NSSize(width: mark.badge == nil ? 16 : 25, height: 18)
+        let rect = CGRect(origin: .zero, size: size)
+        // The picture is drawn once, as finished bitmaps for ordinary and
+        // Retina displays. An image that draws itself on demand is drawn
+        // again whenever the menu bar asks for another display's scale, and
+        // with two displays the menu bar keeps asking.
+        let image = NSImage(size: size)
+        for scale in 1...2 {
+            guard let bitmap = NSBitmapImageRep(
+                bitmapDataPlanes: nil,
+                pixelsWide: Int(size.width) * scale, pixelsHigh: Int(size.height) * scale,
+                bitsPerSample: 8, samplesPerPixel: 4, hasAlpha: true, isPlanar: false,
+                colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0
+            ) else { continue }
+            // Sized in points before drawing, so the drawing is scaled to fit.
+            bitmap.size = size
+            guard let graphics = NSGraphicsContext(bitmapImageRep: bitmap) else { continue }
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current = graphics
+            draw(mark, blinking: blinking, gaze: gaze, in: rect, context: graphics.cgContext)
+            NSGraphicsContext.restoreGraphicsState()
+            image.addRepresentation(bitmap)
         }
         // A template takes the menu bar's own colour, light or dark.
         image.isTemplate = true
         drawn[drawing] = image
         return image
+    }
+
+    /// The plug and its badge, drawn into the current graphics context.
+    @MainActor
+    private static func draw(
+        _ mark: MenuBarMark, blinking: Bool, gaze: Int, in rect: CGRect, context: CGContext
+    ) {
+        // A badged plug sits at the left, so the badge clears its eyes.
+        let middle: CGFloat = mark.badge == nil ? rect.midX : 8
+        drawPlug(
+            awake: mark.awake, eyesOpen: mark.awake && !blinking, gaze: gaze,
+            centre: CGPoint(x: middle, y: rect.midY), in: context
+        )
+        guard let name = mark.badge, let badge = symbol(name, points: 8.5, weight: .bold) else { return }
+        let size = badge.size
+        let origin = NSPoint(x: rect.width - 5.5 - size.width / 2, y: 5 - size.height / 2)
+        context.setBlendMode(.destinationOut)
+        context.fillEllipse(in: CGRect(origin: origin, size: size).insetBy(dx: -1.2, dy: -1.2))
+        context.setBlendMode(.normal)
+        badge.draw(at: origin, from: .zero, operation: .sourceOver, fraction: 1)
     }
 
     /// Awake the mark is solid; asleep it is an outline with its eyes shut.
