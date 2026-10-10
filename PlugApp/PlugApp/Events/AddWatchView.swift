@@ -165,7 +165,7 @@ struct AddWatchView: View {
                                 PlugIcon(.needsYou)
                                     .foregroundStyle(StatusColor.needsYou)
                             }
-                            .font(.caption)
+                            .font(PanelType.small)
                         } else {
                             caption("What the tool is called with, as JSON. Leave empty for none.")
                         }
@@ -179,7 +179,7 @@ struct AddWatchView: View {
 
     private func caption(_ text: String) -> some View {
         Text(text)
-            .font(.caption)
+            .font(PanelType.small)
             .foregroundStyle(.secondary)
             .fixedSize(horizontal: false, vertical: true)
     }

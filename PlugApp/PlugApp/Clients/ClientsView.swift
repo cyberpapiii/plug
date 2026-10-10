@@ -1132,7 +1132,7 @@ private struct ClientRow: View {
             Spacer(minLength: Metric.tight)
             if entry.asking != nil {
                 Text("New")
-                    .font(.caption.weight(.medium))
+                    .font(PanelType.small.weight(.medium))
                     .padding(.horizontal, Metric.tight)
                     .background(.tint.opacity(0.2), in: Capsule())
                     .accessibilityLabel("New sign-in")
@@ -1350,7 +1350,7 @@ private struct ClientDetail: View {
             Text("New sign-in \(asking.when). Which client is this?")
                 .font(.callout.weight(.medium))
             Text("It calls itself \(entry.originalName), like others here. Pick one and this sign-in takes over its name and choices, and the old sign-in is removed.")
-                .font(.caption)
+                .font(PanelType.small)
                 .foregroundStyle(.secondary)
                 .fixedSize(horizontal: false, vertical: true)
             HStack {
@@ -1406,7 +1406,7 @@ private struct ClientDetail: View {
                 if isOpen { opened.remove(server.name) } else { opened.insert(server.name) }
             } label: {
                 Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
+                    .font(PanelType.small.weight(.semibold))
                     .rotationEffect(.degrees(isOpen ? 90 : 0))
                     .frame(width: 12)
             }
@@ -1454,10 +1454,7 @@ private struct ClientDetail: View {
     private func toolRow(_ tool: ToolFacts, access: ClientAccess) -> some View {
         let state = access.state(of: tool)
         return HStack(spacing: Metric.tight) {
-            Text(tool.shortName)
-                .foregroundStyle(state == .on ? .primary : .secondary)
-                .lineLimit(1)
-                .truncationMode(.middle)
+            ToolName(tool.shortName, dimmed: state != .on)
                 .help(tool.summary ?? tool.shortName)
             Spacer(minLength: Metric.tight)
             if case let .offByRule(rule) = state {

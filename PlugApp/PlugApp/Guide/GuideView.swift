@@ -69,7 +69,7 @@ struct GuideView: View {
         VStack(spacing: Metric.rowGap) {
             icon().frame(height: 30)
             Text(title).font(.callout.weight(.semibold))
-            Text(detail).font(.caption).foregroundStyle(.secondary)
+            Text(detail).font(PanelType.small).foregroundStyle(.secondary)
         }
         .frame(maxWidth: .infinity)
     }
@@ -145,7 +145,7 @@ struct GuideView: View {
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text("Want a client to set this up for you?").font(.body.weight(.medium))
                 Text("Paste the prompt into Claude, Codex, or any client that can run commands.")
-                    .font(.caption)
+                    .font(PanelType.small)
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
             }

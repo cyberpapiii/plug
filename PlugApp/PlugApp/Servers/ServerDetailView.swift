@@ -190,9 +190,7 @@ struct ServerDetailView: View {
             ForEach(recentCalls) { event in
                 let call = model.call(event)
                 HStack(spacing: Metric.tight) {
-                    Text(call.tool)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    ToolName(call.tool)
                     Spacer(minLength: Metric.tight)
                     if !call.succeeded {
                         Label {
@@ -205,7 +203,7 @@ struct ServerDetailView: View {
                         .lineLimit(1)
                     }
                     Text(call.duration)
-                        .font(.caption.monospacedDigit())
+                        .font(PanelType.small.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 .help(call.reason ?? call.result)

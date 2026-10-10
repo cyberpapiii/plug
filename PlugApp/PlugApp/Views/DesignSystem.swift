@@ -132,6 +132,31 @@ extension ServerHealth {
 
 // MARK: - Small parts
 
+/// A tool's name, set the way code is in a message so it reads as a name and
+/// not as a sentence. `dimmed` is for a tool that is off.
+struct ToolName: View {
+    let name: String
+    var failed = false
+    var dimmed = false
+
+    init(_ name: String, failed: Bool = false, dimmed: Bool = false) {
+        self.name = name
+        self.failed = failed
+        self.dimmed = dimmed
+    }
+
+    var body: some View {
+        Text(name)
+            .font(PanelType.code)
+            .foregroundStyle(failed ? AnyShapeStyle(StatusColor.stopped) : AnyShapeStyle(dimmed ? .secondary : .primary))
+            .lineLimit(1)
+            .truncationMode(.middle)
+            .padding(.horizontal, Metric.tight)
+            .padding(.vertical, Metric.hairline)
+            .background(Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+    }
+}
+
 /// A server's state as one glyph. Carries its own accessibility wording so the
 /// meaning never lives in colour alone. The large one fills a detail header's
 /// glyph slot.
@@ -168,12 +193,12 @@ struct SectionLabel: View {
     var body: some View {
         HStack(spacing: Metric.tight) {
             Text(text)
-                .font(.subheadline.weight(.semibold))
+                .font(PanelType.small.weight(.semibold))
                 .foregroundStyle(.secondary)
             Spacer(minLength: 0)
             if let trailing {
                 Text(trailing)
-                    .font(.caption.monospacedDigit())
+                    .font(PanelType.small.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
         }
@@ -201,7 +226,7 @@ struct VerdictView: View {
                     .fixedSize(horizontal: false, vertical: true)
                 if let detail = verdict.detail {
                     Text(detail)
-                        .font(.caption)
+                        .font(PanelType.small)
                         .foregroundStyle(.secondary)
                         .lineLimit(2)
                         .fixedSize(horizontal: false, vertical: true)

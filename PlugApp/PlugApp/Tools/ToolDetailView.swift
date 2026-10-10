@@ -92,7 +92,7 @@ struct ToolDetailView: View {
             // value worth copying out of this panel.
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text("Full Name")
-                    .font(.caption)
+                    .font(PanelType.small)
                     .foregroundStyle(.secondary)
                 Text(tool.name)
                     .font(.callout.monospaced())
@@ -126,7 +126,7 @@ struct ToolDetailView: View {
                 }
                 if siblings.count > 8 {
                     Text("and \(siblings.count - 8) more")
-                        .font(.caption)
+                        .font(PanelType.small)
                         .foregroundStyle(.tertiary)
                 }
             }

@@ -161,16 +161,14 @@ private struct ActivityRow: View {
                 AppGlyph(target: call.callerTarget, name: call.callerIconName)
                 if let server = call.server {
                     Image(systemName: "chevron.compact.right")
-                        .font(.caption2)
+                        .font(PanelType.small)
                         .foregroundStyle(.tertiary)
                     ServerGlyph(name: server)
                 }
             }
             .accessibilityHidden(true)
             VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text(call.tool)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                ToolName(call.tool)
                 Text(context)
                     .font(.callout)
                     .foregroundStyle(.secondary)

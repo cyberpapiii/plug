@@ -62,7 +62,7 @@ struct AddServerView: View {
                                     VStack(alignment: .leading, spacing: Metric.hairline) {
                                         Text(server.title).font(.body)
                                         Text(server.summary)
-                                            .font(.caption)
+                                            .font(PanelType.small)
                                             .foregroundStyle(.secondary)
                                             .lineLimit(1)
                                     }
@@ -220,7 +220,7 @@ struct AddServerView: View {
                         VStack(alignment: .leading, spacing: Metric.rowGap) {
                             ForEach(choice.groups, id: \.tag) { group in
                                 Text(group.tag)
-                                    .font(.caption.weight(.semibold))
+                                    .font(PanelType.small.weight(.semibold))
                                     .foregroundStyle(.secondary)
                                     .padding(.top, Metric.hairline)
                                 ForEach(group.operations) { operation in

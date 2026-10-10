@@ -89,7 +89,8 @@ Rules:
   Clients, Events, Activity. The heading opens that page in the window.
   Events appears only once there is an event.
 - A tool's name is set as code on a faint rounded field, the way a message
-  shows code.
+  shows code (`ToolName`). The window does the same everywhere a tool is
+  named, and nothing in the window is smaller than 12 either.
 - Connected clients are up to three icons the size of a server's tile, each
   over the edge of the next.
 - A gap between two overlapping things (stacked icons, a status dot on an
