@@ -401,4 +401,35 @@ final class PlugVerdictTests: XCTestCase {
         )
         XCTAssertEqual(situation.connectedApps, 3)
     }
+
+    func testThePanelNamesWhoIsConnected() {
+        func connected(_ names: [String]) -> String {
+            PlugSituation(
+                connectedApps: names.count,
+                connectedClients: names.map { ConnectedClient(target: $0, name: $0) }
+            ).connectedSummary
+        }
+        XCTAssertEqual(connected([]), "No clients connected")
+        XCTAssertEqual(connected(["Claude"]), "Claude connected")
+        XCTAssertEqual(connected(["Claude", "Codex"]), "Claude and Codex connected")
+        XCTAssertEqual(connected(["Claude", "Codex", "Cursor"]), "Claude, Codex and 1 other connected")
+        XCTAssertEqual(connected(["Claude", "Codex", "Cursor", "Zed", "Pi"]), "Claude, Codex and 3 others connected")
+        XCTAssertEqual(connected(["Claude", "Claude", "Claude"]), "Claude and 2 others connected")
+        XCTAssertEqual(connected(["", ""]), "2 clients connected")
+    }
+
+    func testThePanelCountsServersThatAreOff() {
+        let situation = PlugSituation(runtime: .running, servers: [
+            ServerFacts(name: "a", enabled: true, transport: "stdio", health: .working, toolCount: 3),
+            ServerFacts(name: "b", enabled: false, transport: "stdio", health: .off, toolCount: 0),
+        ])
+        XCTAssertEqual(situation.offServers.map(\.name), ["b"])
+        XCTAssertEqual(situation.runningSummary(stale: false), "1 running · 3 tools · 1 off")
+    }
+
+    func testThePanelSaysHowEventsAre() {
+        XCTAssertEqual(PlugSituation.eventsSummary(count: 1, failing: 0), "1 event")
+        XCTAssertEqual(PlugSituation.eventsSummary(count: 3, failing: 1), "3 events · 1 needs attention")
+        XCTAssertEqual(PlugSituation.eventsSummary(count: 3, failing: 2), "3 events · 2 need attention")
+    }
 }

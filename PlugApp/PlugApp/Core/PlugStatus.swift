@@ -232,14 +232,44 @@ struct PlugSituation: Equatable, Sendable {
     /// The servers with nothing wrong: running, or on their way up.
     var settledServers: [ServerFacts] { activeServers.filter { !$0.health.needsAttention } }
 
+    /// The servers that are turned off. The panel still shows them, dimmed,
+    /// so a server someone is looking for is never missing.
+    var offServers: [ServerFacts] { servers.filter { !$0.enabled } }
+
     /// The line under the menu bar panel's servers: how many are up and what
     /// they offer, or how far along they are while they start.
     func runningSummary(stale: Bool) -> String {
         let running = workingServers.count
-        let summary = activeServers.contains(where: \.health.isSettling)
+        var summary = activeServers.contains(where: \.health.isSettling)
             ? "\(running) of \(activeServers.count) ready"
             : "\(running) running · \(totalTools) \(totalTools == 1 ? "tool" : "tools")"
+        if !offServers.isEmpty { summary += " · \(offServers.count) off" }
         return stale ? "Last known · \(summary)" : summary
+    }
+
+    /// The one line the panel says about events.
+    static func eventsSummary(count: Int, failing: Int) -> String {
+        let events = "\(count) \(count == 1 ? "event" : "events")"
+        guard failing > 0 else { return events }
+        return "\(events) · \(failing) \(failing == 1 ? "needs" : "need") attention"
+    }
+
+    /// Who is connected, by name: the first two, and how many more.
+    var connectedSummary: String {
+        var names: [String] = []
+        for name in connectedClients.map(\.name) where !name.isEmpty && !names.contains(name) {
+            names.append(name)
+        }
+        let others = connectedApps - min(names.count, 2)
+        switch (names.count, connectedApps) {
+        case (_, 0): return "No clients connected"
+        case (0, 1): return "1 client connected"
+        case (0, _): return "\(connectedApps) clients connected"
+        case (1, 1): return "\(names[0]) connected"
+        case (2, 2): return "\(names[0]) and \(names[1]) connected"
+        case (1, _): return "\(names[0]) and \(others) \(others == 1 ? "other" : "others") connected"
+        default: return "\(names[0]), \(names[1]) and \(others) \(others == 1 ? "other" : "others") connected"
+        }
     }
 
     /// Every server in one order for every list: the ones that are on, then
