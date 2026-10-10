@@ -9,12 +9,11 @@ struct ServerDetailView: View {
     let server: ServerFacts
     /// The window's search. It narrows the tool list below.
     let query: String
-    @Bindable var router: Router
+    let router: Router
     let run: (PlugIntent) -> Void
     /// Asks the list to confirm removing this server; the list owns the question.
     let onRemove: () -> Void
     @State private var confirmSignOut = false
-    @State private var showsOffOnly = false
     /// Where this server's own settings are. Nil until Plug has read them.
     @State private var settingsPlace: ServerSettingsPlace?
 
@@ -35,8 +34,16 @@ struct ServerDetailView: View {
                 }
             }
             details
-            if !recentCalls.isEmpty { recent }
-            tools
+            ServerRecentCalls(model: model, server: server.name)
+            ServerTools(
+                model: model,
+                server: server.name,
+                isWorking: server.health == .working,
+                query: query,
+                router: router,
+                run: run
+            )
+            .equatable()
         }
         .task(id: server.name) { await findSettingsPlace() }
         .confirmationDialog(
@@ -180,80 +187,90 @@ struct ServerDetailView: View {
         return "Signed in · renews soon"
     }
 
-    // MARK: - Recent
-
-    private var recentCalls: [ActivityEvent] {
-        model.recentActivity(for: server.name, limit: 6)
+    /// The groups this server's tools are split into, when there are several.
+    private var toolGroups: [String] {
+        ToolCatalog.groups(ofNames: model.toolCatalog.tools(for: server.name).map(\.name))
     }
+}
 
-    private var recent: some View {
-        Section(heading: "Recent Activity") {
-            ForEach(recentCalls) { event in
-                let call = model.call(event)
-                HStack(spacing: Metric.tight) {
-                    ToolName(call.tool)
-                    Spacer(minLength: Metric.tight)
-                    if !call.succeeded {
-                        Label {
-                            Text(call.result).foregroundStyle(.secondary)
-                        } icon: {
-                            PlugIcon(call.failed ? .stopped : .skipped)
-                                .foregroundStyle(call.failed ? StatusColor.stopped : StatusColor.quiet)
+/// A server's latest calls. A view of its own, so a call arriving redraws
+/// these few rows and not the page around them.
+private struct ServerRecentCalls: View {
+    let model: AppModel
+    let server: String
+
+    var body: some View {
+        let calls = model.recentActivity(for: server, limit: 6)
+        if !calls.isEmpty {
+            Section(heading: "Recent Activity") {
+                ForEach(calls) { event in
+                    let call = model.call(event)
+                    HStack(spacing: Metric.tight) {
+                        ToolName(call.tool)
+                        Spacer(minLength: Metric.tight)
+                        if !call.succeeded {
+                            Label {
+                                Text(call.result).foregroundStyle(.secondary)
+                            } icon: {
+                                PlugIcon(call.failed ? .stopped : .skipped)
+                                    .foregroundStyle(call.failed ? StatusColor.stopped : StatusColor.quiet)
+                            }
+                            .font(.callout)
+                            .lineLimit(1)
                         }
-                        .font(.callout)
-                        .lineLimit(1)
+                        Text(call.duration)
+                            .font(PanelType.small.monospacedDigit())
+                            .foregroundStyle(.secondary)
                     }
-                    Text(call.duration)
-                        .font(PanelType.small.monospacedDigit())
-                        .foregroundStyle(.secondary)
+                    .help(call.reason ?? call.result)
+                    .accessibilityElement(children: .ignore)
+                    .accessibilityLabel("\(call.tool), \(call.result), \(call.spokenDuration)")
                 }
-                .help(call.reason ?? call.result)
-                .accessibilityElement(children: .ignore)
-                .accessibilityLabel("\(call.tool), \(call.result), \(call.spokenDuration)")
             }
         }
     }
+}
 
-    // MARK: - Tools
+/// A server's tools. A view of its own that is equal while what it shows is
+/// the same, so the rest of the page changing does not rebuild every row.
+private struct ServerTools: View, Equatable {
+    let model: AppModel
+    let server: String
+    let isWorking: Bool
+    /// The window's search. It narrows the list.
+    let query: String
+    let router: Router
+    let run: (PlugIntent) -> Void
+    @State private var showsOffOnly = false
 
-    private var allTools: [ToolFacts] { model.toolCatalog.tools(for: server.name) }
-    /// The groups this server's tools are split into, when there are several.
-    private var toolGroups: [String] { ToolCatalog.groups(ofNames: allTools.map(\.name)) }
-    private var offCount: Int { allTools.filter { !$0.isOn }.count }
-
-    private var shownTools: [ToolFacts] {
-        let matched = model.toolCatalog.tools(for: server.name, matching: query)
-        return showsOffOnly ? matched.filter { !$0.isOn } : matched
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.model === rhs.model && lhs.router === rhs.router
+            && lhs.server == rhs.server && lhs.isWorking == rhs.isWorking && lhs.query == rhs.query
     }
 
-    /// Nil when every tool is on and shown: the header above already gives
-    /// the count.
-    private var toolsSummary: String? {
-        let total = allTools.count
-        let shown = shownTools.count
-        if shown < total, !showsOffOnly { return "\(shown) of \(total)" }
-        if offCount > 0 { return "\(total - offCount) of \(total) on" }
-        return nil
-    }
-
-    private var trimmedQuery: String { query.trimmingCharacters(in: .whitespaces) }
-
-    private var noToolsShown: String {
-        if !showsOffOnly { return "No tools match “\(trimmedQuery)”." }
-        return trimmedQuery.isEmpty ? "No tools are off." : "No tools that are off match this search."
-    }
-
-    private var tools: some View {
+    var body: some View {
+        let all = model.toolCatalog.tools(for: server)
+        let matched = model.toolCatalog.tools(for: server, matching: query)
+        let shown = showsOffOnly ? matched.filter { !$0.isOn } : matched
+        let canManage = model.canManageTools && model.canMutate
         Section {
-            if allTools.isEmpty {
-                Text(server.health == .working ? "This server offers no tools." : "Tools appear once the server is running.")
+            if all.isEmpty {
+                Text(isWorking ? "This server offers no tools." : "Tools appear once the server is running.")
                     .foregroundStyle(.secondary)
-            } else if shownTools.isEmpty {
+            } else if shown.isEmpty {
                 Text(noToolsShown)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(shownTools) { tool in
-                    toolRow(tool)
+                ForEach(shown) { tool in
+                    ServerToolRow(
+                        tool: tool,
+                        canManage: canManage,
+                        isBusy: model.busyTools.contains(tool.name),
+                        model: model,
+                        router: router,
+                        run: run
+                    )
+                    .equatable()
                 }
             }
         } header: {
@@ -261,13 +278,13 @@ struct ServerDetailView: View {
                 Text("Tools")
                     .font(PanelType.small.weight(.semibold))
                     .foregroundStyle(.secondary)
-                if let toolsSummary {
-                    Text(toolsSummary)
+                if let summary = summary(total: all.count, shown: shown.count, off: all.lazy.filter { !$0.isOn }.count) {
+                    Text(summary)
                         .font(PanelType.small.monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
                 Spacer(minLength: 0)
-                if !allTools.isEmpty {
+                if !all.isEmpty {
                     Picker("Show", selection: $showsOffOnly) {
                         Text("All").tag(false)
                         Text("Off").tag(true)
@@ -281,10 +298,41 @@ struct ServerDetailView: View {
         }
     }
 
-    private func toolRow(_ tool: ToolFacts) -> some View {
-        let canManage = model.canManageTools && model.canMutate
-        let isBusy = model.busyTools.contains(tool.name)
-        return ToolRow(
+    /// Nil when every tool is on and shown: the header above already gives
+    /// the count.
+    private func summary(total: Int, shown: Int, off: Int) -> String? {
+        if shown < total, !showsOffOnly { return "\(shown) of \(total)" }
+        if off > 0 { return "\(total - off) of \(total) on" }
+        return nil
+    }
+
+    private var noToolsShown: String {
+        let trimmed = query.trimmingCharacters(in: .whitespaces)
+        if !showsOffOnly { return "No tools match “\(trimmed)”." }
+        return trimmed.isEmpty ? "No tools are off." : "No tools that are off match this search."
+    }
+}
+
+/// One tool on a server's page, with the details it opens. Equal while the
+/// tool and what may be done to it are the same.
+private struct ServerToolRow: View, Equatable {
+    let tool: ToolFacts
+    let canManage: Bool
+    let isBusy: Bool
+    let model: AppModel
+    let router: Router
+    let run: (PlugIntent) -> Void
+
+    nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.tool == rhs.tool && lhs.canManage == rhs.canManage && lhs.isBusy == rhs.isBusy
+            && lhs.model === rhs.model && lhs.router === rhs.router
+    }
+
+    var body: some View {
+        // Read here, so the row is redrawn when the tool whose details are
+        // open changes.
+        let showsDetails = router.selectedTool == tool.name
+        ToolRow(
             tool: tool,
             canManage: canManage,
             isBusy: isBusy,
@@ -294,7 +342,7 @@ struct ServerDetailView: View {
         .accessibilityAction(named: "Show Details") { router.selectedTool = tool.name }
         .popover(
             isPresented: Binding(
-                get: { router.selectedTool == tool.name },
+                get: { showsDetails },
                 set: { shown in if !shown, router.selectedTool == tool.name { router.selectedTool = nil } }
             ),
             arrowEdge: .trailing
