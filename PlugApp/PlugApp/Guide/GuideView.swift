@@ -46,13 +46,16 @@ struct GuideView: View {
         .task { await model.loadConnectableApps() }
     }
 
+    private var doneSteps: Int { FirstRunGuide.Step.allCases.filter(guide.isDone).count }
+
     /// Plug's two sides, as the one picture a newcomer needs.
     private var sides: some View {
         HStack(spacing: Metric.snug) {
             side("Servers", "provide tools") { sideSymbol(AppSection.servers.symbol) }
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
             side("Plug", "holds them all") {
-                PlugCharacter(mood: .awake).foregroundStyle(.tint).frame(width: 30)
+                // It hops each time a step below is done.
+                PlugCharacter(mood: .awake, cheers: doneSteps).foregroundStyle(.tint).frame(width: 30)
             }
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
             side("Clients", "use tools") { sideSymbol(AppSection.clients.symbol) }

@@ -54,8 +54,8 @@ enum PlugMark {
 /// Plug's mark, moving the way its state reads. It blinks and glances about
 /// when all is well, looks from side to side while it works, shakes its head
 /// once when something is wrong, hops when that passes, and dozes when Plug
-/// is off. With Reduce Motion on it holds still. It takes the foreground
-/// style it is given.
+/// is off. It hops when clicked, too. With Reduce Motion on it holds still.
+/// It takes the foreground style it is given.
 struct PlugCharacter: View {
     enum Mood: Equatable {
         case awake, working, troubled, asleep
@@ -71,6 +71,8 @@ struct PlugCharacter: View {
     }
 
     let mood: Mood
+    /// Each time this goes up, the character hops, as when a step is done.
+    var cheers = 0
 
     @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @State private var open: CGFloat = 1
@@ -90,6 +92,11 @@ struct PlugCharacter: View {
         .scaleEffect(breathing ? 1.06 : 1)
         .visualEffect { [lift] content, proxy in content.offset(y: lift * proxy.size.height) }
         .task(id: Script(mood: mood, still: reduceMotion)) { try? await perform() }
+        .onChange(of: cheers) { old, new in
+            if new > old { Task { try? await hop() } }
+        }
+        .contentShape(Rectangle())
+        .onTapGesture { Task { try? await hop() } }
         .accessibilityHidden(true)
     }
 
@@ -111,11 +118,7 @@ struct PlugCharacter: View {
             lift = 0
         }
         guard !reduceMotion else { return }
-        if relieved {
-            withAnimation(.easeOut(duration: 0.14)) { lift = -0.12 }
-            try await pause(0.14)
-            withAnimation(.spring(duration: 0.4, bounce: 0.55)) { lift = 0 }
-        }
+        if relieved { try await hop() }
         switch mood {
         case .asleep:
             withAnimation(.easeInOut(duration: 2.6).repeatForever(autoreverses: true)) { breathing = true }
@@ -147,6 +150,13 @@ struct PlugCharacter: View {
                 withAnimation(.smooth(duration: 0.3)) { gaze = 0 }
             }
         }
+    }
+
+    private func hop() async throws {
+        guard !reduceMotion else { return }
+        withAnimation(.easeOut(duration: 0.14)) { lift = -0.12 }
+        try await pause(0.14)
+        withAnimation(.spring(duration: 0.4, bounce: 0.55)) { lift = 0 }
     }
 
     private func blink() async throws {

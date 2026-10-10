@@ -67,9 +67,12 @@ One state, one movement, and the movement is small.
 | Wrong | Shakes its head once, then blinks. | Four quick turns, about half a second in all |
 | Fixed | Hops once, then goes back to blinking. | Up in 0.14 seconds, a springy landing |
 | Off | Leans further over, shuts its eyes, and breathes slowly. | 2.6 seconds in, 2.6 out |
+| Loading a page | Looks left, then right, in place of a spinner. | 0.8 seconds each way |
+| A first-run step done | Hops once. | As above |
+| Clicked | Hops once. | As above |
 
-In the menu bar it only blinks, every 6 to 14 seconds, and only while Plug is
-on. Off, it is an outline with its eyes shut.
+In the menu bar it blinks every 6 to 14 seconds while Plug is on, and looks
+left and right while Plug is busy. Off, it is an outline with its eyes shut.
 
 Rules:
 
@@ -87,10 +90,12 @@ Rules:
 | Menu bar | The character alone, with a small badge when something is happening or wrong |
 | Menu bar panel and window banner | The character, moving, beside the one sentence Plug says about itself |
 | A page Plug cannot fill | The character, large, above the reason |
+| A page that is loading | The character, looking from side to side |
 | First-run guide | The character between Servers and Clients |
 | Settings, About | The tile |
 | README and docs | The tile; in the big picture it blinks |
 | MCP server icon that clients show | The tile |
+| Sign-in pages in the browser | The tile at the top and in the tab, over a white card with Plug blue buttons |
 
 Where it does not go: next to a server, a client, a tool, or an event. Those
 have their own icons. The character only ever stands for Plug itself.
@@ -110,6 +115,7 @@ The character is called Plug. The words Plug uses are in
 | `docs/assets/social-preview.png` | The picture for links to the repository |
 | `PlugApp/PlugApp/Assets.xcassets/AppIcon.appiconset/` | The Mac app icon |
 | `PlugApp/PlugApp/Views/PlugCharacter.swift` | The character in the app: its shapes and its motion |
+| `plug-core/src/http/oauth_ui/plug.css` | The look of the sign-in pages |
 
 After changing the source drawing, run `./scripts/render-icons.sh` to redraw
 every size, and update the shapes in `PlugCharacter.swift` to match.

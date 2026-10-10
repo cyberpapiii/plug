@@ -1480,13 +1480,9 @@ async fn await_oauth_callback_inner(
             .unwrap_or_default();
         let escaped_err = html_escape(err);
         let escaped_desc = html_escape(&desc);
-        let error_html = format!(
-            "HTTP/1.1 200 OK\r\n\
-             Content-Type: text/html; charset=utf-8\r\n\
-             Connection: close\r\n\r\n\
-             <html><body><h2>Authentication failed</h2>\
-             <p>{escaped_err}{escaped_desc}</p>\
-             <p>You can close this tab.</p></body></html>"
+        let error_html = callback_page(
+            "Authentication failed",
+            &format!("<p>{escaped_err}{escaped_desc}</p><p>You can close this tab.</p>"),
         );
         let _ = stream.write_all(error_html.as_bytes()).await;
         let _ = stream.shutdown().await;
@@ -1504,17 +1500,36 @@ async fn await_oauth_callback_inner(
     let issuer = params.get("iss").cloned();
 
     // Respond with a success page and close.
-    let success_html = "HTTP/1.1 200 OK\r\n\
-        Content-Type: text/html; charset=utf-8\r\n\
-        Connection: close\r\n\r\n\
-        <html><body>\
-        <h2>Authentication successful</h2>\
-        <p>You can close this tab and return to the terminal.</p>\
-        </body></html>";
+    let success_html = callback_page(
+        "Authentication successful",
+        "<p>You can close this tab and return to the terminal.</p>",
+    );
     let _ = stream.write_all(success_html.as_bytes()).await;
     let _ = stream.shutdown().await;
 
     Ok((code, state, issuer))
+}
+
+/// The page the browser shows when sign-in comes back to Plug: Plug's icon,
+/// a heading, and what to do next, as a whole HTTP response.
+fn callback_page(title: &str, message_html: &str) -> String {
+    const ICON: &str = include_str!("../../../docs/assets/plug-icon.svg");
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: text/html; charset=utf-8\r\n\
+         Connection: close\r\n\r\n\
+         <!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\">\
+         <meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">\
+         <title>{title}</title><style>\
+         :root{{color-scheme:light dark}}\
+         body{{margin:0;min-height:100vh;display:flex;flex-direction:column;align-items:center;\
+         justify-content:center;padding:16px;text-align:center;background:#f4f7fb;color:#0f1b2d;\
+         font:16px/1.5 -apple-system,BlinkMacSystemFont,\"Segoe UI\",Helvetica,Arial,sans-serif}}\
+         svg{{width:72px;height:72px;margin-bottom:16px}}h1{{margin:0 0 8px;font-size:1.5rem}}\
+         p{{margin:0 0 6px;color:#4a5a70}}\
+         @media (prefers-color-scheme:dark){{body{{background:#0d131c;color:#edf2f8}}p{{color:#9aa8bb}}}}\
+         </style></head><body>{ICON}<h1>{title}</h1>{message_html}</body></html>"
+    )
 }
 
 /// Minimal HTML escaping for values interpolated into HTML responses.

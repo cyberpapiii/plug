@@ -6,8 +6,13 @@ use crate::downstream_oauth::{ClientSource, ConsentRequest};
 
 pub const CONSENT_JAVASCRIPT: &str = include_str!("oauth_ui/consent.js");
 pub const ENROLL_JAVASCRIPT: &str = include_str!("oauth_ui/enroll.js");
+pub const STYLESHEET: &str = include_str!("oauth_ui/plug.css");
+pub const ICON: &str = include_str!("../../../docs/assets/plug-icon.svg");
+pub const JAVASCRIPT_TYPE: &str = "application/javascript; charset=utf-8";
+pub const STYLESHEET_TYPE: &str = "text/css; charset=utf-8";
+pub const ICON_TYPE: &str = "image/svg+xml";
 
-const HTML_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
+const HTML_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
 pub fn apply_oauth_html_security_headers(response: &mut Response) {
@@ -81,8 +86,9 @@ pub fn consent_page(consent: &ConsentRequest, owner_enrolled: bool) -> Response 
         "/oauth/assets/consent.js",
         CONSENT_JAVASCRIPT,
     ));
+    let head = page_head(&format!("Allow {client_name} to use Plug?"));
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Allow {client_name} to use Plug?</title></head><body><main id=\"consent\" data-consent-id=\"{}\" data-csrf-token=\"{}\" data-challenge-endpoint=\"/oauth/consent/challenge\" data-decision-endpoint=\"/oauth/consent/decision\"><h1>Allow {client_name} to use Plug?</h1><p><strong>{client_name}</strong></p><p>{identity}</p><section aria-labelledby=\"destination-heading\"><h2 id=\"destination-heading\">Connection destination</h2><p>Callback: <strong>{}</strong></p><details><summary>Show full callback address</summary><code>{}</code></details>{callback_warning}</section><section aria-labelledby=\"resource-heading\"><h2 id=\"resource-heading\">Plug resource</h2><p>Plug MCP server</p><code>{}</code></section><section aria-labelledby=\"permissions-heading\"><h2 id=\"permissions-heading\">Permissions</h2><ul>{scopes}</ul></section><p>This request expires in 5 minutes.</p>{allow}<button id=\"deny\" type=\"button\">Deny</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to verify your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>",
+        "{head}<main id=\"consent\" data-consent-id=\"{}\" data-csrf-token=\"{}\" data-challenge-endpoint=\"/oauth/consent/challenge\" data-decision-endpoint=\"/oauth/consent/decision\"><h1>Allow {client_name} to use Plug?</h1><p><strong>{client_name}</strong></p><p>{identity}</p><section aria-labelledby=\"destination-heading\"><h2 id=\"destination-heading\">Connection destination</h2><p>Callback: <strong>{}</strong></p><details><summary>Show full callback address</summary><code>{}</code></details>{callback_warning}</section><section aria-labelledby=\"resource-heading\"><h2 id=\"resource-heading\">Plug resource</h2><p>Plug MCP server</p><code>{}</code></section><section aria-labelledby=\"permissions-heading\"><h2 id=\"permissions-heading\">Permissions</h2><ul>{scopes}</ul></section><p>This request expires in 5 minutes.</p>{allow}<button id=\"deny\" type=\"button\">Deny</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to verify your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>",
         html_escape(&consent.consent_id),
         html_escape(&consent.csrf_token),
         html_escape(&callback_destination),
@@ -109,28 +115,38 @@ pub fn enrollment_page() -> Response {
         "/oauth/assets/enroll.js",
         ENROLL_JAVASCRIPT,
     ));
+    let head = page_head("Set up Plug owner passkey");
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Set up Plug owner passkey</title></head><body><main id=\"enrollment\"><h1>Set up your Plug owner passkey</h1><p>Use Touch ID or another passkey to approve future Plug connections.</p><button id=\"enroll\" type=\"button\">Create owner passkey</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to create your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>"
+        "{head}<main id=\"enrollment\"><h1>Set up your Plug owner passkey</h1><p>Use Touch ID or another passkey to approve future Plug connections.</p><button id=\"enroll\" type=\"button\">Create owner passkey</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to create your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>"
     );
     html_response(StatusCode::OK, html)
 }
 
 pub fn authorization_error_page(status: StatusCode, code: &str, description: &str) -> Response {
+    let head = page_head("Plug authorization failed");
     let html = format!(
-        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>Plug authorization failed</title></head><body><main><h1>Plug authorization failed</h1><p><strong>Error: <code>{}</code></strong></p><p>{}</p></main></body></html>",
+        "{head}<main><h1>Plug authorization failed</h1><p><strong>Error: <code>{}</code></strong></p><p>{}</p></main></body></html>",
         html_escape(code),
         html_escape(description),
     );
     html_response(status, html)
 }
 
-pub fn javascript_asset(source: &'static str) -> Response {
+/// The start of every page: Plug's icon in the tab and at the top, and the
+/// page's look, both served by Plug itself.
+fn page_head(title: &str) -> String {
+    let icon = html_escape(&versioned_asset_url("/oauth/assets/plug-icon.svg", ICON));
+    let stylesheet = html_escape(&versioned_asset_url("/oauth/assets/plug.css", STYLESHEET));
+    format!(
+        "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\"><link rel=\"stylesheet\" href=\"{stylesheet}\"></head><body><img class=\"brand\" src=\"{icon}\" alt=\"\">",
+        html_escape(title)
+    )
+}
+
+pub fn asset(source: &'static str, content_type: &'static str) -> Response {
     let mut response = (
         StatusCode::OK,
-        [(
-            header::CONTENT_TYPE,
-            "application/javascript; charset=utf-8",
-        )],
+        [(header::CONTENT_TYPE, content_type)],
         source,
     )
         .into_response();
@@ -193,7 +209,7 @@ fn html_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{scope_description, versioned_asset_url};
+    use super::{page_head, scope_description, versioned_asset_url};
 
     #[test]
     fn every_default_scope_has_a_specific_description() {
@@ -205,6 +221,19 @@ mod tests {
                 "{scope} is in the default grant but the consent page has no text for it"
             );
         }
+    }
+
+    #[test]
+    fn every_page_carries_plugs_icon_and_look() {
+        let head = page_head("A <title>");
+        assert!(head.contains("<title>A &lt;title&gt;</title>"));
+        assert!(
+            head.contains(
+                "rel=\"icon\" type=\"image/svg+xml\" href=\"/oauth/assets/plug-icon.svg?v="
+            )
+        );
+        assert!(head.contains("rel=\"stylesheet\" href=\"/oauth/assets/plug.css?v="));
+        assert!(head.contains("<img class=\"brand\" src=\"/oauth/assets/plug-icon.svg?v="));
     }
 
     #[test]

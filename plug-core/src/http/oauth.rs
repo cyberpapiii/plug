@@ -185,26 +185,64 @@ pub(super) async fn oauth_consent_javascript(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, false) {
-        return oauth_forbidden_response();
-    }
-    super::oauth_ui::javascript_asset(super::oauth_ui::CONSENT_JAVASCRIPT)
+    browser_asset(
+        &state,
+        &headers,
+        super::oauth_ui::CONSENT_JAVASCRIPT,
+        super::oauth_ui::JAVASCRIPT_TYPE,
+    )
 }
 
 pub(super) async fn oauth_enroll_javascript(
     State(state): State<Arc<HttpState>>,
     headers: HeaderMap,
 ) -> Response {
+    browser_asset(
+        &state,
+        &headers,
+        super::oauth_ui::ENROLL_JAVASCRIPT,
+        super::oauth_ui::JAVASCRIPT_TYPE,
+    )
+}
+
+pub(super) async fn oauth_stylesheet(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> Response {
+    browser_asset(
+        &state,
+        &headers,
+        super::oauth_ui::STYLESHEET,
+        super::oauth_ui::STYLESHEET_TYPE,
+    )
+}
+
+pub(super) async fn oauth_icon(
+    State(state): State<Arc<HttpState>>,
+    headers: HeaderMap,
+) -> Response {
+    browser_asset(
+        &state,
+        &headers,
+        super::oauth_ui::ICON,
+        super::oauth_ui::ICON_TYPE,
+    )
+}
+
+/// A file the sign-in pages load, served only where those pages are.
+fn browser_asset(
+    state: &HttpState,
+    headers: &HeaderMap,
+    source: &'static str,
+    content_type: &'static str,
+) -> Response {
     let Some(manager) = &state.downstream_oauth else {
         return StatusCode::NOT_FOUND.into_response();
     };
-    if !public_browser_request_allowed(manager, &headers, false) {
+    if !public_browser_request_allowed(manager, headers, false) {
         return oauth_forbidden_response();
     }
-    super::oauth_ui::javascript_asset(super::oauth_ui::ENROLL_JAVASCRIPT)
+    super::oauth_ui::asset(source, content_type)
 }
 
 pub(super) async fn oauth_owner_enroll(

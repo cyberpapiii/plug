@@ -141,10 +141,11 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     }
 }
 
-/// What the menu bar icon is made of: Plug's mark, awake or asleep, and the
-/// badge on its corner, if any.
+/// What the menu bar icon is made of: Plug's mark, awake or asleep, whether
+/// it is busy looking around, and the badge on its corner, if any.
 struct MenuBarMark: Hashable, Sendable {
     let awake: Bool
+    var working = false
     let badge: String?
 }
 
@@ -520,7 +521,7 @@ enum PlugVerdict {
         switch verdict.tone {
         case .good: MenuBarMark(awake: true, badge: nil)
         case .quiet: MenuBarMark(awake: false, badge: nil)
-        case .busy: MenuBarMark(awake: true, badge: "ellipsis.circle.fill")
+        case .busy: MenuBarMark(awake: true, working: true, badge: "ellipsis.circle.fill")
         case .attention: MenuBarMark(awake: true, badge: "exclamationmark.circle.fill")
         case .blocked: MenuBarMark(awake: true, badge: "xmark.circle.fill")
         }
