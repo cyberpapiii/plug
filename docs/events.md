@@ -22,7 +22,8 @@ arguments = { query = "is:unread" }
 every_secs = 300         # default 300, minimum 30
 ```
 
-`plug reload` picks up added, changed, and removed watches.
+Settings, Files, Reload in the app picks up added, changed, and removed
+watches.
 
 The same from the command line, which also checks the tool exists and is
 read-only before saving:
@@ -35,8 +36,8 @@ plug events unwatch gmail.inbox
 
 In the app, the Events tab lists the same watches. Watch a Tool asks for a
 server, a tool, and how often to check. It offers only tools the server marks
-read-only; More options has the event name, the arguments as JSON, and a
-switch that shows the other tools.
+read-only, with a switch that shows the others. More Options has the event
+name and the arguments as JSON.
 
 What Plug does:
 

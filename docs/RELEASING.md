@@ -11,7 +11,7 @@ inside that app.
 
 ## Installation paths
 
-macOS users download the signed DMG from the Plug website or [GitHub
+macOS users download the signed DMG from [GitHub
 Releases](https://github.com/cyberpapiii/plug/releases), move `Plug.app` to
 Applications, and open it once. The alternative is the Homebrew Cask:
 

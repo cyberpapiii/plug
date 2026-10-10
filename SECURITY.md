@@ -23,7 +23,7 @@ long-term support branches.
 
 ## What plug is, in security terms
 
-plug is a local MCP multiplexer. It holds credentials for upstream MCP servers
+Plug is a local MCP gateway. It holds credentials for upstream MCP servers
 and, optionally, acts as an OAuth 2.1 authorization server for downstream MCP
 clients. Three parts of it are security-relevant:
 

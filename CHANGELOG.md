@@ -7,6 +7,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ## [Unreleased]
 
+### Changed
+
+- The README is rewritten around what Plug is today, with diagrams, and the settings file has its own page, `docs/SETTINGS.md`. Stale lines in the other docs are corrected.
+- The setup guide the app hands to an agent now sends keys to the Keychain with `plug secret set`, where it said to use an environment variable.
+
 ### Fixed
 
 - A call in flight while Plug renews a server's sign-in is answered. Renewing swapped the connection out from under the call, which came back as "disconnected before answering".

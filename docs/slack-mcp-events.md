@@ -5,8 +5,8 @@ An opt-in adapter that turns Slack messages into one MCP event,
 webhook. It exists so an agent can react to coworker messages without a separate
 Slack bot.
 
-It is the only event source in Plug. Events from other upstream servers are not
-forwarded, and there is no general event framework; see
+It is one of Plug's two event sources. The other, watching any server's tool
+for a change, is in [events.md](events.md). What this one does not do is under
 [Scope](#scope-what-this-is-not).
 
 Absent `[http.slack_events]` there is no receiver, no worker, and no event
@@ -107,7 +107,7 @@ That client can read the capability and the static `events/list` definition
 before it holds `events:subscribe`. Subscribe and unsubscribe then answer HTTP
 403 with `WWW-Authenticate: Bearer error="insufficient_scope"`, naming the scope
 and the protected-resource metadata, so the client can request incremental
-consent. Every other client sees no event capability, catalog, or challenge.
+consent. Every other client sees nothing of this event.
 
 A subscription lasts at most one day. Refresh it before the advertised
 `refreshBefore`.
@@ -156,8 +156,9 @@ subscription. Unsubscribe waits for an in-flight send before clearing state.
 
 ## Scope: what this is not
 
-- Not a general Plug event system. The event name, the `slack` upstream, the
-  single subscriber, and the subscribe arguments are fixed in code.
+- Not the general event source. The event name, the `slack` upstream, the
+  single subscriber, and the subscribe arguments are fixed in code. To get an
+  event from any other server, watch a tool: [events.md](events.md).
 - Not pass-through. Plug originates this event; it does not relay MCP events
   from upstream servers.
 - Not a Slack bot. It posts nothing and does not replace the dot's own app.

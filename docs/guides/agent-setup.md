@@ -45,8 +45,9 @@ output you can parse. If `plug` is not on the PATH, use
 - Change client settings only through `plug link` and `plug unlink`. Do not
   edit a client's configuration file by hand.
 - Do not ask the person to paste a token or password into the chat. Sign-ins
-  go through `plug auth login`; other secrets go in an environment variable
-  the person sets.
+  go through `plug auth login`. For a key, have the person run
+  `plug secret set <name>`, which asks them for it and keeps it in the
+  Keychain.
 - Ask before you remove a server or unlink a client.
 - When something is wrong, `plug doctor` says what and how to fix it. Logs are
   in `~/Library/Logs/plug/`.
