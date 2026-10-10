@@ -247,6 +247,8 @@ final class AppModel {
     }
 
     @ObservationIgnored private var snapshotRevision = 0
+    /// The daemon's own count of its uptime at the last read, unrounded.
+    @ObservationIgnored private var lastUptimeSecs: UInt64 = 0
     @ObservationIgnored private var keptSituation: (key: SituationKey, value: PlugSituation)?
 
     private func buildSituation() -> PlugSituation {
@@ -566,7 +568,8 @@ final class AppModel {
 
     private func readDaemonStateOnce(forceCatalog: Bool) async throws {
         let handshake = try await ipc.connect()
-        capabilities = Set(handshake.capabilities)
+        let offered = Set(handshake.capabilities)
+        if offered != capabilities { capabilities = offered }
         guard handshake.sharesSupportedIPCVersion else {
             connectionState = .incompatible
             connectionError = nil
@@ -589,11 +592,18 @@ final class AppModel {
         guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
             throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
         }
-        let daemonRestarted = snapshot.uptimeSecs > 0 && value.uptimeSecs < snapshot.uptimeSecs
+        let daemonRestarted = lastUptimeSecs > 0 && value.uptimeSecs < lastUptimeSecs
+        lastUptimeSecs = value.uptimeSecs
         let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
-        snapshotRevision += 1
-        snapshot = value
-        hasLoadedSnapshot = true
+        // A read that says nothing new is not published: every view that
+        // shows a server, a client or Plug's status would be drawn again,
+        // every poll, for a clock that ticked.
+        let steady = value.steadied()
+        if steady != snapshot {
+            snapshotRevision += 1
+            snapshot = steady
+        }
+        if !hasLoadedSnapshot { hasLoadedSnapshot = true }
         snapshotDidLoad?(value)
         NotificationService.shared.observe(value)
         if case let .activity(events) = try await ipc.request(
@@ -627,8 +637,8 @@ final class AppModel {
             toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
             toolCatalogRevision = revision
         }
-        connectionState = .ready
-        connectionError = nil
+        if connectionState != .ready { connectionState = .ready }
+        if connectionError != nil { connectionError = nil }
     }
 
     func performOperation(_ request: (String) -> IPCRequest) async throws {
