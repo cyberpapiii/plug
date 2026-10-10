@@ -573,7 +573,7 @@ struct ClientsView: View {
                 if let error = model.connectableAppsError {
                     PagePane {
                         ContentUnavailableView {
-                            Label("Clients Unavailable", systemImage: "powerplug.portrait")
+                            PlugCharacterLabel(title: "Clients Unavailable", mood: .troubled)
                         } description: {
                             Text(error)
                         } actions: {

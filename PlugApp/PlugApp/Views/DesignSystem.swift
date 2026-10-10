@@ -240,31 +240,16 @@ struct VerdictView: View {
             ZStack {
                 RoundedRectangle(cornerRadius: Metric.corner, style: .continuous)
                     .fill(verdict.tone.tint)
-                if verdict.tone == .busy {
-                    ProgressView().controlSize(.small)
-                } else {
-                    Image(systemName: verdict.symbol)
-                        .font(.title3.weight(.medium))
-                        .symbolRenderingMode(.hierarchical)
-                        .foregroundStyle(verdict.tone.color)
-                        .contentTransition(.symbolEffect(.replace))
-                }
+                PlugCharacter(mood: PlugCharacter.Mood(verdict.tone))
+                    .foregroundStyle(verdict.tone.color)
+                    .padding(Metric.tight)
             }
             .frame(width: Self.heroIconSize, height: Self.heroIconSize)
             .accessibilityHidden(true)
         case .compact:
-            if verdict.tone == .busy {
-                ProgressView()
-                    .controlSize(.small)
-                    .frame(width: 22, height: 22)
-            } else {
-                Image(systemName: verdict.symbol)
-                    .font(.body)
-                    .symbolRenderingMode(.hierarchical)
-                    .foregroundStyle(verdict.tone.color)
-                    .frame(width: 22, height: 22)
-                    .accessibilityHidden(true)
-            }
+            PlugCharacter(mood: PlugCharacter.Mood(verdict.tone))
+                .foregroundStyle(verdict.tone.color)
+                .frame(width: 22, height: 22)
         }
     }
 

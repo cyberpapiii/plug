@@ -272,7 +272,7 @@ struct UnavailablePage: View {
     var body: some View {
         PagePane {
             ContentUnavailableView {
-                Label(verdict.title, systemImage: verdict.symbol)
+                PlugCharacterLabel(title: verdict.title, mood: PlugCharacter.Mood(verdict.tone))
             } description: {
                 if let detail = verdict.detail {
                     Text(detail)

@@ -49,11 +49,13 @@ struct GuideView: View {
     /// Plug's two sides, as the one picture a newcomer needs.
     private var sides: some View {
         HStack(spacing: Metric.snug) {
-            side("Servers", "provide tools", symbol: AppSection.servers.symbol)
+            side("Servers", "provide tools") { sideSymbol(AppSection.servers.symbol) }
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
-            side("Plug", "holds them all", symbol: AppSection.plugSymbol)
+            side("Plug", "holds them all") {
+                PlugCharacter(mood: .awake).foregroundStyle(.tint).frame(width: 30)
+            }
             Image(systemName: "arrow.right").foregroundStyle(.tertiary)
-            side("Clients", "use tools", symbol: AppSection.clients.symbol)
+            side("Clients", "use tools") { sideSymbol(AppSection.clients.symbol) }
         }
         .frame(maxWidth: .infinity)
         .padding(Metric.regular)
@@ -62,12 +64,15 @@ struct GuideView: View {
         .accessibilityLabel("Servers provide tools. Plug holds them all. Clients use tools.")
     }
 
-    private func side(_ title: String, _ detail: String, symbol: String) -> some View {
+    private func sideSymbol(_ name: String) -> some View {
+        Image(systemName: name)
+            .font(.title2)
+            .foregroundStyle(.secondary)
+    }
+
+    private func side(_ title: String, _ detail: String, @ViewBuilder icon: () -> some View) -> some View {
         VStack(spacing: Metric.rowGap) {
-            Image(systemName: symbol)
-                .font(.title2)
-                .foregroundStyle(.secondary)
-                .frame(height: 26)
+            icon().frame(height: 30)
             Text(title).font(.callout.weight(.semibold))
             Text(detail).font(.caption).foregroundStyle(.secondary)
         }
