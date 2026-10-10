@@ -54,7 +54,7 @@ struct PlugIcon: View {
     let kind: Kind
     var size: CGFloat = 18
 
-    init(_ kind: Kind, size: CGFloat = 18) {
+    nonisolated init(_ kind: Kind, size: CGFloat = 18) {
         self.kind = kind
         self.size = size
     }
