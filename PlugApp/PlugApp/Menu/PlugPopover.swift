@@ -18,208 +18,28 @@ import SwiftUI
 struct PlugPopover: View {
     let model: AppModel
     let run: (PlugIntent) -> Void
-    @Environment(\.accessibilityReduceMotion) private var reduceMotion
     @Environment(\.dismiss) private var dismiss
 
-    private var situation: PlugSituation { model.situation }
-    private var trouble: PanelTrouble? {
-        model.serviceEnabled ? PanelTrouble.trouble(for: situation, verdict: model.verdict) : nil
-    }
-
-    /// Off, stopped, or with no servers, there is nothing under the card to
-    /// show.
-    private var showsBody: Bool {
-        model.serviceEnabled && situation.setup == .ready && situation.runtime != .stopped
-            && situation.runtime != .off && !situation.activeServers.isEmpty
-    }
-
     var body: some View {
-        let trouble = trouble
-        VStack(alignment: .leading, spacing: 0) {
-            header(trouble)
-            if let error = model.actionError {
-                ProblemNote(error) { send(.dismissActionError) }
-                    .padding(.horizontal, Metric.panelInset)
-                    .padding(.bottom, Metric.snug)
-            }
-            if let trouble {
-                TroubleCard(trouble: trouble, canFix: model.canMutate, run: send)
-                    .padding(.horizontal, Metric.tight + Metric.hairline)
-                    .padding(.bottom, Metric.snug)
-                    .transition(.opacity)
-            }
-            if showsBody {
-                VStack(alignment: .leading, spacing: 0) {
-                    shelf
-                    clientsLine
-                    activityLine
-                }
-                // The rows are what the daemon said last, not what it says now.
-                .opacity(model.dataIsStale ? 0.55 : 1)
-                .padding(.bottom, Metric.tight)
-                .transition(.opacity)
-            }
-            Divider()
-            footer
-        }
-        .frame(width: Metric.popoverWidth)
-        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: model.verdict)
-        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: trouble)
-        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: situation.settledServers)
-        .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: latestCall?.sequence)
+        let latest = Self.recentCalls(model.activities, limit: 1).first
+        PanelView(
+            facts: PanelFacts(
+                verdict: model.verdict,
+                situation: model.situation,
+                serviceEnabled: model.serviceEnabled,
+                stale: model.dataIsStale,
+                canFix: model.canMutate,
+                events: (model.snapshot.events ?? []).map(EventFacts.init(_:)),
+                call: latest.map(model.call),
+                callID: latest?.sequence
+            ),
+            error: model.actionError,
+            power: ServicePowerToggle(model: model, run: run).labelsHidden(),
+            send: send,
+            quit: { run(.quit) }
+        )
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
-    }
-
-    // MARK: - Header
-
-    /// The character is always Plug blue. Its face says how Plug is, and the
-    /// small mark beside it takes the colour of the trouble.
-    private func header(_ trouble: PanelTrouble?) -> some View {
-        let verdict = model.verdict
-        return HStack(spacing: Metric.snug + Metric.hairline) {
-            PlugCharacter(mood: verdict.mood, mark: trouble?.wash?.color ?? StatusColor.needsYou)
-                .foregroundStyle(.tint)
-                .frame(width: Self.characterSize, height: Self.characterSize)
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text(verdict.title)
-                    .font(.system(size: 15, weight: .semibold))
-                    .lineLimit(2)
-                    .fixedSize(horizontal: false, vertical: true)
-                if let detail = headerDetail {
-                    Text(detail)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(.isHeader)
-            Spacer(minLength: Metric.tight)
-            ServicePowerToggle(model: model, run: run)
-                .labelsHidden()
-                .controlSize(.small)
-        }
-        .padding(.horizontal, Metric.panelInset)
-        .padding(.top, Metric.panelInset)
-        .padding(.bottom, trouble == nil && !showsBody ? Metric.panelInset : Metric.snug + Metric.hairline)
-    }
-
-    private static let characterSize: CGFloat = 40
-
-    /// A second line only while Plug itself is on its way up. Trouble says
-    /// more in its card, and all-is-well needs no more said.
-    private var headerDetail: String? {
-        let verdict = model.verdict
-        guard verdict.tone == .busy, situation.setup != .ready || situation.runtime != .running else { return nil }
-        return verdict.detail
-    }
-
-    // MARK: - Servers
-
-    /// The servers with nothing wrong, as icons. Past two rows the rest are a
-    /// number: the window lists them all.
-    private var shelf: some View {
-        let servers = situation.settledServers
-        let shown = servers.count > Self.shelfLimit ? Array(servers.prefix(Self.shelfLimit - 1)) : servers
-        return VStack(alignment: .leading, spacing: Metric.hairline) {
-            if !servers.isEmpty {
-                LazyVGrid(
-                    columns: [GridItem(.adaptive(minimum: Self.tileSize, maximum: Self.tileSize), spacing: Metric.tight + Metric.hairline)],
-                    alignment: .leading,
-                    spacing: Metric.tight + Metric.hairline
-                ) {
-                    ForEach(shown) { server in
-                        Button { send(.reveal(server: server.name)) } label: {
-                            ServerGlyph(name: server.name, size: Self.tileSize, status: server.health.color)
-                                .opacity(server.health == .working ? 1 : 0.5)
-                        }
-                        .buttonStyle(.plain)
-                        .help("\(server.name) · \(server.health == .working ? server.toolCountText : server.health.label)")
-                        .accessibilityLabel("\(server.name), \(server.health.label)")
-                        .transition(.scale(scale: 0.6).combined(with: .opacity))
-                    }
-                    if shown.count < servers.count {
-                        Text("+\(servers.count - shown.count)")
-                            .font(.caption2.weight(.semibold).monospacedDigit())
-                            .foregroundStyle(.secondary)
-                            .frame(width: Self.tileSize, height: Self.tileSize)
-                            .background(.quaternary, in: RoundedRectangle(cornerRadius: Metric.smallCorner, style: .continuous))
-                            .accessibilityLabel("\(servers.count - shown.count) more servers")
-                    }
-                }
-                .padding(.horizontal, Metric.panelInset)
-                .padding(.bottom, Metric.rowGap)
-            }
-            Button { send(.openWindow(.servers)) } label: {
-                HStack(spacing: Metric.rowGap) {
-                    Text(situation.runningSummary(stale: model.dataIsStale))
-                        .foregroundStyle(.secondary)
-                        .contentTransition(.numericText())
-                    Spacer(minLength: Metric.tight)
-                    Text("Show all").foregroundStyle(.secondary)
-                    chevron
-                }
-                .font(.caption)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(QuietRowButtonStyle())
-            .padding(.horizontal, Metric.tight)
-            .help("Show Servers")
-        }
-    }
-
-    private static let tileSize: CGFloat = 24
-    /// Two rows of the panel's width.
-    private static let shelfLimit = 18
-
-    private var chevron: some View {
-        Image(systemName: "chevron.right")
-            .font(.caption2.weight(.semibold))
-            .foregroundStyle(.tertiary)
-    }
-
-    // MARK: - Connected clients
-
-    private var clientsLine: some View {
-        Button { send(.openWindow(.clients)) } label: {
-            HStack(spacing: Metric.tight + Metric.hairline) {
-                if !situation.connectedClients.isEmpty {
-                    AppIconStack(clients: situation.connectedClients)
-                }
-                Text(connectedAppsText)
-                    .font(.caption)
-                    .foregroundStyle(situation.connectedApps == 0 ? Color.secondary : Color.primary)
-                    .lineLimit(1)
-                    .contentTransition(.numericText())
-                Spacer(minLength: Metric.tight)
-                chevron
-            }
-            .frame(minHeight: AppIconStack.size)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(QuietRowButtonStyle())
-        .padding(.horizontal, Metric.tight)
-        .help("Show Clients")
-    }
-
-    private var connectedAppsText: String {
-        let names = situation.connectedClients.map(\.name).filter { !$0.isEmpty }
-        if !names.isEmpty, names.count == situation.connectedApps, names.count <= 2 {
-            return names.joined(separator: " and ") + " connected"
-        }
-        switch situation.connectedApps {
-        case 0: return "No clients connected"
-        case 1: return "1 client connected"
-        default: return "\(situation.connectedApps) clients connected"
-        }
-    }
-
-    // MARK: - Activity
-
-    private var latestCall: ActivityEvent? {
-        Self.recentCalls(model.activities, limit: 1).first
     }
 
     /// The newest tool calls. Listing, pings, and other protocol traffic are
@@ -232,28 +52,234 @@ struct PlugPopover: View {
             .map { $0 }
     }
 
-    /// The last tool call, on one line. A new one rolls in from below.
-    private var activityLine: some View {
-        Button { send(.openWindow(.activity)) } label: {
-            HStack(spacing: Metric.tight + Metric.hairline) {
-                Group {
-                    if let event = latestCall {
-                        LatestCallLine(call: model.call(event))
-                            .id(event.sequence)
-                            .transition(.push(from: .bottom))
-                    } else {
-                        LatestCallLine(call: nil)
+    /// Window-opening actions close the menu panel first. Otherwise its
+    /// floating window can remain above the sheet or inspector it opened.
+    private func send(_ intent: PlugIntent) {
+        switch intent {
+        case .addServer, .addClient, .importServers, .editServer, .openWindow, .openSettings, .checkup,
+             .openCurrentWindow, .reveal, .showRepairLog, .signIn:
+            dismiss()
+        default:
+            break
+        }
+        run(intent)
+    }
+}
+
+/// Everything the panel shows, as plain values, so it can be drawn and
+/// checked without a running Plug.
+struct PanelFacts: Equatable {
+    var verdict: Verdict
+    var situation: PlugSituation
+    var serviceEnabled = true
+    /// The rows are what Plug said last, not what it says now.
+    var stale = false
+    var canFix = true
+    var events: [EventFacts] = []
+    /// The last tool call, and what tells one call from the next.
+    var call: CallFacts?
+    var callID: UInt64?
+}
+
+struct PanelView<Power: View>: View {
+    let facts: PanelFacts
+    var error: ActionError?
+    let power: Power
+    let send: (PlugIntent) -> Void
+    let quit: () -> Void
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    private var situation: PlugSituation { facts.situation }
+    private var trouble: PanelTrouble? {
+        facts.serviceEnabled ? PanelTrouble.trouble(for: situation, verdict: facts.verdict) : nil
+    }
+
+    /// Off, stopped, or with no servers, there is nothing under the card to
+    /// show.
+    private var showsBody: Bool {
+        facts.serviceEnabled && situation.setup == .ready && situation.runtime != .stopped
+            && situation.runtime != .off && !situation.activeServers.isEmpty
+    }
+
+    var body: some View {
+        let trouble = trouble
+        VStack(alignment: .leading, spacing: 0) {
+            header(trouble)
+            if let error {
+                ProblemNote(error) { send(.dismissActionError) }
+                    .padding(.horizontal, Metric.panelInset)
+                    .padding(.bottom, Metric.snug)
+            }
+            if let trouble {
+                TroubleCard(trouble: trouble, canFix: facts.canFix, run: send)
+                    .padding(.horizontal, Metric.tight + Metric.hairline)
+                    .padding(.bottom, Metric.panelGap)
+                    .transition(.opacity)
+            }
+            if showsBody {
+                VStack(alignment: .leading, spacing: Metric.snug) {
+                    serversSection
+                    clientsSection
+                    eventsSection
+                    activitySection
+                }
+                .opacity(facts.stale ? 0.55 : 1)
+                .padding(.bottom, Metric.panelGap)
+                .transition(.opacity)
+            }
+            Divider()
+            footer
+        }
+        .frame(width: Metric.popoverWidth)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: facts.verdict)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: trouble)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: situation.settledServers)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: facts.callID)
+    }
+
+    // MARK: - Header
+
+    /// The character is always Plug blue. Its face says how Plug is, and the
+    /// small mark beside it takes the colour of the trouble.
+    private func header(_ trouble: PanelTrouble?) -> some View {
+        let verdict = facts.verdict
+        return HStack(spacing: Metric.panelGap) {
+            PlugCharacter(mood: verdict.mood, mark: trouble?.wash?.color ?? StatusColor.needsYou)
+                .foregroundStyle(.tint)
+                .frame(width: characterSize, height: characterSize)
+            VStack(alignment: .leading, spacing: Metric.hairline) {
+                Text(verdict.title)
+                    .font(PanelType.title)
+                    .lineLimit(2)
+                    .fixedSize(horizontal: false, vertical: true)
+                if let detail = headerDetail {
+                    Text(detail)
+                        .font(PanelType.small)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+            Spacer(minLength: Metric.tight)
+            power
+        }
+        .padding(.horizontal, Metric.panelInset)
+        .padding(.top, Metric.panelInset)
+        .padding(.bottom, trouble == nil && !showsBody ? Metric.panelInset : Metric.regular)
+    }
+
+    private var characterSize: CGFloat { 44 }
+
+    /// A second line only while Plug itself is on its way up. Trouble says
+    /// more in its card, and all-is-well needs no more said.
+    private var headerDetail: String? {
+        let verdict = facts.verdict
+        guard verdict.tone == .busy, situation.setup != .ready || situation.runtime != .running else { return nil }
+        return verdict.detail
+    }
+
+    // MARK: - Servers
+
+    /// Every server that needs nothing from you, as icons: the ones running,
+    /// then the ones turned off, dimmed. Past two rows the rest are a number:
+    /// the window lists them all.
+    private var serversSection: some View {
+        let servers = situation.settledServers + situation.offServers
+        let shown = servers.count > shelfLimit ? Array(servers.prefix(shelfLimit - 1)) : servers
+        return PanelSection(
+            title: "Servers", detail: situation.runningSummary(stale: facts.stale),
+            open: { send(.openWindow(.servers)) }
+        ) {
+            if !servers.isEmpty {
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: Metric.panelTile, maximum: Metric.panelTile), spacing: Metric.panelTileGap)],
+                    alignment: .leading,
+                    spacing: Metric.panelTileGap
+                ) {
+                    ForEach(shown) { server in
+                        Button { send(.reveal(server: server.name)) } label: {
+                            ShelfTile(server: server)
+                        }
+                        .buttonStyle(.plain)
+                        .help("\(server.name) · \(server.shelfNote)")
+                        .accessibilityLabel("\(server.name), \(server.shelfNote)")
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
+                    }
+                    if shown.count < servers.count {
+                        Text("+\(servers.count - shown.count)")
+                            .font(PanelType.small.weight(.semibold).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                            .frame(width: Metric.panelTile, height: Metric.panelTile)
+                            .background(.quaternary, in: RoundedRectangle(cornerRadius: Metric.smallCorner, style: .continuous))
+                            .accessibilityLabel("\(servers.count - shown.count) more servers")
                     }
                 }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .clipped()
-                chevron
             }
-            .contentShape(Rectangle())
         }
-        .buttonStyle(QuietRowButtonStyle())
-        .padding(.horizontal, Metric.tight)
-        .help("Show All Activity")
+    }
+
+    /// Two rows of the panel's width.
+    private var shelfLimit: Int { 16 }
+
+    // MARK: - Clients
+
+    private var clientsSection: some View {
+        PanelSection(title: "Clients", open: { send(.openWindow(.clients)) }) {
+            HStack(spacing: Metric.snug) {
+                if !situation.connectedClients.isEmpty {
+                    AppIconStack(clients: situation.connectedClients)
+                }
+                Text(situation.connectedSummary)
+                    .font(PanelType.line)
+                    .foregroundStyle(situation.connectedApps == 0 ? Color.secondary : Color.primary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+            }
+            .frame(minHeight: AppIconStack.size)
+        }
+    }
+
+    // MARK: - Events
+
+    /// Shown only once there is an event to speak of.
+    @ViewBuilder private var eventsSection: some View {
+        let events = facts.events
+        if !events.isEmpty {
+            let failing = events.filter(\.health.needsAttention).count
+            PanelSection(title: "Events", open: { send(.openWindow(.events)) }) {
+                HStack(spacing: Metric.snug) {
+                    Circle()
+                        .fill(failing > 0 ? StatusColor.needsYou : StatusColor.working)
+                        .frame(width: 8, height: 8)
+                        .frame(width: AppIconStack.size)
+                    Text(PlugSituation.eventsSummary(count: events.count, failing: failing))
+                        .font(PanelType.line)
+                        .lineLimit(1)
+                }
+                .frame(minHeight: AppIconStack.size)
+            }
+        }
+    }
+
+    // MARK: - Activity
+
+    /// The last tool call, on one line. A new one rolls in from below.
+    private var activitySection: some View {
+        PanelSection(title: "Activity", open: { send(.openWindow(.activity)) }) {
+            Group {
+                if let call = facts.call {
+                    LatestCallLine(call: call)
+                        .id(facts.callID)
+                        .transition(.push(from: .bottom))
+                } else {
+                    LatestCallLine(call: nil)
+                }
+            }
+            .frame(maxWidth: .infinity, minHeight: AppIconStack.size, alignment: .leading)
+            .clipped()
+        }
     }
 
     // MARK: - Footer
@@ -270,7 +296,7 @@ struct PlugPopover: View {
             .labelStyle(.iconOnly)
             .keyboardShortcut(",", modifiers: .command)
             .help("Settings")
-            Button { run(.quit) } label: {
+            Button(action: quit) {
                 Label("Quit Plug", systemImage: "power")
             }
             .labelStyle(.iconOnly)
@@ -278,21 +304,8 @@ struct PlugPopover: View {
             .help("Quit Plug")
         }
         .buttonStyle(.accessoryBar)
-        .padding(.horizontal, Metric.tight)
-        .padding(.vertical, Metric.tight)
-    }
-
-    /// Window-opening actions close the menu panel first. Otherwise its
-    /// floating window can remain above the sheet or inspector it opened.
-    private func send(_ intent: PlugIntent) {
-        switch intent {
-        case .addServer, .addClient, .importServers, .editServer, .openWindow, .openSettings, .checkup,
-             .openCurrentWindow, .reveal, .showRepairLog, .signIn:
-            dismiss()
-        default:
-            break
-        }
-        run(intent)
+        .font(PanelType.line)
+        .padding(Metric.tight + Metric.hairline)
     }
 }
 
@@ -384,7 +397,8 @@ private struct TroubleCard: View {
                 summary
             }
         }
-        .padding(.horizontal, Metric.tight + Metric.hairline)
+        .padding(.leading, Metric.tight + Metric.hairline)
+        .padding(.trailing, Metric.snug)
         .padding(.vertical, Metric.rowGap)
         .background(
             RoundedRectangle(cornerRadius: Metric.corner, style: .continuous)
@@ -397,16 +411,18 @@ private struct TroubleCard: View {
         HStack(spacing: Metric.snug) {
             if let icon = trouble.icon {
                 PanelIcon(kind: icon)
-                    .frame(width: 24, height: 24)
+                    .frame(width: Metric.panelTile, height: Metric.panelTile)
             }
             if let note = trouble.note {
                 Text(note)
-                    .font(.caption)
+                    .font(PanelType.small)
                     .foregroundStyle(.secondary)
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                Spacer(minLength: Metric.tight)
             }
-            Spacer(minLength: Metric.tight)
             if let secondary = trouble.secondary {
                 Button(secondary.title) { run(secondary.intent) }
             }
@@ -415,8 +431,7 @@ private struct TroubleCard: View {
                     .buttonStyle(.borderedProminent)
             }
         }
-        .controlSize(.small)
-        .frame(minHeight: Metric.popoverRowHeight)
+        .frame(minHeight: TroubleRow.height)
     }
 }
 
@@ -432,13 +447,13 @@ private struct TroubleRow: View {
         HStack(spacing: Metric.tight) {
             Button { run(.reveal(server: server.name)) } label: {
                 HStack(spacing: Metric.snug) {
-                    ServerGlyph(name: server.name, size: 24, status: server.health.color)
-                    VStack(alignment: .leading, spacing: 0) {
+                    ServerGlyph(name: server.name, size: Metric.panelTile, status: server.health.color)
+                    VStack(alignment: .leading, spacing: 1) {
                         Text(server.name)
-                            .font(.callout)
+                            .font(PanelType.line.weight(.medium))
                             .lineLimit(1)
                         Text(server.reason)
-                            .font(.caption)
+                            .font(PanelType.small)
                             .foregroundStyle(.secondary)
                             .lineLimit(1)
                     }
@@ -453,14 +468,15 @@ private struct TroubleRow: View {
 
             fixControl
         }
-        .frame(minHeight: Metric.popoverRowHeight + Metric.tight)
+        .frame(minHeight: Self.height)
     }
+
+    static let height: CGFloat = 44
 
     @ViewBuilder private var fixControl: some View {
         if let cancel = server.cancelSignIn {
             ProgressView().controlSize(.small)
             Button(cancel.title) { run(cancel.intent) }
-                .controlSize(.small)
                 .accessibilityLabel("\(cancel.title), \(server.name)")
         } else if let fix = server.fix {
             Group {
@@ -470,7 +486,6 @@ private struct TroubleRow: View {
                     Button(fix.title) { run(fix.intent) }
                 }
             }
-            .controlSize(.small)
             .disabled(!canFix)
             .accessibilityLabel("\(fix.title), \(server.name)")
         }
@@ -494,7 +509,7 @@ struct PanelIcon: View {
     var body: some View {
         Mark(kind: kind)
             .stroke(.secondary, style: StrokeStyle(lineWidth: 1.6, lineCap: .round, lineJoin: .round))
-            .frame(width: 16, height: 16)
+            .frame(width: 18, height: 18)
             .accessibilityHidden(true)
     }
 
@@ -545,7 +560,68 @@ struct PanelIcon: View {
     }
 }
 
+// MARK: - Sections
+
+/// One group in the panel: its name, which opens its page in the window, and
+/// what it has to show.
+private struct PanelSection<Content: View>: View {
+    let title: String
+    var detail: String?
+    let open: () -> Void
+    @ViewBuilder var content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: Metric.hairline) {
+            Button(action: open) {
+                HStack(spacing: Metric.rowGap) {
+                    Text(title)
+                        .fontWeight(.semibold)
+                    Spacer(minLength: Metric.tight)
+                    if let detail {
+                        Text(detail)
+                            .lineLimit(1)
+                            .contentTransition(.numericText())
+                    }
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 10, weight: .semibold))
+                        .foregroundStyle(.tertiary)
+                }
+                .font(PanelType.small)
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(QuietRowButtonStyle())
+            .padding(.horizontal, Metric.tight)
+            .help("Show \(title)")
+            content
+                .padding(.horizontal, Metric.panelInset)
+        }
+    }
+}
+
 // MARK: - Lines
+
+/// One server on the shelf. Off is the same tile with the colour and the dot
+/// taken away.
+private struct ShelfTile: View {
+    let server: ServerFacts
+
+    var body: some View {
+        ServerGlyph(
+            name: server.name, size: Metric.panelTile, status: server.enabled ? server.health.color : nil
+        )
+        .saturation(server.enabled ? 1 : 0)
+        .opacity(server.enabled ? (server.health == .working ? 1 : 0.5) : 0.45)
+    }
+}
+
+extension ServerFacts {
+    /// What the shelf says about a server when you point at it.
+    var shelfNote: String {
+        guard enabled else { return "Off" }
+        return health == .working ? toolCountText : health.label
+    }
+}
 
 /// The last tool call: a dot for whether it worked, what ran, where, and how
 /// long it took. Nil is a panel that has seen no calls yet.
@@ -553,32 +629,32 @@ private struct LatestCallLine: View {
     let call: CallFacts?
 
     var body: some View {
-        HStack(spacing: Metric.tight + Metric.hairline) {
+        HStack(spacing: Metric.snug) {
             Circle()
                 .fill(dot)
-                .frame(width: 7, height: 7)
+                .frame(width: 8, height: 8)
                 .frame(width: AppIconStack.size)
             if let call {
                 Text(call.tool)
-                    .font(.caption.monospaced())
+                    .font(PanelType.code)
                     .foregroundStyle(call.failed ? StatusColor.stopped : Color.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
                 if let server = call.server {
                     Text(server)
-                        .font(.caption)
+                        .font(PanelType.small)
                         .foregroundStyle(.secondary)
                         .lineLimit(1)
                         .layoutPriority(1)
                 }
                 Spacer(minLength: Metric.tight)
                 Text(call.failed ? call.result : call.duration)
-                    .font(.caption.monospacedDigit())
+                    .font(PanelType.small.monospacedDigit())
                     .foregroundStyle(.tertiary)
                     .fixedSize()
             } else {
                 Text("No activity yet")
-                    .font(.caption)
+                    .font(PanelType.line)
                     .foregroundStyle(.secondary)
                 Spacer(minLength: 0)
             }
@@ -602,7 +678,7 @@ private struct LatestCallLine: View {
 /// Up to three connected app icons, overlapping, so the row says who is
 /// connected before the words do.
 private struct AppIconStack: View {
-    static let size: CGFloat = 20
+    static let size: CGFloat = 22
 
     let clients: [ConnectedClient]
 

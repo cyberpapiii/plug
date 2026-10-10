@@ -116,7 +116,8 @@ up to Open before starting it.
   set up on the Events page with "Watch a Tool". Wanted: someone who has
   never used Plug can add an API or set up an event without being told
   where to look. Also left from the menu bar panel rebuild: an event that
-  needs attention does not show in the panel's card, and the panel's
+  needs attention is counted under the panel's Events heading but has no
+  fix in the panel's card, and the panel's
   activity line shows tool calls only, because the daemon's activity feed
   carries no event deliveries.
 - Skills (#262). Done: `skill://` resources carry their server's name

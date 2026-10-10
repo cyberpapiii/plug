@@ -82,6 +82,14 @@ Rules:
   its controls. A card may have one hairline, above its last line.
 - Every gap is a step of the app's one spacing scale (`Metric`).
 - A fix sits at the end of the row it fixes, never in a list of its own.
+- Text in the panel comes in three sizes (`PanelType`): 15 for the one line
+  Plug says, 13 for a name or a line, 12 for what explains it. Nothing is
+  smaller than 12.
+- Each group has a heading in the 12 size, semibold and grey: Servers,
+  Clients, Events, Activity. The heading opens that page in the window.
+  Events appears only once there is an event.
+- A server's tile is 28 points. A server that is off stays on the shelf,
+  grey and dimmed, with no dot.
 - A plain line that says something and offers a button starts with one
   small grey line icon, drawn for Plug in one weight (`PanelIcon`), that fits
   both the words and the button: a stethoscope beside Run Checkup, a plug

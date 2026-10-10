@@ -46,6 +46,11 @@ enum Metric {
     static let glyphSlot: CGFloat = 32
     static let popoverWidth: CGFloat = 340
     static let popoverRowHeight: CGFloat = 34
+    /// The space between one group and the next in the menu bar panel.
+    static let panelGap: CGFloat = 12
+    /// A server's tile in the menu bar panel, and the gap between two.
+    static let panelTile: CGFloat = 28
+    static let panelTileGap: CGFloat = 8
     /// The list beside a detail, the same width in every section.
     static let listWidth: CGFloat = 270
     /// Room for the window buttons, the sidebar button, and a title with its count.
@@ -55,6 +60,20 @@ enum Metric {
     static let settingsWidth: CGFloat = 520
     static let settingsHeight: CGFloat = 520
     static let sheetWidth: CGFloat = 520
+}
+
+// MARK: - Type
+
+/// The three sizes of text in the menu bar panel. Nothing in it is smaller
+/// than `small`.
+enum PanelType {
+    /// The one line Plug says.
+    static let title = Font.system(size: 15, weight: .semibold)
+    /// A name, or a line you can press.
+    static let line = Font.system(size: 13)
+    /// What explains the line above it, and counts.
+    static let small = Font.system(size: 12)
+    static let code = Font.system(size: 12, design: .monospaced)
 }
 
 // MARK: - Tone
