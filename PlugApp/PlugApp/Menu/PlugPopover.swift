@@ -21,7 +21,7 @@ struct PlugPopover: View {
     @Environment(\.dismiss) private var dismiss
 
     var body: some View {
-        let latest = Self.recentCalls(model.activities, limit: 1).first
+        let latest = Self.latestCall(model.activities)
         PanelView(
             facts: PanelFacts(
                 verdict: model.verdict,
@@ -40,6 +40,17 @@ struct PlugPopover: View {
         )
         .onAppear { model.setWatching(true) }
         .onDisappear { model.setWatching(false) }
+    }
+
+    /// The newest tool call, which is all the panel shows. One pass over the
+    /// list, with nothing copied or sorted, each time the panel is drawn.
+    static func latestCall(_ activities: [ActivityEvent]) -> ActivityEvent? {
+        var latest: Int?
+        for index in activities.indices where activities[index].tool?.isEmpty == false {
+            if let kept = latest, activities[kept].sequence >= activities[index].sequence { continue }
+            latest = index
+        }
+        return latest.map { activities[$0] }
     }
 
     /// The newest tool calls. Listing, pings, and other protocol traffic are
