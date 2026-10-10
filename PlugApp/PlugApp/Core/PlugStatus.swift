@@ -254,23 +254,35 @@ struct PlugSituation: Equatable, Sendable {
         return "\(events) · \(failing) \(failing == 1 ? "needs" : "need") attention"
     }
 
-    /// Who is connected, by name: the first two, and how many more.
-    var connectedSummary: String {
+    /// Who is connected, said from the fullest way to the shortest. The panel
+    /// uses the first that fits, so a name is never cut short.
+    var connectedSummaries: [String] {
         var names: [String] = []
         for name in connectedClients.map(\.name) where !name.isEmpty && !names.contains(name) {
             names.append(name)
         }
-        let others = connectedApps - min(names.count, 2)
+        func others(after shown: Int) -> String {
+            let count = connectedApps - shown
+            return "\(count) \(count == 1 ? "other" : "others")"
+        }
+        let counted = connectedApps == 1 ? "1 client connected" : "\(connectedApps) clients connected"
         switch (names.count, connectedApps) {
-        case (_, 0): return "No clients connected"
-        case (0, 1): return "1 client connected"
-        case (0, _): return "\(connectedApps) clients connected"
-        case (1, 1): return "\(names[0]) connected"
-        case (2, 2): return "\(names[0]) and \(names[1]) connected"
-        case (1, _): return "\(names[0]) and \(others) \(others == 1 ? "other" : "others") connected"
-        default: return "\(names[0]), \(names[1]) and \(others) \(others == 1 ? "other" : "others") connected"
+        case (_, 0): return ["No clients connected"]
+        case (0, _): return [counted]
+        case (1, 1): return ["\(names[0]) connected", counted]
+        case (1, _): return ["\(names[0]) and \(others(after: 1)) connected", counted]
+        case (2, 2):
+            return ["\(names[0]) and \(names[1]) connected", "\(names[0]) and \(others(after: 1)) connected", counted]
+        default:
+            return [
+                "\(names[0]), \(names[1]) and \(others(after: 2)) connected",
+                "\(names[0]) and \(others(after: 1)) connected",
+                counted,
+            ]
         }
     }
+
+    var connectedSummary: String { connectedSummaries[0] }
 
     /// Every server in one order for every list: the ones that are on, then
     /// the ones that are off.

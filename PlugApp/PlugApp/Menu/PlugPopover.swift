@@ -117,14 +117,15 @@ struct PanelView<Power: View>: View {
                     .transition(.opacity)
             }
             if showsBody {
-                VStack(alignment: .leading, spacing: Metric.snug) {
+                VStack(alignment: .leading, spacing: Metric.panelInset) {
                     serversSection
                     clientsSection
                     eventsSection
                     activitySection
                 }
                 .opacity(facts.stale ? 0.55 : 1)
-                .padding(.bottom, Metric.panelGap)
+                .padding(.top, Metric.rowGap)
+                .padding(.bottom, Metric.panelInset)
                 .transition(.opacity)
             }
             Divider()
@@ -231,11 +232,14 @@ struct PanelView<Power: View>: View {
                 if !situation.connectedClients.isEmpty {
                     AppIconStack(clients: situation.connectedClients)
                 }
-                Text(situation.connectedSummary)
-                    .font(PanelType.line)
-                    .foregroundStyle(situation.connectedApps == 0 ? Color.secondary : Color.primary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                ViewThatFits(in: .horizontal) {
+                    ForEach(situation.connectedSummaries, id: \.self) { summary in
+                        Text(summary).lineLimit(1)
+                    }
+                }
+                .font(PanelType.line)
+                .foregroundStyle(situation.connectedApps == 0 ? Color.secondary : Color.primary)
+                .accessibilityLabel(situation.connectedSummary)
             }
             .frame(minHeight: AppIconStack.size)
         }
@@ -571,7 +575,7 @@ private struct PanelSection<Content: View>: View {
     @ViewBuilder var content: Content
 
     var body: some View {
-        VStack(alignment: .leading, spacing: Metric.hairline) {
+        VStack(alignment: .leading, spacing: Metric.tight) {
             Button(action: open) {
                 HStack(spacing: Metric.rowGap) {
                     Text(title)
@@ -635,11 +639,17 @@ private struct LatestCallLine: View {
                 .frame(width: 8, height: 8)
                 .frame(width: AppIconStack.size)
             if let call {
+                // Set the way code is in a message, so it reads as a tool's name.
                 Text(call.tool)
                     .font(PanelType.code)
                     .foregroundStyle(call.failed ? StatusColor.stopped : Color.primary)
                     .lineLimit(1)
                     .truncationMode(.middle)
+                    .padding(.horizontal, Metric.tight)
+                    .padding(.vertical, Metric.hairline)
+                    .background(
+                        Color.primary.opacity(0.08), in: RoundedRectangle(cornerRadius: 5, style: .continuous)
+                    )
                 if let server = call.server {
                     Text(server)
                         .font(PanelType.small)
@@ -675,19 +685,31 @@ private struct LatestCallLine: View {
     }
 }
 
-/// Up to three connected app icons, overlapping, so the row says who is
-/// connected before the words do.
+/// Up to three connected clients as one stack, each icon over the edge of
+/// the next, the way a row of faces shows who liked a post. They are the
+/// size of a server's tile.
 private struct AppIconStack: View {
-    static let size: CGFloat = 22
+    static let size = Metric.panelTile
+    private static let overlap: CGFloat = 10
+    private static let ring: CGFloat = 2
 
     let clients: [ConnectedClient]
 
     var body: some View {
-        HStack(spacing: -Metric.rowGap) {
-            ForEach(Array(clients.prefix(3).enumerated()), id: \.offset) { _, client in
+        let shown = Array(clients.prefix(3).enumerated())
+        HStack(spacing: -Self.overlap) {
+            ForEach(shown, id: \.offset) { index, client in
                 AppGlyph(target: client.target, name: client.name, appPath: client.appPath, size: Self.size)
+                    // A ring in the panel's own colour parts each icon from the one under it.
+                    .padding(Self.ring)
+                    .background(
+                        .background,
+                        in: RoundedRectangle(cornerRadius: Self.size * 0.28 + Self.ring, style: .continuous)
+                    )
+                    .zIndex(Double(shown.count - index))
             }
         }
+        .padding(-Self.ring)
         .accessibilityHidden(true)
     }
 }

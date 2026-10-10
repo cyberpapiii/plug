@@ -416,6 +416,14 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(connected(["Claude", "Codex", "Cursor", "Zed", "Pi"]), "Claude, Codex and 3 others connected")
         XCTAssertEqual(connected(["Claude", "Claude", "Claude"]), "Claude and 2 others connected")
         XCTAssertEqual(connected(["", ""]), "2 clients connected")
+        // Shorter ways to say it, for a panel too narrow for two names.
+        XCTAssertEqual(
+            PlugSituation(
+                connectedApps: 4,
+                connectedClients: ["Codex CLI", "GrokBot", "Zed", "Pi"].map { ConnectedClient(target: $0, name: $0) }
+            ).connectedSummaries,
+            ["Codex CLI, GrokBot and 2 others connected", "Codex CLI and 3 others connected", "4 clients connected"]
+        )
     }
 
     func testThePanelCountsServersThatAreOff() {
