@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Clicking between servers is quicker, most of all onto one with many tools, and hiding or showing the sidebar is smoother. A server's tools are sorted once when they arrive, not on every redraw, and a tool's row is left alone unless that tool changed.
 - The window no longer stutters every two seconds. It was redrawing every server, client and tool on each check of Plug, because a few clocks in what it read had ticked; it now redraws only when something changed.
 - Search in the window is one glass capsule that grows from the magnifying glass, and it folds away when you click anywhere else. The window no longer rebuilds Plug's status and re-reads app icons from disk every two seconds, so clicking around is quicker.
 - Search in the window is a magnifying glass in the bar until you press it, the way Finder shows it. Hiding and showing the sidebar is smooth: the list beside it keeps one width, where it used to resize while the sidebar moved.
@@ -30,6 +31,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The bar at the top of the window holds still when the sidebar is hidden or shown. The add button sits beside search at the far end, and the sidebar button sits beside the page's title. Before, the add button did not fit above the list once the sidebar was hidden, so it jumped and left a stray divider behind, the sidebar button vanished behind a "more" arrow while the sidebar slid back, and an empty piece of glass sat next to search.
 - The app no longer quits if the daemon ever lists the same server twice. It shows the first and carries on.
 - Plug keeps checking on itself when the menu bar panel or the window is closed in the first moments after launch. Before, it could stop checking until you turned Plug off and on.
 - Turning Plug on no longer fails with an error when the file that records it as off has already been removed.

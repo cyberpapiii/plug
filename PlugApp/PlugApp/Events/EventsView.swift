@@ -93,9 +93,10 @@ struct EventsView: View {
         }
         .pageSubtitle(summary)
         .toolbar {
-            // The window draws a section once per column; the button goes
-            // above the list.
-            if pane != .detail {
+            // The window draws a section once per column; the button sits
+            // beside search. Above the list it did not fit once the sidebar
+            // was hidden, and the bar moved it about.
+            if pane != .list {
                 ToolbarItem(placement: .primaryAction) {
                     Button { run(.addWatch) } label: {
                         Label("Watch a Tool", icon: .add)
