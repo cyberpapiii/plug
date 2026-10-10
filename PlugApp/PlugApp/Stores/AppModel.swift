@@ -282,8 +282,22 @@ final class AppModel {
     /// Distinct connected apps, first seen first, so the panel's icon row is
     /// stable while sessions come and go.
     private var connectedClients: [ConnectedClient] {
-        ClientNames(snapshot: snapshot).connectedClients(snapshot.liveSessions)
+        clientNames.connectedClients(snapshot.liveSessions)
     }
+
+    /// The names and places the owner gave clients. Built once per snapshot:
+    /// the Clients page asks for it for every session of every row.
+    var clientNames: ClientNames {
+        // Read first, so a view that only ever sees the kept value still
+        // follows the snapshot.
+        let snapshot = snapshot
+        if let kept = keptClientNames, kept.revision == snapshotRevision { return kept.value }
+        let value = ClientNames(snapshot: snapshot)
+        keptClientNames = (snapshotRevision, value)
+        return value
+    }
+
+    @ObservationIgnored private var keptClientNames: (revision: Int, value: ClientNames)?
 
     /// The single sentence every surface renders.
     var verdict: Verdict { PlugVerdict.verdict(for: situation) }
@@ -394,7 +408,9 @@ final class AppModel {
         monitoringTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let interval = self?.pollInterval else { return }
-                try? await Task.sleep(for: interval)
+                // A tenth of the wait is slack, so the system can wake Plug
+                // along with other work instead of for this alone.
+                try? await Task.sleep(for: interval, tolerance: interval / 10)
                 guard !Task.isCancelled else { return }
                 await self?.refresh()
             }
@@ -550,9 +566,12 @@ final class AppModel {
     /// A drop from a working connection reads as reconnecting, and polls
     /// briskly, until it outlasts the grace. Only then is Plug stopped.
     private func connectionLost(_ error: any Error) {
-        connectionError = error.localizedDescription
+        // A stopped Plug fails every poll the same way. Saying so again
+        // would draw every view again for nothing.
+        let message = error.localizedDescription
+        if connectionError != message { connectionError = message }
         guard connectionState == .ready || connectionState == .reconnecting else {
-            connectionState = .disconnected
+            if connectionState != .disconnected { connectionState = .disconnected }
             return
         }
         let now = ContinuousClock.now
@@ -574,13 +593,13 @@ final class AppModel {
         let offered = Set(handshake.capabilities)
         if offered != capabilities { capabilities = offered }
         guard handshake.sharesSupportedIPCVersion else {
-            connectionState = .incompatible
-            connectionError = nil
+            if connectionState != .incompatible { connectionState = .incompatible }
+            if connectionError != nil { connectionError = nil }
             return
         }
         guard handshake.daemonVersion == clientVersion else {
-            connectionState = .incompatible
-            connectionError = nil
+            if connectionState != .incompatible { connectionState = .incompatible }
+            if connectionError != nil { connectionError = nil }
             // During a launch pass the pass itself settles the version, and
             // a retry asked for now would be swallowed by it.
             if !attemptedSkewRecovery, !reconciliationInFlight {
@@ -618,8 +637,12 @@ final class AppModel {
             )
         ) {
             if activityCursor == 0 {
-                activityWasTruncated = events.count > Self.activityLimit
-                activities = Array(events.suffix(Self.activityLimit))
+                // With no calls yet this branch runs every poll, so it only
+                // writes what changed.
+                let truncated = events.count > Self.activityLimit
+                if activityWasTruncated != truncated { activityWasTruncated = truncated }
+                let latest = Array(events.suffix(Self.activityLimit))
+                if latest != activities { activities = latest }
             } else if !events.isEmpty {
                 let merged = activities + events
                 activityWasTruncated = activityWasTruncated
@@ -746,7 +769,7 @@ final class AppModel {
         isLoadingConnectableApps = true
         defer {
             isLoadingConnectableApps = false
-            hasLoadedConnectableApps = true
+            if !hasLoadedConnectableApps { hasLoadedConnectableApps = true }
         }
         do {
             // Assigned only when it differs: the list is read every few
@@ -755,7 +778,8 @@ final class AppModel {
             if apps != connectableApps { connectableApps = apps }
             if connectableAppsError != nil { connectableAppsError = nil }
         } catch {
-            connectableAppsError = error.localizedDescription
+            let message = error.localizedDescription
+            if connectableAppsError != message { connectableAppsError = message }
         }
     }
 
