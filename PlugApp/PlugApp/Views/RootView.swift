@@ -170,6 +170,24 @@ struct RootView: View {
     }
 
     private var pageTitle: some View {
+        // The bar gives the title the room of its first line and no more, so
+        // that room never changes and the bar never moves the title. The
+        // second line is drawn over the empty bar beside it: it fades in and
+        // the title glides up to make room. Swapped in one step, the title
+        // jumped while the sidebar was still moving.
+        Text(router.section.rawValue)
+            .font(.headline)
+            .lineLimit(1)
+            .fixedSize()
+            .hidden()
+            .overlay(alignment: .leading) {
+                titleLines.animation(.smooth(duration: 0.25), value: showsSubtitle)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+    }
+
+    private var titleLines: some View {
         VStack(alignment: .leading, spacing: 0) {
             Text(router.section.rawValue)
                 .font(.headline)
@@ -177,12 +195,11 @@ struct RootView: View {
                 Text(subtitle)
                     .font(.subheadline)
                     .foregroundStyle(.secondary)
+                    .transition(.opacity)
             }
         }
         .lineLimit(1)
         .fixedSize()
-        .accessibilityElement(children: .combine)
-        .accessibilityAddTraits(.isHeader)
     }
 
     /// The page's title, beside the sidebar button, with no glass behind it.
