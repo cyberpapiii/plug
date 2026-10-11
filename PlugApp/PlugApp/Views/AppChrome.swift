@@ -27,9 +27,16 @@ private struct PageSubtitle: ViewModifier {
     let text: String?
     @Environment(\.showsPageSubtitle) private var shows
 
+    /// From macOS 15 the window draws the title itself and the bar's own is
+    /// gone. Changing the bar's hidden second line still lays the whole bar
+    /// out again, which made the sidebar jerk at the end of its slide.
+    private static var windowDrawsTitle: Bool {
+        if #available(macOS 15.0, *) { true } else { false }
+    }
+
     func body(content: Content) -> some View {
         content
-            .navigationSubtitle(shows ? text ?? "" : "")
+            .navigationSubtitle(shows || Self.windowDrawsTitle ? text ?? "" : "")
             .preference(key: PageSubtitleKey.self, value: text)
     }
 }
