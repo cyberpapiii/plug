@@ -269,7 +269,7 @@ enum MenuBarIcon {
         let drawing = Drawing(mark: mark, blinking: blinking, gaze: gaze)
         if let image = drawn[drawing] { return image }
         // A plain plug takes no more room than it needs.
-        let size = NSSize(width: mark.badge == nil ? 16 : 25, height: 18)
+        let size = NSSize(width: mark.badge == nil ? 17 : 26, height: 18)
         let rect = CGRect(origin: .zero, size: size)
         // The picture is drawn once, as finished bitmaps for ordinary and
         // Retina displays. An image that draws itself on demand is drawn
@@ -303,8 +303,10 @@ enum MenuBarIcon {
     private static func draw(
         _ mark: MenuBarMark, blinking: Bool, gaze: Int, in rect: CGRect, context: CGContext
     ) {
-        // A badged plug sits at the left, so the badge clears its eyes.
-        let middle: CGFloat = mark.badge == nil ? rect.midX : 8
+        // A badged plug sits at the left, so the badge clears its eyes. The
+        // plug's prongs make it look smaller and further left than it is, so
+        // it is drawn a touch large and half a point to the right.
+        let middle: CGFloat = mark.badge == nil ? rect.midX + 0.5 : 9
         drawPlug(
             awake: mark.awake, eyesOpen: mark.awake && !blinking, gaze: gaze,
             centre: CGPoint(x: middle, y: rect.midY), in: context
@@ -322,7 +324,7 @@ enum MenuBarIcon {
     private static func drawPlug(
         awake: Bool, eyesOpen: Bool, gaze: Int, centre: CGPoint, in context: CGContext
     ) {
-        let scale = 15 / PlugMark.height
+        let scale = 16 / PlugMark.height
         var placement = PlugMark.placement(centre: centre, scale: scale, yUp: true)
         func add(_ path: Path) {
             if let placed = path.cgPath.copy(using: &placement) { context.addPath(placed) }
