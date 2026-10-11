@@ -266,7 +266,7 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertTrue(card.servers.isEmpty)
         XCTAssertEqual(card.primary?.intent, .reconnect)
         XCTAssertNil(card.secondary)
-        XCTAssertEqual(card.icon, .plug)
+        XCTAssertEqual(card.icon, .start)
         XCTAssertEqual(card.wash, .blocked)
     }
 

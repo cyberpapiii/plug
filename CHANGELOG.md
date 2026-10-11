@@ -10,6 +10,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Changed
 
 - The menu bar icon is a little larger and sits a point to the right, so it reads as centred and the same size as the icons beside it.
+- Start Plug has a sunrise beside it in the menu bar panel, to pair with the moon for off.
 - A server with many tools opens as fast as one with a few. Its page now makes each tool's row only when it scrolls into view, and the small switch on a row is drawn by Plug instead of being a full system control.
 - Clicking between servers is quicker, most of all onto one with many tools, and hiding or showing the sidebar is smoother. A server's tools are sorted once when they arrive, not on every redraw, and a tool's row is left alone unless that tool changed.
 - The window no longer stutters every two seconds. It was redrawing every server, client and tool on each check of Plug, because a few clocks in what it read had ticked; it now redraws only when something changed.

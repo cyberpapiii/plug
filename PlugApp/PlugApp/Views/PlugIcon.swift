@@ -47,8 +47,8 @@ struct PlugIcon: View {
         // Beside a line that offers a button
         /// A stethoscope, for a checkup.
         case checkup
-        /// A plug with its cord loose, for Plug not running.
-        case plug
+        /// A sunrise, for starting Plug. It pairs with the moon for off.
+        case start
         /// A server's tile with a plus, for adding one.
         case addServer
     }
@@ -205,20 +205,13 @@ struct PlugIcon: View {
                 path.addRelativeArc(center: CGPoint(x: 9.25, y: 10.5), radius: 3.25, startAngle: .degrees(180), delta: .degrees(-180))
                 path.addLine(to: CGPoint(x: 12.5, y: 9.6))
                 path.circle(12.5, 7.7, 1.8)
-            case .plug:
-                path.line(6.2, 2.5, 6.2, 5.5)
-                path.line(9.8, 2.5, 9.8, 5.5)
-                path.move(to: CGPoint(x: 4.5, y: 5.5))
-                path.addLine(to: CGPoint(x: 11.5, y: 5.5))
-                path.addLine(to: CGPoint(x: 11.5, y: 7.5))
-                path.addRelativeArc(center: CGPoint(x: 8, y: 7.5), radius: 3.5, startAngle: .degrees(0), delta: .degrees(180))
-                path.closeSubpath()
-                path.move(to: CGPoint(x: 8, y: 11))
-                path.addLine(to: CGPoint(x: 8, y: 11.8))
-                path.addCurve(
-                    to: CGPoint(x: 4.8, y: 14),
-                    control1: CGPoint(x: 8, y: 13.4), control2: CGPoint(x: 4.8, y: 12.2)
-                )
+            case .start:
+                path.line(2.5, 12.2, 13.5, 12.2)
+                path.move(to: CGPoint(x: 4.6, y: 12.2))
+                path.addRelativeArc(center: CGPoint(x: 8, y: 12.2), radius: 3.4, startAngle: .degrees(180), delta: .degrees(180))
+                path.line(8, 3.6, 8, 5.2)
+                path.line(3.4, 6.2, 4.5, 7.3)
+                path.line(12.6, 6.2, 11.5, 7.3)
             case .addServer:
                 path.tile(2.5, 2.5, 11, 11, 3.4)
                 path.line(8, 5.8, 8, 10.2)
