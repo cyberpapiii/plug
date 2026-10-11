@@ -16,6 +16,10 @@ struct ServerDetailView: View {
     @State private var confirmSignOut = false
     /// Where this server's own settings are. Nil until Plug has read them.
     @State private var settingsPlace: ServerSettingsPlace?
+    /// What was read last time, by server. A page that is opened again shows
+    /// its Settings row at once instead of a moment later, which moved every
+    /// row below it.
+    private static var knownSettingsPlaces: [String: ServerSettingsPlace] = [:]
 
     var body: some View {
         DetailForm {
@@ -171,12 +175,17 @@ struct ServerDetailView: View {
     }
 
     private func findSettingsPlace() async {
-        settingsPlace = nil
-        guard let config = try? await model.serverConfig(name: server.name) else { return }
+        settingsPlace = Self.knownSettingsPlaces[server.name]
+        guard let config = try? await model.serverConfig(name: server.name) else {
+            settingsPlace = nil
+            return
+        }
         let described = (try? await model.serverDescriptions()) ?? []
         let website = described.first { $0.serverId == server.name }?.upstream?.websiteUrl
         guard !Task.isCancelled else { return }
-        settingsPlace = ServerSettingsPlace.find(config: config, website: website)
+        let found = ServerSettingsPlace.find(config: config, website: website)
+        Self.knownSettingsPlaces[server.name] = found
+        if settingsPlace != found { settingsPlace = found }
     }
 
     private var accountLabel: String {
