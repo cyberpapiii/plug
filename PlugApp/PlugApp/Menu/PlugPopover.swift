@@ -354,7 +354,7 @@ struct PanelTrouble: Equatable {
             return servers(situation, verdict: verdict)
         case .stopped:
             return PanelTrouble(
-                note: "Clients cannot reach servers", icon: .plug, primary: verdict.primary, wash: .blocked
+                note: "Clients cannot reach servers", icon: .start, primary: verdict.primary, wash: .blocked
             )
         default:
             return general(verdict)
@@ -387,7 +387,7 @@ struct PanelTrouble: Equatable {
         }
         return PanelTrouble(
             note: verdict.detail,
-            icon: primary.intent == .repairInstallation ? .checkup : .plug,
+            icon: primary.intent == .repairInstallation ? .checkup : .start,
             primary: primary,
             secondary: verdict.secondary,
             wash: verdict.tone
