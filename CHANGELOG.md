@@ -32,6 +32,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The title in the window's bar no longer jumps when the sidebar slides back in. The count under it fades in and the title glides up to make room.
 - A server's page no longer jumps a moment after it opens. The Settings row showed late and pushed every row below it down; a page opened before now shows it at once.
 - Plug no longer keeps the processor busy with its window closed. After being opened and closed a few times, the menu bar icon could start redrawing without stopping. Settings also opens faster.
 - The bar at the top of the window holds still when the sidebar is hidden or shown. The add button sits beside search at the far end, and the sidebar button sits beside the page's title. Before, the add button did not fit above the list once the sidebar was hidden, so it jumped and left a stray divider behind, the sidebar button vanished behind a "more" arrow while the sidebar slid back, and an empty piece of glass sat next to search.
