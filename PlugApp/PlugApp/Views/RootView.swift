@@ -70,6 +70,10 @@ struct RootView: View {
                 // column, so the title drops its second line to fit.
                 .environment(\.showsPageSubtitle, showsSubtitle)
                 .task(id: columns == .all) {
+                    // From macOS 15 the title keeps this time itself. Set
+                    // here, it changed the whole window while the sidebar
+                    // was still sliding, and the slide jumped to its end.
+                    if #available(macOS 15.0, *) { return }
                     guard columns == .all else {
                         showsSubtitle = false
                         return
@@ -82,7 +86,12 @@ struct RootView: View {
                 .toolbar {
                     ToolbarItem(placement: .navigation) {
                         Button {
-                            withAnimation { columns = columns == .all ? .doubleColumn : .all }
+                            // The system's own slide. Changing the columns from
+                            // here in an animation ran half of it and then
+                            // jumped to the end.
+                            if !SidebarToggle.perform() {
+                                withAnimation { columns = columns == .all ? .doubleColumn : .all }
+                            }
                         } label: {
                             Label(columns == .all ? "Hide Sidebar" : "Show Sidebar", systemImage: "sidebar.leading")
                         }
@@ -170,36 +179,7 @@ struct RootView: View {
     }
 
     private var pageTitle: some View {
-        // The bar gives the title the room of its first line and no more, so
-        // that room never changes and the bar never moves the title. The
-        // second line is drawn over the empty bar beside it: it fades in and
-        // the title glides up to make room. Swapped in one step, the title
-        // jumped while the sidebar was still moving.
-        Text(router.section.rawValue)
-            .font(.headline)
-            .lineLimit(1)
-            .fixedSize()
-            .hidden()
-            .overlay(alignment: .leading) {
-                titleLines.animation(.smooth(duration: 0.25), value: showsSubtitle)
-            }
-            .accessibilityElement(children: .combine)
-            .accessibilityAddTraits(.isHeader)
-    }
-
-    private var titleLines: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Text(router.section.rawValue)
-                .font(.headline)
-            if showsSubtitle, let subtitle, !subtitle.isEmpty {
-                Text(subtitle)
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                    .transition(.opacity)
-            }
-        }
-        .lineLimit(1)
-        .fixedSize()
+        PageTitle(title: router.section.rawValue, subtitle: subtitle, sidebarShown: columns == .all)
     }
 
     /// The page's title, beside the sidebar button, with no glass behind it.
@@ -469,6 +449,78 @@ private struct ClickAwayAnchor: NSViewRepresentable {
 
     func updateNSView(_ view: NSView, context: Context) {
         clicks.view = view
+    }
+}
+
+
+/// Asks the window's split view to hide or show its sidebar, the way the
+/// system's own sidebar button does.
+@MainActor
+private enum SidebarToggle {
+    static func perform() -> Bool {
+        guard let content = (NSApp.keyWindow ?? NSApp.mainWindow)?.contentView else { return false }
+        var queue: [NSView] = [content]
+        while !queue.isEmpty {
+            let view = queue.removeFirst()
+            if let split = view as? NSSplitView, let controller = split.delegate as? NSSplitViewController {
+                controller.toggleSidebar(nil)
+                return true
+            }
+            queue.append(contentsOf: view.subviews)
+        }
+        return false
+    }
+}
+
+/// The page's title in the window's bar, with the count under it while the
+/// sidebar shows. The count follows the sidebar late on the way back: with
+/// the sidebar hidden the window's buttons sit over this column, and the
+/// second line does not fit until the slide is over.
+private struct PageTitle: View {
+    let title: String
+    let subtitle: String?
+    let sidebarShown: Bool
+    @State private var showsSubtitle = true
+
+    var body: some View {
+        // The bar gives the title the room of its first line and no more, so
+        // that room never changes and the bar never moves the title. The
+        // second line is drawn over the empty bar beside it: it fades in and
+        // the title glides up to make room. Swapped in one step, the title
+        // jumped while the sidebar was still moving.
+        Text(title)
+            .font(.headline)
+            .lineLimit(1)
+            .fixedSize()
+            .hidden()
+            .overlay(alignment: .leading) {
+                lines.animation(.smooth(duration: 0.25), value: showsSubtitle)
+            }
+            .accessibilityElement(children: .combine)
+            .accessibilityAddTraits(.isHeader)
+            .task(id: sidebarShown) {
+                guard sidebarShown else {
+                    showsSubtitle = false
+                    return
+                }
+                try? await Task.sleep(for: .milliseconds(450))
+                if !Task.isCancelled { showsSubtitle = true }
+            }
+    }
+
+    private var lines: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Text(title)
+                .font(.headline)
+            if showsSubtitle, let subtitle, !subtitle.isEmpty {
+                Text(subtitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .transition(.opacity)
+            }
+        }
+        .lineLimit(1)
+        .fixedSize()
     }
 }
 

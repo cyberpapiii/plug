@@ -33,6 +33,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The sidebar slides all the way back in. It used to slide about halfway and then jump to its place.
 - The title in the window's bar no longer jumps when the sidebar slides back in. The count under it fades in and the title glides up to make room.
 - A server's page no longer jumps a moment after it opens. The Settings row showed late and pushed every row below it down; a page opened before now shows it at once.
 - Plug no longer keeps the processor busy with its window closed. After being opened and closed a few times, the menu bar icon could start redrawing without stopping. Settings also opens faster.
