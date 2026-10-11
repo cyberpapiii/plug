@@ -244,20 +244,6 @@ private struct ServerTools: View, Equatable {
     let router: Router
     let run: (PlugIntent) -> Void
     @State private var showsOffOnly = false
-    /// The list the rows were last built for, and how many are built so far.
-    @State private var builtFor: Build?
-    @State private var builtCount = ServerTools.firstRows
-
-    /// A long list is built a screenful first and the rest right after, so
-    /// the page appears at once instead of after every row is made.
-    private static let firstRows = 30
-    private static let moreRows = 30
-
-    /// One list to build: a server, and whether its tools have arrived.
-    private struct Build: Hashable {
-        let server: String
-        let hasTools: Bool
-    }
 
     nonisolated static func == (lhs: Self, rhs: Self) -> Bool {
         lhs.model === rhs.model && lhs.router === rhs.router
@@ -272,8 +258,6 @@ private struct ServerTools: View, Equatable {
         // Read once here, so opening a tool's details redraws two rows and
         // not every row.
         let selected = router.selectedTool
-        let build = Build(server: server, hasTools: !all.isEmpty)
-        let limit = builtFor == build ? builtCount : Self.firstRows
         Section {
             if all.isEmpty {
                 Text(isWorking ? "This server offers no tools." : "Tools appear once the server is running.")
@@ -282,17 +266,25 @@ private struct ServerTools: View, Equatable {
                 Text(noToolsShown)
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(shown.prefix(limit)) { tool in
-                    ServerToolRow(
-                        tool: tool,
-                        canManage: canManage,
-                        isBusy: model.busyTools.contains(tool.name),
-                        showsDetails: selected == tool.name,
-                        model: model,
-                        router: router,
-                        run: run
-                    )
-                    .equatable()
+                // One row of the form holds every tool, and makes each only
+                // when it scrolls into view. A server with a hundred tools
+                // opens as fast as one with five.
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    ForEach(shown) { tool in
+                        if tool.id != shown.first?.id { Divider() }
+                        ServerToolRow(
+                            tool: tool,
+                            canManage: canManage,
+                            isBusy: model.busyTools.contains(tool.name),
+                            showsDetails: selected == tool.name,
+                            model: model,
+                            router: router,
+                            run: run
+                        )
+                        .equatable()
+                        .padding(.top, tool.id == shown.first?.id ? 0 : Metric.tight)
+                        .padding(.bottom, tool.id == shown.last?.id ? 0 : Metric.tight)
+                    }
                 }
             }
         } header: {
@@ -317,22 +309,7 @@ private struct ServerTools: View, Equatable {
                     .fixedSize()
                 }
             }
-            .task(id: build) { await buildRows(for: build) }
         }
-    }
-
-    /// Adds the rows after the first screenful, a batch per frame.
-    private func buildRows(for build: Build) async {
-        var count = Self.firstRows
-        builtCount = count
-        builtFor = build
-        while count < model.toolCatalog.tools(for: server).count {
-            try? await Task.sleep(nanoseconds: 16_000_000)
-            if Task.isCancelled { return }
-            count += Self.moreRows
-            builtCount = count
-        }
-        builtCount = .max
     }
 
     /// Nil when every tool is on and shown: the header above already gives

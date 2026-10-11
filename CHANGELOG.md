@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- A server with many tools opens as fast as one with a few. Its page now makes each tool's row only when it scrolls into view, and the small switch on a row is drawn by Plug instead of being a full system control.
 - Clicking between servers is quicker, most of all onto one with many tools, and hiding or showing the sidebar is smoother. A server's tools are sorted once when they arrive, not on every redraw, and a tool's row is left alone unless that tool changed.
 - The window no longer stutters every two seconds. It was redrawing every server, client and tool on each check of Plug, because a few clocks in what it read had ticked; it now redraws only when something changed.
 - Search in the window is one glass capsule that grows from the magnifying glass, and it folds away when you click anywhere else. The window no longer rebuilds Plug's status and re-reads app icons from disk every two seconds, so clicking around is quicker.
