@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 /// Which column of the window a section is drawing. The window shows each
@@ -14,6 +15,8 @@ extension EnvironmentValues {
     @Entry var splitPane: SplitPane = .whole
     /// False while the list column sits under the window's buttons.
     @Entry var showsPageSubtitle = true
+    /// False while the window is covered, minimized or on another desktop.
+    @Entry var windowSeen = true
 }
 
 extension View {
@@ -441,6 +444,54 @@ struct EmptyPage: View {
                     Button(secondaryTitle) { run(secondaryIntent) }
                 }
             }
+        }
+    }
+}
+
+/// Whether the window this sits in is on screen. Closed, covered, minimized
+/// or on another desktop, it is not.
+struct WindowSeenReader: NSViewRepresentable {
+    @Binding var seen: Bool
+
+    func makeNSView(context: Context) -> WindowSeenProbe {
+        let probe = WindowSeenProbe()
+        let seen = $seen
+        probe.onSeen = { now in
+            if seen.wrappedValue != now { seen.wrappedValue = now }
+        }
+        return probe
+    }
+
+    func updateNSView(_ probe: WindowSeenProbe, context: Context) {}
+}
+
+final class WindowSeenProbe: NSView {
+    var onSeen: ((Bool) -> Void)?
+
+    override func hitTest(_ point: NSPoint) -> NSView? { nil }
+    override var acceptsFirstResponder: Bool { false }
+
+    override func viewWillMove(toWindow newWindow: NSWindow?) {
+        super.viewWillMove(toWindow: newWindow)
+        let centre = NotificationCenter.default
+        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        if let newWindow {
+            centre.addObserver(
+                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
+            )
+        }
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        look()
+    }
+
+    /// Said a moment later, never in the middle of an update.
+    @objc private func look() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            self.onSeen?(self.window?.occlusionState.contains(.visible) ?? false)
         }
     }
 }
