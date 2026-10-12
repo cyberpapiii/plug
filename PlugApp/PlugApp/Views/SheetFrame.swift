@@ -29,6 +29,7 @@ struct SheetFrame<Content: View, Extra: View>: View {
     @ViewBuilder var extra: Extra
     @ViewBuilder var content: Content
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
@@ -50,6 +51,7 @@ struct SheetFrame<Content: View, Extra: View>: View {
             if let failure {
                 ProblemNote(reason: failure)
                     .padding(.horizontal, Metric.roomy)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
             HStack(spacing: Metric.snug) {
@@ -76,6 +78,8 @@ struct SheetFrame<Content: View, Extra: View>: View {
         }
         .padding(.vertical, Metric.roomy)
         .frame(width: Self.width)
+        // What went wrong arrives and leaves; it does not pop.
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: failure)
         .interactiveDismissDisabled(busy)
         .onExitCommand {
             if confirmTitle == nil, !busy { dismiss() }

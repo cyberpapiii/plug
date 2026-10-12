@@ -64,11 +64,7 @@ struct ImportServersView: View {
         } else if let scan {
             if scan.isEmpty {
                 ContentUnavailableView {
-                    Label {
-                        Text("Nothing New to Import")
-                    } icon: {
-                        PlugIcon(.worked, size: 44)
-                    }
+                    PlugCharacterLabel(title: "Nothing New to Import", mood: .happy)
                 } description: {
                     Text("Every server your other clients use is already in Plug.")
                 }
@@ -106,7 +102,7 @@ struct ImportServersView: View {
             ForEach(order, id: \.self) { source in
                 let name = sourceName(source, in: scan)
                 HStack(spacing: Metric.tight) {
-                    AppGlyph(target: source, name: name)
+                    AppGlyph(target: source, name: name, size: 22)
                     SectionLabel(text: name)
                 }
                 .padding(.top, source == order.first ? 0 : Metric.regular)
@@ -125,8 +121,7 @@ struct ImportServersView: View {
                 Text(serverDescription(server))
                     .font(PanelType.small)
                     .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let reason = refused[server.id] {
                     InlineWarning("Not added: \(reason)")
                         .font(PanelType.small)

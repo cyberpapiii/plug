@@ -308,6 +308,38 @@ struct QuietRowButtonStyle: ButtonStyle {
     }
 }
 
+/// A choice someone picks by clicking it, such as a server or a client in a
+/// sheet: a quiet filled tile that lifts under the pointer and gives a
+/// little when pressed. The label sets its own height, so nothing in it is
+/// cut off.
+struct TileButtonStyle: ButtonStyle {
+    @State private var hovering = false
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+            .padding(.horizontal, Metric.snug)
+            .padding(.vertical, Metric.tight)
+            .background(
+                RoundedRectangle(cornerRadius: Metric.corner, style: .continuous)
+                    .fill(Color.primary.opacity(configuration.isPressed ? 0.14 : (hovering ? 0.1 : 0.06)))
+            )
+            .contentShape(RoundedRectangle(cornerRadius: Metric.corner, style: .continuous))
+            .scaleEffect(configuration.isPressed ? 0.98 : 1)
+            .animation(.snappy(duration: 0.15), value: configuration.isPressed)
+            .onHover { hovering = $0 }
+    }
+}
+
+extension AnyTransition {
+    /// One step of a sheet giving way to the next. The first step lives at
+    /// the leading side and the next at the trailing side, so going forward
+    /// and coming back both read as one strip sliding.
+    static func step(_ side: Edge) -> AnyTransition {
+        .move(edge: side).combined(with: .opacity)
+    }
+}
+
 extension View {
     /// Use the system's real Liquid Glass on macOS 26 while keeping the same
     /// readable material hierarchy on the app's macOS 14–15 floor.

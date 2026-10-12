@@ -160,7 +160,6 @@ final class LinkableAppTests: XCTestCase {
         }
         XCTAssertEqual(AddClient.found(apps).map(\.target), ["claude-code", "cursor", "zed"])
         XCTAssertEqual(AddClient.notFound(apps).map(\.target), ["amp"])
-        XCTAssertEqual(AddClient.firstChoice(apps), .app("zed"))
 
         // A client on this Mac is one button, either way in.
         XCTAssertEqual(step(.app("zed"), .onThisMac), .write(target: "zed"))

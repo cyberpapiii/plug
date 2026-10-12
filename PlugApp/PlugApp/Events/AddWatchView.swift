@@ -19,6 +19,7 @@ struct AddWatchView: View {
     @State private var failure: String?
     @FocusState private var nameFocused: Bool
     @FocusState private var argumentsFocused: Bool
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// Servers that have tools to watch right now.
     private var servers: [String] {
@@ -67,11 +68,21 @@ struct AddWatchView: View {
             confirm: add
         ) {
             if servers.isEmpty {
-                Text("No server has tools right now. Add a server, or wait for one to start.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-                    .padding(.horizontal, Metric.roomy)
+                // Nothing to choose from yet, so the character waits here too.
+                VStack(spacing: Metric.snug) {
+                    PlugCharacter(mood: .curious)
+                        .foregroundStyle(.secondary)
+                        .frame(width: 52, height: 52)
+                        .accessibilityHidden(true)
+                    Text("No server has tools right now. Add a server, or wait for one to start.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .multilineTextAlignment(.center)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .frame(maxWidth: .infinity)
+                .padding(.horizontal, Metric.roomy)
+                .padding(.vertical, Metric.regular)
             } else {
                 form
             }
@@ -109,7 +120,7 @@ struct AddWatchView: View {
                     // Some servers write a page about a tool. Its first line
                     // is enough to recognise it by.
                     if let summary = chosen?.summary?.split(whereSeparator: \.isNewline).first {
-                        caption(String(summary)).lineLimit(2)
+                        caption(String(summary))
                     } else if offered.isEmpty, !showsAllTools {
                         caption("Every \(server) tool can change things. Turn on the option below to pick one.")
                     }
@@ -129,13 +140,17 @@ struct AddWatchView: View {
                     }
                 }
                 if chosen != nil, !trimmedName.isEmpty {
-                    LabeledContent("Clients listen for") {
+                    // On its own line under the label, so a long name wraps
+                    // and is never cut.
+                    VStack(alignment: .leading, spacing: Metric.rowGap) {
+                        Text("Clients listen for")
                         Text("\(server).\(trimmedName)")
-                            .font(.body.monospaced())
+                            .font(PanelType.code)
+                            .foregroundStyle(.secondary)
                             .textSelection(.enabled)
-                            .lineLimit(1)
-                            .truncationMode(.middle)
+                            .fixedSize(horizontal: false, vertical: true)
                     }
+                    .transition(.opacity)
                 }
             }
             Section {
@@ -175,6 +190,8 @@ struct AddWatchView: View {
         }
         .formStyle(.grouped)
         .fixedSize(horizontal: false, vertical: true)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: chosen?.name)
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: showsAllTools)
     }
 
     private func caption(_ text: String) -> some View {
