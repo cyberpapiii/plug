@@ -56,12 +56,6 @@ enum AddClient {
         apps.sorted { $0.name.localizedStandardCompare($1.name) == .orderedAscending }
     }
 
-    /// The first client on this Mac that does not use Plug yet, else the
-    /// one that can be anything.
-    static func firstChoice(_ apps: [LinkableApp]) -> Choice {
-        found(apps).first { !$0.linked }.map { .app($0.target) } ?? .other
-    }
-
     /// A hosted client can only come in over the network.
     static func ways(for choice: Choice) -> [Way] {
         if case .hosted = choice { return [.network] }
@@ -161,20 +155,25 @@ enum ClientSignIn {
     }
 }
 
-/// Adding a client is two choices, which client and how it connects, and
-/// then one button or one thing to paste.
+/// Adding a client is two steps: which client, shown as the apps they are,
+/// then how it connects, with one button or one thing to paste.
 struct AddClientView: View {
     let model: AppModel
+    /// Nil while the first step is showing.
     @State private var choice: AddClient.Choice?
     @State private var way = AddClient.Way.onThisMac
     @State private var copied: String?
     /// What the owner calls a client Plug has no entry for.
     @State private var name = ""
     @State private var failure: String?
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
+
+    /// The list of clients scrolls once it is taller than this.
+    private static let listHeight: CGFloat = 340
 
     private var apps: [LinkableApp] { model.connectableApps }
     private var address: String? { model.snapshot.clientAddress }
-    private var chosen: AddClient.Choice { choice ?? AddClient.firstChoice(apps) }
+    private var chosen: AddClient.Choice { choice ?? .other }
     private var ways: [AddClient.Way] { AddClient.ways(for: chosen) }
     private var chosenWay: AddClient.Way { ways.contains(way) ? way : ways[0] }
     private var command: String {
@@ -193,50 +192,158 @@ struct AddClientView: View {
         SheetFrame(
             title: "Add a Client",
             subtitle: "A client is an app that uses your servers, such as Claude or Cursor.",
-            failure: failure
-        ) {
-            Form {
-                Section {
-                    Picker("Client", selection: Binding(get: { chosen }, set: { choice = $0; copied = nil })) {
-                        Section("On This Mac") {
-                            ForEach(AddClient.found(apps)) { app in
-                                Text(app.linked ? "\(app.name) (uses Plug)" : app.name)
-                                    .tag(AddClient.Choice.app(app.target))
-                            }
-                        }
-                        Section("On the Web") {
-                            ForEach(AddClient.hosted, id: \.self) { Text($0).tag(AddClient.Choice.hosted($0)) }
-                        }
-                        Section("Not Found on This Mac") {
-                            ForEach(AddClient.notFound(apps)) { app in
-                                Text(app.name).tag(AddClient.Choice.app(app.target))
-                            }
-                        }
-                        Section {
-                            Text("Another Client").tag(AddClient.Choice.other)
-                        }
+            failure: failure,
+            extra: {
+                if choice != nil {
+                    Button("Back") {
+                        choice = nil
+                        copied = nil
+                        failure = nil
                     }
-                    if namesIt {
-                        TextField("Name", text: $name, prompt: Text("What you call it"))
-                            .onChange(of: name) { copied = nil }
-                        if let customTarget {
-                            LabeledContent("Icon") {
-                                HStack(spacing: Metric.snug) {
-                                    AppGlyph(target: customTarget, name: name, size: 22)
+                }
+            }
+        ) {
+            ZStack(alignment: .top) {
+                if choice == nil {
+                    clients.transition(.step(.leading))
+                } else {
+                    connect.transition(.step(.trailing))
+                }
+            }
+            .clipped()
+        }
+        .animation(reduceMotion ? nil : .snappy(duration: 0.32), value: choice)
+        .task { await model.loadConnectableApps() }
+    }
+
+    // MARK: - Step 1: which client
+
+    private var clients: some View {
+        // A short list takes only the room it needs; a long one scrolls.
+        ViewThatFits(in: .vertical) {
+            clientRows
+            ScrollView { clientRows }
+        }
+        .frame(maxHeight: Self.listHeight)
+        .padding(.horizontal, Metric.roomy - Metric.snug)
+    }
+
+    private var clientRows: some View {
+        VStack(alignment: .leading, spacing: Metric.hairline) {
+            // The ones that do not use Plug yet come first: they are why
+            // someone opened this.
+            let here = AddClient.found(apps)
+            let found = here.filter { !$0.linked } + here.filter(\.linked)
+            let notFound = AddClient.notFound(apps)
+            if !found.isEmpty {
+                heading("On This Mac", first: true)
+                ForEach(found) { app in
+                    clientRow(.app(app.target), target: app.target, name: app.name, usesPlug: app.linked)
+                }
+            }
+            heading("On the Web", first: found.isEmpty)
+            ForEach(AddClient.hosted, id: \.self) { name in
+                clientRow(.hosted(name), target: name, name: name)
+            }
+            if !notFound.isEmpty {
+                heading("Not Found on This Mac")
+                ForEach(notFound) { app in
+                    clientRow(.app(app.target), target: app.target, name: app.name)
+                }
+            }
+            Divider()
+                .padding(.horizontal, Metric.snug)
+                .padding(.vertical, Metric.tight)
+            Button { pick(.other) } label: {
+                HStack(spacing: Metric.snug) {
+                    PlugIcon(.add, size: 24).foregroundStyle(.secondary)
+                    Text("Another Client")
+                    Spacer(minLength: Metric.snug)
+                    PlugIcon(.show).foregroundStyle(.tertiary)
+                }
+            }
+            .buttonStyle(QuietRowButtonStyle())
+        }
+    }
+
+    private func heading(_ text: String, first: Bool = false) -> some View {
+        SectionLabel(text: text)
+            .padding(.horizontal, Metric.snug)
+            .padding(.top, first ? 0 : Metric.regular)
+            .padding(.bottom, Metric.hairline)
+    }
+
+    private func clientRow(
+        _ choice: AddClient.Choice,
+        target: String,
+        name: String,
+        usesPlug: Bool = false
+    ) -> some View {
+        Button { pick(choice) } label: {
+            HStack(spacing: Metric.snug) {
+                AppGlyph(target: target, name: name, size: 24)
+                Text(name).fixedSize(horizontal: false, vertical: true)
+                Spacer(minLength: Metric.snug)
+                if usesPlug {
+                    Text("Uses Plug")
+                        .font(PanelType.small)
+                        .foregroundStyle(.secondary)
+                }
+                PlugIcon(.show).foregroundStyle(.tertiary)
+            }
+        }
+        .buttonStyle(QuietRowButtonStyle())
+    }
+
+    private func pick(_ picked: AddClient.Choice) {
+        copied = nil
+        failure = nil
+        choice = picked
+    }
+
+    // MARK: - Step 2: how it connects
+
+    private var connect: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(spacing: Metric.snug) {
+                if chosen == .other {
+                    if let customTarget {
+                        AppGlyph(target: customTarget, name: name, size: 32)
+                    } else {
+                        PlugIcon(.add, size: 32).foregroundStyle(.secondary)
+                    }
+                    Text("Another Client").font(.title3.weight(.semibold))
+                } else if let chosenName {
+                    AppGlyph(target: chosenTarget, name: chosenName, size: 32)
+                    Text(chosenName)
+                        .font(.title3.weight(.semibold))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .padding(.horizontal, Metric.roomy)
+
+            Form {
+                if namesIt || ways.count > 1 {
+                    Section {
+                        if namesIt {
+                            TextField("Name", text: $name, prompt: Text("What you call it"))
+                                .onChange(of: name) { copied = nil }
+                            if let customTarget {
+                                LabeledContent("Icon") {
                                     Button("Choose…") {
                                         IconStore.shared.chooseIcon(for: IconStore.key(client: customTarget))
                                     }
                                 }
                             }
                         }
-                    }
-                    if ways.count > 1 {
-                        VStack(alignment: .leading, spacing: Metric.rowGap) {
-                            Picker("Connects", selection: $way) {
-                                ForEach(ways) { Text($0.rawValue).tag($0) }
+                        if ways.count > 1 {
+                            VStack(alignment: .leading, spacing: Metric.rowGap) {
+                                Picker("Connects", selection: $way) {
+                                    ForEach(ways) { Text($0.rawValue).tag($0) }
+                                }
+                                .pickerStyle(.segmented)
+                                caption(chosenWay.caption)
                             }
-                            .pickerStyle(.segmented)
-                            caption(chosenWay.caption)
                         }
                     }
                 }
@@ -245,7 +352,14 @@ struct AddClientView: View {
             .formStyle(.grouped)
             .fixedSize(horizontal: false, vertical: true)
         }
-        .task { await model.loadConnectableApps() }
+    }
+
+    private var chosenTarget: String {
+        switch chosen {
+        case let .app(target): target
+        case let .hosted(name): name
+        case .other: ""
+        }
     }
 
     @ViewBuilder private var step: some View {
@@ -253,7 +367,6 @@ struct AddClientView: View {
         case let .write(target):
             let name = chosenName ?? target
             HStack(spacing: Metric.snug) {
-                AppGlyph(target: target, name: name, size: 22)
                 caption("Plug adds itself to \(name)'s settings.")
                 Spacer(minLength: 0)
                 if model.busyApps.contains(target) {
@@ -275,6 +388,7 @@ struct AddClientView: View {
             } icon: {
                 PlugIcon(.worked).foregroundStyle(StatusColor.working)
             }
+            .transition(.opacity)
         case .command:
             paste(
                 label: "Command",
@@ -330,13 +444,17 @@ struct AddClientView: View {
 
     private func paste(label: String, value: String, entry: String) -> some View {
         VStack(alignment: .leading, spacing: Metric.tight) {
-            LabeledContent(label) {
-                Text(value)
-                    .font(.body.monospaced())
-                    .textSelection(.enabled)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
-            }
+            // The whole value shows, however long: it is the thing to paste.
+            Text(label)
+            Text(value)
+                .font(PanelType.code)
+                .textSelection(.enabled)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(Metric.snug)
+                .nativeInsetSurface(.insetFill)
+                .accessibilityLabel(label)
+                .accessibilityValue(value)
             HStack(spacing: Metric.snug) {
                 Spacer(minLength: 0)
                 copyButton("Copy", value)

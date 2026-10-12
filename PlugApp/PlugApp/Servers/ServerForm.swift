@@ -164,8 +164,7 @@ struct ServerFormFields<Extra: View>: View {
                     if form.isAPI, let document = form.base.spec {
                         LabeledContent("Document") {
                             Text(document)
-                                .lineLimit(1)
-                                .truncationMode(.middle)
+                                .fixedSize(horizontal: false, vertical: true)
                                 .textSelection(.enabled)
                         }
                     }

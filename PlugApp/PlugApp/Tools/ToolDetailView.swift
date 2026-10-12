@@ -31,7 +31,10 @@ struct ToolDetailView: View {
             Text(tool.shortName)
                 .font(.headline)
                 .textSelection(.enabled)
-            Text(tool.server).font(.callout).foregroundStyle(.secondary)
+            HStack(spacing: Metric.rowGap) {
+                ServerGlyph(name: tool.server, size: 16)
+                Text(tool.server).font(.callout).foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -97,8 +100,7 @@ struct ToolDetailView: View {
                 Text(tool.name)
                     .font(.callout.monospaced())
                     .textSelection(.enabled)
-                    .lineLimit(2)
-                    .truncationMode(.middle)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
     }
@@ -121,8 +123,7 @@ struct ToolDetailView: View {
                     Text(sibling.shortName)
                         .font(.callout)
                         .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
                 if siblings.count > 8 {
                     Text("and \(siblings.count - 8) more")

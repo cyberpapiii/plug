@@ -10,6 +10,7 @@ struct EditServerView: View {
     let model: AppModel
     let name: String
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     @State private var form: ServerForm?
     @State private var saving = false
@@ -19,6 +20,7 @@ struct EditServerView: View {
         SheetFrame(
             title: "Edit \(name)",
             subtitle: form != nil ? "Changes take effect as soon as you save." : nil,
+            icon: AnyView(ServerGlyph(name: name, size: 36)),
             failure: form == nil ? nil : failure,
             busy: saving,
             // With no settings to edit there is nothing to save, only Done.
@@ -36,6 +38,7 @@ struct EditServerView: View {
                     get: { self.form ?? form },
                     set: { self.form = $0 }
                 ))
+                .transition(.opacity)
             } else if let failure {
                 // The settings could not be read, so there is nothing to
                 // edit. Say why and offer the one thing that can help. When
@@ -53,6 +56,8 @@ struct EditServerView: View {
                 SheetLoading(label: "Loading server settings")
             }
         }
+        // The form arrives where the dots were; it does not pop in.
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: form != nil)
         .task { await load() }
     }
 
