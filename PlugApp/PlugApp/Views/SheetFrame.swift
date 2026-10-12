@@ -15,6 +15,8 @@ struct SheetFrame<Content: View, Extra: View>: View {
 
     let title: String
     var subtitle: String?
+    /// A picture of what the sheet is about, beside the title.
+    var icon: AnyView?
     /// What went wrong, in a sentence. Stays until the next attempt. The
     /// sheet adds what to do about it.
     var failure: String?
@@ -33,15 +35,20 @@ struct SheetFrame<Content: View, Extra: View>: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text(title)
-                    .font(.title2.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: Metric.snug) {
+                if let icon {
+                    icon.accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: Metric.hairline) {
+                    Text(title)
+                        .font(.title2.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             .padding(.horizontal, Metric.roomy)
@@ -91,6 +98,7 @@ extension SheetFrame where Extra == EmptyView {
     init(
         title: String,
         subtitle: String? = nil,
+        icon: AnyView? = nil,
         failure: String? = nil,
         busy: Bool = false,
         cancelTitle: String = "Cancel",
@@ -102,6 +110,7 @@ extension SheetFrame where Extra == EmptyView {
         self.init(
             title: title,
             subtitle: subtitle,
+            icon: icon,
             failure: failure,
             busy: busy,
             cancelTitle: cancelTitle,
