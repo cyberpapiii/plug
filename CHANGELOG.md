@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Plug rests when its window is covered, minimized or on another desktop, the way it does when the window is closed. It used to keep checking every two seconds, and the Clients page every five, for a window no one could see. It catches up the moment the window is back on screen.
 - The menu bar icon is a little larger and sits a point to the right, so it reads as centred and the same size as the icons beside it.
 - Start Plug has a sunrise beside it in the menu bar panel, to pair with the moon for off.
 - A server with many tools opens as fast as one with a few. Its page now makes each tool's row only when it scrolls into view, and the small switch on a row is drawn by Plug instead of being a full system control.

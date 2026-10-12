@@ -39,6 +39,9 @@ struct RootView: View {
     @State private var firstMoment: FirstRunGuide.Step?
 
     @State private var columns = NavigationSplitViewVisibility.all
+    /// Whether the window is on screen, and whether the model was told so.
+    @State private var windowSeen = false
+    @State private var isWatching = false
     /// Follows the sidebar, but late on the way back: a second line under
     /// the title while the sidebar is still sliding in does not fit, and the
     /// bar folds its buttons into a "more" button until it does.
@@ -174,8 +177,18 @@ struct RootView: View {
         }
         .onChange(of: firstsToLookAt, initial: true) { lookForFirsts() }
         .task { await model.loadConnectableApps() }
-        .onAppear { model.setWatching(true) }
-        .onDisappear { model.setWatching(false) }
+        .background(WindowSeenReader(seen: $windowSeen))
+        .environment(\.windowSeen, windowSeen)
+        .onChange(of: windowSeen) { watch(windowSeen) }
+        .onDisappear { watch(false) }
+    }
+
+    /// Plug checks the daemon briskly only while this window can be read.
+    /// Covered, minimized or on another desktop, it waits like a closed one.
+    private func watch(_ now: Bool) {
+        guard now != isWatching else { return }
+        isWatching = now
+        model.setWatching(now)
     }
 
     private var pageTitle: some View {

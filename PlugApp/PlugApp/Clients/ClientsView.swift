@@ -438,6 +438,7 @@ struct ClientsView: View {
     @Binding var search: String
     let run: (PlugIntent) -> Void
     @Environment(\.splitPane) private var pane
+    @Environment(\.windowSeen) private var windowSeen
 
     /// Keep rarely used legacy integrations out of the default inventory. If
     /// one is still linked or live, it remains visible so status is never
@@ -652,7 +653,9 @@ struct ClientsView: View {
         }
         // Links change outside the app too (`plug link`, another tool editing
         // a client's settings), so the list is read again while it is shown.
-        .task {
+        // Not while the window is covered or minimized: no one is reading it.
+        .task(id: windowSeen) {
+            guard windowSeen else { return }
             while !Task.isCancelled {
                 await model.loadConnectableApps()
                 try? await Task.sleep(for: .seconds(5), tolerance: .seconds(1))
