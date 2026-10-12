@@ -106,7 +106,30 @@ struct FirstMoments: Equatable, Sendable {
     }
 }
 
+/// How much is set up: what the owner has added to Plug. When any of the
+/// three goes up, something was just added, and Plug's character cheers.
+struct SetupCount: Equatable, Sendable {
+    var servers: Int
+    var clients: Int
+    var events: Int
+
+    /// Whether anything was added between two looks.
+    func grew(from earlier: SetupCount) -> Bool {
+        servers > earlier.servers || clients > earlier.clients || events > earlier.events
+    }
+}
+
 extension AppModel {
+    /// What has been added, by kind. Clients are the ones set up to use
+    /// Plug, not the ones connected this minute, which come and go.
+    var setupCount: SetupCount {
+        SetupCount(
+            servers: snapshot.configuredServers.count,
+            clients: connectableApps.filter(\.linked).count,
+            events: snapshot.events?.count ?? 0
+        )
+    }
+
     /// Where this Mac is in the three steps.
     var firstRunGuide: FirstRunGuide {
         FirstRunGuide(
