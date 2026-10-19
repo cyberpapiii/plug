@@ -63,6 +63,13 @@ impl EventDelivery for HttpsDelivery {
         headers: HeaderMap,
         body: Vec<u8>,
     ) -> Result<DeliveryResponse, &'static str> {
+        // Correlate response headers without exposing the URL or signed headers.
+        let event_id = headers
+            .get("webhook-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("unknown")
+            .to_owned();
+        let started = std::time::Instant::now();
         // Overall deadline includes DNS, TLS, send, and bounded response collection.
         tokio::time::timeout(Duration::from_secs(10), async {
             let url = validate_url(value)?;
@@ -95,6 +102,13 @@ impl EventDelivery for HttpsDelivery {
                 .await
                 .map_err(|_| "delivery_failed")?;
             let status = response.status().as_u16();
+            tracing::info!(
+                event_id,
+                stage = "http_headers",
+                status,
+                duration_ms = started.elapsed().as_millis() as u64,
+                "Webhook HTTP timing"
+            );
             let mut bytes = Vec::new();
             while let Some(chunk) = response.chunk().await.map_err(|_| "delivery_failed")? {
                 if bytes.len() + chunk.len() > 4096 {

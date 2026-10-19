@@ -9,6 +9,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Slack events log redacted receipt, durable queue transitions, dispatch and HTTP timings so delivery delays can be traced by event ID without exposing messages or credentials.
+
 - Add Server is one sheet whose two steps slide. Each popular server shows its maker's icon. Picking one, or pasting a server Plug can read whole, shows a short card of what Plug understood, with the full form behind More Options. A server that still needs a name or a field opens the form as before. Plug asks each offered server's site for its icon when the sheet opens, and keeps what it finds for a month.
 - Add a Client starts with the clients themselves, each with its icon, the ones that do not use Plug yet first. Picking one slides to how it connects, with Back to choose again. The command or address to paste is shown whole in its own box.
 - Nothing in a sheet is cut off with an ellipsis any more: a web API's operations and document, an imported server's description, a watched tool's summary and the name clients listen for all wrap.

@@ -472,7 +472,7 @@ impl SlackEvents {
             expires: timestamp + ttl / 1000,
             verified_until: timestamp + 300,
         });
-        self.commit(&mut state, next)?;
+        self.commit(&mut state, next, "subscription_replaced")?;
         self.wake.notify_one();
         Ok(
             json!({"id":id,"refreshBefore":iso_time(timestamp + ttl / 1000)?,"cursor":null,"truncated":false}),
@@ -490,7 +490,7 @@ impl SlackEvents {
             next.subscription = None;
             next.queue.clear();
             next.threads.clear();
-            self.commit(&mut state, next)?;
+            self.commit(&mut state, next, "unsubscribed")?;
         }
         Ok(json!({}))
     }
@@ -509,6 +509,11 @@ impl SlackEvents {
     /// Returns a URL-verification response or an empty event acknowledgement.
     /// A message is acknowledged only after its dedupe/queue state is durable.
     pub async fn ingest(&self, headers: &HeaderMap, body: &[u8]) -> Result<Value, EventError> {
+        let received = std::time::Instant::now();
+        let received_unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
         if self.degraded.load(Ordering::Acquire) || !self.access.enabled() {
             return Err(unavailable());
         }
@@ -562,11 +567,26 @@ impl SlackEvents {
             .filter(|id| !id.is_empty() && id.len() <= 128)
             .ok_or_else(|| invalid("Slack event ID is required"))?;
         let timestamp = now();
+        // Only authenticated envelopes reach this record. Never log the envelope,
+        // message text, headers, credentials, or callback URL.
+        let source_unix_seconds = event["ts"]
+            .as_str()
+            .and_then(|ts| ts.split('.').next())
+            .and_then(|ts| ts.parse::<u64>().ok());
+        tracing::info!(
+            event_id,
+            stage = "received",
+            received_unix_ms,
+            source_unix_seconds,
+            validation_ms = received.elapsed().as_millis() as u64,
+            "Slack event timing"
+        );
         let mut state = self.state.lock().await;
         let mut next = state.clone();
         next.seen.retain(|_, time| *time + 7 * DAY > timestamp);
         next.threads.retain(|_, time| *time + 7 * DAY > timestamp);
         if next.seen.contains_key(event_id) {
+            tracing::info!(event_id, stage = "duplicate", "Slack event timing");
             return Ok(json!({}));
         }
         if !revocation && next.seen.len() >= MAX_SEEN {
@@ -676,12 +696,26 @@ impl SlackEvents {
             return Ok(json!({}));
         }
         next.seen.insert(event_id.to_owned(), timestamp);
-        self.commit(&mut state, next)?;
+        self.commit(
+            &mut state,
+            next,
+            if revocation {
+                "source_revoked"
+            } else {
+                "ingest"
+            },
+        )?;
         self.wake.notify_one();
         Ok(json!({}))
     }
 
-    fn commit(&self, state: &mut EventState, next: EventState) -> Result<(), EventError> {
+    fn commit(
+        &self,
+        state: &mut EventState,
+        next: EventState,
+        reason: &'static str,
+    ) -> Result<(), EventError> {
+        let started = std::time::Instant::now();
         if self.degraded.load(Ordering::Acquire) {
             return Err(unavailable());
         }
@@ -707,7 +741,26 @@ impl SlackEvents {
         })();
         if result.is_err() {
             self.degraded.store(true, Ordering::Release);
+            tracing::warn!(stage = "persistence_failed", reason, "Slack event timing");
             return Err(unavailable());
+        }
+        // Emit durable transitions only after file and directory fsync succeed.
+        let persist_ms = started.elapsed().as_millis() as u64;
+        for pending in &next.queue {
+            let previous = state.queue.iter().find(|p| p.event_id == pending.event_id);
+            if previous.is_none() || previous.is_some_and(|p| p.attempts != pending.attempts) {
+                tracing::info!(event_id = %pending.event_id,
+                    stage = if previous.is_none() { "queued" } else { "retry_scheduled" },
+                    reason, retry_count = pending.attempts, next_at = pending.next_at,
+                    persist_ms, queue_depth = next.queue.len(), "Slack event timing");
+            }
+        }
+        for pending in &state.queue {
+            if !next.queue.iter().any(|p| p.event_id == pending.event_id) {
+                tracing::info!(event_id = %pending.event_id, stage = "terminal", reason,
+                    retry_count = pending.attempts, persist_ms,
+                    queue_depth = next.queue.len(), "Slack event timing");
+            }
         }
         *state = next;
         Ok(())
@@ -745,7 +798,7 @@ impl SlackEvents {
                 next.subscription = None;
                 next.queue.clear();
                 next.threads.clear();
-                self.commit(&mut state, next)?;
+                self.commit(&mut state, next, "subscription_expired")?;
             }
             let Some(subscription) = state.subscription.clone() else {
                 return Ok(());
@@ -755,6 +808,12 @@ impl SlackEvents {
             };
             (subscription, pending)
         };
+        let attempt_started = std::time::Instant::now();
+        let queued_at = self.state.lock().await.seen.get(&pending.event_id).copied();
+        tracing::info!(event_id = %pending.event_id, stage = "attempt",
+            attempt = pending.attempts + 1,
+            queued_for_seconds = queued_at.map(|t| timestamp.saturating_sub(t)),
+            "Slack event timing");
         match self.access.check(None).await {
             Access::Denied => {
                 let mut state = self.state.lock().await;
@@ -762,9 +821,13 @@ impl SlackEvents {
                 next.subscription = None;
                 next.queue.clear();
                 next.threads.clear();
-                return self.commit(&mut state, next);
+                return self.commit(&mut state, next, "access_denied");
             }
-            Access::Unavailable => return Err(unavailable()),
+            Access::Unavailable => {
+                tracing::info!(event_id = %pending.event_id, stage = "deferred",
+                    reason = "access_unavailable", "Slack event timing");
+                return Err(unavailable());
+            }
             Access::Allowed => {}
         }
         match self.access.check(Some(&pending.channel_id)).await {
@@ -775,7 +838,7 @@ impl SlackEvents {
                 next.queue.retain(|p| p.channel_id != pending.channel_id);
                 let prefix = format!("{}:", pending.channel_id);
                 next.threads.retain(|key, _| !key.starts_with(&prefix));
-                return self.commit(&mut state, next);
+                return self.commit(&mut state, next, "channel_denied");
             }
             Access::Unavailable => {
                 let mut state = self.state.lock().await;
@@ -790,7 +853,15 @@ impl SlackEvents {
                     job.attempts += 1;
                     job.next_at = timestamp + (1_u64 << job.attempts).min(300);
                 }
-                return self.commit(&mut state, next);
+                return self.commit(
+                    &mut state,
+                    next,
+                    if pending.attempts + 1 >= MAX_ATTEMPTS {
+                        "channel_checks_exhausted"
+                    } else {
+                        "channel_unavailable"
+                    },
+                );
             }
         }
         if self.degraded.load(Ordering::Acquire) || !self.access.enabled() {
@@ -809,11 +880,27 @@ impl SlackEvents {
             &pending.body,
             timestamp,
         )?;
+        tracing::info!(event_id = %pending.event_id, stage = "dispatch",
+            attempt = pending.attempts + 1,
+            preparation_ms = attempt_started.elapsed().as_millis() as u64, "Slack event timing");
+        let dispatched = std::time::Instant::now();
         let result = self
             .sender
             .post(&subscription.url, headers, pending.body.clone())
             .await;
         let status = result.as_ref().ok().map(|r| r.status);
+        let transport_code = result.as_ref().err().map(|code| match *code {
+            "invalid_url"
+            | "dns_failed"
+            | "transport_unavailable"
+            | "delivery_failed"
+            | "response_too_large"
+            | "timeout" => *code,
+            _ => "transport_error",
+        });
+        tracing::info!(event_id = %pending.event_id, stage = "http_complete",
+            attempt = pending.attempts + 1, status, transport_code,
+            duration_ms = dispatched.elapsed().as_millis() as u64, "Slack event timing");
         let mut state = self.state.lock().await;
         let mut next = state.clone();
         let accepted = status.is_some_and(|s| (200..300).contains(&s));
@@ -836,7 +923,18 @@ impl SlackEvents {
             job.attempts += 1;
             job.next_at = now() + (1_u64 << job.attempts).min(300);
         }
-        self.commit(&mut state, next)
+        let reason = if status == Some(410) {
+            "subscription_gone"
+        } else if accepted {
+            "http_accepted"
+        } else if permanent {
+            "http_rejected"
+        } else if pending.attempts + 1 >= MAX_ATTEMPTS {
+            "attempts_exhausted"
+        } else {
+            "http_retry"
+        };
+        self.commit(&mut state, next, reason)
     }
 }
 

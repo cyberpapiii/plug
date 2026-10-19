@@ -564,3 +564,175 @@ fn owner_proof_window_preserves_existing_subscription_storage_key() {
     proof.owner_proof_until = Some(now() + 3601);
     assert!(!proof.validate().is_empty());
 }
+
+#[derive(Clone, Default)]
+struct LogCapture(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+impl std::io::Write for LogCapture {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = Self;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+impl LogCapture {
+    fn records(&self) -> Vec<Value> {
+        String::from_utf8(self.0.lock().unwrap().clone())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+}
+
+// Exercise actual ingest, retry and durable disposition, not a logging helper.
+#[tokio::test(flavor = "current_thread")]
+async fn delivery_timing_correlates_retries_and_dispositions_without_payloads_or_credentials() {
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (_dir, events, access, sender) = fixture();
+    let mut subscription = params();
+    subscription["delivery"]["url"] = json!("https://events.example.com/credential-bearing-path");
+    events.subscribe(&subscription).await.unwrap();
+    ingest(
+        &events,
+        envelope("EvTiming", "<@U456> private-payload-marker", None),
+    )
+    .await
+    .unwrap();
+    sender.status.store(503, Ordering::SeqCst);
+    events.deliver_one().await.unwrap();
+    events.state.lock().await.queue[0].next_at = 0;
+    sender.status.store(200, Ordering::SeqCst);
+    events.deliver_one().await.unwrap();
+    ingest(
+        &events,
+        envelope("EvDenied", "<@U456> private-payload-marker", None),
+    )
+    .await
+    .unwrap();
+    access.0.store(1, Ordering::SeqCst);
+    events.deliver_one().await.unwrap();
+
+    let records = logs.records();
+    let fields: Vec<_> = records
+        .iter()
+        .map(|r| &r["fields"])
+        .filter(|f| f["event_id"] == "EvTiming")
+        .collect();
+    for stage in [
+        "received",
+        "queued",
+        "attempt",
+        "dispatch",
+        "http_complete",
+        "retry_scheduled",
+        "terminal",
+    ] {
+        assert!(
+            fields.iter().any(|f| f["stage"] == stage),
+            "missing {stage}: {records:?}"
+        );
+    }
+    let responses: Vec<_> = fields
+        .iter()
+        .filter(|f| f["stage"] == "http_complete")
+        .collect();
+    assert_eq!(responses.len(), 2);
+    assert_eq!(responses[0]["status"], 503);
+    assert_eq!(responses[1]["status"], 200);
+    assert!(responses.iter().all(|f| f["duration_ms"].is_u64()));
+    let retries: Vec<_> = fields
+        .iter()
+        .filter(|f| f["stage"] == "retry_scheduled")
+        .collect();
+    assert_eq!(retries.len(), 1);
+    assert_eq!(retries[0]["retry_count"], 1);
+    assert!(retries[0]["next_at"].is_u64());
+    assert!(
+        fields
+            .iter()
+            .any(|f| f["stage"] == "terminal" && f["reason"] == "http_accepted")
+    );
+    assert!(records.iter().any(|r| r["fields"]["event_id"] == "EvDenied"
+        && r["fields"]["stage"] == "terminal"
+        && r["fields"]["reason"] == "access_denied"));
+    let text = serde_json::to_string(&records).unwrap();
+    for forbidden in [
+        "private-payload-marker",
+        "credential-bearing-path",
+        "whsec_",
+        "fake-signing-secret",
+        "webhook-signature",
+        "events.example.com",
+    ] {
+        assert!(!text.contains(forbidden), "telemetry exposed {forbidden}");
+    }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn failed_persistence_never_logs_a_durable_terminal_disposition() {
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    let (_dir, events, _access, _sender) = fixture();
+    events.subscribe(&params()).await.unwrap();
+    ingest(&events, envelope("EvDiskFailure", "<@U456>", None))
+        .await
+        .unwrap();
+    // Force rename to fail after the response has been received.
+    std::fs::remove_file(&events.path).unwrap();
+    std::fs::create_dir(&events.path).unwrap();
+    assert!(events.deliver_one().await.is_err());
+    let records = logs.records();
+    assert!(
+        records
+            .iter()
+            .any(|r| r["fields"]["stage"] == "persistence_failed")
+    );
+    assert!(!records.iter().any(|r| r["fields"]["stage"] == "terminal"));
+    assert_eq!(events.state.lock().await.queue.len(), 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn http_rejection_exhaustion_and_gone_log_distinct_durable_dispositions() {
+    let logs = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .with_writer(logs.clone())
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+    for (status, retries, reason) in [
+        (403, 0, "http_rejected"),
+        (503, MAX_ATTEMPTS - 1, "attempts_exhausted"),
+        (410, 0, "subscription_gone"),
+    ] {
+        let (_dir, events, _access, sender) = fixture();
+        events.subscribe(&params()).await.unwrap();
+        let id = format!("EvStatus{status}");
+        ingest(&events, envelope(&id, "<@U456>", None))
+            .await
+            .unwrap();
+        events.state.lock().await.queue[0].attempts = retries;
+        sender.status.store(status, Ordering::SeqCst);
+        events.deliver_one().await.unwrap();
+        assert!(events.state.lock().await.queue.is_empty());
+        assert!(logs.records().iter().any(|r| r["fields"]["event_id"] == id
+            && r["fields"]["stage"] == "terminal"
+            && r["fields"]["reason"] == reason));
+    }
+}
