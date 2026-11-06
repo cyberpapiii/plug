@@ -17,7 +17,12 @@ pub(crate) async fn cmd_secret(
 ) -> anyhow::Result<()> {
     let stores = match super::config::load_editable_config(config_path) {
         Ok((_, config)) => Stores::from_config(&config.secrets),
-        Err(_) => Stores::builtin(),
+        Err(error) => {
+            ui::print_warning_line(format!(
+                "The settings file could not be read, so only the built-in stores are used: {error}"
+            ));
+            Stores::builtin()
+        }
     };
     match command {
         crate::SecretCommands::Set { name, store } => {

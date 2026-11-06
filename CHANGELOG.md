@@ -139,6 +139,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A server that is down is brought back by one recovery at a time, at the same pace whatever noticed it. A failed reconnect during a tool call, after a call timed out, or after a sign-in was renewed now hands the server to that recovery instead of retrying on its own, and a recovery that found another start of its server running no longer gave up, which could leave the server down.
 - Editing a server's tool renames, tool groups, call limit, circuit breaker or health check interval takes effect on save, without restarting the server. Those edits used to be read as no change, and the sandbox setting was missed the same way; a sandbox change now restarts the server. A server that fails to start during a reload reports the whole cause, and one refused for its sign-in is marked as needing sign-in.
 - A server whose calls were dropped or timed out while its circuit breaker was testing it is tested again after thirty seconds. It used to stay blocked until it was reconnected. A server edit whose keys could not be moved to the Keychain is refused, where it used to be saved with the keys written into the file.
+- `plug auth status` and `plug events` say why they could not read live state from a running Plug, and `plug secret` says when the settings file could not be read and only the built-in stores are used. They used to fall back without a word, or tell you to start a Plug that was already running.
+- Advice to restart Plug points at the Restart button under Plug in Plug.app's Settings, where it is. It used to name a Service section that no longer exists.
+- The file an upstream sign-in keeps while you approve it in the browser is written as a new owner-only file put in place in one step, like the token file, so a link planted at its path is replaced rather than written through.
+- A remote client that comes back to a session Plug timed out keeps it. Reopening the session queued the old one's cleanup, which then ran on the reopened session and dropped its notifications, subscriptions and what the client said it supports.
 
 ## [0.11.0] - 2026-10-07
 

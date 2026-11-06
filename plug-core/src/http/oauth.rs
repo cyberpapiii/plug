@@ -71,7 +71,7 @@ async fn get_oauth_authorization_server_metadata(
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
         "token_endpoint_auth_methods_supported": ["none"],
-        "scopes_supported": manager.config.oauth_scopes,
+        "scopes_supported": manager.scopes(),
         "client_id_metadata_document_supported": true,
     }));
     (StatusCode::OK, response).into_response()
@@ -83,7 +83,7 @@ async fn get_oauth_protected_resource_metadata(
     let response = Json(json!({
         "resource": manager.resource(),
         "authorization_servers": [manager.base_url()],
-        "scopes_supported": resource_scopes(&manager.config.oauth_scopes),
+        "scopes_supported": resource_scopes(manager.scopes()),
         "bearer_methods_supported": ["header"],
     }));
     (StatusCode::OK, response).into_response()
@@ -670,14 +670,13 @@ fn oauth_authorization_error_redirect(
     error: &DownstreamOauthError,
 ) -> String {
     let (_, code, description) = oauth_public_error(error);
-    let query = url::form_urlencoded::Serializer::new(String::new())
-        .append_pair("error", code)
-        .append_pair("error_description", description)
-        .append_pair("state", state)
-        .finish();
-    format!(
-        "{redirect_uri}{}{query}",
-        if redirect_uri.contains('?') { '&' } else { '?' }
+    crate::downstream_oauth::redirect_with_params(
+        redirect_uri,
+        &[
+            ("error", code),
+            ("error_description", description),
+            ("state", state),
+        ],
     )
 }
 

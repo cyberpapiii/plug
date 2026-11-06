@@ -20,10 +20,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-#[cfg(not(target_os = "linux"))]
-use keyring as platform_keyring;
-#[cfg(target_os = "linux")]
-use keyring_core as platform_keyring;
+use crate::platform_keyring;
 
 use crate::config;
 
@@ -765,7 +762,6 @@ impl CompositeCredentialStore {
         operation: impl FnOnce() -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
         use fs4::FileExt;
-        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
 
         let path = self.credential_write_lock_path()?;
@@ -777,7 +773,6 @@ impl CompositeCredentialStore {
         })?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true);
-        #[cfg(unix)]
         options.mode(0o600);
         let file = options.open(&path).map_err(|error| {
             AuthError::InternalError(format!("failed to open credential lock: {error}"))
@@ -967,71 +962,15 @@ impl CompositeCredentialStore {
         value: &T,
         file_kind: &'static str,
     ) -> Result<(), AuthError> {
-        use fs4::FileExt;
-        use std::io::Write;
-
         let dir = path.parent().ok_or_else(|| {
             AuthError::InternalError(format!("{file_kind} path has no parent directory"))
         })?;
         crate::fs_perm::ensure_dir_0700(dir)
             .map_err(|e| AuthError::InternalError(format!("failed to create tokens dir: {e}")))?;
-
         let json = serde_json::to_string_pretty(value)
             .map_err(|e| AuthError::InternalError(format!("serialization failed: {e}")))?;
-        let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)
-        };
-        #[cfg(not(unix))]
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path);
-
-        let mut file = file.map_err(|e| {
-            AuthError::InternalError(format!("failed to open temp {file_kind}: {e}"))
-        })?;
-
-        // Fully qualified: std's inherent `File::lock` (Rust 1.89+) would
-        // otherwise shadow the fs4 trait method depending on toolchain version.
-        FileExt::lock(&file).map_err(|e| {
-            AuthError::InternalError(format!("failed to lock temp {file_kind}: {e}"))
-        })?;
-
-        file.write_all(json.as_bytes()).map_err(|e| {
-            let _ = FileExt::unlock(&file);
-            AuthError::InternalError(format!("failed to write temp {file_kind}: {e}"))
-        })?;
-        file.sync_all().map_err(|error| {
-            let _ = FileExt::unlock(&file);
-            AuthError::InternalError(format!("failed to sync temp {file_kind}: {error}"))
-        })?;
-
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            let _ = FileExt::unlock(&file);
-            let _ = std::fs::remove_file(&tmp_path);
-            AuthError::InternalError(format!("failed to rename temp {file_kind}: {e}"))
-        })?;
-
-        FileExt::unlock(&file).map_err(|e| {
-            AuthError::InternalError(format!("failed to unlock committed {file_kind}: {e}"))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-
+        crate::fs_perm::write_private_atomic(&path, json.as_bytes())
+            .map_err(|e| AuthError::InternalError(format!("failed to write {file_kind}: {e}")))?;
         debug!(server = %self.server_name, file_kind, "credential store file saved");
         Ok(())
     }
@@ -1519,25 +1458,7 @@ impl StateStore for CompositeStateStore {
 
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| AuthError::InternalError(format!("state serialization failed: {e}")))?;
-
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|e| AuthError::InternalError(format!("failed to open state file: {e}")))?;
-            file.write_all(json.as_bytes()).map_err(|e| {
-                AuthError::InternalError(format!("failed to write state file: {e}"))
-            })?;
-        }
-
-        #[cfg(not(unix))]
-        std::fs::write(&path, &json)
+        crate::fs_perm::write_private_atomic(&path, json.as_bytes())
             .map_err(|e| AuthError::InternalError(format!("failed to write state file: {e}")))?;
 
         debug!(server = %self.server_name, "state file saved for CSRF flow");
@@ -2004,7 +1925,6 @@ mod tests {
         assert_eq!(loaded.granted_scopes, vec!["read", "write"]);
         assert_eq!(loaded.token_received_at, Some(1234567890));
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let path = store.token_file_path().unwrap();
@@ -2035,7 +1955,6 @@ mod tests {
             .expect("expected dynamic registration");
         assert_eq!(loaded, registration);
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let path = store.registration_file_path().unwrap();
@@ -2606,11 +2525,7 @@ mod tests {
             .save(credentials)
             .await
             .expect_err("an unavailable authoritative mirror must fail the save");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to rename temp token file")
-        );
+        assert!(error.to_string().contains("failed to write token file"));
         assert!(
             store.keyring_load().is_none(),
             "failed mirror persistence must not publish a newer Keychain-only credential"

@@ -21,6 +21,7 @@ pub(super) struct DaemonProxySession {
     pub(super) writer: tokio::net::unix::OwnedWriteHalf,
     pub(super) client_id: String,
     pub(super) client_info: Option<String>,
+    pub(super) link_target: Option<String>,
     pub(super) session_id: String,
     pub(super) capabilities: rmcp::model::ServerCapabilities,
     pub(super) modern_downstream_enabled: bool,
@@ -68,6 +69,7 @@ impl DaemonProxySession {
         config_path: Option<&PathBuf>,
         client_id: String,
         client_info: Option<String>,
+        link_target: Option<String>,
     ) -> anyhow::Result<Self> {
         let mut connection = match Connection::open().await {
             Ok(connection) => connection,
@@ -107,7 +109,7 @@ impl DaemonProxySession {
                 client_info: client_info.clone(),
                 adapter_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                 host: crate::client_host::current(),
-                link_target: crate::client_host::link_target(),
+                link_target: link_target.clone(),
             })
             .await?;
         let IpcResponse::Registered {
@@ -150,6 +152,7 @@ impl DaemonProxySession {
             writer,
             client_id,
             client_info,
+            link_target,
             session_id,
             capabilities,
             modern_downstream_enabled,

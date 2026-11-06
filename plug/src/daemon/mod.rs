@@ -174,6 +174,7 @@ fn lock_with_retry(
 fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .read(true)
         .open(pid_path)
@@ -992,7 +993,7 @@ async fn handle_ipc_loop(
                         let notif = IpcResponse::LoggingNotification {
                             params: serde_json::to_value(
                                 plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
-                                    skipped as u64,
+                                    skipped,
                                     "ipc",
                                 ),
                             )
@@ -2016,14 +2017,12 @@ pub async fn shutdown_signal(cancel: CancellationToken, _router: Arc<ToolRouter>
 /// Must be called BEFORE any other tracing subscriber is initialized.
 pub fn setup_file_logging(
     log_directory: &std::path::Path,
+    filter: tracing_subscriber::EnvFilter,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     ensure_dir(log_directory)?;
 
     let file_appender = ReopeningLog::open(log_directory, LOG_FILE_CHECK_EVERY)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| crate::default_log_filter("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -2599,6 +2598,7 @@ mod tests {
 
         let claiming = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&pid_file)

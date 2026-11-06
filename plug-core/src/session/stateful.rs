@@ -562,6 +562,22 @@ impl SessionStore {
         Ok(true)
     }
 
+    /// Make `session_id` look idle for two minutes.
+    #[cfg(test)]
+    pub(crate) fn backdate_for_tests(&self, session_id: &str) {
+        self.sessions
+            .get_mut(session_id)
+            .expect("session")
+            .last_activity = Instant::now()
+            .checked_sub(Duration::from_secs(120))
+            .expect("backdate instant");
+    }
+
+    /// Whether the store holds `session_id`, expired or not.
+    pub(crate) fn is_open(&self, session_id: &str) -> bool {
+        self.sessions.contains_key(session_id)
+    }
+
     pub fn validate(&self, session_id: &str) -> Result<(), SessionError> {
         self.with_live_session_mut(session_id, |entry| {
             entry.last_activity = Instant::now();
@@ -799,22 +815,12 @@ mod tests {
         store
     }
 
-    fn backdate(store: &SessionStore, session_id: &str) {
-        store
-            .sessions
-            .get_mut(session_id)
-            .expect("session")
-            .last_activity = Instant::now()
-            .checked_sub(Duration::from_secs(120))
-            .expect("backdate instant");
-    }
-
     #[test]
     fn expiry_rechecks_at_removal_so_a_refreshed_session_survives() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let store = store_reporting_to(60, 100, tx);
         let id = store.create_session().unwrap();
-        backdate(&store, &id);
+        store.backdate_for_tests(&id);
 
         // The sweep saw it expired, then a request refreshed it before the
         // removal ran.
@@ -834,7 +840,7 @@ mod tests {
         let store = store_reporting_to(60, 100, tx);
         let expired = store.create_session().unwrap();
         let live = store.create_session().unwrap();
-        backdate(&store, &expired);
+        store.backdate_for_tests(&expired);
 
         assert_eq!(store.prune_expired_sessions(), 1);
         assert_eq!(store.prune_expired_sessions(), 0);
@@ -896,7 +902,7 @@ mod tests {
     fn a_session_that_timed_out_reopens() {
         let store = SessionStore::new(60, 10);
         let id = store.create_session().unwrap();
-        backdate(&store, &id);
+        store.backdate_for_tests(&id);
 
         assert!(store.reopen_session(&id).unwrap());
         assert!(store.validate(&id).is_ok());

@@ -54,17 +54,6 @@ pub(crate) fn current() -> Option<ClientHost> {
     }
 }
 
-/// The target this connector was linked as, from `plug connect --client`.
-static LINK_TARGET: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-
-pub(crate) fn set_link_target(target: Option<String>) {
-    let _ = LINK_TARGET.set(target);
-}
-
-pub(crate) fn link_target() -> Option<String> {
-    LINK_TARGET.get().cloned().flatten()
-}
-
 /// Programs that run something else and say nothing about what. Two clients
 /// started with a bare `python3` are the same executable, so the script is
 /// what tells them apart.
