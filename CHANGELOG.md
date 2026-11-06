@@ -52,6 +52,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A tool call its client cancelled shows as cancelled in Activity. It used to show as failed.
 - Importing a server whose name is taken, and whose `<name>-<client>` is taken too, adds it as `<name>-<client>-2` and so on. It used to replace the server already under that name.
 - A second account of a Google Workspace server gets the Workspace tool groups whatever the server is called. Only a server named `workspace` used to get them, so a second account of one named otherwise listed its tools under the same names as the first.
 - `plug doctor` fails on an unset `$NAME` only when Plug's own settings use it, and warns when a server does. A server whose name began with `plug`, such as `plugin-x`, used to fail the check.

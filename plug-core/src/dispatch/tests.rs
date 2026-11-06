@@ -457,6 +457,40 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
     assert!(activity[0].remote, "an HTTP call comes over the network");
 }
 
+/// A local caller whose client cancelled the request.
+struct CancelledCaller(IpcContext);
+
+impl DownstreamContext for CancelledCaller {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        let call = self.0.downstream_call_context();
+        call.cancellation.cancel();
+        call
+    }
+
+    fn session_bound(&self) -> bool {
+        self.0.session_bound()
+    }
+
+    fn task_owner(&self) -> Result<TaskOwner, McpError> {
+        self.0.task_owner()
+    }
+}
+
+#[tokio::test]
+async fn a_cancelled_call_is_recorded_as_cancelled() {
+    let router = router_with_unrouted_single_route();
+    let ctx = CancelledCaller(local_caller());
+    dispatch_call(&router, &ctx, CallToolRequestParams::new("Mock__tool"))
+        .await
+        .expect_err("the call has no upstream and was cancelled");
+    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
+    assert_eq!(activity.len(), 1);
+    assert_eq!(
+        activity[0].outcome,
+        crate::activity::ActivityOutcome::Cancelled
+    );
+}
+
 fn assert_plug_icons_sequence(icons: &[rmcp::model::Icon]) {
     let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
     assert_eq!(icons.len(), expected_sizes.len() + 1);
