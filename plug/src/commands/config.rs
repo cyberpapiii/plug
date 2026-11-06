@@ -13,7 +13,7 @@ pub(crate) fn load_editable_config(
     let path = config_path
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
-    let config = plug_core::operator::load_editable_config(&path)?;
+    let config = plug_core::config::load_editable_config(&path)?;
     Ok((path, config))
 }
 

@@ -53,7 +53,7 @@ use auth_status::{auth_status_from_statuses, dispatch_auth_status};
 // makes the same call for the same reason.
 #[allow(clippy::result_large_err)]
 fn load_editable_config(path: &std::path::Path) -> Result<plug_core::config::Config, IpcResponse> {
-    plug_core::operator::load_editable_config(path).map_err(|error| IpcResponse::Error {
+    plug_core::config::load_editable_config(path).map_err(|error| IpcResponse::Error {
         code: "CONFIG_READ_FAILED".to_string(),
         message: error.to_string(),
     })
@@ -1575,7 +1575,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             // daemon keeps serving its last good config: report the error and
             // list the running config instead.
             let (config, config_error) =
-                match plug_core::operator::load_editable_config(&ctx.config_path) {
+                match plug_core::config::load_editable_config(&ctx.config_path) {
                     Ok(config) => (std::sync::Arc::new(config), None),
                     Err(error) => (
                         std::sync::Arc::clone(&ctx.engine.config()),

@@ -9,6 +9,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `$NAME` now means the same thing in `config.toml` as in the environment servers get: a variable already set in Plug's environment wins, and `.env` fills in the rest. A name set in both used to take the `.env` value in the config and the environment's value in servers.
+- `$NAME` also expands in an OpenAPI server's `spec` and in a server's `sandbox` paths.
+- `plug import` keeps a key it finds in another client's settings, and says which keys it wrote into the config file so you can run `plug secret move`. It used to replace the key with `$NAME`, losing it. Importing in the app stores such keys in the Keychain.
+- A `[lazy_tools.clients]` entry may name a client by any of its aliases. An entry naming no known client is ignored; it used to stop the config from loading.
 - `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
 - `plug link` and `plug unlink` answer `--output json` with the clients they changed.
 - `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.
@@ -40,6 +44,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Settings changes are saved for a config whose TLS paths or address use `$NAME`, such as `tls_cert_path = "$HOME/certs/plug.pem"`. Every change made from the app or the command line used to fail on such a config, which judged the path as written rather than its value.
+- `plug doctor` and `plug status` say an `auto` auth mode needs the bearer token when `http.public_base_url` is a public address in front of a loopback listener, as Plug does. They used to report no auth.
+- A `public_base_url` on `[::1]` counts as this Mac, as `127.0.0.1` and `localhost` do.
+- `plug doctor` counts a variable set in `.env` as set, and warns about a world-readable config only when a key is written in it.
 - On the 2026-07-28 protocol over HTTP with no token (a loopback-only listener), a client can now read and cancel the tasks it starts and cancel a call it made. The tasks were owned under a name the task methods never looked for, and cancellations were ignored.
 - `plug import` finds the servers in OpenCode and Kilo Code settings, which keep them under `mcp`, and imports an entry marked `"type": "sse"` as SSE where it came in as HTTP.
 - `plug import` and `plug setup` refuse to write into a config that does not load. They used to add servers to the end of the broken file.

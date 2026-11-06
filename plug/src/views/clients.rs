@@ -108,8 +108,11 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
     let labels = targets
         .iter()
         .map(|target| {
-            let policy =
-                plug_core::config::resolve_lazy_tool_policy_for_target(&config, target.slug());
+            let policy = plug_core::clients::lazy_tool_policy(
+                config.meta_tool_mode,
+                &config.lazy_tools,
+                target.slug(),
+            );
             format!(
                 "{:<20} {} ({})",
                 target.display_name(),
@@ -179,7 +182,8 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
     }
 
     plug_core::operator::persist_config_atomic(&path, &config)?;
-    let policy = plug_core::config::resolve_lazy_tool_policy_for_target(&config, slug);
+    let policy =
+        plug_core::clients::lazy_tool_policy(config.meta_tool_mode, &config.lazy_tools, slug);
     print_success_line(format!(
         "{} lazy tools: {} ({})",
         target,

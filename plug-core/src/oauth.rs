@@ -206,6 +206,12 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
 }
 
 /// The `tokens` directory in Plug's config directory.
+/// The file a server's sign-in is mirrored to.
+pub(crate) fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
+    let safe = config::sanitize_server_name_for_path(server_name)?;
+    Ok(tokens_dir().join(format!("{safe}.json")))
+}
+
 pub fn tokens_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(environment) = test_credential_environment() {
@@ -909,10 +915,9 @@ impl CompositeCredentialStore {
     // -- file helpers -----------------------------------------------------
 
     fn token_file_path(&self) -> Result<PathBuf, AuthError> {
-        let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
+        token_file_path(&self.server_name).map_err(|e| {
             AuthError::InternalError(format!("invalid server name for file path: {e}"))
-        })?;
-        Ok(tokens_dir().join(format!("{safe}.json")))
+        })
     }
 
     fn registration_file_path(&self) -> Result<PathBuf, AuthError> {

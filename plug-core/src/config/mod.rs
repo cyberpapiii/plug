@@ -1,12 +1,20 @@
-pub(crate) mod expand;
+pub mod env;
+mod events;
+pub mod secrets;
+mod token_place;
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use crate::types::{LazyToolMode, LazyToolModeOrigin, LazyToolSetting, ResolvedLazyToolPolicy};
-pub use expand::expand_env_vars;
+use crate::types::LazyToolSetting;
+pub use events::{
+    EVENT_SCOPE, EventsConfig, MIN_WATCH_SECS, SLACK_EVENT_NAME, SLACK_SERVER, SlackEventsConfig,
+    WatchConfig, events_missing, events_possible,
+};
+pub use secrets::{CommandStoreConfig, FILE, KEYCHAIN, OP, SecretsConfig};
+pub use token_place::TokenPlace;
 
 /// Top-level configuration for plug.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -16,8 +24,7 @@ pub struct Config {
     pub log_level: String,
     /// Tool name prefix delimiter.
     pub prefix_delimiter: String,
-    /// Legacy setting retained for compatibility.
-    /// Tool names are always prefixed in v0.1 to avoid collisions.
+    /// Kept so old files load. Tool names are always prefixed.
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     ///
@@ -51,15 +58,11 @@ pub struct Config {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub clients: std::collections::BTreeMap<String, ClientSettings>,
     /// Events Plug makes itself, such as watching a tool for change.
-    #[serde(default, skip_serializing_if = "crate::events::EventsConfig::is_empty")]
-    pub events: crate::events::EventsConfig,
+    #[serde(default, skip_serializing_if = "EventsConfig::is_empty")]
+    pub events: EventsConfig,
     /// Secret stores beyond the built-in ones.
-    #[serde(
-        default,
-        skip_serializing_if = "crate::secrets::SecretsConfig::is_empty"
-    )]
-    pub secrets: crate::secrets::SecretsConfig,
-    /// HTTP server configuration.
+    #[serde(default, skip_serializing_if = "SecretsConfig::is_empty")]
+    pub secrets: SecretsConfig,
     #[serde(default)]
     pub http: HttpConfig,
     /// Allow configured upstreams to negotiate the MCP 2026-07-28 lifecycle.
@@ -72,11 +75,8 @@ pub struct Config {
     /// Default is 0, which disables auto-shutdown and keeps the daemon alive
     /// until explicit shutdown.
     pub daemon_grace_period_secs: u64,
-    /// Active upstream supervision policy (item 2b): bounded restart of an
-    /// upstream that stays degraded past a threshold.
     #[serde(default)]
     pub supervision: SupervisionConfig,
-    /// Upstream server definitions.
     #[serde(default, serialize_with = "in_name_order")]
     pub servers: HashMap<String, ServerConfig>,
 }
@@ -106,8 +106,8 @@ impl Default for Config {
             priority_tools: Vec::new(),
             disabled_tools: Vec::new(),
             clients: std::collections::BTreeMap::new(),
-            events: crate::events::EventsConfig::default(),
-            secrets: crate::secrets::SecretsConfig::default(),
+            events: EventsConfig::default(),
+            secrets: SecretsConfig::default(),
             http: HttpConfig::default(),
             modern_upstream_enabled: false,
             daemon_grace_period_secs: 0,
@@ -117,7 +117,7 @@ impl Default for Config {
     }
 }
 
-/// Active upstream supervision policy (item 2b / R10). When an upstream stays
+/// Active upstream supervision policy. When an upstream stays
 /// degraded past a threshold, the supervisor restarts it (process restart for
 /// stdio, reconnect-with-reset for HTTP/SSE), bounded by exponential backoff so
 /// a perpetually-failing upstream cannot cause a restart storm.
@@ -254,112 +254,12 @@ pub struct LazyToolsConfig {
     pub clients: HashMap<String, LazyToolSetting>,
 }
 
-impl LazyToolsConfig {
-    pub fn has_override_for_target(&self, target: &str) -> bool {
-        self.clients.contains_key(target)
-    }
-}
-
-pub fn default_lazy_tool_mode_for_client(client_type: crate::types::ClientType) -> LazyToolMode {
-    match client_type {
-        crate::types::ClientType::ClaudeCode
-        | crate::types::ClientType::Cursor
-        | crate::types::ClientType::CodexCli => LazyToolMode::Native,
-        crate::types::ClientType::OpenCode => LazyToolMode::Bridge,
-        crate::types::ClientType::ClaudeDesktop
-        | crate::types::ClientType::Devin
-        | crate::types::ClientType::VSCodeCopilot
-        | crate::types::ClientType::CopilotCli
-        | crate::types::ClientType::GeminiCli
-        | crate::types::ClientType::GrokBuild
-        | crate::types::ClientType::GrokBot
-        | crate::types::ClientType::Zed
-        | crate::types::ClientType::Unknown => LazyToolMode::Standard,
-    }
-}
-
-pub fn default_lazy_tool_mode_for_target(target: &str) -> LazyToolMode {
-    crate::clients::ClientTarget::from_slug(target)
-        .and_then(|target| target.info().live)
-        .map(default_lazy_tool_mode_for_client)
-        .unwrap_or(LazyToolMode::Standard)
-}
-
-pub fn lazy_tool_policy_reason(mode: LazyToolMode, origin: LazyToolModeOrigin) -> &'static str {
-    match origin {
-        LazyToolModeOrigin::ClientOverride => "configured for this client target",
-        LazyToolModeOrigin::GlobalOverride => "configured globally for all client targets",
-        LazyToolModeOrigin::LegacyMetaToolMode => "mapped from deprecated meta_tool_mode = true",
-        LazyToolModeOrigin::AutoDefault => match mode {
-            LazyToolMode::Standard => {
-                "default full-tool behavior for clients without a proven lazy discovery path"
-            }
-            LazyToolMode::Native => "client has its own native lazy/deferred tool discovery",
-            LazyToolMode::Bridge => "client benefits from plug-owned search bridge discovery",
-        },
-    }
-}
-
-pub fn resolve_lazy_tool_policy(
-    config: &Config,
-    client_type: crate::types::ClientType,
-) -> ResolvedLazyToolPolicy {
-    let target = client_type.target_slug();
-    resolve_lazy_tool_policy_for_target(config, target.unwrap_or("unknown"))
-}
-
-pub fn resolve_lazy_tool_policy_for_target(
-    config: &Config,
-    target: &str,
-) -> ResolvedLazyToolPolicy {
-    resolve_lazy_tool_policy_from_settings(config.meta_tool_mode, &config.lazy_tools, target)
-}
-
-pub fn resolve_lazy_tool_policy_from_settings(
-    meta_tool_mode: bool,
-    lazy_tools: &LazyToolsConfig,
-    target: &str,
-) -> ResolvedLazyToolPolicy {
-    if let Some(setting) = lazy_tools.clients.get(target)
-        && let Some(mode) = setting_to_mode(*setting)
-    {
-        return resolved_policy(mode, LazyToolModeOrigin::ClientOverride);
-    }
-
-    if let Some(mode) = setting_to_mode(lazy_tools.mode) {
-        return resolved_policy(mode, LazyToolModeOrigin::GlobalOverride);
-    }
-
-    if meta_tool_mode {
-        return resolved_policy(LazyToolMode::Bridge, LazyToolModeOrigin::LegacyMetaToolMode);
-    }
-
-    resolved_policy(
-        default_lazy_tool_mode_for_target(target),
-        LazyToolModeOrigin::AutoDefault,
-    )
-}
-
-fn setting_to_mode(setting: LazyToolSetting) -> Option<LazyToolMode> {
-    match setting {
-        LazyToolSetting::Auto => None,
-        LazyToolSetting::Standard => Some(LazyToolMode::Standard),
-        LazyToolSetting::Native => Some(LazyToolMode::Native),
-        LazyToolSetting::Bridge => Some(LazyToolMode::Bridge),
-    }
-}
-
-fn resolved_policy(mode: LazyToolMode, origin: LazyToolModeOrigin) -> ResolvedLazyToolPolicy {
-    ResolvedLazyToolPolicy::new(mode, origin, lazy_tool_policy_reason(mode, origin))
-}
-
-/// HTTP server configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct HttpConfig {
     /// Public-channel Slack MCP Events adapter. Absent means no event routes or state.
     #[serde(default)]
-    pub slack_events: Option<crate::slack_events::SlackEventsConfig>,
+    pub slack_events: Option<SlackEventsConfig>,
     /// Opt in to the MCP 2026-07-28 downstream lifecycle. This remains false
     /// until modern conformance has been run for the installed release.
     #[serde(default)]
@@ -413,11 +313,9 @@ impl Default for HttpConfig {
     }
 }
 
-/// Authentication mode for downstream HTTP clients.
-///
-/// `Auto` preserves the current v0.1 behavior as a compatibility path:
-/// - loopback bind => no downstream auth
-/// - non-loopback bind => bearer auth
+/// Authentication mode for downstream HTTP clients. `Auto` is bearer once
+/// the server is reachable off this Mac and none before: see
+/// [`HttpConfig::requires_bearer`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DownstreamAuthMode {
@@ -444,6 +342,28 @@ impl HttpConfig {
         self.tls_cert_path.is_some() && self.tls_key_path.is_some()
     }
 
+    /// Whether clients off this Mac can reach the server: it binds a
+    /// non-loopback address, or `public_base_url` names another host (the
+    /// tunnel topology, `cloudflared` to `127.0.0.1:3282`).
+    pub fn reachable_off_loopback(&self) -> bool {
+        let public_host_is_remote = self
+            .public_base_url
+            .as_deref()
+            .and_then(|url| url::Url::parse(url).ok())
+            .is_some_and(|url| !url.host_str().is_some_and(is_loopback_host));
+        !is_loopback_host(&self.bind_address) || public_host_is_remote
+    }
+
+    /// Whether a client must present the bearer token: in `bearer` mode,
+    /// and in `auto` mode once the server is reachable off this Mac.
+    pub fn requires_bearer(&self) -> bool {
+        match self.auth_mode {
+            DownstreamAuthMode::Bearer => true,
+            DownstreamAuthMode::Auto => self.reachable_off_loopback(),
+            DownstreamAuthMode::None | DownstreamAuthMode::Oauth => false,
+        }
+    }
+
     /// The address a client is given to reach Plug over HTTP: the public one
     /// when there is one, else this Mac's own.
     pub fn mcp_url(&self) -> String {
@@ -451,7 +371,7 @@ impl HttpConfig {
             let scheme = if self.tls_enabled() { "https" } else { "http" };
             let host = match self.bind_address.as_str() {
                 "0.0.0.0" | "::" | "[::]" => "localhost",
-                bind if http_bind_is_loopback(bind) => "localhost",
+                bind if is_loopback_host(bind) => "localhost",
                 bind => bind,
             };
             format!("{scheme}://{host}:{}", self.port)
@@ -565,6 +485,23 @@ pub const REDACTED_SECRET: &str =
     "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}";
 
 impl ServerConfig {
+    /// Whether Plug signs in to this server with OAuth. `oauth_client_id`
+    /// alone does not make it so: the server starts without OAuth.
+    pub fn is_oauth(&self) -> bool {
+        self.auth.as_deref() == Some("oauth")
+    }
+
+    /// How Plug authenticates to this server: `oauth`, `bearer`, or `none`.
+    pub fn auth_label(&self) -> &'static str {
+        if self.is_oauth() {
+            "oauth"
+        } else if self.auth_token.is_some() {
+            "bearer"
+        } else {
+            "none"
+        }
+    }
+
     /// Copy with credential material replaced by [`REDACTED_SECRET`].
     ///
     /// Environment values are redacted wholesale rather than by key-name
@@ -624,23 +561,15 @@ pub struct StdioSandboxConfig {
     pub profile_path: Option<PathBuf>,
 }
 
-/// Check whether a bind address refers to loopback (localhost-only).
-pub fn http_bind_is_loopback(bind_address: &str) -> bool {
-    matches!(bind_address, "127.0.0.1" | "::1" | "[::1]" | "localhost")
-}
-
-/// True when `public_base_url` is set to a non-loopback origin — i.e. the
-/// server is reachable from off-host even on a loopback bind (the common
-/// tunnel topology: `cloudflared` → `127.0.0.1:3282`). Auth guards must treat
-/// this as externally exposed, not as a trusted local listener.
-pub fn http_public_base_url_is_non_loopback(public_base_url: Option<&str>) -> bool {
-    match public_base_url.and_then(|u| url::Url::parse(u).ok()) {
-        Some(parsed) => !matches!(
-            parsed.host_str(),
-            None | Some("127.0.0.1") | Some("localhost") | Some("::1")
-        ),
-        None => false,
-    }
+/// Whether a host, as a bind address or a URL gives it, is this Mac only:
+/// `localhost`, or a loopback IP with or without IPv6 brackets.
+pub fn is_loopback_host(host: &str) -> bool {
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.is_loopback())
 }
 
 /// Transport type for upstream servers.
@@ -651,7 +580,7 @@ pub enum TransportType {
     Stdio,
     Http,
     Sse,
-    /// An HTTP API described by an OpenAPI document; see [`crate::openapi`].
+    /// An HTTP API described by an OpenAPI document.
     OpenApi,
 }
 
@@ -726,37 +655,7 @@ pub fn sanitize_server_name_for_path(name: &str) -> Result<&str, String> {
 pub fn validate_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
     errors.extend(config.secrets.validate());
-    let events_missing = crate::events::events_missing(&config.http);
-    if let Some(events) = &config.http.slack_events {
-        errors.extend(events.validate());
-        errors.extend(
-            events_missing
-                .iter()
-                .map(|missing| format!("http.slack_events needs {missing}")),
-        );
-        if !crate::slack_events::upstream_enabled(config) {
-            errors.push("http.slack_events requires the enabled slack upstream".into());
-        }
-    }
-    errors.extend(config.events.validate());
-    if !config.events.watch.is_empty() {
-        errors.extend(
-            events_missing
-                .iter()
-                .map(|missing| format!("events.watch needs {missing}")),
-        );
-        for watch in &config.events.watch {
-            let event = watch.event_name();
-            if !config.servers.contains_key(&watch.server) {
-                errors.push(format!(
-                    "events.watch '{event}' names a server that is not configured"
-                ));
-            }
-            if event == crate::slack_events::EVENT_NAME {
-                errors.push(format!("events.watch '{event}' is already an event"));
-            }
-        }
-    }
+    errors.extend(config.event_errors());
 
     if config.supervision.enabled {
         if config.supervision.degraded_restart_threshold == 0 {
@@ -822,16 +721,16 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             );
         }
     }
-    let externally_exposed = !http_bind_is_loopback(&config.http.bind_address)
-        || http_public_base_url_is_non_loopback(config.http.public_base_url.as_deref());
-    if externally_exposed && matches!(config.http.auth_mode, DownstreamAuthMode::None) {
+    if config.http.reachable_off_loopback()
+        && matches!(config.http.auth_mode, DownstreamAuthMode::None)
+    {
         errors.push(
             "http.auth_mode = \"none\" is not allowed when the server is reachable off-loopback (non-loopback bind or non-loopback public_base_url)"
                 .to_string(),
         );
     }
 
-    if !http_bind_is_loopback(&config.http.bind_address) && config.http.tls_cert_path.is_none() {
+    if !is_loopback_host(&config.http.bind_address) && config.http.tls_cert_path.is_none() {
         errors.push(
             "http.tls_cert_path and http.tls_key_path are required when binding a non-loopback downstream address".to_string(),
         );
@@ -892,18 +791,6 @@ pub fn validate_config(config: &Config) -> Vec<String> {
         errors.push("tool_search_threshold must be >= 10".to_string());
     }
 
-    for target in config.lazy_tools.clients.keys() {
-        match crate::clients::ClientTarget::from_slug(target).map(crate::clients::ClientTarget::slug) {
-            Some(canonical) if canonical == target => {}
-            Some(canonical) => errors.push(format!(
-                "lazy_tools.clients target '{target}' is an alias; use canonical target '{canonical}'"
-            )),
-            None => errors.push(format!(
-                "lazy_tools.clients contains unknown client target '{target}'"
-            )),
-        }
-    }
-
     for (name, server) in &config.servers {
         if name.is_empty() {
             errors.push("server name must not be empty".to_string());
@@ -920,7 +807,7 @@ pub fn validate_config(config: &Config) -> Vec<String> {
             errors.push(format!("server '{name}': {e}"));
         }
 
-        if server.auth.as_deref() == Some("oauth") {
+        if server.is_oauth() {
             if server.auth_token.is_some() {
                 errors.push(format!(
                     "server '{name}': auth = \"oauth\" is mutually exclusive with auth_token"
@@ -993,13 +880,13 @@ pub fn validate_config(config: &Config) -> Vec<String> {
                         "server '{name}': openapi transport requires 'spec' to be set"
                     ));
                 }
-                if server.auth.as_deref() == Some("oauth") {
+                if server.is_oauth() {
                     errors.push(format!(
                         "server '{name}': openapi transport takes auth_token, not auth = \"oauth\""
                     ));
                 }
                 if let Some(token_in) = &server.token_in
-                    && let Err(error) = crate::openapi::TokenPlace::parse(token_in)
+                    && let Err(error) = TokenPlace::parse(token_in)
                 {
                     errors.push(format!("server '{name}': {error}"));
                 }
@@ -1010,195 +897,160 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     errors
 }
 
-fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String> {
-    let mut env_map: HashMap<String, String> = std::env::vars().collect();
-    env_map.extend(crate::dotenv::read_dotenv_vars_for_config(Some(
-        config_path,
-    )));
-    env_map
-}
-
-fn transform_path_buf(path: &mut PathBuf, mut transform: impl FnMut(String) -> String) {
-    *path = PathBuf::from(transform(path.to_string_lossy().into_owned()));
-}
-
-fn transform_env_expandable_strings(
+/// Visit every value `$NAME` expands in, mutably, with the server it belongs
+/// to and the field it is in. Expansion and `plug doctor` both walk this one
+/// list. `token_in` and `operations` are names, not values, so they are not
+/// on it.
+pub(crate) fn for_each_expandable(
     config: &mut Config,
-    mut transform: impl FnMut(String) -> String,
+    mut visit: impl FnMut(Option<&str>, &str, &mut String),
 ) {
-    config.log_level = transform(config.log_level.clone());
-    config.prefix_delimiter = transform(config.prefix_delimiter.clone());
-    for (target, mode) in config.lazy_tools.clients.drain().collect::<Vec<_>>() {
-        config.lazy_tools.clients.insert(transform(target), mode);
+    fn path(value: &mut PathBuf, mut visit: impl FnMut(&mut String)) {
+        let mut text = value.to_string_lossy().into_owned();
+        visit(&mut text);
+        *value = PathBuf::from(text);
     }
-    for tool in &mut config.priority_tools {
-        *tool = transform(tool.clone());
-    }
-    for tool in &mut config.disabled_tools {
-        *tool = transform(tool.clone());
-    }
-
-    config.http.bind_address = transform(config.http.bind_address.clone());
-    if let Some(ref mut public_base_url) = config.http.public_base_url {
-        *public_base_url = transform(public_base_url.clone());
-    }
-    if let Some(ref mut scopes) = config.http.oauth_scopes {
-        for scope in scopes.iter_mut() {
-            *scope = transform(scope.clone());
-        }
-    }
-    for origin in &mut config.http.allowed_origins {
-        *origin = transform(origin.clone());
-    }
-    if let Some(ref mut cert_path) = config.http.tls_cert_path {
-        transform_path_buf(cert_path, &mut transform);
-    }
-    if let Some(ref mut key_path) = config.http.tls_key_path {
-        transform_path_buf(key_path, &mut transform);
+    fn keys<V>(
+        map: &mut HashMap<String, V>,
+        field: &str,
+        server: Option<&str>,
+        visit: &mut impl FnMut(Option<&str>, &str, &mut String),
+    ) {
+        *map = map
+            .drain()
+            .map(|(mut key, value)| {
+                visit(server, field, &mut key);
+                (key, value)
+            })
+            .collect();
     }
 
-    for server in config.servers.values_mut() {
-        if let Some(ref mut cmd) = server.command {
-            *cmd = transform(cmd.clone());
-        }
-        for arg in &mut server.args {
-            *arg = transform(arg.clone());
-        }
-        for val in server.env.values_mut() {
-            *val = transform(val.clone());
-        }
-        if let Some(ref mut url) = server.url {
-            *url = transform(url.clone());
-        }
-        if let Some(ref mut token) = server.auth_token {
-            *token = transform(token.as_str().to_string()).into();
-        }
-        if let Some(ref mut auth) = server.auth {
-            *auth = transform(auth.clone());
-        }
-        if let Some(ref mut client_id) = server.oauth_client_id {
-            *client_id = transform(client_id.clone());
-        }
-        if let Some(ref mut scopes) = server.oauth_scopes {
-            for scope in scopes.iter_mut() {
-                *scope = transform(scope.clone());
+    let mut top = |field: &str, value: &mut String| visit(None, field, value);
+    top("log_level", &mut config.log_level);
+    top("prefix_delimiter", &mut config.prefix_delimiter);
+    config
+        .priority_tools
+        .iter_mut()
+        .for_each(|v| top("priority_tools", v));
+    config
+        .disabled_tools
+        .iter_mut()
+        .for_each(|v| top("disabled_tools", v));
+    let http = &mut config.http;
+    top("http.bind_address", &mut http.bind_address);
+    http.allowed_origins
+        .iter_mut()
+        .for_each(|v| top("http.allowed_origins", v));
+    if let Some(cert) = &mut http.tls_cert_path {
+        path(cert, |v| top("http.tls_cert_path", v));
+    }
+    if let Some(key) = &mut http.tls_key_path {
+        path(key, |v| top("http.tls_key_path", v));
+    }
+    if let Some(url) = &mut http.public_base_url {
+        top("http.public_base_url", url);
+    }
+    for scope in http.oauth_scopes.iter_mut().flatten() {
+        top("http.oauth_scopes", scope);
+    }
+    keys(
+        &mut config.lazy_tools.clients,
+        "lazy_tools.clients.key",
+        None,
+        &mut visit,
+    );
+
+    for (name, server) in &mut config.servers {
+        let name = Some(name.as_str());
+        let mut at = |field: &str, value: &mut String| visit(name, field, value);
+        for (field, value) in [
+            ("command", &mut server.command),
+            ("url", &mut server.url),
+            ("auth", &mut server.auth),
+            ("oauth_client_id", &mut server.oauth_client_id),
+            ("spec", &mut server.spec),
+        ] {
+            if let Some(value) = value {
+                at(field, value);
             }
         }
-        if !server.tool_renames.is_empty() {
-            let remapped = server
-                .tool_renames
-                .drain()
-                .map(|(key, value)| (transform(key), transform(value)))
-                .collect();
-            server.tool_renames = remapped;
+        server.args.iter_mut().for_each(|v| at("args", v));
+        for (key, value) in &mut server.env {
+            at(&format!("env.{key}"), value);
         }
+        if let Some(token) = &mut server.auth_token {
+            let mut text = token.as_str().to_string();
+            at("auth_token", &mut text);
+            *token = text.into();
+        }
+        for scope in server.oauth_scopes.iter_mut().flatten() {
+            at("oauth_scopes", scope);
+        }
+        server
+            .tool_renames
+            .values_mut()
+            .for_each(|v| at("tool_renames.value", v));
         for group in &mut server.tool_groups {
-            group.prefix = transform(group.prefix.clone());
-            for item in &mut group.contains {
-                *item = transform(item.clone());
+            at("tool_groups.prefix", &mut group.prefix);
+            group
+                .contains
+                .iter_mut()
+                .for_each(|v| at("tool_groups.contains", v));
+            group
+                .strip
+                .iter_mut()
+                .for_each(|v| at("tool_groups.strip", v));
+        }
+        if let Some(sandbox) = &mut server.sandbox {
+            for (field, paths) in [
+                ("sandbox.allow_read", &mut sandbox.allow_read),
+                ("sandbox.allow_write", &mut sandbox.allow_write),
+            ] {
+                paths.iter_mut().for_each(|p| path(p, |v| at(field, v)));
             }
-            for item in &mut group.strip {
-                *item = transform(item.clone());
+            if let Some(profile) = &mut sandbox.profile_path {
+                path(profile, |v| at("sandbox.profile_path", v));
             }
         }
-    }
-}
-
-pub(crate) fn visit_env_expandable_fields(
-    config: &Config,
-    mut visit: impl FnMut(Option<&str>, &str, &str),
-) {
-    visit(None, "log_level", &config.log_level);
-    visit(None, "prefix_delimiter", &config.prefix_delimiter);
-    for target in config.lazy_tools.clients.keys() {
-        visit(None, "lazy_tools.clients.key", target);
-    }
-    for tool in &config.priority_tools {
-        visit(None, "priority_tools", tool);
-    }
-    for tool in &config.disabled_tools {
-        visit(None, "disabled_tools", tool);
-    }
-
-    visit(None, "http.bind_address", &config.http.bind_address);
-    for origin in &config.http.allowed_origins {
-        visit(None, "http.allowed_origins", origin);
-    }
-    if let Some(ref cert_path) = config.http.tls_cert_path {
-        visit(
-            None,
-            "http.tls_cert_path",
-            cert_path.to_string_lossy().as_ref(),
+        keys(
+            &mut server.tool_renames,
+            "tool_renames.key",
+            name,
+            &mut visit,
         );
     }
-    if let Some(ref key_path) = config.http.tls_key_path {
-        visit(
-            None,
-            "http.tls_key_path",
-            key_path.to_string_lossy().as_ref(),
-        );
-    }
-    if let Some(ref public_base_url) = config.http.public_base_url {
-        visit(None, "http.public_base_url", public_base_url);
-    }
-    if let Some(ref scopes) = config.http.oauth_scopes {
-        for scope in scopes {
-            visit(None, "http.oauth_scopes", scope);
-        }
-    }
+}
 
-    for (server_name, server) in &config.servers {
-        if let Some(ref cmd) = server.command {
-            visit(Some(server_name), "command", cmd);
-        }
-        for arg in &server.args {
-            visit(Some(server_name), "args", arg);
-        }
-        for (key, val) in &server.env {
-            let field = format!("env.{key}");
-            visit(Some(server_name), &field, val);
-        }
-        if let Some(ref url) = server.url {
-            visit(Some(server_name), "url", url);
-        }
-        if let Some(ref token) = server.auth_token {
-            visit(Some(server_name), "auth_token", token.as_str());
-        }
-        if let Some(ref auth) = server.auth {
-            visit(Some(server_name), "auth", auth);
-        }
-        if let Some(ref client_id) = server.oauth_client_id {
-            visit(Some(server_name), "oauth_client_id", client_id);
-        }
-        if let Some(ref scopes) = server.oauth_scopes {
-            for scope in scopes {
-                visit(Some(server_name), "oauth_scopes", scope);
-            }
-        }
-        for (key, value) in &server.tool_renames {
-            visit(Some(server_name), "tool_renames.key", key);
-            visit(Some(server_name), "tool_renames.value", value);
-        }
-        for group in &server.tool_groups {
-            visit(Some(server_name), "tool_groups.prefix", &group.prefix);
-            for item in &group.contains {
-                visit(Some(server_name), "tool_groups.contains", item);
-            }
-            for item in &group.strip {
-                visit(Some(server_name), "tool_groups.strip", item);
-            }
-        }
+impl Config {
+    /// Replace each `$NAME` with its value in `vars`.
+    pub fn expand_env_refs(&mut self, vars: &HashMap<String, String>) {
+        for_each_expandable(self, |_, _, value| *value = env::expand(value, vars));
     }
 }
 
-pub(crate) fn visit_env_expandable_strings(config: &Config, mut visit: impl FnMut(&str)) {
-    visit_env_expandable_fields(config, |_, _, value| visit(value));
+/// What is wrong with a config as it is written to `config_path`: the
+/// errors it would have once loaded. A `$NAME` in a path or address is
+/// judged by its value, so a config that loads can always be saved.
+pub fn validate_as_written(config: &Config, config_path: &Path) -> Vec<String> {
+    let mut expanded = config.clone();
+    expanded.expand_env_refs(&env::env_source(config_path));
+    validate_config(&expanded)
 }
 
-fn expand_config_env_refs(config: &mut Config, env_map: &HashMap<String, String>) {
-    use expand::expand_env_vars_with_source;
+/// The config as the file has it, `$NAME` unexpanded: the one to edit and
+/// save, so a reference is never written back as its value.
+#[allow(clippy::result_large_err)]
+pub fn load_editable_config(path: &Path) -> Result<Config, figment::Error> {
+    use figment::Figment;
+    use figment::providers::{Format, Serialized, Toml};
 
-    transform_env_expandable_strings(config, |value| expand_env_vars_with_source(&value, env_map));
+    if !path.exists() {
+        return Ok(Config::default());
+    }
+    Figment::new()
+        .merge(Serialized::defaults(Config::default()))
+        .merge(Toml::file(path))
+        .extract()
 }
 
 /// Returns the plug config directory (e.g. `~/.config/plug/`).
@@ -1213,31 +1065,8 @@ pub fn default_config_path() -> PathBuf {
     config_dir().join("config.toml")
 }
 
-/// Extract all `$VAR_NAME` references from the config without expanding them.
-///
-/// Used by `auto_start_daemon` to forward referenced env vars to the daemon process.
-#[allow(clippy::result_large_err)]
-pub fn load_raw_config(config_path: Option<PathBuf>) -> Result<Vec<String>, figment::Error> {
-    use figment::Figment;
-    use figment::providers::{Format, Serialized, Toml};
-
-    let path = config_path.unwrap_or_else(default_config_path);
-
-    let config: Config = Figment::new()
-        .merge(Serialized::defaults(Config::default()))
-        .merge(Toml::file(&path))
-        .extract()?;
-
-    let mut vars = Vec::new();
-    visit_env_expandable_strings(&config, |value| {
-        vars.extend(expand::extract_env_refs(value))
-    });
-    vars.sort();
-    vars.dedup();
-    Ok(vars)
-}
-
-/// Load config with Figment layered resolution.
+/// The config as Plug runs it: the file under `PLUG_` environment overrides,
+/// with `$NAME` expanded, and valid.
 #[allow(clippy::result_large_err)]
 pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Error> {
     use figment::Figment;
@@ -1250,8 +1079,7 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
         .merge(Toml::file(&path))
         .merge(Env::prefixed("PLUG_").split("__"))
         .extract()?;
-    let env_map = resolved_env_source(&path);
-    expand_config_env_refs(&mut config, &env_map);
+    config.expand_env_refs(&env::env_source(&path));
 
     let errors = validate_config(&config);
     if errors.is_empty() {
@@ -1436,36 +1264,6 @@ LOG_LEVEL = "debug"
         path
     }
 
-    // ---- default values ----
-
-    #[test]
-    fn default_values_are_sensible() {
-        let cfg = Config::default();
-        assert_eq!(cfg.http.auth_mode, DownstreamAuthMode::Auto);
-        assert_eq!(cfg.http.public_base_url, None);
-        assert_eq!(cfg.http.oauth_scopes, None);
-        assert_eq!(cfg.http.bind_address, "127.0.0.1");
-        assert_eq!(cfg.http.port, 3282);
-        assert!(cfg.http.allowed_origins.is_empty());
-        assert_eq!(cfg.http.tls_cert_path, None);
-        assert_eq!(cfg.http.tls_key_path, None);
-        assert_eq!(cfg.http.session_timeout_secs, 1800);
-        assert_eq!(cfg.http.max_sessions, 100);
-        assert_eq!(cfg.http.sse_channel_capacity, 32);
-        assert_eq!(cfg.log_level, "info");
-        assert_eq!(cfg.prefix_delimiter, "__");
-        assert!(cfg.enable_prefix);
-        assert_eq!(cfg.startup_concurrency, 12);
-        assert_eq!(cfg.lazy_tools.mode, LazyToolSetting::Auto);
-        assert!(cfg.lazy_tools.clients.is_empty());
-        assert_eq!(
-            resolve_lazy_tool_policy_for_target(&cfg, "opencode").mode,
-            LazyToolMode::Bridge
-        );
-        assert!(cfg.disabled_tools.is_empty());
-        assert!(cfg.servers.is_empty());
-    }
-
     // ---- TOML loading ----
 
     #[test]
@@ -1511,79 +1309,6 @@ LOG_LEVEL = "debug"
     }
 
     #[test]
-    fn lazy_tool_policy_loads_global_and_client_overrides() {
-        let cfg = config_from_toml(
-            r#"
-            [lazy_tools]
-            mode = "standard"
-
-            [lazy_tools.clients]
-            opencode = "bridge"
-            "claude-code" = "native"
-            "#,
-        );
-
-        assert_eq!(cfg.lazy_tools.mode, LazyToolSetting::Standard);
-        assert_eq!(
-            cfg.lazy_tools.clients.get("opencode"),
-            Some(&LazyToolSetting::Bridge)
-        );
-        assert_eq!(
-            resolve_lazy_tool_policy_for_target(&cfg, "opencode").mode,
-            LazyToolMode::Bridge
-        );
-        assert_eq!(
-            resolve_lazy_tool_policy_for_target(&cfg, "cursor").mode,
-            LazyToolMode::Standard
-        );
-    }
-
-    #[test]
-    fn lazy_tool_policy_defaults_by_client_capability() {
-        let cfg = Config::default();
-
-        let claude = resolve_lazy_tool_policy_for_target(&cfg, "claude-code");
-        assert_eq!(claude.mode, LazyToolMode::Native);
-        assert_eq!(claude.origin, LazyToolModeOrigin::AutoDefault);
-
-        let opencode = resolve_lazy_tool_policy_for_target(&cfg, "opencode");
-        assert_eq!(opencode.mode, LazyToolMode::Bridge);
-        assert_eq!(opencode.origin, LazyToolModeOrigin::AutoDefault);
-
-        let unknown = resolve_lazy_tool_policy_for_target(&cfg, "unknown-client");
-        assert_eq!(unknown.mode, LazyToolMode::Standard);
-        assert_eq!(unknown.origin, LazyToolModeOrigin::AutoDefault);
-    }
-
-    #[test]
-    fn lazy_tool_policy_client_override_does_not_affect_other_targets() {
-        let mut cfg = Config::default();
-        cfg.lazy_tools
-            .clients
-            .insert("opencode".to_string(), LazyToolSetting::Standard);
-
-        let opencode = resolve_lazy_tool_policy_for_target(&cfg, "opencode");
-        assert_eq!(opencode.mode, LazyToolMode::Standard);
-        assert_eq!(opencode.origin, LazyToolModeOrigin::ClientOverride);
-
-        let claude = resolve_lazy_tool_policy_for_target(&cfg, "claude-code");
-        assert_eq!(claude.mode, LazyToolMode::Native);
-        assert_eq!(claude.origin, LazyToolModeOrigin::AutoDefault);
-    }
-
-    #[test]
-    fn lazy_tool_policy_uses_legacy_meta_tool_mode_as_bridge_input() {
-        let cfg = Config {
-            meta_tool_mode: true,
-            ..Config::default()
-        };
-
-        let policy = resolve_lazy_tool_policy_for_target(&cfg, "claude-desktop");
-        assert_eq!(policy.mode, LazyToolMode::Bridge);
-        assert_eq!(policy.origin, LazyToolModeOrigin::LegacyMetaToolMode);
-    }
-
-    #[test]
     fn load_config_uses_dotenv_adjacent_to_active_config_path() {
         let dir = unique_temp_dir("dotenv-adjacent");
         let config_path = dir.join("config.toml");
@@ -1612,6 +1337,75 @@ LOG_LEVEL = "debug"
     }
 
     #[test]
+    fn a_config_with_tls_paths_under_a_name_can_be_saved_as_written() {
+        let dir = unique_temp_dir("tls-by-name");
+        let config_path = dir.join("config.toml");
+        std::fs::write(dir.join("cert.pem"), "cert").unwrap();
+        std::fs::write(dir.join("key.pem"), "key").unwrap();
+        std::fs::set_permissions(
+            dir.join("key.pem"),
+            std::os::unix::fs::PermissionsExt::from_mode(0o600),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join(".env"),
+            format!("PLUG_TEST_TLS_DIR={}\n", dir.display()),
+        )
+        .unwrap();
+        std::fs::write(
+            &config_path,
+            r#"
+            [http]
+            tls_cert_path = "$PLUG_TEST_TLS_DIR/cert.pem"
+            tls_key_path = "$PLUG_TEST_TLS_DIR/key.pem"
+            "#,
+        )
+        .unwrap();
+
+        let written = load_editable_config(&config_path).unwrap();
+        assert!(
+            !validate_config(&written).is_empty(),
+            "the literal path does not exist"
+        );
+        assert_eq!(
+            validate_as_written(&written, &config_path),
+            Vec::<String>::new()
+        );
+        assert!(load_config(Some(&config_path)).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn spec_and_sandbox_paths_expand() {
+        let mut cfg = config_from_toml(
+            r#"
+            [servers.api]
+            transport = "openapi"
+            spec = "$SPEC_URL"
+
+            [servers.local]
+            command = "tool"
+            sandbox = { enabled = true, allow_read = ["$DATA/in"], profile_path = "$DATA/p.sb" }
+            "#,
+        );
+        let vars = HashMap::from([
+            (
+                "SPEC_URL".to_string(),
+                "https://api.test/openapi.json".to_string(),
+            ),
+            ("DATA".to_string(), "/data".to_string()),
+        ]);
+        cfg.expand_env_refs(&vars);
+        assert_eq!(
+            cfg.servers["api"].spec.as_deref(),
+            Some("https://api.test/openapi.json")
+        );
+        let sandbox = cfg.servers["local"].sandbox.as_ref().unwrap();
+        assert_eq!(sandbox.allow_read, vec![PathBuf::from("/data/in")]);
+        assert_eq!(sandbox.profile_path, Some(PathBuf::from("/data/p.sb")));
+    }
+
+    #[test]
     fn load_config_enforces_semantic_validation() {
         let dir = unique_temp_dir("validation");
         let config_path = dir.join("config.toml");
@@ -1628,47 +1422,6 @@ LOG_LEVEL = "debug"
         let err = load_config(Some(&config_path)).expect_err("semantic validation should fail");
         assert!(
             err.to_string().contains("auth_mode = \"none\""),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn load_config_rejects_unknown_lazy_tool_client_target() {
-        let dir = unique_temp_dir("lazy-policy-target");
-        let config_path = dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-            [lazy_tools.clients]
-            "not-a-client" = "bridge"
-            "#,
-        )
-        .unwrap();
-
-        let err = load_config(Some(&config_path)).expect_err("unknown target should fail");
-        assert!(
-            err.to_string()
-                .contains("lazy_tools.clients contains unknown client target"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn load_config_rejects_lazy_tool_client_aliases() {
-        let dir = unique_temp_dir("lazy-policy-alias");
-        let config_path = dir.join("config.toml");
-        std::fs::write(
-            &config_path,
-            r#"
-            [lazy_tools.clients]
-            codex = "native"
-            "#,
-        )
-        .unwrap();
-
-        let err = load_config(Some(&config_path)).expect_err("alias target should fail");
-        assert!(
-            err.to_string().contains("use canonical target 'codex-cli'"),
             "unexpected error: {err}"
         );
     }
@@ -1989,6 +1742,31 @@ LOG_LEVEL = "debug"
                 .any(|e| e.contains("http.auth_mode = \"none\"") && e.contains("non-loopback")),
             "expected none/non-loopback validation error, got {errors:?}"
         );
+    }
+
+    #[test]
+    fn auto_mode_wants_a_bearer_once_the_server_is_reachable_off_this_mac() {
+        let http = |bind: &str, public: Option<&str>| HttpConfig {
+            bind_address: bind.to_string(),
+            public_base_url: public.map(str::to_string),
+            ..HttpConfig::default()
+        };
+        for (bind, public, off) in [
+            ("127.0.0.1", None, false),
+            ("::1", Some("http://[::1]:3282"), false),
+            ("127.0.0.2", Some("http://localhost:3282"), false),
+            ("127.0.0.1", Some("https://plug.example.com"), true),
+            ("0.0.0.0", None, true),
+        ] {
+            let http = http(bind, public);
+            assert_eq!(http.reachable_off_loopback(), off, "{bind} {public:?}");
+            assert_eq!(http.requires_bearer(), off, "{bind} {public:?}");
+        }
+        let bearer = HttpConfig {
+            auth_mode: DownstreamAuthMode::Bearer,
+            ..HttpConfig::default()
+        };
+        assert!(bearer.requires_bearer());
     }
 
     #[test]

@@ -928,8 +928,7 @@ async fn validate_origin(
         }
 
         // Parse origin to extract host — prevents bypass via localhost.evil.com
-        let is_local =
-            extract_origin_host(origin).is_some_and(crate::config::http_bind_is_loopback);
+        let is_local = extract_origin_host(origin).is_some_and(crate::config::is_loopback_host);
 
         if !is_local {
             return Err(HttpError::InvalidOrigin);
@@ -1131,7 +1130,7 @@ fn validate_modern_host(
         host.split(':').next().map(str::to_string)
     }
     .ok_or_else(|| HttpError::BadRequest("modern request Host is malformed".into()))?;
-    let local = crate::config::http_bind_is_loopback(&host_name);
+    let local = crate::config::is_loopback_host(&host_name);
     let explicitly_allowed = allowed_origins.iter().any(|origin| {
         extract_origin_host(origin)
             .is_some_and(|allowed_host| allowed_host.eq_ignore_ascii_case(&host_name))
@@ -1164,7 +1163,7 @@ fn validate_modern_origin(
     {
         return Ok(());
     }
-    if extract_origin_host(origin).is_some_and(crate::config::http_bind_is_loopback) {
+    if extract_origin_host(origin).is_some_and(crate::config::is_loopback_host) {
         Ok(())
     } else {
         Err(HttpError::InvalidOrigin)
@@ -3146,7 +3145,7 @@ mod tests {
         ] {
             let host = extract_origin_host(origin).expect("loopback origin host");
             assert!(
-                crate::config::http_bind_is_loopback(host),
+                crate::config::is_loopback_host(host),
                 "expected {host} parsed from {origin} to be loopback"
             );
         }
@@ -3158,7 +3157,7 @@ mod tests {
         ] {
             let host = extract_origin_host(origin).expect("non-loopback origin host");
             assert!(
-                !crate::config::http_bind_is_loopback(host),
+                !crate::config::is_loopback_host(host),
                 "expected {host} parsed from {origin} to remain non-loopback"
             );
         }

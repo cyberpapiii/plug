@@ -6,12 +6,14 @@
 //! doctor all read the row, so adding a client is one variant and one row.
 
 mod layout;
+mod lazy;
 
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 
 pub use layout::{EntryShape, FileFormat, Layout, PlugLink, ServerEntry};
+pub use lazy::lazy_tool_policy;
 
 use crate::types::ClientType;
 

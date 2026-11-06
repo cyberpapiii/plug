@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use super::{SecretError, SecretStore};
 use crate::types::SecretString;
 
-pub const FILE: &str = "file";
+pub use crate::config::FILE;
 
 pub struct File {
     path: PathBuf,
@@ -95,7 +95,7 @@ fn quoted(value: &str) -> Option<String> {
 impl SecretStore for File {
     fn get(&self, name: &str) -> Result<Option<SecretString>, SecretError> {
         let content = self.lines()?.join("\n");
-        Ok(crate::dotenv::parse_dotenv(&content)
+        Ok(crate::config::env::parse_dotenv(&content)
             .remove(name)
             .map(SecretString::from))
     }

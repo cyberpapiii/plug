@@ -14,7 +14,6 @@ pub mod clients;
 pub mod config;
 pub mod dispatch;
 pub mod doctor;
-pub mod dotenv;
 pub mod downstream_identity;
 pub mod downstream_oauth;
 pub mod engine;

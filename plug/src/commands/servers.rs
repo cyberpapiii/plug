@@ -60,7 +60,7 @@ fn parse_unset_env_names(values: &[String]) -> anyhow::Result<Vec<String>> {
 }
 
 fn current_remote_auth_selection(server: &plug_core::config::ServerConfig) -> RemoteAuthSelection {
-    if server.auth.as_deref() == Some("oauth") {
+    if server.is_oauth() {
         RemoteAuthSelection::Oauth {
             client_id: server.oauth_client_id.clone(),
             scopes: server.oauth_scopes.clone(),
@@ -614,7 +614,7 @@ pub(crate) async fn cmd_server_add(
         }
     };
 
-    let oauth_enabled = server.auth.as_deref() == Some("oauth");
+    let oauth_enabled = server.is_oauth();
     apply_server_mutation(
         config_path,
         plug_core::operator::OperatorMutation::AddServer {
@@ -922,7 +922,7 @@ pub(crate) async fn cmd_server_edit(
             }
         }
 
-        server.auth.as_deref() == Some("oauth")
+        server.is_oauth()
     };
     let updated_server = config
         .servers

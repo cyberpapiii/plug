@@ -1264,7 +1264,7 @@ enum ConfiguredAuth {
 
 impl ServerManager {
     fn configured_auth_for_server(config: &ServerConfig) -> ConfiguredAuth {
-        if config.auth.as_deref() == Some("oauth") {
+        if config.is_oauth() {
             ConfiguredAuth::Oauth
         } else if config.auth_token.is_some() {
             ConfiguredAuth::Bearer
@@ -1295,7 +1295,7 @@ impl ServerManager {
     ) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
-        if config.auth.as_deref() == Some("oauth") && crate::oauth::is_auth_rejection(error) {
+        if config.is_oauth() && crate::oauth::is_auth_rejection(error) {
             self.mark_auth_required(name);
         } else {
             self.mark_start_failure(name);
@@ -2771,7 +2771,7 @@ async fn resolve_upstream_auth(
         anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint");
     }
 
-    if config.auth.as_deref() != Some("oauth") {
+    if !config.is_oauth() {
         return Ok(config.auth_token.as_ref().map(|t| t.as_str().to_string()));
     }
     match crate::oauth::verified_access_token_for_resource(

@@ -22,7 +22,9 @@
 /// guaranteed single-threaded here since this runs before `#[tokio::main]`.
 #[allow(unsafe_code)]
 fn apply_dotenv() {
-    for (key, value) in plug_core::dotenv::load_dotenv() {
+    for (key, value) in
+        plug_core::config::env::dotenv_to_apply(&plug_core::config::default_config_path())
+    {
         unsafe {
             std::env::set_var(&key, &value);
         }

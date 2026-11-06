@@ -93,7 +93,7 @@ async fn move_keys(
             },
         )
         .await?;
-        let left = plug_core::operator::load_editable_config(&path)?
+        let left = plug_core::config::load_editable_config(&path)?
             .servers
             .get(&name)
             .map(|server| stores.plaintext(server))

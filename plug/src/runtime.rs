@@ -1783,30 +1783,13 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
 fn resolve_downstream_bearer_token(
     http: &plug_core::config::HttpConfig,
 ) -> anyhow::Result<Option<Arc<str>>> {
-    match http.auth_mode {
-        plug_core::config::DownstreamAuthMode::Auto => {
-            let externally_exposed = !plug_core::config::http_bind_is_loopback(&http.bind_address)
-                || plug_core::config::http_public_base_url_is_non_loopback(
-                    http.public_base_url.as_deref(),
-                );
-            if externally_exposed {
-                let token_path = plug_core::auth::http_auth_token_path(http.port);
-                let token = plug_core::auth::load_or_generate_token(&token_path)?;
-                tracing::info!("HTTP auth enabled (auto mode: server reachable off-loopback)");
-                Ok(Some(Arc::<str>::from(token.as_str())))
-            } else {
-                Ok(None)
-            }
-        }
-        plug_core::config::DownstreamAuthMode::None => Ok(None),
-        plug_core::config::DownstreamAuthMode::Bearer => {
-            let token_path = plug_core::auth::http_auth_token_path(http.port);
-            let token = plug_core::auth::load_or_generate_token(&token_path)?;
-            tracing::info!("HTTP bearer auth enabled");
-            Ok(Some(Arc::<str>::from(token.as_str())))
-        }
-        plug_core::config::DownstreamAuthMode::Oauth => Ok(None),
+    if !http.requires_bearer() {
+        return Ok(None);
     }
+    let token_path = plug_core::auth::http_auth_token_path(http.port);
+    let token = plug_core::auth::load_or_generate_token(&token_path)?;
+    tracing::info!(mode = http.auth_mode.label(), "HTTP bearer auth enabled");
+    Ok(Some(Arc::<str>::from(token.as_str())))
 }
 
 fn preflight_http_bind(http: &plug_core::config::HttpConfig) -> anyhow::Result<()> {

@@ -716,7 +716,7 @@ async fn cmd_auth_login(
         .get(server_name)
         .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
 
-    if server_config.auth.as_deref() != Some("oauth") {
+    if !server_config.is_oauth() {
         anyhow::bail!(
             "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
         );
@@ -938,7 +938,7 @@ async fn cmd_auth_complete(
         .get(server_name)
         .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
 
-    if server_config.auth.as_deref() != Some("oauth") {
+    if !server_config.is_oauth() {
         anyhow::bail!(
             "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
         );
@@ -1050,7 +1050,7 @@ async fn inject_credentials(
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::VendorExtraTokenFields;
 
-    let is_oauth = server_config.auth.as_deref() == Some("oauth");
+    let is_oauth = server_config.is_oauth();
     let store = oauth::get_or_create_store(server_name);
     if is_oauth {
         let url = server_config
@@ -1162,11 +1162,7 @@ async fn cmd_auth_status(
 ) -> anyhow::Result<()> {
     let cfg = config::load_config(config_path)?;
 
-    let mut oauth_servers: Vec<_> = cfg
-        .servers
-        .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth"))
-        .collect();
+    let mut oauth_servers: Vec<_> = cfg.servers.iter().filter(|(_, sc)| sc.is_oauth()).collect();
     oauth_servers.sort_by_key(|(name, _)| (*name).clone());
 
     if oauth_servers.is_empty() {
@@ -1661,7 +1657,7 @@ mod tests {
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
-            server.auth.as_deref() == Some("oauth"),
+            server.is_oauth(),
             server.oauth_client_id.as_deref(),
             None,
             true,
@@ -1670,7 +1666,7 @@ mod tests {
         assert!(refreshable);
 
         let (fallback_client_id, fallback_refreshable) = oauth::injected_client_identity(
-            server.auth.as_deref() == Some("oauth"),
+            server.is_oauth(),
             server.oauth_client_id.as_deref(),
             None,
             false,
@@ -1689,7 +1685,7 @@ mod tests {
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
-            server.auth.as_deref() == Some("oauth"),
+            server.is_oauth(),
             server.oauth_client_id.as_deref(),
             Some("dynamic-client-123"),
             true,

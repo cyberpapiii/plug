@@ -337,11 +337,7 @@ impl Default for RouterConfig {
 impl RouterConfig {
     fn lazy_policy_for_client(&self, client_type: ClientType) -> ResolvedLazyToolPolicy {
         let target = client_type.target_slug().unwrap_or("unknown");
-        crate::config::resolve_lazy_tool_policy_from_settings(
-            self.meta_tool_mode,
-            &self.lazy_tools,
-            target,
-        )
+        crate::clients::lazy_tool_policy(self.meta_tool_mode, &self.lazy_tools, target)
     }
 
     fn lazy_surface_for_client(&self, client_type: ClientType) -> LazyToolSurface {

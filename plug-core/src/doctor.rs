@@ -112,9 +112,9 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         codesign,
     ) = tokio::join!(
         check_config_exists(config_path),
-        check_config_permissions(config, config_path),
+        check_config_permissions(config_path),
         check_port_available(config),
-        check_env_vars(config),
+        check_env_vars(config, config_path),
         check_server_binaries(config),
         check_server_connectivity(config),
         check_tool_collisions(config),
@@ -257,11 +257,10 @@ fn toml_parse(contents: &str) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-/// Keys written in the config file, which the Keychain would keep better.
-/// Reads the file as written: after `$VAR` expansion every value looks typed.
-fn check_keys_in_config(config_path: &Path) -> CheckResult {
-    let name = "keys_in_config".to_string();
-    let mut found: Vec<String> = crate::operator::load_editable_config(config_path)
+/// Keys written in the config file, as `<server>.<field>`. Reads the file as
+/// written: after `$VAR` expansion every value looks typed.
+fn keys_written(config_path: &Path) -> Vec<String> {
+    let mut found: Vec<String> = crate::config::load_editable_config(config_path)
         .map(|config| {
             let stores = crate::secrets::Stores::from_config(&config.secrets);
             config
@@ -277,6 +276,13 @@ fn check_keys_in_config(config_path: &Path) -> CheckResult {
         })
         .unwrap_or_default();
     found.sort();
+    found
+}
+
+/// Keys written in the config file, which the Keychain would keep better.
+fn check_keys_in_config(config_path: &Path) -> CheckResult {
+    let name = "keys_in_config".to_string();
+    let found = keys_written(config_path);
     if found.is_empty() {
         CheckResult {
             name,
@@ -295,7 +301,7 @@ fn check_keys_in_config(config_path: &Path) -> CheckResult {
 }
 
 /// Check 2: config file permissions (Unix only).
-async fn check_config_permissions(config: &Config, config_path: &Path) -> CheckResult {
+async fn check_config_permissions(config_path: &Path) -> CheckResult {
     let name = "config_permissions".to_string();
 
     if !config_path.exists() {
@@ -313,12 +319,7 @@ async fn check_config_permissions(config: &Config, config_path: &Path) -> CheckR
         match std::fs::metadata(config_path) {
             Ok(meta) => {
                 let mode = meta.permissions().mode() & 0o777;
-                let has_secrets = config.servers.values().any(|s| {
-                    s.auth_token.is_some()
-                        || s.env.values().any(|v| {
-                            v.contains("KEY") || v.contains("TOKEN") || v.contains("SECRET")
-                        })
-                });
+                let has_secrets = !keys_written(config_path).is_empty();
 
                 if has_secrets && (mode & 0o077) != 0 {
                     CheckResult {
@@ -402,14 +403,15 @@ async fn check_port_available(config: &Config) -> CheckResult {
 
 /// Check 4: all env vars referenced in server configs are set.
 /// Core plug vars (PLUG_*) cause Fail; third-party server vars only Warn.
-async fn check_env_vars(config: &Config) -> CheckResult {
+async fn check_env_vars(config: &Config, config_path: &Path) -> CheckResult {
     let name = "env_vars".to_string();
     let mut core_missing: Vec<String> = Vec::new();
     let mut third_party_missing: Vec<String> = Vec::new();
+    let vars = crate::config::env::env_source(config_path);
 
-    crate::config::visit_env_expandable_fields(config, |server_name, field, value| {
-        for var in extract_env_refs(value) {
-            if std::env::var(&var).is_ok() {
+    crate::config::for_each_expandable(&mut config.clone(), |server_name, field, value| {
+        for var in crate::config::env::env_refs(value) {
+            if vars.contains_key(&var) {
                 continue;
             }
             let message = if let Some(server_name) = server_name {
@@ -454,11 +456,6 @@ async fn check_env_vars(config: &Config) -> CheckResult {
             ),
         }
     }
-}
-
-/// Extract `$VAR_NAME` references from a string.
-fn extract_env_refs(input: &str) -> Vec<String> {
-    crate::config::expand::extract_env_refs(input)
 }
 
 /// Check 5: each stdio server's command binary is found in PATH.
@@ -950,7 +947,7 @@ async fn check_http_auth(config: &Config) -> CheckResult {
         crate::config::DownstreamAuthMode::None => CheckResult {
             name,
             status: CheckStatus::Pass,
-            message: if crate::config::http_bind_is_loopback(&config.http.bind_address) {
+            message: if crate::config::is_loopback_host(&config.http.bind_address) {
                 "HTTP auth disabled explicitly (loopback/local-only deployment)".to_string()
             } else {
                 "HTTP auth disabled explicitly".to_string()
@@ -989,13 +986,7 @@ async fn check_http_auth(config: &Config) -> CheckResult {
             }
         }
         crate::config::DownstreamAuthMode::Auto | crate::config::DownstreamAuthMode::Bearer => {
-            let requires_token =
-                matches!(
-                    config.http.auth_mode,
-                    crate::config::DownstreamAuthMode::Bearer
-                ) || !crate::config::http_bind_is_loopback(&config.http.bind_address);
-
-            if !requires_token {
+            if !config.http.requires_bearer() {
                 return CheckResult {
                     name,
                     status: CheckStatus::Pass,
@@ -1003,6 +994,12 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                     fix_suggestion: None,
                 };
             }
+            let mode = if config.http.auth_mode == crate::config::DownstreamAuthMode::Bearer {
+                "HTTP auth mode is bearer".to_string()
+            } else {
+                "HTTP auth in auto mode resolves to bearer because the server is reachable off this Mac"
+                    .to_string()
+            };
 
             let token_path = crate::auth::http_auth_token_path(config.http.port);
 
@@ -1010,17 +1007,10 @@ async fn check_http_auth(config: &Config) -> CheckResult {
                 return CheckResult {
                     name,
                     status: CheckStatus::Warn,
-                    message: match config.http.auth_mode {
-                        crate::config::DownstreamAuthMode::Bearer => format!(
-                            "HTTP auth mode is bearer but the auth token has not been generated yet ({})",
-                            token_path.display()
-                        ),
-                        crate::config::DownstreamAuthMode::Auto => format!(
-                            "HTTP auth in auto mode resolves to bearer for bind {} but the auth token has not been generated yet",
-                            config.http.bind_address
-                        ),
-                        _ => unreachable!("requires_token only applies to auto/bearer"),
-                    },
+                    message: format!(
+                        "{mode}, but the auth token has not been generated yet ({})",
+                        token_path.display()
+                    ),
                     fix_suggestion: Some(
                         "Start Plug (open Plug.app, or run `plug start`) and it generates the token, or change http.auth_mode for your deployment".to_string(),
                     ),
@@ -1053,17 +1043,7 @@ async fn check_http_auth(config: &Config) -> CheckResult {
             CheckResult {
                 name,
                 status: CheckStatus::Pass,
-                message: match config.http.auth_mode {
-                    crate::config::DownstreamAuthMode::Bearer => format!(
-                        "HTTP bearer auth token configured ({})",
-                        token_path.display()
-                    ),
-                    crate::config::DownstreamAuthMode::Auto => format!(
-                        "HTTP auth in auto mode resolves to bearer for bind {}",
-                        config.http.bind_address
-                    ),
-                    _ => unreachable!("requires_token only applies to auto/bearer"),
-                },
+                message: format!("{mode}; the auth token is in {}", token_path.display()),
                 fix_suggestion: None,
             }
         }
@@ -1109,34 +1089,23 @@ async fn check_oauth_metadata_reachable(base_url: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Check OAuth config fields are coherent.
+/// OAuth servers that ask for no scopes. The rules a config must keep to
+/// load are `validate_config`'s, and doctor only sees a config that loaded.
 async fn check_oauth_config(config: &Config) -> CheckResult {
     let name = "oauth_config".to_string();
+    let mut unscoped: Vec<String> = config
+        .servers
+        .iter()
+        .filter(|(_, server)| {
+            server.is_oauth() && server.oauth_scopes.as_ref().is_none_or(Vec::is_empty)
+        })
+        .map(|(server_name, _)| {
+            format!("server '{server_name}': auth = \"oauth\" but no scopes configured")
+        })
+        .collect();
+    unscoped.sort();
 
-    let mut issues = Vec::new();
-    for (server_name, sc) in &config.servers {
-        if sc.auth.as_deref() != Some("oauth") {
-            continue;
-        }
-
-        if sc.auth_token.is_some() {
-            issues.push(format!(
-                "server '{server_name}': auth = \"oauth\" and auth_token are both set (mutually exclusive)"
-            ));
-        }
-        if matches!(sc.transport, TransportType::Stdio) {
-            issues.push(format!(
-                "server '{server_name}': auth = \"oauth\" on stdio transport (requires http or sse)"
-            ));
-        }
-        if sc.oauth_scopes.is_none() || sc.oauth_scopes.as_ref().is_some_and(|s| s.is_empty()) {
-            issues.push(format!(
-                "server '{server_name}': auth = \"oauth\" but no scopes configured"
-            ));
-        }
-    }
-
-    if issues.is_empty() {
+    if unscoped.is_empty() {
         CheckResult {
             name,
             status: CheckStatus::Pass,
@@ -1146,15 +1115,8 @@ async fn check_oauth_config(config: &Config) -> CheckResult {
     } else {
         CheckResult {
             name,
-            status: if issues
-                .iter()
-                .any(|i| i.contains("mutually exclusive") || i.contains("stdio"))
-            {
-                CheckStatus::Fail
-            } else {
-                CheckStatus::Warn
-            },
-            message: issues.join("; "),
+            status: CheckStatus::Warn,
+            message: unscoped.join("; "),
             fix_suggestion: Some("Check OAuth settings in your config.toml".to_string()),
         }
     }
@@ -1167,7 +1129,7 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     let oauth_servers: Vec<_> = config
         .servers
         .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+        .filter(|(_, sc)| sc.is_oauth() && sc.enabled)
         .collect();
 
     if oauth_servers.is_empty() {
@@ -1187,10 +1149,9 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     let mut signed_in = 0usize;
     let mut exposed = Vec::new();
     for (server_name, _) in &oauth_servers {
-        let Ok(safe_name) = crate::config::sanitize_server_name_for_path(server_name) else {
+        let Ok(token_file) = crate::oauth::token_file_path(server_name) else {
             continue;
         };
-        let token_file = tokens_dir.join(format!("{safe_name}.json"));
         let Ok(metadata) = std::fs::metadata(&token_file) else {
             continue;
         };
@@ -1263,7 +1224,7 @@ async fn check_codesign_identity(config: &Config) -> CheckResult {
         let oauth_count = config
             .servers
             .iter()
-            .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+            .filter(|(_, sc)| sc.is_oauth() && sc.enabled)
             .count();
 
         if oauth_count == 0 {
@@ -1442,8 +1403,7 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn config_permissions_no_file() {
-        let config = test_config();
-        let result = check_config_permissions(&config, Path::new("/nonexistent/config.toml")).await;
+        let result = check_config_permissions(Path::new("/nonexistent/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Pass);
     }
 
@@ -1455,19 +1415,21 @@ auth_token = "keychain:b.token"
         let dir = std::env::temp_dir().join("plug_doctor_test_perms");
         let _ = std::fs::create_dir_all(&dir);
         let path = dir.join("config.toml");
-        std::fs::write(&path, "# test").unwrap();
+        std::fs::write(
+            &path,
+            "[servers.test]\ncommand = \"echo\"\nenv = { LOG_LEVEL = \"KEY_TOKEN_SECRET\" }\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let result = check_config_permissions(&path).await;
+        assert_eq!(result.status, CheckStatus::Pass, "a setting is not a key");
 
-        let mut config = test_config();
-        config.servers.insert(
-            "test".to_string(),
-            ServerConfig {
-                auth_token: Some("secret".to_string().into()),
-                ..stdio_server("echo")
-            },
-        );
-
-        let result = check_config_permissions(&config, &path).await;
+        std::fs::write(
+            &path,
+            "[servers.test]\ncommand = \"echo\"\nauth_token = \"secret\"\n",
+        )
+        .unwrap();
+        let result = check_config_permissions(&path).await;
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains("world/group-readable"));
 
@@ -1490,7 +1452,7 @@ auth_token = "keychain:b.token"
     #[tokio::test]
     async fn env_vars_all_set() {
         let config = test_config();
-        let result = check_env_vars(&config).await;
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Pass);
     }
 
@@ -1507,7 +1469,7 @@ auth_token = "keychain:b.token"
                 ..stdio_server("echo")
             },
         );
-        let result = check_env_vars(&config).await;
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Warn);
         assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
     }
@@ -1525,7 +1487,7 @@ auth_token = "keychain:b.token"
                 ..stdio_server("echo")
             },
         );
-        let result = check_env_vars(&config).await;
+        let result = check_env_vars(&config, Path::new("/nonexistent/plug/config.toml")).await;
         assert_eq!(result.status, CheckStatus::Fail);
         assert!(result.message.contains("PLUG_NONEXISTENT_VAR_XYZ"));
     }
@@ -1542,6 +1504,22 @@ auth_token = "keychain:b.token"
         let result = check_http_auth(&config).await;
         assert_eq!(result.status, CheckStatus::Pass);
         assert!(result.message.contains("auto mode"));
+    }
+
+    #[tokio::test]
+    async fn http_auth_auto_behind_a_tunnel_needs_the_token() {
+        let mut config = test_config();
+        config.http.auth_mode = crate::config::DownstreamAuthMode::Auto;
+        config.http.bind_address = "127.0.0.1".to_string();
+        config.http.public_base_url = Some("https://plug.example.com".to_string());
+        config.http.port = 62003;
+
+        let result = check_http_auth(&config).await;
+        assert!(
+            result.message.contains("resolves to bearer"),
+            "{}",
+            result.message
+        );
     }
 
     #[tokio::test]
@@ -2047,17 +2025,6 @@ auth_token = "keychain:b.token"
         );
         assert!(result.message.contains("remote"));
         assert!(!result.message.contains("local"));
-    }
-
-    // -- extract_env_refs --
-
-    #[test]
-    fn extract_refs_basic() {
-        assert_eq!(extract_env_refs("$HOME/bin"), vec!["HOME"]);
-        assert_eq!(extract_env_refs("$FOO and $BAR"), vec!["FOO", "BAR"]);
-        assert!(extract_env_refs("no vars").is_empty());
-        assert!(extract_env_refs("$(shell)").is_empty());
-        assert!(extract_env_refs("$lowercase").is_empty());
     }
 
     // -- DoctorReport --

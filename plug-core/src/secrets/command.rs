@@ -11,11 +11,7 @@ use std::time::{Duration, Instant};
 use super::{SecretError, SecretStore, valid_name};
 use crate::types::SecretString;
 
-/// Where `{name}` goes in the command.
-pub const NAME: &str = "{name}";
-
-/// The 1Password store's id: `op://vault/item/field` is a reference as it is.
-pub const OP: &str = "op";
+pub use crate::config::secrets::{NAME, OP};
 
 /// The login shell's PATH. The service starts with a bare one, and a
 /// password manager's tool is rarely in `/usr/bin`.
@@ -52,7 +48,7 @@ impl Command {
             argv: ["op", "read", "--no-newline", "op:{name}"]
                 .map(str::to_string)
                 .to_vec(),
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(crate::config::secrets::DEFAULT_COMMAND_TIMEOUT_SECS),
             accepts: |name| {
                 name.starts_with("//") && name.len() > 2 && !name.chars().any(char::is_control)
             },

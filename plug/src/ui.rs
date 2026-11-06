@@ -301,14 +301,7 @@ pub(crate) fn server_place(server: Option<&plug_core::config::ServerConfig>) -> 
 pub(crate) fn summarize_server_auth(
     server: Option<&plug_core::config::ServerConfig>,
 ) -> &'static str {
-    match server {
-        Some(server) => match (server.auth.as_deref(), server.auth_token.is_some()) {
-            (Some("oauth"), _) => "oauth",
-            (_, true) => "bearer",
-            _ => "none",
-        },
-        None => "unknown",
-    }
+    server.map_or("unknown", plug_core::config::ServerConfig::auth_label)
 }
 
 pub(crate) fn truncate_tail(value: &str, max_width: usize) -> String {

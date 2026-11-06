@@ -14,45 +14,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::{HeaderMap, StatusCode};
 use serde_json::Value;
 
+pub use crate::config::{
+    EVENT_SCOPE, EventsConfig, MIN_WATCH_SECS, WatchConfig, events_missing, events_possible,
+};
 pub use access::RuntimeWatchAccess;
 pub use delivery::{DeliveryResponse, EventDelivery, HttpsDelivery};
 pub(crate) use delivery::{hmac_sha256, validate_url};
 pub(crate) use hub::MAX_QUEUE;
 pub use hub::{Access, Hub, Pending, Source, SourceState, State, Subscription};
-pub use watch::{
-    EventStatus, EventsConfig, MIN_WATCH_SECS, WatchAccess, WatchConfig, WatchEvents, WatchHealth,
-    WatchSource, WatchState,
-};
+pub use watch::{EventStatus, WatchAccess, WatchEvents, WatchHealth, WatchSource, WatchState};
 
-/// The OAuth scope a client needs to subscribe to any event.
-pub const EVENT_SCOPE: &str = "events:subscribe";
 pub(crate) const DAY: u64 = 86_400;
 /// The largest event, and the largest body a source accepts from outside.
 pub(crate) const MAX_BODY: usize = 256 * 1024;
-
-/// What `http` lacks before remote clients can subscribe to events, each as
-/// the end of a sentence starting "... needs". Empty when events are possible.
-pub fn events_missing(http: &crate::config::HttpConfig) -> Vec<&'static str> {
-    let mut missing = Vec::new();
-    if !http.modern_downstream_enabled || http.auth_mode != crate::config::DownstreamAuthMode::Oauth
-    {
-        missing.push(
-            "remote clients that sign in: set http.modern_downstream_enabled = true and http.auth_mode = \"oauth\"",
-        );
-    }
-    if !http
-        .oauth_scopes
-        .as_ref()
-        .is_some_and(|scopes| scopes.iter().any(|scope| scope == EVENT_SCOPE))
-    {
-        missing.push("\"events:subscribe\" in http.oauth_scopes");
-    }
-    missing
-}
-
-pub fn events_possible(http: &crate::config::HttpConfig) -> bool {
-    events_missing(http).is_empty()
-}
 
 /// What the HTTP transport needs from an event source. A new source is one
 /// more entry in `HttpState`'s list, with no transport changes.
