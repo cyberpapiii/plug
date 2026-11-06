@@ -267,7 +267,7 @@ mod tests {
     async fn a_reply_over_one_frame_is_reassembled() {
         let _guard = test_paths::lock().lock().await;
         let root = temp_root("chunked");
-        test_paths::set(root.clone(), root.clone());
+        let _paths = test_paths::set(root.clone(), root.clone());
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -290,7 +290,6 @@ mod tests {
         };
         assert_eq!(payload["text"].as_str().map(str::len), Some(text.len()));
         daemon.await.unwrap();
-        test_paths::clear();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -300,7 +299,7 @@ mod tests {
     async fn the_token_is_attached_to_operator_requests() {
         let _guard = test_paths::lock().lock().await;
         let root = temp_root("token");
-        test_paths::set(root.clone(), root.clone());
+        let _paths = test_paths::set(root.clone(), root.clone());
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         std::fs::write(plug_core::paths::token_path(), "the-token").unwrap();
@@ -320,7 +319,6 @@ mod tests {
         assert!(matches!(response, IpcResponse::Ok));
         let sent = daemon.await.unwrap();
         assert_eq!(sent.auth_token(), Some("the-token"));
-        test_paths::clear();
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -331,7 +329,7 @@ mod tests {
     async fn a_request_gives_up_on_a_daemon_that_never_answers() {
         let _guard = test_paths::lock().lock().await;
         let root = temp_root("silent");
-        test_paths::set(root.clone(), root.clone());
+        let _paths = test_paths::set(root.clone(), root.clone());
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -347,7 +345,6 @@ mod tests {
             .expect_err("a silent daemon must not be waited on forever");
 
         silent.abort();
-        test_paths::clear();
         let _ = std::fs::remove_dir_all(&root);
         assert!(
             matches!(error, IpcClientError::Timeout(_)),
@@ -359,10 +356,9 @@ mod tests {
     async fn no_daemon_reads_as_unreachable() {
         let _guard = test_paths::lock().lock().await;
         let root = temp_root("absent");
-        test_paths::set(root.clone(), root.clone());
+        let _paths = test_paths::set(root.clone(), root.clone());
         let (availability, value) = query(IpcRequest::Status, Some).await;
         assert_eq!(availability, DaemonQueryAvailability::Unreachable);
         assert!(value.is_none());
-        test_paths::clear();
     }
 }

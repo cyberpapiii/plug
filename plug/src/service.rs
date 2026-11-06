@@ -957,14 +957,12 @@ arguments = {
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).expect("create runtime root");
-        plug_core::paths::test::set(root.clone(), root.clone());
+        let _paths = plug_core::paths::test::set(root.clone(), root.clone());
 
         let started = std::time::Instant::now();
         let error = wait_for_daemon_socket(false, true)
             .await
             .expect_err("a vanished startup lock must not be reported as success");
-
-        plug_core::paths::test::clear();
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(
@@ -989,7 +987,7 @@ arguments = {
             std::process::id(),
             uuid::Uuid::new_v4().as_fields().0
         ));
-        plug_core::paths::test::set(root.clone(), root.clone());
+        let _paths = plug_core::paths::test::set(root.clone(), root.clone());
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
             .expect("create runtime dir");
@@ -998,7 +996,6 @@ arguments = {
         let started = wait_for_daemon_socket(true, false).await;
 
         drop(listener);
-        plug_core::paths::test::clear();
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(started.expect("socket present means started"));
@@ -1020,11 +1017,9 @@ arguments = {
         let _guard = plug_core::paths::test::lock().lock().await;
         let temp =
             std::env::temp_dir().join(format!("plug-service-launchd-guard-{}", std::process::id()));
-        plug_core::paths::test::set(temp.join("runtime"), temp.join("state"));
+        let _paths = plug_core::paths::test::set(temp.join("runtime"), temp.join("state"));
 
         let result = ensure_started(None).await;
-
-        plug_core::paths::test::clear();
         let error = result.expect_err("test startup must fail closed");
         assert!(
             error.to_string().contains("refusing to mutate launchd"),
