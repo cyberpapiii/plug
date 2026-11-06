@@ -18,10 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-#[cfg(not(target_os = "linux"))]
-use keyring as platform_keyring;
-#[cfg(target_os = "linux")]
-use keyring_core as platform_keyring;
+use crate::platform_keyring;
 
 use crate::config::ServerConfig;
 use crate::types::SecretString;

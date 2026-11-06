@@ -95,7 +95,6 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<
 /// process group, so this reaches a helper that would otherwise live on
 /// holding the pipes open.
 fn stop(child: &mut std::process::Child) {
-    #[cfg(unix)]
     let _ = std::process::Command::new("/bin/kill")
         .args(["-KILL", "--", &format!("-{}", child.id())])
         .stdin(Stdio::null())
@@ -121,7 +120,6 @@ impl SecretStore for Command {
         if let Some(path) = LOGIN_PATH.get() {
             command.env("PATH", path);
         }
-        #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {

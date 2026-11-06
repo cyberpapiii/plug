@@ -141,6 +141,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A server whose calls were dropped or timed out while its circuit breaker was testing it is tested again after thirty seconds. It used to stay blocked until it was reconnected. A server edit whose keys could not be moved to the Keychain is refused, where it used to be saved with the keys written into the file.
 - `plug auth status` and `plug events` say why they could not read live state from a running Plug, and `plug secret` says when the settings file could not be read and only the built-in stores are used. They used to fall back without a word, or tell you to start a Plug that was already running.
 - Advice to restart Plug points at the Restart button under Plug in Plug.app's Settings, where it is. It used to name a Service section that no longer exists.
+- The file an upstream sign-in keeps while you approve it in the browser is written as a new owner-only file put in place in one step, like the token file, so a link planted at its path is replaced rather than written through.
 
 ## [0.11.0] - 2026-10-07
 

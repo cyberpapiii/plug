@@ -50,6 +50,13 @@ pub mod types;
 pub(crate) mod upstream_http;
 pub mod watcher;
 
+// The Keychain on macOS. CI also runs on Linux, where the kernel keyring
+// stands in.
+#[cfg(not(target_os = "linux"))]
+pub(crate) use keyring as platform_keyring;
+#[cfg(target_os = "linux")]
+pub(crate) use keyring_core as platform_keyring;
+
 #[cfg(test)]
 mod test_log;
 
