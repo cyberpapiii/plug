@@ -318,6 +318,12 @@ impl From<&Config> for RouterConfig {
     }
 }
 
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self::from(&Config::default())
+    }
+}
+
 impl RouterConfig {
     fn lazy_policy_for_client(&self, client_type: ClientType) -> ResolvedLazyToolPolicy {
         let target = client_type.target_slug().unwrap_or("unknown");
@@ -4477,7 +4483,7 @@ mod lifecycle_regression_tests {
     async fn drain_calls_waits_for_running_calls_and_gives_up_at_the_deadline() {
         let router = Arc::new(ToolRouter::new(
             Arc::new(ServerManager::new()),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         assert_eq!(router.drain_calls(Duration::from_secs(5)).await, 0);
 
@@ -4493,21 +4499,6 @@ mod lifecycle_regression_tests {
         });
         assert_eq!(remaining, 0);
         assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    fn test_router_config() -> RouterConfig {
-        RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: crate::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        }
     }
 
     #[test]
@@ -4534,7 +4525,7 @@ mod lifecycle_regression_tests {
     fn concurrent_duplicate_downstream_key_never_evicts_the_winner() {
         let router = Arc::new(ToolRouter::new(
             Arc::new(ServerManager::new()),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         let mut notifications = router.subscribe_notifications();
         let context = DownstreamCallContext::stdio(

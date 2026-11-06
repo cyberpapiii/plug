@@ -3588,21 +3588,6 @@ mod tests {
         }
     }
 
-    fn test_router_config() -> RouterConfig {
-        RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: crate::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        }
-    }
-
     #[tokio::test]
     async fn a_server_whose_secret_is_missing_says_so_and_does_not_start() {
         let mut config = test_server_config();
@@ -4902,7 +4887,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -5012,7 +4997,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -5113,7 +5098,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -5252,7 +5237,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -5342,7 +5327,7 @@ mod tests {
     #[tokio::test]
     async fn bridge_lazy_mode_exposes_search_and_loaded_direct_tool_calls() {
         let server_manager = Arc::new(ServerManager::new());
-        let mut config = test_router_config();
+        let mut config = RouterConfig::default();
         config.lazy_tools.mode = crate::types::LazyToolSetting::Bridge;
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
@@ -5477,7 +5462,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -5621,7 +5606,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -5958,7 +5943,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -6008,7 +5993,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -6048,7 +6033,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
 
@@ -6193,7 +6178,7 @@ mod tests {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         server_manager.set_tool_router(Arc::downgrade(&router));
         router.set_client_log_level("client", rmcp::model::LoggingLevel::Debug);

@@ -1,20 +1,5 @@
 use super::*;
 
-fn test_router_config() -> RouterConfig {
-    RouterConfig {
-        enable_prefix: true,
-        prefix_delimiter: "__".to_string(),
-        priority_tools: Vec::new(),
-        disabled_tools: Vec::new(),
-        tool_description_max_chars: None,
-        tool_search_threshold: 50,
-        meta_tool_mode: false,
-        lazy_tools: LazyToolsConfig::default(),
-        tool_filter_enabled: true,
-        enrichment_servers: std::collections::HashSet::new(),
-    }
-}
-
 fn expected_meta_tool_names() -> Vec<&'static str> {
     vec!["plug__search_tools"]
 }
@@ -151,7 +136,7 @@ fn client_metadata_never_changes_principal_identity() {
 
 fn router_with_git_commit_tool() -> ToolRouter {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut routes = HashMap::new();
     routes.insert(
         "git__commit".to_string(),
@@ -231,7 +216,7 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
 #[test]
 fn get_info_returns_correct_server_info() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, test_router_config());
+    let handler = ProxyHandler::new(sm, RouterConfig::default());
     let info = handler.get_info();
 
     assert_eq!(info.server_info.name, "plug");
@@ -277,7 +262,7 @@ fn assert_plug_icons_sequence(icons: &[Icon]) {
 #[tokio::test(start_paused = true)]
 async fn schedule_tool_list_changed_refresh_debounces_bursts() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut rx = router.subscribe_notifications();
 
     router.schedule_tool_list_changed_refresh();
@@ -309,7 +294,7 @@ async fn schedule_tool_list_changed_refresh_debounces_bursts() {
 #[tokio::test(start_paused = true)]
 async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut rx = router.subscribe_notifications();
 
     // First refresh cycle.
@@ -340,7 +325,7 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
 #[tokio::test]
 async fn refresh_tools_with_no_servers() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, test_router_config());
+    let handler = ProxyHandler::new(sm, RouterConfig::default());
     handler.refresh_tools().await;
 
     let tools = handler.router().list_tools();
@@ -350,7 +335,7 @@ async fn refresh_tools_with_no_servers() {
 #[tokio::test]
 async fn tool_router_list_tools_returns_arc() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     router.refresh_tools().await;
 
     let tools1 = router.list_tools();
@@ -549,7 +534,7 @@ fn apply_canonical_tool_title_creates_annotation_title_when_missing() {
 #[test]
 fn list_tools_for_client_returns_correct_counts() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Manually set up a snapshot with 150 tools
     let tools: Vec<Tool> = (0..150)
@@ -612,7 +597,7 @@ fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() 
     let sm = Arc::new(ServerManager::new());
     let config = RouterConfig {
         tool_filter_enabled: false,
-        ..test_router_config()
+        ..RouterConfig::default()
     };
     let router = ToolRouter::new(sm, config);
 
@@ -713,7 +698,7 @@ fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy
     let config = RouterConfig {
         tool_filter_enabled: false,
         lazy_tools,
-        ..test_router_config()
+        ..RouterConfig::default()
     };
     let router = ToolRouter::new(sm, config);
     let tools: Vec<Tool> = (0..3)
@@ -748,7 +733,7 @@ fn standard_client_sees_full_catalog_when_filtering_disabled_and_unknown_is_lazy
 #[test]
 fn search_tools_returns_matches() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Set up a snapshot with named tools
     let tools = vec![
@@ -831,7 +816,7 @@ fn search_tools_returns_matches() {
 #[test]
 fn search_index_scores_match_direct_scoring_and_follow_the_snapshot() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut titled = Tool::new(
         Cow::Borrowed("Git_Hub__Create-PR"),
         Cow::Borrowed("Open a Pull Request on GitHub"),
@@ -905,8 +890,10 @@ fn search_index_scores_match_direct_scoring_and_follow_the_snapshot() {
 #[test]
 fn meta_tool_mode_lists_only_meta_tools() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = ToolRouter::new(sm, config);
 
     let tools = vec![Tool::new(
@@ -958,7 +945,7 @@ fn meta_tool_mode_lists_only_meta_tools() {
 #[test]
 fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router.cache.store(Arc::new(
         RouterSnapshot {
@@ -1001,7 +988,7 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
 #[test]
 fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1064,7 +1051,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
 #[test]
 fn bridge_search_keeps_session_working_set_bounded() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     let tools = (0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5))
@@ -1134,7 +1121,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
 #[test]
 fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1200,7 +1187,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
 #[tokio::test]
 async fn bridge_session_rejects_unloaded_direct_tool_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1346,8 +1333,10 @@ async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
 #[tokio::test]
 async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.disabled_tools = vec!["plug__search_tools".to_string()];
+    let config = RouterConfig::from(&Config {
+        disabled_tools: vec!["plug__search_tools".to_string()],
+        ..Default::default()
+    });
     let router = ToolRouter::new(sm, config);
 
     assert!(
@@ -1378,7 +1367,7 @@ async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
 #[test]
 fn synthesized_capabilities_include_tasks_when_tools_exist() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1495,7 +1484,7 @@ fn is_session_error_unexpected_response_not_session() {
 #[test]
 fn case_insensitive_route_lookup() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let mut routes = HashMap::new();
     routes.insert(
@@ -1539,7 +1528,7 @@ fn case_insensitive_route_lookup() {
 #[tokio::test(start_paused = true)]
 async fn call_tool_times_out_waiting_for_semaphore() {
     let server_manager = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(server_manager.clone(), test_router_config());
+    let router = ToolRouter::new(server_manager.clone(), RouterConfig::default());
 
     let upstream =
         connect_subscribable_upstream("busy-server", SubscribableUpstreamState::new(&[])).await;
@@ -1593,7 +1582,7 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
     let server_manager = Arc::new(ServerManager::new());
     let router = Arc::new(ToolRouter::new(
         Arc::clone(&server_manager),
-        test_router_config(),
+        RouterConfig::default(),
     ));
     let old_state = SubscribableUpstreamState::new(&[]);
     let old_upstream = connect_subscribable_upstream("queued-server", Arc::clone(&old_state)).await;
@@ -1652,7 +1641,7 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
 #[test]
 fn list_tools_page_for_client_uses_cursor_pagination() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let tools: Vec<Tool> = (0..750)
         .map(|index| {
             Tool::new(
@@ -1715,7 +1704,7 @@ fn paginated_result_returns_mid_cursor_page_from_borrowed_slice() {
 #[tokio::test]
 async fn route_upstream_progress_publishes_targeted_notification() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut rx = router.subscribe_notifications();
     let progress_token = ProgressToken(NumberOrString::String(Arc::from("progress-1")));
 
@@ -1764,7 +1753,7 @@ async fn route_upstream_progress_publishes_targeted_notification() {
 #[test]
 fn synthesized_capabilities_advertises_subscribe_when_upstream_supports_it() {
     let sm = Arc::new(ServerManager::new());
-    let config = test_router_config();
+    let config = RouterConfig::default();
     let router = ToolRouter::new(sm, config);
 
     // No upstreams → no resources capability at all
@@ -1775,7 +1764,7 @@ fn synthesized_capabilities_advertises_subscribe_when_upstream_supports_it() {
 #[test]
 fn resource_subscription_registry_lifecycle() {
     let sm = Arc::new(ServerManager::new());
-    let config = test_router_config();
+    let config = RouterConfig::default();
     let router = ToolRouter::new(sm, config);
 
     let target = NotificationTarget::Stdio {
@@ -1813,7 +1802,7 @@ fn resource_subscription_registry_lifecycle() {
 #[test]
 fn synthesized_capabilities_no_completions_without_upstream() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let caps = router.synthesized_capabilities();
     assert!(caps.completions.is_none());
 }
@@ -1838,7 +1827,7 @@ fn complete_request_params_serde_roundtrip() {
 #[test]
 fn route_upstream_logging_message_publishes_with_server_prefix() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     // Default level is Warning, so send a warning-level message
     let mut rx = router.subscribe_logging();
 
@@ -1863,7 +1852,7 @@ fn route_upstream_logging_message_publishes_with_server_prefix() {
 #[test]
 fn route_upstream_logging_message_filters_below_threshold() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut rx = router.subscribe_logging();
 
     // Default level is Warning — debug should be filtered
@@ -1878,7 +1867,7 @@ fn route_upstream_logging_message_filters_below_threshold() {
 #[test]
 fn set_client_log_level_changes_effective_level() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Default is Warning
     assert_eq!(router.log_level(), LoggingLevel::Warning);
@@ -1903,7 +1892,7 @@ fn set_client_log_level_changes_effective_level() {
 #[test]
 fn route_upstream_logging_respects_changed_level() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut rx = router.subscribe_logging();
 
     // Lower threshold to Debug
@@ -1927,7 +1916,7 @@ fn route_upstream_logging_respects_changed_level() {
 #[test]
 fn logging_channel_is_separate_from_control_channel() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
     let mut control_rx = router.subscribe_notifications();
     let mut logging_rx = router.subscribe_logging();
 
@@ -1968,7 +1957,7 @@ fn logging_channel_is_separate_from_control_channel() {
 #[test]
 fn synthesized_capabilities_includes_logging_when_upstream_supports_it() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Without any upstream servers, no logging capability
     let caps = router.synthesized_capabilities();
@@ -1989,7 +1978,7 @@ fn make_root(uri: &str, name: Option<&str>) -> Root {
 #[test]
 fn list_roots_union_empty_when_no_clients() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let result = router.list_roots_union();
     assert!(result.roots.is_empty());
@@ -1998,7 +1987,7 @@ fn list_roots_union_empty_when_no_clients() {
 #[test]
 fn set_roots_for_target_returns_true_on_first_insert() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("client-1"),
@@ -2011,7 +2000,7 @@ fn set_roots_for_target_returns_true_on_first_insert() {
 #[test]
 fn set_roots_for_target_returns_false_when_unchanged() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("client-1"),
@@ -2026,7 +2015,7 @@ fn set_roots_for_target_returns_false_when_unchanged() {
 #[test]
 fn set_roots_for_target_returns_true_when_changed() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("client-1"),
@@ -2041,7 +2030,7 @@ fn set_roots_for_target_returns_true_when_changed() {
 #[test]
 fn clear_roots_for_target_returns_true_when_existed() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("client-1"),
@@ -2055,7 +2044,7 @@ fn clear_roots_for_target_returns_true_when_existed() {
 #[test]
 fn clear_roots_for_target_returns_false_when_not_existed() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("client-nonexistent"),
@@ -2066,7 +2055,7 @@ fn clear_roots_for_target_returns_false_when_not_existed() {
 #[test]
 fn list_roots_union_deduplicates_by_uri() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Client 1 has roots A and B
     let target1 = NotificationTarget::Stdio {
@@ -2105,7 +2094,7 @@ fn list_roots_union_deduplicates_by_uri() {
 #[test]
 fn list_roots_union_is_sorted_by_uri() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target = NotificationTarget::Stdio {
         client_id: Arc::from("client-1"),
@@ -2134,7 +2123,7 @@ fn list_roots_union_is_sorted_by_uri() {
 #[test]
 fn clear_roots_removes_from_union() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let target1 = NotificationTarget::Stdio {
         client_id: Arc::from("client-1"),
@@ -2160,7 +2149,7 @@ fn clear_roots_removes_from_union() {
 #[test]
 fn test_upstream_request_lookup_requires_active_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     let result = router.active_call_for_upstream_request(
         "unknown-server",
@@ -2178,7 +2167,7 @@ fn test_upstream_request_lookup_requires_active_call() {
 #[test]
 fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
@@ -2227,7 +2216,7 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
 #[test]
 fn test_route_upstream_progress_restores_downstream_token() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut rx = router.subscribe_notifications();
 
     router
@@ -2281,7 +2270,7 @@ fn test_route_upstream_progress_restores_downstream_token() {
 #[test]
 fn test_anonymous_upstream_cancellation_preserves_active_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
@@ -2312,7 +2301,7 @@ fn test_anonymous_upstream_cancellation_preserves_active_call() {
 #[test]
 fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
@@ -2360,7 +2349,7 @@ fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
 #[test]
 fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
     let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, test_router_config());
+    let router = ToolRouter::new(sm, RouterConfig::default());
 
     router
         .register_active_call(
@@ -2530,7 +2519,7 @@ impl crate::dispatch::DownstreamContext for ScopedTaskDownstream {
 /// branches observably distinct.
 fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut routes = HashMap::new();
     routes.insert(
         "Mock__tool".to_string(),
@@ -3208,7 +3197,7 @@ fn sub_target(id: &str) -> NotificationTarget {
 #[tokio::test]
 async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&["memory://old"]);
     sm.replace_server(
         "mock",
@@ -3272,7 +3261,7 @@ async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog
 #[tokio::test]
 async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&["memory://old"]);
     sm.replace_server(
         "mock",
@@ -3409,7 +3398,7 @@ fn publish_tool_route_snapshot_with_metadata(
 #[tokio::test]
 async fn native_continuation_rejects_route_replacement_before_second_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let mut first = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
     first.protocol_era = crate::protocol::ProtocolEra::Modern;
@@ -3489,7 +3478,7 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
 #[tokio::test]
 async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
     sm.replace_server("modern", upstream).await;
@@ -3574,7 +3563,7 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
     });
     let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
         Arc::clone(&sm),
-        test_router_config(),
+        RouterConfig::default(),
         quotas,
     ));
     let state = SubscribableUpstreamState::new(&[]);
@@ -3616,7 +3605,7 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
 #[tokio::test]
 async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
     sm.replace_server("modern", upstream).await;
@@ -3659,7 +3648,7 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
 #[tokio::test]
 async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     state
         .tool_requires_input
@@ -3724,7 +3713,7 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
 #[tokio::test]
 async fn continuation_keeps_max_byte_reservation_across_larger_second_input_required() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     state
         .tool_requires_input
@@ -3803,7 +3792,7 @@ async fn continuation_keeps_max_byte_reservation_across_larger_second_input_requ
 #[tokio::test]
 async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     state
         .tool_requires_input
@@ -3871,7 +3860,7 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
     });
     let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
         Arc::clone(&sm),
-        test_router_config(),
+        RouterConfig::default(),
         quotas,
     ));
     let state = SubscribableUpstreamState::new(&[]);
@@ -3938,7 +3927,7 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
     });
     let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
         Arc::clone(&sm),
-        test_router_config(),
+        RouterConfig::default(),
         quotas,
     ));
     let state = SubscribableUpstreamState::new(&[]);
@@ -3997,7 +3986,7 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
 #[tokio::test]
 async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
     let state = SubscribableUpstreamState::new(&[]);
     let mut upstream = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
     upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
@@ -4027,8 +4016,10 @@ async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect()
 #[tokio::test]
 async fn invoke_meta_tool_applies_pair_suppression_to_resolved_target() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = Arc::new(ToolRouter::new(Arc::clone(&sm), config));
     let state = SubscribableUpstreamState::new(&[]);
     let mut upstream = connect_subscribable_upstream("modern", Arc::clone(&state)).await;
@@ -4059,8 +4050,10 @@ async fn invoke_meta_tool_applies_pair_suppression_to_resolved_target() {
 #[tokio::test]
 async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = Arc::new(ToolRouter::new(Arc::clone(&sm), config));
     let state = SubscribableUpstreamState::new(&[]);
     state
@@ -4105,7 +4098,7 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
 #[tokio::test]
 async fn refresh_rebind_with_racing_last_unsubscribe_leaves_no_orphan() {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x", "memory://y"]);
     let new_state = SubscribableUpstreamState::new(&[]);
@@ -4206,7 +4199,7 @@ async fn setup_subscribe_racing_prune() -> (
     Arc<SubscribableUpstreamState>,
 ) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x"]);
     sm.replace_server(
@@ -4335,7 +4328,7 @@ async fn setup_refresh_parked_pre_publish() -> (
     tokio::task::JoinHandle<()>,
 ) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x", "memory://y"]);
     let new_state = SubscribableUpstreamState::new(&[]);
@@ -4572,7 +4565,7 @@ async fn setup_two_owner_router() -> (
     Arc<SubscribableUpstreamState>,
 ) {
     let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
 
     let old_state = SubscribableUpstreamState::new(&["memory://x"]);
     let new_state = SubscribableUpstreamState::new(&[]);
@@ -4785,7 +4778,7 @@ async fn failed_heal_migration_propagates_error_to_subscriber() {
 #[test]
 fn dropping_router_releases_subscription_registry() {
     let server_manager = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(server_manager, test_router_config());
+    let router = ToolRouter::new(server_manager, RouterConfig::default());
     let registry = Arc::downgrade(&router.resource_subscriptions);
 
     drop(router);
@@ -4854,8 +4847,10 @@ fn result_text(result: &CallToolResult) -> String {
 
 #[test]
 fn a_client_with_an_allow_list_gets_only_what_is_on_it() {
-    let mut config = test_router_config();
-    config.tool_filter_enabled = false;
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let allowed_tool = |server: &str, tool: &str| crate::config::AllowedTool {
         server: server.to_string(),
@@ -4923,8 +4918,10 @@ fn a_client_with_an_allow_list_gets_only_what_is_on_it() {
 
 #[test]
 fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
-    let mut config = test_router_config();
-    config.tool_filter_enabled = false;
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let listed = |client_key: Option<&str>| {
         tool_names(&router.list_tools_for_client_session(ClientType::ClaudeCode, None, client_key))
@@ -4962,8 +4959,10 @@ fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
 
 #[tokio::test]
 async fn a_blocked_tool_answers_a_call_as_a_tool_that_does_not_exist() {
-    let mut config = test_router_config();
-    config.tool_filter_enabled = false;
+    let config = RouterConfig {
+        tool_filter_enabled: false,
+        ..Default::default()
+    };
     let router = Arc::new(router_with_client_blocks(config));
     let call = |tool: &'static str, client_key: Option<&'static str>| {
         let router = Arc::clone(&router);
@@ -5028,8 +5027,10 @@ async fn a_blocked_tool_answers_a_call_as_a_tool_that_does_not_exist() {
 
 #[tokio::test]
 async fn the_meta_tools_do_not_reach_around_a_block() {
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let cursor = context_for(Some("cursor"));
     let pi = context_for(Some("pi"));
@@ -5106,8 +5107,10 @@ async fn the_meta_tools_do_not_reach_around_a_block() {
 
 #[test]
 fn an_allow_list_leaves_a_client_the_tool_it_searches_with() {
-    let mut config = test_router_config();
-    config.meta_tool_mode = true;
+    let config = RouterConfig {
+        meta_tool_mode: true,
+        ..Default::default()
+    };
     let router = router_with_client_blocks(config);
     let mut clients = std::collections::BTreeMap::new();
     clients.insert(
@@ -5132,7 +5135,7 @@ fn an_allow_list_leaves_a_client_the_tool_it_searches_with() {
 
 #[test]
 fn clients_hear_about_a_block_changing_and_about_nothing_else() {
-    let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
     let mut notifications = router.subscribe_notifications();
     let mut clients = std::collections::BTreeMap::new();
 
@@ -5294,7 +5297,7 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
 /// Two servers, each with a resource, a resource template, and a prompt.
 /// `cursor` is kept from `git`.
 fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
-    let router = ToolRouter::new(Arc::new(ServerManager::new()), test_router_config());
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
     router.replace_snapshot(RouterSnapshot {
         routes: HashMap::new(),
         routes_lower: HashMap::new(),

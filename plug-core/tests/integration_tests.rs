@@ -1513,21 +1513,7 @@ async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
 #[tokio::test]
 async fn test_proxy_handler_refresh_tools_empty() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(
-        sm,
-        plug_core::proxy::RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: plug_core::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        },
-    );
+    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
     handler.refresh_tools().await;
 
     let info = handler.get_info();
@@ -1735,21 +1721,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
 #[test]
 fn test_proxy_handler_get_info() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(
-        sm,
-        plug_core::proxy::RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: plug_core::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        },
-    );
+    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
     let info = handler.get_info();
 
     assert_eq!(info.server_info.name, "plug");
@@ -1778,21 +1750,7 @@ async fn test_server_manager_tools_empty() {
 #[test]
 fn test_resources_capability_omitted_until_upstream_support() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(
-        sm,
-        plug_core::proxy::RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: plug_core::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        },
-    );
+    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
     let info = handler.get_info();
 
     assert!(
@@ -1804,21 +1762,7 @@ fn test_resources_capability_omitted_until_upstream_support() {
 #[test]
 fn test_prompts_not_advertised() {
     let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(
-        sm,
-        plug_core::proxy::RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: plug_core::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        },
-    );
+    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
     let info = handler.get_info();
 
     // prompts is None in capabilities (default), which means list_prompts

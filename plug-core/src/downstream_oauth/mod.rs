@@ -5865,18 +5865,7 @@ mod tests {
         let server_manager = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
+            crate::proxy::RouterConfig::default(),
         ));
         router.replace_snapshot(crate::proxy::RouterSnapshot {
             routes_lower: HashMap::new(),

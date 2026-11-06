@@ -3068,21 +3068,7 @@ mod tests {
         manager: crate::downstream_oauth::DownstreamOauthManager,
     ) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -3370,18 +3356,7 @@ mod tests {
     }
 
     fn test_state() -> Arc<HttpState> {
-        test_state_with_router_config(crate::proxy::RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: crate::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        })
+        test_state_with_router_config(crate::proxy::RouterConfig::default())
     }
 
     fn enable_test_task_surface(router: &ToolRouter) {
@@ -5053,21 +5028,7 @@ mod tests {
         let sessions = GateSecondValidateSessionStore::new();
         let session_id = sessions.create_session().unwrap();
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router: Arc::clone(&router),
             sessions: Arc::clone(&sessions) as Arc<dyn SessionStore>,
@@ -5330,21 +5291,7 @@ mod tests {
     #[tokio::test]
     async fn origin_allowlisted_external_origin_accepted() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -5528,18 +5475,12 @@ mod tests {
 
     #[tokio::test]
     async fn http_tools_list_uses_meta_tool_mode_surface() {
-        let state = test_state_with_router_config(crate::proxy::RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: true,
-            lazy_tools: crate::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        });
+        let state = test_state_with_router_config(crate::proxy::RouterConfig::from(
+            &crate::config::Config {
+                meta_tool_mode: true,
+                ..Default::default()
+            },
+        ));
 
         state.router.replace_snapshot(crate::proxy::RouterSnapshot {
             routes_lower: HashMap::new(),
@@ -6451,21 +6392,7 @@ mod tests {
 
     fn test_state_with_auth(token: &str) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -6580,21 +6507,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_mode_metadata_endpoint_returns_server_metadata() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -6644,21 +6557,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_mode_metadata_advertises_public_clients_only() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -6708,21 +6607,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_protected_resource_metadata_endpoint_returns_rfc9728_metadata() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -7937,21 +7822,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_client_credentials_flow_is_rejected() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -7996,21 +7867,7 @@ mod tests {
     #[tokio::test]
     async fn oauth_mode_requires_access_token_for_mcp_requests() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
@@ -8611,21 +8468,7 @@ mod tests {
     #[tokio::test]
     async fn discovery_server_card_when_unauth_on_oauth_protected_server_is_static() {
         let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(
-            sm,
-            crate::proxy::RouterConfig {
-                enable_prefix: true,
-                prefix_delimiter: "__".to_string(),
-                priority_tools: Vec::new(),
-                disabled_tools: Vec::new(),
-                tool_description_max_chars: None,
-                tool_search_threshold: 50,
-                meta_tool_mode: false,
-                lazy_tools: crate::config::LazyToolsConfig::default(),
-                tool_filter_enabled: true,
-                enrichment_servers: std::collections::HashSet::new(),
-            },
-        ));
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
         let state = Arc::new(HttpState {
             router,
             sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),

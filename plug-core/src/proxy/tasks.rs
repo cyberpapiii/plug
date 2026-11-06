@@ -1307,21 +1307,6 @@ mod tests {
     use crate::legacy_tasks::{Task, TaskStatus};
     use rmcp::model::PingRequest;
 
-    fn test_router_config() -> RouterConfig {
-        RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        }
-    }
-
     /// Drop guard that flips a flag when the future holding it stops
     /// running — this is how the tests below prove an aborted task's future
     /// actually stopped executing, rather than merely proving its store
@@ -1350,7 +1335,7 @@ mod tests {
 
     async fn assert_owner_teardown_aborts_long_running_local_task(owner: TaskOwner) {
         let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(sm, test_router_config());
+        let router = ToolRouter::new(sm, RouterConfig::default());
 
         let dropped = Arc::new(AtomicBool::new(false));
         let observer = AbortObserver(Arc::clone(&dropped));
@@ -1405,7 +1390,7 @@ mod tests {
     #[tokio::test]
     async fn cleanup_tasks_for_owner_ignores_other_owners_running_tasks() {
         let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(sm, test_router_config());
+        let router = ToolRouter::new(sm, RouterConfig::default());
         let owner_a = ToolRouter::task_owner_for_http_session("session-a");
         let owner_b = ToolRouter::task_owner_for_http_session("session-b");
 
@@ -1799,7 +1784,7 @@ mod tests {
     async fn cleanup_is_bounded_and_aborts_local_tasks_before_hung_upstream_cancel() {
         let state = GatedTaskUpstreamState::new(true, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "hung",
             connect_gated_task_upstream("hung", Arc::clone(&state), 5).await,
@@ -1874,7 +1859,7 @@ mod tests {
     async fn stale_live_task_expiry_sends_bounded_upstream_cancellation() {
         let state = GatedTaskUpstreamState::new(true, false);
         let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(Arc::clone(&sm), test_router_config());
+        let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
         sm.replace_server(
             "expiry-upstream",
             connect_gated_task_upstream("expiry-upstream", Arc::clone(&state), 5).await,
@@ -1919,7 +1904,7 @@ mod tests {
     async fn cancel_task_for_owner_is_bounded_when_upstream_cancel_hangs() {
         let state = GatedTaskUpstreamState::new(true, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "hung",
             connect_gated_task_upstream("hung", Arc::clone(&state), 5).await,
@@ -1967,7 +1952,7 @@ mod tests {
     async fn native_enqueue_racing_teardown_cancels_upstream_and_returns_error() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2056,7 +2041,7 @@ mod tests {
     async fn native_enqueue_bounds_request_handle_acquisition() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         let (upstream, _frozen_runtime) =
             connect_frozen_task_upstream("mock", Arc::clone(&state), 2);
         let peer = upstream.client.peer().clone();
@@ -2174,7 +2159,7 @@ mod tests {
     async fn modern_downstream_forces_local_wrapper_around_legacy_native_upstream() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2223,7 +2208,7 @@ mod tests {
     async fn modern_get_inlines_result_for_legacy_passthrough_completed_in_same_process() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server("mock", connect_gated_task_upstream("mock", state, 5).await)
             .await;
         let owner = TaskOwner::new(Arc::<str>::from("shared-durable-principal"));
@@ -2282,7 +2267,7 @@ mod tests {
         let sm = Arc::new(ServerManager::new());
         let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
             sm,
-            test_router_config(),
+            RouterConfig::default(),
             quotas,
         ));
         install_single_route(&router, "Mock__echo", "missing", "echo");
@@ -2326,7 +2311,7 @@ mod tests {
         let sm = Arc::new(ServerManager::new());
         let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
             sm,
-            test_router_config(),
+            RouterConfig::default(),
             quotas,
         ));
         install_single_route(&router, "Mock__echo", "missing", "echo");
@@ -2363,7 +2348,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_refuses_when_owner_liveness_probe_reports_closed() {
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
+        let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
         let owner = ToolRouter::task_owner_for_http_session("session-already-gone");
 
         let probe: OwnerLivenessProbe = Arc::new(|| false);
@@ -2403,7 +2388,7 @@ mod tests {
     async fn hung_native_create_is_bounded_and_cancels_upstream_request() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 2).await,
@@ -2474,7 +2459,7 @@ mod tests {
     async fn native_create_reaper_cancels_late_created_upstream_task() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2513,7 +2498,7 @@ mod tests {
     async fn dropped_enqueue_caller_does_not_orphan_native_create() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2691,7 +2676,7 @@ mod tests {
     async fn record_vanishing_between_send_and_record_cancels_upstream_request() {
         let state = GatedCallUpstreamState::new();
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
@@ -2774,7 +2759,7 @@ mod tests {
     async fn abort_between_send_and_record_fires_cancel_guard() {
         let state = GatedCallUpstreamState::new();
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
