@@ -322,7 +322,8 @@ pub(crate) async fn apply_server_mutation(
     }
 
     crate::runtime::ensure_daemon_with_feedback(None, false).await?;
-    let auth_token = crate::daemon::read_auth_token()?;
+    // `ipc_client` puts the daemon token in.
+    let auth_token = String::new();
     let request = match mutation {
         plug_core::operator::OperatorMutation::AddServer { name, server } => {
             plug_core::ipc::IpcRequest::AddServer {
@@ -408,7 +409,7 @@ pub(crate) async fn apply_server_mutation(
             anyhow::bail!("Plug stores tool blocks by server itself")
         }
     };
-    match crate::daemon::ipc_request(&request).await? {
+    match crate::ipc_client::request(request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),
         plug_core::ipc::IpcResponse::Error { message, .. } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected daemon response: {other:?}"),

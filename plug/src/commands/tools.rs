@@ -108,7 +108,7 @@ pub(crate) async fn cmd_tool_disable(
     if patterns.is_empty() {
         ensure_daemon_with_feedback(config_path, true).await?;
         let mut all_tools: Vec<String> = if let Ok(plug_core::ipc::IpcResponse::Tools { tools }) =
-            crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::ListTools).await
+            crate::ipc_client::request(plug_core::ipc::IpcRequest::ListTools).await
         {
             tools
                 .into_iter()

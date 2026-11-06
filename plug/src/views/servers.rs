@@ -5,7 +5,7 @@ use crate::OutputFormat;
 use crate::commands::servers::{
     cmd_server_add, cmd_server_edit, cmd_server_remove, cmd_server_set_enabled,
 };
-use crate::runtime::daemon_query;
+use crate::ipc_client;
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_reason, status_label, status_marker, summarize_server_auth,
@@ -94,8 +94,8 @@ pub(crate) async fn cmd_server_list(
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
 
     loop {
-        let (availability, live_status) = daemon_query(
-            &plug_core::ipc::IpcRequest::Status,
+        let (availability, live_status) = ipc_client::query(
+            plug_core::ipc::IpcRequest::Status,
             |response| match response {
                 plug_core::ipc::IpcResponse::Status { servers, .. } => Some(servers),
                 _ => None,
@@ -267,7 +267,7 @@ pub(crate) async fn cmd_server_list(
                         names.len(),
                         if availability.daemon_reachable() {
                             "runtime inspection failed"
-                        } else if crate::runtime::daemon_starting() {
+                        } else if crate::ipc_client::daemon_starting() {
                             "daemon is starting"
                         } else {
                             "daemon not running"

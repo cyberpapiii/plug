@@ -2,7 +2,6 @@
 
 use std::sync::Arc;
 
-use rmcp::ErrorData as McpError;
 use rmcp::model::RequestId;
 
 use plug_core::dispatch::IpcContext;
@@ -57,24 +56,6 @@ pub(super) fn ipc_context(
     context
 }
 
-/// An MCP answer as an IPC frame. An error rides the same `McpResponse`
-/// channel, told apart by its `code` field.
-pub(super) fn ipc_from_mcp_result(result: Result<serde_json::Value, McpError>) -> IpcResponse {
-    let payload = match result {
-        Ok(payload) => payload,
-        Err(error) => match serde_json::to_value(error) {
-            Ok(payload) => payload,
-            Err(error) => {
-                return IpcResponse::Error {
-                    code: "SERIALIZE_ERROR".to_string(),
-                    message: error.to_string(),
-                };
-            }
-        },
-    };
-    IpcResponse::McpResponse { payload }
-}
-
 pub(super) async fn dispatch_mcp_request(
     ctx: &ConnectionContext,
     session_id: &str,
@@ -89,29 +70,8 @@ pub(super) async fn dispatch_mcp_request(
     // with less than the daemon has.
     ctx.engine.wait_until_ready().await;
     let context = ipc_context(ctx, session_id, request_context);
-    ipc_from_mcp_result(
+    IpcResponse::from_mcp_result(
         plug_core::dispatch::handle(ctx.engine.tool_router(), &context, method, params.cloned())
             .await,
     )
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mcp_errors_ride_the_mcp_response_channel() {
-        let ok = ipc_from_mcp_result(Ok(serde_json::json!({ "ok": true })));
-        let IpcResponse::McpResponse { payload } = ok else {
-            panic!("expected McpResponse for Ok, got {ok:?}");
-        };
-        assert_eq!(payload, serde_json::json!({ "ok": true }));
-
-        let err = ipc_from_mcp_result(Err(McpError::invalid_params("boom".to_string(), None)));
-        let IpcResponse::McpResponse { payload } = err else {
-            panic!("expected McpResponse for Err, got {err:?}");
-        };
-        assert_eq!(payload["code"].as_i64(), Some(-32602));
-        assert_eq!(payload["message"].as_str(), Some("boom"));
-    }
 }

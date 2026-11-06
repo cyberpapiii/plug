@@ -5,7 +5,7 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::config::load_editable_config;
 use crate::commands::tools::prompt_tool_actions;
-use crate::runtime::daemon_query;
+use crate::ipc_client;
 use crate::ui::{
     can_prompt_interactively, print_banner, print_heading, print_info_line, print_label_value,
     print_wrapped_rows, terminal_width,
@@ -135,8 +135,8 @@ pub(crate) async fn cmd_tool_list(
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
 
     loop {
-        let (status_availability, runtime_status) = daemon_query(
-            &plug_core::ipc::IpcRequest::Status,
+        let (status_availability, runtime_status) = ipc_client::query(
+            plug_core::ipc::IpcRequest::Status,
             |response| match response {
                 plug_core::ipc::IpcResponse::Status { servers, .. } => Some(
                     servers
@@ -159,8 +159,8 @@ pub(crate) async fn cmd_tool_list(
             .unwrap_or(0);
         let runtime_available = status_availability.runtime_available();
         let runtime_servers = runtime_status.unwrap_or_default();
-        let (tools_availability, tools_result) = daemon_query(
-            &plug_core::ipc::IpcRequest::ListTools,
+        let (tools_availability, tools_result) = ipc_client::query(
+            plug_core::ipc::IpcRequest::ListTools,
             |response| match response {
                 plug_core::ipc::IpcResponse::Tools { tools } => Some(
                     tools

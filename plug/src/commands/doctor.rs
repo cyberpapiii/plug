@@ -498,11 +498,13 @@ async fn bounded_ipc_probe<F>(
     name: &str,
 ) -> anyhow::Result<plug_core::ipc::IpcResponse>
 where
-    F: std::future::Future<Output = anyhow::Result<plug_core::ipc::IpcResponse>>,
+    F: std::future::Future<
+            Output = Result<plug_core::ipc::IpcResponse, crate::ipc_client::IpcClientError>,
+        >,
 {
-    tokio::time::timeout(timeout, future)
+    Ok(tokio::time::timeout(timeout, future)
         .await
-        .map_err(|_| anyhow::anyhow!("{name} timed out after {}ms", timeout.as_millis()))?
+        .map_err(|_| anyhow::anyhow!("{name} timed out after {}ms", timeout.as_millis()))??)
 }
 
 async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
@@ -526,7 +528,7 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
         }
     };
     let handshake = bounded_ipc_probe(
-        crate::daemon::ipc_request(&IpcRequest::OperatorHandshake {
+        crate::ipc_client::request(IpcRequest::OperatorHandshake {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
             ipc_min: OPERATOR_IPC_MIN,
             ipc_max: OPERATOR_IPC_MAX,
@@ -554,7 +556,7 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
         }
     };
     let live_sessions = bounded_ipc_probe(
-        crate::daemon::ipc_request(&IpcRequest::ListLiveSessions),
+        crate::ipc_client::request(IpcRequest::ListLiveSessions),
         std::time::Duration::from_secs(2),
         "adapter session inspection",
     )
@@ -666,9 +668,9 @@ fn inspect_linked_clients(
 
 async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckResult> {
     let mut checks = Vec::new();
-    let daemon_reachable = crate::runtime::daemon_running().await;
-    let status_response = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await;
-    let auth_response = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await;
+    let daemon_reachable = crate::ipc_client::daemon_running().await;
+    let status_response = crate::ipc_client::request(plug_core::ipc::IpcRequest::Status).await;
+    let auth_response = crate::ipc_client::request(plug_core::ipc::IpcRequest::AuthStatus).await;
 
     if daemon_reachable
         && !matches!(
@@ -715,9 +717,9 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
         checks.extend(runtime_auth_checks(&servers));
     }
 
-    if daemon_reachable && let Ok(auth_token) = crate::daemon::read_auth_token() {
-        let snapshot = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot {
-            auth_token,
+    if daemon_reachable {
+        let snapshot = crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
+            auth_token: String::new(),
         })
         .await;
         if let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) = snapshot {
@@ -1485,7 +1487,9 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn unified_install_ipc_probe_timeout_is_bounded() {
         let result = super::bounded_ipc_probe(
-            std::future::pending::<anyhow::Result<plug_core::ipc::IpcResponse>>(),
+            std::future::pending::<
+                Result<plug_core::ipc::IpcResponse, crate::ipc_client::IpcClientError>,
+            >(),
             std::time::Duration::from_secs(2),
             "operator handshake",
         )

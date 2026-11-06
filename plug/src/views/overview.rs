@@ -2,9 +2,8 @@ use dialoguer::console::style;
 
 use crate::OutputFormat;
 use crate::commands::clients::{link_transport, linked_clients};
-use crate::runtime::{
-    LiveClientSupport, daemon_query, daemon_running, fetch_live_sessions, live_inventory_metadata,
-};
+use crate::ipc_client::{self, daemon_running};
+use crate::runtime::{LiveClientSupport, fetch_live_sessions, live_inventory_metadata};
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
     print_reason, print_warning_line, status_label, status_marker, summarize_server_auth,
@@ -260,7 +259,7 @@ pub(crate) async fn cmd_overview(
     let inventory = live_inventory_metadata(&live_clients, live_inventory_scope);
 
     if matches!(output, OutputFormat::Json) {
-        let daemon_running = crate::daemon::connect_to_daemon().await.is_some();
+        let daemon_running = crate::ipc_client::daemon_running().await;
         let config = if config_exists {
             plug_core::config::load_config(Some(&config_path)).ok()
         } else {
@@ -303,7 +302,7 @@ pub(crate) async fn cmd_overview(
     }
 
     let config = plug_core::config::load_config(Some(&config_path))?;
-    let daemon_running = crate::daemon::connect_to_daemon().await.is_some();
+    let daemon_running = crate::ipc_client::daemon_running().await;
     let transport_counts =
         config
             .servers
@@ -359,7 +358,7 @@ pub(crate) async fn cmd_overview(
         "Service",
         if daemon_running {
             style("running").green().bold()
-        } else if crate::runtime::daemon_starting() {
+        } else if crate::ipc_client::daemon_starting() {
             style("starting").yellow().bold()
         } else {
             style("stopped").yellow().bold()
@@ -474,8 +473,8 @@ pub(crate) async fn cmd_status(
         Some((token_path.exists(), token))
     });
 
-    let (status_availability, live_status) = daemon_query(
-        &plug_core::ipc::IpcRequest::Status,
+    let (status_availability, live_status) = ipc_client::query(
+        plug_core::ipc::IpcRequest::Status,
         |response| match response {
             plug_core::ipc::IpcResponse::Status {
                 servers,
@@ -680,7 +679,7 @@ pub(crate) async fn cmd_status(
                 &servers,
                 live_client_support,
                 true,
-                crate::runtime::DaemonQueryAvailability::Available.status_source(),
+                crate::ipc_client::DaemonQueryAvailability::Available.status_source(),
                 daemon_running,
                 resource_subscriptions,
             );

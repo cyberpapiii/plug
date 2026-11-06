@@ -3,9 +3,8 @@ use dialoguer::console::style;
 
 use crate::OutputFormat;
 use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
-use crate::runtime::{
-    LiveClientSupport, daemon_running, fetch_live_sessions, live_inventory_metadata,
-};
+use crate::ipc_client::daemon_running;
+use crate::runtime::{LiveClientSupport, fetch_live_sessions, live_inventory_metadata};
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_success_line, print_warning_line,
@@ -347,7 +346,7 @@ pub(crate) async fn cmd_client_list(
     loop {
         let daemon_error = if daemon_running().await {
             None
-        } else if crate::runtime::daemon_starting() {
+        } else if crate::ipc_client::daemon_starting() {
             Some("daemon is starting".to_string())
         } else {
             Some("daemon not running".to_string())
