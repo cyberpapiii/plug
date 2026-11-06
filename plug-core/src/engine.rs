@@ -16,20 +16,12 @@ use tokio_util::task::TaskTracker;
 use crate::config::{Config, ServerConfig};
 use crate::health::{Monitor, Reconnect, Recovery};
 use crate::proxy::{RouterConfig, ToolRouter};
-use crate::reload::{ReloadReport, server_config_changed};
+use crate::reload::{ReloadReport, ServerChange, server_change};
 use crate::server::{ServerManager, UpstreamEvents, UpstreamServer, retire_upstream_owned};
 use crate::supervision::Supervision;
 use crate::types::{ServerHealth, ServerStatus};
 
 const ARTIFACT_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Read-only, Clone-able snapshot of Engine state.
-#[derive(Clone, Debug)]
-pub struct EngineSnapshot {
-    pub servers: Vec<ServerStatus>,
-    pub tool_count: usize,
-    pub uptime: Duration,
-}
 
 /// The core runtime that owns all shared state.
 ///
@@ -124,7 +116,7 @@ impl Engine {
     /// Start every enabled server and the background work that keeps them up.
     ///
     /// Every task goes on `self.tracker`, so shutdown can wait for them.
-    pub async fn start(self: &Arc<Self>) -> Result<(), anyhow::Error> {
+    pub async fn start(self: &Arc<Self>) {
         let config = self.config.load();
 
         // Each server's health task starts as soon as that server's own start
@@ -176,8 +168,6 @@ impl Engine {
         // construction, and `send` refuses to update a channel with no
         // receivers, which would leave every later subscriber waiting forever.
         self.ready.send_replace(true);
-
-        Ok(())
     }
 
     /// Bounded shutdown: cancel tasks, give background work a short drain window,
@@ -193,13 +183,9 @@ impl Engine {
         self.server_manager.shutdown_all().await;
     }
 
-    /// Get a read-only snapshot of the current Engine state.
-    pub fn snapshot(&self) -> EngineSnapshot {
-        EngineSnapshot {
-            servers: self.server_manager.server_statuses(),
-            tool_count: self.tool_router.tool_count(),
-            uptime: self.started_at.elapsed(),
-        }
+    /// When this engine was created.
+    pub fn started_at(&self) -> Instant {
+        self.started_at
     }
 
     /// Return status information for all upstream servers.
@@ -277,7 +263,7 @@ impl Engine {
     ///
     /// Holds `reload_lock`, so a reload is wholly before or after the commit,
     /// and must not be called with it held (tokio's `Mutex` is not
-    /// reentrant). Staleness is judged by `server_config_changed`, the
+    /// reentrant). Staleness is judged by `server_change`, the
     /// predicate reload uses to decide which servers to restart: reload has
     /// already acted on exactly those, and only those, so a change it ignores
     /// must still commit, or a working reconnection would be thrown away.
@@ -295,7 +281,10 @@ impl Engine {
             == crate::config::UpstreamProtocolMode::Legacy
             || upstream.protocol_gate_state == self.server_manager.modern_upstream_gate_state();
         match current.servers.get(server_id) {
-            Some(cfg) if !server_config_changed(connected_with, cfg) && gate_is_current => {
+            Some(cfg)
+                if server_change(connected_with, cfg) != ServerChange::Restart
+                    && gate_is_current =>
+            {
                 // Settings a reload applies live may have moved meanwhile.
                 upstream.config = cfg.clone();
                 self.server_manager
@@ -414,28 +403,6 @@ impl Engine {
     /// that saw the connection go bad in a way health checks do not.
     pub fn recover_server(&self, server_id: &str) {
         self.health.recover(server_id);
-    }
-
-    /// Enable or disable a server. Clones the current config, toggles the
-    /// `enabled` field, and applies via `reload_config` for a clean diff.
-    pub async fn set_server_enabled(
-        self: &Arc<Self>,
-        server_id: &str,
-        enabled: bool,
-    ) -> Result<(), anyhow::Error> {
-        let mut new_config = (**self.config.load()).clone();
-        let server = new_config
-            .servers
-            .get_mut(server_id)
-            .ok_or_else(|| anyhow::anyhow!("unknown server: {server_id}"))?;
-
-        if server.enabled == enabled {
-            return Ok(()); // No change needed
-        }
-
-        server.enabled = enabled;
-        self.reload_config(new_config).await;
-        Ok(())
     }
 
     /// Hand the engine the watch events the daemon opened, so operator
@@ -1127,7 +1094,7 @@ mod tests {
         config
     }
 
-    /// `tools` feeds `args`, which `server_config_changed` compares;
+    /// `tools` feeds `args`, which `server_change` compares;
     /// `max_concurrent` is a field it omits.
     fn mock_stdio_server_config(tools: &str, max_concurrent: usize) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
@@ -1169,7 +1136,7 @@ mod tests {
     async fn settings_that_need_no_restart_apply_to_the_running_server() {
         let config = mock_stdio_config("foo", "echo");
         let engine = Engine::new(config.clone());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let before = engine
             .server_manager()
             .get_upstream("foo")
@@ -1463,13 +1430,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn engine_shutdown_without_start() {
-        let engine = Engine::new(test_config());
-        // Should not panic even without start()
-        engine.shutdown().await;
-    }
-
-    #[tokio::test]
     async fn engine_restart_rate_limit() {
         let engine = Engine::new(test_config());
         let _ = engine.restart_server("test-server").await;
@@ -1491,7 +1451,7 @@ mod tests {
     #[tokio::test]
     async fn engine_restart_respawns_refresh_loop_for_oauth_server() {
         let engine = Engine::new(oauth_mock_stdio_config());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let refresh_tasks = &engine.supervision().refresh_tasks;
         let before = refresh_tasks.current("oauth-mock");
         assert!(before.is_some());
@@ -1505,54 +1465,6 @@ mod tests {
         assert!(after.is_some() && after != before);
 
         engine.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn engine_set_server_enabled_unknown() {
-        let engine = Engine::new(test_config());
-        let result = engine.set_server_enabled("nonexistent", true).await;
-        assert!(result.is_err());
-    }
-
-    #[tokio::test]
-    async fn engine_set_server_enabled_noop() {
-        use crate::config::ServerConfig;
-
-        let mut config = Config::default();
-        config.servers.insert(
-            "test".to_string(),
-            ServerConfig {
-                command: Some("test-server".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let engine = Engine::new(config);
-        // Already enabled — should be a no-op
-        let result = engine.set_server_enabled("test", true).await;
-        assert!(result.is_ok());
-    }
-
-    #[tokio::test]
-    async fn engine_set_server_enabled_toggle() {
-        use crate::config::ServerConfig;
-
-        let mut config = Config::default();
-        config.servers.insert(
-            "test".to_string(),
-            ServerConfig {
-                command: Some("test-server".to_string()),
-                ..Default::default()
-            },
-        );
-
-        let engine = Engine::new(config);
-
-        let result = engine.set_server_enabled("test", false).await;
-        assert!(result.is_ok());
-
-        let cfg = engine.config();
-        assert!(!cfg.servers["test"].enabled);
     }
 
     #[tokio::test]
@@ -1871,7 +1783,7 @@ HOME_DIR = "$HOME"
         use crate::config::ServerConfig;
 
         let engine = Engine::new(Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         let mut new_config = Config::default();
         new_config.servers.insert(
@@ -1907,76 +1819,6 @@ HOME_DIR = "$HOME"
         engine.shutdown().await;
     }
 
-    /// Verify that concurrent reads (snapshot, server_statuses, tool list) remain
-    /// safe while reload_config removes/adds servers. The ArcSwap-based design
-    /// guarantees wait-free reads; this test documents that invariant.
-    #[tokio::test]
-    async fn concurrent_reads_during_reload() {
-        use crate::config::ServerConfig;
-
-        use std::sync::atomic::{AtomicBool, Ordering};
-
-        // Config A: has "alpha" server (will be removed by reload)
-        let mut config_a = Config::default();
-        config_a.servers.insert(
-            "alpha".to_string(),
-            ServerConfig {
-                command: Some("test-server".to_string()),
-                ..Default::default()
-            },
-        );
-
-        // Config B: empty (removes "alpha")
-        let config_b = Config::default();
-
-        let engine = Engine::new(config_a);
-        let done = Arc::new(AtomicBool::new(false));
-
-        // Spawn reader tasks that continuously call snapshot/server_statuses/tool list
-        let mut readers = Vec::new();
-        for _ in 0..4 {
-            let eng = engine.clone();
-            let done_flag = done.clone();
-            readers.push(tokio::spawn(async move {
-                let mut iterations = 0u64;
-                while !done_flag.load(Ordering::Relaxed) {
-                    let _snap = eng.snapshot();
-                    let _statuses = eng.server_statuses();
-                    let _tools = eng
-                        .tool_router()
-                        .list_tools_for_client(crate::types::ClientType::Unknown);
-                    iterations += 1;
-                    // Yield to avoid starving the reload task
-                    if iterations.is_multiple_of(100) {
-                        tokio::task::yield_now().await;
-                    }
-                }
-                iterations
-            }));
-        }
-
-        // Run several reload cycles concurrently with the readers
-        // (reload with empty config — no actual MCP servers to start/stop,
-        // but it exercises the full config diff + swap + event path)
-        for _ in 0..10 {
-            let _ = engine.reload_config(config_b.clone()).await;
-            tokio::task::yield_now().await;
-        }
-
-        // Signal readers to stop
-        done.store(true, Ordering::Relaxed);
-
-        // All readers should complete without panic
-        for handle in readers {
-            let iterations = handle.await.expect("reader task panicked");
-            assert!(iterations > 0, "reader should have executed at least once");
-        }
-
-        // Config should reflect the last reload (empty)
-        let snap = engine.snapshot();
-        assert!(snap.servers.is_empty());
-    }
-
     /// The daemon binds its socket before `start` runs and gates capability
     /// negotiation on this signal, so a readiness flag that never flips would
     /// hang every MCP request instead of answering late.
@@ -1989,7 +1831,7 @@ HOME_DIR = "$HOME"
             let engine = engine.clone();
             tokio::spawn(async move { engine.wait_until_ready().await })
         };
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         assert!(engine.is_ready());
         tokio::time::timeout(Duration::from_secs(5), waiting)

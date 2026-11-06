@@ -4,14 +4,15 @@
 //! Reload is triggered by:
 //! - `plug reload` CLI command via daemon IPC
 //! - File watcher (`watcher.rs`, 500ms debounce via `notify`)
+//! - Operator mutations and tool-block pinning, which write the config and
+//!   reload it themselves
 
 use std::collections::HashSet;
 
-use crate::config::{Config, ServerConfig, UpstreamProtocolMode};
+use crate::config::{Config, HttpConfig, ServerConfig, UpstreamProtocolMode};
 
-/// Diff result between old and new configs.
 #[derive(Debug, Clone)]
-pub struct ConfigDiff {
+pub(crate) struct ConfigDiff {
     pub added: Vec<(String, ServerConfig)>,
     pub removed: Vec<String>,
     /// Servers to stop and start again with their new config.
@@ -98,13 +99,7 @@ pub(crate) fn server_change(old: &ServerConfig, new: &ServerConfig) -> ServerCha
     }
 }
 
-/// Whether `new` needs the server restarted to take effect.
-pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
-    server_change(old, new) == ServerChange::Restart
-}
-
-/// Compare two configs and return the diff.
-pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
+pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     let old_names: HashSet<&String> = old.servers.keys().collect();
     let new_names: HashSet<&String> = new.servers.keys().collect();
 
@@ -140,92 +135,7 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         }
     }
 
-    let mut restart_required = Vec::new();
-    note_restart_required(
-        &mut restart_required,
-        old.http.bind_address != new.http.bind_address,
-        "http.bind_address changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.http.port != new.http.port,
-        "http.port changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.http.allowed_origins != new.http.allowed_origins,
-        "http.allowed_origins changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.http.session_timeout_secs != new.http.session_timeout_secs,
-        "http.session_timeout_secs changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.http.max_sessions != new.http.max_sessions,
-        "http.max_sessions changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.http.sse_channel_capacity != new.http.sse_channel_capacity,
-        "http.sse_channel_capacity changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.prefix_delimiter != new.prefix_delimiter,
-        "prefix_delimiter changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.tool_filter_enabled != new.tool_filter_enabled,
-        "tool_filter_enabled changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.tool_description_max_chars != new.tool_description_max_chars,
-        "tool_description_max_chars changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.tool_search_threshold != new.tool_search_threshold,
-        "tool_search_threshold changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.meta_tool_mode != new.meta_tool_mode,
-        "meta_tool_mode changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.lazy_tools != new.lazy_tools,
-        "lazy_tools changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.priority_tools != new.priority_tools,
-        "priority_tools changed",
-    );
-    note_restart_required(
-        &mut restart_required,
-        old.disabled_tools != new.disabled_tools,
-        "disabled_tools changed",
-    );
-
-    let enriched = |config: &Config| -> std::collections::BTreeSet<String> {
-        config
-            .servers
-            .iter()
-            .filter(|(_, server)| server.enrichment)
-            .map(|(name, _)| name.clone())
-            .collect()
-    };
-    note_restart_required(
-        &mut restart_required,
-        enriched(old) != enriched(new),
-        "servers.*.enrichment changed",
-    );
-
+    let restart_required = settings_needing_restart(old, new);
     let settings_changed = !restart_required.is_empty()
         || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled
         || old.modern_upstream_enabled != new.modern_upstream_enabled;
@@ -241,10 +151,118 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     }
 }
 
-fn note_restart_required(restart_required: &mut Vec<String>, changed: bool, setting: &str) {
-    if changed {
-        restart_required.push(format!("{setting} (restart required)"));
-    }
+/// The settings outside `servers` that changed and are read only when Plug
+/// starts. The destructuring names every field of [`Config`] and
+/// [`HttpConfig`], so a field added to either does not compile until it is
+/// classified here as live or restart-only.
+fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
+    let Config {
+        log_level,
+        prefix_delimiter,
+        enable_prefix,
+        // Read by each reload's server starts.
+        startup_concurrency: _,
+        tool_filter_enabled,
+        tool_description_max_chars,
+        tool_search_threshold,
+        meta_tool_mode,
+        lazy_tools,
+        priority_tools,
+        disabled_tools,
+        // Applied by `Engine::store_config`.
+        clients: _,
+        secrets: _,
+        modern_upstream_enabled: _,
+        // Watches and supervision policy are read from the live config.
+        events: _,
+        supervision: _,
+        // Classified per server by `server_change`, except `enrichment` below.
+        servers: _,
+        http,
+    } = new;
+    let HttpConfig {
+        slack_events,
+        // Applied by `Engine::store_config`.
+        modern_downstream_enabled: _,
+        auth_mode,
+        public_base_url,
+        oauth_scopes,
+        bind_address,
+        port,
+        allowed_origins,
+        tls_cert_path,
+        tls_key_path,
+        session_timeout_secs,
+        max_sessions,
+        sse_channel_capacity,
+    } = http;
+
+    let enriched = |config: &Config| -> std::collections::BTreeSet<String> {
+        config
+            .servers
+            .iter()
+            .filter(|(_, server)| server.enrichment)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+
+    let old_http = &old.http;
+    [
+        ("log_level", *log_level != old.log_level),
+        ("http.bind_address", *bind_address != old_http.bind_address),
+        ("http.port", *port != old_http.port),
+        (
+            "http.allowed_origins",
+            *allowed_origins != old_http.allowed_origins,
+        ),
+        ("http.auth_mode", *auth_mode != old_http.auth_mode),
+        (
+            "http.public_base_url",
+            *public_base_url != old_http.public_base_url,
+        ),
+        ("http.oauth_scopes", *oauth_scopes != old_http.oauth_scopes),
+        (
+            "http.tls_cert_path",
+            *tls_cert_path != old_http.tls_cert_path,
+        ),
+        ("http.tls_key_path", *tls_key_path != old_http.tls_key_path),
+        ("http.slack_events", *slack_events != old_http.slack_events),
+        (
+            "http.session_timeout_secs",
+            *session_timeout_secs != old_http.session_timeout_secs,
+        ),
+        ("http.max_sessions", *max_sessions != old_http.max_sessions),
+        (
+            "http.sse_channel_capacity",
+            *sse_channel_capacity != old_http.sse_channel_capacity,
+        ),
+        (
+            "prefix_delimiter",
+            *prefix_delimiter != old.prefix_delimiter,
+        ),
+        ("enable_prefix", *enable_prefix != old.enable_prefix),
+        (
+            "tool_filter_enabled",
+            *tool_filter_enabled != old.tool_filter_enabled,
+        ),
+        (
+            "tool_description_max_chars",
+            *tool_description_max_chars != old.tool_description_max_chars,
+        ),
+        (
+            "tool_search_threshold",
+            *tool_search_threshold != old.tool_search_threshold,
+        ),
+        ("meta_tool_mode", *meta_tool_mode != old.meta_tool_mode),
+        ("lazy_tools", *lazy_tools != old.lazy_tools),
+        ("priority_tools", *priority_tools != old.priority_tools),
+        ("disabled_tools", *disabled_tools != old.disabled_tools),
+        ("servers.*.enrichment", enriched(old) != enriched(new)),
+    ]
+    .into_iter()
+    .filter(|(_, changed)| *changed)
+    .map(|(setting, _)| format!("{setting} changed (restart required)"))
+    .collect()
 }
 
 /// Report of what happened during a reload.
@@ -263,7 +281,6 @@ pub struct ReloadReport {
 mod tests {
     use super::*;
     use crate::config::{Config, ServerConfig};
-    use std::collections::HashMap;
 
     fn make_server(command: &str) -> ServerConfig {
         ServerConfig {
@@ -365,71 +382,60 @@ mod tests {
         assert!(!diff.restart_required.is_empty());
     }
 
+    /// Each setting read only when Plug starts is reported by its own name,
+    /// and a setting the engine applies live is not.
     #[test]
-    fn diff_marks_router_settings_restart_required() {
-        let old = Config::default();
-        let new = Config {
-            priority_tools: vec!["plug__search_tools".into()],
-            tool_description_max_chars: Some(128),
-            tool_filter_enabled: false,
-            lazy_tools: crate::config::LazyToolsConfig {
-                mode: crate::types::LazyToolSetting::Bridge,
-                clients: HashMap::new(),
-            },
-            ..Config::default()
-        };
+    fn startup_only_settings_say_a_restart_is_needed() {
+        type Edit = fn(&mut Config);
+        let restart_only: [(&str, Edit); 9] = [
+            ("enable_prefix", |c| c.enable_prefix = false),
+            ("log_level", |c| c.log_level = "debug".into()),
+            ("http.auth_mode", |c| {
+                c.http.auth_mode = crate::config::DownstreamAuthMode::Bearer
+            }),
+            ("http.public_base_url", |c| {
+                c.http.public_base_url = Some("https://plug.example".into())
+            }),
+            ("http.oauth_scopes", |c| {
+                c.http.oauth_scopes = Some(vec!["tools:read".into()])
+            }),
+            ("http.tls_cert_path", |c| {
+                c.http.tls_cert_path = Some("cert.pem".into())
+            }),
+            ("http.tls_key_path", |c| {
+                c.http.tls_key_path = Some("key.pem".into())
+            }),
+            ("http.session_timeout_secs", |c| {
+                c.http.session_timeout_secs = 60
+            }),
+            ("priority_tools", |c| {
+                c.priority_tools = vec!["plug__search_tools".into()]
+            }),
+        ];
+        for (setting, edit) in restart_only {
+            let old = Config::default();
+            let mut new = old.clone();
+            edit(&mut new);
+            let diff = diff_configs(&old, &new);
+            assert_eq!(
+                diff.restart_required,
+                [format!("{setting} changed (restart required)")],
+                "{setting}"
+            );
+            assert!(diff.settings_changed, "{setting}");
+        }
 
-        let diff = diff_configs(&old, &new);
-
-        assert!(diff.settings_changed);
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("priority_tools"))
-        );
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("tool_description_max_chars"))
-        );
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("tool_filter_enabled"))
-        );
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("lazy_tools"))
-        );
-    }
-
-    #[test]
-    fn diff_marks_http_session_settings_restart_required() {
-        let old = Config::default();
-        let mut new = Config::default();
-        new.http.session_timeout_secs = 60;
-        new.http.max_sessions = 5;
-        new.http.sse_channel_capacity = 8;
-
-        let diff = diff_configs(&old, &new);
-
-        assert!(diff.settings_changed);
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("http.session_timeout_secs"))
-        );
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("http.max_sessions"))
-        );
-        assert!(
-            diff.restart_required
-                .iter()
-                .any(|item| item.contains("http.sse_channel_capacity"))
-        );
+        let live: [Edit; 3] = [
+            |c| c.startup_concurrency = 1,
+            |c| c.supervision.enabled = !c.supervision.enabled,
+            |c| c.http.modern_downstream_enabled = true,
+        ];
+        for edit in live {
+            let old = Config::default();
+            let mut new = old.clone();
+            edit(&mut new);
+            assert!(diff_configs(&old, &new).restart_required.is_empty());
+        }
     }
 
     #[test]

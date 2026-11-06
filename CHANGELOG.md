@@ -49,6 +49,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug reload` and a config file edit now say a restart is needed when you change `enable_prefix`, `log_level`, `http.auth_mode`, `http.public_base_url`, `http.oauth_scopes`, `http.tls_cert_path`, `http.tls_key_path` or `http.slack_events`. These take effect only when Plug starts, but the reload used to report nothing for them.
 - `plug auth login` and `plug auth inject` no longer crash on a server whose Keychain entry is bound to its sign-in server but whose token file is missing. Reading the entry tried to rewrite the file by itself, without the shared mark a bound pair needs; Plug now leaves a bound file to a full save.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.

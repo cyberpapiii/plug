@@ -185,7 +185,7 @@ mod tests {
             write_config(&config_path, &Config::default());
 
             let engine = Engine::new(Config::default());
-            engine.start().await.expect("engine start");
+            engine.start().await;
             let seen_config = Arc::clone(&engine.config());
 
             let ready = spawn_config_watcher(

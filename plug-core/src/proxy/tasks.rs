@@ -2767,7 +2767,7 @@ mod tests {
             .extend(["--fail-mode".to_string(), "crash".to_string()]);
         config.servers.insert("mock".to_string(), mock);
         let engine = crate::engine::Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let router = Arc::clone(engine.tool_router());
 
         let owner = crate::downstream_identity::http_session_task_owner("session-crash");

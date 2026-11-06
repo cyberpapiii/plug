@@ -520,7 +520,7 @@ mod tests {
             .insert("dead".to_string(), unstartable_server_config(INTERVAL_SECS));
 
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
         // Well past the health task's start jitter (<= 10s) but far short of the
         // 600s interval, so only an unconsumed first tick can have fired.
@@ -550,7 +550,7 @@ mod tests {
             .insert("dead".to_string(), unstartable_server_config(600));
 
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -590,7 +590,7 @@ mod tests {
             .servers
             .insert("dead".to_string(), unstartable_server_config(60));
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
         tokio::time::sleep(Duration::from_secs(3600)).await;
         engine.shutdown().await;
@@ -661,7 +661,7 @@ mod tests {
         config.servers.insert("late".to_string(), server);
 
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
         // The upstream appears after the first recovery attempt has failed.
         tokio::time::sleep(Duration::from_millis(300)).await;

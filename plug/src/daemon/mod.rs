@@ -307,7 +307,7 @@ pub(crate) async fn run_daemon_with_lock(
                     Ok((stream, _addr)) => {
                         let engine_cancel = engine.cancel_token().clone();
                         let server_manager = engine.server_manager().clone();
-                        let snapshot = engine.snapshot();
+                        let started_at = engine.started_at();
                         let auth = auth_token.clone();
                         let engine_clone = engine.clone();
                         let registry = client_registry.clone();
@@ -315,9 +315,6 @@ pub(crate) async fn run_daemon_with_lock(
                         let http = Arc::clone(&http);
 
                         tokio::spawn(async move {
-                            let started_at = Instant::now()
-                                .checked_sub(snapshot.uptime)
-                                .unwrap_or_else(Instant::now);
                             let ctx = ConnectionContext {
                                 cancel: engine_cancel,
                                 auth_token: auth,
@@ -2538,7 +2535,7 @@ allowed_servers = ["slack"]
             .servers
             .insert("mock".to_string(), mock_server("echo"));
         let engine = Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let oauth_path =
             std::env::temp_dir().join(format!("plug-daemon-revoke-{}.json", uuid::Uuid::new_v4()));
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
@@ -3169,7 +3166,7 @@ allowed_servers = ["slack"]
                 config.servers.insert(name.to_string(), server);
             }
             let engine = Engine::new(config);
-            engine.start().await.expect("engine start");
+            engine.start().await;
 
             // Short unique socket path in /tmp — a Unix socket path must fit in
             // SUN_LEN (~104 bytes), and the platform temp dir is already long. No
@@ -3403,7 +3400,7 @@ allowed_servers = ["slack"]
     async fn idle_registered_connection_services_reverse_request_without_new_client_frame() {
         let config = plug_core::config::Config::default();
         let engine = Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         let socket_path = std::path::PathBuf::from(format!(
             "/tmp/plug-ipc-idle-reverse-{}.sock",
@@ -3522,7 +3519,7 @@ allowed_servers = ["slack"]
     #[tokio::test]
     async fn registered_connection_is_pushed_modern_gate_changes() {
         let engine = Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         let socket_path = std::path::PathBuf::from(format!(
             "/tmp/plug-ipc-gate-push-{}.sock",
@@ -3592,7 +3589,7 @@ allowed_servers = ["slack"]
     async fn failed_deregister_does_not_kill_reverse_channel() {
         let config = plug_core::config::Config::default();
         let engine = Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         let socket_path = std::path::PathBuf::from(format!(
             "/tmp/plug-ipc-failed-dereg-{}.sock",
@@ -3897,7 +3894,7 @@ allowed_servers = ["slack"]
         use tower::ServiceExt as _;
 
         let engine = parity_mock_engine();
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let state = Arc::new(plug_core::http::server::HttpState::new(
             engine.tool_router().clone(),
             Arc::new(plug_core::session::SessionStore::new(1800, 100)),

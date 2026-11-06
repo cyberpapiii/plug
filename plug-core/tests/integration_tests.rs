@@ -1313,8 +1313,7 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
     let gated_engine = Engine::new(gated_config);
     gated_engine
         .start()
-        .await
-        .expect("start gate-off legacy path");
+        .await;
     let gated_status = gated_engine
         .server_statuses()
         .into_iter()
@@ -1348,7 +1347,7 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         lifecycle_server_config("legacy-only", UpstreamProtocolMode::Auto, &auto_log),
     );
     let auto_engine = Engine::new(auto_config);
-    auto_engine.start().await.expect("start auto fallback path");
+    auto_engine.start().await;
     let auto_sequence = lifecycle_sequence(&auto_log);
     assert_eq!(
         &auto_sequence[..4],
@@ -1385,8 +1384,7 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
     let modern_engine = Engine::new(modern_config);
     modern_engine
         .start()
-        .await
-        .expect("start forced modern path");
+        .await;
     let modern_status = modern_engine
         .server_statuses()
         .into_iter()
@@ -1488,7 +1486,7 @@ async fn legacy_task_child_process_stdio_preserves_full_lifecycle_under_rmcp3() 
     config.servers.insert("legacy-task".to_string(), server);
 
     let engine = Engine::new(config);
-    engine.start().await.expect("start raw legacy task child");
+    engine.start().await;
     let router = engine.tool_router();
     let tool_name = router
         .list_tools()
@@ -1569,7 +1567,7 @@ async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
     config.servers.insert("mock".to_string(), server);
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     // Without the per-server listing timeout this hangs forever; with it the
     // stalled upstream is skipped after ~1s and the refresh completes.
@@ -1613,7 +1611,7 @@ async fn catalog_families_fetch_concurrently() {
     config.servers.insert("mock".to_string(), server);
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let started = std::time::Instant::now();
     engine.tool_router().refresh_tools().await;
@@ -1659,7 +1657,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     config.servers.insert("mock".to_string(), server);
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
     let router = engine.tool_router();
     let uri = "file:///tmp/mock-resource.txt";
 
@@ -1936,7 +1934,7 @@ async fn test_stdio_timeout_reconnects_cleanly() {
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let first = engine.tool_router().call_tool("Mock__echo", None).await;
     assert!(first.is_err(), "first call should time out");
@@ -2002,7 +2000,7 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let call = || async {
         engine
@@ -2275,7 +2273,7 @@ async fn run_http_upstream_crash_restart_scenario(
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     // Phase 1: baseline call succeeds against the live upstream.
     let result = engine
@@ -2434,7 +2432,7 @@ async fn test_end_to_end_proxy_path() {
         .insert("mock".to_string(), mock_server("echo,greet"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2503,7 +2501,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         .insert("mock".to_string(), mock_server("echo"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let state = Arc::new(HttpState::new(
         engine.tool_router().clone(),
@@ -2620,7 +2618,7 @@ async fn an_mcp_app_reaches_the_client_whole() {
     config.servers.insert("mock".to_string(), mock);
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2686,7 +2684,7 @@ async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
     config.disabled_tools = vec!["Mock__greet".to_string()];
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2719,7 +2717,7 @@ async fn test_structured_content_passes_through_end_to_end() {
         .insert("mock".to_string(), mock_server("structured"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2747,7 +2745,7 @@ async fn test_resource_link_passes_through_end_to_end() {
         .insert("mock".to_string(), mock_server("resource_link"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2775,7 +2773,7 @@ async fn test_oversized_tool_result_spills_to_artifact_link() {
         .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2807,7 +2805,7 @@ async fn test_artifact_manifest_is_readable() {
         .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2849,7 +2847,7 @@ async fn test_artifact_chunk_is_readable() {
         .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2889,7 +2887,7 @@ async fn test_attachment_like_tool_result_spills_to_artifact_link() {
         .insert("mock".to_string(), mock_server("attachment_blob"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect(engine.tool_router().clone());
 
@@ -2917,7 +2915,7 @@ async fn test_http_structured_content_passes_through_end_to_end() {
         .insert("mock".to_string(), mock_server("structured"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let state = Arc::new(HttpState::new(
         engine.tool_router().clone(),
@@ -2992,7 +2990,7 @@ async fn test_http_resource_link_passes_through_end_to_end() {
         .insert("mock".to_string(), mock_server("resource_link"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let state = Arc::new(HttpState::new(
         engine.tool_router().clone(),
@@ -3068,7 +3066,7 @@ async fn test_http_oversized_tool_result_spills_to_artifact_link() {
         .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let state = Arc::new(HttpState::new(
         engine.tool_router().clone(),
@@ -3143,7 +3141,7 @@ async fn test_multi_client_shared_engine_isolation() {
         .insert("mock".to_string(), mock_server("echo"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client_a = Downstream::connect(engine.tool_router().clone());
     let client_b = Downstream::connect(engine.tool_router().clone());
@@ -3536,7 +3534,7 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let startup_snapshot = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3688,7 +3686,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let statuses = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3813,7 +3811,7 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let statuses = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3901,7 +3899,7 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -3981,7 +3979,7 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4076,7 +4074,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4162,7 +4160,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let status = tokio::time::timeout(Duration::from_secs(5), async {
@@ -4236,7 +4234,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         .insert("mock".to_string(), mock_server("echo"));
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
         public_base_url: "https://plug.example.com".to_string(),
@@ -4480,7 +4478,7 @@ async fn test_elicitation_reverse_request_round_trip() {
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect_with_bridge(
         engine.tool_router().clone(),
@@ -4530,7 +4528,7 @@ async fn test_sampling_reverse_request_round_trip() {
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let client = Downstream::connect_with_bridge(
         engine.tool_router().clone(),
@@ -4577,7 +4575,7 @@ async fn test_http_elicitation_reverse_request_round_trip() {
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let state = Arc::new(HttpState::new(
         engine.tool_router().clone(),
@@ -4751,7 +4749,7 @@ async fn test_http_sampling_reverse_request_round_trip() {
     );
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
 
     let state = Arc::new(HttpState::new(
         engine.tool_router().clone(),
@@ -5166,7 +5164,7 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
         );
 
         let started_engine = Engine::new(config);
-        started_engine.start().await.expect("engine start");
+        started_engine.start().await;
         engine = Some(Arc::clone(&started_engine));
 
         let tool_name = started_engine
@@ -5331,7 +5329,7 @@ async fn an_openapi_document_becomes_a_server() {
     assert!(validate_config(&config).is_empty());
 
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
     let router = engine.tool_router();
 
     let text = |result: &rmcp::model::CallToolResult| -> String {
@@ -5377,7 +5375,7 @@ async fn an_openapi_document_becomes_a_server() {
     config.servers.insert("pets".to_string(), api);
     assert!(validate_config(&config).is_empty());
     let engine = Engine::new(config);
-    engine.start().await.expect("engine start");
+    engine.start().await;
     let arguments = serde_json::json!({ "id": "rex" });
     let found = engine
         .tool_router()

@@ -803,17 +803,14 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     // Downstream HTTP keeps the old ordering below. Remote clients cannot be
     // told the catalog grew, so for them a bound port must continue to mean a
     // complete catalog.
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
     let startup = {
         let engine = engine.clone();
         let config_path = config_path.clone();
         tokio::spawn(async move {
-            let started = engine.start().await;
-            let ready = started.is_ok();
-            let _ = started_tx.send(started);
-            if ready {
-                engine.pin_tool_blocks(&config_path).await;
-            }
+            engine.start().await;
+            let _ = started_tx.send(());
+            engine.pin_tool_blocks(&config_path).await;
         })
     };
     let http_runtime = build_configured_http_runtime(&engine.config(), &engine)?;
@@ -828,9 +825,8 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     let http_cancel = engine.cancel_token().clone();
     let http_router = http_runtime.router;
     let http_future = async move {
-        match started_rx.await {
-            Ok(result) => result?,
-            Err(_) => anyhow::bail!("daemon startup ended without reporting a result"),
+        if started_rx.await.is_err() {
+            anyhow::bail!("daemon startup ended without reporting a result");
         }
         serve_router(http_router, &http_config, http_cancel).await
     };
@@ -1172,7 +1168,7 @@ mod tests {
     #[tokio::test]
     async fn serve_router_supports_https() {
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(plug_core::http::server::HttpState::new(
             engine.tool_router().clone(),
@@ -1427,7 +1423,7 @@ mod tests {
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         let daemon_engine = Arc::clone(&engine);
         let daemon_config_path = config_path.clone();
@@ -1466,7 +1462,7 @@ mod tests {
 
     async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state_path = unique_temp_dir("owner-operator").join("oauth.json");
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
@@ -1845,7 +1841,7 @@ mod tests {
         .expect("reopen CIMD fixture");
 
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(
             plug_core::http::server::HttpState::new(
@@ -2020,7 +2016,7 @@ mod tests {
             plug_core::test_helpers::mock_server("echo"),
         );
         let engine = plug_core::engine::Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let tool_router = engine.tool_router().clone();
 
         let oauth_path = std::env::temp_dir().join(format!(
