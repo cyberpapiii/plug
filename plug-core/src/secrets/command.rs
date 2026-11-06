@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use super::{SecretError, SecretStore, valid_name};
 use crate::types::SecretString;
 
-pub use crate::config::secrets::{NAME, OP};
+use crate::config::secrets::{NAME, OP};
 
 pub struct Command {
     id: String,
@@ -201,7 +201,7 @@ impl SecretStore for Command {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -238,18 +238,23 @@ mod tests {
     }
 
     /// Whether the process whose id `script` wrote to `pid_file` is gone
-    /// within two seconds. `kill -0` asks only whether it is still there.
+    /// within five seconds. A zombie counts as gone: it has exited, and in a
+    /// container with no init to reap it, it stays a zombie.
     fn helper_is_gone(pid_file: &std::path::Path) -> bool {
-        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let pid = std::fs::read_to_string(pid_file)
+            .expect("the script should write its helper's pid before it is stopped");
         let alive = || {
-            std::process::Command::new("/bin/kill")
-                .args(["-0", pid.trim()])
+            let state = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
                 .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
+                .output()
+                .unwrap();
+            state.status.success()
+                && !String::from_utf8_lossy(&state.stdout)
+                    .trim()
+                    .starts_with('Z')
         };
-        let gone_by = Instant::now() + Duration::from_secs(2);
+        let gone_by = Instant::now() + Duration::from_secs(5);
         while alive() && Instant::now() < gone_by {
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -261,7 +266,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
-        let store = shell(&script, Duration::from_millis(400));
+        // Long enough for `sh` to write the pid file under a loaded machine;
+        // the command never ends, so the test always waits all of it.
+        let store = shell(&script, Duration::from_secs(1));
         assert!(matches!(
             store.get("github"),
             Err(SecretError::TimedOut { .. })
@@ -279,7 +286,9 @@ mod tests {
             "sleep 30 >/dev/null & echo $! > '{}'; printf value",
             pid_file.display()
         );
-        let store = shell(&script, Duration::from_millis(300));
+        // The command is done in milliseconds; the timeout is only how long
+        // the store waits on the error pipe before stopping the helper.
+        let store = shell(&script, Duration::from_secs(1));
         assert_eq!(store.get("github").unwrap().unwrap().as_str(), "value");
         assert!(helper_is_gone(&pid_file), "the helper outlived the command");
     }
