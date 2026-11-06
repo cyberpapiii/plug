@@ -27,10 +27,6 @@ use keyring_core as platform_keyring;
 
 use crate::config;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Default token lifetime when `expires_in` is missing or invalid.
 pub const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 
@@ -123,10 +119,6 @@ pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Global store registry
-// ---------------------------------------------------------------------------
-
 static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
     LazyLock::new(DashMap::new);
 
@@ -213,11 +205,7 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
         .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Token helpers
-// ---------------------------------------------------------------------------
-
-/// Return the `~/.config/plug/tokens/` directory path.
+/// The `tokens` directory in Plug's config directory.
 pub fn tokens_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(environment) = test_credential_environment() {
@@ -368,10 +356,6 @@ pub async fn bind_discovered_authority(
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     store.bind_verified_authority(&authority)
 }
-
-// ---------------------------------------------------------------------------
-// CachedCredentials
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct CachedCredentials {
@@ -543,12 +527,8 @@ impl std::fmt::Debug for CachedCredentials {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CompositeCredentialStore
-// ---------------------------------------------------------------------------
-
 /// Credential store that mirrors credentials to a JSON file at
-/// `~/.config/plug/tokens/{server_name}.json` and can also use the OS keyring.
+/// `tokens/{server_name}.json` in Plug's config directory and can also use the OS keyring.
 ///
 /// Reads prefer the local 0600 token file once credentials have been mirrored
 /// there, which avoids repeated macOS keychain prompts across short-lived CLI
@@ -1490,12 +1470,8 @@ impl CredentialStore for CompositeCredentialStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CompositeStateStore
-// ---------------------------------------------------------------------------
-
 /// File-based PKCE state store. Each state entry is stored at
-/// `~/.config/plug/tokens/{server_name}_state_{csrf}.json`.
+/// `tokens/{server_name}_state_{csrf}.json` in Plug's config directory.
 pub struct CompositeStateStore {
     server_name: String,
 }
@@ -1596,10 +1572,6 @@ impl StateStore for CompositeStateStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Token refresh
-// ---------------------------------------------------------------------------
-
 /// Outcome of an OAuth token refresh attempt.
 #[derive(Debug)]
 pub enum RefreshResult {
@@ -1641,7 +1613,23 @@ fn has_token(haystack: &str, needle: &str) -> bool {
         })
 }
 
-pub(crate) fn is_auth_error(message: &str) -> bool {
+/// An upstream refused Plug's credentials: its owner has to sign in again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct AuthRejected(pub(crate) String);
+
+/// Whether `error` means the server needs its owner to sign in again.
+///
+/// Plug's own refusals are [`AuthRejected`]. rmcp 3.1.0 reports its OAuth
+/// failures (`AuthError`, a refused token refresh) and some transport
+/// failures only as text, so for those the words in each cause are read.
+pub(crate) fn is_auth_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<AuthRejected>().is_some() || is_auth_error(&cause.to_string())
+    })
+}
+
+fn is_auth_error(message: &str) -> bool {
     let normalized = message.to_lowercase();
 
     normalized.contains("authorization required")
@@ -1651,10 +1639,6 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
         || normalized.contains("resource_metadata=")
         || has_token(&normalized, "unauthorized")
         || has_token(&normalized, "401")
-}
-
-pub(crate) fn is_auth_error_chain(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| is_auth_error(&cause.to_string()))
 }
 
 pub fn injected_client_identity(
@@ -1812,8 +1796,7 @@ pub async fn refresh_access_token(
             RefreshResult::Refreshed
         }
         Err(e) => {
-            let err = anyhow::anyhow!("{e:#}");
-            if is_auth_error_chain(&err) {
+            if is_auth_rejection(&anyhow::anyhow!("{e:#}")) {
                 RefreshResult::AuthError(format!("{e}"))
             } else {
                 RefreshResult::TransientError(format!("{e}"))
@@ -1821,10 +1804,6 @@ pub async fn refresh_access_token(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1963,8 +1942,11 @@ mod tests {
         )
         .context("failed to connect to HTTP upstream");
 
-        assert!(is_auth_error_chain(&err));
+        assert!(is_auth_rejection(&err));
         assert!(!is_auth_error(&err.to_string()));
+        assert!(is_auth_rejection(
+            &anyhow::Error::new(AuthRejected("signed out".into())).context("start failed")
+        ));
     }
 
     #[test]

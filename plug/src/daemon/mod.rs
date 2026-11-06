@@ -1932,21 +1932,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::Reload { .. } => {
             // Load fresh config from disk and apply via Engine
             match plug_core::config::load_config(Some(&ctx.config_path)) {
-                Ok(new_config) => match ctx.engine.reload_config(new_config).await {
-                    Ok(report) => {
-                        tracing::info!(
-                            added = report.added.len(),
-                            removed = report.removed.len(),
-                            changed = report.changed.len(),
-                            "config reloaded via IPC"
-                        );
-                        IpcResponse::Reloaded { report }
-                    }
-                    Err(e) => IpcResponse::Error {
-                        code: "RELOAD_FAILED".to_string(),
-                        message: e.to_string(),
-                    },
-                },
+                Ok(new_config) => {
+                    let report = ctx.engine.reload_config(new_config).await;
+                    tracing::info!(
+                        added = report.added.len(),
+                        removed = report.removed.len(),
+                        changed = report.changed.len(),
+                        "config reloaded via IPC"
+                    );
+                    IpcResponse::Reloaded { report }
+                }
                 Err(e) => IpcResponse::Error {
                     code: "CONFIG_LOAD_FAILED".to_string(),
                     message: e.to_string(),

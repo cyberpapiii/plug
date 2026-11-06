@@ -238,7 +238,7 @@ async fn read_document(spec: &str, timeout: Duration) -> anyhow::Result<String> 
 
     // The bearer token is never sent here: the document may live on a
     // different host from the API it describes.
-    let response = http_client()
+    let response = http_client()?
         .get(spec)
         .timeout(timeout)
         .header(
@@ -279,15 +279,6 @@ async fn read_up_to(
     Ok((body, false))
 }
 
-/// Whether a redirect from `from` to `to` stays on the same scheme, host
-/// and port. A credential sent to one is not sent on to anything else: not
-/// another port on the host, and not the same address without TLS.
-fn same_origin(from: &reqwest::Url, to: &reqwest::Url) -> bool {
-    from.scheme() == to.scheme()
-        && from.host_str() == to.host_str()
-        && from.port_or_known_default() == to.port_or_known_default()
-}
-
 fn expand_home(path: &str) -> std::path::PathBuf {
     match path.strip_prefix("~/") {
         Some(rest) => dirs::home_dir()
@@ -297,25 +288,21 @@ fn expand_home(path: &str) -> std::path::PathBuf {
     }
 }
 
-fn http_client() -> reqwest::Client {
-    crate::tls::ensure_rustls_provider_installed();
-    reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        // A redirect may not carry a request, and its credential, anywhere
-        // but the address the server is configured for.
-        .redirect(reqwest::redirect::Policy::custom(|attempt| {
-            let same_host = attempt
-                .previous()
-                .last()
-                .is_some_and(|previous| same_origin(previous, attempt.url()));
-            if same_host && attempt.previous().len() < 5 {
-                attempt.follow()
-            } else {
-                attempt.stop()
-            }
-        }))
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
+fn http_client() -> anyhow::Result<reqwest::Client> {
+    // A redirect may not carry a request, and its credential, anywhere but
+    // the address the server is configured for: not another port on the
+    // host, and not the same address without TLS.
+    crate::upstream_http::client(reqwest::redirect::Policy::custom(|attempt| {
+        let same_host = attempt
+            .previous()
+            .last()
+            .is_some_and(|previous| crate::upstream_http::same_origin(previous, attempt.url()));
+        if same_host && attempt.previous().len() < 5 {
+            attempt.follow()
+        } else {
+            attempt.stop()
+        }
+    }))
 }
 
 /// Parse an OpenAPI 3 document, JSON or YAML.
@@ -545,7 +532,10 @@ fn base_url(root: &Value, spec: &str, url_override: Option<&str>) -> anyhow::Res
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
         "API address '{url}' must be an http or https URL"
     );
-    if url.host_str().is_some_and(crate::server::is_blocked_host) {
+    if url
+        .host_str()
+        .is_some_and(crate::upstream_http::is_blocked_host)
+    {
         anyhow::bail!("API address '{url}' is blocked: cloud metadata endpoint");
     }
     url.set_query(None);
@@ -878,13 +868,13 @@ pub(crate) struct OpenApiServer {
 }
 
 impl OpenApiServer {
-    pub(crate) fn new(document: ApiDocument, config: &ServerConfig) -> Self {
-        Self {
+    pub(crate) fn new(document: ApiDocument, config: &ServerConfig) -> anyhow::Result<Self> {
+        Ok(Self {
             document,
-            client: http_client(),
+            client: http_client()?,
             auth_token: config.auth_token.clone(),
             call_timeout: Duration::from_secs(config.call_timeout_secs),
-        }
+        })
     }
 
     async fn call(&self, operation: &Operation, arguments: &Map<String, Value>) -> CallToolResult {
@@ -1042,19 +1032,6 @@ impl ServerHandler for OpenApiServer {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn a_redirect_keeps_the_scheme_host_and_port() {
-        let url = |text: &str| reqwest::Url::parse(text).unwrap();
-        let api = url("https://api.example.com/v1/items");
-        assert!(same_origin(&api, &url("https://api.example.com/v2/items")));
-        assert!(same_origin(&api, &url("https://api.example.com:443/v2")));
-        // Another port on the host is another program.
-        assert!(!same_origin(&api, &url("https://api.example.com:8443/v1")));
-        // The same address without TLS would send the key in the clear.
-        assert!(!same_origin(&api, &url("http://api.example.com/v1/items")));
-        assert!(!same_origin(&api, &url("https://example.com/v1/items")));
-    }
 
     #[tokio::test]
     async fn a_response_is_read_only_up_to_the_limit() {

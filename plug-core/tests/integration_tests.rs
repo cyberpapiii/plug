@@ -1709,7 +1709,7 @@ fn test_proxy_handler_get_info() {
 #[tokio::test]
 async fn test_server_manager_tools_empty() {
     let sm = Arc::new(ServerManager::new());
-    let tools = sm.get_tools().await;
+    let tools = sm.get_tools();
     assert!(
         tools.is_empty(),
         "expected no tools from empty ServerManager"
@@ -2346,8 +2346,8 @@ async fn run_http_upstream_crash_restart_scenario(
     );
 
     // Phase 5: deterministically exercise the engine reconnect path
-    // (`do_reconnect` success: fresh connect + `replace_server` +
-    // `refresh_tools`) against the restarted upstream — the same entry point
+    // (one fresh connect, commit and `refresh_tools`) against the restarted
+    // upstream — the same entry point
     // health-monitor proactive recovery and call-path reactive recovery use.
     engine
         .reconnect_server("httpcrash")

@@ -1044,11 +1044,7 @@ impl super::ToolRouter {
                 "proxy background task tool call started"
             );
             let semaphore_timeout = Duration::from_secs(1);
-            let semaphore = self
-                .server_manager
-                .semaphores
-                .get(&server_id)
-                .map(|entry| Arc::clone(entry.value()));
+            let semaphore = self.server_manager.call_slots(&server_id);
             let permit = if let Some(sem) = semaphore {
                 match tokio::time::timeout(semaphore_timeout, sem.acquire_owned()).await {
                     Ok(Ok(permit)) => Some(permit),
@@ -2682,10 +2678,7 @@ mod tests {
             connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
         )
         .await;
-        // `replace_server` does not build the per-server semaphore; install
-        // one so this test can prove the Missing branch releases its permit.
-        sm.semaphores
-            .insert("mock".to_string(), Arc::new(tokio::sync::Semaphore::new(1)));
+        sm.apply_live_settings("mock", &one_call_at_a_time());
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
         let owner = ToolRouter::task_owner_for_http_session("session-record-vanish");
@@ -2728,9 +2721,7 @@ mod tests {
         // The permit must come back: the Missing branch returns instead of
         // holding the server's `max_concurrent` slot on a dead call.
         let semaphore = sm
-            .semaphores
-            .get("mock")
-            .map(|entry| Arc::clone(entry.value()))
+            .call_slots("mock")
             .expect("mock semaphore installed above");
         let mut permit_released = false;
         for _ in 0..200 {
@@ -2765,8 +2756,7 @@ mod tests {
             connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
         )
         .await;
-        sm.semaphores
-            .insert("mock".to_string(), Arc::new(tokio::sync::Semaphore::new(1)));
+        sm.apply_live_settings("mock", &one_call_at_a_time());
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
         let owner = ToolRouter::task_owner_for_http_session("session-abort-in-gap");
@@ -2814,9 +2804,7 @@ mod tests {
 
         // The permit died with the aborted future.
         let semaphore = sm
-            .semaphores
-            .get("mock")
-            .map(|entry| Arc::clone(entry.value()))
+            .call_slots("mock")
             .expect("mock semaphore installed above");
         let mut permit_released = false;
         for _ in 0..200 {
@@ -2831,5 +2819,12 @@ mod tests {
             "aborting the executor must release the per-server concurrency permit"
         );
         assert_eq!(router.task_count_for_owner(&owner).await, 0);
+    }
+
+    fn one_call_at_a_time() -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            max_concurrent: 1,
+            ..Default::default()
+        }
     }
 }

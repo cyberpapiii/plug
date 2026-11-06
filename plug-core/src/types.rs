@@ -831,6 +831,31 @@ mod tests {
     }
 
     #[test]
+    fn three_failed_checks_degrade_six_fail_and_successes_climb_back() {
+        use super::{HealthState, ServerHealth};
+        let mut state = HealthState::new();
+        let after: Vec<ServerHealth> = (0..6)
+            .map(|_| {
+                state.record_failure();
+                state.health
+            })
+            .collect();
+        use ServerHealth::{Degraded, Failed, Healthy};
+        assert_eq!(
+            after,
+            [Healthy, Healthy, Degraded, Degraded, Degraded, Failed]
+        );
+        assert_eq!(
+            state.consecutive_failures,
+            HealthState::failed().consecutive_failures
+        );
+        state.record_success();
+        assert_eq!(state.health, Degraded);
+        state.record_success();
+        assert_eq!(state.health, Healthy);
+    }
+
+    #[test]
     fn auth_required_is_sticky_on_success() {
         use super::{HealthState, ServerHealth};
         let mut state = HealthState {
@@ -1110,9 +1135,28 @@ pub struct HealthState {
 }
 
 impl HealthState {
+    const DEGRADED_AFTER: u32 = 3;
+    const FAILED_AFTER: u32 = 6;
+
     pub fn new() -> Self {
         Self {
             health: ServerHealth::Healthy,
+            consecutive_failures: 0,
+        }
+    }
+
+    /// The state of a server that is down: what a run of failed checks
+    /// would have reached.
+    pub fn failed() -> Self {
+        Self {
+            health: ServerHealth::Failed,
+            consecutive_failures: Self::FAILED_AFTER,
+        }
+    }
+
+    pub fn auth_required() -> Self {
+        Self {
+            health: ServerHealth::AuthRequired,
             consecutive_failures: 0,
         }
     }
@@ -1136,14 +1180,14 @@ impl HealthState {
         let old = self.health;
         self.health = match old {
             ServerHealth::Healthy => {
-                if self.consecutive_failures >= 3 {
+                if self.consecutive_failures >= Self::DEGRADED_AFTER {
                     ServerHealth::Degraded
                 } else {
                     ServerHealth::Healthy
                 }
             }
             ServerHealth::Degraded => {
-                if self.consecutive_failures >= 6 {
+                if self.consecutive_failures >= Self::FAILED_AFTER {
                     ServerHealth::Failed
                 } else {
                     ServerHealth::Degraded

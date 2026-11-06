@@ -1,5 +1,3 @@
-#![allow(clippy::mutable_key_type)]
-
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
@@ -8,7 +6,7 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -44,10 +42,8 @@ use failure::StderrTail;
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(test)]
-const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+/// How long a replaced upstream stays open for the calls still using it.
+const REPLACEMENT_GRACE: Duration = Duration::from_secs(30);
 
 fn upstream_metadata_from_implementation(
     implementation: &Implementation,
@@ -89,9 +85,42 @@ fn client_lifecycle_mode(mode: UpstreamProtocolMode) -> ClientLifecycleMode {
     }
 }
 
-fn should_fallback_to_legacy_sse(mode: UpstreamProtocolMode, error: &anyhow::Error) -> bool {
-    mode == UpstreamProtocolMode::Legacy
-        && crate::transport::sse_client::should_fallback_http_error(error)
+/// The HTTP status an upstream refused a streamable-HTTP request with.
+///
+/// rmcp 3.1.0 turns a 401 or 403 that carries `WWW-Authenticate` into
+/// `AuthRequired` / `InsufficientScope`, and any other refusal into
+/// `UnexpectedServerResponse("HTTP {status}: {body}")` (its reqwest client's
+/// `post_message`), where the status exists only as text. This is the one
+/// place that reads that text.
+fn refused_with(error: &StreamableHttpError<reqwest::Error>) -> Option<u16> {
+    match error {
+        StreamableHttpError::AuthRequired(_) => Some(401),
+        StreamableHttpError::InsufficientScope(_) => Some(403),
+        StreamableHttpError::UnexpectedServerResponse(message) => {
+            message.strip_prefix("HTTP ")?.get(..3)?.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+/// [`refused_with`] for a failed `initialize` over streamable HTTP.
+fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Option<u16> {
+    let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
+        return None;
+    };
+    error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+        .and_then(refused_with)
+}
+
+/// Whether a legacy-mode HTTP upstream that refused `initialize` is an old
+/// SSE server: those answer the streamable-HTTP POST with 405.
+fn should_fallback_to_legacy_sse(
+    mode: UpstreamProtocolMode,
+    error: &rmcp::service::ClientInitializeError,
+) -> bool {
+    mode == UpstreamProtocolMode::Legacy && initialize_refused_with(error) == Some(405)
 }
 
 /// RMCP 3.x intentionally dropped SEP-1686's top-level `capabilities.tasks`,
@@ -144,17 +173,6 @@ struct InitializedNotificationCompatHttpClient {
     last_session_id: Arc<std::sync::Mutex<Option<Arc<str>>>>,
 }
 
-/// How long an upstream HTTP connect may take before it is abandoned.
-///
-/// DNS, TCP and TLS to a reachable host settle well inside a second even
-/// across an ocean, so a connect still running after this is not slow, it is
-/// not happening. Without a bound it runs until the per-server start timeout
-/// expires — thirty seconds by default — and startup readiness waits on it,
-/// which is how one unreachable remote server delays every other one. The
-/// downstream OAuth metadata client has always bounded its connects; this is
-/// the same bound on the path that carries every upstream call.
-pub(crate) const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Bound on the legacy `tasks/list` capability probe. A legacy server that
 /// implements the old task surface answers a read-only list at once; one that
 /// ignores the method would otherwise hold the start open for its whole
@@ -166,30 +184,19 @@ const LEGACY_TASKS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// answers `logging/setLevel` keeps the request open.
 const INITIAL_LOG_LEVEL_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn upstream_http_client() -> reqwest::Client {
-    // Building a TLS-capable client panics without a crypto provider, and the
-    // callers that used to guarantee one are elsewhere in the start path.
-    // Claiming it here makes this function correct on its own.
-    crate::tls::ensure_rustls_provider_installed();
-    reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-}
-
 impl InitializedNotificationCompatHttpClient {
     fn new(
         server_name: Arc<str>,
         connection: ConnectionGeneration,
         tool_router: std::sync::Weak<ToolRouter>,
-    ) -> Self {
-        Self {
-            inner: upstream_http_client(),
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: crate::upstream_http::client(reqwest::redirect::Policy::default())?,
             server_name,
             connection,
             tool_router,
             last_session_id: Arc::new(std::sync::Mutex::new(None)),
-        }
+        })
     }
 
     /// Record the session id carried by an outbound call and advance the
@@ -232,21 +239,6 @@ fn is_initialized_notification_message(message: &rmcp::model::ClientJsonRpcMessa
         message,
         rmcp::model::ClientJsonRpcMessage::Notification(notification)
             if matches!(notification.notification, rmcp::model::ClientNotification::InitializedNotification(InitializedNotification { .. }))
-    )
-}
-
-fn is_initialized_notification_auth_failure(error: &StreamableHttpError<reqwest::Error>) -> bool {
-    let message = error.to_string().to_lowercase();
-    crate::oauth::is_auth_error(&message)
-        || message.contains("403")
-        || message.contains("forbidden")
-}
-
-fn is_initialized_notification_compat_failure(error: &StreamableHttpError<reqwest::Error>) -> bool {
-    matches!(
-        error,
-        StreamableHttpError::UnexpectedServerResponse(message)
-            if message.starts_with("HTTP 400")
     )
 }
 
@@ -694,25 +686,13 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
             && result
                 .as_ref()
                 .err()
-                .is_some_and(is_initialized_notification_compat_failure)
+                .is_some_and(|error| refused_with(error) == Some(400))
         {
             tracing::warn!(
                 server = %self.server_name,
                 "ignoring notifications/initialized failure for HTTP upstream; continuing with compatibility fallback"
             );
             return Ok(StreamableHttpPostResponse::Accepted);
-        }
-
-        if is_initialized
-            && result
-                .as_ref()
-                .err()
-                .is_some_and(is_initialized_notification_auth_failure)
-        {
-            tracing::debug!(
-                server = %self.server_name,
-                "notifications/initialized failure classified as auth rejection"
-            );
         }
 
         result
@@ -766,30 +746,36 @@ pub(crate) struct UpstreamClientHandler {
     /// Bound on the re-list a `tools/list_changed` notification triggers: the
     /// server's `call_timeout_secs`, the same bound every other listing uses.
     list_timeout: Duration,
-    #[cfg(test)]
-    protocol_version_override: Option<rmcp::model::ProtocolVersion>,
+    /// The protocol version offered in `initialize`.
+    protocol_version: rmcp::model::ProtocolVersion,
 }
 
-#[cfg(test)]
 impl UpstreamClientHandler {
-    /// Test-support constructor so tests outside this module (e.g.
-    /// `proxy::tests` driving `refresh_tools` against in-process duplex
-    /// upstreams) can build a connected `UpstreamServer` without making the
-    /// fields themselves crate-visible.
+    pub(crate) fn new(
+        server_id: &str,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        router: std::sync::Weak<ToolRouter>,
+        list_timeout: Duration,
+    ) -> Self {
+        Self {
+            server_id: Arc::from(server_id),
+            tools,
+            router,
+            list_timeout,
+            protocol_version: crate::protocol::supported_protocol_version(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_for_tests(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
         router: std::sync::Weak<ToolRouter>,
     ) -> Self {
-        Self {
-            server_id,
-            tools,
-            router,
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        }
+        Self::new(&server_id, tools, router, Duration::from_secs(300))
     }
 
+    #[cfg(test)]
     pub(crate) fn new_for_tests_with_protocol(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
@@ -797,11 +783,8 @@ impl UpstreamClientHandler {
         protocol_version: rmcp::model::ProtocolVersion,
     ) -> Self {
         Self {
-            server_id,
-            tools,
-            router,
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: Some(protocol_version),
+            protocol_version,
+            ..Self::new_for_tests(server_id, tools, router)
         }
     }
 }
@@ -837,18 +820,7 @@ impl ClientHandler for UpstreamClientHandler {
             .extensions
             .get_or_insert_with(Default::default)
             .insert(MCP_APPS_EXTENSION_ID.to_string(), apps);
-        let protocol_version = {
-            #[cfg(test)]
-            if let Some(version) = &self.protocol_version_override {
-                version.clone()
-            } else {
-                crate::protocol::supported_protocol_version()
-            }
-            #[cfg(not(test))]
-            crate::protocol::supported_protocol_version()
-        };
-        info = info.with_protocol_version(protocol_version);
-        info
+        info.with_protocol_version(self.protocol_version.clone())
     }
 
     fn list_roots(
@@ -1149,13 +1121,7 @@ pub(crate) fn next_upstream_generation() -> u64 {
         .expect("upstream connection generation exhausted")
 }
 
-/// Manages the lifecycle of upstream MCP servers.
-///
-/// Uses `ArcSwap` for wait-free reads — critical for HTTP concurrency where
-/// multiple requests resolve tools simultaneously. Writes (server start/stop)
-/// are infrequent and use compare-and-swap.
-/// Runtime per-upstream call metrics (atomics, recorded on the call path).
-/// Observability only — nothing routes on these.
+/// Per-upstream call metrics for status output. Nothing decides on them.
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamMetrics {
     call_count: AtomicU64,
@@ -1163,15 +1129,13 @@ pub(crate) struct UpstreamMetrics {
     last_latency_ms: AtomicU64,
     /// Unix epoch seconds since which calls have been failing; 0 = healthy.
     degraded_since_epoch: AtomicU64,
-    /// How many times the supervisor has restarted this upstream since start.
+    /// Recovery episodes and supervised restarts since this server started.
     restart_count: AtomicU64,
-    /// Unix epoch seconds of the most recent supervised restart; 0 = never.
+    /// Unix epoch seconds of the most recent of them; 0 = never.
     last_restart_epoch: AtomicU64,
 }
 
 impl UpstreamMetrics {
-    /// Record a supervised restart: bump the count and stamp the time. Read back
-    /// through `snapshot()` into `plug status --output json`.
     fn record_restart(&self) {
         self.restart_count.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
@@ -1240,23 +1204,23 @@ pub(crate) struct ListingResult<T> {
     pub degraded: BTreeSet<String>,
 }
 
-fn circuit_state_label(state: crate::circuit::CircuitState) -> &'static str {
-    match state {
-        crate::circuit::CircuitState::Closed => "closed",
-        crate::circuit::CircuitState::Open => "open",
-        crate::circuit::CircuitState::HalfOpen => "half-open",
-    }
-}
-
+/// Owns the connected upstream servers and the per-server state every call
+/// path reads: health, call guards, metrics and the last-known-good catalog.
+///
+/// The server map is an `ArcSwap`, so the many concurrent readers on the
+/// call path never wait; the rare writers serialize on a lock.
 pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
     /// Serializes every writer to `servers` (RCU: lock, load, clone, mutate,
     /// store, drop the guard). Never hold this across an `await`.
     server_map_write_lock: std::sync::Mutex<()>,
-    pub(crate) health: DashMap<String, HealthState>,
+    health: DashMap<String, HealthState>,
     configured_auth: DashMap<String, ConfiguredAuth>,
-    pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
-    pub(crate) metrics: DashMap<String, Arc<UpstreamMetrics>>,
+    /// Each running server's current settings. Unlike the config an
+    /// `UpstreamServer` connected with, this follows a reload.
+    settings: DashMap<String, Arc<ServerConfig>>,
+    circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
+    metrics: DashMap<String, Arc<UpstreamMetrics>>,
     /// Last-known-good resource/template/prompt listings per server, carried
     /// forward when a live listing times out or errors so a transient stall does
     /// not prune the catalog (and its active subscriptions). Tools already cache
@@ -1269,17 +1233,15 @@ pub struct ServerManager {
     /// Why each server last failed to start or reconnect, already redacted.
     /// Cleared when it starts; shown in status while it is unhealthy.
     last_errors: DashMap<String, String>,
-    pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
-    /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
-    /// all trying to reconnect the same server simultaneously).
-    reconnecting: DashMap<String, Arc<AtomicBool>>,
+    semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
     tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
     /// Grace-period retirement tasks spawned by `replace_server` for
     /// old-generation upstreams still held by in-flight requests. Tracked so
     /// `shutdown_all` can force them to retire immediately instead of leaving
-    /// them to complete their sleep up to `UPSTREAM_REPLACEMENT_GRACE_PERIOD`
+    /// them to complete their sleep up to `replacement_grace`
     /// after the engine reports shutdown complete. Otherwise self-cleaning.
     retire_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    replacement_grace: Duration,
     /// Set to `true` by `shutdown_all` to tell every pending grace-period
     /// retirement task to skip its sleep and retire now. Normal operation
     /// (no shutdown) never observes a `true` value, so the grace period is
@@ -1333,10 +1295,7 @@ impl ServerManager {
     ) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
-        if config.auth.as_deref() == Some("oauth")
-            && (crate::oauth::is_auth_error_chain(error)
-                || crate::oauth::is_auth_error(&format!("{error:#}")))
-        {
+        if config.auth.as_deref() == Some("oauth") && crate::oauth::is_auth_rejection(error) {
             self.mark_auth_required(name);
         } else {
             self.mark_start_failure(name);
@@ -1350,6 +1309,7 @@ impl ServerManager {
             server_map_write_lock: std::sync::Mutex::new(()),
             health: DashMap::new(),
             configured_auth: DashMap::new(),
+            settings: DashMap::new(),
             circuit_breakers: DashMap::new(),
             metrics: DashMap::new(),
             last_resources: DashMap::new(),
@@ -1358,9 +1318,9 @@ impl ServerManager {
             availability: DashMap::new(),
             last_errors: DashMap::new(),
             semaphores: DashMap::new(),
-            reconnecting: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            replacement_grace: REPLACEMENT_GRACE,
             shutdown_signal,
             check_now: Arc::new(tokio::sync::Notify::new()),
             modern_upstream_gate_state: AtomicU64::new(0),
@@ -1400,7 +1360,7 @@ impl ServerManager {
             .record(ok, latency_ms);
     }
 
-    /// Record a supervised restart of `server_id` in its metrics (item 2b).
+    /// Count a restart of `server_id` for status output.
     pub(crate) fn record_restart(&self, server_id: &str) {
         self.metrics
             .entry(server_id.to_string())
@@ -1408,15 +1368,21 @@ impl ServerManager {
             .record_restart();
     }
 
-    /// Unix epoch seconds of the most recent supervised restart, or `None` if the
-    /// upstream has never been restarted. Drives the supervisor's backoff clock.
-    pub(crate) fn last_restart_epoch(&self, server_id: &str) -> Option<u64> {
-        let epoch = self
-            .metrics
-            .get(server_id)?
-            .last_restart_epoch
-            .load(Ordering::Relaxed);
-        (epoch != 0).then_some(epoch)
+    pub(crate) fn health(&self, server_id: &str) -> Option<ServerHealth> {
+        self.health.get(server_id).map(|entry| entry.health)
+    }
+
+    /// Count one health check of `server_id`, returning its health before and
+    /// after.
+    pub(crate) fn record_check(&self, server_id: &str, ok: bool) -> (ServerHealth, ServerHealth) {
+        let mut entry = self.health.entry(server_id.to_string()).or_default();
+        let before = entry.health;
+        if ok {
+            entry.record_success();
+        } else {
+            entry.record_failure();
+        }
+        (before, entry.health)
     }
 
     /// Whether `server_id`'s circuit breaker is currently open.
@@ -1438,7 +1404,7 @@ impl ServerManager {
     fn circuit_state_for(&self, server_id: &str) -> &'static str {
         self.circuit_breakers
             .get(server_id)
-            .map(|cb| circuit_state_label(cb.state()))
+            .map(|cb| cb.state().label())
             .unwrap_or("closed")
     }
 
@@ -1481,12 +1447,7 @@ impl ServerManager {
     pub(crate) fn update_availability(&self, degraded: &BTreeSet<String>) {
         let servers = self.servers.load();
         for name in servers.keys() {
-            let routable = self
-                .health
-                .get(name)
-                .map(|h| h.health.is_routable())
-                .unwrap_or(true);
-            let availability = if !routable {
+            let availability = if !self.is_routable(name) {
                 Availability::Absent
             } else if degraded.contains(name) {
                 Availability::Degraded
@@ -1570,11 +1531,7 @@ impl ServerManager {
     /// begin per-server background work without waiting for the slowest upstream:
     /// one server that takes a minute to spawn must not delay the health task that
     /// would otherwise be reconnecting an upstream that is already back.
-    pub async fn start_all(
-        &self,
-        config: &Config,
-        on_settled: impl Fn(&str),
-    ) -> Result<(), anyhow::Error> {
+    pub async fn start_all(&self, config: &Config, on_settled: impl Fn(&str)) {
         self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
@@ -1585,7 +1542,7 @@ impl ServerManager {
 
         if enabled.is_empty() {
             tracing::info!("no servers configured");
-            return Ok(());
+            return;
         }
 
         tracing::info!(
@@ -1652,8 +1609,6 @@ impl ServerManager {
 
         let servers = self.servers.load();
         tracing::info!(started = servers.len(), "server startup complete");
-
-        Ok(())
     }
 
     /// Spawn and initialize a single upstream server.
@@ -1725,7 +1680,12 @@ impl ServerManager {
                 let secrets = failure::config_secrets(&resolved);
                 let text = format!("{error:#}");
                 if secrets.iter().any(|secret| text.contains(secret.as_str())) {
-                    Err(anyhow::anyhow!(failure::redact(&text, &secrets)))
+                    let redacted = failure::redact(&text, &secrets);
+                    Err(if crate::oauth::is_auth_rejection(&error) {
+                        anyhow::Error::new(crate::oauth::AuthRejected(redacted))
+                    } else {
+                        anyhow::anyhow!(redacted)
+                    })
                 } else {
                     Err(error)
                 }
@@ -1739,7 +1699,6 @@ impl ServerManager {
         tool_router: std::sync::Weak<ToolRouter>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        // Recursion shield: never start a server named "plug"
         if name == "plug" {
             anyhow::bail!("recursion shield: ignoring upstream server named 'plug'");
         }
@@ -1800,14 +1759,12 @@ impl ServerManager {
                     }
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-                    let handler = Arc::new(UpstreamClientHandler {
-                        server_id: Arc::from(name),
-                        tools: Arc::clone(&tools),
-                        router: tool_router.clone(),
-                        list_timeout: Duration::from_secs(config.call_timeout_secs),
-                        #[cfg(test)]
-                        protocol_version_override: None,
-                    });
+                    let handler = Arc::new(UpstreamClientHandler::new(
+                        name,
+                        Arc::clone(&tools),
+                        tool_router.clone(),
+                        Duration::from_secs(config.call_timeout_secs),
+                    ));
 
                     let client: McpClient = handler
                         .serve_with_lifecycle(
@@ -1835,15 +1792,13 @@ impl ServerManager {
                     })
                 }
                 TransportType::Http => {
-                    crate::tls::ensure_rustls_provider_installed();
-
                     let url = config
                         .url
                         .as_deref()
                         .ok_or_else(|| anyhow::anyhow!("HTTP transport requires a URL"))?;
 
                     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(url);
-                    transport_config.retry_config = Arc::new(CappedStreamRetry);
+                    transport_config.retry_config = Arc::new(crate::backoff::Backoff::STREAM);
 
                     // RMCP's auth_header accepts a raw token and adds the Bearer prefix.
                     if let Some(token) = resolve_upstream_auth(name, url, config).await? {
@@ -1866,19 +1821,17 @@ impl ServerManager {
                             Arc::from(name),
                             connection.clone(),
                             tool_router.clone(),
-                        ),
+                        )?,
                         transport_config,
                     );
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-                    let handler = Arc::new(UpstreamClientHandler {
-                        server_id: Arc::from(name),
-                        tools: Arc::clone(&tools),
-                        router: tool_router.clone(),
-                        list_timeout: Duration::from_secs(config.call_timeout_secs),
-                        #[cfg(test)]
-                        protocol_version_override: None,
-                    });
+                    let handler = Arc::new(UpstreamClientHandler::new(
+                        name,
+                        Arc::clone(&tools),
+                        tool_router.clone(),
+                        Duration::from_secs(config.call_timeout_secs),
+                    ));
 
                     match handler
                         .serve_with_lifecycle(
@@ -1901,9 +1854,15 @@ impl ServerManager {
                             .await
                         }
                         Err(e) => {
-                            let error =
-                                anyhow::Error::new(e).context("failed to connect to HTTP upstream");
-                            if should_fallback_to_legacy_sse(effective_protocol_mode, &error) {
+                            let fall_back =
+                                should_fallback_to_legacy_sse(effective_protocol_mode, &e);
+                            let error = if initialize_refused_with(&e) == Some(401) {
+                                anyhow::Error::new(crate::oauth::AuthRejected(e.to_string()))
+                            } else {
+                                anyhow::Error::new(e)
+                            }
+                            .context("failed to connect to HTTP upstream");
+                            if fall_back {
                                 tracing::info!(
                                     server = %name,
                                     error = %error,
@@ -1943,7 +1902,7 @@ impl ServerManager {
                     // The adapter is a real MCP server on the far end of an
                     // in-process pipe. It stops when the client side drops.
                     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-                    let adapter = crate::openapi::OpenApiServer::new(document, config);
+                    let adapter = crate::openapi::OpenApiServer::new(document, config)?;
                     tokio::spawn(async move {
                         if let Ok(service) = adapter.serve(server_io).await {
                             let _ = service.waiting().await;
@@ -1951,14 +1910,12 @@ impl ServerManager {
                     });
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-                    let handler = Arc::new(UpstreamClientHandler {
-                        server_id: Arc::from(name),
-                        tools: Arc::clone(&tools),
-                        router: tool_router.clone(),
-                        list_timeout: Duration::from_secs(config.call_timeout_secs),
-                        #[cfg(test)]
-                        protocol_version_override: None,
-                    });
+                    let handler = Arc::new(UpstreamClientHandler::new(
+                        name,
+                        Arc::clone(&tools),
+                        tool_router.clone(),
+                        Duration::from_secs(config.call_timeout_secs),
+                    ));
                     let client: McpClient = handler
                         .serve(client_io)
                         .await
@@ -2013,8 +1970,6 @@ impl ServerManager {
         tool_router: std::sync::Weak<ToolRouter>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        crate::tls::ensure_rustls_provider_installed();
-
         let url = config
             .url
             .as_deref()
@@ -2044,17 +1999,15 @@ impl ServerManager {
             Arc::new(move || on_upstream_session_replaced(&connection, &tool_router))
         });
 
-        let transport = LegacySseClientTransport::from_config(transport_config);
+        let transport = LegacySseClientTransport::from_config(transport_config)?;
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from(name),
-            tools: Arc::clone(&tools),
-            router: tool_router,
-            list_timeout: Duration::from_secs(config.call_timeout_secs),
-            #[cfg(test)]
-            protocol_version_override: None,
-        });
+        let handler = Arc::new(UpstreamClientHandler::new(
+            name,
+            Arc::clone(&tools),
+            tool_router,
+            Duration::from_secs(config.call_timeout_secs),
+        ));
 
         let client: McpClient = handler
             .serve(transport)
@@ -2074,9 +2027,7 @@ impl ServerManager {
         .await
     }
 
-    /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
-    ///
-    /// Every transport ends here, so the three start paths cannot drift apart.
+    /// Every transport ends here, so the start paths cannot drift apart.
     #[allow(clippy::too_many_arguments)]
     async fn finish_upstream_connection(
         name: &str,
@@ -2159,282 +2110,148 @@ impl ServerManager {
         })
     }
 
-    /// Return all tools from all healthy servers, each paired with the server name.
-    pub async fn get_tools(&self) -> Vec<(String, rmcp::model::Tool)> {
-        let servers = self.servers.load();
+    /// Whether calls may be routed to `name`. A server not checked yet may.
+    fn is_routable(&self, name: &str) -> bool {
+        self.health
+            .get(name)
+            .is_none_or(|entry| entry.health.is_routable())
+    }
+
+    /// The running servers calls may be routed to, sorted by name.
+    pub fn healthy_upstreams(&self) -> Vec<(String, Arc<UpstreamServer>)> {
+        let mut routable: Vec<_> = self
+            .servers
+            .load()
+            .iter()
+            .filter(|(name, _)| self.is_routable(name))
+            .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
+            .collect();
+        routable.sort_by(|a, b| a.0.cmp(&b.0));
+        routable
+    }
+
+    /// Every tool of every routable server, with its server's name.
+    pub fn get_tools(&self) -> Vec<(String, rmcp::model::Tool)> {
         let mut result = Vec::new();
-        for (server_name, upstream) in servers.iter() {
-            let health_ok = self
-                .health
-                .get(server_name)
-                .map(|h| h.health.is_routable())
-                .unwrap_or(true);
-            if !health_ok {
-                continue;
-            }
+        for (server_name, upstream) in self.healthy_upstreams() {
             let tools = upstream.tools.load();
-            result.reserve(tools.len());
             result.extend(tools.iter().map(|tool| (server_name.clone(), tool.clone())));
         }
         result
     }
 
     pub(crate) async fn get_resources(&self) -> ListingResult<Resource> {
-        let servers = self.servers.load();
-        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
-            .iter()
-            .filter_map(|(server_name, upstream)| {
-                let health_ok = self
-                    .health
-                    .get(server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true);
-                (health_ok && upstream.capabilities.resources.is_some())
-                    .then(|| (server_name.clone(), Arc::clone(upstream)))
-            })
-            .collect();
-        targets.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let results = join_all(
-            targets
-                .into_iter()
-                .map(|(server_name, upstream)| async move {
-                    // Bound each per-server listing call so one stalled-but-
-                    // connected upstream cannot block the whole catalog
-                    // refresh (the rmcp list_all_* calls carry no timeout).
-                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let outcome = match tokio::time::timeout(
-                        timeout,
-                        upstream.client.peer().list_all_resources(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resources)) => ListingOutcome::Fresh(resources),
-                        // A server without this list has an empty one. It
-                        // is not a failure, and warning on every refresh
-                        // buried the real ones.
-                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
-                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
-                        {
-                            ListingOutcome::Fresh(Vec::new())
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(server = %server_name, error = %error, "failed to list resources; carrying last-known-good");
-                            ListingOutcome::Unavailable
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                server = %server_name,
-                                timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing resources; carrying last-known-good"
-                            );
-                            ListingOutcome::Unavailable
-                        }
-                    };
-                    (server_name, outcome)
-                }),
+        self.list_all(
+            "resources",
+            |caps| caps.resources.is_some(),
+            &self.last_resources,
+            |upstream| async move { upstream.client.peer().list_all_resources().await },
         )
-        .await;
-
-        let mut items = Vec::new();
-        let mut degraded = BTreeSet::new();
-        for (server_name, outcome) in results {
-            match outcome {
-                ListingOutcome::Fresh(resources) => {
-                    let cached = Arc::new(resources);
-                    self.last_resources
-                        .insert(server_name.clone(), Arc::clone(&cached));
-                    for resource in cached.iter() {
-                        items.push((server_name.clone(), resource.clone()));
-                    }
-                }
-                ListingOutcome::Unavailable => {
-                    // A routable upstream that fails to list is degraded whether or
-                    // not we have last-known-good to serve — including its first,
-                    // uncached listing. Marking degraded only when a cache exists
-                    // would report a present-but-failing server as healthy.
-                    if let Some(cached) = self.last_resources.get(&server_name) {
-                        for resource in cached.iter() {
-                            items.push((server_name.clone(), resource.clone()));
-                        }
-                    }
-                    degraded.insert(server_name);
-                }
-            }
-        }
-        ListingResult { items, degraded }
+        .await
     }
 
     pub(crate) async fn get_resource_templates(&self) -> ListingResult<ResourceTemplate> {
-        let servers = self.servers.load();
-        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
-            .iter()
-            .filter_map(|(server_name, upstream)| {
-                let health_ok = self
-                    .health
-                    .get(server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true);
-                (health_ok && upstream.capabilities.resources.is_some())
-                    .then(|| (server_name.clone(), Arc::clone(upstream)))
-            })
-            .collect();
-        targets.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let results = join_all(
-            targets
-                .into_iter()
-                .map(|(server_name, upstream)| async move {
-                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let outcome = match tokio::time::timeout(
-                        timeout,
-                        upstream.client.peer().list_all_resource_templates(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(templates)) => ListingOutcome::Fresh(templates),
-                        // A server without this list has an empty one. It
-                        // is not a failure, and warning on every refresh
-                        // buried the real ones.
-                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
-                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
-                        {
-                            ListingOutcome::Fresh(Vec::new())
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(server = %server_name, error = %error, "failed to list resource templates; carrying last-known-good");
-                            ListingOutcome::Unavailable
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                server = %server_name,
-                                timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing resource templates; carrying last-known-good"
-                            );
-                            ListingOutcome::Unavailable
-                        }
-                    };
-                    (server_name, outcome)
-                }),
+        self.list_all(
+            "resource templates",
+            |caps| caps.resources.is_some(),
+            &self.last_resource_templates,
+            |upstream| async move { upstream.client.peer().list_all_resource_templates().await },
         )
-        .await;
-
-        let mut items = Vec::new();
-        let mut degraded = BTreeSet::new();
-        for (server_name, outcome) in results {
-            match outcome {
-                ListingOutcome::Fresh(templates) => {
-                    let cached = Arc::new(templates);
-                    self.last_resource_templates
-                        .insert(server_name.clone(), Arc::clone(&cached));
-                    for template in cached.iter() {
-                        items.push((server_name.clone(), template.clone()));
-                    }
-                }
-                ListingOutcome::Unavailable => {
-                    // Degraded whether or not last-known-good exists (see get_resources).
-                    if let Some(cached) = self.last_resource_templates.get(&server_name) {
-                        for template in cached.iter() {
-                            items.push((server_name.clone(), template.clone()));
-                        }
-                    }
-                    degraded.insert(server_name);
-                }
-            }
-        }
-        ListingResult { items, degraded }
+        .await
     }
 
     pub(crate) async fn get_prompts(&self) -> ListingResult<Prompt> {
-        let servers = self.servers.load();
-        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
-            .iter()
-            .filter_map(|(server_name, upstream)| {
-                let health_ok = self
-                    .health
-                    .get(server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true);
-                (health_ok && upstream.capabilities.prompts.is_some())
-                    .then(|| (server_name.clone(), Arc::clone(upstream)))
-            })
-            .collect();
-        targets.sort_by(|a, b| a.0.cmp(&b.0));
+        self.list_all(
+            "prompts",
+            |caps| caps.prompts.is_some(),
+            &self.last_prompts,
+            |upstream| async move { upstream.client.peer().list_all_prompts().await },
+        )
+        .await
+    }
 
-        let results = join_all(
-            targets
-                .into_iter()
-                .map(|(server_name, upstream)| async move {
-                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let outcome = match tokio::time::timeout(
-                        timeout,
-                        upstream.client.peer().list_all_prompts(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(prompts)) => ListingOutcome::Fresh(prompts),
-                        // A server without this list has an empty one. It
-                        // is not a failure, and warning on every refresh
-                        // buried the real ones.
+    /// List one catalog dimension from every routable server that offers it,
+    /// all at once, each bounded by its server's `call_timeout_secs` (the
+    /// rmcp `list_all_*` calls carry no timeout of their own), so one stalled
+    /// server cannot hold the whole refresh.
+    async fn list_all<T, Fut>(
+        &self,
+        what: &str,
+        offers: impl Fn(&ServerCapabilities) -> bool,
+        last_known_good: &DashMap<String, Arc<Vec<T>>>,
+        list: impl Fn(Arc<UpstreamServer>) -> Fut,
+    ) -> ListingResult<T>
+    where
+        T: Clone,
+        Fut: Future<Output = Result<Vec<T>, rmcp::service::ServiceError>>,
+    {
+        let targets: Vec<_> = self
+            .healthy_upstreams()
+            .into_iter()
+            .filter(|(_, upstream)| offers(&upstream.capabilities))
+            .collect();
+        let results = join_all(targets.into_iter().map(|(server_name, upstream)| {
+            let timeout_secs = upstream.config.call_timeout_secs;
+            let listing = list(upstream);
+            async move {
+                let outcome =
+                    match tokio::time::timeout(Duration::from_secs(timeout_secs), listing).await {
+                        Ok(Ok(items)) => ListingOutcome::Fresh(items),
+                        // A server without this list has an empty one. It is
+                        // not a failure, and warning on every refresh buried
+                        // the real ones.
                         Ok(Err(rmcp::service::ServiceError::McpError(error)))
                             if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
                         {
                             ListingOutcome::Fresh(Vec::new())
                         }
                         Ok(Err(error)) => {
-                            tracing::warn!(server = %server_name, error = %error, "failed to list prompts; carrying last-known-good");
+                            tracing::warn!(server = %server_name, error = %error, "failed to list {what}; carrying last-known-good");
                             ListingOutcome::Unavailable
                         }
                         Err(_) => {
                             tracing::warn!(
                                 server = %server_name,
-                                timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing prompts; carrying last-known-good"
+                                timeout_secs,
+                                "timed out listing {what}; carrying last-known-good"
                             );
                             ListingOutcome::Unavailable
                         }
                     };
-                    (server_name, outcome)
-                }),
-        )
+                (server_name, outcome)
+            }
+        }))
         .await;
 
         let mut items = Vec::new();
         let mut degraded = BTreeSet::new();
         for (server_name, outcome) in results {
-            match outcome {
-                ListingOutcome::Fresh(prompts) => {
-                    let cached = Arc::new(prompts);
-                    self.last_prompts
-                        .insert(server_name.clone(), Arc::clone(&cached));
-                    for prompt in cached.iter() {
-                        items.push((server_name.clone(), prompt.clone()));
-                    }
+            let listed = match outcome {
+                ListingOutcome::Fresh(fresh) => {
+                    let fresh = Arc::new(fresh);
+                    last_known_good.insert(server_name.clone(), Arc::clone(&fresh));
+                    Some(fresh)
                 }
                 ListingOutcome::Unavailable => {
-                    // Degraded whether or not last-known-good exists (see get_resources).
-                    if let Some(cached) = self.last_prompts.get(&server_name) {
-                        for prompt in cached.iter() {
-                            items.push((server_name.clone(), prompt.clone()));
-                        }
-                    }
-                    degraded.insert(server_name);
+                    // Degraded whether or not there is a last-known-good to
+                    // serve, its first listing included: marking it only when
+                    // a cache exists would report a failing server healthy.
+                    degraded.insert(server_name.clone());
+                    last_known_good
+                        .get(&server_name)
+                        .map(|cached| Arc::clone(cached.value()))
                 }
+            };
+            for item in listed.iter().flat_map(|listed| listed.iter()) {
+                items.push((server_name.clone(), item.clone()));
             }
         }
         ListingResult { items, degraded }
     }
 
     pub fn healthy_capabilities(&self) -> Vec<ServerCapabilities> {
-        let servers = self.servers.load();
-        servers
-            .iter()
-            .filter(|(server_name, _)| {
-                self.health
-                    .get(*server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true)
-            })
+        self.healthy_upstreams()
+            .into_iter()
             .map(|(_, upstream)| upstream.capabilities.clone())
             .collect()
     }
@@ -2451,21 +2268,6 @@ impl ServerManager {
         servers
             .get(server_name)
             .and_then(|upstream| upstream.upstream.clone())
-    }
-
-    /// Get all healthy upstream servers as (name, server) pairs.
-    pub fn healthy_upstreams(&self) -> Vec<(String, Arc<UpstreamServer>)> {
-        let servers = self.servers.load();
-        servers
-            .iter()
-            .filter(|(name, _)| {
-                self.health
-                    .get(name.as_str())
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true)
-            })
-            .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
-            .collect()
     }
 
     /// Gracefully shutdown all upstream servers.
@@ -2543,6 +2345,7 @@ impl ServerManager {
 
         self.health.clear();
         self.configured_auth.clear();
+        self.settings.clear();
         self.circuit_breakers.clear();
         self.metrics.clear();
         self.last_resources.clear();
@@ -2551,7 +2354,6 @@ impl ServerManager {
         self.availability.clear();
         self.last_errors.clear();
         self.semaphores.clear();
-        self.reconnecting.clear();
     }
 
     /// Return health/status information for all servers.
@@ -2623,8 +2425,6 @@ impl ServerManager {
         self.last_errors.get(name).map(|error| error.clone())
     }
 
-    /// Record that a configured server failed during startup so it appears in
-    /// status output and becomes eligible for proactive recovery.
     /// Whether every call slot of `name` is taken by a running call.
     pub(crate) fn busy_with_a_call(&self, name: &str) -> bool {
         self.semaphores
@@ -2642,14 +2442,9 @@ impl ServerManager {
         Arc::clone(&self.check_now)
     }
 
+    /// Mark `name` down, so status shows it and recovery takes it on.
     pub fn mark_start_failure(&self, name: &str) {
-        self.health.insert(
-            name.to_string(),
-            HealthState {
-                health: ServerHealth::Failed,
-                consecutive_failures: 6,
-            },
-        );
+        self.health.insert(name.to_string(), HealthState::failed());
     }
 
     /// Mark a server as requiring OAuth authentication.
@@ -2657,13 +2452,8 @@ impl ServerManager {
     pub fn mark_auth_required(&self, name: &str) {
         self.configured_auth
             .insert(name.to_string(), ConfiguredAuth::Oauth);
-        self.health.insert(
-            name.to_string(),
-            HealthState {
-                health: ServerHealth::AuthRequired,
-                consecutive_failures: 0,
-            },
-        );
+        self.health
+            .insert(name.to_string(), HealthState::auth_required());
     }
 
     /// Start a single server and register it in the manager.
@@ -2698,6 +2488,8 @@ impl ServerManager {
     fn install_call_guards(&self, name: &str, config: &ServerConfig, fresh: bool) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
+        self.settings
+            .insert(name.to_string(), Arc::new(config.clone()));
         let new_semaphore = || Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
         let new_breaker = || Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
         if fresh {
@@ -2720,6 +2512,53 @@ impl ServerManager {
             self.circuit_breakers
                 .insert(name.to_string(), new_breaker());
         }
+    }
+
+    /// Apply to running `name` the settings that need no restart: its call
+    /// limit, its circuit breaker, and how its tools are named. Calls already
+    /// holding a slot finish under the old limit.
+    pub(crate) fn apply_live_settings(&self, name: &str, config: &ServerConfig) {
+        let previous = self.settings(name);
+        if previous
+            .as_ref()
+            .is_none_or(|previous| previous.max_concurrent != config.max_concurrent)
+        {
+            self.semaphores.insert(
+                name.to_string(),
+                Arc::new(tokio::sync::Semaphore::new(config.max_concurrent)),
+            );
+        }
+        if !config.circuit_breaker_enabled {
+            self.circuit_breakers.remove(name);
+        } else if !self.circuit_breakers.contains_key(name) {
+            self.circuit_breakers.insert(
+                name.to_string(),
+                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+            );
+        }
+        self.settings
+            .insert(name.to_string(), Arc::new(config.clone()));
+    }
+
+    /// The circuit breaker every call to `name` goes through, if it has one.
+    pub(crate) fn circuit_breaker(&self, name: &str) -> Option<Arc<CircuitBreaker>> {
+        self.circuit_breakers
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// The slots that bound how many calls to `name` run at once.
+    pub(crate) fn call_slots(&self, name: &str) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.semaphores
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// `name`'s current settings, while it runs.
+    pub(crate) fn settings(&self, name: &str) -> Option<Arc<ServerConfig>> {
+        self.settings
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Push the router's effective log level to a newly registered upstream so
@@ -2760,6 +2599,7 @@ impl ServerManager {
         // removed server stays in the list.
         self.health.remove(name);
         self.configured_auth.remove(name);
+        self.settings.remove(name);
         if let Some(upstream_arc) = self.remove_upstream(name) {
             self.circuit_breakers.remove(name);
             self.metrics.remove(name);
@@ -2772,8 +2612,11 @@ impl ServerManager {
         }
     }
 
-    /// Replace an upstream server (used after reconnection).
-    /// Updates the servers map and resets circuit breaker and health state.
+    /// Swap in a reconnected upstream and reset its health and breaker.
+    ///
+    /// Only for an upstream connected against the live config: use
+    /// `Engine::commit_replacement`, which checks that, or a removed server
+    /// comes back.
     ///
     /// Unlike [`stop_server`], the last-known-good listing caches (`last_resources`,
     /// `last_resource_templates`, `last_prompts`) and `availability` are intentionally
@@ -2782,7 +2625,7 @@ impl ServerManager {
     /// first post-reconnect listing succeeds. They are overwritten on the next Fresh
     /// listing and reclaimed by `stop_server`/`update_availability` if the server is
     /// removed from config.
-    pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
+    pub(crate) async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
         self.install_call_guards(name, &upstream.config, false);
         self.spawn_initial_log_level(name, &upstream);
         let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
@@ -2798,10 +2641,11 @@ impl ServerManager {
             if Arc::strong_count(&old_upstream) > 1 {
                 let name = name.to_string();
                 let mut shutdown_rx = self.shutdown_signal.subscribe();
+                let grace = self.replacement_grace;
                 let mut retire_tasks = self.retire_tasks.lock().await;
                 retire_tasks.spawn(async move {
                     tokio::select! {
-                        _ = tokio::time::sleep(UPSTREAM_REPLACEMENT_GRACE_PERIOD) => {}
+                        _ = tokio::time::sleep(grace) => {}
                         // Engine is shutting down: skip the rest of the grace
                         // period and retire immediately.
                         _ = shutdown_rx.wait_for(|v| *v) => {}
@@ -2815,15 +2659,6 @@ impl ServerManager {
                 retire_upstream_owned(name.to_string(), old_upstream, "replace").await;
             }
         }
-    }
-
-    /// Get the reconnecting flag for a server (creates one if missing).
-    /// Used to prevent concurrent reconnection stampedes.
-    pub fn get_reconnecting_flag(&self, name: &str) -> Arc<AtomicBool> {
-        self.reconnecting
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone()
     }
 }
 
@@ -2919,17 +2754,9 @@ impl Default for ServerManager {
     }
 }
 
-/// Check if a hostname or IP address is a cloud metadata endpoint.
-///
-/// Only blocks cloud metadata endpoints (169.254.169.254, metadata.google.internal).
-/// Loopback and private IPs are allowed because all servers in config.toml are
-/// explicitly user-configured — blocking them prevents legitimate local servers.
 /// Check a remote upstream URL against the SSRF block list and resolve the
 /// bearer token to send: the verified OAuth token for `auth = "oauth"`, the
 /// static `auth_token` otherwise. Shared by the HTTP and legacy SSE paths.
-///
-/// DNS-based bypasses (a hostname resolving to a private IP) are not covered;
-/// that would need async resolution at connect time.
 async fn resolve_upstream_auth(
     name: &str,
     url: &str,
@@ -2939,9 +2766,9 @@ async fn resolve_upstream_auth(
         .parse::<http::Uri>()
         .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
     if let Some(host) = parsed.host()
-        && is_blocked_host(host)
+        && crate::upstream_http::is_blocked_host(host)
     {
-        anyhow::bail!("URL host '{host}' is blocked — private, loopback, or metadata endpoint");
+        anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint");
     }
 
     if config.auth.as_deref() != Some("oauth") {
@@ -2963,56 +2790,10 @@ async fn resolve_upstream_auth(
                 server = %name,
                 "OAuth server has no available token, marking AuthRequired"
             );
-            Err(anyhow::anyhow!(
+            Err(anyhow::Error::new(crate::oauth::AuthRejected(format!(
                 "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
-            ))
+            ))))
         }
-    }
-}
-
-pub(crate) fn is_blocked_host(host: &str) -> bool {
-    // Known metadata hostnames
-    if host == "metadata.google.internal" {
-        return true;
-    }
-
-    // Try parsing as IP address — only block cloud metadata IP
-    let host_trimmed = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = host_trimmed.parse::<std::net::IpAddr>() {
-        return is_metadata_ip(&ip);
-    }
-
-    false
-}
-
-/// Returns true only for cloud metadata IPs (169.254.169.254).
-fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            // AWS/GCP/Azure metadata endpoint
-            *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
-        }
-        std::net::IpAddr::V6(_) => false,
-    }
-}
-
-/// How long to wait before reopening an HTTP server's event stream.
-///
-/// rmcp's own policy doubles without a ceiling, so a server that was away for
-/// ten minutes is next tried after seventeen more, and after thirty-two tries
-/// the doubling overflows. This one doubles from one second and stops at a
-/// minute.
-#[derive(Debug)]
-struct CappedStreamRetry;
-
-impl CappedStreamRetry {
-    const LONGEST: Duration = Duration::from_secs(60);
-}
-
-impl rmcp::transport::common::client_side_sse::SseRetryPolicy for CappedStreamRetry {
-    fn retry(&self, current_times: usize) -> Option<Duration> {
-        let doubled = 1u64.checked_shl(current_times as u32).unwrap_or(u64::MAX);
-        Some(Duration::from_secs(doubled).min(Self::LONGEST))
     }
 }
 
@@ -3033,16 +2814,6 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn the_wait_to_reopen_a_stream_doubles_and_stops_at_a_minute() {
-        use rmcp::transport::common::client_side_sse::SseRetryPolicy;
-        let policy = CappedStreamRetry;
-        assert_eq!(policy.retry(0), Some(Duration::from_secs(1)));
-        assert_eq!(policy.retry(3), Some(Duration::from_secs(8)));
-        assert_eq!(policy.retry(6), Some(Duration::from_secs(60)));
-        assert_eq!(policy.retry(64), Some(Duration::from_secs(60)));
-        assert_eq!(policy.retry(usize::MAX), Some(Duration::from_secs(60)));
-    }
     use crate::config::{ServerConfig, TransportType};
     use crate::proxy::{ProxyHandler, RouterConfig};
 
@@ -3078,7 +2849,7 @@ mod tests {
         let starting = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move {
-                let _ = manager
+                manager
                     .start_all(&config, move |name| {
                         let _ = tx.send(name.to_string());
                     })
@@ -3308,7 +3079,8 @@ mod tests {
             // reaction, and a router that cannot be upgraded simply skips the
             // refresh kick.
             std::sync::Weak::new(),
-        );
+        )
+        .expect("build the HTTP client");
         (client, connection)
     }
 
@@ -3433,13 +3205,6 @@ mod tests {
     use tokio::sync::{Notify, watch};
 
     #[test]
-    fn secret_string_as_str_preserves_auth_header_value() {
-        let token = crate::types::SecretString::from("real-token".to_string());
-        assert_eq!(format!("Bearer {}", token.as_str()), "Bearer real-token");
-        assert_eq!(format!("{token}"), "[REDACTED]");
-    }
-
-    #[test]
     fn upstream_metrics_record_success_error_and_recovery() {
         let sm = ServerManager::new();
 
@@ -3532,60 +3297,42 @@ mod tests {
     }
 
     #[test]
-    fn upstream_protocol_gate_and_lifecycle_mapping_are_exact() {
-        assert_eq!(
-            effective_upstream_protocol_mode(UpstreamProtocolMode::Modern, false),
-            UpstreamProtocolMode::Legacy
-        );
-        assert_eq!(
-            effective_upstream_protocol_mode(UpstreamProtocolMode::Auto, true),
-            UpstreamProtocolMode::Auto
-        );
-
-        assert_eq!(
-            client_lifecycle_mode(UpstreamProtocolMode::Auto),
-            ClientLifecycleMode::Auto {
-                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
-                legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
-            }
-        );
-        assert_eq!(
-            client_lifecycle_mode(UpstreamProtocolMode::Modern),
-            ClientLifecycleMode::Discover {
-                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
-            }
-        );
-    }
-
-    #[test]
-    fn modern_modes_never_enter_the_legacy_sse_error_fallback() {
-        let method_not_allowed =
-            anyhow::anyhow!("unexpected server response: HTTP 405 Method Not Allowed");
+    fn only_a_405_to_a_legacy_mode_initialize_falls_back_to_sse() {
+        let refused =
+            |message: &'static str| rmcp::service::ClientInitializeError::TransportError {
+                error: rmcp::transport::DynamicTransportError::from_parts(
+                    "test",
+                    std::any::TypeId::of::<()>(),
+                    Box::new(
+                        StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+                            message.into(),
+                        ),
+                    ),
+                ),
+                context: "send initialize request".into(),
+            };
+        let method_not_allowed = refused("HTTP 405 Method Not Allowed: ");
         assert!(should_fallback_to_legacy_sse(
             UpstreamProtocolMode::Legacy,
             &method_not_allowed
         ));
-        assert!(!should_fallback_to_legacy_sse(
-            UpstreamProtocolMode::Auto,
-            &method_not_allowed
-        ));
-        assert!(!should_fallback_to_legacy_sse(
-            UpstreamProtocolMode::Modern,
-            &method_not_allowed
-        ));
-
+        for mode in [UpstreamProtocolMode::Auto, UpstreamProtocolMode::Modern] {
+            assert!(!should_fallback_to_legacy_sse(mode, &method_not_allowed));
+        }
         for message in [
-            "HTTP 401 Unauthorized",
-            "TLS certificate validation failed",
-            "request timed out",
-            "HTTP 429 Too Many Requests",
-            "HTTP 500 Internal Server Error",
+            "HTTP 401 Unauthorized: ",
+            "HTTP 404 Not Found: ",
+            "HTTP 500 Internal Server Error: ",
         ] {
             assert!(!should_fallback_to_legacy_sse(
                 UpstreamProtocolMode::Legacy,
-                &anyhow::anyhow!(message)
+                &refused(message)
             ));
         }
+        assert_eq!(
+            initialize_refused_with(&refused("HTTP 401 Unauthorized: ")),
+            Some(401)
+        );
     }
 
     #[tokio::test]
@@ -4086,13 +3833,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from(name.to_string()),
-            tools: Arc::clone(&tools),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from(name.to_string()),
+            Arc::clone(&tools),
+            std::sync::Weak::new(),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -4149,13 +3894,11 @@ mod tests {
         }
         let _cleanup = KillOnExit(child_pid);
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("eof-ignorer"),
-            tools: Arc::clone(&tools),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("eof-ignorer"),
+            Arc::clone(&tools),
+            std::sync::Weak::new(),
+        ));
         let client: McpClient = rmcp::service::serve_directly(handler, transport, None);
         let upstream = UpstreamServer {
             name: "eof-ignorer".to_string(),
@@ -4195,13 +3938,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from(name.to_string()),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from(name.to_string()),
+            Arc::clone(&tools),
+            Arc::downgrade(router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -4345,63 +4086,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ssrf_allows_loopback() {
-        // Loopback is allowed — user-configured local servers are legitimate
-        assert!(!is_blocked_host("127.0.0.1"));
-        assert!(!is_blocked_host("127.0.0.2"));
-        assert!(!is_blocked_host("[::1]"));
-    }
-
-    #[test]
-    fn ssrf_allows_private_ranges() {
-        // Private IPs are allowed — user-configured local servers are legitimate
-        assert!(!is_blocked_host("10.0.0.1"));
-        assert!(!is_blocked_host("172.16.0.1"));
-        assert!(!is_blocked_host("192.168.1.1"));
-    }
-
-    #[test]
-    fn ssrf_blocks_cloud_metadata() {
-        assert!(is_blocked_host("169.254.169.254"));
-        assert!(is_blocked_host("metadata.google.internal"));
-        // Other link-local IPs are NOT blocked (only the specific metadata IP)
-        assert!(!is_blocked_host("169.254.0.1"));
-    }
-
-    #[test]
-    fn ssrf_allows_public_ips() {
-        assert!(!is_blocked_host("8.8.8.8"));
-        assert!(!is_blocked_host("1.1.1.1"));
-        assert!(!is_blocked_host("example.com"));
-        assert!(!is_blocked_host("localhost"));
-    }
-
-    #[test]
-    fn replace_server_resets_health_state() {
-        let mgr = ServerManager::new();
-
-        // Simulate a degraded server by recording failures
-        {
-            let mut entry = mgr.health.entry("test".to_string()).or_default();
-            entry.record_failure();
-            entry.record_failure();
-            entry.record_failure(); // → Degraded
-            assert_eq!(entry.health, ServerHealth::Degraded);
-        }
-
-        // We can't easily create a real UpstreamServer without a running MCP server,
-        // but we can verify the health reset logic by checking the DashMap directly.
-        // The replace_server method resets health via: `*entry = HealthState::new()`
-        if let Some(mut entry) = mgr.health.get_mut("test") {
-            *entry = HealthState::new();
-        }
-
-        let health = mgr.health.get("test").unwrap();
-        assert_eq!(health.health, ServerHealth::Healthy);
-        assert_eq!(health.consecutive_failures, 0);
-    }
-
     #[tokio::test]
     async fn concurrent_insert_upstream_preserves_all_servers() {
         let mgr = Arc::new(ServerManager::new());
@@ -4525,7 +4209,10 @@ mod tests {
 
     #[tokio::test]
     async fn replace_server_cancels_replaced_upstream_when_old_arc_is_still_held() {
-        let mgr = ServerManager::new();
+        let mgr = ServerManager {
+            replacement_grace: Duration::from_millis(50),
+            ..ServerManager::new()
+        };
 
         let (upstream_server_a, tools_rx_a) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer_a = Arc::clone(&upstream_server_a.peer);
@@ -4543,13 +4230,11 @@ mod tests {
         });
 
         let tools_a = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler_a = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("replace-test"),
-            tools: Arc::clone(&tools_a),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler_a = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("replace-test"),
+            Arc::clone(&tools_a),
+            std::sync::Weak::new(),
+        ));
         let client_a: McpClient = upstream_handler_a
             .serve(client_transport_a)
             .await
@@ -4603,13 +4288,11 @@ mod tests {
         });
 
         let tools_b = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler_b = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("replace-test"),
-            tools: Arc::clone(&tools_b),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler_b = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("replace-test"),
+            Arc::clone(&tools_b),
+            std::sync::Weak::new(),
+        ));
         let client_b: McpClient = upstream_handler_b
             .serve(client_transport_b)
             .await
@@ -4653,13 +4336,16 @@ mod tests {
         .expect("replaced upstream should be cancelled even with lingering Arc");
     }
 
-    // Plan 012: grace-period retirement tasks are tracked so `shutdown_all`
-    // can retire them immediately instead of leaving orphaned upstreams
-    // alive up to `UPSTREAM_REPLACEMENT_GRACE_PERIOD` after shutdown returns.
+    // Grace-period retirement tasks are tracked so `shutdown_all` can retire
+    // them at once instead of leaving replaced upstreams alive for the rest
+    // of their grace after shutdown returns.
 
     #[tokio::test]
     async fn replace_grace_still_waits_in_normal_operation() {
-        let mgr = ServerManager::new();
+        let mgr = ServerManager {
+            replacement_grace: Duration::from_millis(50),
+            ..ServerManager::new()
+        };
         let upstream = make_connected_test_upstream("grace-normal").await;
         mgr.insert_upstream("grace-normal".to_string(), Arc::new(upstream));
 
@@ -4670,8 +4356,8 @@ mod tests {
         let replacement = make_connected_test_upstream("grace-normal").await;
         mgr.replace_server("grace-normal", replacement).await;
 
-        // Immediately after replace_server returns, the grace period (50ms
-        // in test builds) has not elapsed yet — normal operation must not
+        // Immediately after replace_server returns, the 50ms grace has not
+        // elapsed yet — normal operation must not
         // retire the old upstream early.
         assert!(
             !old_upstream.client.is_closed(),
@@ -4699,7 +4385,7 @@ mod tests {
 
         // Hold a second reference so replace_server takes the grace-period
         // path, leaving a pending retirement task asleep for
-        // UPSTREAM_REPLACEMENT_GRACE_PERIOD (50ms in test builds).
+        // the 30s grace.
         let old_upstream = mgr
             .get_upstream("grace-shutdown")
             .expect("initial upstream");
@@ -4803,24 +4489,6 @@ mod tests {
     }
 
     #[test]
-    fn get_reconnecting_flag_returns_same_instance() {
-        let mgr = ServerManager::new();
-        let flag1 = mgr.get_reconnecting_flag("test");
-        let flag2 = mgr.get_reconnecting_flag("test");
-        // Both should point to the same AtomicBool
-        assert!(Arc::ptr_eq(&flag1, &flag2));
-    }
-
-    #[test]
-    fn reconnecting_flags_are_per_server() {
-        let mgr = ServerManager::new();
-        let flag_a = mgr.get_reconnecting_flag("server-a");
-        let flag_b = mgr.get_reconnecting_flag("server-b");
-        // Different servers should have different flags
-        assert!(!Arc::ptr_eq(&flag_a, &flag_b));
-    }
-
-    #[test]
     fn server_statuses_include_failed_startups_without_upstreams() {
         let mgr = ServerManager::new();
         mgr.mark_start_failure("workspace");
@@ -4908,13 +4576,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5018,13 +4684,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5353,13 +5017,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5478,13 +5140,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5620,13 +5280,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("catalog"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("catalog"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -6085,26 +5743,6 @@ mod tests {
         assert_eq!(router.tool_count(), 2);
     }
 
-    /// An upstream that never answers a connect must not hold startup for the
-    /// whole per-server start timeout, which defaults to thirty seconds and
-    /// which every other server's readiness waits behind.
-    #[tokio::test]
-    async fn upstream_http_connect_is_bounded_well_under_the_start_timeout() {
-        // RFC 5737 TEST-NET-1: reserved for documentation, routed nowhere.
-        let started = std::time::Instant::now();
-        let result = upstream_http_client()
-            .get("http://192.0.2.1:80/mcp")
-            .send()
-            .await;
-
-        assert!(result.is_err(), "a reserved address should never answer");
-        assert!(
-            started.elapsed() < UPSTREAM_CONNECT_TIMEOUT + Duration::from_secs(5),
-            "connect took {:?}, which is not bounded by the connect timeout",
-            started.elapsed()
-        );
-    }
-
     /// A server that failed at boot has no semaphore and no breaker. When it
     /// recovers through a reconnect it must get both, or it runs with no
     /// concurrency limit and no circuit breaker for the rest of the process.
@@ -6413,7 +6051,7 @@ mod tests {
             ),
         );
 
-        mgr.start_all(&config, |_| {}).await.expect("start_all");
+        mgr.start_all(&config, |_| {}).await;
 
         let statuses = mgr.server_statuses();
         assert_eq!(statuses.len(), 1);

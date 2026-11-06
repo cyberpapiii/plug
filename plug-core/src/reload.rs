@@ -1,4 +1,5 @@
-//! Config hot-reload: diff configs and apply changes at runtime.
+//! Config hot-reload: what changed between two configs, and what each change
+//! takes. [`crate::engine::Engine::reload_config`] applies it.
 //!
 //! Reload is triggered by:
 //! - `plug reload` CLI command via daemon IPC
@@ -6,89 +7,100 @@
 
 use std::collections::HashSet;
 
-use futures::stream::{self, StreamExt};
-
 use crate::config::{Config, ServerConfig, UpstreamProtocolMode};
-use crate::server::ServerManager;
 
 /// Diff result between old and new configs.
 #[derive(Debug, Clone)]
 pub struct ConfigDiff {
-    /// Servers to add (name, config).
     pub added: Vec<(String, ServerConfig)>,
-    /// Servers to remove.
     pub removed: Vec<String>,
-    /// Servers to restart (name, new config). Changed means different command/args/env/timeout.
+    /// Servers to stop and start again with their new config.
     pub changed: Vec<(String, ServerConfig)>,
-    /// Servers unchanged.
+    /// Servers that keep running, including those in `updated`.
     pub unchanged: Vec<String>,
+    /// Running servers whose new settings apply without a restart.
+    pub updated: Vec<(String, ServerConfig)>,
     /// Whether non-server settings changed (bind address, prefix, etc.).
     pub settings_changed: bool,
-    /// Settings that require a restart to apply.
+    /// Settings that take effect only when Plug restarts.
     pub restart_required: Vec<String>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ReloadStartKind {
-    Start,
+/// What a change to one server's settings takes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) enum ServerChange {
+    None,
+    /// Applies to the running server: its call limits, circuit breaker,
+    /// tool names and groups, and health interval.
+    Live,
+    /// The server is stopped and started again.
     Restart,
 }
 
-#[derive(Debug, Clone)]
-struct ReloadStartAction {
-    name: String,
-    config: ServerConfig,
-    kind: ReloadStartKind,
+/// Classify every field of [`ServerConfig`]. The destructuring names each
+/// one, so a field added to the config does not compile until it is
+/// classified here.
+pub(crate) fn server_change(old: &ServerConfig, new: &ServerConfig) -> ServerChange {
+    let ServerConfig {
+        command,
+        args,
+        env,
+        enabled,
+        transport,
+        protocol_mode,
+        url,
+        auth_token,
+        auth,
+        oauth_client_id,
+        oauth_scopes,
+        timeout_secs,
+        call_timeout_secs,
+        max_concurrent,
+        health_check_interval_secs,
+        circuit_breaker_enabled,
+        // Read into the router when Plug starts; reported by `diff_configs`.
+        enrichment: _,
+        tool_renames,
+        tool_groups,
+        sandbox,
+        spec,
+        operations,
+        token_in,
+    } = new;
+    let restart = *command != old.command
+        || *args != old.args
+        || *env != old.env
+        || *enabled != old.enabled
+        || *transport != old.transport
+        || *protocol_mode != old.protocol_mode
+        || *url != old.url
+        || *auth_token != old.auth_token
+        || *auth != old.auth
+        || *oauth_client_id != old.oauth_client_id
+        || *oauth_scopes != old.oauth_scopes
+        || *timeout_secs != old.timeout_secs
+        || *call_timeout_secs != old.call_timeout_secs
+        || *sandbox != old.sandbox
+        || *spec != old.spec
+        || *operations != old.operations
+        || *token_in != old.token_in;
+    let live = *max_concurrent != old.max_concurrent
+        || *health_check_interval_secs != old.health_check_interval_secs
+        || *circuit_breaker_enabled != old.circuit_breaker_enabled
+        || *tool_renames != old.tool_renames
+        || *tool_groups != old.tool_groups;
+    if restart {
+        ServerChange::Restart
+    } else if live {
+        ServerChange::Live
+    } else {
+        ServerChange::None
+    }
 }
 
-async fn run_reload_start_actions(
-    actions: Vec<ReloadStartAction>,
-    concurrency_limit: usize,
-    server_manager: std::sync::Arc<ServerManager>,
-) -> Vec<(ReloadStartAction, Result<(), String>)> {
-    stream::iter(actions)
-        .map(move |action| {
-            let server_manager = server_manager.clone();
-            async move {
-                match action.kind {
-                    ReloadStartKind::Restart => {
-                        tracing::info!(server = %action.name, "starting replacement for changed server");
-                    }
-                    ReloadStartKind::Start => {
-                        tracing::info!(server = %action.name, "starting new server");
-                    }
-                }
-
-                let result = server_manager
-                    .start_and_register(&action.name, &action.config)
-                    .await
-                    .map_err(|e| e.to_string());
-                (action, result)
-            }
-        })
-        .buffer_unordered(concurrency_limit.max(1))
-        .collect()
-        .await
-}
-
-/// The servers a reload starts: every changed or added server that is on.
-/// A server that is off is stopped with the rest and stays stopped.
-fn reload_start_actions(diff: &ConfigDiff) -> Vec<ReloadStartAction> {
-    let action = |kind| {
-        move |(name, config): &(String, ServerConfig)| {
-            config.enabled.then(|| ReloadStartAction {
-                name: name.clone(),
-                config: config.clone(),
-                kind,
-            })
-        }
-    };
-    let changed = diff
-        .changed
-        .iter()
-        .filter_map(action(ReloadStartKind::Restart));
-    let added = diff.added.iter().filter_map(action(ReloadStartKind::Start));
-    changed.chain(added).collect()
+/// Whether `new` needs the server restarted to take effect.
+pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
+    server_change(old, new) == ServerChange::Restart
 }
 
 /// Compare two configs and return the diff.
@@ -108,6 +120,7 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
 
     let mut changed = Vec::new();
     let mut unchanged = Vec::new();
+    let mut updated = Vec::new();
 
     for name in old_names.intersection(&new_names) {
         let old_cfg = &old.servers[*name];
@@ -116,10 +129,14 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
             != new.modern_upstream_enabled
             && (old_cfg.protocol_mode != UpstreamProtocolMode::Legacy
                 || new_cfg.protocol_mode != UpstreamProtocolMode::Legacy);
-        if server_config_changed(old_cfg, new_cfg) || gate_change_requires_renegotiation {
+        let change = server_change(old_cfg, new_cfg);
+        if change == ServerChange::Restart || gate_change_requires_renegotiation {
             changed.push(((*name).clone(), new_cfg.clone()));
         } else {
             unchanged.push((*name).clone());
+            if change == ServerChange::Live {
+                updated.push(((*name).clone(), new_cfg.clone()));
+            }
         }
     }
 
@@ -200,6 +217,20 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         "daemon_grace_period_secs changed",
     );
 
+    let enriched = |config: &Config| -> std::collections::BTreeSet<String> {
+        config
+            .servers
+            .iter()
+            .filter(|(_, server)| server.enrichment)
+            .map(|(name, _)| name.clone())
+            .collect()
+    };
+    note_restart_required(
+        &mut restart_required,
+        enriched(old) != enriched(new),
+        "servers.*.enrichment changed",
+    );
+
     let settings_changed = !restart_required.is_empty()
         || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled
         || old.modern_upstream_enabled != new.modern_upstream_enabled;
@@ -209,6 +240,7 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         removed,
         changed,
         unchanged,
+        updated,
         settings_changed,
         restart_required,
     }
@@ -218,149 +250,6 @@ fn note_restart_required(restart_required: &mut Vec<String>, changed: bool, sett
     if changed {
         restart_required.push(format!("{setting} (restart required)"));
     }
-}
-
-/// Check if a server config has materially changed (requiring restart).
-pub(crate) fn server_config_changed(old: &ServerConfig, new: &ServerConfig) -> bool {
-    old.command != new.command
-        || old.args != new.args
-        || old.env != new.env
-        || old.transport != new.transport
-        || old.protocol_mode != new.protocol_mode
-        || old.url != new.url
-        || old.timeout_secs != new.timeout_secs
-        || old.call_timeout_secs != new.call_timeout_secs
-        || old.enabled != new.enabled
-        || old.auth_token != new.auth_token
-        || old.auth != new.auth
-        || old.oauth_client_id != new.oauth_client_id
-        || old.oauth_scopes != new.oauth_scopes
-        || old.health_check_interval_secs != new.health_check_interval_secs
-        || old.spec != new.spec
-        || old.operations != new.operations
-        || old.token_in != new.token_in
-}
-
-/// Apply a config diff to the running engine.
-///
-/// Steps:
-/// 1. Stop removed servers
-/// 2. Stop changed servers
-/// 3. Batch-start changed and added servers
-/// 4. Swap config via ArcSwap
-/// 5. Spawn background tasks for successful starts
-/// 6. Refresh tool cache
-/// 7. Emit ConfigReloaded event
-pub async fn apply_reload(
-    engine: &std::sync::Arc<crate::engine::Engine>,
-    new_config: Config,
-) -> Result<ReloadReport, anyhow::Error> {
-    let old_config = engine.config();
-    let diff = diff_configs(&old_config, &new_config);
-
-    let mut report = ReloadReport {
-        added: diff.added.iter().map(|(n, _)| n.clone()).collect(),
-        removed: diff.removed.clone(),
-        changed: diff.changed.iter().map(|(n, _)| n.clone()).collect(),
-        unchanged: diff.unchanged.clone(),
-        settings_changed: diff.settings_changed,
-        restart_required: diff.restart_required.clone(),
-        errors: Vec::new(),
-    };
-
-    let server_manager = engine.server_manager();
-    // Set the live gate before any replacement starts. Existing connections
-    // remain valid until their targeted restart below; credentials stay in the
-    // existing stores and are resolved normally by the replacement.
-    server_manager.set_modern_upstream_enabled(new_config.modern_upstream_enabled);
-    let mut spawn_after_swap: Vec<(String, ServerConfig)> = Vec::new();
-
-    for name in &diff.removed {
-        tracing::info!(server = %name, "stopping removed server");
-        server_manager.stop_server(name).await;
-        engine.clear_health_task_generation(name);
-        engine.clear_refresh_task_generation(name);
-        // stop_server clears the metrics (incl. the restart clock); clear the
-        // matching supervision backoff so a re-added server doesn't inherit a
-        // stale escalating counter.
-        engine.reset_supervision(name);
-    }
-
-    // Stop changed servers before their replacement startup batch begins.
-    for (name, _new_cfg) in &diff.changed {
-        tracing::info!(server = %name, "restarting changed server");
-        server_manager.stop_server(name).await;
-        engine.reset_supervision(name);
-    }
-
-    let start_actions = reload_start_actions(&diff);
-
-    let start_results = run_reload_start_actions(
-        start_actions,
-        new_config.startup_concurrency,
-        server_manager.clone(),
-    )
-    .await;
-
-    // Record startup outcomes after the batch completes so config swap and
-    // downstream refresh happen once for the whole reload.
-    for (action, result) in start_results {
-        match result {
-            Ok(()) => {
-                if action.config.enabled {
-                    spawn_after_swap.push((action.name.clone(), action.config.clone()));
-                }
-            }
-            Err(error) => {
-                // Only a real sign-in failure asks the owner to sign in; a
-                // network failure on a server that signs in is retried like
-                // any other. Either way the server gets its health task, so
-                // one that could not start during the reload is retried.
-                server_manager.record_start_failure(
-                    &action.name,
-                    &action.config,
-                    &anyhow::anyhow!("{error}"),
-                );
-                if action.config.enabled {
-                    spawn_after_swap.push((action.name.clone(), action.config.clone()));
-                }
-                let verb = match action.kind {
-                    ReloadStartKind::Restart => "restart",
-                    ReloadStartKind::Start => "start",
-                };
-                let msg = format!("failed to {verb} server {}: {error}", action.name);
-                tracing::error!("{msg}");
-                report.errors.push(msg);
-            }
-        }
-    }
-
-    // Catalog rebuild only when the upstream server set changes. Tool-shaping
-    // fields are restart-required and do not update live `RouterConfig`, so
-    // refreshing on those alone rebuilds routes with stale shaping.
-    let catalog_dirty =
-        !diff.added.is_empty() || !diff.changed.is_empty() || !diff.removed.is_empty();
-
-    // Swap config atomically before spawning background tasks so new tasks
-    // observe the updated server set immediately.
-    engine.store_config(new_config);
-
-    for (name, cfg) in &spawn_after_swap {
-        engine.spawn_background_tasks_for_server(name, cfg);
-    }
-
-    if catalog_dirty {
-        engine.tool_router().refresh_tools().await;
-    }
-
-    #[cfg(test)]
-    engine.note_reload_applied();
-
-    for warning in &diff.restart_required {
-        tracing::warn!("{warning}");
-    }
-
-    Ok(report)
 }
 
 /// Report of what happened during a reload.
@@ -375,17 +264,11 @@ pub struct ReloadReport {
     pub errors: Vec<String>,
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::{Config, ServerConfig};
-    use futures::stream::{self, StreamExt};
     use std::collections::HashMap;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::time::Duration;
 
     fn make_server(command: &str) -> ServerConfig {
         ServerConfig {
@@ -432,40 +315,6 @@ mod tests {
         assert!(diff.removed.is_empty());
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].0, "github");
-    }
-
-    #[test]
-    fn a_reload_starts_only_the_servers_that_are_on() {
-        let mut old = Config::default();
-        old.servers.insert("turned-off".into(), make_server("npx"));
-        old.servers.insert("edited".into(), make_server("npx"));
-        let mut off = make_server("npx");
-        off.enabled = false;
-        old.servers.insert("edited-while-off".into(), off.clone());
-
-        let mut new = Config::default();
-        new.servers.insert("turned-off".into(), off.clone());
-        new.servers.insert("edited".into(), make_server("node"));
-        off.command = Some("node".into());
-        new.servers.insert("edited-while-off".into(), off.clone());
-        new.servers.insert("added-off".into(), off);
-        new.servers.insert("added".into(), make_server("npx"));
-
-        let diff = diff_configs(&old, &new);
-        assert_eq!(diff.changed.len(), 3, "all three are stopped");
-
-        let mut started: Vec<_> = reload_start_actions(&diff)
-            .into_iter()
-            .map(|action| (action.name, action.kind))
-            .collect();
-        started.sort_by(|a, b| a.0.cmp(&b.0));
-        assert_eq!(
-            started,
-            vec![
-                ("added".to_string(), ReloadStartKind::Start),
-                ("edited".to_string(), ReloadStartKind::Restart),
-            ]
-        );
     }
 
     #[test]
@@ -605,69 +454,27 @@ mod tests {
     }
 
     #[test]
-    fn diff_health_interval_change_triggers_restart() {
-        let mut old = Config::default();
-        old.servers.insert("github".into(), make_server("npx"));
+    fn a_change_is_live_or_needs_a_restart() {
+        let old = make_server("npx");
+        let mut live = old.clone();
+        live.health_check_interval_secs = 5;
+        live.max_concurrent = 3;
+        live.circuit_breaker_enabled = false;
+        live.tool_renames.insert("a".into(), "b".into());
+        assert_eq!(server_change(&old, &live), ServerChange::Live);
+        assert_eq!(server_change(&old, &old.clone()), ServerChange::None);
 
-        let mut new = Config::default();
-        let mut server = make_server("npx");
-        server.health_check_interval_secs = 5;
-        new.servers.insert("github".into(), server);
+        let mut sandboxed = old.clone();
+        sandboxed.sandbox = Some(Default::default());
+        assert_eq!(server_change(&old, &sandboxed), ServerChange::Restart);
 
-        let diff = diff_configs(&old, &new);
-        assert_eq!(diff.changed.len(), 1);
-        assert_eq!(diff.changed[0].0, "github");
-    }
-
-    // Paused time: the 25ms sleeps are a synthetic in-memory "task duration"
-    // used only to create overlap between the buffered futures (no I/O), so
-    // tokio's auto-advance resolves them instantly while preserving the
-    // buffer_unordered(2) concurrency-cap ordering the test asserts on.
-    #[tokio::test(start_paused = true)]
-    async fn run_reload_start_actions_is_bounded_and_concurrent() {
-        let actions = vec![
-            ReloadStartAction {
-                name: "one".into(),
-                config: make_server("one"),
-                kind: ReloadStartKind::Start,
-            },
-            ReloadStartAction {
-                name: "two".into(),
-                config: make_server("two"),
-                kind: ReloadStartKind::Start,
-            },
-            ReloadStartAction {
-                name: "three".into(),
-                config: make_server("three"),
-                kind: ReloadStartKind::Restart,
-            },
-        ];
-
-        let active = Arc::new(AtomicUsize::new(0));
-        let peak = Arc::new(AtomicUsize::new(0));
-
-        let results: Vec<_> = stream::iter(actions)
-            .map({
-                let active = Arc::clone(&active);
-                let peak = Arc::clone(&peak);
-                move |action| {
-                    let active = Arc::clone(&active);
-                    let peak = Arc::clone(&peak);
-                    async move {
-                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
-                        peak.fetch_max(current, Ordering::SeqCst);
-                        tokio::time::sleep(Duration::from_millis(25)).await;
-                        active.fetch_sub(1, Ordering::SeqCst);
-                        (action, Ok::<(), String>(()))
-                    }
-                }
-            })
-            .buffer_unordered(2)
-            .collect()
-            .await;
-
-        assert_eq!(results.len(), 3);
-        assert_eq!(peak.load(Ordering::SeqCst), 2);
-        assert!(results.into_iter().all(|(_, result)| result.is_ok()));
+        let mut config = Config::default();
+        config.servers.insert("github".into(), old);
+        let mut edited = config.clone();
+        edited.servers.insert("github".into(), live);
+        let diff = diff_configs(&config, &edited);
+        assert!(diff.changed.is_empty());
+        assert_eq!(diff.unchanged, vec!["github"]);
+        assert_eq!(diff.updated.len(), 1);
     }
 }

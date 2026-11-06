@@ -150,42 +150,6 @@ impl Default for SupervisionConfig {
     }
 }
 
-impl SupervisionConfig {
-    /// Pure decision: should the supervisor restart this upstream now?
-    ///
-    /// `attempts` is the consecutive supervised-restart count since the last
-    /// recovery to healthy — it drives the exponential inter-episode backoff.
-    /// `secs_since_last_restart` is `None` when the upstream has never been
-    /// supervised (so it is immediately eligible once degraded).
-    pub fn should_restart(
-        &self,
-        health: crate::types::ServerHealth,
-        consecutive_failures: u32,
-        circuit_open: bool,
-        secs_since_last_restart: Option<u64>,
-        attempts: u32,
-    ) -> bool {
-        if !self.enabled {
-            return false;
-        }
-        let sustained = matches!(
-            health,
-            crate::types::ServerHealth::Degraded | crate::types::ServerHealth::Failed
-        ) && consecutive_failures >= self.degraded_restart_threshold;
-        if !(sustained || circuit_open) {
-            return false;
-        }
-        let required_wait = self
-            .min_restart_interval_secs
-            .saturating_mul(2u64.saturating_pow(attempts.min(16)))
-            .min(self.max_restart_interval_secs);
-        match secs_since_last_restart {
-            None => true,
-            Some(elapsed) => elapsed >= required_wait,
-        }
-    }
-}
-
 /// What the owner has set for one client.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -725,7 +689,7 @@ pub enum UpstreamProtocolMode {
 /// contains = ["event", "calendar", "freebusy"]
 /// strip = ["calendar"]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolGroupRule {
     /// The group prefix (e.g. "Gmail", "GoogleDrive").
     pub prefix: String,
@@ -1320,8 +1284,6 @@ mod tests {
     use figment::providers::{Format, Serialized, Toml};
     use std::path::PathBuf;
 
-    use crate::types::ServerHealth;
-
     fn server_with_secrets() -> ServerConfig {
         toml::from_str(
             r#"
@@ -1418,59 +1380,6 @@ LOG_LEVEL = "debug"
 
         assert!(edited.auth_token.is_none());
         assert!(edited.env.is_empty());
-    }
-
-    fn supervision_cfg() -> SupervisionConfig {
-        SupervisionConfig {
-            enabled: true,
-            degraded_restart_threshold: 5,
-            min_restart_interval_secs: 60,
-            max_restart_interval_secs: 600,
-        }
-    }
-
-    #[test]
-    fn supervision_disabled_never_restarts() {
-        let mut cfg = supervision_cfg();
-        cfg.enabled = false;
-        assert!(!cfg.should_restart(ServerHealth::Failed, 100, true, None, 0));
-    }
-
-    #[test]
-    fn supervision_ignores_healthy_with_closed_circuit() {
-        let cfg = supervision_cfg();
-        assert!(!cfg.should_restart(ServerHealth::Healthy, 0, false, None, 0));
-    }
-
-    #[test]
-    fn supervision_waits_for_the_degraded_threshold() {
-        let cfg = supervision_cfg();
-        // Degraded but below the consecutive-failure threshold.
-        assert!(!cfg.should_restart(ServerHealth::Degraded, 4, false, None, 0));
-        // At the threshold, never restarted -> immediately due.
-        assert!(cfg.should_restart(ServerHealth::Degraded, 5, false, None, 0));
-    }
-
-    #[test]
-    fn supervision_fires_on_open_circuit_even_when_health_probe_passes() {
-        // The iMessage-leak case: health pings pass (Healthy) but real calls fail
-        // and the circuit opens. An open circuit alone makes it due.
-        let cfg = supervision_cfg();
-        assert!(cfg.should_restart(ServerHealth::Healthy, 0, true, None, 0));
-    }
-
-    #[test]
-    fn supervision_backoff_grows_and_caps() {
-        let cfg = supervision_cfg();
-        // attempts=0 -> required wait = min (60s). 30s elapsed is too soon.
-        assert!(!cfg.should_restart(ServerHealth::Failed, 6, false, Some(30), 0));
-        assert!(cfg.should_restart(ServerHealth::Failed, 6, false, Some(60), 0));
-        // attempts=1 -> required = 120s; attempts=2 -> 240s.
-        assert!(!cfg.should_restart(ServerHealth::Failed, 6, false, Some(119), 1));
-        assert!(cfg.should_restart(ServerHealth::Failed, 6, false, Some(120), 1));
-        // Large attempt count caps at max (600s), never overflows.
-        assert!(!cfg.should_restart(ServerHealth::Failed, 6, false, Some(599), 50));
-        assert!(cfg.should_restart(ServerHealth::Failed, 6, false, Some(600), 50));
     }
 
     #[test]

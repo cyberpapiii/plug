@@ -1514,9 +1514,12 @@ async fn call_tool_times_out_waiting_for_semaphore() {
         connect_subscribable_upstream("busy-server", SubscribableUpstreamState::new(&[])).await;
     server_manager.replace_server("busy-server", upstream).await;
 
-    server_manager.semaphores.insert(
-        "busy-server".to_string(),
-        Arc::new(tokio::sync::Semaphore::new(0)),
+    server_manager.apply_live_settings(
+        "busy-server",
+        &crate::config::ServerConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        },
     );
 
     let mut routes = HashMap::new();
@@ -1570,10 +1573,16 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
         .replace_server("queued-server", old_upstream)
         .await;
 
-    let semaphore = Arc::new(tokio::sync::Semaphore::new(0));
-    server_manager
-        .semaphores
-        .insert("queued-server".to_string(), Arc::clone(&semaphore));
+    server_manager.apply_live_settings(
+        "queued-server",
+        &crate::config::ServerConfig {
+            max_concurrent: 0,
+            ..Default::default()
+        },
+    );
+    let semaphore = server_manager
+        .call_slots("queued-server")
+        .expect("queued-server has slots");
     publish_tool_route_snapshot(&router, "Queued__tool", "queued-server");
 
     let call_router = Arc::clone(&router);

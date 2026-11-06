@@ -2298,36 +2298,27 @@ impl ToolRouter {
             .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
     }
 
+    /// Reconnect `server_id` once before the caller sends again. A failure
+    /// hands the server to its recovery episode.
     async fn reconnect_server_now(&self, server_id: &str) -> Result<(), anyhow::Error> {
         let engine = self
             .upgrade_engine()
             .ok_or_else(|| anyhow::anyhow!("engine reference unavailable"))?;
-        engine.reconnect_server(server_id).await
+        if let Err(error) = engine.reconnect_server(server_id).await {
+            engine.recover_server(server_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn reconnect_server_in_background(&self, server_id: String) {
-        let Some(engine) = self.upgrade_engine() else {
-            tracing::warn!(
+        match self.upgrade_engine() {
+            Some(engine) => engine.recover_server(&server_id),
+            None => tracing::warn!(
                 server = %server_id,
                 "no engine reference available for background reconnect"
-            );
-            return;
-        };
-
-        tokio::spawn(async move {
-            if let Err(reconnect_err) = engine.reconnect_server(&server_id).await {
-                tracing::warn!(
-                    server = %server_id,
-                    error = %reconnect_err,
-                    "background reconnect after timeout failed"
-                );
-            } else {
-                tracing::info!(
-                    server = %server_id,
-                    "background reconnect after timeout succeeded"
-                );
-            }
-        });
+            ),
+        }
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
@@ -2426,7 +2417,7 @@ impl ToolRouter {
     async fn refresh_tools_once(&self) {
         #[cfg(test)]
         self.refresh_pass_count.fetch_add(1, Ordering::SeqCst);
-        let upstream_tools = self.server_manager.get_tools().await;
+        let upstream_tools = self.server_manager.get_tools();
         let (resources_result, resource_templates_result, prompts_result) = tokio::join!(
             self.server_manager.get_resources(),
             self.server_manager.get_resource_templates(),
@@ -2463,7 +2454,7 @@ impl ToolRouter {
         // PER TOOL with at most one lookup PER SERVER. Reused in pass 3 for
         // icons so that pass doesn't re-hit `get_upstream_metadata` either.
         struct ServerRefreshCtx {
-            upstream: Option<Arc<crate::server::UpstreamServer>>,
+            settings: Option<Arc<crate::config::ServerConfig>>,
             tool_group_rules: Option<Vec<crate::config::ToolGroupRule>>,
             icons: Option<Vec<Icon>>,
         }
@@ -2491,11 +2482,11 @@ impl ToolRouter {
             let mut exposed_name = tool.name.to_string();
 
             let ctx = server_ctx.entry(server_name.clone()).or_insert_with(|| {
-                let upstream = self.server_manager.get_upstream(&server_name);
+                let settings = self.server_manager.settings(&server_name);
                 let metadata = self.server_manager.get_upstream_metadata(&server_name);
-                let tool_group_rules = upstream.as_ref().and_then(|u| {
-                    if !u.config.tool_groups.is_empty() {
-                        Some(u.config.tool_groups.clone())
+                let tool_group_rules = settings.as_ref().and_then(|settings| {
+                    if !settings.tool_groups.is_empty() {
+                        Some(settings.tool_groups.clone())
                     } else {
                         crate::tool_naming::builtin_group_rules(
                             &server_name,
@@ -2505,15 +2496,15 @@ impl ToolRouter {
                 });
                 let icons = metadata.and_then(|metadata| metadata.icons);
                 ServerRefreshCtx {
-                    upstream,
+                    settings,
                     tool_group_rules,
                     icons,
                 }
             });
 
             // 1. Apply manual renames if any
-            if let Some(upstream) = ctx.upstream.as_ref()
-                && let Some(new_name) = upstream.config.tool_renames.get(&exposed_name)
+            if let Some(settings) = ctx.settings.as_ref()
+                && let Some(new_name) = settings.tool_renames.get(&exposed_name)
             {
                 exposed_name = new_name.clone();
             }
@@ -3528,7 +3519,7 @@ impl ToolRouter {
             // flattened into a generic availability failure. The existing
             // outcome encoding tells clients not to retry until they have
             // re-authorized, without returning any credential material.
-            let health = self.server_manager.health.get(&server_id).map(|h| h.health);
+            let health = self.server_manager.health(&server_id);
             if let Some(outcome) = health.and_then(health_gate_outcome) {
                 let era = downstream
                     .as_ref()
@@ -3538,7 +3529,7 @@ impl ToolRouter {
             }
 
             // Circuit breaker gate
-            if let Some(cb) = self.server_manager.circuit_breakers.get(&server_id) {
+            if let Some(cb) = self.server_manager.circuit_breaker(&server_id) {
                 cb.call_allowed().map_err(|_: CircuitBreakerError| {
                     McpError::from(ProtocolError::ServerUnavailable {
                         server_id: server_id.clone(),
@@ -3652,11 +3643,7 @@ impl ToolRouter {
             // the first is queued or executing, rather than waiting for the
             // semaphore and becoming a second side effect after the first
             // call unregisters.
-            let semaphore = self
-                .server_manager
-                .semaphores
-                .get(&server_id)
-                .map(|entry| Arc::clone(entry.value()));
+            let semaphore = self.server_manager.call_slots(&server_id);
             let permit = if let Some(sem) = semaphore {
                 Some(
                     tokio::time::timeout(semaphore_timeout, sem.acquire_owned())
@@ -3798,11 +3785,7 @@ impl ToolRouter {
             let duration_ms = call_start.elapsed().as_millis() as u64;
 
             // Record circuit breaker outcome
-            let cb = self
-                .server_manager
-                .circuit_breakers
-                .get(&server_id)
-                .map(|entry| Arc::clone(entry.value()));
+            let cb = self.server_manager.circuit_breaker(&server_id);
 
             // Close out this attempt's ledgers: record the circuit breaker
             // outcome and call metrics when given, then drop the active-call
