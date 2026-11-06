@@ -10,7 +10,6 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
-use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
 use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient};
 use tokio::sync::Mutex;
@@ -799,6 +798,9 @@ enum CallKind {
     /// The task with this id. Its record holds the upstream request, so a
     /// cancel or a teardown reaches the call.
     Task(String),
+    /// A legacy task-wrapped call to a server that runs tasks itself. Its
+    /// answer is the task the server created.
+    CreateTask,
 }
 
 impl CallKind {
@@ -809,8 +811,15 @@ impl CallKind {
     fn task_id(&self) -> Option<&str> {
         match self {
             Self::Task(task_id) => Some(task_id),
-            Self::Direct | Self::Invoked => None,
+            Self::Direct | Self::Invoked | Self::CreateTask => None,
         }
+    }
+
+    /// Whether a downstream cancel of the request reaches this call. A
+    /// task's request was answered when the task was created. A task create
+    /// is left to finish, so the task it makes is recorded or cancelled.
+    fn downstream_cancels(&self) -> bool {
+        matches!(self, Self::Direct | Self::Invoked)
     }
 }
 
@@ -3377,10 +3386,10 @@ impl ToolRouter {
     }
 
     /// Route one tool call to its server and wait for the answer. Every
-    /// tool call, a task's included, runs through here, so the health gate,
-    /// circuit breaker, call slots, timeout, metrics, result sanitizing and
-    /// the resend rule apply to each the same way. `is_retry` marks the one
-    /// resend after a reconnect.
+    /// tool call, a task's and a task create's included, runs through here,
+    /// so the health gate, circuit breaker, call slots, timeout, metrics,
+    /// result sanitizing and the resend rule apply to each the same way.
+    /// `is_retry` marks the one resend after a reconnect.
     fn call_tool_inner<'a>(
         &'a self,
         tool_name: &'a str,
@@ -3502,7 +3511,25 @@ impl ToolRouter {
                 merge_call_extension_meta(&mut upstream_params, meta);
             }
 
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
+            let request = if matches!(kind, CallKind::CreateTask) {
+                upstream_params
+                    .meta
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                        serde_json::json!({}),
+                    );
+                let params =
+                    crate::legacy_tasks::call_tool_params(upstream_params).map_err(|error| {
+                        McpError::internal_error(
+                            format!("failed to serialize legacy task-wrapped tool call: {error}"),
+                            None,
+                        )
+                    })?;
+                crate::legacy_tasks::request("tools/call", Some(params))
+            } else {
+                ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params))
+            };
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,
@@ -3521,10 +3548,8 @@ impl ToolRouter {
                     }
                 }
             }
-            // A task's downstream request was answered when the task was
-            // created, so nothing downstream waits on this call's id.
             let mut active_call_guard = None;
-            if let Some(call_context) = downstream.clone().filter(|_| !kind.is_task()) {
+            if let Some(call_context) = downstream.clone().filter(|_| kind.downstream_cancels()) {
                 self.register_active_call(
                     call_id,
                     ActiveCallRecord {
@@ -3615,8 +3640,10 @@ impl ToolRouter {
 
             // No `options.timeout`: rmcp's timeout path cancels through an
             // unbounded `send_notification`, so a wedged sink would hang the
-            // call forever. The bound is the `tokio::time::timeout` below,
-            // paired with a cancel bounded on its own.
+            // call forever. The bounds are the `tokio::time::timeout`s below,
+            // the answer's paired with a cancel bounded on its own. rmcp's
+            // peer channel is bounded too, so sending can wait before a
+            // request id exists to cancel.
             let mut options = PeerRequestOptions::default();
             options.meta = extension_meta.clone().map(RequestMetaObject);
             // rmcp puts its own progress token on every request it sends;
@@ -3627,16 +3654,17 @@ impl ToolRouter {
                 peer: request_peer,
                 progress_token: request_progress_token,
                 ..
-            } = peer
-                .send_cancellable_request(request, options)
-                .await
-                .map_err(|error| {
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    map_service_error(error)
-                })?;
+            } = answer_within(
+                timeout_duration,
+                peer.send_cancellable_request(request, options),
+            )
+            .await
+            .inspect_err(|_| {
+                if let Some(ref mut guard) = active_call_guard {
+                    guard.disarm();
+                }
+                self.remove_active_call(call_id);
+            })?;
 
             match &kind {
                 CallKind::Task(task_id) => {
@@ -3649,6 +3677,7 @@ impl ToolRouter {
                     )
                     .await?;
                 }
+                CallKind::CreateTask => {}
                 CallKind::Direct | CallKind::Invoked => {
                     self.attach_upstream_request_id(
                         call_id,
@@ -3678,7 +3707,8 @@ impl ToolRouter {
 
             // The oneshot maps as rmcp's `await_response` maps it: a dropped
             // responder means the transport went away.
-            let result = match tokio::time::timeout(timeout_duration, &mut rx).await {
+            let answer = tokio::time::timeout(timeout_duration, &mut rx).await;
+            let result = match answer {
                 Ok(Ok(inner)) => inner,
                 Ok(Err(_recv_error)) => Err(rmcp::service::ServiceError::TransportClosed),
                 Err(_elapsed) => {
@@ -3689,6 +3719,15 @@ impl ToolRouter {
                         timeout_duration,
                     )
                     .await;
+                    if matches!(kind, CallKind::CreateTask) {
+                        tasks::spawn_late_task_reaper(
+                            rx,
+                            Arc::clone(&self.server_manager),
+                            timeout_duration,
+                            server_id.clone(),
+                            Arc::clone(&trace_id),
+                        );
+                    }
                     Err(rmcp::service::ServiceError::Timeout {
                         timeout: timeout_duration,
                     })
@@ -3753,6 +3792,40 @@ impl ToolRouter {
 
             let lost = result.as_ref().err().and_then(LostSession::of);
             match result {
+                Ok(answer) if matches!(kind, CallKind::CreateTask) => {
+                    match crate::legacy_tasks::parse_create_result(answer) {
+                        Ok(created) => {
+                            finish(Some(true), Some(true));
+                            tracing::info!(
+                                call_id,
+                                trace_id = %trace_id,
+                                server = %server_id,
+                                tool = %original_name,
+                                task_id = %created.task.task_id,
+                                duration_ms,
+                                "proxy native upstream task created"
+                            );
+                            Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
+                                (&created.task).into(),
+                            )))
+                        }
+                        Err(error) => {
+                            finish(None, Some(false));
+                            tracing::warn!(
+                                call_id,
+                                trace_id = %trace_id,
+                                server = %server_id,
+                                tool = %original_name,
+                                %error,
+                                "upstream answered a task-wrapped call without a legacy task"
+                            );
+                            Err(McpError::internal_error(
+                                "upstream task-capable server returned an invalid legacy task response",
+                                None,
+                            ))
+                        }
+                    }
+                }
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.

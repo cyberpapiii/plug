@@ -209,10 +209,6 @@ impl super::ToolRouter {
         owner_liveness: Option<OwnerLivenessProbe>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CreateTaskResult, McpError> {
-        let extension_meta = downstream
-            .as_ref()
-            .and_then(|context| context.extension_envelope.as_ref())
-            .and_then(crate::types::ExtensionEnvelope::to_meta);
         // Task augmentation is a second method family layered on tools/call.
         // Authorize and reserve both queue + durable-record capacity before
         // touching the lifecycle ledger, task store, or any upstream.
@@ -319,227 +315,88 @@ impl super::ToolRouter {
             .as_ref()
             .is_some_and(|context| context.protocol_era == crate::protocol::ProtocolEra::Modern);
         if !modern_downstream
-            && let Some(upstream) = self.server_manager.get_upstream(&server_id)
-            && crate::protocol::legacy_tasks_capability(&upstream.capabilities)
+            && self
+                .server_manager
+                .get_upstream(&server_id)
+                .is_some_and(|upstream| {
+                    crate::protocol::legacy_tasks_capability(&upstream.capabilities)
+                })
         {
-            let call_timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-            let peer = upstream.client.peer().clone();
-            drop(upstream);
-
-            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-            if let Some(args) = arguments.clone() {
-                upstream_params = upstream_params.with_arguments(args);
-            }
-            if let Some(meta) = extension_meta.clone() {
-                merge_call_extension_meta(&mut upstream_params, meta);
-            }
-            upstream_params
-                .meta
-                .get_or_insert_with(Default::default)
-                .insert(
-                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-                    serde_json::json!({}),
-                );
-            if let Some(token) = progress_token.clone() {
-                upstream_params.set_progress_token(token);
-            }
-            let upstream_params =
-                crate::legacy_tasks::call_tool_params(upstream_params).map_err(|error| {
-                    McpError::internal_error(
-                        format!("failed to serialize legacy task-wrapped tool call: {error}"),
-                        None,
-                    )
-                })?;
-
-            // The round trip is DETACHED: it runs in its own spawned task and
-            // the `OwnerCreateGuard` moves into it, so a caller whose future
-            // is dropped mid-await (e.g. axum dropping the POST handler on
-            // client disconnect) can neither release the guard early nor
-            // orphan the upstream task — the round trip completes in the
-            // background and either records the created task (owner still
-            // live; it stays retrievable via tasks/list) or hits the
-            // tombstone branch and cancels the upstream task.
+            // The round trip runs on a task of its own that owns the create
+            // guard, so a caller dropped mid-await (axum drops the handler
+            // when the client disconnects) can neither release the guard
+            // early nor orphan the upstream task: the task the server makes
+            // is recorded for a live owner or cancelled upstream.
             let router = Arc::clone(self);
             let tool_name = tool_name.to_string();
             let round_trip = tokio::spawn(async move {
                 let _queued_task_lease = _queued_task_lease;
                 let _create_guard = create_guard;
-                let deadline = tokio::time::Instant::now() + call_timeout;
-
-                let request = crate::legacy_tasks::request("tools/call", Some(upstream_params));
-                // DEFAULT options on purpose: setting rmcp's own
-                // `options.timeout` would hand the timeout path to
-                // `await_response`, whose auto-cancel awaits an UNBOUNDED
-                // `send_notification` — a wedged sink would hang this task
-                // forever. The bound lives in our own `tokio::time::timeout`
-                // below, paired with a bounded explicit cancel. The same
-                // deadline covers BOTH queueing the request and receiving
-                // its response: rmcp's peer channel is bounded, so acquiring
-                // a RequestHandle can itself backpressure before a request id
-                // exists to cancel.
-                let handle = match tokio::time::timeout_at(
-                    deadline,
-                    peer.send_cancellable_request(request, PeerRequestOptions::default()),
-                )
-                .await
-                {
-                    Ok(Ok(handle)) => handle,
-                    Ok(Err(error)) => {
-                        return Err(map_service_error(error));
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            server = %server_id,
-                            tool = %original_name,
-                            timeout_secs = call_timeout.as_secs(),
-                            "native task creation timed out while queueing upstream request"
-                        );
-                        return Err(McpError::internal_error(
-                            ServiceError::Timeout {
-                                timeout: call_timeout,
-                            }
-                            .to_string(),
-                            None,
-                        ));
-                    }
+                let answer = router
+                    .call_tool_inner(
+                        &tool_name,
+                        ToolRoundInput {
+                            arguments,
+                            input_responses: None,
+                            request_state: None,
+                            expected_route: None,
+                        },
+                        progress_token,
+                        downstream,
+                        CallKind::CreateTask,
+                        false,
+                    )
+                    .await?;
+                let CallToolResponse::Task(created) = answer else {
+                    return Err(McpError::internal_error(
+                        "upstream task-capable server returned an invalid legacy task response",
+                        None,
+                    ));
                 };
-                let RequestHandle {
-                    mut rx,
-                    id: upstream_request_id,
-                    peer: request_peer,
-                    ..
-                } = handle;
-
-                let recv = match tokio::time::timeout_at(deadline, &mut rx).await {
-                    Ok(recv) => recv,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            server = %server_id,
-                            tool = %original_name,
-                            timeout_secs = call_timeout.as_secs(),
-                            "native task creation timed out; cancelling upstream request"
-                        );
-                        cancel_upstream_request(
-                            &request_peer,
-                            upstream_request_id,
-                            "task creation timed out",
-                            call_timeout,
-                        )
-                        .await;
-                        // Reaper: if the CreateTaskResult still lands late,
-                        // cancel the just-created task by id. The guard is
-                        // NOT handed to the reaper — it dies with this task
-                        // (the reaper only cancels; it never creates
-                        // records).
-                        spawn_late_task_reaper(
-                            rx,
-                            Arc::clone(&router.server_manager),
-                            call_timeout,
-                            server_id.clone(),
-                            Arc::clone(&trace_id),
-                        );
-                        return Err(McpError::internal_error(
-                            ServiceError::Timeout {
-                                timeout: call_timeout,
-                            }
-                            .to_string(),
-                            None,
-                        ));
-                    }
+                let task = crate::legacy_tasks::Task::from(&created.task);
+                let upstream = TaskUpstreamRef::Task {
+                    server_id: server_id.clone(),
+                    task_id: task.task_id.clone(),
                 };
-                // Replicate rmcp `await_response`'s oneshot mapping: a
-                // dropped responder means the transport went away.
-                let response = match recv {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => {
-                        return Err(map_service_error(error));
-                    }
-                    Err(_recv_error) => {
-                        return Err(McpError::internal_error(
-                            ServiceError::TransportClosed.to_string(),
-                            None,
-                        ));
-                    }
-                };
-
-                let parsed = crate::legacy_tasks::parse_create_result(response);
-                if let Err(error) = &parsed {
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        tool = %original_name,
-                        %error,
-                        "upstream answered a task-wrapped call without a legacy task"
-                    );
-                }
-                if let Ok(result) = parsed {
-                    tracing::info!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        tool = %original_name,
-                        task_id = %result.task.task_id,
-                        "proxy native upstream task created"
-                    );
-                    let upstream = TaskUpstreamRef::Task {
-                        server_id: server_id.clone(),
-                        task_id: result.task.task_id.clone(),
-                    };
-                    let (created, expired_cleanup) = {
-                        let mut store = router.task_store.lock().await;
-                        let created = match task_quota_lease {
-                            Some(lease) => store.create_passthrough_with_quota(
-                                owner,
-                                &tool_name,
-                                &result.task,
-                                upstream,
-                                lease,
-                            ),
-                            None => {
-                                store.create_passthrough(owner, &tool_name, &result.task, upstream)
-                            }
-                        };
-                        if let Ok(task) = &created {
-                            store.record_source(&task.task_id, &server_id, &original_name);
-                        }
-                        (created, store.take_expired_cleanup())
-                    };
-                    router.finish_expired_task_cleanup(expired_cleanup).await;
-                    return match created {
-                        Ok(task) => Ok(CreateTaskResult::new(task)),
-                        Err(error) => {
-                            // The owner was torn down during the upstream
-                            // round trip: the native task exists upstream but
-                            // nothing tracks it locally anymore. Best-effort
-                            // bounded cancel so the upstream stops instead of
-                            // running to completion for a result nobody will
-                            // ever collect.
-                            tracing::info!(
-                                trace_id = %trace_id,
-                                server = %server_id,
-                                task_id = %result.task.task_id,
-                                "owner torn down during native task creation; cancelling upstream task"
-                            );
-                            let upstream = TaskUpstreamRef::Task {
-                                server_id,
-                                task_id: result.task.task_id.clone(),
-                            };
-                            if let Some((peer, bound)) =
-                                cancel_route(&router.server_manager, &upstream)
-                            {
-                                cancel_upstream(&peer, &upstream, "task owner disconnected", bound)
-                                    .await;
-                            }
-                            Err(error)
+                let (recorded, expired_cleanup) = {
+                    let mut store = router.task_store.lock().await;
+                    let recorded = match task_quota_lease {
+                        Some(lease) => store.create_passthrough_with_quota(
+                            owner,
+                            &tool_name,
+                            &task,
+                            upstream.clone(),
+                            lease,
+                        ),
+                        None => {
+                            store.create_passthrough(owner, &tool_name, &task, upstream.clone())
                         }
                     };
+                    if let Ok(record) = &recorded {
+                        store.record_source(&record.task_id, &server_id, &original_name);
+                    }
+                    (recorded, store.take_expired_cleanup())
+                };
+                router.finish_expired_task_cleanup(expired_cleanup).await;
+                match recorded {
+                    Ok(record) => Ok(CreateTaskResult::new(record)),
+                    Err(error) => {
+                        // The owner was torn down during the round trip, so
+                        // nothing here tracks the task the server made.
+                        tracing::info!(
+                            trace_id = %trace_id,
+                            server = %server_id,
+                            task_id = %task.task_id,
+                            "owner torn down during native task creation; cancelling upstream task"
+                        );
+                        if let Some((peer, bound)) = cancel_route(&router.server_manager, &upstream)
+                        {
+                            cancel_upstream(&peer, &upstream, "task owner disconnected", bound)
+                                .await;
+                        }
+                        Err(error)
+                    }
                 }
-
-                Err(McpError::internal_error(
-                    "upstream task-capable server returned an invalid legacy task response",
-                    None,
-                ))
             });
             return match round_trip.await {
                 Ok(result) => result,
@@ -1867,7 +1724,7 @@ mod tests {
         .expect("request-handle acquisition must respect the configured timeout");
 
         let error = result.expect_err("a full peer queue must time out task creation");
-        assert!(error.message.to_lowercase().contains("timeout"));
+        assert!(error.message.contains("timed out"), "{error:?}");
         assert_eq!(router.task_count_for_owner(&owner).await, 0);
     }
 
@@ -2197,7 +2054,7 @@ mod tests {
             .expect("enqueue task must not panic");
         let error = result.expect_err("a never-answering upstream must surface an error");
         assert!(
-            error.message.contains("request timeout"),
+            error.message.contains("timed out"),
             "unexpected error message: {}",
             error.message
         );
@@ -2654,6 +2511,44 @@ mod tests {
         let task = settled_task(&router, &owner, &created.task.task_id).await;
         assert_eq!(task.status, TaskStatus::Failed);
         assert!(!state.call_entered.load(Ordering::SeqCst));
+    }
+
+    /// A server that runs tasks itself is asked to create one the way any
+    /// tool is called: not while it waits for sign-in, and counted as a
+    /// call when it answers.
+    #[tokio::test]
+    async fn a_native_task_create_is_a_tool_call() {
+        let owner = crate::downstream_identity::http_session_task_owner("session-native-call");
+        let connect = |state: Arc<GatedTaskUpstreamState>| async move {
+            let sm = Arc::new(ServerManager::new());
+            let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+            sm.replace_server("mock", connect_gated_task_upstream("mock", state, 5).await)
+                .await;
+            install_single_route(&router, "Mock__echo", "mock", "echo");
+            (sm, router)
+        };
+
+        let state = GatedTaskUpstreamState::new(false, true);
+        let (sm, router) = connect(Arc::clone(&state)).await;
+        sm.mark_auth_required("mock");
+        router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect_err("a server waiting for sign-in is not asked");
+        assert!(!state.enqueue_entered.load(Ordering::SeqCst));
+
+        let (sm, router) = connect(GatedTaskUpstreamState::new(false, true)).await;
+        let created = router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("the server creates the task");
+        assert_ne!(created.task.task_id, "upstream-task-1");
+        assert_eq!(
+            sm.metrics_snapshot("mock")
+                .map(|metrics| metrics.call_count),
+            Some(1)
+        );
+        router.cleanup_tasks_for_owner(&owner).await;
     }
 
     struct SkillLinkUpstream;
