@@ -11,90 +11,16 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
 use super::hub::{Access, Hub, Pending, Source, SourceState};
+use crate::config::{MIN_WATCH_SECS, WatchConfig};
+
 use super::{
     EventDelivery, EventError, EventSource, MAX_BODY, invalid, iso_time, now, unavailable,
 };
 
-/// The shortest interval a watch may ask for.
-pub const MIN_WATCH_SECS: u64 = 30;
 /// How many watched tools are called at once. The rest wait their turn.
 pub(super) const CHECKS_AT_ONCE: usize = 8;
 /// How often the watches are looked over for ones that are due.
 const CHECK_TICK: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct EventsConfig {
-    /// Tools watched for change. Each one is an event clients can subscribe to.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub watch: Vec<WatchConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct WatchConfig {
-    /// The event is named `<server>.<name>`.
-    pub name: String,
-    pub server: String,
-    /// The tool's own name on that server, without Plug's prefix.
-    pub tool: String,
-    #[serde(default, skip_serializing_if = "Map::is_empty")]
-    pub arguments: Map<String, Value>,
-    #[serde(default = "default_every_secs")]
-    pub every_secs: u64,
-    /// Watch a tool the server does not mark read-only. Off by default,
-    /// because watching must not change anything.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub allow_writes: bool,
-}
-
-fn default_every_secs() -> u64 {
-    300
-}
-
-impl WatchConfig {
-    pub fn event_name(&self) -> String {
-        format!("{}.{}", self.server, self.name)
-    }
-}
-
-impl EventsConfig {
-    pub fn is_empty(&self) -> bool {
-        self.watch.is_empty()
-    }
-
-    pub fn validate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-        let mut names = HashSet::new();
-        for watch in &self.watch {
-            let event = watch.event_name();
-            if watch.name.is_empty()
-                || watch.name.len() > 64
-                || !watch
-                    .name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            {
-                errors.push(format!(
-                    "events.watch name '{}' must be lowercase letters, digits, and underscores",
-                    watch.name
-                ));
-            }
-            if watch.tool.is_empty() {
-                errors.push(format!("events.watch '{event}' names no tool"));
-            }
-            if watch.every_secs < MIN_WATCH_SECS {
-                errors.push(format!(
-                    "events.watch '{event}' every_secs must be at least {MIN_WATCH_SECS}"
-                ));
-            }
-            if !names.insert(event.clone()) {
-                errors.push(format!("events.watch '{event}' is already an event"));
-            }
-        }
-        errors
-    }
-}
 
 /// How a watch is doing, for `plug events` and the app.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]

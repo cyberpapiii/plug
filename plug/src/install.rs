@@ -7,10 +7,7 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-pub const APP_BUNDLE_ID: &str = "com.cyberpapiii.plug";
-pub const DEVELOPER_TEAM_ID: &str = "HJF7LN64XX";
-
-const BUNDLE_EXECUTABLE: &str = "Contents/Resources/plug";
+use plug_core::paths::{APP_BUNDLE_ID, BUNDLED_BINARY, DAEMON_ARGS, DAEMON_LABEL, TEAM_ID};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifiedAppInstallation {
@@ -95,7 +92,7 @@ pub fn canonical_client_command() -> Result<PathBuf> {
     let production_macos = true;
     #[cfg(not(target_os = "macos"))]
     let production_macos = false;
-    let dev = std::env::var_os("PLUG_DEV").as_deref() == Some(OsStr::new("1"));
+    let dev = plug_core::paths::is_development();
     canonical_client_command_from(app.as_ref(), &current, dev, production_macos)
 }
 
@@ -135,7 +132,7 @@ fn delegation_decision(
 pub fn maybe_delegate_to_app() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let dev = std::env::var_os("PLUG_DEV").as_deref() == Some(OsStr::new("1"));
+        let dev = plug_core::paths::is_development();
         if dev {
             return Ok(());
         }
@@ -196,7 +193,7 @@ pub(crate) fn running_as_bundle_executable(current: &Path) -> bool {
     fallback_bundle_paths()
         .into_iter()
         .chain(std::iter::once_with(registered_bundle_paths).flatten())
-        .any(|bundle| paths_match(current, &bundle.join(BUNDLE_EXECUTABLE)))
+        .any(|bundle| paths_match(current, &bundle.join(BUNDLED_BINARY)))
 }
 
 /// Whether two paths name the same file once symlinks are resolved.
@@ -389,7 +386,7 @@ fn cleanup_launchd_plan(
     let mut remove_labels = Vec::new();
     let mut preserved = Vec::new();
     for job in jobs {
-        if job.label == crate::service::LABEL
+        if job.label == DAEMON_LABEL
             && proven_daemon_invocations.contains(&job.label)
             && matches!(
                 crate::service::classify_launchd_program(
@@ -475,7 +472,7 @@ fn login_user_id() -> Result<String> {
 pub fn prove_app_daemon_invocation(app: &VerifiedAppInstallation) -> Result<bool> {
     let uid = login_user_id()?;
     let mut command = Command::new("/bin/launchctl");
-    command.args(["print", &format!("gui/{uid}/{}", crate::service::LABEL)]);
+    command.args(["print", &format!("gui/{uid}/{}", DAEMON_LABEL)]);
     let output = bounded_output(command, std::time::Duration::from_secs(2))?;
     if !output.status.success() {
         return Ok(false);
@@ -486,7 +483,7 @@ pub fn prove_app_daemon_invocation(app: &VerifiedAppInstallation) -> Result<bool
         .map(str::trim)
         .collect::<Vec<_>>()
         .windows(2)
-        .any(|lines| lines == ["serve", "--daemon"]);
+        .any(|lines| lines == DAEMON_ARGS);
     let identifies_app = output.contains(&format!("parent bundle identifier = {APP_BUNDLE_ID}"))
         || output.contains(&format!("program = {}", app.executable_path.display()));
     Ok(has_daemon_arguments && identifies_app)
@@ -530,9 +527,7 @@ pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
     let mut proven_daemon_invocations = std::collections::BTreeSet::new();
     if let Some(app) = app.as_ref() {
         for job in &jobs {
-            if job.label == crate::service::LABEL
-                && prove_app_daemon_invocation(app).unwrap_or(false)
-            {
+            if job.label == DAEMON_LABEL && prove_app_daemon_invocation(app).unwrap_or(false) {
                 proven_daemon_invocations.insert(job.label.clone());
             }
         }
@@ -611,7 +606,7 @@ fn fallback_bundle_paths() -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn verify_app_bundle(bundle_path: &Path) -> Result<VerifiedAppInstallation> {
-    let executable_path = bundle_path.join(BUNDLE_EXECUTABLE);
+    let executable_path = bundle_path.join(BUNDLED_BINARY);
     ensure!(
         executable_path.is_file(),
         "Plug.app is missing its embedded executable {}",
@@ -660,7 +655,7 @@ fn codesign_requirement_argument() -> String {
     // argv element. Passing "-R" and the expression separately makes codesign
     // interpret the expression as a file path.
     format!(
-        "-R=anchor apple generic and identifier \"{APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{DEVELOPER_TEAM_ID}\""
+        "-R=anchor apple generic and identifier \"{APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
     )
 }
 
@@ -707,7 +702,7 @@ fn version_probe_command(executable_path: &Path) -> Command {
     // A production executable normally resolves and verifies Plug.app before
     // parsing arguments. The verifier is already checking that same signed
     // bundle, so a nested --version probe must not enter delegation again.
-    command.arg("--version").env("PLUG_DEV", "1");
+    command.arg("--version").env(plug_core::paths::DEV_ENV, "1");
     command
 }
 
@@ -723,7 +718,7 @@ mod tests {
     fn app(path: impl Into<PathBuf>) -> VerifiedAppInstallation {
         let bundle_path = path.into();
         VerifiedAppInstallation {
-            executable_path: bundle_path.join("Contents/Resources/plug"),
+            executable_path: plug_core::paths::bundled_binary(&bundle_path),
             bundle_path,
             version: "0.6.4".into(),
         }
@@ -818,8 +813,8 @@ mod tests {
     fn codesign_requirement_is_one_option_argument() {
         let argument = super::codesign_requirement_argument();
         assert!(argument.starts_with("-R=anchor apple generic"));
-        assert!(argument.contains(super::APP_BUNDLE_ID));
-        assert!(argument.contains(super::DEVELOPER_TEAM_ID));
+        assert!(argument.contains(plug_core::paths::APP_BUNDLE_ID));
+        assert!(argument.contains(plug_core::paths::TEAM_ID));
     }
 
     #[cfg(target_os = "macos")]
@@ -968,7 +963,7 @@ mod tests {
     fn bundle_executables_skip_delegation_verification() {
         for bundle in super::fallback_bundle_paths() {
             assert!(super::running_as_bundle_executable(
-                &bundle.join(super::BUNDLE_EXECUTABLE)
+                &bundle.join(plug_core::paths::BUNDLED_BINARY)
             ));
         }
         assert!(!super::running_as_bundle_executable(std::path::Path::new(

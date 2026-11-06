@@ -428,7 +428,11 @@ pub(crate) fn linked_clients() -> Vec<(ClientTarget, ServerEntry)> {
 }
 
 fn lazy_tool_policy_summary(config: &plug_core::config::Config, target: ClientTarget) -> String {
-    let policy = plug_core::config::resolve_lazy_tool_policy_for_target(config, target.slug());
+    let policy = plug_core::clients::lazy_tool_policy(
+        config.meta_tool_mode,
+        &config.lazy_tools,
+        target.slug(),
+    );
     format!(
         "{target} lazy tools: {} ({}) - {}",
         policy.mode.label(),
@@ -462,8 +466,11 @@ pub(crate) fn client_views(
                 .map(|session| live_transport_name(session.transport))
                 .collect();
             let link = linked(target);
-            let lazy_policy =
-                plug_core::config::resolve_lazy_tool_policy_for_target(config, target.slug());
+            let lazy_policy = plug_core::clients::lazy_tool_policy(
+                config.meta_tool_mode,
+                &config.lazy_tools,
+                target.slug(),
+            );
             ClientView {
                 name: target.display_name().to_string(),
                 target: target.slug().to_string(),

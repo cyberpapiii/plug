@@ -795,13 +795,6 @@ pub struct IpcServerSourceInfo {
 
 impl IpcServerSourceInfo {
     pub fn from_config(config: &crate::config::ServerConfig) -> Self {
-        let auth = if config.auth.as_deref() == Some("oauth") || config.oauth_client_id.is_some() {
-            "oauth"
-        } else if config.auth_token.is_some() {
-            "bearer"
-        } else {
-            "none"
-        };
         Self {
             transport: match config.transport {
                 crate::config::TransportType::Stdio => "stdio",
@@ -814,7 +807,7 @@ impl IpcServerSourceInfo {
             command: config.command.clone(),
             args: config.args.clone(),
             url: config.url.clone(),
-            auth: auth.to_string(),
+            auth: config.auth_label().to_string(),
         }
     }
 }

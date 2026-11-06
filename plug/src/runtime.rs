@@ -777,9 +777,7 @@ fn build_configured_http_runtime(
             plug_core::slack_events::SlackEvents::open(
                 event_config.clone(),
                 secret,
-                &plug_core::config::config_dir()
-                    .join("slack-events")
-                    .join(key),
+                &plug_core::paths::dir().join("slack-events").join(key),
                 Arc::new(plug_core::slack_events::RuntimeAccess::new(
                     engine,
                     oauth,
@@ -799,7 +797,7 @@ fn build_configured_http_runtime(
     // A watch is a convenience: failing to open its state must not stop Plug.
     let watch_events = downstream_oauth.clone().and_then(|oauth| {
         plug_core::events::WatchEvents::open(
-            &plug_core::config::config_dir().join("events").join("watch"),
+            &plug_core::paths::events_dir().join("watch"),
             Arc::new(plug_core::events::RuntimeWatchAccess::new(engine, oauth)),
             Arc::new(plug_core::events::HttpsDelivery),
         )
@@ -1134,8 +1132,7 @@ fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)
 fn expected_proxy_daemon_identity() -> anyhow::Result<(std::path::PathBuf, bool)> {
     #[cfg(target_os = "macos")]
     {
-        let development =
-            std::env::var_os("PLUG_DEV").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let development = plug_core::paths::is_development();
         if !development {
             // Running from inside Plug.app already means running the bundle the
             // verifier would check, so verifying would re-prove the code on
@@ -1625,7 +1622,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     let runtime_lock = daemon::acquire_runtime_lock()?;
     let config_path = config_path
         .cloned()
-        .unwrap_or_else(plug_core::config::default_config_path);
+        .unwrap_or_else(plug_core::paths::default_config_path);
     let config = plug_core::config::load_config(Some(&config_path))?;
     preflight_http_bind(&config.http)?;
     let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
@@ -1715,8 +1712,7 @@ fn require_canonical_daemon_owner() -> anyhow::Result<()> {
 
     #[cfg(not(test))]
     {
-        let development =
-            std::env::var_os("PLUG_DEV").as_deref() == Some(std::ffi::OsStr::new("1"));
+        let development = plug_core::paths::is_development();
         let app_installed = crate::install::resolve_verified_app()?.is_some();
         let app_managed =
             crate::service::inspect()?.ownership == crate::service::ServiceOwnership::AppManaged;
@@ -1783,30 +1779,13 @@ pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyho
 fn resolve_downstream_bearer_token(
     http: &plug_core::config::HttpConfig,
 ) -> anyhow::Result<Option<Arc<str>>> {
-    match http.auth_mode {
-        plug_core::config::DownstreamAuthMode::Auto => {
-            let externally_exposed = !plug_core::config::http_bind_is_loopback(&http.bind_address)
-                || plug_core::config::http_public_base_url_is_non_loopback(
-                    http.public_base_url.as_deref(),
-                );
-            if externally_exposed {
-                let token_path = plug_core::auth::http_auth_token_path(http.port);
-                let token = plug_core::auth::load_or_generate_token(&token_path)?;
-                tracing::info!("HTTP auth enabled (auto mode: server reachable off-loopback)");
-                Ok(Some(Arc::<str>::from(token.as_str())))
-            } else {
-                Ok(None)
-            }
-        }
-        plug_core::config::DownstreamAuthMode::None => Ok(None),
-        plug_core::config::DownstreamAuthMode::Bearer => {
-            let token_path = plug_core::auth::http_auth_token_path(http.port);
-            let token = plug_core::auth::load_or_generate_token(&token_path)?;
-            tracing::info!("HTTP bearer auth enabled");
-            Ok(Some(Arc::<str>::from(token.as_str())))
-        }
-        plug_core::config::DownstreamAuthMode::Oauth => Ok(None),
+    if !http.requires_bearer() {
+        return Ok(None);
     }
+    let token_path = plug_core::auth::http_auth_token_path(http.port);
+    let token = plug_core::auth::load_or_generate_token(&token_path)?;
+    tracing::info!(mode = http.auth_mode.label(), "HTTP bearer auth enabled");
+    Ok(Some(Arc::<str>::from(token.as_str())))
 }
 
 fn preflight_http_bind(http: &plug_core::config::HttpConfig) -> anyhow::Result<()> {

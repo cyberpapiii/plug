@@ -54,7 +54,7 @@ final class IconStore {
 
     init(chosenDirectory: URL? = nil, cacheDirectory: URL? = nil) {
         self.chosenDirectory = chosenDirectory
-            ?? PlugIPCClient.defaultSocketURL.deletingLastPathComponent().appending(path: "icons")
+            ?? PlugPaths.directoryURL.appending(path: "icons")
         // Beside the chosen icons, not under Caches: a disk cleaner empties
         // Caches, and every icon was then looked for again the next day.
         self.cacheDirectory = cacheDirectory ?? self.chosenDirectory.appending(path: "found")

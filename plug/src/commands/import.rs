@@ -10,14 +10,32 @@ use crate::ui::{
 };
 
 /// Add `servers` to the config at `config_path`. A config that does not load
-/// is refused rather than written over.
+/// is refused rather than written over. Keys the servers came with are
+/// written as they were, and named so the person can move them.
 pub(crate) fn add_servers(
     config_path: Option<&std::path::PathBuf>,
     servers: &[DiscoveredServer],
 ) -> anyhow::Result<()> {
     let (path, mut config) = crate::commands::config::load_editable_config(config_path)?;
     plug_core::import::add_to_config(&mut config, servers);
-    plug_core::operator::persist_config_atomic(&path, &config)
+    plug_core::operator::persist_config_atomic(&path, &config)?;
+    let stores = plug_core::secrets::Stores::from_config(&config.secrets);
+    let typed: Vec<String> = servers
+        .iter()
+        .flat_map(|server| {
+            stores
+                .plaintext(&server.config)
+                .into_iter()
+                .map(move |field| format!("{}.{field}", server.name))
+        })
+        .collect();
+    if !typed.is_empty() {
+        crate::ui::print_warning_line(format!(
+            "Keys written in the config file: {}. Run `plug secret move` to keep them in the Keychain.",
+            typed.join(", ")
+        ));
+    }
+    Ok(())
 }
 
 /// Scan `sources` for servers the config does not have yet.

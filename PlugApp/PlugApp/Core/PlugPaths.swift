@@ -12,14 +12,6 @@ enum BundledPlug {
     }
 }
 
-enum PlugPaths {
-    /// Where the daemon writes its logs, spelled as the daemon spells it
-    /// (`plug/src/daemon/paths.rs`). The app's own log goes beside them.
-    static var logs: URL {
-        URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory)
-    }
-}
-
 extension URL {
     /// The same file path with symlinks resolved, for comparing two URLs that
     /// may reach the same file by different routes.

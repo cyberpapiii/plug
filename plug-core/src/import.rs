@@ -121,14 +121,7 @@ fn discovered(source: ClientTarget, name: String, entry: ServerEntry) -> Discove
         config: ServerConfig {
             command: entry.command,
             args: entry.args.unwrap_or_default(),
-            env: entry
-                .env
-                .into_iter()
-                .map(|(key, value)| {
-                    let value = sanitize_env_value(&key, &value);
-                    (key, value)
-                })
-                .collect(),
+            env: entry.env.into_iter().collect(),
             enabled: entry.enabled,
             transport: entry.transport,
             url: entry.url,
@@ -137,23 +130,6 @@ fn discovered(source: ClientTarget, name: String, entry: ServerEntry) -> Discove
         source,
         source_target: source.slug(),
         source_name: source.display_name(),
-    }
-}
-
-/// A value that looks like a secret under a name that suggests one is
-/// replaced by a reference to a variable of that name.
-fn sanitize_env_value(key: &str, value: &str) -> String {
-    if value.starts_with('$') {
-        return value.to_string();
-    }
-    let secret_keys = [
-        "token", "key", "secret", "password", "api_key", "apikey", "auth",
-    ];
-    let key_lower = key.to_lowercase();
-    if secret_keys.iter().any(|k| key_lower.contains(k)) && value.len() > 8 {
-        format!("${key}")
-    } else {
-        value.to_string()
     }
 }
 
@@ -205,16 +181,13 @@ mod tests {
     }
 
     #[test]
-    fn a_literal_secret_becomes_a_reference() {
+    fn a_literal_secret_is_kept_for_the_secret_store() {
         let json = r#"{"mcpServers":{"github":{"command":"npx","args":["server-github"],"env":{"GITHUB_TOKEN":"ghp_abc123"}}}}"#;
         let servers = read(ClientTarget::ClaudeDesktop, json);
         assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].config.env["GITHUB_TOKEN"], "$GITHUB_TOKEN");
+        assert_eq!(servers[0].config.env["GITHUB_TOKEN"], "ghp_abc123");
         assert_eq!(servers[0].source_target, "claude-desktop");
         assert_eq!(servers[0].source_name, "Claude Desktop");
-
-        assert_eq!(sanitize_env_value("PATH", "/usr/bin"), "/usr/bin");
-        assert_eq!(sanitize_env_value("API_KEY", "$API_KEY"), "$API_KEY");
     }
 
     #[test]

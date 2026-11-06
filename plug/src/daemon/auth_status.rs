@@ -40,7 +40,7 @@ pub(super) async fn auth_status_from_statuses(
     let mut oauth_servers: Vec<_> = config
         .servers
         .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+        .filter(|(_, sc)| sc.is_oauth() && sc.enabled)
         .collect();
     oauth_servers.sort_by_key(|(name, _)| (*name).clone());
 

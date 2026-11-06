@@ -6,7 +6,7 @@ import PlugIPC
 /// app nor reconciliation starts Plug again until the owner turns it on.
 struct ServiceDisabledMarker: Sendable {
     static let standard = ServiceDisabledMarker(
-        url: PlugIPCClient.defaultSocketURL.deletingLastPathComponent().appending(path: "service-disabled")
+        url: PlugPaths.marker(PlugPaths.serviceDisabledMarker)
     )
 
     let url: URL

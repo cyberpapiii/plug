@@ -182,7 +182,7 @@ impl Engine {
         );
 
         for (name, server_config) in &config.servers {
-            if server_config.enabled && server_config.auth.as_deref() == Some("oauth") {
+            if server_config.enabled && server_config.is_oauth() {
                 spawn_refresh_loop_for_server(Arc::clone(self), name.clone());
             }
         }
@@ -266,7 +266,7 @@ impl Engine {
         server_name: &str,
         server_config: &ServerConfig,
     ) {
-        if server_config.enabled && server_config.auth.as_deref() == Some("oauth") {
+        if server_config.enabled && server_config.is_oauth() {
             spawn_refresh_loop_for_server(Arc::clone(self), server_name.to_string());
         } else {
             self.supervision.refresh_tasks.clear(server_name);
@@ -680,7 +680,7 @@ impl Engine {
                 // A key left untouched arrives as a placeholder. Put back what
                 // the file holds for it, so a key still written there in the
                 // clear is moved along with the ones typed now.
-                if let Ok(file) = crate::operator::load_editable_config(config_path) {
+                if let Ok(file) = crate::config::load_editable_config(config_path) {
                     server.restore_redacted_secrets(file.servers.get(&name));
                 }
                 let (server, staged) = keep(name.clone(), server).await?;
@@ -900,7 +900,7 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
             engine.supervision.refresh_tasks.clear(server_name);
             break;
         };
-        if !server_config.enabled || server_config.auth.as_deref() != Some("oauth") {
+        if !server_config.enabled || !server_config.is_oauth() {
             break;
         }
 
@@ -1502,7 +1502,7 @@ mod tests {
         assert!(report.added.contains(&"fixture".to_string()));
         assert!(engine.config().servers.contains_key("fixture"));
         assert!(
-            crate::operator::load_editable_config(&path)
+            crate::config::load_editable_config(&path)
                 .unwrap()
                 .servers
                 .contains_key("fixture")
@@ -1550,7 +1550,7 @@ mod tests {
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("typed-engine-value"), "{written}");
-        let saved = crate::operator::load_editable_config(&path).unwrap();
+        let saved = crate::config::load_editable_config(&path).unwrap();
         assert_eq!(
             saved.servers["keeper"].env["API_TOKEN"],
             "keychain:keeper.API_TOKEN"
@@ -1611,7 +1611,7 @@ FROM_ENV = "$HOME"
 
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("written-in-the-clear"), "{written}");
-        let saved = crate::operator::load_editable_config(&path).unwrap();
+        let saved = crate::config::load_editable_config(&path).unwrap();
         assert_eq!(
             saved.servers["older"].env["API_TOKEN"],
             "keychain:older.API_TOKEN"
@@ -1653,7 +1653,7 @@ FROM_ENV = "$HOME"
             .unwrap();
         let written = std::fs::read_to_string(&path).unwrap();
         assert!(!written.contains("typed-for-the-file"), "{written}");
-        let saved = crate::operator::load_editable_config(&path).unwrap();
+        let saved = crate::config::load_editable_config(&path).unwrap();
         assert_eq!(
             saved.servers["filed"].env["API_TOKEN"],
             "file:filed.API_TOKEN"
@@ -1739,7 +1739,7 @@ FROM_ENV = "$HOME"
             .unwrap_err();
         assert!(error.to_string().contains("cannot write keys"), "{error}");
         assert!(
-            !crate::operator::load_editable_config(&path)
+            !crate::config::load_editable_config(&path)
                 .unwrap()
                 .servers
                 .contains_key("refused")
@@ -1782,7 +1782,7 @@ HOME_DIR = "$HOME"
             "an unrelated mutation must not restart a server with $VAR env: {report:?}"
         );
         assert_ne!(engine.config().servers["fixture"].env["HOME_DIR"], "$HOME");
-        let persisted = crate::operator::load_editable_config(&path).unwrap();
+        let persisted = crate::config::load_editable_config(&path).unwrap();
         assert_eq!(persisted.servers["fixture"].env["HOME_DIR"], "$HOME");
     }
 

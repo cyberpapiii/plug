@@ -71,7 +71,7 @@ while IFS= read -r path; do
   case "$path" in
     docs/* | *.md) ;;
     PlugApp/*) app=true ;;
-    testdata/ipc/* | testdata/legacy_plug_programs.json)
+    testdata/ipc/* | testdata/legacy_plug_programs.json | testdata/paths.json)
       rust=true
       app=true
       ;;

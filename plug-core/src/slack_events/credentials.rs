@@ -28,7 +28,8 @@ pub struct KeychainSigningSecrets;
 impl KeychainSigningSecrets {
     fn entry(account: &str) -> Result<platform_keyring::Entry, CredentialError> {
         crate::oauth::initialize_platform_keyring().map_err(|_| CredentialError::Unavailable)?;
-        platform_keyring::Entry::new("plug", account).map_err(|_| CredentialError::Unavailable)
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, account)
+            .map_err(|_| CredentialError::Unavailable)
     }
 }
 impl SigningSecretBackend for KeychainSigningSecrets {
