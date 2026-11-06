@@ -1629,7 +1629,10 @@ impl ToolRouter {
             .map(|(name, upstream)| {
                 let params = params.clone();
                 async move {
-                    if let Err(error) = upstream.client.peer().set_level(params).await {
+                    if let Err(error) = self
+                        .bounded_request(&upstream, upstream.client.peer().set_level(params))
+                        .await
+                    {
                         tracing::warn!(
                             server = %name,
                             error = %error,
@@ -2247,6 +2250,23 @@ impl ToolRouter {
         if let Some(recovery) = self.recovery.upgrade() {
             recovery.recover_server(&server_id);
         }
+    }
+
+    /// Wait for `upstream`'s answer no longer than one of its tool calls may
+    /// take, and reconnect it when its connection turns out to be gone.
+    async fn bounded_request<T>(
+        &self,
+        upstream: &crate::server::UpstreamServer,
+        request: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+    ) -> Result<T, McpError> {
+        let request = async {
+            let answer = request.await;
+            if matches!(answer, Err(rmcp::service::ServiceError::TransportClosed)) {
+                self.reconnect_server_in_background(upstream.name.clone());
+            }
+            answer
+        };
+        answer_within(upstream_call_timeout(upstream), request).await
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
@@ -4426,6 +4446,22 @@ fn map_service_error(error: rmcp::service::ServiceError) -> McpError {
     match error {
         rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
         other => McpError::internal_error(other.to_string(), None),
+    }
+}
+
+fn upstream_call_timeout(upstream: &crate::server::UpstreamServer) -> Duration {
+    Duration::from_secs(upstream.config.call_timeout_secs)
+}
+
+/// Wait at most `timeout` for an upstream's answer. rmcp waits for one
+/// forever.
+async fn answer_within<T>(
+    timeout: Duration,
+    request: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+) -> Result<T, McpError> {
+    match tokio::time::timeout(timeout, request).await {
+        Ok(answer) => answer.map_err(map_service_error),
+        Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: timeout })),
     }
 }
 

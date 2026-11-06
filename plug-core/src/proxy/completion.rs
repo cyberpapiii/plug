@@ -56,9 +56,8 @@ impl super::ToolRouter {
             })?;
 
         let mut result = self
-            .bounded_read(
-                &server_id,
-                upstream.config.call_timeout_secs,
+            .bounded_request(
+                &upstream,
                 upstream
                     .client
                     .peer()
@@ -73,30 +72,6 @@ impl super::ToolRouter {
             admit_resource_contents_meta(contents);
         }
         Ok(result)
-    }
-
-    /// Wait for a read from a server no longer than a tool call may take, and
-    /// reconnect the server when its connection turns out to be gone. Reads
-    /// used to wait with no limit, so a server that took the request and
-    /// never answered held the client forever.
-    async fn bounded_read<T>(
-        &self,
-        server_id: &str,
-        timeout_secs: u64,
-        read: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
-    ) -> Result<T, McpError> {
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-        match tokio::time::timeout(timeout, read).await {
-            Ok(Ok(result)) => Ok(result),
-            Ok(Err(rmcp::service::ServiceError::McpError(error))) => Err(error),
-            Ok(Err(error)) => {
-                if matches!(error, rmcp::service::ServiceError::TransportClosed) {
-                    self.reconnect_server_in_background(server_id.to_string());
-                }
-                Err(McpError::internal_error(error.to_string(), None))
-            }
-            Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: timeout })),
-        }
     }
 
     pub async fn get_prompt(
@@ -133,11 +108,7 @@ impl super::ToolRouter {
         }
 
         let mut result = self
-            .bounded_read(
-                &server_id,
-                upstream.config.call_timeout_secs,
-                upstream.client.peer().get_prompt(request),
-            )
+            .bounded_request(&upstream, upstream.client.peer().get_prompt(request))
             .await?;
         admit_catalog_meta(&mut result.meta, "prompt-result");
         for message in &mut result.messages {
@@ -173,13 +144,7 @@ impl super::ToolRouter {
                 sid
             }
             Reference::Resource(resource_ref) => {
-                let sid = snapshot
-                    .resource_routes
-                    .get(&resource_ref.uri)
-                    .cloned()
-                    .or_else(|| {
-                        resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri)
-                    })
+                let sid = resolve_resource_route(&snapshot.resource_routes, &resource_ref.uri)
                     .filter(|server_id| self.client_may_use_all_of_server(client_key, server_id))
                     .ok_or_else(|| {
                         McpError::from(ProtocolError::InvalidRequest {
@@ -209,12 +174,9 @@ impl super::ToolRouter {
                 })
             })?;
 
-        let mut result = upstream
-            .client
-            .peer()
-            .complete(params)
-            .await
-            .map_err(map_service_error)?;
+        let mut result = self
+            .bounded_request(&upstream, upstream.client.peer().complete(params))
+            .await?;
         admit_catalog_meta(&mut result.meta, "completion-result");
         Ok(result)
     }

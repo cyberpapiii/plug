@@ -5200,3 +5200,127 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     assert_eq!(both.len(), 2);
     assert!(both.contains(&cursor) && both.contains(&zed));
 }
+
+/// An upstream that takes requests and never answers them.
+struct SilentUpstreamHandler;
+
+impl ServerHandler for SilentUpstreamHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::default())
+    }
+
+    fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn set_level(
+        &self,
+        _request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn subscribe(
+        &self,
+        _request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn unsubscribe(
+        &self,
+        _request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+}
+
+async fn connect_silent_upstream(name: &str) -> UpstreamServer {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = SilentUpstreamHandler
+            .serve(server_transport)
+            .await
+            .expect("start silent upstream test server");
+        let _ = server.waiting().await;
+    });
+    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+    let handler = Arc::new(UpstreamClientHandler::new_for_tests(
+        Arc::from(name.to_string()),
+        Arc::clone(&tools),
+        crate::server::no_events(),
+    ));
+    let client = handler
+        .serve(client_transport)
+        .await
+        .expect("connect silent upstream test client");
+    let mut capabilities = ServerCapabilities::default();
+    capabilities.logging = Some(serde_json::Map::new());
+    let mut resources = rmcp::model::ResourcesCapability::default();
+    resources.subscribe = Some(true);
+    capabilities.resources = Some(resources);
+    UpstreamServer {
+        name: name.to_string(),
+        config: subscribable_test_server_config(),
+        client,
+        tools,
+        capabilities,
+        upstream: None,
+        protocol_era: crate::protocol::ProtocolEra::Legacy,
+        selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+        protocol_gate_state: 0,
+        connection: crate::server::ConnectionGeneration::new(),
+        child_pid: None,
+        stderr_tail: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_to_an_upstream_that_never_answers_end_at_its_call_timeout() {
+    let sm = Arc::new(ServerManager::new());
+    let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
+    sm.replace_server("silent", connect_silent_upstream("silent").await)
+        .await;
+    let mut snapshot = (*router.cache.load_full()).clone();
+    snapshot.prompt_routes.insert(
+        "silent__greet".to_string(),
+        ("silent".to_string(), "greet".to_string()),
+    );
+    router.cache.store(Arc::new(snapshot));
+    let call_timeout = Duration::from_secs(subscribable_test_server_config().call_timeout_secs);
+
+    let started = tokio::time::Instant::now();
+    let error = router
+        .complete_request(
+            CompleteRequestParams::new(
+                Reference::for_prompt("silent__greet"),
+                ArgumentInfo::new("name", "a"),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a completion nobody answers fails");
+    assert!(error.message.contains("timed out"), "{error:?}");
+    assert_eq!(started.elapsed(), call_timeout);
+
+    let started = tokio::time::Instant::now();
+    router.forward_set_level_to_upstreams().await;
+    assert_eq!(started.elapsed(), call_timeout);
+
+    use subscriptions::UpstreamResourceOps as _;
+    let upstream = sm.get_upstream("silent").expect("silent upstream");
+    for answer in [
+        upstream.subscribe_resource("file:///notes").await,
+        upstream.unsubscribe_resource("file:///notes").await,
+    ] {
+        let error = answer.expect_err("a subscription change nobody answers fails");
+        assert!(error.message.contains("timed out"), "{error:?}");
+    }
+}

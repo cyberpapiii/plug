@@ -7,22 +7,20 @@ use crate::legacy_tasks::{
 };
 use crate::tasks::{OwnerLivenessProbe, UpstreamRecordOutcome, owner_closed_during_create_error};
 
-/// Ask a task-native upstream about one of its tasks, for at most its
-/// `call_timeout_secs`. rmcp's `send_request` waits for an answer forever.
+/// Ask a task-native upstream about one of its tasks.
 async fn ask_task_upstream(
     server: &crate::server::UpstreamServer,
     method: &str,
     params: serde_json::Value,
 ) -> Result<rmcp::model::ServerResult, McpError> {
-    let bound = Duration::from_secs(server.config.call_timeout_secs);
-    let send = server
-        .client
-        .peer()
-        .send_request(crate::legacy_tasks::request(method, Some(params)));
-    match tokio::time::timeout(bound, send).await {
-        Ok(response) => response.map_err(map_service_error),
-        Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: bound })),
-    }
+    answer_within(
+        upstream_call_timeout(server),
+        server
+            .client
+            .peer()
+            .send_request(crate::legacy_tasks::request(method, Some(params))),
+    )
+    .await
 }
 
 /// RAII cover for the send-to-record gap in `record_task_request`:

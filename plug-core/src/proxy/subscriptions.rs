@@ -38,12 +38,10 @@ use tokio_util::task::TaskTracker;
 ///   call `Peer::subscribe`/`Peer::unsubscribe` directly.
 pub(super) struct SubscriptionRegistry {
     entries: DashMap<String, Entry>,
-    /// Persistent per-URI async mutex serializing upstream transitions.
-    /// Entries here are never pruned — the plan calls this out explicitly:
-    /// the cardinality is bounded by distinct resource URIs ever subscribed
-    /// to, which is small relative to a long-running daemon's lifetime, and
-    /// removing them safely would require its own generation-matched
-    /// protocol for no real benefit.
+    /// Persistent per-URI async mutex serializing upstream transitions,
+    /// each bounded by its server's call timeout. Entries are never pruned:
+    /// there is one per distinct URI ever subscribed to, and removing one
+    /// safely would need its own generation-matched protocol.
     transition_locks: DashMap<String, Arc<Mutex<()>>>,
     next_generation: AtomicU64,
     /// Where transitions are spawned, so shutdown waits for them.
@@ -194,28 +192,26 @@ impl UpstreamResourceOps for crate::server::UpstreamServer {
         &'a self,
         uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + 'a>> {
-        Box::pin(async move {
-            self.client
-                .peer()
-                .subscribe(SubscribeRequestParams::new(
-                    skills::inward(&self.name, uri).into_owned(),
-                ))
-                .await
-                .map_err(map_service_error)
-        })
+        Box::pin(answer_within(
+            upstream_call_timeout(self),
+            self.client.peer().subscribe(SubscribeRequestParams::new(
+                skills::inward(&self.name, uri).into_owned(),
+            )),
+        ))
     }
 
     fn unsubscribe_resource<'a>(
         &'a self,
         uri: &'a str,
     ) -> Pin<Box<dyn Future<Output = Result<(), McpError>> + Send + 'a>> {
-        Box::pin(async move {
+        Box::pin(answer_within(
+            upstream_call_timeout(self),
             self.client
                 .peer()
-                .unsubscribe(make_unsubscribe_params(&skills::inward(&self.name, uri)))
-                .await
-                .map_err(map_service_error)
-        })
+                .unsubscribe(UnsubscribeRequestParams::new(
+                    skills::inward(&self.name, uri).into_owned(),
+                )),
+        ))
     }
 }
 
@@ -227,11 +223,6 @@ pub(super) fn as_upstream_ops(
     upstream: Arc<crate::server::UpstreamServer>,
 ) -> Arc<dyn UpstreamResourceOps> {
     upstream
-}
-
-fn make_unsubscribe_params(uri: &str) -> UnsubscribeRequestParams {
-    serde_json::from_value::<UnsubscribeRequestParams>(serde_json::json!({ "uri": uri }))
-        .expect("UnsubscribeRequestParams from known-good JSON")
 }
 
 /// Outcome of classifying an existing registry entry against an old/new
