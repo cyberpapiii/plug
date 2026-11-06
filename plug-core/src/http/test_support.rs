@@ -13,13 +13,6 @@ pub(super) use crate::http::events::*;
 pub(super) use crate::http::fanout::*;
 pub(super) use crate::http::guard::*;
 pub(super) use crate::http::identity::*;
-pub(super) use crate::http::oauth::{
-    get_oauth_authorization_server_metadata, get_oauth_protected_resource_metadata,
-    oauth_authorize, oauth_consent_challenge, oauth_consent_decision, oauth_consent_javascript,
-    oauth_enroll_javascript, oauth_icon, oauth_owner_enroll, oauth_owner_enroll_challenge,
-    oauth_owner_enroll_complete, oauth_register, oauth_stylesheet, oauth_token,
-    protected_resource_metadata_url,
-};
 pub(super) use crate::http::response::*;
 pub(super) use crate::http::reverse::*;
 pub(super) use crate::http::server::*;

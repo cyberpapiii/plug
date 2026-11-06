@@ -19,7 +19,7 @@ use axum::routing::{get, post};
 use passkey_auth::{AuthenticationResponse, RegistrationResponse};
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct OAuthAuthorizeParams {
+struct OAuthAuthorizeParams {
     response_type: String,
     client_id: String,
     redirect_uri: String,
@@ -31,13 +31,13 @@ pub(super) struct OAuthAuthorizeParams {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct OAuthConsentChallengeRequest {
+struct OAuthConsentChallengeRequest {
     consent_id: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(tag = "decision", rename_all = "snake_case")]
-pub(super) enum OAuthConsentDecision {
+enum OAuthConsentDecision {
     Approve {
         ceremony_id: String,
         credential: AuthenticationResponse,
@@ -49,17 +49,17 @@ pub(super) enum OAuthConsentDecision {
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct OAuthOwnerEnrollmentChallengeRequest {
+struct OAuthOwnerEnrollmentChallengeRequest {
     bootstrap: String,
 }
 
 #[derive(Debug, serde::Deserialize)]
-pub(super) struct OAuthOwnerEnrollmentCompleteRequest {
+struct OAuthOwnerEnrollmentCompleteRequest {
     ceremony_id: String,
     credential: RegistrationResponse,
 }
 
-pub(super) async fn get_oauth_authorization_server_metadata(
+async fn get_oauth_authorization_server_metadata(
     State(manager): State<DownstreamOauthManager>,
 ) -> impl IntoResponse {
     let response = Json(json!({
@@ -77,7 +77,7 @@ pub(super) async fn get_oauth_authorization_server_metadata(
     (StatusCode::OK, response).into_response()
 }
 
-pub(super) async fn get_oauth_protected_resource_metadata(
+async fn get_oauth_protected_resource_metadata(
     State(manager): State<DownstreamOauthManager>,
 ) -> impl IntoResponse {
     let response = Json(json!({
@@ -89,7 +89,7 @@ pub(super) async fn get_oauth_protected_resource_metadata(
     (StatusCode::OK, response).into_response()
 }
 
-pub(super) async fn oauth_register(
+async fn oauth_register(
     State(manager): State<DownstreamOauthManager>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
@@ -109,7 +109,7 @@ pub(super) async fn oauth_register(
     }
 }
 
-pub(super) async fn oauth_authorize(
+async fn oauth_authorize(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     params: Result<Query<OAuthAuthorizeParams>, QueryRejection>,
@@ -167,7 +167,7 @@ pub(super) async fn oauth_authorize(
     }
 }
 
-pub(super) async fn oauth_consent_javascript(
+async fn oauth_consent_javascript(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
@@ -179,7 +179,7 @@ pub(super) async fn oauth_consent_javascript(
     )
 }
 
-pub(super) async fn oauth_enroll_javascript(
+async fn oauth_enroll_javascript(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
@@ -191,7 +191,7 @@ pub(super) async fn oauth_enroll_javascript(
     )
 }
 
-pub(super) async fn oauth_stylesheet(
+async fn oauth_stylesheet(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
@@ -203,10 +203,7 @@ pub(super) async fn oauth_stylesheet(
     )
 }
 
-pub(super) async fn oauth_icon(
-    State(manager): State<DownstreamOauthManager>,
-    headers: HeaderMap,
-) -> Response {
+async fn oauth_icon(State(manager): State<DownstreamOauthManager>, headers: HeaderMap) -> Response {
     browser_asset(
         &manager,
         &headers,
@@ -228,7 +225,7 @@ fn browser_asset(
     super::oauth_ui::asset(source, content_type)
 }
 
-pub(super) async fn oauth_owner_enroll(
+async fn oauth_owner_enroll(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
@@ -238,7 +235,7 @@ pub(super) async fn oauth_owner_enroll(
     super::oauth_ui::enrollment_page()
 }
 
-pub(super) async fn oauth_consent_challenge(
+async fn oauth_consent_challenge(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     request: Result<Json<OAuthConsentChallengeRequest>, JsonRejection>,
@@ -257,7 +254,7 @@ pub(super) async fn oauth_consent_challenge(
     }
 }
 
-pub(super) async fn oauth_consent_decision(
+async fn oauth_consent_decision(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     decision: Result<Json<OAuthConsentDecision>, JsonRejection>,
@@ -292,7 +289,7 @@ pub(super) async fn oauth_consent_decision(
     }
 }
 
-pub(super) async fn oauth_owner_enroll_challenge(
+async fn oauth_owner_enroll_challenge(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     request: Result<Json<OAuthOwnerEnrollmentChallengeRequest>, JsonRejection>,
@@ -310,7 +307,7 @@ pub(super) async fn oauth_owner_enroll_challenge(
     }
 }
 
-pub(super) async fn oauth_owner_enroll_complete(
+async fn oauth_owner_enroll_complete(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     request: Result<Json<OAuthOwnerEnrollmentCompleteRequest>, JsonRejection>,
@@ -331,7 +328,7 @@ pub(super) async fn oauth_owner_enroll_complete(
     }
 }
 
-pub(super) async fn oauth_token(
+async fn oauth_token(
     State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     params: Result<Form<HashMap<String, String>>, FormRejection>,
@@ -402,7 +399,7 @@ pub(super) async fn oauth_token(
     }
 }
 
-pub(super) fn oauth_credential_response<T: serde::Serialize>(payload: T) -> Response {
+fn oauth_credential_response<T: serde::Serialize>(payload: T) -> Response {
     let mut response = oauth_json_response(StatusCode::OK, payload);
     response
         .headers_mut()
@@ -413,7 +410,7 @@ pub(super) fn oauth_credential_response<T: serde::Serialize>(payload: T) -> Resp
     response
 }
 
-pub(super) fn oauth_error_response(error: &DownstreamOauthError) -> Response {
+fn oauth_error_response(error: &DownstreamOauthError) -> Response {
     let (status, code, description) = oauth_public_error(error);
     oauth_json_response(
         status,
@@ -424,9 +421,7 @@ pub(super) fn oauth_error_response(error: &DownstreamOauthError) -> Response {
     )
 }
 
-pub(super) fn oauth_validated_callback_error_response(
-    error: &DownstreamOauthError,
-) -> Option<Response> {
+fn oauth_validated_callback_error_response(error: &DownstreamOauthError) -> Option<Response> {
     let DownstreamOauthError::AuthorizationExpired(callback) = error else {
         return None;
     };
@@ -438,7 +433,7 @@ pub(super) fn oauth_validated_callback_error_response(
     ))
 }
 
-pub(super) fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
+fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
     let mut response = (status, Json(payload)).into_response();
     super::oauth_ui::apply_oauth_security_headers(&mut response);
     response
@@ -451,9 +446,7 @@ static OWNER_CREDENTIAL_LIMIT: std::sync::LazyLock<String> = std::sync::LazyLock
     )
 });
 
-pub(super) fn oauth_public_error(
-    error: &DownstreamOauthError,
-) -> (StatusCode, &'static str, &'static str) {
+fn oauth_public_error(error: &DownstreamOauthError) -> (StatusCode, &'static str, &'static str) {
     match error {
         DownstreamOauthError::InvalidClient => (
             StatusCode::UNAUTHORIZED,
@@ -550,7 +543,7 @@ pub(super) fn oauth_public_error(
     }
 }
 
-pub(super) fn accepts_html(headers: &HeaderMap) -> bool {
+fn accepts_html(headers: &HeaderMap) -> bool {
     headers
         .get_all(header::ACCEPT)
         .iter()
@@ -559,7 +552,7 @@ pub(super) fn accepts_html(headers: &HeaderMap) -> bool {
         .any(html_media_range_is_acceptable)
 }
 
-pub(super) fn html_media_range_is_acceptable(value: &str) -> bool {
+fn html_media_range_is_acceptable(value: &str) -> bool {
     let mut parts = value.split(';');
     if !parts
         .next()
@@ -583,18 +576,18 @@ pub(super) fn html_media_range_is_acceptable(value: &str) -> bool {
     quality > 0.0
 }
 
-pub(super) fn oauth_authorization_error_response(error: &DownstreamOauthError) -> Response {
+fn oauth_authorization_error_response(error: &DownstreamOauthError) -> Response {
     let (status, code, description) = oauth_public_error(error);
     super::oauth_ui::authorization_error_page(status, code, description)
 }
 
-pub(super) fn oauth_forbidden_response() -> Response {
+fn oauth_forbidden_response() -> Response {
     let mut response = StatusCode::FORBIDDEN.into_response();
     super::oauth_ui::apply_oauth_security_headers(&mut response);
     response
 }
 
-pub(super) fn public_browser_request_allowed(
+fn public_browser_request_allowed(
     manager: &DownstreamOauthManager,
     headers: &HeaderMap,
     require_origin: bool,
@@ -643,7 +636,7 @@ pub(super) fn public_browser_request_allowed(
 /// sent. `x-forwarded-for` is *appended* to, so the leftmost entry is the value
 /// the client supplied and the rightmost is the one the nearest proxy added;
 /// only the rightmost is worth anything.
-pub(super) fn registration_rate_key(peer: Option<std::net::IpAddr>, headers: &HeaderMap) -> String {
+fn registration_rate_key(peer: Option<std::net::IpAddr>, headers: &HeaderMap) -> String {
     let Some(peer) = peer else {
         // No connection info means no way to tell a proxy from a client, so
         // neither source is trustworthy. One shared bucket is a worse rate
@@ -671,7 +664,7 @@ pub(super) fn registration_rate_key(peer: Option<std::net::IpAddr>, headers: &He
     }
 }
 
-pub(super) fn oauth_authorization_error_redirect(
+fn oauth_authorization_error_redirect(
     redirect_uri: &str,
     state: &str,
     error: &DownstreamOauthError,
@@ -734,10 +727,6 @@ pub(super) fn router(manager: DownstreamOauthManager) -> Router {
 
 #[cfg(test)]
 mod tests {
-    use super::super::oauth::{
-        accepts_html, oauth_authorization_error_response, oauth_error_response, oauth_public_error,
-        registration_rate_key,
-    };
     use super::*;
     use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
     use crate::downstream_oauth::{
