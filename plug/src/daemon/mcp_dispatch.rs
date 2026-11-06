@@ -96,14 +96,7 @@ impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
 }
 
 /// Encode a serializable value as an IPC `McpResponse` payload, falling back to
-/// a `SERIALIZE_ERROR` frame if serialization fails. The single encode primitive
-/// for IPC method results — replaces the per-arm `match serde_json::to_value`
-/// ladder so every arm shares one fallback path.
-#[cfg(test)]
-pub(super) fn ipc_ok<T: serde::Serialize>(value: T) -> IpcResponse {
-    ipc_ok_with_context(value, None)
-}
-
+/// a `SERIALIZE_ERROR` frame if serialization fails.
 fn ipc_ok_with_context<T: serde::Serialize>(
     value: T,
     context: Option<&IpcMcpRequestContext>,
@@ -652,7 +645,7 @@ mod tests {
 
     #[test]
     fn ipc_ok_encodes_value_as_mcp_response() {
-        let resp = ipc_ok(serde_json::json!({ "a": 1 }));
+        let resp = ipc_ok_with_context(serde_json::json!({ "a": 1 }), None);
         let IpcResponse::McpResponse { payload } = resp else {
             panic!("expected McpResponse, got {resp:?}");
         };
@@ -662,7 +655,7 @@ mod tests {
         // takes the SERIALIZE_ERROR fallback frame rather than an McpResponse.
         let mut unserializable = std::collections::BTreeMap::new();
         unserializable.insert((1_i32, 2_i32), 3_i32);
-        match ipc_ok(unserializable) {
+        match ipc_ok_with_context(unserializable, None) {
             IpcResponse::Error { code, .. } => assert_eq!(code, "SERIALIZE_ERROR"),
             other => panic!("expected SERIALIZE_ERROR frame, got {other:?}"),
         }

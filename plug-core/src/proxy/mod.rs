@@ -953,7 +953,7 @@ impl ToolRouter {
         CATALOG_REVISION.load(Ordering::Relaxed)
     }
 
-    fn new_with_quotas(
+    pub(crate) fn new_with_quotas(
         server_manager: Arc<ServerManager>,
         config: RouterConfig,
         admission_quotas: crate::protocol::AdmissionQuotas,
@@ -1107,15 +1107,6 @@ impl ToolRouter {
         filter: &crate::activity::ActivityFilter,
     ) -> Vec<crate::activity::ActivityEvent> {
         self.activity_store.snapshot(filter)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_admission_quotas_for_tests(
-        server_manager: Arc<ServerManager>,
-        config: RouterConfig,
-        admission_quotas: crate::protocol::AdmissionQuotas,
-    ) -> Self {
-        Self::new_with_quotas(server_manager, config, admission_quotas)
     }
 
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<ProtocolNotification> {

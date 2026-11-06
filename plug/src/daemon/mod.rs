@@ -339,10 +339,7 @@ fn spawn_grace_period_task(
 
 // ─────────────────────────── Daemon entry point ──────────────────────────────
 
-/// Start the daemon: Engine + Unix socket IPC listener + file logging.
-///
-/// Returns the tracing-appender guard that MUST be held for the daemon's lifetime
-/// (dropping it flushes and closes the log file).
+/// `run_daemon_with_lock` after taking the runtime lock, without downstream OAuth.
 #[cfg(test)]
 pub async fn run_daemon(
     engine: Arc<Engine>,

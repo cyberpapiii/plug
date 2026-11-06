@@ -2265,7 +2265,7 @@ mod tests {
             ..Default::default()
         });
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        let router = Arc::new(ToolRouter::new_with_quotas(
             sm,
             RouterConfig::default(),
             quotas,
@@ -2309,7 +2309,7 @@ mod tests {
             ..Default::default()
         });
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        let router = Arc::new(ToolRouter::new_with_quotas(
             sm,
             RouterConfig::default(),
             quotas,

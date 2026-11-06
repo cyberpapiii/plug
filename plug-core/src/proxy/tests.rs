@@ -3561,7 +3561,7 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
         per_principal_divisor: 1,
         ..Default::default()
     });
-    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+    let router = Arc::new(ToolRouter::new_with_quotas(
         Arc::clone(&sm),
         RouterConfig::default(),
         quotas,
@@ -3858,7 +3858,7 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
         per_principal_divisor: 1,
         ..Default::default()
     });
-    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+    let router = Arc::new(ToolRouter::new_with_quotas(
         Arc::clone(&sm),
         RouterConfig::default(),
         quotas,
@@ -3925,7 +3925,7 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
         per_principal_divisor: 1,
         ..Default::default()
     });
-    let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+    let router = Arc::new(ToolRouter::new_with_quotas(
         Arc::clone(&sm),
         RouterConfig::default(),
         quotas,
