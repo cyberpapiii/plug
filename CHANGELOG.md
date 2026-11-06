@@ -99,6 +99,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   longer kept from the client that ran it.
 - A legacy SSE server that was away for a while is reconnected within a minute of coming back. Its wait between tries used to keep doubling with no limit, so after ten minutes away the next try came seventeen minutes later.
 - A server that is down is brought back by one recovery at a time, at the same pace whatever noticed it. A failed reconnect during a tool call, after a call timed out, or after a sign-in was renewed now hands the server to that recovery instead of retrying on its own, and a recovery that found another start of its server running no longer gave up, which could leave the server down.
+- Editing a server's tool renames, tool groups, call limit, circuit breaker or health check interval takes effect on save, without restarting the server. Those edits used to be read as no change, and the sandbox setting was missed the same way; a sandbox change now restarts the server. A server that fails to start during a reload reports the whole cause, and one refused for its sign-in is marked as needing sign-in.
 
 ## [0.11.0] - 2026-10-07
 

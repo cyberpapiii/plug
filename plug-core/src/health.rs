@@ -85,8 +85,7 @@ pub(crate) fn spawn_health_check(engine: &Arc<Engine>, name: &str, server_config
                 engine.supervision().health_tasks.clear(&name);
                 break;
             };
-            if !current_config.enabled || current_config.health_check_interval_secs != interval_secs
-            {
+            if !current_config.enabled {
                 break;
             }
             check_once(&engine, &server_manager, &name).await;

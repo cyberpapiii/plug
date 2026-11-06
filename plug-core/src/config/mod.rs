@@ -692,7 +692,7 @@ pub enum UpstreamProtocolMode {
 /// contains = ["event", "calendar", "freebusy"]
 /// strip = ["calendar"]
 /// ```
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolGroupRule {
     /// The group prefix (e.g. "Gmail", "GoogleDrive").
     pub prefix: String,

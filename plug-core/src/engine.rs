@@ -11,6 +11,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
+use futures::stream::{self, StreamExt};
 use tokio::sync::Mutex;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
@@ -19,7 +20,7 @@ use tokio_util::task::TaskTracker;
 use crate::config::{Config, ServerConfig};
 use crate::health::{spawn_health_check, spawn_health_checks};
 use crate::proxy::{RouterConfig, ToolRouter};
-use crate::reload::server_config_changed;
+use crate::reload::{ReloadReport, server_config_changed};
 use crate::server::{ServerManager, UpstreamServer, retire_upstream_owned};
 use crate::supervision::Supervision;
 use crate::types::{ServerHealth, ServerStatus};
@@ -308,7 +309,7 @@ impl Engine {
         &self,
         server_id: &str,
         connected_with: &ServerConfig,
-        upstream: UpstreamServer,
+        mut upstream: UpstreamServer,
     ) -> Reconnect {
         let _guard = self.reload_lock.lock().await;
         let current = self.config.load();
@@ -317,6 +318,8 @@ impl Engine {
             || upstream.protocol_gate_state == self.server_manager.modern_upstream_gate_state();
         match current.servers.get(server_id) {
             Some(cfg) if !server_config_changed(connected_with, cfg) && gate_is_current => {
+                // Settings a reload applies live may have moved meanwhile.
+                upstream.config = cfg.clone();
                 self.server_manager
                     .replace_server(server_id, upstream)
                     .await;
@@ -454,7 +457,7 @@ impl Engine {
         }
 
         server.enabled = enabled;
-        self.reload_config(new_config).await?;
+        self.reload_config(new_config).await;
         Ok(())
     }
 
@@ -512,10 +515,7 @@ impl Engine {
         self: &Arc<Self>,
         config_path: &std::path::Path,
         mutation: crate::operator::OperatorMutation,
-    ) -> anyhow::Result<(
-        crate::operator::OperatorMutationResult,
-        crate::reload::ReloadReport,
-    )> {
+    ) -> anyhow::Result<(crate::operator::OperatorMutationResult, ReloadReport)> {
         self.apply_operator_mutation_keeping(config_path, mutation, None)
             .await
     }
@@ -528,10 +528,7 @@ impl Engine {
         config_path: &std::path::Path,
         mutation: crate::operator::OperatorMutation,
         secret_store: Option<&str>,
-    ) -> anyhow::Result<(
-        crate::operator::OperatorMutationResult,
-        crate::reload::ReloadReport,
-    )> {
+    ) -> anyhow::Result<(crate::operator::OperatorMutationResult, ReloadReport)> {
         let store = secret_store.unwrap_or(crate::secrets::KEYCHAIN);
         if ![crate::secrets::KEYCHAIN, crate::secrets::FILE].contains(&store) {
             anyhow::bail!("Plug cannot write keys to `{store}`; choose `keychain` or `file`");
@@ -577,7 +574,7 @@ impl Engine {
             // The mutation persists the raw file, `$VAR` refs and all. Reload what the
             // daemon would load at startup, or every env-ref server looks changed.
             let config = crate::config::load_config(Some(&config_path.to_path_buf()))?;
-            let report = crate::reload::apply_reload(self, config).await?;
+            let report = self.apply_reload(config).await;
             if let Some((name, server)) = before {
                 let config = self.config.load_full();
                 let _ = tokio::task::spawn_blocking(move || {
@@ -736,16 +733,116 @@ impl Engine {
         ))
     }
 
-    /// Reload configuration from a new Config.
-    ///
-    /// Diffs the old and new configs, starts/stops/restarts servers as needed,
-    /// refreshes the tool cache, and emits `ConfigReloaded`.
-    pub async fn reload_config(
-        self: &Arc<Self>,
-        new_config: Config,
-    ) -> Result<crate::reload::ReloadReport, anyhow::Error> {
+    /// Apply `new_config`: stop removed servers, restart changed ones, apply
+    /// the rest of the changes to the servers that keep running, and swap
+    /// the config in. A server that fails to start is reported in the result
+    /// and left to recovery.
+    pub async fn reload_config(self: &Arc<Self>, new_config: Config) -> ReloadReport {
         let _guard = self.reload_lock.lock().await;
-        crate::reload::apply_reload(self, new_config).await
+        self.apply_reload(new_config).await
+    }
+
+    /// [`Engine::reload_config`], with `reload_lock` held by the caller.
+    async fn apply_reload(self: &Arc<Self>, new_config: Config) -> ReloadReport {
+        let old_config = self.config.load_full();
+        let diff = crate::reload::diff_configs(&old_config, &new_config);
+        let mut report = ReloadReport {
+            added: diff.added.iter().map(|(n, _)| n.clone()).collect(),
+            removed: diff.removed.clone(),
+            changed: diff.changed.iter().map(|(n, _)| n.clone()).collect(),
+            unchanged: diff.unchanged.clone(),
+            settings_changed: diff.settings_changed,
+            restart_required: diff.restart_required.clone(),
+            errors: Vec::new(),
+        };
+
+        // The live gate goes first, so replacements negotiate under it.
+        // Running connections stay until their own restart below.
+        self.server_manager
+            .set_modern_upstream_enabled(new_config.modern_upstream_enabled);
+
+        for name in &diff.removed {
+            tracing::info!(server = %name, "stopping removed server");
+            self.server_manager.stop_server(name).await;
+            self.supervision.health_tasks.clear(name);
+            self.supervision.refresh_tasks.clear(name);
+            self.supervision.forget(name);
+        }
+        for (name, _) in &diff.changed {
+            tracing::info!(server = %name, "restarting changed server");
+            self.server_manager.stop_server(name).await;
+            self.supervision.forget(name);
+        }
+        for (name, server_config) in &diff.updated {
+            self.server_manager.apply_live_settings(name, server_config);
+        }
+
+        // A server that is off is stopped with the rest and stays stopped.
+        let starts: Vec<(String, ServerConfig)> = diff
+            .changed
+            .iter()
+            .chain(&diff.added)
+            .filter(|(_, server_config)| server_config.enabled)
+            .cloned()
+            .collect();
+        let server_manager = &self.server_manager;
+        let started: Vec<_> = stream::iter(starts)
+            .map(|(name, server_config)| async move {
+                tracing::info!(server = %name, "starting server");
+                let result = server_manager
+                    .start_and_register(&name, &server_config)
+                    .await;
+                (name, server_config, result)
+            })
+            .buffer_unordered(new_config.startup_concurrency.max(1))
+            .collect()
+            .await;
+        for (name, server_config, result) in &started {
+            if let Err(error) = result {
+                // Only a real sign-in failure asks the owner to sign in; a
+                // network failure on a server that signs in is retried like
+                // any other.
+                server_manager.record_start_failure(name, server_config, error);
+                let message = format!("failed to start server {name}: {error:#}");
+                tracing::error!("{message}");
+                report.errors.push(message);
+            }
+        }
+
+        let catalog_dirty = !diff.added.is_empty()
+            || !diff.changed.is_empty()
+            || !diff.removed.is_empty()
+            || !diff.updated.is_empty();
+
+        // Swapped before the background tasks start, so they see the new
+        // server set.
+        self.store_config(new_config);
+
+        // A server that could not start gets its health task too, so it is
+        // retried.
+        for (name, server_config, _) in &started {
+            self.spawn_background_tasks_for_server(name, server_config);
+        }
+        for (name, server_config) in &diff.updated {
+            let interval_changed = old_config.servers.get(name).is_some_and(|old| {
+                old.health_check_interval_secs != server_config.health_check_interval_secs
+            });
+            if interval_changed {
+                crate::health::spawn_health_check(self, name, server_config);
+            }
+        }
+
+        if catalog_dirty {
+            self.tool_router.refresh_tools().await;
+        }
+
+        #[cfg(test)]
+        self.note_reload_applied();
+
+        for warning in &diff.restart_required {
+            tracing::warn!("{warning}");
+        }
+        report
     }
 }
 
@@ -966,23 +1063,81 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_reload_starts_only_the_servers_that_are_on() {
+        let engine = Arc::new(Engine::new(Config::default()));
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("on".into(), mock_stdio_server_config("echo", 1));
+        let mut off = mock_stdio_server_config("echo", 1);
+        off.enabled = false;
+        config.servers.insert("off".into(), off);
+
+        let report = engine.reload_config(config).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(engine.server_manager().get_upstream("on").is_some());
+        assert!(engine.server_manager().get_upstream("off").is_none());
+        engine.shutdown().await;
+    }
+
+    /// Renames, groups, the call limit and the breaker apply to a running
+    /// server. They used to be read from the config it connected with, so an
+    /// edit to them did nothing until some unrelated restart.
+    #[tokio::test]
+    async fn settings_that_need_no_restart_apply_to_the_running_server() {
+        let config = mock_stdio_config("foo", "echo");
+        let engine = Arc::new(Engine::new(config.clone()));
+        engine.start().await.expect("engine start");
+        let before = engine
+            .server_manager()
+            .get_upstream("foo")
+            .expect("foo runs");
+
+        let mut edited = config;
+        let foo = edited.servers.get_mut("foo").expect("foo configured");
+        foo.tool_renames.insert("echo".into(), "say".into());
+        foo.max_concurrent = 3;
+        foo.circuit_breaker_enabled = false;
+        let report = engine.reload_config(edited).await;
+
+        assert!(report.unchanged.contains(&"foo".to_string()), "{report:?}");
+        let after = engine
+            .server_manager()
+            .get_upstream("foo")
+            .expect("foo runs");
+        assert!(Arc::ptr_eq(&before, &after), "foo was restarted");
+        let names: Vec<String> = engine
+            .tool_router()
+            .list_tools_for_client(crate::types::ClientType::Unknown)
+            .iter()
+            .map(|tool| tool.name.to_string())
+            .collect();
+        assert!(names.iter().any(|name| name.ends_with("say")), "{names:?}");
+        assert!(
+            !names.iter().any(|name| name.ends_with("echo")),
+            "{names:?}"
+        );
+        let slots = engine
+            .server_manager()
+            .call_slots("foo")
+            .expect("foo has slots");
+        assert_eq!(slots.available_permits(), 3);
+        assert!(engine.server_manager().circuit_breaker("foo").is_none());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn reload_updates_modern_downstream_gate_without_rebuilding_engine() {
         let engine = Arc::new(Engine::new(Config::default()));
         assert!(!engine.tool_router().modern_downstream_enabled());
 
         let mut enabled = Config::default();
         enabled.http.modern_downstream_enabled = true;
-        let report = engine
-            .reload_config(enabled)
-            .await
-            .expect("enable reload succeeds");
+        let report = engine.reload_config(enabled).await;
         assert!(report.settings_changed);
         assert!(engine.tool_router().modern_downstream_enabled());
 
-        let report = engine
-            .reload_config(Config::default())
-            .await
-            .expect("disable reload succeeds");
+        let report = engine.reload_config(Config::default()).await;
         assert!(report.settings_changed);
         assert!(!engine.tool_router().modern_downstream_enabled());
     }
@@ -1041,10 +1196,7 @@ mod tests {
         // replacement while the old reconnect remains parked.
         let mut enabled = initial;
         enabled.modern_upstream_enabled = true;
-        engine
-            .reload_config(enabled)
-            .await
-            .expect("gate-enabling reload succeeds");
+        engine.reload_config(enabled).await;
         let installed = engine
             .server_manager()
             .get_upstream("foo")
@@ -1083,10 +1235,7 @@ mod tests {
             .await
             .expect("mock upstream connects");
 
-        engine
-            .reload_config(Config::default())
-            .await
-            .expect("reload succeeds");
+        engine.reload_config(Config::default()).await;
 
         let outcome = engine.commit_replacement("foo", &snapshot, upstream).await;
         assert!(matches!(outcome, Reconnect::Abandoned));
@@ -1120,10 +1269,7 @@ mod tests {
         changed_config
             .servers
             .insert("foo".to_string(), mock_stdio_server_config("echo,greet", 1));
-        let report = engine
-            .reload_config(changed_config)
-            .await
-            .expect("reload succeeds");
+        let report = engine.reload_config(changed_config).await;
         assert!(
             report.errors.is_empty(),
             "reload should start the changed server cleanly: {:?}",
@@ -1174,10 +1320,7 @@ mod tests {
         unchanged_config
             .servers
             .insert("foo".to_string(), mock_stdio_server_config("echo", 7));
-        let report = engine
-            .reload_config(unchanged_config)
-            .await
-            .expect("reload succeeds");
+        let report = engine.reload_config(unchanged_config).await;
         assert!(report.unchanged.contains(&"foo".to_string()));
         assert!(
             engine.server_manager().get_upstream("foo").is_none(),
@@ -1665,10 +1808,7 @@ HOME_DIR = "$HOME"
             },
         );
 
-        let report = engine
-            .reload_config(new_config)
-            .await
-            .expect("reload report");
+        let report = engine.reload_config(new_config).await;
         assert!(
             !report.errors.is_empty(),
             "expected reload failure for invalid command"

@@ -113,19 +113,13 @@ async fn run_watcher(
                         continue;
                     }
                 };
-                match engine.reload_config(new_config).await {
-                    Ok(report) => {
-                        tracing::info!(
-                            added = report.added.len(),
-                            removed = report.removed.len(),
-                            changed = report.changed.len(),
-                            "config reloaded via file watcher"
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(error = %e, "config reload failed — keeping current config");
-                    }
-                }
+                let report = engine.reload_config(new_config).await;
+                tracing::info!(
+                    added = report.added.len(),
+                    removed = report.removed.len(),
+                    changed = report.changed.len(),
+                    "config reloaded via file watcher"
+                );
             }
         }
     }
@@ -142,13 +136,9 @@ async fn run_watcher(
 // `DEBOUNCE_MS`), so they use `#[tokio::test(flavor = "multi_thread")]` —
 // paused/virtual tokio time cannot observe the debouncer's own OS thread.
 //
-// Residual gaps NOT covered here (see plan 024): the missing-directory
-// branch (`:48-55`, trivial and requires racing spawn against dir creation),
-// the full-channel drop (`:66`, needs >16 debounced events in flight), and
-// the reload-failure-keeps-config branch (`:116-118`) — `apply_reload`
-// (`reload.rs:230-334`) always returns `Ok`, recording per-server start
-// failures in `ReloadReport::errors` rather than surfacing an `Err`, so
-// there is no easy input that makes `engine.reload_config()` itself fail.
+// Not covered: the missing-directory branch (it needs a race between the
+// spawn and the directory appearing) and the dropped event when the channel
+// is full (it needs more than 16 debounced events in flight).
 #[cfg(test)]
 mod tests {
     use super::*;

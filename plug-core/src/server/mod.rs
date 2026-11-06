@@ -1250,10 +1250,13 @@ pub struct ServerManager {
     /// Serializes every writer to `servers` (RCU: lock, load, clone, mutate,
     /// store, drop the guard). Never hold this across an `await`.
     server_map_write_lock: std::sync::Mutex<()>,
-    pub(crate) health: DashMap<String, HealthState>,
+    health: DashMap<String, HealthState>,
     configured_auth: DashMap<String, ConfiguredAuth>,
-    pub(crate) circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
-    pub(crate) metrics: DashMap<String, Arc<UpstreamMetrics>>,
+    /// Each running server's current settings. Unlike the config an
+    /// `UpstreamServer` connected with, this follows a reload.
+    settings: DashMap<String, Arc<ServerConfig>>,
+    circuit_breakers: DashMap<String, Arc<CircuitBreaker>>,
+    metrics: DashMap<String, Arc<UpstreamMetrics>>,
     /// Last-known-good resource/template/prompt listings per server, carried
     /// forward when a live listing times out or errors so a transient stall does
     /// not prune the catalog (and its active subscriptions). Tools already cache
@@ -1266,7 +1269,7 @@ pub struct ServerManager {
     /// Why each server last failed to start or reconnect, already redacted.
     /// Cleared when it starts; shown in status while it is unhealthy.
     last_errors: DashMap<String, String>,
-    pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
+    semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
     tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
     /// Grace-period retirement tasks spawned by `replace_server` for
     /// old-generation upstreams still held by in-flight requests. Tracked so
@@ -1344,6 +1347,7 @@ impl ServerManager {
             server_map_write_lock: std::sync::Mutex::new(()),
             health: DashMap::new(),
             configured_auth: DashMap::new(),
+            settings: DashMap::new(),
             circuit_breakers: DashMap::new(),
             metrics: DashMap::new(),
             last_resources: DashMap::new(),
@@ -2536,6 +2540,7 @@ impl ServerManager {
 
         self.health.clear();
         self.configured_auth.clear();
+        self.settings.clear();
         self.circuit_breakers.clear();
         self.metrics.clear();
         self.last_resources.clear();
@@ -2678,6 +2683,8 @@ impl ServerManager {
     fn install_call_guards(&self, name: &str, config: &ServerConfig, fresh: bool) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
+        self.settings
+            .insert(name.to_string(), Arc::new(config.clone()));
         let new_semaphore = || Arc::new(tokio::sync::Semaphore::new(config.max_concurrent));
         let new_breaker = || Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default()));
         if fresh {
@@ -2700,6 +2707,53 @@ impl ServerManager {
             self.circuit_breakers
                 .insert(name.to_string(), new_breaker());
         }
+    }
+
+    /// Apply to running `name` the settings that need no restart: its call
+    /// limit, its circuit breaker, and how its tools are named. Calls already
+    /// holding a slot finish under the old limit.
+    pub(crate) fn apply_live_settings(&self, name: &str, config: &ServerConfig) {
+        let previous = self.settings(name);
+        if previous
+            .as_ref()
+            .is_none_or(|previous| previous.max_concurrent != config.max_concurrent)
+        {
+            self.semaphores.insert(
+                name.to_string(),
+                Arc::new(tokio::sync::Semaphore::new(config.max_concurrent)),
+            );
+        }
+        if !config.circuit_breaker_enabled {
+            self.circuit_breakers.remove(name);
+        } else if !self.circuit_breakers.contains_key(name) {
+            self.circuit_breakers.insert(
+                name.to_string(),
+                Arc::new(CircuitBreaker::new(CircuitBreakerConfig::default())),
+            );
+        }
+        self.settings
+            .insert(name.to_string(), Arc::new(config.clone()));
+    }
+
+    /// The circuit breaker every call to `name` goes through, if it has one.
+    pub(crate) fn circuit_breaker(&self, name: &str) -> Option<Arc<CircuitBreaker>> {
+        self.circuit_breakers
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// The slots that bound how many calls to `name` run at once.
+    pub(crate) fn call_slots(&self, name: &str) -> Option<Arc<tokio::sync::Semaphore>> {
+        self.semaphores
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
+    }
+
+    /// `name`'s current settings, while it runs.
+    pub(crate) fn settings(&self, name: &str) -> Option<Arc<ServerConfig>> {
+        self.settings
+            .get(name)
+            .map(|entry| Arc::clone(entry.value()))
     }
 
     /// Push the router's effective log level to a newly registered upstream so
@@ -2740,6 +2794,7 @@ impl ServerManager {
         // removed server stays in the list.
         self.health.remove(name);
         self.configured_auth.remove(name);
+        self.settings.remove(name);
         if let Some(upstream_arc) = self.remove_upstream(name) {
             self.circuit_breakers.remove(name);
             self.metrics.remove(name);
