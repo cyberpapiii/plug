@@ -272,13 +272,6 @@ pub fn parse_payload_result(
     }
 }
 
-pub fn parse_cancel_result(result: ServerResult) -> Result<CancelTaskResult, serde_json::Error> {
-    match result {
-        ServerResult::CustomResult(result) => result.result_as(),
-        other => serde_json::from_value(serde_json::to_value(other)?),
-    }
-}
-
 pub fn parse_list_result(result: ServerResult) -> Result<ListTasksResult, serde_json::Error> {
     match result {
         ServerResult::CustomResult(result) => result.result_as(),

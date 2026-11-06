@@ -9,7 +9,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
 use crate::legacy_tasks::{
-    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult, Task, TaskStatus,
+    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, Task, TaskStatus,
 };
 use crate::protocol::QuotaLease;
 
@@ -569,11 +569,8 @@ impl TaskStore {
             .collect()
     }
 
-    pub fn list_for_owner(
-        &mut self,
-        owner: &TaskOwner,
-        request: Option<rmcp::model::PaginatedRequestParams>,
-    ) -> ListTasksResult {
+    /// `owner`'s tasks, oldest first.
+    pub fn list_for_owner(&mut self, owner: &TaskOwner) -> Vec<Task> {
         self.prune_expired();
         let mut tasks = self
             .tasks
@@ -582,8 +579,7 @@ impl TaskStore {
             .map(|record| record.task.clone())
             .collect::<Vec<_>>();
         tasks.sort_by(|a, b| a.created_at.cmp(&b.created_at));
-
-        paginate_tasks(tasks, request)
+        tasks
     }
 
     pub fn get_info_for_owner(
@@ -858,25 +854,6 @@ fn task_not_found(task_id: &str) -> McpError {
     )
 }
 
-fn paginate_tasks(
-    tasks: Vec<Task>,
-    request: Option<rmcp::model::PaginatedRequestParams>,
-) -> ListTasksResult {
-    const PAGE_SIZE: usize = 500;
-    let start = request
-        .as_ref()
-        .and_then(|params| params.cursor.as_ref())
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .filter(|idx| *idx < tasks.len())
-        .unwrap_or(0);
-    let end = usize::min(start + PAGE_SIZE, tasks.len());
-    let next_cursor = (end < tasks.len()).then(|| end.to_string());
-
-    let mut result = ListTasksResult::new(tasks[start..end].to_vec());
-    result.next_cursor = next_cursor;
-    result
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1024,10 +1001,10 @@ mod tests {
             .create(owner_b.clone(), "Mock__echo")
             .expect("create task");
 
-        let list_a = store.list_for_owner(&owner_a, None);
-        let list_b = store.list_for_owner(&owner_b, None);
-        assert_eq!(list_a.tasks.len(), 2);
-        assert_eq!(list_b.tasks.len(), 1);
+        let list_a = store.list_for_owner(&owner_a);
+        let list_b = store.list_for_owner(&owner_b);
+        assert_eq!(list_a.len(), 2);
+        assert_eq!(list_b.len(), 1);
     }
 
     #[test]
@@ -1334,7 +1311,7 @@ mod tests {
             )
             .expect_err("passthrough create after teardown must be refused");
         assert_eq!(passthrough_err.code, ErrorCode::INVALID_REQUEST);
-        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+        assert!(store.list_for_owner(&owner).is_empty());
 
         // Tombstone hygiene: once the in-flight enqueue resolves (guard
         // drops), the tombstone is gone and a fresh create for the same
@@ -1343,7 +1320,7 @@ mod tests {
         store
             .create(owner.clone(), "Mock__echo")
             .expect("fresh create after the in-flight enqueue resolved");
-        assert_eq!(store.list_for_owner(&owner, None).tasks.len(), 1);
+        assert_eq!(store.list_for_owner(&owner).len(), 1);
     }
 
     /// The tombstone must survive until the LAST in-flight create resolves —
@@ -1416,7 +1393,7 @@ mod tests {
         store.attach_abort_handle(&task.task_id, handle);
 
         tokio::time::advance(Duration::from_millis(DEFAULT_STALE_IN_FLIGHT_TTL_MS + 1)).await;
-        assert!(store.list_for_owner(&owner, None).tasks.is_empty());
+        assert!(store.list_for_owner(&owner).is_empty());
         tokio::task::yield_now().await;
         assert!(
             dropped.load(std::sync::atomic::Ordering::SeqCst),

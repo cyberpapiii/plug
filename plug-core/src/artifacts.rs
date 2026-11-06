@@ -12,11 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProtocolError;
-use crate::legacy_tasks::GetTaskPayloadResult;
 
-pub const INLINE_RESULT_MAX_BYTES: usize = 512 * 1024;
-pub const ARTIFACT_RESULT_MIN_BYTES: usize = 16 * 1024 * 1024;
-pub const ARTIFACT_STORE_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const INLINE_RESULT_MAX_BYTES: usize = 512 * 1024;
+const ARTIFACT_RESULT_MIN_BYTES: usize = 16 * 1024 * 1024;
+const ARTIFACT_STORE_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const ARTIFACT_RETENTION: Duration = Duration::from_secs(72 * 60 * 60);
 const ARTIFACT_SCHEME_PREFIX: &str = "plug://artifact/";
 const MANIFEST_SUFFIX: &str = "/manifest";
@@ -86,28 +85,20 @@ impl ArtifactStore {
         store
     }
 
-    pub async fn maybe_spill_tool_result(
-        &self,
-        source_tool: &str,
-        result: CallToolResult,
-    ) -> Result<CallToolResult, McpError> {
-        self.maybe_spill_tool_result_with_limit(None, source_tool, result, ARTIFACT_STORE_MAX_BYTES)
-            .await
-    }
-
-    /// [`ArtifactStore::maybe_spill_tool_result`] for a call to the tool
-    /// `source_server` calls `own_tool`, listed as `source_tool`. Both are
-    /// kept with the artifact, so who may read it later does not depend on
-    /// the tool still being listed, or listed under that name.
+    /// Keep a result too large to send, and answer with a link to it. The
+    /// result came from the tool listed as `source_tool`; `source` is its
+    /// server and that server's own name for it, when known. Both are kept
+    /// with the artifact, so who may read it later does not depend on the
+    /// tool still being listed, or listed under that name. A result kept
+    /// with no server is withheld from a client with a block.
     pub async fn maybe_spill_result_of(
         &self,
-        source_server: &str,
-        own_tool: &str,
+        source: Option<(&str, &str)>,
         source_tool: &str,
         result: CallToolResult,
     ) -> Result<CallToolResult, McpError> {
         self.maybe_spill_tool_result_with_limit(
-            Some((source_server, own_tool)),
+            source,
             source_tool,
             result,
             ARTIFACT_STORE_MAX_BYTES,
@@ -272,38 +263,6 @@ impl ArtifactStore {
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(text, uri).with_mime_type("application/json"),
         ]))
-    }
-
-    /// Keep a task's result when it is too large to send. It is kept with
-    /// the tool the task ran, when the task still says which; one that does
-    /// not is kept with no tool, and is withheld from a client with a block.
-    pub async fn maybe_spill_task_payload(
-        &self,
-        source: Option<&crate::tasks::TaskSource>,
-        task_id: &str,
-        payload: Value,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        match serde_json::from_value::<CallToolResult>(payload.clone()) {
-            Ok(result) => {
-                let unknown = format!("task_result:{task_id}");
-                let listed = source.map_or(unknown.as_str(), |source| source.listed.as_str());
-                let behind = source
-                    .and_then(|source| source.behind.as_ref())
-                    .map(|(server, own_tool)| (server.as_str(), own_tool.as_str()));
-                let spilled = self
-                    .maybe_spill_tool_result_with_limit(
-                        behind,
-                        listed,
-                        result,
-                        ARTIFACT_STORE_MAX_BYTES,
-                    )
-                    .await?;
-                let value = serde_json::to_value(spilled)
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(GetTaskPayloadResult::new(value))
-            }
-            Err(_) => Ok(GetTaskPayloadResult::new(payload)),
-        }
     }
 
     pub fn prune(&self) {
@@ -1029,7 +988,7 @@ mod tests {
             "R".repeat(ARTIFACT_RESULT_MIN_BYTES + 1),
         )]);
         let spilled = store
-            .maybe_spill_tool_result("rehydrate_tool", result)
+            .maybe_spill_result_of(None, "rehydrate_tool", result)
             .await
             .expect("spill result");
         let uri = spilled
@@ -1049,17 +1008,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_tasks_large_result_is_kept_with_the_tool_the_task_ran() {
-        let base_dir = temp_dir("task-source");
+    async fn a_large_result_is_kept_with_the_tool_it_came_from() {
+        let base_dir = temp_dir("result-source");
         let store = test_store(base_dir.clone());
         let large = || {
-            serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+            CallToolResult::success(vec![ContentBlock::text(
                 "T".repeat(ARTIFACT_RESULT_MIN_BYTES + 1),
-            )]))
-            .unwrap()
+            )])
         };
-        let kept = |payload: GetTaskPayloadResult| {
-            let result: CallToolResult = serde_json::from_value(payload.0).unwrap();
+        let kept = |result: CallToolResult| {
             let uri = &result
                 .content
                 .iter()
@@ -1069,30 +1026,24 @@ mod tests {
             store.source(uri).expect("a kept artifact")
         };
 
-        let source = crate::tasks::TaskSource {
-            listed: "git__commit".to_string(),
-            behind: Some(("git".to_string(), "commit".to_string())),
-        };
-        let payload = store
-            .maybe_spill_task_payload(Some(&source), "task_1", large())
+        let spilled = store
+            .maybe_spill_result_of(Some(("git", "commit")), "git__commit", large())
             .await
             .unwrap();
         assert_eq!(
-            kept(payload),
+            kept(spilled),
             (
                 Some("git".to_string()),
                 Some("commit".to_string()),
                 "git__commit".to_string()
             )
         );
-        // A task that is gone says nothing, and its result is kept with no
-        // tool: a client with a block does not get it.
-        let payload = store
-            .maybe_spill_task_payload(None, "task_2", large())
+        let spilled = store
+            .maybe_spill_result_of(None, "task_result:task_2", large())
             .await
             .unwrap();
         assert_eq!(
-            kept(payload),
+            kept(spilled),
             (None, None, "task_result:task_2".to_string())
         );
 
@@ -1145,7 +1096,7 @@ mod tests {
         let result = CallToolResult::success(vec![ContentBlock::text(text)]);
 
         let spilled = store
-            .maybe_spill_tool_result("Mock__attachment_get_data", result)
+            .maybe_spill_result_of(None, "Mock__attachment_get_data", result)
             .await
             .expect("spill result");
 

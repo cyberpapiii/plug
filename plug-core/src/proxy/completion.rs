@@ -209,16 +209,12 @@ impl super::ToolRouter {
                 })
             })?;
 
-        let mut result =
-            upstream
-                .client
-                .peer()
-                .complete(params)
-                .await
-                .map_err(|error| match error {
-                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                    other => McpError::internal_error(other.to_string(), None),
-                })?;
+        let mut result = upstream
+            .client
+            .peer()
+            .complete(params)
+            .await
+            .map_err(map_service_error)?;
         admit_catalog_meta(&mut result.meta, "completion-result");
         Ok(result)
     }

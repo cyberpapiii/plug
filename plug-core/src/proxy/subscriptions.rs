@@ -231,13 +231,6 @@ pub(super) fn as_upstream_ops(
     upstream
 }
 
-fn map_service_error(error: rmcp::service::ServiceError) -> McpError {
-    match error {
-        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-        other => McpError::internal_error(other.to_string(), None),
-    }
-}
-
 fn make_unsubscribe_params(uri: &str) -> UnsubscribeRequestParams {
     serde_json::from_value::<UnsubscribeRequestParams>(serde_json::json!({ "uri": uri }))
         .expect("UnsubscribeRequestParams from known-good JSON")

@@ -1355,53 +1355,53 @@ fn detect_tool_definition_drift_reports_changed_tools_only() {
     );
 }
 
-// -----------------------------------------------------------------------
-// Session error classification tests
-// -----------------------------------------------------------------------
-
 #[test]
-fn is_session_error_transport_closed() {
+fn only_a_lost_connection_is_a_lost_session_and_only_a_refused_one_proves_the_call_never_arrived() {
     use rmcp::service::ServiceError;
-    assert!(is_session_error(&ServiceError::TransportClosed));
-}
-
-#[test]
-fn a_closed_connection_does_not_prove_the_call_never_arrived() {
-    use rmcp::service::ServiceError;
-    // The server may have taken the call before the connection closed, so
-    // this alone never licenses sending a tool call a second time.
-    assert!(!never_reached_server(&ServiceError::TransportClosed));
-}
-
-#[test]
-fn is_session_error_mcp_error_not_session() {
-    use rmcp::service::ServiceError;
-    // Application-level MCP error should NOT trigger reconnect
-    let mcp_err = McpError::internal_error("tool failed".to_string(), None);
-    assert!(!is_session_error(&ServiceError::McpError(mcp_err)));
-}
-
-#[test]
-fn is_session_error_timeout_not_session() {
-    use rmcp::service::ServiceError;
-    // Timeouts should NOT trigger reconnect
-    assert!(!is_session_error(&ServiceError::Timeout {
-        timeout: Duration::from_secs(30),
-    }));
-}
-
-#[test]
-fn is_session_error_cancelled_not_session() {
-    use rmcp::service::ServiceError;
-    assert!(!is_session_error(&ServiceError::Cancelled {
-        reason: Some("test".to_string()),
-    }));
-}
-
-#[test]
-fn is_session_error_unexpected_response_not_session() {
-    use rmcp::service::ServiceError;
-    assert!(!is_session_error(&ServiceError::UnexpectedResponse));
+    let send_failure = |message: &str| {
+        ServiceError::TransportSend(rmcp::transport::DynamicTransportError::from_parts(
+            "test",
+            std::any::TypeId::of::<()>(),
+            message.to_string().into(),
+        ))
+    };
+    let cases = [
+        (
+            send_failure("HTTP 404: Session not found"),
+            Some(LostSession::NeverArrived),
+        ),
+        (
+            send_failure("Connection refused (os error 61)"),
+            Some(LostSession::NeverArrived),
+        ),
+        (
+            send_failure("connection reset by peer"),
+            Some(LostSession::MayHaveArrived),
+        ),
+        (
+            send_failure("Broken pipe"),
+            Some(LostSession::MayHaveArrived),
+        ),
+        (
+            ServiceError::TransportClosed,
+            Some(LostSession::MayHaveArrived),
+        ),
+        (send_failure("invalid header value"), None),
+        (
+            ServiceError::McpError(McpError::internal_error("tool failed", None)),
+            None,
+        ),
+        (
+            ServiceError::Timeout {
+                timeout: Duration::from_secs(30),
+            },
+            None,
+        ),
+        (ServiceError::UnexpectedResponse, None),
+    ];
+    for (error, expected) in cases {
+        assert_eq!(LostSession::of(&error), expected, "{error}");
+    }
 }
 
 #[test]
