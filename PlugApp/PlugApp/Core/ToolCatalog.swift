@@ -66,15 +66,6 @@ extension ToolFacts {
     }
 }
 
-/// Tools of one server, kept together because that is how people look for them.
-struct ToolGroup: Identifiable, Equatable, Sendable {
-    var id: String { server }
-    let server: String
-    let tools: [ToolFacts]
-
-    var onCount: Int { tools.filter(\.isOn).count }
-}
-
 /// The full tool list, grouped and searchable.
 struct ToolCatalog: Equatable, Sendable {
     let tools: [ToolFacts]
@@ -107,22 +98,6 @@ struct ToolCatalog: Equatable, Sendable {
         .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }
 
-    var onCount: Int { tools.filter(\.isOn).count }
-    var offCount: Int { tools.count - onCount }
-
-    /// Groups matching a query, servers alphabetical, tools alphabetical.
-    ///
-    /// A query matches a tool's name or its description, and also matches every
-    /// tool of a server whose name matches — searching "figma" should show what
-    /// Figma can do, not nothing.
-    func groups(matching query: String = "") -> [ToolGroup] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let matched = needle.isEmpty ? tools : tools.filter { $0.matches(needle) }
-        return Dictionary(grouping: matched, by: \.server)
-            .map { server, tools in ToolGroup(server: server, tools: tools.sorted(by: ToolFacts.inNameOrder)) }
-            .sorted { $0.server.localizedStandardCompare($1.server) == .orderedAscending }
-    }
-
     /// Every tool a wildcard holds off. A pattern is the only way a tool can be
     /// off without being named, so the panel that explains one has to be able
     /// to list what else it took.
@@ -132,8 +107,10 @@ struct ToolCatalog: Equatable, Sendable {
 
     func tools(for server: String) -> [ToolFacts] { byServer[server] ?? [] }
 
-    /// One server's tools that match a query, by the same rule as `groups`:
-    /// a query naming the server keeps all of its tools.
+    /// One server's tools that match a query, alphabetical. A query matches a
+    /// tool's name or its description, and a query naming the server keeps
+    /// all of its tools: searching "figma" should show what Figma can do, not
+    /// nothing.
     func tools(for server: String, matching query: String) -> [ToolFacts] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let own = tools(for: server)

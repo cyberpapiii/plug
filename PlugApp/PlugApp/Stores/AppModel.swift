@@ -518,7 +518,7 @@ final class AppModel {
         // A read that says nothing new is not published: every view that
         // shows a server, a client or Plug's status would be drawn again,
         // every poll, for a clock that ticked.
-        let steady = value.steadied()
+        let steady = value.steadied(startup: ServerHealth.notLoadedAfterSecs)
         if steady != snapshot {
             snapshotRevision += 1
             snapshot = steady

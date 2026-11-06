@@ -29,7 +29,6 @@ func makeTestInstallation(
         bundleURL: bundle,
         executableURL: bundle.appending(path: "Contents/Resources/plug"),
         appVersion: version,
-        buildVersion: build,
-        embeddedVersion: version
+        buildVersion: build
     )
 }

@@ -43,21 +43,15 @@ final class ToolCatalogTests: XCTestCase {
         )
     }
 
-    func testGroupsAreServerAlphabeticalAndToolAlphabetical() {
-        let groups = catalog.groups()
-        XCTAssertEqual(groups.map(\.server), ["figma", "notion"])
-        XCTAssertEqual(groups[0].tools.map(\.shortName), ["export_frame", "get_file"])
-    }
-
-    func testSearchingForAServerShowsEverythingThatServerCanDo() {
-        let groups = catalog.groups(matching: "figma")
-        XCTAssertEqual(groups.count, 1)
-        XCTAssertEqual(groups[0].tools.count, 2)
+    func testAServersToolsAreAlphabetical() {
+        XCTAssertEqual(catalog.tools(for: "figma").map(\.shortName), ["export_frame", "get_file"])
     }
 
     func testSearchingMatchesDescriptionsNotJustNames() {
-        let groups = catalog.groups(matching: "export an image")
-        XCTAssertEqual(groups.flatMap(\.tools).map(\.name), ["figma__export_frame"])
+        XCTAssertEqual(
+            catalog.tools(for: "figma", matching: "export an image").map(\.name),
+            ["figma__export_frame"]
+        )
     }
 
     func testSearchNarrowsOneServersToolsButNamingTheServerKeepsAll() {
@@ -76,17 +70,8 @@ final class ToolCatalogTests: XCTestCase {
     }
 
     func testSearchIgnoresSurroundingSpaceAndCase() {
-        XCTAssertEqual(catalog.groups(matching: "  NOTION "), catalog.groups(matching: "notion"))
-    }
-
-    func testCountsSeparateOnFromOff() {
-        XCTAssertEqual(catalog.onCount, 2)
-        XCTAssertEqual(catalog.offCount, 2)
-    }
-
-    func testAGroupCountsWhatIsStillOn() {
-        let notion = catalog.groups(matching: "notion")[0]
-        XCTAssertEqual(notion.onCount, 0)
+        XCTAssertEqual(catalog.servers(withToolsMatching: "  EXPORT "), ["figma"])
+        XCTAssertEqual(catalog.tools(for: "figma", matching: "  EXPORT ").map(\.shortName), ["export_frame"])
     }
 
     func testAToolCoveredByAWildcardNamesIt() {

@@ -86,8 +86,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
             bundleURL: bundleURL,
             executableURL: executableURL,
             appVersion: appVersion,
-            buildVersion: buildVersion,
-            embeddedVersion: embeddedVersion
+            buildVersion: buildVersion
         )
     }
 

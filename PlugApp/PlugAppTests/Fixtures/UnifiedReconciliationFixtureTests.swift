@@ -480,8 +480,7 @@ private struct SignedReconciliationFixture {
             bundleURL: bundleURL,
             executableURL: executableURL,
             appVersion: appVersion,
-            buildVersion: appBuild,
-            embeddedVersion: appVersion
+            buildVersion: appBuild
         )
         formulaURL = rootURL.appending(path: "homebrew/opt/plug/bin/plug")
         brewURL = rootURL.appending(path: "homebrew/bin/brew")

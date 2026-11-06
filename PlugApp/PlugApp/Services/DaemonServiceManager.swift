@@ -159,12 +159,6 @@ final class DaemonServiceManager {
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake {
         let expectedVersion = canonical.appVersion
-        guard canonical.embeddedVersion == expectedVersion else {
-            throw DaemonServiceError.invalidAppVersion(
-                expected: expectedVersion,
-                actual: canonical.embeddedVersion
-            )
-        }
         if case let .appManagedCurrent(record) = inspected.ownership,
            let handshake = try? await backend.handshake(),
            canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
@@ -424,12 +418,10 @@ final class DaemonServiceManager {
 
     private func verifiedApp(expectedVersion: String) async throws -> VerifiedAppInstallation {
         let canonical = try await appInspector.inspectCurrentApp()
-        guard canonical.appVersion == expectedVersion,
-              canonical.embeddedVersion == expectedVersion
-        else {
+        guard canonical.appVersion == expectedVersion else {
             throw DaemonServiceError.invalidAppVersion(
                 expected: expectedVersion,
-                actual: canonical.embeddedVersion
+                actual: canonical.appVersion
             )
         }
         return canonical

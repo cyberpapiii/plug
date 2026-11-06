@@ -199,12 +199,10 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(local.clientKey, "claude-code")
         XCTAssertEqual(local.accessKey, "claude-code")
         XCTAssertEqual(local.target, "claude-code")
-        XCTAssertEqual(local.connectedSecs, 3_700)
         let remote = snapshot.liveSessions[1]
         XCTAssertEqual(remote.transport, "http")
         XCTAssertEqual(remote.clientKey, "oauth:abc")
         XCTAssertNil(remote.target)
-        XCTAssertNil(remote.lastActivitySecs)
 
         XCTAssertEqual(snapshot.upstreamAuth.first?.tokenExpiresInSecs, 7_300)
         XCTAssertEqual(snapshot.upstreamAuth.first?.warnings, ["token expires soon"])

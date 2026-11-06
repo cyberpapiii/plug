@@ -116,8 +116,6 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     /// The client Plug takes this one for, by its link target: the one its
     /// link names, else the one its reported name is.
     public let target: String?
-    public var connectedSecs: UInt64
-    public var lastActivitySecs: UInt64?
 }
 
 public struct ClientHost: Codable, Equatable, Sendable {
@@ -365,14 +363,13 @@ public extension OperatorSnapshot {
     /// apart are equal unless something happened. Every count of seconds in
     /// it ticks on its own, and a reader that redraws on any difference
     /// would redraw on every read.
-    func steadied() -> OperatorSnapshot {
+    ///
+    /// A reader asks one thing of the daemon's first `startup` seconds:
+    /// whether they are over. So the uptime reads 0 until then and more
+    /// than `startup` after, rounded to the minute.
+    func steadied(startup: UInt64) -> OperatorSnapshot {
         var steady = self
-        // A reader asks one thing of the first minute: whether it is over.
-        steady.uptimeSecs = uptimeSecs > 60 ? max(61, uptimeSecs / 60 * 60) : 0
-        for index in steady.liveSessions.indices {
-            steady.liveSessions[index].connectedSecs = liveSessions[index].connectedSecs / 60 * 60
-            steady.liveSessions[index].lastActivitySecs = liveSessions[index].lastActivitySecs.map { $0 / 60 * 60 }
-        }
+        steady.uptimeSecs = uptimeSecs > startup ? max(startup + 1, uptimeSecs / 60 * 60) : 0
         for index in steady.upstreamAuth.indices {
             steady.upstreamAuth[index].tokenExpiresInSecs = upstreamAuth[index].tokenExpiresInSecs.map {
                 $0 >= 3_600 ? $0 / 3_600 * 3_600 : $0 / 60 * 60

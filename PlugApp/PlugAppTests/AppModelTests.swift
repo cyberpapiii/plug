@@ -976,8 +976,7 @@ final class AppModelTests: XCTestCase {
             bundleURL: executable.deletingLastPathComponent().deletingLastPathComponent(),
             executableURL: executable,
             appVersion: currentTestAppVersion,
-            buildVersion: "12",
-            embeddedVersion: currentTestAppVersion
+            buildVersion: "12"
         )
         let record = LaunchdJobRecord(
             label: "com.plug.daemon",
