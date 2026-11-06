@@ -141,7 +141,7 @@ fn ago(timestamp: Option<u64>) -> String {
     match timestamp {
         Some(at) => format!(
             "{} ago",
-            format_duration(plug_core::slack_events::now().saturating_sub(at))
+            format_duration(plug_core::events::now().saturating_sub(at))
         ),
         None => "never".to_string(),
     }
@@ -244,7 +244,7 @@ mod tests {
         });
         assert_eq!(health_line(&status), "Waiting for the first check.");
         status.state = WatchHealth::Watching;
-        status.last_checked = Some(plug_core::slack_events::now());
+        status.last_checked = Some(plug_core::events::now());
         assert!(health_line(&status).ends_with("last change never."));
     }
 }
