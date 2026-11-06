@@ -183,6 +183,33 @@ fn a_listed_tool_gives_its_own_name_and_says_when_it_is_not_read_only() {
 }
 
 #[test]
+fn a_lost_call_is_sent_again_only_on_the_servers_word() {
+    use rmcp::model::ToolAnnotations;
+    let resend = |declared: Option<ToolAnnotations>, inferred: Option<ToolAnnotations>| {
+        let mut snapshot = (**router_with_git_commit_tool().cache.load()).clone();
+        snapshot.tool_risk_inventory.insert(
+            "git__commit".to_string(),
+            ToolRisk {
+                upstream_declared: declared,
+                plug_inferred: inferred.clone(),
+                effective: inferred,
+            },
+        );
+        snapshot.may_resend("git__commit")
+    };
+    let mut read_only = ToolAnnotations::default();
+    read_only.read_only_hint = Some(true);
+    let mut idempotent = ToolAnnotations::default();
+    idempotent.idempotent_hint = Some(true);
+    assert!(resend(Some(read_only.clone()), None));
+    assert!(resend(Some(idempotent.clone()), None));
+    assert!(!resend(Some(ToolAnnotations::default()), None));
+    // Plug's guess from the tool's name is not the server's word.
+    assert!(!resend(None, Some(read_only)));
+    assert!(!resend(None, Some(idempotent)));
+}
+
+#[test]
 fn a_watch_takes_the_servers_word_over_the_tools_name() {
     use rmcp::model::ToolAnnotations;
     let hint = |read_only| {
