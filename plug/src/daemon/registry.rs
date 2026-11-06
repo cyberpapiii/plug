@@ -6,14 +6,10 @@ use dashmap::DashMap;
 use rmcp::model::ClientCapabilities;
 
 /// Tracks proxy client sessions connected to the daemon.
-///
-/// Uses a `watch` channel to broadcast client count changes for the grace
-/// period shutdown logic (avoids missed-wakeup races that `Notify` has).
 pub struct ClientRegistry {
     sessions: DashMap<String, ClientSession>,
-    pub(super) client_sessions: DashMap<String, String>,
-    /// Sends current client count on every change.
-    count_tx: tokio::sync::watch::Sender<usize>,
+    /// The one live session of each client id.
+    client_sessions: DashMap<String, String>,
 }
 
 /// Metadata for a connected proxy client.
@@ -52,16 +48,11 @@ pub(super) struct RegistrationResult {
 }
 
 impl ClientRegistry {
-    pub(super) fn new() -> (Self, tokio::sync::watch::Receiver<usize>) {
-        let (count_tx, count_rx) = tokio::sync::watch::channel(0usize);
-        (
-            Self {
-                sessions: DashMap::new(),
-                client_sessions: DashMap::new(),
-                count_tx,
-            },
-            count_rx,
-        )
+    pub(super) fn new() -> Self {
+        Self {
+            sessions: DashMap::new(),
+            client_sessions: DashMap::new(),
+        }
     }
 
     /// Register a live local client, returning the assigned session ID.
@@ -110,7 +101,6 @@ impl ClientRegistry {
                 cancellation_capability: cancellation_capability.clone(),
             },
         );
-        self.count_tx.send_modify(|c| *c = self.sessions.len());
         RegistrationResult {
             session_id,
             replaced_session_id,
@@ -128,25 +118,25 @@ impl ClientRegistry {
         self.register_hosted(client_id, client_info, adapter_version, None)
     }
 
-    /// Deregister a client session.
-    pub(super) fn deregister(&self, session_id: &str) {
-        if let Some((_, session)) = self.sessions.remove(session_id) {
-            if self
-                .client_sessions
-                .get(&session.client_id)
-                .is_some_and(|entry| entry.value() == session_id)
-            {
-                self.client_sessions.remove(&session.client_id);
-            }
-            let duration = session.connected_at.elapsed();
-            tracing::info!(
-                client_id = %session.client_id,
-                session_id = %session_id,
-                duration_secs = duration.as_secs(),
-                "client deregistered"
-            );
-            self.count_tx.send_modify(|c| *c = self.sessions.len());
-        }
+    /// Deregister a client session. Returns its client id when no session
+    /// holds that id any more.
+    pub(super) fn deregister(&self, session_id: &str) -> Option<String> {
+        let (_, session) = self.sessions.remove(session_id)?;
+        let duration = session.connected_at.elapsed();
+        tracing::info!(
+            client_id = %session.client_id,
+            session_id = %session_id,
+            duration_secs = duration.as_secs(),
+            "client deregistered"
+        );
+        self.client_sessions
+            .remove_if(&session.client_id, |_, live| live == session_id)
+            .map(|(client_id, _)| client_id)
+    }
+
+    /// Whether a session holds `client_id`.
+    pub(super) fn has_client(&self, client_id: &str) -> bool {
+        self.client_sessions.contains_key(client_id)
     }
 
     /// Record the target the connector says it was linked as. One that is
@@ -229,10 +219,9 @@ impl ClientRegistry {
         self.sessions.contains_key(session_id)
     }
 
-    /// Snapshot all live sessions in the newer transport-aware shape.
+    /// Every live session, in no particular order.
     pub(super) fn list_live_sessions(&self) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
-        let mut sessions = self
-            .sessions
+        self.sessions
             .iter()
             .map(|entry| plug_core::ipc::IpcLiveSessionInfo {
                 transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
@@ -249,13 +238,7 @@ impl ClientRegistry {
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })
-            .collect::<Vec<_>>();
-        sessions.sort_by(|a, b| {
-            a.client_info
-                .cmp(&b.client_info)
-                .then(a.session_id.cmp(&b.session_id))
-        });
-        sessions
+            .collect()
     }
 }
 
@@ -265,7 +248,7 @@ mod tests {
 
     #[test]
     fn registration_does_not_reject_live_desktop_connections_at_an_arbitrary_count() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         for i in 0..256 {
             registry.register_hosted(
@@ -281,7 +264,7 @@ mod tests {
 
     #[test]
     fn register_replaces_existing_session_for_same_client_id() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         let first = registry.register_hosted(
             "client-123".to_string(),
@@ -312,7 +295,7 @@ mod tests {
 
     #[test]
     fn deregistering_replaced_session_does_not_remove_active_replacement() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         let first = registry.register_hosted(
             "client-123".to_string(),
@@ -335,7 +318,7 @@ mod tests {
 
     #[test]
     fn registration_keeps_the_host_program_in_live_inventory() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let host = plug_core::downstream_identity::ClientHost {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
@@ -355,7 +338,7 @@ mod tests {
 
     #[test]
     fn registration_preserves_adapter_version_in_live_inventory() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
 
         registry.register_hosted(
             "client-123".to_string(),
@@ -371,7 +354,7 @@ mod tests {
     }
     #[test]
     fn a_session_is_keyed_by_how_it_was_linked_before_what_it_reports() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let session = registry
             .register(
                 "client".to_string(),

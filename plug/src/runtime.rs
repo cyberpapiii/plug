@@ -12,9 +12,9 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::{Json, Router};
+use plug_core::http::server::ClientRevocation;
 use tokio_util::sync::CancellationToken;
 
-const OPERATOR_LIVE_SESSIONS_PATH: &str = "/_plug/live-sessions";
 const OPERATOR_OAUTH_CLIENTS_PATH: &str = "/_plug/oauth/clients";
 const OPERATOR_OWNER_BOOTSTRAP_PATH: &str = "/_plug/oauth/owner/bootstrap";
 const OPERATOR_OWNER_CREDENTIALS_PATH: &str = "/_plug/oauth/owner/credentials";
@@ -152,29 +152,6 @@ pub(crate) fn live_inventory_metadata(
     }
 }
 
-enum LiveSessionSourceState {
-    Available(Vec<plug_core::ipc::IpcLiveSessionInfo>),
-    Unavailable,
-}
-
-impl LiveSessionSourceState {
-    fn available(&self) -> bool {
-        matches!(self, Self::Available(_))
-    }
-
-    fn into_sessions(self) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
-        match self {
-            Self::Available(sessions) => sessions,
-            Self::Unavailable => Vec::new(),
-        }
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-struct OperatorLiveSessionsResponse {
-    sessions: Vec<plug_core::ipc::IpcLiveSessionInfo>,
-}
-
 struct OperatorHttpState {
     http_state: Arc<plug_core::http::server::HttpState>,
     operator_token: Arc<str>,
@@ -208,46 +185,6 @@ struct OperatorProofResponse {
 #[derive(serde::Serialize)]
 struct OwnerBootstrapResponse {
     enrollment_url: String,
-}
-
-async fn operator_live_sessions(
-    State(state): State<Arc<OperatorHttpState>>,
-    headers: HeaderMap,
-) -> Result<Json<OperatorLiveSessionsResponse>, StatusCode> {
-    operator_proof_authorized(&state, &headers, "GET", OPERATOR_LIVE_SESSIONS_PATH, false).await?;
-
-    let sessions = state
-        .http_state
-        .sessions
-        .session_snapshots()
-        .into_iter()
-        .map(|snapshot| plug_core::ipc::IpcLiveSessionInfo {
-            transport: match snapshot.transport {
-                plug_core::session::DownstreamTransport::Http => {
-                    plug_core::ipc::LiveSessionTransport::Http
-                }
-            },
-            client_id: None,
-            link_target: None,
-            session_id: snapshot.session_id,
-            client_type: snapshot.client_type,
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            client_key: plug_core::downstream_identity::remote_client_key(
-                snapshot.grant.as_deref(),
-                snapshot.client_type,
-            ),
-            access_key: Some(plug_core::downstream_identity::remote_access_key(
-                snapshot.grant.as_deref(),
-            )),
-            grant: snapshot.grant,
-            connected_secs: snapshot.connected_seconds,
-            last_activity_secs: Some(snapshot.idle_seconds),
-        })
-        .collect();
-
-    Ok(Json(OperatorLiveSessionsResponse { sessions }))
 }
 
 fn operator_hmac(token: &str, domain: &[u8], fields: &[&str]) -> String {
@@ -308,8 +245,7 @@ fn operator_request_proof(
 
 fn operator_intent_allowed(method: &str, path: &str) -> bool {
     match (method, path) {
-        ("GET", OPERATOR_LIVE_SESSIONS_PATH)
-        | ("GET", OPERATOR_OAUTH_CLIENTS_PATH)
+        ("GET", OPERATOR_OAUTH_CLIENTS_PATH)
         | ("POST", OPERATOR_OWNER_BOOTSTRAP_PATH)
         | ("GET", OPERATOR_OWNER_CREDENTIALS_PATH) => true,
         ("DELETE", path) => [OPERATOR_OAUTH_CLIENTS_PATH, OPERATOR_OWNER_CREDENTIALS_PATH]
@@ -559,37 +495,10 @@ async fn operator_revoke_oauth_client(
     if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", &path, false).await {
         return status;
     }
-    let Some(manager) = state.http_state.downstream_oauth.as_ref() else {
-        return StatusCode::NOT_FOUND;
-    };
-    match manager.revoke_client(&client_id).await {
-        Ok(true) => {
-            state.http_state.sessions.end_sessions_of(&client_id);
-            // Revocation is the durable-owner lifecycle boundary. The OAuth
-            // manager rejects future token use before this point; task cleanup
-            // then uses TaskStore's create guard/tombstone ledger so an
-            // in-flight create cannot survive the revocation.
-            let resource = manager.resource();
-            let owner = plug_core::downstream_identity::HttpCredential::Grant {
-                issuer: manager.base_url(),
-                client_id: &client_id,
-                resource: &resource,
-            }
-            .task_owner(None);
-            state
-                .http_state
-                .router
-                .cleanup_tasks_for_owner(&owner)
-                .await;
-            StatusCode::NO_CONTENT
-        }
-        Ok(false) => StatusCode::NOT_FOUND,
-        Err(_) => {
-            // The grant stopped working before the save was tried, so its
-            // sessions end even though the save failed.
-            state.http_state.sessions.end_sessions_of(&client_id);
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+    match state.http_state.revoke_downstream_client(&client_id).await {
+        ClientRevocation::Revoked => StatusCode::NO_CONTENT,
+        ClientRevocation::UnknownClient | ClientRevocation::OauthDisabled => StatusCode::NOT_FOUND,
+        ClientRevocation::SaveFailed(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 
@@ -605,7 +514,6 @@ fn build_runtime_router(
         proofs: tokio::sync::Mutex::new(std::collections::HashMap::new()),
     });
     let operator_router = Router::new()
-        .route(OPERATOR_LIVE_SESSIONS_PATH, get(operator_live_sessions))
         .route(OPERATOR_PROOF_PATH, post(operator_proof))
         .route(OPERATOR_OAUTH_CLIENTS_PATH, get(operator_oauth_clients))
         .route(
@@ -724,8 +632,7 @@ pub(crate) async fn send_authenticated_operator_request(
 
 struct ConfiguredHttpRuntime {
     router: Router,
-    sessions: Arc<dyn plug_core::session::SessionStore>,
-    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
+    state: Arc<plug_core::http::server::HttpState>,
 }
 
 fn public_host_allowance(public_base_url: &str) -> Option<Arc<str>> {
@@ -741,15 +648,10 @@ fn build_configured_http_runtime(
     config: &plug_core::config::Config,
     engine: &Arc<plug_core::engine::Engine>,
 ) -> anyhow::Result<ConfiguredHttpRuntime> {
-    let (expiry_tx, mut expiry_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-    let sessions: Arc<dyn plug_core::session::SessionStore> = Arc::new(
-        plug_core::session::StatefulSessionStore::new(
-            config.http.session_timeout_secs,
-            config.http.max_sessions,
-        )
-        .with_expiry_notifier(expiry_tx),
-    );
-    sessions.spawn_cleanup_task(engine.cancel_token().clone());
+    let sessions = Arc::new(plug_core::session::SessionStore::new(
+        config.http.session_timeout_secs,
+        config.http.max_sessions,
+    ));
     let tool_router = engine.tool_router().clone();
     let auth_token = resolve_downstream_bearer_token(&config.http)?;
     let operator_token = Arc::<str>::from(plug_core::auth::load_or_generate_token(
@@ -817,7 +719,7 @@ fn build_configured_http_runtime(
     let http_state = Arc::new(
         plug_core::http::server::HttpState::new(
             tool_router.clone(),
-            Arc::clone(&sessions),
+            sessions,
             engine.cancel_token().clone(),
         )
         .with_auth_mode(config.http.auth_mode.clone())
@@ -843,172 +745,42 @@ fn build_configured_http_runtime(
         ),
     );
 
-    let http_state_for_expiry = Arc::clone(&http_state);
-    tokio::spawn(async move {
-        while let Some(session_id) = expiry_rx.recv().await {
-            http_state_for_expiry.teardown_session(&session_id).await;
-        }
-    });
-
     Ok(ConfiguredHttpRuntime {
         router: build_runtime_router(
-            http_state,
+            Arc::clone(&http_state),
             operator_token,
             Arc::from(local_operator_authority(
                 &config.http.bind_address,
                 config.http.port,
             )),
         ),
-        sessions,
-        downstream_oauth,
+        state: http_state,
     })
 }
 
-fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
-    let scheme = if http.tls_enabled() { "https" } else { "http" };
-    let authority = local_operator_connection_authority(&http.bind_address, http.port);
-    format!("{scheme}://{authority}{OPERATOR_LIVE_SESSIONS_PATH}")
-}
-
-async fn fetch_http_live_sessions(config_path: Option<&PathBuf>) -> LiveSessionSourceState {
-    let config = match plug_core::config::load_config(config_path) {
-        Ok(config) => config,
-        Err(_) => return LiveSessionSourceState::Unavailable,
-    };
-    let token_path = plug_core::auth::http_operator_token_path(config.http.port);
-    fetch_http_live_sessions_from(
-        local_http_inventory_url(&config.http),
-        local_operator_authority(&config.http.bind_address, config.http.port),
-        &token_path,
-    )
-    .await
-}
-
-async fn fetch_http_live_sessions_from(
-    url: String,
-    host_authority: String,
-    token_path: &std::path::Path,
-) -> LiveSessionSourceState {
-    let token = match std::fs::read_to_string(token_path) {
-        Ok(token) => token,
-        Err(_) => return LiveSessionSourceState::Unavailable,
-    };
-    let token = token.trim().to_string();
-    if token.is_empty() {
-        return LiveSessionSourceState::Unavailable;
-    }
-
-    plug_core::tls::ensure_rustls_provider_installed();
-    let client = reqwest::Client::builder()
-        .danger_accept_invalid_certs(true)
-        .timeout(std::time::Duration::from_secs(2))
-        .no_proxy()
-        .redirect(reqwest::redirect::Policy::none())
-        .build();
-    let client = match client {
-        Ok(client) => client,
-        Err(_) => return LiveSessionSourceState::Unavailable,
-    };
-    let endpoint = match reqwest::Url::parse(&url) {
-        Ok(endpoint) => endpoint,
-        Err(_) => return LiveSessionSourceState::Unavailable,
-    };
-    let response = send_authenticated_operator_request(
-        &client,
-        endpoint,
-        &host_authority,
-        &token,
-        reqwest::Method::GET,
-        false,
-    )
-    .await;
-    let response = match response {
-        Ok(response) => response,
-        Err(_) => return LiveSessionSourceState::Unavailable,
-    };
-    if !response.status().is_success() {
-        return LiveSessionSourceState::Unavailable;
-    }
-    match response.json::<OperatorLiveSessionsResponse>().await {
-        Ok(body) => LiveSessionSourceState::Available(body.sessions),
-        Err(_) => LiveSessionSourceState::Unavailable,
-    }
-}
-
-fn merge_live_session_sources(
-    daemon_scope: plug_core::ipc::LiveSessionInventoryScope,
-    daemon_source: LiveSessionSourceState,
-    http_source: LiveSessionSourceState,
-) -> (
-    Vec<plug_core::ipc::IpcLiveSessionInfo>,
-    plug_core::ipc::LiveSessionInventoryScope,
-) {
-    let daemon_available = daemon_source.available();
-    let http_available = http_source.available();
-    let mut daemon_sessions = daemon_source.into_sessions();
-    let mut http_sessions = http_source.into_sessions();
-    let scope = match (daemon_available, http_available) {
-        (true, true) => plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        (true, false) => daemon_scope,
-        (false, true) => plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
-        (false, false) => plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-    };
-
-    daemon_sessions.append(&mut http_sessions);
-    daemon_sessions.sort_by(|a, b| {
-        let transport_order = |transport: plug_core::ipc::LiveSessionTransport| match transport {
-            plug_core::ipc::LiveSessionTransport::DaemonProxy => 0,
-            plug_core::ipc::LiveSessionTransport::Http => 1,
-            plug_core::ipc::LiveSessionTransport::Sse => 2,
-        };
-        transport_order(a.transport)
-            .cmp(&transport_order(b.transport))
-            .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
-            .then(a.session_id.cmp(&b.session_id))
-    });
-
-    (daemon_sessions, scope)
-}
-
+/// Every live downstream session, as the daemon reports them.
 pub(crate) async fn fetch_live_sessions(
-    config_path: Option<&PathBuf>,
+    _config_path: Option<&PathBuf>,
 ) -> (
     Vec<plug_core::ipc::IpcLiveSessionInfo>,
     plug_core::ipc::LiveSessionInventoryScope,
     LiveClientSupport,
 ) {
-    let (daemon_source, daemon_scope, support) =
-        match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListLiveSessions).await {
-            Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => (
-                LiveSessionSourceState::Available(sessions),
-                scope,
-                LiveClientSupport::Supported,
-            ),
-            Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => (
-                LiveSessionSourceState::Unavailable,
-                plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-                LiveClientSupport::DaemonRestartRequired,
-            ),
-            _ => (
-                LiveSessionSourceState::Unavailable,
-                plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-                LiveClientSupport::Supported,
-            ),
-        };
-
-    if matches!(
-        daemon_scope,
-        plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-    ) {
-        let sessions = daemon_source.into_sessions();
-        return (sessions, daemon_scope, support);
+    match daemon::ipc_request(&plug_core::ipc::IpcRequest::ListLiveSessions).await {
+        Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => {
+            (sessions, scope, LiveClientSupport::Supported)
+        }
+        Ok(plug_core::ipc::IpcResponse::Error { code, .. }) if code == "PARSE_ERROR" => (
+            Vec::new(),
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+            LiveClientSupport::DaemonRestartRequired,
+        ),
+        _ => (
+            Vec::new(),
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
+            LiveClientSupport::Supported,
+        ),
     }
-
-    let http_source = fetch_http_live_sessions(config_path).await;
-
-    let (sessions, scope) = merge_live_session_sources(daemon_scope, daemon_source, http_source);
-
-    (sessions, scope, support)
 }
 
 pub(crate) struct DaemonProxySession {
@@ -1673,9 +1445,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     let daemon_future = daemon::run_daemon_with_lock(
         engine.clone(),
         config_path,
-        engine.config().daemon_grace_period_secs,
-        Some(http_runtime.sessions),
-        http_runtime.downstream_oauth,
+        http_runtime.state,
         runtime_lock,
     );
     tokio::pin!(daemon_future);
@@ -1841,7 +1611,6 @@ mod tests {
 
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
-    use plug_core::session::SessionStore;
     use rcgen::generate_simple_self_signed;
     use rustls::pki_types::ServerName;
     use rustls::{ClientConfig, RootCertStore};
@@ -2022,20 +1791,6 @@ mod tests {
     // tests serialize on one lock (see daemon::runtime_paths_test_lock).
     fn runtime_path_test_lock() -> &'static tokio::sync::Mutex<()> {
         crate::daemon::runtime_paths_test_lock()
-    }
-
-    async fn spawn_http_test_server(app: Router) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind test listener");
-        let addr = listener.local_addr().expect("listener addr");
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.expect("serve test router");
-        });
-        (
-            format!("http://{}{}", addr, OPERATOR_LIVE_SESSIONS_PATH),
-            handle,
-        )
     }
 
     async fn spawn_https_test_server(
@@ -2402,9 +2157,7 @@ mod tests {
             plug_core::config::Config::default(),
         ));
         engine.start().await.expect("engine start");
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        sessions.spawn_cleanup_task(engine.cancel_token().clone());
+        let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(plug_core::http::server::HttpState::new(
             engine.tool_router().clone(),
             sessions,
@@ -2576,169 +2329,6 @@ mod tests {
     }
 
     #[test]
-    fn merge_live_session_sources_marks_transport_complete_when_both_sources_exist() {
-        let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
-            transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
-            client_id: Some("daemon".to_string()),
-            session_id: "daemon-1".to_string(),
-            client_type: plug_core::types::ClientType::ClaudeCode,
-            client_info: Some("Claude Code".to_string()),
-            adapter_version: Some("0.6.5".to_string()),
-            host: None,
-            grant: None,
-            link_target: None,
-            client_key: None,
-            access_key: None,
-            connected_secs: 10,
-            last_activity_secs: None,
-        }];
-        let http = vec![plug_core::ipc::IpcLiveSessionInfo {
-            transport: plug_core::ipc::LiveSessionTransport::Http,
-            client_id: None,
-            session_id: "http-1".to_string(),
-            client_type: plug_core::types::ClientType::ClaudeDesktop,
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            grant: None,
-            link_target: None,
-            client_key: None,
-            access_key: None,
-            connected_secs: 5,
-            last_activity_secs: Some(1),
-        }];
-
-        let (sessions, scope) = merge_live_session_sources(
-            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-            LiveSessionSourceState::Available(daemon),
-            LiveSessionSourceState::Available(http),
-        );
-
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-        );
-        assert_eq!(sessions.len(), 2);
-    }
-
-    #[test]
-    fn merge_live_session_sources_marks_transport_complete_when_http_source_is_idle() {
-        let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
-            transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
-            client_id: Some("daemon".to_string()),
-            session_id: "daemon-1".to_string(),
-            client_type: plug_core::types::ClientType::ClaudeCode,
-            client_info: Some("Claude Code".to_string()),
-            adapter_version: Some("0.6.5".to_string()),
-            host: None,
-            grant: None,
-            link_target: None,
-            client_key: None,
-            access_key: None,
-            connected_secs: 10,
-            last_activity_secs: None,
-        }];
-
-        let (sessions, scope) = merge_live_session_sources(
-            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-            LiveSessionSourceState::Available(daemon),
-            LiveSessionSourceState::Available(Vec::new()),
-        );
-
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-        );
-        assert_eq!(sessions.len(), 1);
-    }
-
-    #[test]
-    fn merge_live_session_sources_preserves_daemon_proxy_only_scope_when_http_unavailable() {
-        let daemon = vec![plug_core::ipc::IpcLiveSessionInfo {
-            transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
-            client_id: Some("daemon".to_string()),
-            session_id: "daemon-1".to_string(),
-            client_type: plug_core::types::ClientType::ClaudeCode,
-            client_info: Some("Claude Code".to_string()),
-            adapter_version: Some("0.6.5".to_string()),
-            host: None,
-            grant: None,
-            link_target: None,
-            client_key: None,
-            access_key: None,
-            connected_secs: 10,
-            last_activity_secs: None,
-        }];
-
-        let (sessions, scope) = merge_live_session_sources(
-            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
-            LiveSessionSourceState::Available(daemon),
-            LiveSessionSourceState::Unavailable,
-        );
-
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly
-        );
-        assert_eq!(sessions.len(), 1);
-    }
-
-    #[test]
-    fn merge_live_session_sources_marks_http_only_without_daemon() {
-        let http = vec![plug_core::ipc::IpcLiveSessionInfo {
-            transport: plug_core::ipc::LiveSessionTransport::Http,
-            client_id: None,
-            session_id: "http-1".to_string(),
-            client_type: plug_core::types::ClientType::ClaudeDesktop,
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            grant: None,
-            link_target: None,
-            client_key: None,
-            access_key: None,
-            connected_secs: 5,
-            last_activity_secs: Some(1),
-        }];
-
-        let (sessions, scope) = merge_live_session_sources(
-            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            LiveSessionSourceState::Unavailable,
-            LiveSessionSourceState::Available(http),
-        );
-
-        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
-        assert_eq!(sessions.len(), 1);
-    }
-
-    #[test]
-    fn merge_live_session_sources_marks_http_only_when_http_source_is_idle() {
-        let (sessions, scope) = merge_live_session_sources(
-            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            LiveSessionSourceState::Unavailable,
-            LiveSessionSourceState::Available(Vec::new()),
-        );
-
-        assert_eq!(scope, plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
-        assert!(sessions.is_empty());
-    }
-
-    #[test]
-    fn merge_live_session_sources_marks_unavailable_when_no_sources_exist() {
-        let (sessions, scope) = merge_live_session_sources(
-            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            LiveSessionSourceState::Unavailable,
-            LiveSessionSourceState::Unavailable,
-        );
-
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::Unavailable
-        );
-        assert!(sessions.is_empty());
-    }
-
-    #[test]
     fn live_inventory_availability_marks_missing_sources() {
         let complete = live_inventory_availability(
             plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
@@ -2878,9 +2468,7 @@ mod tests {
         let daemon_engine = Arc::clone(&engine);
         let daemon_config_path = config_path.clone();
         let daemon_handle =
-            tokio::spawn(
-                async move { run_daemon(daemon_engine, daemon_config_path, 0, None).await },
-            );
+            tokio::spawn(async move { run_daemon(daemon_engine, daemon_config_path).await });
 
         tokio::time::sleep(Duration::from_millis(100)).await;
         if daemon_handle.is_finished() {
@@ -2912,97 +2500,12 @@ mod tests {
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
-    #[tokio::test]
-    async fn operator_live_sessions_requires_token() {
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
-        engine.start().await.expect("engine start");
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        let state = Arc::new(plug_core::http::server::HttpState::new(
-            engine.tool_router().clone(),
-            sessions,
-            engine.cancel_token().clone(),
-        ));
-
-        let app = build_runtime_router(
-            state,
-            Arc::from("expected-token"),
-            Arc::from("127.0.0.1:3282"),
-        );
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .uri(OPERATOR_LIVE_SESSIONS_PATH)
-                    .header("host", "127.0.0.1:3282")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        engine.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn operator_live_sessions_returns_http_snapshot_inventory() {
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
-        engine.start().await.expect("engine start");
-        let store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let session_id = store.create_session().expect("session");
-        store
-            .set_client_type(&session_id, plug_core::types::ClientType::ClaudeDesktop)
-            .expect("set client type");
-        let sessions: Arc<dyn plug_core::session::SessionStore> = Arc::new(store);
-        let state = Arc::new(plug_core::http::server::HttpState::new(
-            engine.tool_router().clone(),
-            sessions,
-            engine.cancel_token().clone(),
-        ));
-
-        let app = build_runtime_router(
-            state,
-            Arc::from("expected-token"),
-            Arc::from("127.0.0.1:3282"),
-        );
-        let response = proof_authenticated_request(
-            &app,
-            "GET",
-            OPERATOR_LIVE_SESSIONS_PATH,
-            "expected-token",
-            false,
-        )
-        .await;
-
-        assert_eq!(response.status(), StatusCode::OK);
-        let body = to_bytes(response.into_body(), usize::MAX)
-            .await
-            .expect("body bytes");
-        let parsed: OperatorLiveSessionsResponse =
-            serde_json::from_slice(&body).expect("json body");
-        assert_eq!(parsed.sessions.len(), 1);
-        assert_eq!(
-            parsed.sessions[0].transport,
-            plug_core::ipc::LiveSessionTransport::Http
-        );
-        assert_eq!(
-            parsed.sessions[0].client_type,
-            plug_core::types::ClientType::ClaudeDesktop
-        );
-        engine.shutdown().await;
-    }
-
     async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
         let engine = Arc::new(plug_core::engine::Engine::new(
             plug_core::config::Config::default(),
         ));
         engine.start().await.expect("engine start");
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state_path = unique_temp_dir("owner-operator").join("oauth.json");
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             plug_core::downstream_oauth::DownstreamOauthConfig {
@@ -3386,8 +2889,7 @@ mod tests {
             plug_core::config::Config::default(),
         ));
         engine.start().await.expect("engine start");
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(
             plug_core::http::server::HttpState::new(
                 engine.tool_router().clone(),
@@ -3656,8 +3158,7 @@ mod tests {
         .with_authorization(principal, claims.scopes)
         .with_principal_lifecycle(claims.principal_lifecycle);
 
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
+        let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let http_state = Arc::new(
             plug_core::http::server::HttpState::new(
                 tool_router.clone(),
@@ -3687,121 +3188,6 @@ mod tests {
 
         engine.shutdown().await;
         let _ = std::fs::remove_file(oauth_path);
-    }
-
-    #[tokio::test]
-    async fn expired_http_session_cleans_up_tasks() {
-        let mut config = plug_core::config::Config::default();
-        config.servers.insert(
-            "mock".to_string(),
-            plug_core::test_helpers::mock_server("echo"),
-        );
-        let engine = Arc::new(plug_core::engine::Engine::new(config));
-        engine.start().await.expect("engine start");
-        let tool_router = engine.tool_router().clone();
-
-        let sessions: Arc<dyn plug_core::session::SessionStore> =
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        let http_state = Arc::new(plug_core::http::server::HttpState::new(
-            tool_router.clone(),
-            sessions,
-            engine.cancel_token().clone(),
-        ));
-
-        let session_id = "expiring-session";
-        let owner = plug_core::downstream_identity::http_session_task_owner(session_id);
-
-        // Spot-check a second cleanup also runs, guarding the extraction from
-        // silently dropping one of the other seven teardown steps.
-        tool_router.set_client_log_level(session_id, rmcp::model::LoggingLevel::Debug);
-        assert_eq!(tool_router.log_level(), rmcp::model::LoggingLevel::Debug);
-
-        tool_router
-            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
-            .await
-            .expect("enqueue task for expiring session");
-        assert_eq!(tool_router.task_count_for_owner(&owner).await, 1);
-
-        http_state.teardown_session(session_id).await;
-
-        assert_eq!(tool_router.task_count_for_owner(&owner).await, 0);
-        assert_eq!(
-            tool_router.log_level(),
-            rmcp::model::LoggingLevel::Warning,
-            "expiry cleanup should also have removed the session's log level"
-        );
-
-        engine.shutdown().await;
-    }
-
-    #[tokio::test]
-    async fn fetch_http_live_sessions_from_returns_unavailable_when_token_missing() {
-        let dir = unique_temp_dir("missing-token");
-        let token_path = dir.join("operator.token");
-
-        let state = fetch_http_live_sessions_from(
-            "http://127.0.0.1:9/nowhere".to_string(),
-            "127.0.0.1:9".to_string(),
-            &token_path,
-        )
-        .await;
-
-        assert!(matches!(state, LiveSessionSourceState::Unavailable));
-        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
-    }
-
-    #[tokio::test]
-    async fn fetch_http_live_sessions_from_returns_unavailable_when_token_empty() {
-        let dir = unique_temp_dir("empty-token");
-        let token_path = dir.join("operator.token");
-        std::fs::write(&token_path, "\n").expect("write empty token");
-
-        let state = fetch_http_live_sessions_from(
-            "http://127.0.0.1:9/nowhere".to_string(),
-            "127.0.0.1:9".to_string(),
-            &token_path,
-        )
-        .await;
-
-        assert!(matches!(state, LiveSessionSourceState::Unavailable));
-        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
-    }
-
-    #[tokio::test]
-    async fn fetch_http_live_sessions_from_returns_unavailable_on_unauthorized() {
-        let dir = unique_temp_dir("unauthorized");
-        let token_path = dir.join("operator.token");
-        std::fs::write(&token_path, "expected-token").expect("write token");
-        let app = Router::new().route(
-            OPERATOR_LIVE_SESSIONS_PATH,
-            get(|| async { StatusCode::UNAUTHORIZED }),
-        );
-        let (url, handle) = spawn_http_test_server(app).await;
-
-        let parsed = reqwest::Url::parse(&url).unwrap();
-        let authority = format!("127.0.0.1:{}", parsed.port().unwrap());
-        let state = fetch_http_live_sessions_from(url, authority, &token_path).await;
-
-        handle.abort();
-        assert!(matches!(state, LiveSessionSourceState::Unavailable));
-        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
-    }
-
-    #[tokio::test]
-    async fn fetch_http_live_sessions_from_returns_unavailable_on_invalid_json() {
-        let dir = unique_temp_dir("invalid-json");
-        let token_path = dir.join("operator.token");
-        std::fs::write(&token_path, "expected-token").expect("write token");
-        let app = Router::new().route(OPERATOR_LIVE_SESSIONS_PATH, get(|| async { "not-json" }));
-        let (url, handle) = spawn_http_test_server(app).await;
-
-        let parsed = reqwest::Url::parse(&url).unwrap();
-        let authority = format!("127.0.0.1:{}", parsed.port().unwrap());
-        let state = fetch_http_live_sessions_from(url, authority, &token_path).await;
-
-        handle.abort();
-        assert!(matches!(state, LiveSessionSourceState::Unavailable));
-        std::fs::remove_dir_all(dir).expect("cleanup temp dir");
     }
 
     fn proxy_handshake(

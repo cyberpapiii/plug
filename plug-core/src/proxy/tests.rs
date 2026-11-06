@@ -136,7 +136,7 @@ fn client_metadata_never_changes_principal_identity() {
     assert_ne!(original.client_metadata, changed.client_metadata);
 }
 
-fn router_with_git_commit_tool() -> ToolRouter {
+pub(super) fn router_with_git_commit_tool() -> ToolRouter {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
     let mut routes = HashMap::new();

@@ -347,8 +347,8 @@ pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String
 {arguments}
   </array>
   <key>RunAtLoad</key><true/>
-  <!-- Restart only on a non-zero exit. Idle grace-period shutdown and
-       `plug stop` exit 0 and stay stopped; a panic or a kill self-heals. -->
+  <!-- Restart only on a non-zero exit. `plug stop` exits 0 and stays
+       stopped; a panic or a kill self-heals. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
   <!-- Shutdown lets running tool calls finish for up to eight seconds, and

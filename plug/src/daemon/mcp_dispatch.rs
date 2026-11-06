@@ -23,8 +23,7 @@ pub(super) fn ipc_context(
     // accepts the create: the same `ipc:<client_id>` owner is live again.
     let owner_liveness = registry_client_id.clone().map(|client_id| {
         let registry = Arc::clone(&ctx.client_registry);
-        Arc::new(move || registry.client_sessions.contains_key(&client_id))
-            as plug_core::tasks::OwnerLivenessProbe
+        Arc::new(move || registry.has_client(&client_id)) as plug_core::tasks::OwnerLivenessProbe
     });
     let request_id = request_context
         .map(|context| context.request_id.clone())

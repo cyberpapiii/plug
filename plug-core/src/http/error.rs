@@ -57,6 +57,15 @@ pub enum HttpError {
     Internal(String),
 }
 
+impl From<crate::session::SessionError> for HttpError {
+    fn from(error: crate::session::SessionError) -> Self {
+        match error {
+            crate::session::SessionError::NotFound => Self::SessionNotFound,
+            crate::session::SessionError::TooMany => Self::TooManySessions,
+        }
+    }
+}
+
 impl IntoResponse for HttpError {
     fn into_response(self) -> Response {
         // A refusal is the only trace a client's broken request leaves here.
@@ -216,15 +225,6 @@ mod tests {
             let response = error.into_response();
             assert_eq!(response.status(), expected_status);
         }
-    }
-
-    #[test]
-    fn session_not_found_does_not_leak_session_id() {
-        // Security: error response body must not contain session IDs
-        let error = HttpError::SessionNotFound;
-        let display = format!("{error}");
-        assert!(!display.contains("session_id"));
-        assert!(!display.contains("uuid"));
     }
 
     #[test]

@@ -40,9 +40,8 @@ use crate::mcp_http_headers::{
 };
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
-use crate::session::{SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
+use crate::session::{SessionEnd, SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
 
-/// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 /// MCP protocol version header name.
@@ -56,7 +55,7 @@ use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 /// Shared state for all HTTP handlers.
 pub struct HttpState {
     pub router: Arc<ToolRouter>,
-    pub sessions: Arc<dyn SessionStore>,
+    pub sessions: Arc<SessionStore>,
     pub(crate) cancel: CancellationToken,
     pub(crate) auth_mode: crate::config::DownstreamAuthMode,
     pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
@@ -69,13 +68,50 @@ pub struct HttpState {
     /// `None` means the current downstream auth mode does not require bearer auth.
     pub(crate) auth_token: Option<Arc<str>>,
     /// Sessions whose clients advertise `roots` capability.
-    pub(crate) roots_capable_sessions: DashMap<String, ()>,
+    pub(crate) roots_capable_sessions: Arc<DashMap<String, ()>>,
     /// Pending reverse requests sent to HTTP clients (keyed by session_id + request_id).
-    pub(crate) pending_client_requests: DashMap<(String, i64), oneshot::Sender<ClientResult>>,
+    pub(crate) pending_client_requests: Arc<PendingClientRequests>,
     /// Counter for generating unique reverse-request IDs.
     pub(crate) reverse_request_counter: AtomicU64,
     /// Per-session client capabilities for reverse-request gating.
-    pub(crate) client_capabilities: DashMap<String, ClientCapabilities>,
+    pub(crate) client_capabilities: Arc<DashMap<String, ClientCapabilities>>,
+}
+
+type PendingClientRequests = DashMap<(String, i64), oneshot::Sender<ClientResult>>;
+
+/// What HTTP holds for its sessions outside the session store.
+struct HeldForSessions {
+    router: Arc<ToolRouter>,
+    roots_capable_sessions: Arc<DashMap<String, ()>>,
+    pending_client_requests: Arc<PendingClientRequests>,
+    client_capabilities: Arc<DashMap<String, ClientCapabilities>>,
+}
+
+impl HeldForSessions {
+    /// Release what is held for a session that has left the store.
+    async fn release(&self, session_id: &str) {
+        self.roots_capable_sessions.remove(session_id);
+        self.client_capabilities.remove(session_id);
+        // Dropping pending reverse-request senders wakes their receivers with
+        // RecvError instead of leaving them to time out.
+        self.pending_client_requests
+            .retain(|(pending_session_id, _), _| pending_session_id != session_id);
+        self.router
+            .end_downstream_session(crate::proxy::EndedSession::Http { session_id })
+            .await;
+    }
+}
+
+/// What revoking a downstream OAuth client came to.
+#[derive(Debug)]
+pub enum ClientRevocation {
+    /// Its grant is gone, its sessions ended, and the tasks it owned went.
+    Revoked,
+    UnknownClient,
+    OauthDisabled,
+    /// The grant stopped working before the save was tried, so its sessions
+    /// ended even though saving the revocation failed.
+    SaveFailed(crate::downstream_oauth::DownstreamOauthError),
 }
 
 /// One HTTP request as the dispatcher sees it: a legacy request inside its
@@ -85,7 +121,7 @@ struct HttpDownstreamContext {
     request_id: RequestId,
     client_type: crate::types::ClientType,
     trace_id: Arc<str>,
-    sessions: Arc<dyn SessionStore>,
+    sessions: Arc<SessionStore>,
     auth_status: AuthStatus,
     oauth_issuer: Option<Arc<str>>,
     protocol_era: crate::protocol::ProtocolEra,
@@ -257,10 +293,8 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
         Ok(http_credential(&self.auth_status, self.oauth_issuer.as_deref()).task_owner(session_id))
     }
 
-    /// HTTP teardown (DELETE / idle expiry) removes the session from this
-    /// store BEFORE running task cleanup, and session ids are server-minted
-    /// UUIDv4 (never reused), so "still in the store" is a sound "teardown
-    /// has not started" signal.
+    /// A session leaves the store before what it holds is released, so one
+    /// still in the store has not begun to end.
     fn owner_liveness_probe(&self) -> Option<crate::tasks::OwnerLivenessProbe> {
         if !self.session_bound() {
             return None;
@@ -376,12 +410,16 @@ impl DownstreamBridge for HttpBridge {
 impl HttpState {
     /// State with `auth_mode = auto`, no bearer token, no downstream OAuth, no
     /// events, no extra allowed origins, and the default SSE channel capacity.
+    ///
+    /// From here on `sessions` drops expired sessions on its own, and what
+    /// Plug holds for any session that lapses is released. Must be called on
+    /// a Tokio runtime. A session store serves one `HttpState`.
     pub fn new(
         router: Arc<ToolRouter>,
-        sessions: Arc<dyn SessionStore>,
+        sessions: Arc<SessionStore>,
         cancel: CancellationToken,
     ) -> Self {
-        Self {
+        let state = Self {
             router,
             sessions,
             cancel,
@@ -392,10 +430,32 @@ impl HttpState {
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
             auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
+            roots_capable_sessions: Arc::default(),
+            pending_client_requests: Arc::default(),
             reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
+            client_capabilities: Arc::default(),
+        };
+        let (lapsed_tx, mut lapsed_rx) = mpsc::unbounded_channel::<String>();
+        state
+            .sessions
+            .report_lapses_to(lapsed_tx)
+            .expect("a session store serves one HttpState");
+        state.sessions.spawn_cleanup_task(state.cancel.clone());
+        let held = state.held_for_sessions();
+        tokio::spawn(async move {
+            while let Some(session_id) = lapsed_rx.recv().await {
+                held.release(&session_id).await;
+            }
+        });
+        state
+    }
+
+    fn held_for_sessions(&self) -> HeldForSessions {
+        HeldForSessions {
+            router: Arc::clone(&self.router),
+            roots_capable_sessions: Arc::clone(&self.roots_capable_sessions),
+            pending_client_requests: Arc::clone(&self.pending_client_requests),
+            client_capabilities: Arc::clone(&self.client_capabilities),
         }
     }
 
@@ -439,35 +499,50 @@ impl HttpState {
         self
     }
 
-    /// Release everything the daemon holds for an HTTP session that has left
-    /// the session store, whether by `DELETE /mcp` or by idle expiry.
-    ///
-    /// Session-owned legacy task records end with the wire session. Durable
-    /// principal-owned records intentionally survive and can be resumed by a
-    /// later session authenticated as the same principal.
-    pub async fn teardown_session(&self, session_id: &str) {
-        let target = NotificationTarget::Http {
-            session_id: Arc::from(session_id),
-        };
-        self.router.cleanup_subscriptions_for_target(&target).await;
-        self.roots_capable_sessions.remove(session_id);
-        self.client_capabilities.remove(session_id);
-        // Dropping pending reverse-request senders wakes their receivers with
-        // RecvError instead of leaving them to time out.
-        self.pending_client_requests
-            .retain(|(pending_session_id, _), _| pending_session_id != session_id);
-        self.router.unregister_downstream_bridge(&target);
-        if self.router.clear_roots_for_target(&target) {
-            self.router.forward_roots_list_changed_to_upstreams().await;
+    /// End a session and release what Plug holds for it. Returns whether it
+    /// was open.
+    pub(crate) async fn end_session(&self, session_id: &str, why: SessionEnd) -> bool {
+        if !self.sessions.end(session_id, why) {
+            return false;
         }
-        // A stale per-client log level would keep the effective level
-        // permanently at a permissive value.
-        self.router.remove_client_log_level(session_id);
-        let lazy_session_key =
-            crate::downstream_identity::DownstreamTransport::Http.lazy_session_key(session_id);
-        self.router.clear_lazy_session(&lazy_session_key);
-        let owner = crate::downstream_identity::http_session_task_owner(session_id);
-        self.router.cleanup_tasks_for_owner(&owner).await;
+        self.held_for_sessions().release(session_id).await;
+        true
+    }
+
+    /// Take a downstream OAuth client's access away: its tokens stop
+    /// working, its sessions end, and the tasks it owns as its principal go.
+    pub async fn revoke_downstream_client(&self, client_id: &str) -> ClientRevocation {
+        let Some(manager) = self.downstream_oauth.as_ref() else {
+            return ClientRevocation::OauthDisabled;
+        };
+        match manager.revoke_client(client_id).await {
+            Ok(true) => {
+                self.end_sessions_of(client_id).await;
+                // The manager already refuses the grant's tokens, and the
+                // task store's create guard keeps a create that is under way
+                // from outliving this cleanup.
+                let resource = manager.resource();
+                let owner = HttpCredential::Grant {
+                    issuer: manager.base_url(),
+                    client_id,
+                    resource: &resource,
+                }
+                .task_owner(None);
+                self.router.cleanup_tasks_for_owner(&owner).await;
+                ClientRevocation::Revoked
+            }
+            Ok(false) => ClientRevocation::UnknownClient,
+            Err(error) => {
+                self.end_sessions_of(client_id).await;
+                ClientRevocation::SaveFailed(error)
+            }
+        }
+    }
+
+    async fn end_sessions_of(&self, client_id: &str) {
+        for session_id in self.sessions.sessions_of(client_id) {
+            self.end_session(&session_id, SessionEnd::Revoked).await;
+        }
     }
 
     pub fn spawn_notification_fanout(self: &Arc<Self>) {
@@ -1455,8 +1530,10 @@ async fn delete_mcp(
     let session_id = extract_session_id(&headers)?;
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
-    if state.sessions.remove(&session_id) {
-        state.teardown_session(&session_id).await;
+    if state
+        .end_session(&session_id, SessionEnd::ClosedByClient)
+        .await
+    {
         tracing::info!(session_id = %session_id, "session terminated via DELETE");
         Ok(StatusCode::OK.into_response())
     } else {
@@ -1900,7 +1977,7 @@ fn extract_session_id(headers: &HeaderMap) -> Result<String, HttpError> {
 /// not exist.
 fn session_is_the_callers(
     headers: &HeaderMap,
-    sessions: &dyn SessionStore,
+    sessions: &SessionStore,
     auth_status: &AuthStatus,
 ) -> Result<(), HttpError> {
     let Ok(session_id) = extract_session_id(headers) else {
@@ -1943,6 +2020,7 @@ fn bind_session_to_caller(
     state
         .sessions
         .set_broadcast_audience(session_id, broadcast_audience_for(policy_context))
+        .map_err(Into::into)
 }
 
 /// A client that was connected when Plug restarted, or that stayed quiet past
@@ -1964,8 +2042,8 @@ fn reopen_lost_session(state: &Arc<HttpState>, headers: &HeaderMap, auth_status:
         RequestId::Number(0),
         Arc::<str>::from(extract_trace_id(headers)),
     );
+    // Binding fails only for a session that is already gone again.
     if bind_session_to_caller(state, &session_id, auth_status, &policy_context).is_err() {
-        state.sessions.remove(&session_id);
         return;
     }
     // The client will not say `initialized` again, so the session is wired for
@@ -1998,12 +2076,9 @@ fn reopen_lost_session(state: &Arc<HttpState>, headers: &HeaderMap, auth_status:
 }
 
 /// Validate that the session exists and is not expired.
-fn validate_session_header(
-    headers: &HeaderMap,
-    sessions: &dyn SessionStore,
-) -> Result<(), HttpError> {
+fn validate_session_header(headers: &HeaderMap, sessions: &SessionStore) -> Result<(), HttpError> {
     let session_id = extract_session_id(headers)?;
-    sessions.validate(&session_id)
+    Ok(sessions.validate(&session_id)?)
 }
 
 /// Build a JSON response from a ServerJsonRpcMessage.
@@ -2207,7 +2282,6 @@ mod tests {
     use axum::body::Body;
     use http::Request as HttpRequest;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicUsize;
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -2277,7 +2351,7 @@ mod tests {
         Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -2476,13 +2550,13 @@ mod tests {
         let router = Arc::new(ToolRouter::new(sm, router_config));
         Arc::new(HttpState::new(
             router,
-            Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            Arc::new(crate::session::SessionStore::new(1800, 100)),
             CancellationToken::new(),
         ))
     }
 
-    #[test]
-    fn word_about_a_server_goes_only_to_clients_allowed_that_server() {
+    #[tokio::test]
+    async fn word_about_a_server_goes_only_to_clients_allowed_that_server() {
         let state = test_state();
         let mut clients = std::collections::BTreeMap::new();
         clients.insert(
@@ -2842,7 +2916,7 @@ mod tests {
             AccessTokenValidation::Valid(claims) => claims,
             other => panic!("issued token must validate, got {other:?}"),
         };
-        let sessions = crate::session::StatefulSessionStore::new(60, 10);
+        let sessions = crate::session::SessionStore::new(60, 10);
         let theirs = sessions.create_session().unwrap();
         let someone_elses = sessions.create_session().unwrap();
         let unowned = sessions.create_session().unwrap();
@@ -3040,7 +3114,7 @@ mod tests {
         };
         let claims = client_id;
         let client_id = claims.client_id.clone();
-        let snapshots = state.sessions.session_snapshots();
+        let snapshots = state.sessions.snapshots();
         let session = snapshots
             .iter()
             .find(|snapshot| snapshot.session_id == session_id)
@@ -3495,8 +3569,8 @@ mod tests {
         crate::dispatch::admit_modern_task(router, &caller, call)
     }
 
-    #[test]
-    fn modern_http_task_admission_matrix_is_consistent() {
+    #[tokio::test]
+    async fn modern_http_task_admission_matrix_is_consistent() {
         let state = test_state();
         let allowed = modern_task_policy_context(true, ["tasks:use".to_string()]);
         let task_meta = modern_task_meta(true);
@@ -3612,7 +3686,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 Arc::clone(&state.router),
-                Arc::clone(&state.sessions),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 state.cancel.clone(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -3654,8 +3728,8 @@ mod tests {
         assert_eq!(value["error"]["data"]["kind"], "permission_denied");
     }
 
-    #[test]
-    fn modern_capability_projection_is_permission_filtered_and_bridge_free() {
+    #[tokio::test]
+    async fn modern_capability_projection_is_permission_filtered_and_bridge_free() {
         let state = test_state();
         state.router.set_modern_downstream_enabled(true);
         let context = DownstreamCallContext::http(
@@ -3690,146 +3764,6 @@ mod tests {
         assert!(capabilities.extensions.is_none());
         assert!(capabilities.experimental.is_none());
         assert!(capabilities.logging.is_none());
-    }
-
-    /// Session-store wrapper that parks the owner-liveness validation (the
-    /// second validation in a task-wrapped POST) until a concurrent DELETE
-    /// has removed the session. It delegates every other operation to the
-    /// production store, so the regression drives the real HTTP handlers.
-    struct GateSecondValidateSessionStore {
-        inner: crate::session::StatefulSessionStore,
-        validate_calls: AtomicUsize,
-        second_validate_notify: tokio::sync::Notify,
-        released: std::sync::Mutex<bool>,
-        release_cv: std::sync::Condvar,
-    }
-
-    impl GateSecondValidateSessionStore {
-        fn new() -> Arc<Self> {
-            Arc::new(Self {
-                inner: crate::session::StatefulSessionStore::new(1800, 100),
-                validate_calls: AtomicUsize::new(0),
-                second_validate_notify: tokio::sync::Notify::new(),
-                released: std::sync::Mutex::new(false),
-                release_cv: std::sync::Condvar::new(),
-            })
-        }
-
-        fn release_second_validate(&self) {
-            *self.released.lock().unwrap() = true;
-            self.release_cv.notify_all();
-        }
-    }
-
-    struct SecondValidateReleaseGuard(Arc<GateSecondValidateSessionStore>);
-
-    impl Drop for SecondValidateReleaseGuard {
-        fn drop(&mut self) {
-            self.0.release_second_validate();
-        }
-    }
-
-    impl SessionStore for GateSecondValidateSessionStore {
-        fn create_session(&self) -> Result<String, HttpError> {
-            self.inner.create_session()
-        }
-
-        fn reopen_session(&self, session_id: &str) -> Result<bool, HttpError> {
-            self.inner.reopen_session(session_id)
-        }
-
-        fn validate(&self, session_id: &str) -> Result<(), HttpError> {
-            if self.validate_calls.fetch_add(1, Ordering::SeqCst) == 1 {
-                self.second_validate_notify.notify_one();
-                let mut released = self.released.lock().unwrap();
-                while !*released {
-                    released = self.release_cv.wait(released).unwrap();
-                }
-            }
-            self.inner.validate(session_id)
-        }
-
-        fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
-            self.inner.has_live_sse_sender(session_id)
-        }
-
-        fn set_sse_sender(
-            &self,
-            session_id: &str,
-            sender: mpsc::Sender<crate::session::SseEvent>,
-            last_event_id: Option<u64>,
-        ) -> Result<(), HttpError> {
-            self.inner.set_sse_sender(session_id, sender, last_event_id)
-        }
-
-        fn set_client_type(
-            &self,
-            session_id: &str,
-            client_type: crate::types::ClientType,
-        ) -> Result<(), HttpError> {
-            self.inner.set_client_type(session_id, client_type)
-        }
-
-        fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
-            self.inner.get_client_type(session_id)
-        }
-
-        fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), HttpError> {
-            self.inner.set_grant(session_id, client_id)
-        }
-
-        fn set_broadcast_audience(
-            &self,
-            session_id: &str,
-            audience: crate::session::BroadcastAudience,
-        ) -> Result<(), HttpError> {
-            self.inner.set_broadcast_audience(session_id, audience)
-        }
-
-        fn remove(&self, session_id: &str) -> bool {
-            self.inner.remove(session_id)
-        }
-
-        fn set_access_check(
-            &self,
-            session_id: &str,
-            check: crate::session::AccessCheck,
-        ) -> Result<(), HttpError> {
-            self.inner.set_access_check(session_id, check)
-        }
-
-        fn broadcast_where(
-            &self,
-            message: SseMessage,
-            kind: crate::session::BroadcastKind,
-            allowed: &dyn Fn(Option<&str>) -> bool,
-        ) {
-            self.inner.broadcast_where(message, kind, allowed);
-        }
-
-        fn send_to_live_session(
-            &self,
-            session_id: &str,
-            message: SseMessage,
-        ) -> SessionSendOutcome {
-            self.inner.send_to_live_session(session_id, message)
-        }
-
-        fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
-            self.inner.remove_replay_events_by_key(session_id, key);
-        }
-
-        fn spawn_cleanup_task(&self, cancel: CancellationToken) {
-            self.inner.spawn_cleanup_task(cancel);
-        }
-
-        fn session_count(&self) -> usize {
-            self.inner.session_count()
-        }
-
-        fn session_snapshots(&self) -> Vec<crate::session::DownstreamSessionSnapshot> {
-            self.inner.session_snapshots()
-        }
     }
 
     #[tokio::test]
@@ -4209,89 +4143,38 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
     }
 
-    /// End-to-end transport regression for the create-vs-teardown boundary:
-    /// the POST passes its initial session validation, registers the task
-    /// owner guard, then DELETE removes that same session before the enqueue
-    /// path's liveness re-check. The real handler must refuse the create.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn task_wrapped_post_racing_delete_refuses_late_create() {
-        let sessions = GateSecondValidateSessionStore::new();
-        let session_id = sessions.create_session().unwrap();
-        let sm = Arc::new(crate::server::ServerManager::new());
-        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState::new(
-            Arc::clone(&router),
-            Arc::clone(&sessions) as Arc<dyn SessionStore>,
-            CancellationToken::new(),
-        ));
-        let app = build_router(state);
+    /// A task created in a legacy session asks whether the session is still
+    /// open after it registers its create guard, so a create racing DELETE is
+    /// refused: the probe must see the session closed once DELETE returns.
+    #[tokio::test]
+    async fn the_task_owner_probe_sees_a_deleted_session_closed() {
+        let state = test_state();
+        let session_id = state.sessions.create_session().unwrap();
+        let context = HttpDownstreamContext::new(
+            &state,
+            AuthStatus::Authenticated(None),
+            Some(&session_id),
+            RequestId::Number(1),
+            Arc::from("trace"),
+            None,
+        );
+        let probe = crate::dispatch::DownstreamContext::owner_liveness_probe(&context)
+            .expect("a legacy session has a probe");
+        assert!(probe());
 
-        let post_body = serde_json::json!({
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": "missing__tool",
-                "arguments": {},
-                "task": {}
-            }
-        });
-        let post_request = HttpRequest::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("content-type", "application/json")
-            .header(SESSION_ID_HEADER, &session_id)
-            .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
-            .body(Body::from(serde_json::to_vec(&post_body).unwrap()))
-            .unwrap();
-        let post_app = app.clone();
-        let post = tokio::spawn(async move { post_app.oneshot(post_request).await.unwrap() });
-
-        if tokio::time::timeout(
-            Duration::from_secs(5),
-            sessions.second_validate_notify.notified(),
-        )
-        .await
-        .is_err()
-        {
-            let validate_calls = sessions.validate_calls.load(Ordering::SeqCst);
-            sessions.release_second_validate();
-            let response = post.await.unwrap();
-            let status = response.status();
-            let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
-                .await
-                .unwrap();
-            panic!(
-                "task POST never reached its post-guard owner-liveness validation; validate_calls={validate_calls}, status={status}, body={}",
-                String::from_utf8_lossy(&body)
-            );
-        }
-        let release_guard = SecondValidateReleaseGuard(Arc::clone(&sessions));
-
-        let delete_request = HttpRequest::builder()
-            .method("DELETE")
-            .uri("/mcp")
-            .header(SESSION_ID_HEADER, &session_id)
-            .body(Body::empty())
-            .unwrap();
-        let delete_response = app.oneshot(delete_request).await.unwrap();
-        assert_eq!(delete_response.status(), StatusCode::OK);
-
-        sessions.release_second_validate();
-        drop(release_guard);
-        let post_response = post.await.unwrap();
-        assert_eq!(post_response.status(), StatusCode::OK);
-        let body = axum::body::to_bytes(post_response.into_body(), 1024 * 1024)
+        let response = build_router(Arc::clone(&state))
+            .oneshot(
+                HttpRequest::builder()
+                    .method("DELETE")
+                    .uri("/mcp")
+                    .header(SESSION_ID_HEADER, &session_id)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(value["error"]["code"], ErrorCode::INVALID_REQUEST.0);
-        assert_eq!(
-            value["error"]["message"],
-            "session closed during task creation"
-        );
-        let owner = crate::downstream_identity::http_session_task_owner(&session_id);
-        assert_eq!(router.task_count_for_owner(&owner).await, 0);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(!probe());
     }
 
     #[tokio::test]
@@ -4346,6 +4229,84 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(state.router.task_count_for_owner(&owner).await, 0);
+    }
+
+    fn bare_router() -> Arc<ToolRouter> {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()))
+    }
+
+    #[tokio::test]
+    async fn a_session_that_times_out_is_released_without_being_asked() {
+        let router = bare_router();
+        enable_test_task_surface(&router);
+        let state = HttpState::new(
+            Arc::clone(&router),
+            Arc::new(crate::session::SessionStore::new(0, 100)),
+            CancellationToken::new(),
+        );
+        let session_id = state.sessions.create_session().unwrap();
+        router.set_client_log_level(&session_id, LoggingLevel::Debug);
+        let owner = crate::downstream_identity::http_session_task_owner(&session_id);
+        router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue a task for the session");
+
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        assert!(state.sessions.validate(&session_id).is_err());
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while router.task_count_for_owner(&owner).await > 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the lapsed session's tasks are released");
+        assert_eq!(router.log_level(), LoggingLevel::Warning);
+    }
+
+    #[tokio::test]
+    async fn revoking_a_client_ends_its_sessions_and_the_tasks_it_owns() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let (client_id, _tokens) = issue_test_oauth_grant(&manager, "tools:read").await;
+        let router = bare_router();
+        enable_test_task_surface(&router);
+        let state = HttpState::new(
+            Arc::clone(&router),
+            Arc::new(crate::session::SessionStore::new(1800, 100)),
+            CancellationToken::new(),
+        )
+        .with_downstream_oauth(Some(manager.clone()));
+        let theirs = state.sessions.create_session().unwrap();
+        state
+            .sessions
+            .set_grant(&theirs, client_id.clone())
+            .unwrap();
+        let other = state.sessions.create_session().unwrap();
+        let resource = manager.resource();
+        let owner = HttpCredential::Grant {
+            issuer: manager.base_url(),
+            client_id: &client_id,
+            resource: &resource,
+        }
+        .task_owner(None);
+        router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue a task for the client");
+
+        assert!(matches!(
+            state.revoke_downstream_client(&client_id).await,
+            ClientRevocation::Revoked
+        ));
+        assert!(state.sessions.validate(&theirs).is_err());
+        assert!(state.sessions.validate(&other).is_ok());
+        assert_eq!(router.task_count_for_owner(&owner).await, 0);
+        assert!(matches!(
+            state.revoke_downstream_client(&client_id).await,
+            ClientRevocation::UnknownClient
+        ));
     }
 
     /// Drop guard that flips a flag when the future holding it stops
@@ -4473,7 +4434,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_allowed_origins(vec![Arc::from("https://claude.ai")]),
@@ -5565,7 +5526,7 @@ mod tests {
         Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Bearer)
@@ -5672,7 +5633,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -5714,7 +5675,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -5756,7 +5717,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -6963,7 +6924,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -7000,7 +6961,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
@@ -7593,7 +7554,7 @@ mod tests {
         let state = Arc::new(
             HttpState::new(
                 router,
-                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
             .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)

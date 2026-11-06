@@ -670,6 +670,56 @@ impl fmt::Debug for IpcRequest {
     }
 }
 
+impl IpcRequest {
+    /// The session this request acts in, when only the connection that
+    /// registered that session may send it. The daemon checks that before
+    /// the request runs. Cancellation names a session too, but arrives on a
+    /// socket of its own and proves itself with the session's cancellation
+    /// capability instead.
+    pub fn connection_session_id(&self) -> Option<&str> {
+        match self {
+            Self::Deregister { session_id }
+            | Self::UpdateSession { session_id, .. }
+            | Self::Ping { session_id }
+            | Self::Capabilities { session_id }
+            | Self::ModernDownstreamGate { session_id }
+            | Self::McpRequest { session_id, .. }
+            | Self::McpRequestWithContext { session_id, .. }
+            | Self::UpdateRoots { session_id, .. }
+            | Self::UpdateCapabilities { session_id, .. }
+            | Self::RestoreResourceSubscriptions { session_id, .. } => Some(session_id),
+            Self::CancelMcpRequest { .. }
+            | Self::Status
+            | Self::OperatorHandshake { .. }
+            | Self::ActivitySnapshot { .. }
+            | Self::OperatorSnapshot { .. }
+            | Self::GetServerConfig { .. }
+            | Self::RevokeDownstreamClient { .. }
+            | Self::ValidateServer { .. }
+            | Self::DescribeApi { .. }
+            | Self::AddServer { .. }
+            | Self::UpdateServer { .. }
+            | Self::RemoveServer { .. }
+            | Self::AddAccount { .. }
+            | Self::SetServerEnabled { .. }
+            | Self::SetToolEnabled { .. }
+            | Self::RenameClient { .. }
+            | Self::MoveClientSettings { .. }
+            | Self::SetClientPlace { .. }
+            | Self::SetClientBlock { .. }
+            | Self::AddWatch { .. }
+            | Self::RemoveWatch { .. }
+            | Self::RestartServer { .. }
+            | Self::Reload { .. }
+            | Self::Shutdown { .. }
+            | Self::Register { .. }
+            | Self::ListTools
+            | Self::ListLiveSessions
+            | Self::AuthStatus => None,
+        }
+    }
+}
+
 /// Request-scoped downstream identity that must survive the private daemon
 /// hop. Principal and durable owner are deliberately not serialized: the
 /// daemon derives both from its authenticated client registry entry.

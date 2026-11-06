@@ -1304,7 +1304,7 @@ impl ToolRouter {
         self.continuation_registry.clear();
     }
 
-    pub fn revoke_continuations_for_principal(&self, principal: &PrincipalId) {
+    pub(crate) fn revoke_continuations_for_principal(&self, principal: &PrincipalId) {
         self.continuation_registry.revoke_principal(principal);
     }
 
@@ -1542,12 +1542,12 @@ impl ToolRouter {
     }
 
     /// Remove a client's log level (on disconnect) and recalculate.
-    pub fn remove_client_log_level(&self, client_id: &str) {
+    pub(crate) fn remove_client_log_level(&self, client_id: &str) {
         self.client_log_levels.remove(client_id);
         self.recalculate_effective_level();
     }
 
-    pub fn clear_lazy_session(&self, session_key: &str) {
+    pub(crate) fn clear_lazy_session(&self, session_key: &str) {
         self.lazy_working_sets.remove(session_key);
     }
 
@@ -1609,7 +1609,7 @@ impl ToolRouter {
     }
 
     /// Remove cached roots for a disconnected client. Returns true if entry existed.
-    pub fn clear_roots_for_target(&self, target: &NotificationTarget) -> bool {
+    pub(crate) fn clear_roots_for_target(&self, target: &NotificationTarget) -> bool {
         self.client_roots.remove(target).is_some()
     }
 
@@ -1662,7 +1662,7 @@ impl ToolRouter {
     }
 
     /// Unregister a downstream bridge on client disconnect.
-    pub fn unregister_downstream_bridge(&self, target: &NotificationTarget) {
+    pub(crate) fn unregister_downstream_bridge(&self, target: &NotificationTarget) {
         self.downstream_bridges.remove(target);
     }
 
@@ -4532,10 +4532,12 @@ mod call_metadata_regression_tests {
 mod catalog;
 mod completion;
 pub mod continuations;
+mod sessions;
 mod skills;
 mod subscriptions;
 mod tasks;
 pub(crate) use catalog::*;
+pub use sessions::{ConnectorAfter, EndedSession};
 
 #[cfg(test)]
 mod tests;

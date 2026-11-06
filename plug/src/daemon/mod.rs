@@ -18,9 +18,10 @@ use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
+use plug_core::http::server::{ClientRevocation, HttpState};
 use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse};
+use plug_core::proxy::{ConnectorAfter, EndedSession};
 use plug_core::proxy::{DownstreamBridge, ToolRouter};
-use plug_core::session::SessionStore;
 
 mod framing;
 use framing::FrameReader;
@@ -238,143 +239,28 @@ pub(crate) fn runtime_lock_is_held() -> bool {
     }
 }
 
-// ───────────────────────── Grace-period auto-shutdown ─────────────────────────
-
-/// Spawn the grace-period auto-shutdown task.
-///
-/// Watches `count_rx` for IPC client-count changes. When the count drops to
-/// zero, starts a `grace_period_secs` countdown. If the countdown fires while
-/// IPC count is still zero but daemon-owned HTTP sessions are active, the
-/// daemon is kept alive — but instead of falling back to the plain IPC watch
-/// (which would never wake on an HTTP-session-count change, stranding the
-/// daemon alive indefinitely), the task enters a bounded re-check loop that
-/// polls both counts on `recheck_interval` until either an IPC client
-/// reconnects (control returns to the outer watch loop) or HTTP sessions
-/// drain to zero (the daemon is cancelled). The re-check loop does not
-/// restart a fresh grace period — the grace period already expired once;
-/// HTTP sessions were the only thing holding the daemon up, and the
-/// session-store's own timeout already governs their lifetime.
-fn spawn_grace_period_task(
-    grace_period_secs: u64,
-    mut count_rx: tokio::sync::watch::Receiver<usize>,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-    daemon_cancel: CancellationToken,
-    grace_token: CancellationToken,
-) {
-    tokio::spawn(async move {
-        // Bounded: never busier than 1s, never lazier than 30s; scales down
-        // for short test-sized grace periods.
-        let recheck_interval = Duration::from_secs(grace_period_secs.clamp(1, 30));
-
-        loop {
-            // Wait for a change in client count
-            if count_rx.changed().await.is_err() {
-                return; // Sender dropped (registry gone)
-            }
-
-            let count = *count_rx.borrow();
-            if count == 0 {
-                tracing::info!(
-                    grace_secs = grace_period_secs,
-                    "last client disconnected, starting grace period"
-                );
-
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
-                        // Grace period expired — recheck IPC and daemon-owned HTTP sessions.
-                        let http_session_count = http_sessions
-                            .as_ref()
-                            .map(|sessions| sessions.session_count())
-                            .unwrap_or(0);
-                        if *count_rx.borrow() == 0 && http_session_count == 0 {
-                            tracing::info!("grace period expired with no clients, shutting down");
-                            daemon_cancel.cancel();
-                            return;
-                        } else if *count_rx.borrow() == 0 && http_session_count > 0 {
-                            tracing::info!(
-                                http_session_count,
-                                "grace period expired but HTTP sessions are still active; keeping daemon alive"
-                            );
-
-                            // Re-check loop: HTTP sessions are the only thing keeping the
-                            // daemon alive. Poll until they drain (shut down) or an IPC
-                            // client reconnects (resume the outer watch loop).
-                            'recheck: loop {
-                                tokio::select! {
-                                    _ = tokio::time::sleep(recheck_interval) => {
-                                        if *count_rx.borrow() > 0 {
-                                            tracing::info!("client reconnected, grace period cancelled");
-                                            break 'recheck;
-                                        }
-                                        let http_session_count = http_sessions
-                                            .as_ref()
-                                            .map(|sessions| sessions.session_count())
-                                            .unwrap_or(0);
-                                        if http_session_count == 0 {
-                                            tracing::info!("grace period expired with no clients, shutting down");
-                                            daemon_cancel.cancel();
-                                            return;
-                                        }
-                                        // Still held alive by HTTP sessions; keep polling.
-                                    }
-                                    result = count_rx.changed() => {
-                                        if result.is_err() {
-                                            return;
-                                        }
-                                        if *count_rx.borrow() > 0 {
-                                            tracing::info!("client reconnected, grace period cancelled");
-                                            break 'recheck;
-                                        }
-                                        // Still 0; keep polling the re-check loop.
-                                    }
-                                    _ = grace_token.cancelled() => return,
-                                }
-                            }
-                        }
-                    }
-                    result = count_rx.changed() => {
-                        if result.is_err() {
-                            return;
-                        }
-                        if *count_rx.borrow() > 0 {
-                            tracing::info!("client reconnected, grace period cancelled");
-                        }
-                    }
-                    _ = grace_token.cancelled() => return,
-                }
-            }
-        }
-    });
-}
-
 // ─────────────────────────── Daemon entry point ──────────────────────────────
 
-/// `run_daemon_with_lock` after taking the runtime lock, without downstream OAuth.
+/// `run_daemon_with_lock` after taking the runtime lock, with HTTP sessions
+/// but no downstream OAuth.
 #[cfg(test)]
-pub async fn run_daemon(
-    engine: Arc<Engine>,
-    config_path: PathBuf,
-    grace_period_secs: u64,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-) -> anyhow::Result<()> {
+pub async fn run_daemon(engine: Arc<Engine>, config_path: PathBuf) -> anyhow::Result<()> {
     let runtime_lock = acquire_runtime_lock()?;
-    run_daemon_with_lock(
-        engine,
-        config_path,
-        grace_period_secs,
-        http_sessions,
-        None,
-        runtime_lock,
-    )
-    .await
+    let http = Arc::new(HttpState::new(
+        Arc::clone(engine.tool_router()),
+        Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+        engine.cancel_token().clone(),
+    ));
+    run_daemon_with_lock(engine, config_path, http, runtime_lock).await
 }
 
+/// Serve local connectors on the daemon socket. `http` is the downstream
+/// HTTP state the same process serves, whose sessions the daemon lists and
+/// whose clients it revokes.
 pub(crate) async fn run_daemon_with_lock(
     engine: Arc<Engine>,
     config_path: PathBuf,
-    grace_period_secs: u64,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
+    http: Arc<HttpState>,
     runtime_lock: DaemonRuntimeLock,
 ) -> anyhow::Result<()> {
     let rt_dir = plug_core::paths::dir();
@@ -439,28 +325,10 @@ pub(crate) async fn run_daemon_with_lock(
 
     let cancel = engine.cancel_token().clone();
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
-    let (client_registry, count_rx) = ClientRegistry::new();
-    let client_registry = Arc::new(client_registry);
-
-    // Grace period: when the last proxy client disconnects, start a countdown.
-    // If no new client reconnects and no daemon-owned HTTP sessions remain when it
-    // fires, shut down the daemon.
-    // A grace_period_secs of 0 disables auto-shutdown (explicit shutdown only),
-    // which is the default behavior.
-    let grace_cancel = CancellationToken::new();
+    let client_registry = Arc::new(ClientRegistry::new());
 
     #[cfg(target_os = "macos")]
     menu_bar::spawn(cancel.clone());
-
-    if grace_period_secs > 0 {
-        spawn_grace_period_task(
-            grace_period_secs,
-            count_rx,
-            http_sessions.clone(),
-            cancel.clone(),
-            grace_cancel.clone(),
-        );
-    }
 
     // Accept IPC connections until shutdown
     loop {
@@ -479,8 +347,7 @@ pub(crate) async fn run_daemon_with_lock(
                         let engine_clone = engine.clone();
                         let registry = client_registry.clone();
                         let config_path = config_path.clone();
-                        let http_sessions = http_sessions.clone();
-                        let downstream_oauth = downstream_oauth.clone();
+                        let http = Arc::clone(&http);
 
                         tokio::spawn(async move {
                             let started_at = Instant::now()
@@ -494,8 +361,7 @@ pub(crate) async fn run_daemon_with_lock(
                                 config_path: config_path.clone(),
                                 started_at,
                                 client_registry: registry,
-                                http_sessions,
-                                downstream_oauth,
+                                http,
                                 session_id: None,
                                 reverse_request_rx: None,
                             };
@@ -515,10 +381,6 @@ pub(crate) async fn run_daemon_with_lock(
         }
     }
 
-    // Stop grace period task
-    grace_cancel.cancel();
-
-    // Cleanup
     tracing::info!("daemon shutting down, cleaning up");
     std::fs::remove_file(&sock_path).ok();
     std::fs::remove_file(&pid_file_path).ok();
@@ -643,8 +505,7 @@ struct ConnectionContext {
     config_path: PathBuf,
     started_at: Instant,
     client_registry: Arc<ClientRegistry>,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
+    http: Arc<HttpState>,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
     /// Receiver for reverse requests from the daemon bridge. Created during
@@ -671,8 +532,7 @@ impl ConnectionContext {
             config_path: self.config_path.clone(),
             started_at: self.started_at,
             client_registry: Arc::clone(&self.client_registry),
-            http_sessions: self.http_sessions.clone(),
-            downstream_oauth: self.downstream_oauth.clone(),
+            http: Arc::clone(&self.http),
             session_id: self.session_id.clone(),
             reverse_request_rx: None,
         }
@@ -775,47 +635,29 @@ async fn handle_ipc_connection(
         }
     }
 
-    // Auto-deregister on disconnect (clean or crash)
-    if let Some(ref session_id) = ctx.session_id {
-        let removed_client_id = ctx.client_registry.client_id(session_id);
-        ctx.client_registry.deregister(session_id);
-        let target = plug_core::notifications::NotificationTarget::Ipc {
-            client_id: std::sync::Arc::from(session_id.as_str()),
-        };
-        ctx.engine
-            .tool_router()
-            .cleanup_subscriptions_for_target(&target)
-            .await;
-        ctx.engine
-            .tool_router()
-            .unregister_downstream_bridge(&target);
-        if ctx.engine.tool_router().clear_roots_for_target(&target) {
-            ctx.engine
-                .tool_router()
-                .forward_roots_list_changed_to_upstreams()
-                .await;
-        }
-        ctx.engine.tool_router().remove_client_log_level(session_id);
-        let lazy_session_key =
-            plug_core::downstream_identity::DownstreamTransport::Ipc.lazy_session_key(session_id);
-        ctx.engine
-            .tool_router()
-            .clear_lazy_session(&lazy_session_key);
-        if let Some(client_id) = removed_client_id
-            && !ctx.client_registry.client_sessions.contains_key(&client_id)
-        {
-            ctx.engine.tool_router().revoke_continuations_for_principal(
-                &plug_core::downstream_identity::ipc_registry_principal(&client_id),
-            );
-            let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
-            ctx.engine
-                .tool_router()
-                .cleanup_tasks_for_owner(&owner)
-                .await;
-        }
+    if let Some(session_id) = ctx.session_id.take() {
+        end_ipc_session(&ctx, &session_id).await;
     }
 
     result
+}
+
+/// Take `session_id` out of the registry and release what the router holds
+/// for it. A session a newer registration already replaced was released
+/// then; what is released again here is only what it picked up since.
+async fn end_ipc_session(ctx: &ConnectionContext, session_id: &str) {
+    let last_of_client = ctx.client_registry.deregister(session_id);
+    let connector = match last_of_client.as_deref() {
+        Some(client_id) => ConnectorAfter::Gone { client_id },
+        None => ConnectorAfter::StillRegistered,
+    };
+    ctx.engine
+        .tool_router()
+        .end_downstream_session(EndedSession::Ipc {
+            session_id,
+            connector,
+        })
+        .await;
 }
 
 /// Key a live session's lazy working set the way its transport stores it:
@@ -1495,46 +1337,11 @@ fn tool_catalog_revision(ctx: &ConnectionContext) -> u64 {
 }
 
 async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
-    fn downstream_http_live_sessions(
-        sessions: &dyn SessionStore,
-    ) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
-        let mut live_sessions = sessions
-            .session_snapshots()
-            .into_iter()
-            .map(|snapshot| plug_core::ipc::IpcLiveSessionInfo {
-                transport: match snapshot.transport {
-                    plug_core::session::DownstreamTransport::Http => {
-                        plug_core::ipc::LiveSessionTransport::Http
-                    }
-                },
-                client_id: None,
-                link_target: None,
-                session_id: snapshot.session_id,
-                client_type: snapshot.client_type,
-                client_info: None,
-                adapter_version: None,
-                host: None,
-                client_key: plug_core::downstream_identity::remote_client_key(
-                    snapshot.grant.as_deref(),
-                    snapshot.client_type,
-                ),
-                access_key: Some(plug_core::downstream_identity::remote_access_key(
-                    snapshot.grant.as_deref(),
-                )),
-                grant: snapshot.grant,
-                connected_secs: snapshot.connected_seconds,
-                last_activity_secs: Some(snapshot.idle_seconds),
-            })
-            .collect::<Vec<_>>();
-        live_sessions.sort_by(|a, b| {
-            a.client_type
-                .to_string()
-                .cmp(&b.client_type.to_string())
-                .then(a.session_id.cmp(&b.session_id))
-        });
-        live_sessions
+    if let Some(session_id) = request.connection_session_id()
+        && let Some(refusal) = reject_unowned_session(ctx, session_id)
+    {
+        return refusal;
     }
-
     match request {
         IpcRequest::Status => {
             let servers = ctx.server_manager.server_statuses();
@@ -1600,11 +1407,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 })
                 .collect::<Vec<_>>();
             configured_servers.sort_by(|a, b| a.name.cmp(&b.name));
-            let mut live_sessions = ctx.client_registry.list_live_sessions();
-            if let Some(http_sessions) = ctx.http_sessions.as_ref() {
-                live_sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
-            }
-            live_sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
+            let live_sessions = plug_core::session::live_sessions(
+                ctx.client_registry.list_live_sessions(),
+                &ctx.http.sessions,
+            );
             let client_visibility = live_sessions
                 .iter()
                 .map(|session| plug_core::ipc::OperatorClientVisibility {
@@ -1697,7 +1503,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             let mut server_statuses = ctx.server_manager.server_statuses();
             strip_upstream_icons(&mut server_statuses);
             let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
-            let downstream_clients = match ctx.downstream_oauth.as_ref() {
+            let downstream_clients = match ctx.http.downstream_oauth.as_ref() {
                 Some(manager) => manager.list_clients().await,
                 None => Vec::new(),
             };
@@ -1742,36 +1548,22 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
         IpcRequest::RevokeDownstreamClient { client_id, .. } => {
-            let Some(manager) = ctx.downstream_oauth.as_ref() else {
-                return IpcResponse::Error {
-                    code: "DOWNSTREAM_OAUTH_DISABLED".to_string(),
-                    message: "downstream OAuth is not enabled".to_string(),
-                };
-            };
-            match manager.revoke_client(client_id).await {
-                Ok(true) => {
-                    if let Some(sessions) = ctx.http_sessions.as_ref() {
-                        sessions.end_sessions_of(client_id);
-                    }
-                    IpcResponse::DownstreamClientRevoked {
-                        client_id: client_id.clone(),
-                    }
-                }
-                Ok(false) => IpcResponse::Error {
+            match ctx.http.revoke_downstream_client(client_id).await {
+                ClientRevocation::Revoked => IpcResponse::DownstreamClientRevoked {
+                    client_id: client_id.clone(),
+                },
+                ClientRevocation::UnknownClient => IpcResponse::Error {
                     code: "UNKNOWN_DOWNSTREAM_CLIENT".to_string(),
                     message: format!("registered client `{client_id}` was not found"),
                 },
-                Err(error) => {
-                    // The grant stopped working before the save was tried,
-                    // so its sessions end even though the save failed.
-                    if let Some(sessions) = ctx.http_sessions.as_ref() {
-                        sessions.end_sessions_of(client_id);
-                    }
-                    IpcResponse::Error {
-                        code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
-                        message: error.to_string(),
-                    }
-                }
+                ClientRevocation::OauthDisabled => IpcResponse::Error {
+                    code: "DOWNSTREAM_OAUTH_DISABLED".to_string(),
+                    message: "downstream OAuth is not enabled".to_string(),
+                },
+                ClientRevocation::SaveFailed(error) => IpcResponse::Error {
+                    code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
+                    message: error.to_string(),
+                },
             }
         }
         IpcRequest::ValidateServer { name, server, .. } => {
@@ -1986,10 +1778,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     ),
                 };
             }
-            // Enforce one registration per connection — deregister previous if exists
-            if let Some(ref old_session) = ctx.session_id {
-                ctx.client_registry.deregister(old_session);
-            }
+            let previous_session_id = ctx.session_id.take();
             let registration = ctx.client_registry.register_hosted(
                 client_id.clone(),
                 client_info.clone(),
@@ -2005,30 +1794,21 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     new_session_id = %registration.session_id,
                     "client transport session replaced"
                 );
-                let target = plug_core::notifications::NotificationTarget::Ipc {
-                    client_id: Arc::from(replaced_session_id.as_str()),
-                };
                 ctx.engine
                     .tool_router()
-                    .cleanup_subscriptions_for_target(&target)
+                    .end_downstream_session(EndedSession::Ipc {
+                        session_id: replaced_session_id,
+                        // The new registration holds the same client id.
+                        connector: ConnectorAfter::StillRegistered,
+                    })
                     .await;
-                ctx.engine
-                    .tool_router()
-                    .unregister_downstream_bridge(&target);
-                if ctx.engine.tool_router().clear_roots_for_target(&target) {
-                    ctx.engine
-                        .tool_router()
-                        .forward_roots_list_changed_to_upstreams()
-                        .await;
-                }
-                ctx.engine
-                    .tool_router()
-                    .remove_client_log_level(replaced_session_id);
-                let lazy_session_key = plug_core::downstream_identity::DownstreamTransport::Ipc
-                    .lazy_session_key(replaced_session_id);
-                ctx.engine
-                    .tool_router()
-                    .clear_lazy_session(&lazy_session_key);
+            }
+            // One registration per connection: one this connection made
+            // earlier for another client id ends now.
+            if let Some(previous) = previous_session_id
+                && registration.replaced_session_id.as_ref() != Some(&previous)
+            {
+                end_ipc_session(ctx, &previous).await;
             }
             let session_id = registration.session_id;
             ctx.session_id = Some(session_id.clone());
@@ -2063,46 +1843,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::Deregister { session_id } => {
-            // Enforce session ownership — only deregister your own session
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            let removed_client_id = ctx.client_registry.client_id(session_id);
-            ctx.client_registry.deregister(session_id);
-            let target = plug_core::notifications::NotificationTarget::Ipc {
-                client_id: std::sync::Arc::from(session_id.as_str()),
-            };
-            ctx.engine
-                .tool_router()
-                .cleanup_subscriptions_for_target(&target)
-                .await;
-            ctx.engine
-                .tool_router()
-                .unregister_downstream_bridge(&target);
-            if ctx.engine.tool_router().clear_roots_for_target(&target) {
-                ctx.engine
-                    .tool_router()
-                    .forward_roots_list_changed_to_upstreams()
-                    .await;
-            }
-            ctx.engine.tool_router().remove_client_log_level(session_id);
-            let lazy_session_key = plug_core::downstream_identity::DownstreamTransport::Ipc
-                .lazy_session_key(session_id);
-            ctx.engine
-                .tool_router()
-                .clear_lazy_session(&lazy_session_key);
-            if let Some(client_id) = removed_client_id
-                && !ctx.client_registry.client_sessions.contains_key(&client_id)
-            {
-                ctx.engine.tool_router().revoke_continuations_for_principal(
-                    &plug_core::downstream_identity::ipc_registry_principal(&client_id),
-                );
-                let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
-                ctx.engine
-                    .tool_router()
-                    .cleanup_tasks_for_owner(&owner)
-                    .await;
-            }
+            end_ipc_session(ctx, session_id).await;
             ctx.session_id = None;
             ctx.reverse_request_rx = None;
             IpcResponse::Ok
@@ -2112,10 +1853,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             client_info,
         } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             if ctx
                 .client_registry
                 .update_client_info(session_id, client_info.clone())
@@ -2134,12 +1871,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
-        IpcRequest::Ping { session_id } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            IpcResponse::Pong
-        }
+        IpcRequest::Ping { .. } => IpcResponse::Pong,
 
         IpcRequest::ListTools => {
             let tool_router = ctx.engine.tool_router();
@@ -2188,35 +1920,13 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             IpcResponse::Tools { tools: ipc_tools }
         }
         IpcRequest::ListLiveSessions => IpcResponse::LiveSessions {
-            sessions: {
-                let mut sessions = ctx.client_registry.list_live_sessions();
-                if let Some(http_sessions) = ctx.http_sessions.as_ref() {
-                    sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
-                }
-                sessions.sort_by(|a, b| {
-                    let transport_order =
-                        |transport: plug_core::ipc::LiveSessionTransport| match transport {
-                            plug_core::ipc::LiveSessionTransport::DaemonProxy => 0,
-                            plug_core::ipc::LiveSessionTransport::Http => 1,
-                            plug_core::ipc::LiveSessionTransport::Sse => 2,
-                        };
-                    transport_order(a.transport)
-                        .cmp(&transport_order(b.transport))
-                        .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
-                        .then(a.session_id.cmp(&b.session_id))
-                });
-                sessions
-            },
-            scope: if ctx.http_sessions.is_some() {
-                plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-            } else {
-                plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly
-            },
+            sessions: plug_core::session::live_sessions(
+                ctx.client_registry.list_live_sessions(),
+                &ctx.http.sessions,
+            ),
+            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
         },
         IpcRequest::Capabilities { session_id } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             // Capabilities are negotiated once per session and never
             // revisited, so answering from a catalog that is still filling
             // would tell a client the daemon has no tools and leave it with no
@@ -2236,20 +1946,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
-        IpcRequest::ModernDownstreamGate { session_id } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            IpcResponse::ModernDownstreamGate {
-                enabled: ctx.engine.tool_router().modern_downstream_enabled(),
-            }
-        }
+        IpcRequest::ModernDownstreamGate { .. } => IpcResponse::ModernDownstreamGate {
+            enabled: ctx.engine.tool_router().modern_downstream_enabled(),
+        },
 
         IpcRequest::UpdateRoots { session_id, roots } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             match serde_json::from_value::<Vec<rmcp::model::Root>>(roots.clone()) {
                 Ok(parsed_roots) => {
                     let target = plug_core::notifications::NotificationTarget::Ipc {
@@ -2278,10 +1979,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             capabilities,
         } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             if ctx
                 .client_registry
                 .update_capabilities(session_id, *capabilities.clone())
@@ -2300,9 +1997,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::RestoreResourceSubscriptions { session_id, uris } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: Arc::from(session_id.as_str()),
             };
@@ -2366,27 +2060,14 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             method,
             params,
-        } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await
-        }
+        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await,
 
         IpcRequest::McpRequestWithContext {
             session_id,
             method,
             params,
             context,
-        } => {
-            // Context-bearing requests use the same connection ownership
-            // rules as the legacy IPC request shape.
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await
-        }
+        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await,
 
         IpcRequest::CancelMcpRequest {
             session_id,
@@ -2907,7 +2588,7 @@ mod tests {
 
     #[test]
     fn cancellation_identity_cannot_cross_client_boundary() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let first = registry.register("first-client".to_string(), Some("client".to_string()), None);
         let second = registry.register(
             "second-client".to_string(),
@@ -3022,7 +2703,7 @@ mod tests {
     pub(super) fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
         let config = plug_core::config::load_config(Some(&config_path)).unwrap();
         let engine = Arc::new(Engine::new(config));
-        let (client_registry, _count_rx) = ClientRegistry::new();
+        let client_registry = ClientRegistry::new();
         test_connection_context(
             &engine,
             CancellationToken::new(),
@@ -3046,8 +2727,11 @@ mod tests {
             config_path: config_path.into(),
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
+            http: Arc::new(HttpState::new(
+                Arc::clone(engine.tool_router()),
+                Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )),
             session_id: None,
             reverse_request_rx: None,
         }
@@ -3110,12 +2794,11 @@ mod tests {
         let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let mut ctx = auth_status_test_context(config_path);
-        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let session_id = session_store.create_session().expect("session");
-        session_store
+        let session_id = ctx.http.sessions.create_session().expect("session");
+        ctx.http
+            .sessions
             .set_client_type(&session_id, plug_core::types::ClientType::ClaudeDesktop)
             .expect("set client type");
-        ctx.http_sessions = Some(Arc::new(session_store));
 
         let response = dispatch_request(&IpcRequest::ListLiveSessions, &mut ctx).await;
         let IpcResponse::LiveSessions { sessions, scope } = response else {
@@ -3138,130 +2821,90 @@ mod tests {
         std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
-    // Paused time: spawn_grace_period_task only awaits in-memory watch
-    // channels and a fixed timer (no real I/O), so tokio's auto-advance
-    // fires the grace-period timer instantly instead of burning 1.5s of
-    // wall-clock per test.
-    #[tokio::test(start_paused = true)]
-    async fn grace_period_shuts_down_when_no_http_sessions() {
-        let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None, None);
-
-        let daemon_cancel = CancellationToken::new();
-        let grace_cancel = CancellationToken::new();
-
-        spawn_grace_period_task(
-            1,
-            count_rx,
-            None,
-            daemon_cancel.clone(),
-            grace_cancel.clone(),
+    /// The app and `plug auth clients revoke` revoke over the socket. That
+    /// used to end the client's sessions but leave the tasks it owned.
+    #[tokio::test]
+    async fn revoking_a_client_over_ipc_ends_its_sessions_and_its_tasks() {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server("echo"));
+        let engine = Arc::new(Engine::new(config));
+        engine.start().await.expect("engine start");
+        let oauth_path =
+            std::env::temp_dir().join(format!("plug-daemon-revoke-{}.json", uuid::Uuid::new_v4()));
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            plug_core::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: vec!["tools:read".to_string()],
+                local_port: 3282,
+            },
+            oauth_path.clone(),
+        )
+        .expect("OAuth manager");
+        let client = manager
+            .register_client(
+                plug_core::downstream_oauth::ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example/callback".to_string()],
+                    client_name: Some("revoked client".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "daemon-revoke-test",
+            )
+            .await
+            .expect("register client");
+        let mut ctx = test_connection_context(
+            &engine,
+            CancellationToken::new(),
+            ClientRegistry::new(),
+            "/tmp/plug-daemon-revoke-config.toml",
         );
+        ctx.http = Arc::new(
+            HttpState::new(
+                Arc::clone(engine.tool_router()),
+                Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_downstream_oauth(Some(manager.clone())),
+        );
+        let session_id = ctx.http.sessions.create_session().expect("session");
+        ctx.http
+            .sessions
+            .set_grant(&session_id, client.client_id.clone())
+            .expect("set grant");
+        let resource = manager.resource();
+        let owner = plug_core::downstream_identity::HttpCredential::Grant {
+            issuer: manager.base_url(),
+            client_id: &client.client_id,
+            resource: &resource,
+        }
+        .task_owner(None);
+        let router = Arc::clone(engine.tool_router());
+        router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue a task for the client");
 
-        registry.deregister(&registration.session_id);
+        let response = dispatch_request(
+            &IpcRequest::RevokeDownstreamClient {
+                auth_token: "test-token".to_string(),
+                client_id: client.client_id.clone(),
+            },
+            &mut ctx,
+        )
+        .await;
 
-        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(
-            daemon_cancel.is_cancelled(),
-            "daemon should shut down once grace expires with no IPC clients and no HTTP sessions"
+            matches!(response, IpcResponse::DownstreamClientRevoked { .. }),
+            "{response:?}"
         );
-
-        grace_cancel.cancel();
-    }
-
-    // Paused time: same rationale as grace_period_shuts_down_when_no_http_sessions.
-    #[tokio::test(start_paused = true)]
-    async fn grace_period_rearms_when_http_sessions_drain_to_zero() {
-        let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None, None);
-
-        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let http_session_id = session_store.create_session().expect("session");
-        let http_sessions: Arc<dyn SessionStore> = Arc::new(session_store);
-
-        let daemon_cancel = CancellationToken::new();
-        let grace_cancel = CancellationToken::new();
-
-        spawn_grace_period_task(
-            1,
-            count_rx,
-            Some(http_sessions.clone()),
-            daemon_cancel.clone(),
-            grace_cancel.clone(),
-        );
-
-        // Last IPC client disconnects -> grace countdown starts.
-        registry.deregister(&registration.session_id);
-
-        // Grace period (1s) expires while the HTTP session is still active: the
-        // daemon must NOT fall back to an IPC-only wait and must stay alive.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            !daemon_cancel.is_cancelled(),
-            "daemon should stay alive while HTTP sessions are active"
-        );
-
-        // Drain the HTTP session; the bounded re-check loop (1s poll) should
-        // notice on its next tick and shut the daemon down.
-        http_sessions.remove(&http_session_id);
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            daemon_cancel.is_cancelled(),
-            "daemon should shut down within one re-check interval of HTTP sessions draining to zero"
-        );
-
-        grace_cancel.cancel();
-    }
-
-    // Paused time: same rationale as grace_period_shuts_down_when_no_http_sessions.
-    #[tokio::test(start_paused = true)]
-    async fn grace_period_ipc_reconnect_during_held_alive_resumes_watching() {
-        let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None, None);
-
-        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let _http_session_id = session_store.create_session().expect("session");
-        let http_sessions: Arc<dyn SessionStore> = Arc::new(session_store);
-
-        let daemon_cancel = CancellationToken::new();
-        let grace_cancel = CancellationToken::new();
-
-        spawn_grace_period_task(
-            1,
-            count_rx,
-            Some(http_sessions),
-            daemon_cancel.clone(),
-            grace_cancel.clone(),
-        );
-
-        registry.deregister(&registration.session_id);
-
-        // Grace period expires with the HTTP session still active -> the daemon
-        // is held alive and enters the bounded re-check loop.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(!daemon_cancel.is_cancelled());
-
-        // An IPC client reconnects while the daemon is held alive by the HTTP session.
-        let reconnect = registry.register("client-2".to_string(), None, None);
-
-        // Give the re-check loop's `count_rx.changed()` branch time to observe it.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !daemon_cancel.is_cancelled(),
-            "daemon must not shut down once an IPC client reconnects"
-        );
-
-        // Disconnecting again should start a *fresh* grace period (the task
-        // returned to the outer watch loop, not a stale re-check that fires
-        // immediately).
-        registry.deregister(&reconnect.session_id);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !daemon_cancel.is_cancelled(),
-            "a fresh grace period should not have expired yet"
-        );
-
-        grace_cancel.cancel();
+        assert!(ctx.http.sessions.validate(&session_id).is_err());
+        assert_eq!(router.task_count_for_owner(&owner).await, 0);
+        engine.shutdown().await;
+        let _ = std::fs::remove_file(oauth_path);
     }
 
     #[test]
@@ -3451,7 +3094,7 @@ mod tests {
         let daemon = {
             let engine = engine.clone();
             let config_path = config_path.clone();
-            tokio::spawn(async move { run_daemon(engine, config_path, 30, None).await })
+            tokio::spawn(async move { run_daemon(engine, config_path).await })
         };
 
         let sock_path = socket_path();
@@ -3511,7 +3154,7 @@ mod tests {
         std::fs::write(&config_path, "").expect("write config");
         let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
 
-        let result = run_daemon(engine, config_path, 0, None).await;
+        let result = run_daemon(engine, config_path).await;
         assert!(result.is_err(), "losing concurrent start should fail");
 
         let token_after =
@@ -3552,7 +3195,7 @@ mod tests {
         std::fs::write(&config_path, "").expect("write config");
         let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
 
-        let result = run_daemon(engine, config_path, 0, None).await;
+        let result = run_daemon(engine, config_path).await;
         assert!(
             result.is_err(),
             "startup with a blocking socket directory should fail"
@@ -3621,7 +3264,7 @@ mod tests {
         use plug_core::proxy::DownstreamBridge;
         use rmcp::model::{ClientCapabilities, ElicitRequestParams};
 
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let registry = Arc::new(registry);
         let reg_result =
             registry.register("test-client".to_string(), Some("test".to_string()), None);
@@ -3694,7 +3337,7 @@ mod tests {
         use plug_core::proxy::DownstreamBridge;
         use rmcp::model::ClientCapabilities;
 
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let registry = Arc::new(registry);
         let reg_result =
             registry.register("test-client".to_string(), Some("test".to_string()), None);
@@ -3831,7 +3474,7 @@ mod tests {
             let cancel = CancellationToken::new();
 
             // Server side: accept exactly one connection and run the real handler.
-            let (client_registry, _count_rx) = ClientRegistry::new();
+            let client_registry = ClientRegistry::new();
             let ctx = test_connection_context(
                 &engine,
                 cancel.clone(),
@@ -4073,7 +3716,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
 
-        let (client_registry, _count_rx) = ClientRegistry::new();
+        let client_registry = ClientRegistry::new();
         let session_id = "idle-reverse-session".to_string();
 
         // Pre-seed `session_id` and a hand-built reverse-request channel
@@ -4228,7 +3871,7 @@ mod tests {
         let _ = std::fs::remove_file(&socket_path);
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
-        let (client_registry, _count_rx) = ClientRegistry::new();
+        let client_registry = ClientRegistry::new();
         let mut ctx = test_connection_context(
             &engine,
             cancel.clone(),
@@ -4299,7 +3942,7 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
 
-        let (client_registry, _count_rx) = ClientRegistry::new();
+        let client_registry = ClientRegistry::new();
         let session_id = "failed-dereg-session".to_string();
 
         // Same hand-built harness as
@@ -4597,8 +4240,7 @@ mod tests {
         engine.start().await.expect("engine start");
         let state = Arc::new(plug_core::http::server::HttpState::new(
             engine.tool_router().clone(),
-            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-                as Arc<dyn SessionStore>,
+            Arc::new(plug_core::session::SessionStore::new(1800, 100)),
             CancellationToken::new(),
         ));
         let app = plug_core::http::server::build_router(state);
@@ -5453,7 +5095,7 @@ mod tests {
             plug_core::ipc::IPC_PROTOCOL_VERSION_MIN - 1,
             plug_core::ipc::IPC_PROTOCOL_VERSION + 1,
         ] {
-            let (client_registry, _count_rx) = ClientRegistry::new();
+            let client_registry = ClientRegistry::new();
             let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
             let mut ctx = test_connection_context(
                 &engine,

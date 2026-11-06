@@ -211,11 +211,6 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         old.disabled_tools != new.disabled_tools,
         "disabled_tools changed",
     );
-    note_restart_required(
-        &mut restart_required,
-        old.daemon_grace_period_secs != new.daemon_grace_period_secs,
-        "daemon_grace_period_secs changed",
-    );
 
     let enriched = |config: &Config| -> std::collections::BTreeSet<String> {
         config

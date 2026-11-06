@@ -1,27 +1,24 @@
 use std::collections::VecDeque;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use crate::http::error::HttpError;
-
 use super::{
-    DownstreamSessionSnapshot, DownstreamTransport, SessionSendOutcome, SessionStore, SseEvent,
-    SseMessage, SseReplayKey,
+    DownstreamSessionSnapshot, SessionError, SessionSendOutcome, SseEvent, SseMessage, SseReplayKey,
 };
 
-/// Current in-memory stateful downstream session store.
-pub struct StatefulSessionStore {
-    sessions: Arc<DashMap<String, SessionState>>,
+/// The in-memory store of downstream HTTP sessions.
+pub struct SessionStore {
+    sessions: DashMap<String, SessionState>,
     admission_lock: std::sync::Mutex<()>,
     max_sessions: usize,
     timeout: Duration,
-    /// Optional channel to notify when sessions are implicitly removed (expiry).
-    /// The receiver should clean up any subscription state for the expired session.
-    expiry_tx: Option<mpsc::UnboundedSender<String>>,
+    /// Where sessions that lapse inside the store are reported, so what the
+    /// daemon holds for them is released. See [`SessionEnd::Lapsed`].
+    lapsed_tx: OnceLock<mpsc::UnboundedSender<String>>,
     /// Sessions their own client closed, newest last. These stay closed; any
     /// other session Plug no longer has may be reopened.
     closed: std::sync::Mutex<VecDeque<String>>,
@@ -29,6 +26,20 @@ pub struct StatefulSessionStore {
 
 /// How many closed sessions are remembered.
 const CLOSED_SESSIONS_KEPT: usize = 512;
+
+/// Why a session left the store. What each one implies is decided in
+/// [`SessionStore::forget`] and nowhere else.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionEnd {
+    /// Its client sent `DELETE`. The id is never opened again.
+    ClosedByClient,
+    /// The grant that opened it was revoked.
+    Revoked,
+    /// It timed out, was dropped to make room, or the sign-in behind it
+    /// ended. Found inside the store with no caller to release it, so it is
+    /// reported to the listener instead.
+    Lapsed,
+}
 
 struct SessionState {
     last_activity: Instant,
@@ -53,9 +64,9 @@ impl SessionState {
     }
 }
 
-impl StatefulSessionStore {
-    /// Return a transport-aware snapshot of tracked HTTP sessions.
-    pub fn list_sessions(&self) -> Vec<DownstreamSessionSnapshot> {
+impl SessionStore {
+    /// The live sessions, by session id.
+    pub fn snapshots(&self) -> Vec<DownstreamSessionSnapshot> {
         let timeout = self.timeout;
 
         let mut snapshots: Vec<DownstreamSessionSnapshot> = self
@@ -69,7 +80,6 @@ impl StatefulSessionStore {
 
                 Some(DownstreamSessionSnapshot {
                     session_id: entry.key().clone(),
-                    transport: DownstreamTransport::Http,
                     client_type: state.client_type,
                     grant: state.grant.clone(),
                     connected_seconds: state.created_at.elapsed().as_secs(),
@@ -85,11 +95,11 @@ impl StatefulSessionStore {
 
     pub fn new(timeout_secs: u64, max_sessions: usize) -> Self {
         Self {
-            sessions: Arc::new(DashMap::new()),
+            sessions: DashMap::new(),
             admission_lock: std::sync::Mutex::new(()),
             max_sessions,
             timeout: Duration::from_secs(timeout_secs),
-            expiry_tx: None,
+            lapsed_tx: OnceLock::new(),
             closed: std::sync::Mutex::new(VecDeque::new()),
         }
     }
@@ -114,27 +124,77 @@ impl StatefulSessionStore {
         );
     }
 
-    /// Set a channel that receives session IDs when sessions are implicitly removed
-    /// (timeout expiry). This allows callers to clean up external state like
-    /// resource subscriptions.
-    pub fn with_expiry_notifier(mut self, tx: mpsc::UnboundedSender<String>) -> Self {
-        self.expiry_tx = Some(tx);
-        self
+    /// Report every session that lapses from now on to `tx`. A store has
+    /// one listener; a second is refused.
+    pub(crate) fn report_lapses_to(
+        &self,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Result<(), mpsc::UnboundedSender<String>> {
+        self.lapsed_tx.set(tx)
     }
 
-    /// Remove `session_id` if it is still expired at the moment of removal,
-    /// and report it to the expiry listener. See [`remove_if_expired`].
+    /// End `session_id` for `why`. A caller that ends a session releases
+    /// what the daemon holds for it itself; only a lapse is reported.
+    pub(crate) fn end(&self, session_id: &str, why: SessionEnd) -> bool {
+        let removed = self.sessions.remove(session_id).is_some();
+        if removed {
+            self.forget(session_id, why);
+        }
+        removed
+    }
+
+    /// What a session's leaving implies, once it has left.
+    fn forget(&self, session_id: &str, why: SessionEnd) {
+        tracing::debug!(session_id = %session_id, ?why, "session ended");
+        match why {
+            SessionEnd::ClosedByClient => {
+                let mut closed = self.closed.lock().expect("closed sessions mutex poisoned");
+                if closed.len() == CLOSED_SESSIONS_KEPT {
+                    closed.pop_front();
+                }
+                closed.push_back(session_id.to_owned());
+            }
+            SessionEnd::Revoked => {}
+            SessionEnd::Lapsed => {
+                if let Some(tx) = self.lapsed_tx.get() {
+                    let _ = tx.send(session_id.to_owned());
+                }
+            }
+        }
+    }
+
+    /// Remove `session_id` only if it is still expired under the map's shard
+    /// lock. Checking expiry and removing in two steps let a request that
+    /// touched the session in between lose its session anyway: the listener
+    /// tore down its bridge, subscriptions, and tasks while the client was
+    /// still using it.
     fn remove_if_expired(&self, session_id: &str) -> bool {
-        remove_if_expired(
-            &self.sessions,
-            self.timeout,
-            self.expiry_tx.as_ref(),
-            session_id,
-        )
+        let timeout = self.timeout;
+        let removed = self
+            .sessions
+            .remove_if(session_id, |_, state| {
+                state.last_activity.elapsed() > timeout
+            })
+            .is_some();
+        if removed {
+            self.forget(session_id, SessionEnd::Lapsed);
+        }
+        removed
     }
 
+    /// Remove every expired session, rechecking each at removal time. Returns
+    /// how many were removed.
     fn prune_expired_sessions(&self) -> usize {
-        prune_expired_sessions(&self.sessions, self.timeout, self.expiry_tx.as_ref())
+        let candidates: Vec<String> = self
+            .sessions
+            .iter()
+            .filter(|entry| entry.last_activity.elapsed() > self.timeout)
+            .map(|entry| entry.key().clone())
+            .collect();
+        candidates
+            .iter()
+            .filter(|session_id| self.remove_if_expired(session_id))
+            .count()
     }
 
     /// Whether there is room for one more session, after dropping expired ones
@@ -169,9 +229,7 @@ impl StatefulSessionStore {
             .is_some();
         if removed {
             tracing::info!(session = %session_id, "dropped the quietest session to make room");
-            if let Some(tx) = &self.expiry_tx {
-                let _ = tx.send(session_id);
-            }
+            self.forget(&session_id, SessionEnd::Lapsed);
         }
         self.sessions.len() < self.max_sessions
     }
@@ -223,34 +281,24 @@ impl StatefulSessionStore {
         &self,
         session_id: &str,
         mut f: impl FnMut(&mut SessionState) -> T,
-    ) -> Result<T, HttpError> {
+    ) -> Result<T, SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
 
         if entry.last_activity.elapsed() > self.timeout {
             drop(entry);
             self.remove_if_expired(session_id);
-            return Err(HttpError::SessionNotFound);
+            return Err(SessionError::NotFound);
         }
         if entry.access_ended() {
             drop(entry);
-            self.end(session_id);
-            return Err(HttpError::SessionNotFound);
+            self.end(session_id, SessionEnd::Lapsed);
+            return Err(SessionError::NotFound);
         }
 
         Ok(f(&mut entry))
-    }
-
-    /// Remove a session and have the daemon release what it holds for it,
-    /// as for one that timed out.
-    fn end(&self, session_id: &str) -> bool {
-        let removed = self.sessions.remove(session_id).is_some();
-        if removed && let Some(tx) = &self.expiry_tx {
-            let _ = tx.send(session_id.to_owned());
-        }
-        removed
     }
 
     fn try_send_to_session(
@@ -270,7 +318,7 @@ impl StatefulSessionStore {
                 remove_session = true;
             } else if entry.access_ended() {
                 drop(entry);
-                self.end(session_id);
+                self.end(session_id, SessionEnd::Lapsed);
                 return SessionSendOutcome::SessionNotFound;
             } else if let Some(sender) = entry.sse_sender.clone() {
                 let event = Self::next_event(&mut entry, message);
@@ -339,10 +387,6 @@ impl StatefulSessionStore {
     ///
     /// Returns `true` if the event was delivered live, `false` if it was
     /// queued (or the session vanished in the interim).
-    ///
-    /// Extracted (mirroring `clear_sender_if_matching`) so the race-guard
-    /// decision can be exercised directly by tests without relying on real
-    /// thread interleaving.
     fn enqueue_or_deliver_racy(&self, session_id: &str, event: SseEvent) -> bool {
         let Some(mut entry) = self.sessions.get_mut(session_id) else {
             return false;
@@ -371,9 +415,6 @@ impl StatefulSessionStore {
     /// reconnecting client may have installed a fresh, live sender in the window
     /// between `try_send_to_session` releasing and re-acquiring this entry's guard,
     /// and wiping that out would silently break the new connection.
-    ///
-    /// Extracted from `try_send_to_session` so the race-guard decision can be
-    /// exercised directly by tests without relying on real thread interleaving.
     fn clear_sender_if_matching(
         &self,
         session_id: &str,
@@ -468,14 +509,14 @@ impl StatefulSessionStore {
     }
 }
 
-impl SessionStore for StatefulSessionStore {
-    fn create_session(&self) -> Result<String, HttpError> {
+impl SessionStore {
+    pub fn create_session(&self) -> Result<String, SessionError> {
         let _guard = self
             .admission_lock
             .lock()
             .expect("session admission mutex poisoned");
         if !self.make_room() {
-            return Err(HttpError::TooManySessions);
+            return Err(SessionError::TooMany);
         }
 
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -485,10 +526,14 @@ impl SessionStore for StatefulSessionStore {
         Ok(session_id)
     }
 
-    fn reopen_session(&self, session_id: &str) -> Result<bool, HttpError> {
+    /// Open a session again under the id its client still holds, after Plug
+    /// restarted or the session timed out. `Ok(true)` when this call opened
+    /// it, `Ok(false)` when it was open already. A session its client closed
+    /// is not reopened.
+    pub fn reopen_session(&self, session_id: &str) -> Result<bool, SessionError> {
         // Plug only ever hands out UUIDs, so nothing else can be one it lost.
         if uuid::Uuid::parse_str(session_id).is_err() {
-            return Err(HttpError::SessionNotFound);
+            return Err(SessionError::NotFound);
         }
         let _guard = self
             .admission_lock
@@ -505,10 +550,10 @@ impl SessionStore for StatefulSessionStore {
             .iter()
             .any(|closed| closed == session_id)
         {
-            return Err(HttpError::SessionNotFound);
+            return Err(SessionError::NotFound);
         }
         if !self.make_room() {
-            return Err(HttpError::TooManySessions);
+            return Err(SessionError::TooMany);
         }
         self.insert_new(session_id.to_owned());
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
@@ -517,26 +562,26 @@ impl SessionStore for StatefulSessionStore {
         Ok(true)
     }
 
-    fn validate(&self, session_id: &str) -> Result<(), HttpError> {
+    pub fn validate(&self, session_id: &str) -> Result<(), SessionError> {
         self.with_live_session_mut(session_id, |entry| {
             entry.last_activity = Instant::now();
         })
     }
 
-    fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, HttpError> {
+    pub fn has_live_sse_sender(&self, session_id: &str) -> Result<bool, SessionError> {
         self.with_live_session_mut(session_id, |entry| entry.sse_sender.is_some())
     }
 
-    fn set_sse_sender(
+    pub fn set_sse_sender(
         &self,
         session_id: &str,
         sender: mpsc::Sender<SseEvent>,
         last_event_id: Option<u64>,
-    ) -> Result<(), HttpError> {
+    ) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
         entry.last_activity = Instant::now();
         entry.sse_sender = Some(sender);
         // Clone before mut borrow: send_replay_events may clear sse_sender on fail.
@@ -552,76 +597,73 @@ impl SessionStore for StatefulSessionStore {
         Ok(())
     }
 
-    fn set_client_type(
+    pub fn set_client_type(
         &self,
         session_id: &str,
         client_type: crate::types::ClientType,
-    ) -> Result<(), HttpError> {
+    ) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
         entry.client_type = client_type;
         Ok(())
     }
 
-    fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), HttpError> {
+    pub fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
         entry.grant = Some(client_id);
         Ok(())
     }
 
-    fn set_access_check(
+    pub fn set_access_check(
         &self,
         session_id: &str,
         check: crate::session::AccessCheck,
-    ) -> Result<(), HttpError> {
+    ) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
         entry.still_allowed = Some(check);
         Ok(())
     }
 
-    fn set_broadcast_audience(
+    pub fn set_broadcast_audience(
         &self,
         session_id: &str,
         audience: crate::session::BroadcastAudience,
-    ) -> Result<(), HttpError> {
+    ) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
         entry.broadcast_audience = audience;
         Ok(())
     }
 
-    fn get_client_type(&self, session_id: &str) -> Result<crate::types::ClientType, HttpError> {
+    pub fn get_client_type(
+        &self,
+        session_id: &str,
+    ) -> Result<crate::types::ClientType, SessionError> {
         let entry = self
             .sessions
             .get(session_id)
-            .ok_or(HttpError::SessionNotFound)?;
+            .ok_or(SessionError::NotFound)?;
         Ok(entry.client_type)
     }
 
-    fn remove(&self, session_id: &str) -> bool {
-        let removed = self.sessions.remove(session_id).is_some();
-        if removed {
-            tracing::debug!(session_id = %session_id, "session removed");
-            let mut closed = self.closed.lock().expect("closed sessions mutex poisoned");
-            if closed.len() == CLOSED_SESSIONS_KEPT {
-                closed.pop_front();
-            }
-            closed.push_back(session_id.to_owned());
-        }
-        removed
+    pub fn broadcast(&self, message: SseMessage, kind: crate::session::BroadcastKind) {
+        self.broadcast_where(message, kind, &|_| true);
     }
 
-    fn broadcast_where(
+    /// [`SessionStore::broadcast`] to the sessions `allowed` passes, asked
+    /// with the OAuth client that opened each one. Asked at delivery, so a
+    /// rule changed a moment ago already applies.
+    pub fn broadcast_where(
         &self,
         message: SseMessage,
         kind: crate::session::BroadcastKind,
@@ -671,15 +713,19 @@ impl SessionStore for StatefulSessionStore {
             self.remove_if_expired(&session_id);
         }
         for session_id in ended {
-            self.end(&session_id);
+            self.end(&session_id, SessionEnd::Lapsed);
         }
     }
 
-    fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> SessionSendOutcome {
+    pub fn send_to_live_session(
+        &self,
+        session_id: &str,
+        message: SseMessage,
+    ) -> SessionSendOutcome {
         self.try_send_to_session(session_id, message, true)
     }
 
-    fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
+    pub fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             entry
                 .replay_events
@@ -690,10 +736,10 @@ impl SessionStore for StatefulSessionStore {
         }
     }
 
-    fn spawn_cleanup_task(&self, cancel: CancellationToken) {
-        let sessions = Arc::clone(&self.sessions);
-        let timeout = self.timeout;
-        let expiry_tx = self.expiry_tx.clone();
+    /// Drop expired sessions every 30 seconds until `cancel` fires or the
+    /// store is gone.
+    pub(crate) fn spawn_cleanup_task(self: &Arc<Self>, cancel: CancellationToken) {
+        let store = Arc::downgrade(self);
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(30));
@@ -707,10 +753,12 @@ impl SessionStore for StatefulSessionStore {
                         break;
                     }
                     _ = interval.tick() => {
-                        let expired =
-                            prune_expired_sessions(&sessions, timeout, expiry_tx.as_ref());
+                        let Some(store) = store.upgrade() else {
+                            break;
+                        };
+                        let expired = store.prune_expired_sessions();
                         if expired > 0 {
-                            tracing::info!(expired, remaining = sessions.len(), "cleaned up expired sessions");
+                            tracing::info!(expired, remaining = store.sessions.len(), "cleaned up expired sessions");
                         }
                     }
                 }
@@ -718,78 +766,40 @@ impl SessionStore for StatefulSessionStore {
         });
     }
 
-    fn session_count(&self) -> usize {
+    pub fn session_count(&self) -> usize {
         self.sessions.len()
     }
 
-    fn session_snapshots(&self) -> Vec<DownstreamSessionSnapshot> {
-        self.list_sessions()
-    }
-
-    fn grant_of(&self, session_id: &str) -> Option<String> {
+    /// The OAuth client whose token opened `session_id`, when one did.
+    pub fn grant_of(&self, session_id: &str) -> Option<String> {
         self.sessions.get(session_id)?.grant.clone()
     }
 
-    fn end_sessions_of(&self, client_id: &str) -> usize {
-        let ended: Vec<String> = self
-            .sessions
+    /// The sessions `client_id`'s grant opened.
+    pub(crate) fn sessions_of(&self, client_id: &str) -> Vec<String> {
+        self.sessions
             .iter()
             .filter(|entry| entry.grant.as_deref() == Some(client_id))
             .map(|entry| entry.key().clone())
-            .collect();
-        ended
-            .into_iter()
-            .filter(|session_id| self.end(session_id))
-            .count()
+            .collect()
     }
-}
-
-/// Remove `session_id` only if it is still expired under the map's shard
-/// lock, and tell the expiry listener about it.
-///
-/// Checking expiry and removing in two steps let a request that touched the
-/// session in between lose its session anyway: the listener tore down its
-/// bridge, subscriptions, and tasks while the client was still using it.
-fn remove_if_expired(
-    sessions: &DashMap<String, SessionState>,
-    timeout: Duration,
-    expiry_tx: Option<&mpsc::UnboundedSender<String>>,
-    session_id: &str,
-) -> bool {
-    let removed = sessions
-        .remove_if(session_id, |_, state| {
-            state.last_activity.elapsed() > timeout
-        })
-        .is_some();
-    if removed && let Some(tx) = expiry_tx {
-        let _ = tx.send(session_id.to_owned());
-    }
-    removed
-}
-
-/// Remove every expired session, rechecking each at removal time. Returns how
-/// many were removed.
-fn prune_expired_sessions(
-    sessions: &DashMap<String, SessionState>,
-    timeout: Duration,
-    expiry_tx: Option<&mpsc::UnboundedSender<String>>,
-) -> usize {
-    let candidates: Vec<String> = sessions
-        .iter()
-        .filter(|entry| entry.last_activity.elapsed() > timeout)
-        .map(|entry| entry.key().clone())
-        .collect();
-    candidates
-        .iter()
-        .filter(|session_id| remove_if_expired(sessions, timeout, expiry_tx, session_id))
-        .count()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn backdate(store: &StatefulSessionStore, session_id: &str) {
+    fn store_reporting_to(
+        timeout_secs: u64,
+        max_sessions: usize,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> SessionStore {
+        let store = SessionStore::new(timeout_secs, max_sessions);
+        store.report_lapses_to(tx).expect("first listener");
+        store
+    }
+
+    fn backdate(store: &SessionStore, session_id: &str) {
         store
             .sessions
             .get_mut(session_id)
@@ -802,7 +812,7 @@ mod tests {
     #[test]
     fn expiry_rechecks_at_removal_so_a_refreshed_session_survives() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let store = store_reporting_to(60, 100, tx);
         let id = store.create_session().unwrap();
         backdate(&store, &id);
 
@@ -821,7 +831,7 @@ mod tests {
     #[test]
     fn prune_removes_and_reports_each_expired_session_once() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let store = store_reporting_to(60, 100, tx);
         let expired = store.create_session().unwrap();
         let live = store.create_session().unwrap();
         backdate(&store, &expired);
@@ -836,7 +846,7 @@ mod tests {
 
     #[test]
     fn a_session_plug_lost_reopens_under_the_same_id() {
-        let store = StatefulSessionStore::new(1800, 10);
+        let store = SessionStore::new(1800, 10);
         let lost = uuid::Uuid::new_v4().to_string();
 
         assert!(store.reopen_session(&lost).unwrap());
@@ -848,7 +858,7 @@ mod tests {
 
     #[test]
     fn a_reopened_session_ignores_event_ids_it_never_issued() {
-        let store = StatefulSessionStore::new(1800, 10);
+        let store = SessionStore::new(1800, 10);
         let lost = uuid::Uuid::new_v4().to_string();
         assert!(store.reopen_session(&lost).unwrap());
         let message = || SseMessage::from_json_value(serde_json::json!({"n": 1})).unwrap();
@@ -870,7 +880,7 @@ mod tests {
 
     #[test]
     fn an_event_id_from_the_future_is_treated_as_none() {
-        let store = StatefulSessionStore::new(1800, 10);
+        let store = SessionStore::new(1800, 10);
         let id = store.create_session().unwrap();
         store.send_to_live_session(
             &id,
@@ -884,7 +894,7 @@ mod tests {
 
     #[test]
     fn a_session_that_timed_out_reopens() {
-        let store = StatefulSessionStore::new(60, 10);
+        let store = SessionStore::new(60, 10);
         let id = store.create_session().unwrap();
         backdate(&store, &id);
 
@@ -894,38 +904,38 @@ mod tests {
 
     #[test]
     fn a_session_its_client_closed_stays_closed() {
-        let store = StatefulSessionStore::new(1800, 10);
+        let store = SessionStore::new(1800, 10);
         let id = store.create_session().unwrap();
-        assert!(store.remove(&id));
+        assert!(store.end(&id, SessionEnd::ClosedByClient));
 
         assert!(matches!(
             store.reopen_session(&id),
-            Err(HttpError::SessionNotFound)
+            Err(SessionError::NotFound)
         ));
     }
 
     #[test]
     fn only_an_id_plug_could_have_issued_reopens() {
-        let store = StatefulSessionStore::new(1800, 10);
+        let store = SessionStore::new(1800, 10);
         assert!(matches!(
             store.reopen_session("not-a-session"),
-            Err(HttpError::SessionNotFound)
+            Err(SessionError::NotFound)
         ));
     }
 
     #[test]
     fn reopening_respects_the_session_cap() {
-        let store = StatefulSessionStore::new(1800, 1);
+        let store = SessionStore::new(1800, 1);
         store.create_session().unwrap();
         assert!(matches!(
             store.reopen_session(&uuid::Uuid::new_v4().to_string()),
-            Err(HttpError::TooManySessions)
+            Err(SessionError::TooMany)
         ));
     }
 
     #[test]
     fn a_full_store_drops_its_quietest_session_and_takes_it_back_later() {
-        let store = StatefulSessionStore::new(1800, 2);
+        let store = SessionStore::new(1800, 2);
         let quiet_since = |id: &str, secs: u64| {
             store.sessions.get_mut(id).unwrap().last_activity =
                 Instant::now() - Duration::from_secs(secs);
@@ -943,10 +953,7 @@ mod tests {
         assert!(store.validate(&streaming).is_ok());
 
         // Nothing quiet enough is left, so the store is honestly full.
-        assert!(matches!(
-            store.create_session(),
-            Err(HttpError::TooManySessions)
-        ));
+        assert!(matches!(store.create_session(), Err(SessionError::TooMany)));
 
         // The dropped client calls again and gets its session back.
         quiet_since(&newcomer, 90);
@@ -956,7 +963,7 @@ mod tests {
 
     #[test]
     fn create_session_returns_uuid() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         assert!(!id.is_empty());
         assert!(uuid::Uuid::parse_str(&id).is_ok());
@@ -964,14 +971,14 @@ mod tests {
 
     #[test]
     fn validate_existing_session() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         assert!(store.validate(&id).is_ok());
     }
 
     #[test]
     fn live_sse_sender_reports_presence() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         assert!(!store.has_live_sse_sender(&id).unwrap());
         let (tx, _rx) = mpsc::channel(1);
@@ -981,21 +988,21 @@ mod tests {
 
     #[test]
     fn validate_nonexistent_session() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         assert!(store.validate("nonexistent").is_err());
     }
 
     #[test]
     fn remove_session() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
-        assert!(store.remove(&id));
+        assert!(store.end(&id, SessionEnd::ClosedByClient));
         assert!(store.validate(&id).is_err());
     }
 
     #[test]
     fn max_sessions_cap() {
-        let store = StatefulSessionStore::new(1800, 2);
+        let store = SessionStore::new(1800, 2);
         store.create_session().unwrap();
         store.create_session().unwrap();
         assert!(store.create_session().is_err());
@@ -1003,7 +1010,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_prunes_expired_sessions_before_enforcing_cap() {
-        let store = StatefulSessionStore::new(0, 1);
+        let store = SessionStore::new(0, 1);
         store.create_session().unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(store.create_session().is_ok());
@@ -1011,28 +1018,12 @@ mod tests {
 
     #[test]
     fn session_count() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         assert_eq!(store.session_count(), 0);
         let id = store.create_session().unwrap();
         assert_eq!(store.session_count(), 1);
-        store.remove(&id);
+        store.end(&id, SessionEnd::ClosedByClient);
         assert_eq!(store.session_count(), 0);
-    }
-
-    #[test]
-    fn expired_count_does_not_underflow_when_map_grows_during_retain() {
-        // Mirrors the cleanup task's pre-fix subtraction of the post-retain
-        // count from the pre-retain count: a concurrent insert racing
-        // `retain()` can leave the post-retain count greater than the
-        // pre-retain count. The fixed formula must saturate to 0 instead of
-        // underflowing (a panic with overflow-checks on, a huge wrapped
-        // value in release builds).
-        let before: usize = 1;
-        let after_growth: usize = 4;
-        assert_eq!(before.saturating_sub(after_growth), 0);
-
-        // Sanity: the ordinary shrinking case still reports the real count.
-        assert_eq!(5usize.saturating_sub(2), 3);
     }
 
     #[tokio::test(start_paused = true)]
@@ -1049,7 +1040,7 @@ mod tests {
         // as expired, so we don't need a real 30s sleep to observe the
         // cleanup task's fixed 30s tick doing its job; `time::advance` alone
         // drives the interval.
-        let store = StatefulSessionStore::new(0, 100);
+        let store = Arc::new(SessionStore::new(0, 100));
         let cancel = CancellationToken::new();
         store.spawn_cleanup_task(cancel.clone());
 
@@ -1084,19 +1075,18 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_reports_transport_and_client_type() {
-        let store = StatefulSessionStore::new(1800, 100);
+    fn snapshots_report_client_type() {
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         store
             .set_client_type(&id, crate::types::ClientType::Cursor)
             .unwrap();
 
-        let snapshots = store.list_sessions();
+        let snapshots = store.snapshots();
         assert_eq!(snapshots.len(), 1);
 
         let snapshot = &snapshots[0];
         assert_eq!(snapshot.session_id, id);
-        assert_eq!(snapshot.transport, DownstreamTransport::Http);
         assert_eq!(snapshot.client_type, crate::types::ClientType::Cursor);
         assert_eq!(snapshot.grant, None);
         assert_eq!(snapshot.timeout_seconds, 1800);
@@ -1108,7 +1098,7 @@ mod tests {
     fn a_session_ends_once_its_client_no_longer_has_access() {
         use std::sync::atomic::{AtomicBool, Ordering};
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let store = store_reporting_to(60, 100, tx);
         let used = store.create_session().unwrap();
         let idle = store.create_session().unwrap();
         let other = store.create_session().unwrap();
@@ -1169,7 +1159,7 @@ mod tests {
 
     #[test]
     fn a_message_goes_only_to_the_sessions_allowed_when_it_is_sent() {
-        let store = StatefulSessionStore::new(60, 100);
+        let store = SessionStore::new(60, 100);
         let theirs = store.create_session().unwrap();
         let shared = store.create_session().unwrap();
         store.set_grant(&theirs, "client-abc".to_string()).unwrap();
@@ -1199,9 +1189,9 @@ mod tests {
     }
 
     #[test]
-    fn taking_a_clients_access_away_ends_its_sessions_and_only_its() {
+    fn a_revoked_session_ends_unreported_and_may_reopen() {
         let (tx, mut rx) = mpsc::unbounded_channel();
-        let store = StatefulSessionStore::new(60, 100).with_expiry_notifier(tx);
+        let store = store_reporting_to(60, 100, tx);
         let theirs = store.create_session().unwrap();
         let other = store.create_session().unwrap();
         let unowned = store.create_session().unwrap();
@@ -1212,29 +1202,29 @@ mod tests {
         assert_eq!(store.grant_of(&theirs).as_deref(), Some("client-abc"));
         assert_eq!(store.grant_of(&unowned), None);
 
-        assert_eq!(store.end_sessions_of("client-abc"), 1);
+        assert_eq!(store.sessions_of("client-abc"), vec![theirs.clone()]);
+        assert!(store.end(&theirs, SessionEnd::Revoked));
         assert!(store.validate(&theirs).is_err());
         assert!(store.validate(&other).is_ok());
         assert!(store.validate(&unowned).is_ok());
-        // The open stream closes and the daemon is told to clean up.
         assert!(
             events
                 .try_recv()
                 .is_err_and(|error| matches!(error, mpsc::error::TryRecvError::Disconnected))
         );
-        assert_eq!(rx.try_recv().unwrap(), theirs);
+        // The caller that revoked it releases it, so the listener hears
+        // nothing, and the id is not remembered as closed by its client.
+        assert!(rx.try_recv().is_err());
+        assert!(store.reopen_session(&theirs).unwrap());
     }
 
     #[test]
     fn a_session_opened_with_a_grant_reports_that_grant() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
         store.set_grant(&id, "client-abc".to_string()).unwrap();
 
-        assert_eq!(
-            store.list_sessions()[0].grant.as_deref(),
-            Some("client-abc")
-        );
+        assert_eq!(store.snapshots()[0].grant.as_deref(), Some("client-abc"));
         assert!(
             store
                 .set_grant("missing", "client-abc".to_string())
@@ -1243,15 +1233,15 @@ mod tests {
     }
 
     #[test]
-    fn list_sessions_filters_expired_sessions() {
-        let store = StatefulSessionStore::new(0, 100);
+    fn snapshots_filter_expired_sessions() {
+        let store = SessionStore::new(0, 100);
         let id = store.create_session().unwrap();
 
         std::thread::sleep(Duration::from_millis(10));
 
         assert!(
             store
-                .list_sessions()
+                .snapshots()
                 .iter()
                 .all(|snapshot| snapshot.session_id != id)
         );
@@ -1260,7 +1250,7 @@ mod tests {
 
     #[tokio::test]
     async fn expired_session_fails_validation() {
-        let store = StatefulSessionStore::new(0, 100);
+        let store = SessionStore::new(0, 100);
         let id = store.create_session().unwrap();
         tokio::time::sleep(Duration::from_millis(10)).await;
         assert!(store.validate(&id).is_err());
@@ -1268,7 +1258,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_prunes_expired_sessions_before_delivery() {
-        let store = StatefulSessionStore::new(0, 100);
+        let store = SessionStore::new(0, 100);
         let id = store.create_session().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx, None).unwrap();
@@ -1290,7 +1280,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_skips_full_senders_without_blocking_other_sessions() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let slow_id = store.create_session().unwrap();
         let fast_id = store.create_session().unwrap();
 
@@ -1332,7 +1322,7 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_skips_sessions_whose_audience_denies_the_kind() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let narrow_id = store.create_session().unwrap();
         let wide_id = store.create_session().unwrap();
         // Never given an audience: stands in for the window between
@@ -1407,7 +1397,7 @@ mod tests {
 
     #[tokio::test]
     async fn targeted_message_is_requeued_when_sender_is_full() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         let (tx, _rx) = mpsc::channel(1);
@@ -1441,7 +1431,7 @@ mod tests {
     async fn closed_sender_is_cleared_when_no_reconnect_races_in() {
         // Baseline: preserves the pre-fix behavior when nothing installs a new
         // sender in the window between clear detection and clearing.
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         let (tx_a, rx_a) = mpsc::channel(1);
@@ -1466,7 +1456,7 @@ mod tests {
         // reconnected sender (B) -- simulating a client reconnect racing into
         // the window between phase 1 (detecting A failed) and phase 2 (clearing
         // it). B must survive and receive the event that failed to reach A.
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         // Install A and make it fail (closed receiver), as phase 1 of
@@ -1503,7 +1493,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_replays_events_after_last_event_id() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         let (first_tx, mut first_rx) = mpsc::channel(8);
@@ -1535,7 +1525,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_without_last_event_id_drains_pending_only() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         store.send_to_live_session(
@@ -1553,7 +1543,7 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_request_replay_events_are_removed_by_key() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         store.send_to_live_session(
@@ -1579,7 +1569,7 @@ mod tests {
         // first `try_send` failure re-enqueued only that one event and
         // `break`-ed, silently discarding every already-drained, not-yet-sent
         // event after it.
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         for seq in 1..=5u64 {
@@ -1635,7 +1625,7 @@ mod tests {
         // window between phase 1 and phase 2. The racing event must reach
         // the new sender live rather than being stranded in the pending
         // queue until the next reconnect.
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         // No sender yet -- this is what phase 1 of `try_send_to_session`
@@ -1680,7 +1670,7 @@ mod tests {
 
     #[tokio::test]
     async fn replay_empty_queue_is_noop() {
-        let store = StatefulSessionStore::new(1800, 100);
+        let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
         let (tx, mut rx) = mpsc::channel(4);

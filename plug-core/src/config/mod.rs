@@ -71,10 +71,6 @@ pub struct Config {
     /// initialization regardless of its per-server `protocol` setting.
     #[serde(default)]
     pub modern_upstream_enabled: bool,
-    /// Seconds to keep daemon alive after last client disconnects.
-    /// Default is 0, which disables auto-shutdown and keeps the daemon alive
-    /// until explicit shutdown.
-    pub daemon_grace_period_secs: u64,
     #[serde(default)]
     pub supervision: SupervisionConfig,
     #[serde(default, serialize_with = "in_name_order")]
@@ -110,7 +106,6 @@ impl Default for Config {
             secrets: SecretsConfig::default(),
             http: HttpConfig::default(),
             modern_upstream_enabled: false,
-            daemon_grace_period_secs: 0,
             supervision: SupervisionConfig::default(),
             servers: HashMap::new(),
         }
@@ -1361,6 +1356,16 @@ LOG_LEVEL = "debug"
             validate_as_written(&written, &config_path),
             Vec::<String>::new()
         );
+        assert!(load_config(Some(&config_path)).is_ok());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The idle self-shutdown knob is gone; a file that still sets it loads.
+    #[test]
+    fn a_file_setting_the_retired_grace_period_still_loads() {
+        let dir = unique_temp_dir("retired-grace-period");
+        let config_path = dir.join("config.toml");
+        std::fs::write(&config_path, "daemon_grace_period_secs = 30\n").unwrap();
         assert!(load_config(Some(&config_path)).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }

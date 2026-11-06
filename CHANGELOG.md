@@ -17,6 +17,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A `[lazy_tools.clients]` entry may name a client by any of its aliases. An entry naming no known client is ignored; it used to stop the config from loading.
 - `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
 - `plug link` and `plug unlink` answer `--output json` with the clients they changed.
+- `daemon_grace_period_secs` is gone: Plug.app keeps the daemon running, so it never shuts itself down when idle. A config that still sets it loads and the key is ignored.
 - `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.
 - `plug` on its own suggests the same next steps in text as it lists in `--output json`.
 - `plug repair` writes `connect --client <name>` into Codex and Goose settings too, as it already did for JSON settings, and keeps the comments in a Goose file when it links Plug.
@@ -46,6 +47,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Revoking a remote client from the app or with `plug auth clients revoke` ends the tasks it started as well as its sessions. Only a revoke through the local HTTP operator route used to end them.
 - Settings changes are saved for a config whose TLS paths or address use `$NAME`, such as `tls_cert_path = "$HOME/certs/plug.pem"`. Every change made from the app or the command line used to fail on such a config, which judged the path as written rather than its value.
 - `plug doctor` and `plug status` say an `auto` auth mode needs the bearer token when `http.public_base_url` is a public address in front of a loopback listener, as Plug does. They used to report no auth.
 - A `public_base_url` on `[::1]` counts as this Mac, as `127.0.0.1` and `localhost` do.

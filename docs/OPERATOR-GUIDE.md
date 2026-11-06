@@ -237,7 +237,7 @@ Operator inventory:
 
 - `plug tools --output json` includes source metadata, trust boundary, upstream-declared annotations, Plug-inferred annotations, and effective annotations.
 - `plug servers --output json` includes transport/auth/trust metadata. Live daemon output does not serialize secrets.
-- `/_plug/live-sessions` exposes active session inventory for local operator tooling and requires the HMAC request-proof exchange above.
+- `plug clients --output json` lists live sessions, local and HTTP, as the daemon reports them over its socket.
 
 ## Stdio Upstream Sandboxing
 

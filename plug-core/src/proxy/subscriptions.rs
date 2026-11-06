@@ -1550,7 +1550,7 @@ impl super::ToolRouter {
     ///
     /// Iterates all subscription entries and removes the target. When a URI
     /// transitions from 1 → 0 subscribers, forwards `unsubscribe` upstream.
-    pub async fn cleanup_subscriptions_for_target(&self, target: &NotificationTarget) {
+    pub(crate) async fn cleanup_subscriptions_for_target(&self, target: &NotificationTarget) {
         // Route-resolved handles are only fallbacks: each drain prefers the
         // entry's recorded owner at drain time.
         self.resource_subscriptions
