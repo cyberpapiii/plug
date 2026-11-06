@@ -689,6 +689,16 @@ impl DownstreamCallContext {
         &self,
         family: crate::protocol::MethodFamily,
     ) -> crate::protocol::PolicyDecision {
+        self.decide(family, false)
+    }
+
+    /// `bridge_implemented` is true only where Plug itself completes a
+    /// multi-round tool call, the one bridge that exists.
+    fn decide(
+        &self,
+        family: crate::protocol::MethodFamily,
+        bridge_implemented: bool,
+    ) -> crate::protocol::PolicyDecision {
         crate::protocol::decide_method(
             &crate::protocol::CapabilityPolicyInput {
                 era: self.protocol_era,
@@ -696,14 +706,14 @@ impl DownstreamCallContext {
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
                 modern_direction_enabled: self.modern_direction_enabled,
-                bridge_implemented: false,
+                bridge_implemented,
             },
             family,
         )
     }
 
-    pub fn authorize(&self, family: crate::protocol::MethodFamily) -> Result<(), rmcp::ErrorData> {
-        match self.policy_decision(family) {
+    fn admit(&self, decision: crate::protocol::PolicyDecision) -> Result<(), rmcp::ErrorData> {
+        match decision {
             crate::protocol::PolicyDecision::Allow => Ok(()),
             crate::protocol::PolicyDecision::Deny(outcome) => {
                 Err(outcome.into_error(self.protocol_era))
@@ -711,23 +721,12 @@ impl DownstreamCallContext {
         }
     }
 
+    pub fn authorize(&self, family: crate::protocol::MethodFamily) -> Result<(), rmcp::ErrorData> {
+        self.admit(self.decide(family, false))
+    }
+
     fn authorize_continuation(&self) -> Result<(), rmcp::ErrorData> {
-        match crate::protocol::decide_method(
-            &crate::protocol::CapabilityPolicyInput {
-                era: self.protocol_era,
-                principal: self.principal.as_ref(),
-                scopes: self.scopes.as_ref(),
-                local_trust: self.local_trust,
-                modern_direction_enabled: self.modern_direction_enabled,
-                bridge_implemented: true,
-            },
-            crate::protocol::MethodFamily::Continuations,
-        ) {
-            crate::protocol::PolicyDecision::Allow => Ok(()),
-            crate::protocol::PolicyDecision::Deny(outcome) => {
-                Err(outcome.into_error(self.protocol_era))
-            }
-        }
+        self.admit(self.decide(crate::protocol::MethodFamily::Continuations, true))
     }
 
     pub(crate) fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
