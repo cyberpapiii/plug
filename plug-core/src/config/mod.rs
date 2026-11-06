@@ -1949,9 +1949,17 @@ LOG_LEVEL = "debug"
                 ..Default::default()
             },
         );
-        let errors = validate_config(&cfg);
-        // Should catch port, startup_concurrency, missing command, and zero timeout
-        assert!(errors.len() >= 4, "expected >= 4 errors, got: {errors:?}");
+        let mut errors = validate_config(&cfg);
+        errors.sort();
+        assert_eq!(
+            errors,
+            [
+                "http.port must be in range 1-65535",
+                "server 'bad_stdio': stdio transport requires 'command' to be set",
+                "server 'bad_stdio': timeout must be > 0",
+                "startup_concurrency must be > 0",
+            ]
+        );
     }
 
     #[test]
