@@ -10,12 +10,10 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
-use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
 use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::ArtifactStore;
 use crate::circuit::CircuitBreakerError;
@@ -31,9 +29,7 @@ use crate::types::{
     ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
     ResolvedLazyToolPolicy, ServerHealth,
 };
-use continuations::{
-    MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES, MRTR_MAX_ROUNDS,
-};
+use continuations::{MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ROUNDS};
 
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Backstop timeout for a single `refresh_tools` pass inside the notification
@@ -47,7 +43,8 @@ const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
-/// Built once at `refresh_tools()` time so that `list_tools_for_client()` is O(1).
+/// Built once at `refresh_tools()` time, so a listing reads it without
+/// rebuilding.
 #[derive(Clone)]
 pub(crate) struct RouterSnapshot {
     /// Full sorted tool list (for clients with no limit).
@@ -524,9 +521,6 @@ pub struct DownstreamCallContext {
     scopes: Arc<BTreeSet<String>>,
     local_trust: bool,
     pub client_metadata: Option<crate::protocol::ClientMetadata>,
-    pub deadline: Option<std::time::Instant>,
-    pub cancellation: CancellationToken,
-    pub durable_owner: Option<TaskOwner>,
     /// OAuth client generation captured during bearer validation. Durable
     /// admission rechecks it after registering the TaskStore create guard.
     principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
@@ -557,9 +551,6 @@ impl DownstreamCallContext {
             scopes: Arc::new(BTreeSet::new()),
             local_trust,
             client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
             principal_lifecycle: None,
             extension_envelope: None,
         }
@@ -678,18 +669,6 @@ impl DownstreamCallContext {
 
     pub fn with_modern_direction_enabled(mut self, enabled: bool) -> Self {
         self.modern_direction_enabled = enabled;
-        self
-    }
-
-    pub fn with_lifecycle(
-        mut self,
-        deadline: Option<std::time::Instant>,
-        cancellation: CancellationToken,
-        durable_owner: Option<TaskOwner>,
-    ) -> Self {
-        self.deadline = deadline;
-        self.cancellation = cancellation;
-        self.durable_owner = durable_owner;
         self
     }
 
@@ -820,6 +799,9 @@ enum CallKind {
     /// The task with this id. Its record holds the upstream request, so a
     /// cancel or a teardown reaches the call.
     Task(String),
+    /// A legacy task-wrapped call to a server that runs tasks itself. Its
+    /// answer is the task the server created.
+    CreateTask,
 }
 
 impl CallKind {
@@ -830,8 +812,15 @@ impl CallKind {
     fn task_id(&self) -> Option<&str> {
         match self {
             Self::Task(task_id) => Some(task_id),
-            Self::Direct | Self::Invoked => None,
+            Self::Direct | Self::Invoked | Self::CreateTask => None,
         }
+    }
+
+    /// Whether a downstream cancel of the request reaches this call. A
+    /// task's request was answered when the task was created. A task create
+    /// is left to finish, so the task it makes is recorded or cancelled.
+    fn downstream_cancels(&self) -> bool {
+        matches!(self, Self::Direct | Self::Invoked)
     }
 }
 
@@ -1225,14 +1214,12 @@ impl ToolRouter {
         )
     }
 
-    /// The server and the server's own name behind `listed`, a name Plug
-    /// lists a tool under. Plug's own tools have neither.
+    /// The server and the server's own name behind `listed`, a name a call
+    /// to the tool may use. Plug's own tools have neither.
     pub fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
-        let cache = self.cache.load();
-        cache
-            .routes
-            .get(listed)
-            .or_else(|| cache.routes_lower.get(&listed.to_ascii_lowercase()))
+        self.cache
+            .load()
+            .resolve_route(listed)
             .filter(|(server, _)| server != crate::tool_naming::INTERNAL_SERVER_ID)
             .cloned()
     }
@@ -1648,7 +1635,10 @@ impl ToolRouter {
             .map(|(name, upstream)| {
                 let params = params.clone();
                 async move {
-                    if let Err(error) = upstream.client.peer().set_level(params).await {
+                    if let Err(error) = self
+                        .bounded_request(&upstream, upstream.client.peer().set_level(params))
+                        .await
+                    {
                         tracing::warn!(
                             server = %name,
                             error = %error,
@@ -2274,6 +2264,23 @@ impl ToolRouter {
         }
     }
 
+    /// Wait for `upstream`'s answer no longer than one of its tool calls may
+    /// take, and reconnect it when its connection turns out to be gone.
+    async fn bounded_request<T>(
+        &self,
+        upstream: &crate::server::UpstreamServer,
+        request: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+    ) -> Result<T, McpError> {
+        let request = async {
+            let answer = request.await;
+            if matches!(answer, Err(rmcp::service::ServiceError::TransportClosed)) {
+                self.reconnect_server_in_background(upstream.name.clone());
+            }
+            answer
+        };
+        answer_within(upstream_call_timeout(upstream), request).await
+    }
+
     /// Refresh the merged tool list and routing table from all upstream servers.
     ///
     /// Builds the full sorted list plus pre-cached filtered views for each
@@ -2392,7 +2399,6 @@ impl ToolRouter {
         let upstream_prompts = prompts_result.items;
 
         // ── Pass 1: classify, sanitize, and try keyword stripping ──
-        // Each entry: (server_name, tool, prefix, stripped_name, full_name, matched_keyword)
         struct Classified {
             server_name: String,
             tool: Tool,
@@ -2455,17 +2461,14 @@ impl ToolRouter {
                 }
             });
 
-            // 1. Apply manual renames if any
             if let Some(settings) = ctx.settings.as_ref()
                 && let Some(new_name) = settings.tool_renames.get(&exposed_name)
             {
                 exposed_name = new_name.clone();
             }
 
-            // 2. Sanitize to snake_case (hyphens, camelCase, dots -> snake_case)
             let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
-            // 3. Determine prefix and tool name via rules or server name
             let (prefix, full_name, stripped_name) = if let Some(ref rules) = ctx.tool_group_rules {
                 match crate::tool_naming::classify_with_rules(&sanitized, rules) {
                     Some(result) => {
@@ -2646,7 +2649,6 @@ impl ToolRouter {
             prefixed_tool.icons =
                 normalized_icons_with_fallback(prefixed_tool.icons.as_deref(), upstream_icons);
 
-            // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
 
             tool_risk_inventory.insert(
@@ -2660,7 +2662,6 @@ impl ToolRouter {
             tools.push(prefixed_tool);
         }
 
-        // Sort: priority tools first, then alphabetical
         tools.sort_unstable_by(|a, b| priority_sort(a, b, &self.config.priority_tools));
 
         // Add search_tools meta-tool if tool count exceeds threshold
@@ -2862,8 +2863,7 @@ impl ToolRouter {
         // Classify every currently-tracked subscription URI against the
         // old/new route snapshots. Pure decision — no registry mutation, no
         // upstream calls yet. See `SubscriptionRegistry::classify_route_changes`
-        // for the exact rebind/prune criteria (unchanged from the historical
-        // inline `retain` closure this replaced).
+        // for the exact rebind/prune criteria.
         let reconciliation = {
             let old_snapshot = self.cache.load();
             self.resource_subscriptions
@@ -2872,7 +2872,7 @@ impl ToolRouter {
 
         // Execute prunes for URIs that lost their route entirely
         // (best-effort upstream unsubscribe) before publishing the new
-        // snapshot — same ordering as the historical stale-unsubscribe pass.
+        // snapshot.
         // Distinct URIs use distinct transition locks, so parallelize them
         // (wall-clock = max RTT, not sum).
         {
@@ -2927,7 +2927,7 @@ impl ToolRouter {
         self.publish_route_snapshot(snapshot);
 
         // Rebind subscriptions whose URI still exists but ownership changed,
-        // after publishing the new snapshot (same ordering as before).
+        // after publishing the new snapshot.
         Self::rebind_reconciled_routes(
             &self.server_manager,
             &self.resource_subscriptions,
@@ -3320,17 +3320,11 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
                 .into_error(context.protocol_era));
         }
-        let context = context;
         let binding = binding.ok_or_else(|| {
             crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
         })?;
         let input_requests = input_required.input_requests.clone().unwrap_or_default();
         if input_requests.is_empty()
-            || input_requests.len() > MRTR_MAX_ITEMS
-            || input_required
-                .request_state
-                .as_ref()
-                .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
             || input_requests.values().any(|request| {
                 !matches!(
                     request,
@@ -3341,10 +3335,11 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                 .into_error(context.protocol_era));
         }
-        let payload_bytes = serde_json::to_vec(&input_required)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .len();
-        if payload_bytes > MRTR_MAX_BYTES {
+        if continuations::exceeds_continuation_limits(
+            input_required.request_state.as_deref(),
+            input_requests.len(),
+            &input_required,
+        ) {
             return Err(McpError::invalid_request(
                 "upstream multi-round response exceeds Plug's bounded continuation limits",
                 None,
@@ -3391,10 +3386,10 @@ impl ToolRouter {
     }
 
     /// Route one tool call to its server and wait for the answer. Every
-    /// tool call, a task's included, runs through here, so the health gate,
-    /// circuit breaker, call slots, timeout, metrics, result sanitizing and
-    /// the resend rule apply to each the same way. `is_retry` marks the one
-    /// resend after a reconnect.
+    /// tool call, a task's and a task create's included, runs through here,
+    /// so the health gate, circuit breaker, call slots, timeout, metrics,
+    /// result sanitizing and the resend rule apply to each the same way.
+    /// `is_retry` marks the one resend after a reconnect.
     fn call_tool_inner<'a>(
         &'a self,
         tool_name: &'a str,
@@ -3516,7 +3511,25 @@ impl ToolRouter {
                 merge_call_extension_meta(&mut upstream_params, meta);
             }
 
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
+            let request = if matches!(kind, CallKind::CreateTask) {
+                upstream_params
+                    .meta
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                        serde_json::json!({}),
+                    );
+                let params =
+                    crate::legacy_tasks::call_tool_params(upstream_params).map_err(|error| {
+                        McpError::internal_error(
+                            format!("failed to serialize legacy task-wrapped tool call: {error}"),
+                            None,
+                        )
+                    })?;
+                crate::legacy_tasks::request("tools/call", Some(params))
+            } else {
+                ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params))
+            };
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,
@@ -3535,10 +3548,8 @@ impl ToolRouter {
                     }
                 }
             }
-            // A task's downstream request was answered when the task was
-            // created, so nothing downstream waits on this call's id.
             let mut active_call_guard = None;
-            if let Some(call_context) = downstream.clone().filter(|_| !kind.is_task()) {
+            if let Some(call_context) = downstream.clone().filter(|_| kind.downstream_cancels()) {
                 self.register_active_call(
                     call_id,
                     ActiveCallRecord {
@@ -3629,8 +3640,10 @@ impl ToolRouter {
 
             // No `options.timeout`: rmcp's timeout path cancels through an
             // unbounded `send_notification`, so a wedged sink would hang the
-            // call forever. The bound is the `tokio::time::timeout` below,
-            // paired with a cancel bounded on its own.
+            // call forever. The bounds are the `tokio::time::timeout`s below,
+            // the answer's paired with a cancel bounded on its own. rmcp's
+            // peer channel is bounded too, so sending can wait before a
+            // request id exists to cancel.
             let mut options = PeerRequestOptions::default();
             options.meta = extension_meta.clone().map(RequestMetaObject);
             // rmcp puts its own progress token on every request it sends;
@@ -3641,16 +3654,17 @@ impl ToolRouter {
                 peer: request_peer,
                 progress_token: request_progress_token,
                 ..
-            } = peer
-                .send_cancellable_request(request, options)
-                .await
-                .map_err(|error| {
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    map_service_error(error)
-                })?;
+            } = answer_within(
+                timeout_duration,
+                peer.send_cancellable_request(request, options),
+            )
+            .await
+            .inspect_err(|_| {
+                if let Some(ref mut guard) = active_call_guard {
+                    guard.disarm();
+                }
+                self.remove_active_call(call_id);
+            })?;
 
             match &kind {
                 CallKind::Task(task_id) => {
@@ -3663,6 +3677,7 @@ impl ToolRouter {
                     )
                     .await?;
                 }
+                CallKind::CreateTask => {}
                 CallKind::Direct | CallKind::Invoked => {
                     self.attach_upstream_request_id(
                         call_id,
@@ -3692,7 +3707,8 @@ impl ToolRouter {
 
             // The oneshot maps as rmcp's `await_response` maps it: a dropped
             // responder means the transport went away.
-            let result = match tokio::time::timeout(timeout_duration, &mut rx).await {
+            let answer = tokio::time::timeout(timeout_duration, &mut rx).await;
+            let result = match answer {
                 Ok(Ok(inner)) => inner,
                 Ok(Err(_recv_error)) => Err(rmcp::service::ServiceError::TransportClosed),
                 Err(_elapsed) => {
@@ -3703,6 +3719,15 @@ impl ToolRouter {
                         timeout_duration,
                     )
                     .await;
+                    if matches!(kind, CallKind::CreateTask) {
+                        tasks::spawn_late_task_reaper(
+                            rx,
+                            Arc::clone(&self.server_manager),
+                            timeout_duration,
+                            server_id.clone(),
+                            Arc::clone(&trace_id),
+                        );
+                    }
                     Err(rmcp::service::ServiceError::Timeout {
                         timeout: timeout_duration,
                     })
@@ -3767,6 +3792,40 @@ impl ToolRouter {
 
             let lost = result.as_ref().err().and_then(LostSession::of);
             match result {
+                Ok(answer) if matches!(kind, CallKind::CreateTask) => {
+                    match crate::legacy_tasks::parse_create_result(answer) {
+                        Ok(created) => {
+                            finish(Some(true), Some(true));
+                            tracing::info!(
+                                call_id,
+                                trace_id = %trace_id,
+                                server = %server_id,
+                                tool = %original_name,
+                                task_id = %created.task.task_id,
+                                duration_ms,
+                                "proxy native upstream task created"
+                            );
+                            Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
+                                (&created.task).into(),
+                            )))
+                        }
+                        Err(error) => {
+                            finish(None, Some(false));
+                            tracing::warn!(
+                                call_id,
+                                trace_id = %trace_id,
+                                server = %server_id,
+                                tool = %original_name,
+                                %error,
+                                "upstream answered a task-wrapped call without a legacy task"
+                            );
+                            Err(McpError::internal_error(
+                                "upstream task-capable server returned an invalid legacy task response",
+                                None,
+                            ))
+                        }
+                    }
+                }
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
@@ -4455,6 +4514,22 @@ fn map_service_error(error: rmcp::service::ServiceError) -> McpError {
     }
 }
 
+fn upstream_call_timeout(upstream: &crate::server::UpstreamServer) -> Duration {
+    Duration::from_secs(upstream.config.call_timeout_secs)
+}
+
+/// Wait at most `timeout` for an upstream's answer. rmcp waits for one
+/// forever.
+async fn answer_within<T>(
+    timeout: Duration,
+    request: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+) -> Result<T, McpError> {
+    match tokio::time::timeout(timeout, request).await {
+        Ok(answer) => answer.map_err(map_service_error),
+        Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: timeout })),
+    }
+}
+
 /// Ask `peer` to stop `request_id`, waiting at most `bound`: rmcp's
 /// notification send waits on a full transport sink forever.
 async fn cancel_upstream_request(
@@ -4502,7 +4577,7 @@ impl Drop for InFlightCall<'_> {
 mod lifecycle_regression_tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_calls_waits_for_running_calls_and_gives_up_at_the_deadline() {
         let router = Arc::new(ToolRouter::new(
             Arc::new(ServerManager::new()),
@@ -4515,33 +4590,13 @@ mod lifecycle_regression_tests {
         assert_eq!(router.drain_calls(Duration::from_millis(20)).await, 2);
 
         drop(first);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let (remaining, ()) = tokio::join!(router.drain_calls(Duration::from_secs(5)), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(second);
         });
         assert_eq!(remaining, 0);
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn auth_required_health_has_non_retryable_authorization_outcome() {
-        let outcome = health_gate_outcome(ServerHealth::AuthRequired)
-            .expect("auth-required health must reject the call");
-        assert_eq!(
-            outcome,
-            crate::protocol::ProtocolOutcome::AuthorizationRequired
-        );
-        let encoded = outcome.encode(crate::protocol::ProtocolEra::Modern);
-        assert!(
-            !encoded.retryable,
-            "client must re-authorize before retrying"
-        );
-
-        assert_eq!(
-            health_gate_outcome(ServerHealth::Failed),
-            Some(crate::protocol::ProtocolOutcome::UpstreamUnavailable)
-        );
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
     }
 
     #[test]

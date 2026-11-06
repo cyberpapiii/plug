@@ -332,4 +332,23 @@ mod tests {
         assert_eq!(result.task.task_id, "task_1");
         assert_eq!(result.task.ttl, Some(1000));
     }
+
+    /// A native create's task reaches Plug through rmcp's task type and
+    /// comes back unchanged.
+    #[test]
+    fn a_task_survives_the_trip_through_rmcp() {
+        for status in [
+            TaskStatus::Working,
+            TaskStatus::InputRequired,
+            TaskStatus::Completed,
+            TaskStatus::Failed,
+            TaskStatus::Cancelled,
+        ] {
+            let task = Task::new("task_1".into(), status, "then".into(), "now".into())
+                .with_status_message("halfway")
+                .with_ttl(1000)
+                .with_poll_interval(25);
+            assert_eq!(Task::from(&rmcp::model::Task::from(&task)), task);
+        }
+    }
 }

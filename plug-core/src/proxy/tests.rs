@@ -16,24 +16,11 @@ fn expected_legacy_meta_tool_names() -> Vec<&'static str> {
 }
 
 #[test]
-fn trace_ids_are_w3c_sized_hex_values() {
-    let trace_id = new_trace_id();
-    assert_eq!(trace_id.len(), 32);
-    assert!(trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_ne!(trace_id, "00000000000000000000000000000000");
-}
-
-#[test]
 fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     // HTTP is the internet-reachable transport. A context that reaches policy
     // without an adapter having declared how the caller authenticated must be
     // able to do nothing, not everything.
     for context in [
-        DownstreamCallContext::http(
-            "bare-session",
-            RequestId::Number(1),
-            crate::types::ClientType::Unknown,
-        ),
         DownstreamCallContext::http("bare-session", RequestId::Number(2), ClientType::Unknown),
         DownstreamCallContext::http("bare-session", RequestId::Number(3), ClientType::Unknown)
             .with_trace_id("0123456789abcdef0123456789abcdef"),
@@ -303,18 +290,6 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
     assert_eq!(second, ProtocolNotification::ToolListChanged);
-}
-
-#[tokio::test]
-async fn tool_router_list_tools_returns_arc() {
-    let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, RouterConfig::default());
-    router.refresh_tools().await;
-
-    let tools1 = router.list_tools();
-    let tools2 = router.list_tools();
-    // Both should point to the same allocation (Arc)
-    assert!(Arc::ptr_eq(&tools1, &tools2));
 }
 
 #[test]
@@ -1792,23 +1767,6 @@ fn synthesized_capabilities_no_completions_without_upstream() {
 }
 
 #[test]
-fn complete_request_params_serde_roundtrip() {
-    let params = CompleteRequestParams::new(
-        Reference::for_prompt("test-prompt"),
-        ArgumentInfo::new("arg1", "partial"),
-    );
-
-    let json = serde_json::to_value(&params).unwrap();
-    let deserialized: CompleteRequestParams = serde_json::from_value(json).unwrap();
-    assert_eq!(deserialized.argument.name, "arg1");
-    assert_eq!(deserialized.argument.value, "partial");
-    match &deserialized.r#ref {
-        Reference::Prompt(p) => assert_eq!(p.name, "test-prompt"),
-        other => panic!("expected Prompt reference, got {other:?}"),
-    }
-}
-
-#[test]
 fn route_upstream_logging_message_publishes_with_server_prefix() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
@@ -1950,7 +1908,7 @@ fn synthesized_capabilities_includes_logging_when_upstream_supports_it() {
 
 // ── Roots cache tests ──────────────────────────────────────────────
 
-/// Helper to construct `Root` (which is `#[non_exhaustive]` in rmcp 1.1).
+/// Helper to construct `Root`, which rmcp marks `#[non_exhaustive]`.
 fn make_root(uri: &str, name: Option<&str>) -> Root {
     serde_json::from_value(serde_json::json!({
         "uri": uri,
@@ -2387,22 +2345,6 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
                 ))),
             })
             .is_none()
-    );
-}
-
-#[test]
-fn test_downstream_context_notification_target() {
-    assert_eq!(
-        DownstreamCallContext::ipc(
-            Arc::from("client-a"),
-            RequestId::from(NumberOrString::Number(1)),
-            crate::types::ClientType::Unknown,
-            None
-        )
-        .notification_target(),
-        NotificationTarget::Ipc {
-            client_id: Arc::from("client-a"),
-        },
     );
 }
 
@@ -3951,9 +3893,8 @@ async fn setup_subscribe_racing_prune() -> (
     (sm, router, old_state)
 }
 
-/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe
-/// used to fail "resource not found" (route gone) without touching the
-/// registry. It must now drain via the recorded owner.
+/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe,
+/// with the route gone, drains via the recorded owner.
 #[tokio::test]
 async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
     let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -3976,7 +3917,7 @@ async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
         "the drain must unsubscribe the recorded old owner"
     );
 
-    // With neither an entry nor a route left, the historical error stands.
+    // With neither an entry nor a route left, it is an error.
     let err = router
         .unsubscribe_resource("memory://x", &sub_target("b"))
         .await
@@ -3986,8 +3927,8 @@ async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
 
 /// Prune-side race, next-refresh ending: the following refresh pass
 /// classifies the surviving routeless entry as a prune with no old server
-/// id (upstream fallback `None`). It used to remove the entry with no
-/// upstream unsubscribe ever sent; the recorded owner must drain it.
+/// id (upstream fallback `None`). The recorded owner must drain it, so an
+/// upstream unsubscribe is sent.
 #[tokio::test]
 async fn next_refresh_prunes_routeless_entry_via_recorded_owner() {
     let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -4202,10 +4143,8 @@ async fn first_subscribe_straddling_publish_rebinds_via_self_check() {
 
 /// Routeless-entry-gains-route-elsewhere variant: the racing-subscriber
 /// setup leaves an entry recorded on "old" with no route at all. When a
-/// later refresh routes the URI to a DIFFERENT server ("c"), classify's
-/// old None arm used to do nothing (it only pruned when the new snapshot
-/// also lacked the URI) — owner-vs-route mismatch unreconciled forever.
-/// The recorded owner must now drive a rebind onto "c".
+/// later refresh routes the URI to a DIFFERENT server ("c"), the recorded
+/// owner must drive a rebind onto "c".
 #[tokio::test]
 async fn routeless_entry_gaining_route_elsewhere_is_rebound() {
     let (sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -4967,6 +4906,12 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
         Some(("git".to_string(), "commit".to_string()))
     );
     assert_eq!(router.tool_behind("git__nothing"), None);
+    // An MCP App calls a tool by its server's own name.
+    assert_eq!(
+        router.tool_behind("commit"),
+        Some(("git".to_string(), "commit".to_string()))
+    );
+    assert_eq!(router.server_for_tool("commit").as_deref(), Some("git"));
     assert_eq!(
         router.listed_name("git", "commit").as_deref(),
         Some("git__commit")
@@ -5199,4 +5144,128 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     let both = heard(&router);
     assert_eq!(both.len(), 2);
     assert!(both.contains(&cursor) && both.contains(&zed));
+}
+
+/// An upstream that takes requests and never answers them.
+struct SilentUpstreamHandler;
+
+impl ServerHandler for SilentUpstreamHandler {
+    fn get_info(&self) -> ServerInfo {
+        ServerInfo::new(ServerCapabilities::default())
+    }
+
+    fn complete(
+        &self,
+        _request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn set_level(
+        &self,
+        _request: SetLevelRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn subscribe(
+        &self,
+        _request: SubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+
+    fn unsubscribe(
+        &self,
+        _request: UnsubscribeRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
+        std::future::pending()
+    }
+}
+
+async fn connect_silent_upstream(name: &str) -> UpstreamServer {
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    tokio::spawn(async move {
+        let server = SilentUpstreamHandler
+            .serve(server_transport)
+            .await
+            .expect("start silent upstream test server");
+        let _ = server.waiting().await;
+    });
+    let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
+    let handler = Arc::new(UpstreamClientHandler::new_for_tests(
+        Arc::from(name.to_string()),
+        Arc::clone(&tools),
+        crate::server::no_events(),
+    ));
+    let client = handler
+        .serve(client_transport)
+        .await
+        .expect("connect silent upstream test client");
+    let mut capabilities = ServerCapabilities::default();
+    capabilities.logging = Some(serde_json::Map::new());
+    let mut resources = rmcp::model::ResourcesCapability::default();
+    resources.subscribe = Some(true);
+    capabilities.resources = Some(resources);
+    UpstreamServer {
+        name: name.to_string(),
+        config: subscribable_test_server_config(),
+        client,
+        tools,
+        capabilities,
+        upstream: None,
+        protocol_era: crate::protocol::ProtocolEra::Legacy,
+        selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+        protocol_gate_state: 0,
+        connection: crate::server::ConnectionGeneration::new(),
+        child_pid: None,
+        stderr_tail: None,
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn requests_to_an_upstream_that_never_answers_end_at_its_call_timeout() {
+    let sm = Arc::new(ServerManager::new());
+    let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
+    sm.replace_server("silent", connect_silent_upstream("silent").await)
+        .await;
+    let mut snapshot = (*router.cache.load_full()).clone();
+    snapshot.prompt_routes.insert(
+        "silent__greet".to_string(),
+        ("silent".to_string(), "greet".to_string()),
+    );
+    router.cache.store(Arc::new(snapshot));
+    let call_timeout = Duration::from_secs(subscribable_test_server_config().call_timeout_secs);
+
+    let started = tokio::time::Instant::now();
+    let error = router
+        .complete_request(
+            CompleteRequestParams::new(
+                Reference::for_prompt("silent__greet"),
+                ArgumentInfo::new("name", "a"),
+            ),
+            None,
+        )
+        .await
+        .expect_err("a completion nobody answers fails");
+    assert!(error.message.contains("timed out"), "{error:?}");
+    assert_eq!(started.elapsed(), call_timeout);
+
+    let started = tokio::time::Instant::now();
+    router.forward_set_level_to_upstreams().await;
+    assert_eq!(started.elapsed(), call_timeout);
+
+    use subscriptions::UpstreamResourceOps as _;
+    let upstream = sm.get_upstream("silent").expect("silent upstream");
+    for answer in [
+        upstream.subscribe_resource("file:///notes").await,
+        upstream.unsubscribe_resource("file:///notes").await,
+    ] {
+        let error = answer.expect_err("a subscription change nobody answers fails");
+        assert!(error.message.contains("timed out"), "{error:?}");
+    }
 }

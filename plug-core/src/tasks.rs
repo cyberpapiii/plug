@@ -8,9 +8,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::legacy_tasks::{
-    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, Task, TaskStatus,
-};
+use crate::legacy_tasks::{GetTaskPayloadResult, GetTaskResult, Task, TaskStatus};
 use crate::protocol::QuotaLease;
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
@@ -22,8 +20,8 @@ pub(crate) const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// session is still live. Checked by `enqueue_tool_task` immediately after it
 /// registers its [`OwnerCreateGuard`], closing the race where a teardown
 /// completes *entirely* before the enqueue registers anything (so the
-/// tombstone never sees the create). `None` means the transport has no
-/// teardown path that could race task creation (stdio).
+/// tombstone never sees the create). `None` means the caller has no
+/// teardown that could race task creation.
 pub type OwnerLivenessProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -51,6 +49,14 @@ pub enum TaskUpstreamRef {
         server_id: String,
         task_id: String,
     },
+}
+
+impl TaskUpstreamRef {
+    pub fn server_id(&self) -> &str {
+        match self {
+            Self::Request { server_id, .. } | Self::Task { server_id, .. } => server_id,
+        }
+    }
 }
 
 /// The tool a task is running: the name it was called by, and the server
@@ -93,13 +99,9 @@ pub(crate) struct ExpiredTaskCleanup {
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
 
-/// Outcome of [`TaskStore::set_upstream_request`].
-///
-/// `Missing` and "recorded with no pending cancel" must be distinguishable:
-/// the old `Option<String>` return conflated them, so a record that vanished
-/// between the upstream send and this call (owner teardown draining the
-/// store) could never trigger an upstream cancellation from the dispatch
-/// path.
+/// Outcome of [`TaskStore::set_upstream_request`]. `Missing` means the
+/// record vanished between the upstream send and this call (owner teardown
+/// drained the store), so the caller must cancel the upstream request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamRecordOutcome {
     /// No record exists for the task id: the owner was torn down (or the
@@ -737,20 +739,6 @@ impl TaskStore {
                 None,
             )),
         }
-    }
-
-    pub fn cancel_result_for_owner(
-        &mut self,
-        owner: &TaskOwner,
-        task_id: &str,
-    ) -> Result<CancelTaskResult, McpError> {
-        self.prune_expired();
-        let record = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| task_not_found(task_id))?;
-        ensure_owner(owner, record)?;
-        Ok(CancelTaskResult::new(record.task.clone()))
     }
 
     /// Drain stale in-flight cleanup after the synchronous store operation

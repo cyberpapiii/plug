@@ -6,7 +6,6 @@ use crate::session::SessionStore;
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
 use std::sync::Arc;
-use tokio_util::sync::CancellationToken;
 
 /// One HTTP request as the dispatcher sees it: a legacy request inside its
 /// session, or a stateless modern request identified by its credential.
@@ -20,7 +19,6 @@ pub(super) struct HttpDownstreamContext {
     pub(super) oauth_issuer: Option<Arc<str>>,
     pub(super) protocol_era: crate::protocol::ProtocolEra,
     pub(super) modern_direction_enabled: bool,
-    pub(super) cancellation: CancellationToken,
     pub(super) client_metadata: Option<crate::protocol::ClientMetadata>,
     /// What a modern request declared in `_meta`. HTTP serves the modern
     /// tasks extension, so a modern request always has one.
@@ -88,7 +86,6 @@ impl HttpDownstreamContext {
             oauth_issuer,
             protocol_era,
             modern_direction_enabled: state.router.modern_downstream_enabled(),
-            cancellation: CancellationToken::new(),
             client_metadata,
             modern_task_client,
         }
@@ -164,8 +161,7 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
         )
         .with_trace_id(Arc::clone(&self.trace_id))
         .with_protocol(self.protocol_era, self.protocol_era.version_str())
-        .with_modern_direction_enabled(self.modern_direction_enabled)
-        .with_lifecycle(None, self.cancellation.clone(), None);
+        .with_modern_direction_enabled(self.modern_direction_enabled);
         if let Some(metadata) = &self.client_metadata {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
@@ -213,7 +209,6 @@ impl HttpRequestCancellationGuard {
 impl Drop for HttpRequestCancellationGuard {
     fn drop(&mut self) {
         if self.armed {
-            self.context.cancellation.cancel();
             self.router.cancel_downstream_request(
                 &self.context,
                 Some("downstream HTTP request ended".to_string()),
