@@ -3506,19 +3506,8 @@ impl ToolRouter {
             upstream_params.input_responses = round.input_responses.clone();
             upstream_params.request_state = round.request_state.clone();
             let downstream_progress_token = progress_token.clone();
-            let upstream_progress_token = downstream_progress_token.as_ref().map(|_| {
-                ProgressToken(NumberOrString::String(Arc::from(format!(
-                    "plug-progress-{call_id}"
-                ))))
-            });
             if let Some(meta) = extension_meta.clone() {
                 merge_call_extension_meta(&mut upstream_params, meta);
-            }
-            // Extension metadata must be installed before the translated
-            // progress token. Assigning it afterwards replaces the entire
-            // `_meta` object and silently disables progress forwarding.
-            if let Some(token) = upstream_progress_token.clone() {
-                upstream_params.set_progress_token(token);
             }
 
             let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
@@ -3638,12 +3627,8 @@ impl ToolRouter {
             // paired with a cancel bounded on its own.
             let mut options = PeerRequestOptions::default();
             options.meta = extension_meta.clone().map(RequestMetaObject);
-            if let Some(token) = upstream_progress_token.clone() {
-                options
-                    .meta
-                    .get_or_insert_with(RequestMetaObject::new)
-                    .set_progress_token(token);
-            }
+            // rmcp puts its own progress token on every request it sends;
+            // `request_progress_token` below is the one to map back.
             let RequestHandle {
                 mut rx,
                 id: upstream_request_id,

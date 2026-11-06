@@ -1042,7 +1042,8 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
                 tracing::warn!(
                     server = %server_name,
                     error = %e,
-                    "token refresh failed (transient), retrying in 30s"
+                    retry_in_secs = REFRESH_POLL.as_secs(),
+                    "token refresh failed (transient), retrying"
                 );
                 continue;
             }

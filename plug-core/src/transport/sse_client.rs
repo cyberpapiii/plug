@@ -17,6 +17,9 @@ type BoxedSseStream = BoxStream<'static, Result<sse_stream::Sse, sse_stream::Err
 
 const CHANNEL_CAPACITY: usize = 16;
 
+/// How long a message POST may take unless the server's config says.
+const POST_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum LegacySseError {
@@ -45,6 +48,9 @@ pub struct LegacySseTransportConfig {
     pub uri: Arc<str>,
     pub auth_token: Option<Arc<str>>,
     pub endpoint_wait_timeout: Duration,
+    /// Bound on each message POST. The server answers on the stream, so the
+    /// POST itself only hands the message over.
+    pub post_timeout: Duration,
     /// Called when the server re-advertises a *different* POST endpoint after a
     /// stream reconnect.
     ///
@@ -66,6 +72,7 @@ impl std::fmt::Debug for LegacySseTransportConfig {
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
             .field("endpoint_wait_timeout", &self.endpoint_wait_timeout)
+            .field("post_timeout", &self.post_timeout)
             .finish()
     }
 }
@@ -76,6 +83,7 @@ impl LegacySseTransportConfig {
             uri: uri.into(),
             auth_token: None,
             endpoint_wait_timeout: Duration::from_secs(5),
+            post_timeout: POST_TIMEOUT,
             session_observer: None,
         }
     }
@@ -92,6 +100,11 @@ impl LegacySseTransportConfig {
 
     pub fn endpoint_wait_timeout(mut self, timeout: Duration) -> Self {
         self.endpoint_wait_timeout = timeout;
+        self
+    }
+
+    pub fn post_timeout(mut self, timeout: Duration) -> Self {
+        self.post_timeout = timeout;
         self
     }
 }
@@ -184,7 +197,7 @@ impl Worker for LegacySseWorker {
         post_message(
             &self.client,
             endpoint.clone(),
-            self.config.auth_token.clone(),
+            &self.config,
             initialize.message,
         )
         .await
@@ -236,7 +249,7 @@ impl Worker for LegacySseWorker {
                     let response = post_message(
                         &self.client,
                         endpoint,
-                        self.config.auth_token.clone(),
+                        &self.config,
                         send.message,
                     ).await;
                     let _ = send.responder.send(response.map(|_| ()));
@@ -482,15 +495,15 @@ async fn open_sse_stream(
 async fn post_message(
     client: &reqwest::Client,
     endpoint: Arc<str>,
-    auth_token: Option<Arc<str>>,
+    config: &LegacySseTransportConfig,
     message: ClientJsonRpcMessage,
 ) -> Result<(), LegacySseError> {
     let mut request = client
         .post(endpoint.as_ref())
-        .timeout(Duration::from_secs(30))
+        .timeout(config.post_timeout)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json, text/event-stream");
-    if let Some(token) = auth_token {
+    if let Some(token) = &config.auth_token {
         request = request.bearer_auth(token.as_ref());
     }
     for (name, value) in crate::mcp_http_headers::mirrored_headers_for_message(&message) {
@@ -737,6 +750,37 @@ mod tests {
     fn resolve_endpoint_empty_returns_error() {
         let result = resolve_endpoint("http://localhost:8080/mcp", "  ");
         assert!(result.is_err());
+    }
+
+    /// A server that never answers a POST holds a message for the server's
+    /// own timeout, not a fixed one.
+    #[tokio::test]
+    async fn a_post_gives_up_after_the_configured_timeout() {
+        crate::tls::ensure_rustls_provider_installed();
+        let app = axum::Router::new().route(
+            "/messages",
+            axum::routing::post(std::future::pending::<axum::http::StatusCode>),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await });
+
+        let config = LegacySseTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
+            .post_timeout(Duration::from_millis(200));
+        let client = crate::upstream_http::client(reqwest::redirect::Policy::none()).unwrap();
+        let message = ClientJsonRpcMessage::notification(
+            rmcp::model::ClientNotification::InitializedNotification(Default::default()),
+        );
+        let started = std::time::Instant::now();
+        let result = post_message(
+            &client,
+            Arc::from(format!("http://127.0.0.1:{port}/messages")),
+            &config,
+            message,
+        )
+        .await;
+        assert!(matches!(result, Err(LegacySseError::Reqwest(error)) if error.is_timeout()));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

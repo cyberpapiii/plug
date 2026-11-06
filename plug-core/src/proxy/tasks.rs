@@ -7,6 +7,24 @@ use crate::legacy_tasks::{
 };
 use crate::tasks::{OwnerLivenessProbe, UpstreamRecordOutcome, owner_closed_during_create_error};
 
+/// Ask a task-native upstream about one of its tasks, for at most its
+/// `call_timeout_secs`. rmcp's `send_request` waits for an answer forever.
+async fn ask_task_upstream(
+    server: &crate::server::UpstreamServer,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<rmcp::model::ServerResult, McpError> {
+    let bound = Duration::from_secs(server.config.call_timeout_secs);
+    let send = server
+        .client
+        .peer()
+        .send_request(crate::legacy_tasks::request(method, Some(params)));
+    match tokio::time::timeout(bound, send).await {
+        Ok(response) => response.map_err(map_service_error),
+        Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: bound })),
+    }
+}
+
 /// RAII cover for the send-to-record gap in `record_task_request`:
 /// constructed the moment the upstream request is in flight and defused
 /// once the request id is safely recorded on the task record — or once an
@@ -483,22 +501,11 @@ impl super::ToolRouter {
             (tasks, store.take_expired_cleanup())
         };
         self.finish_expired_task_cleanup(cleanup).await;
-        // A cursor past the end, left by tasks that expired between pages,
-        // is the last page. One Plug never gave out is refused: answering it
-        // with the first page again would loop a client that follows it.
-        let start = match request.and_then(|params| params.cursor) {
-            None => 0,
-            Some(cursor) => cursor
-                .parse::<usize>()
-                .map_err(|_| {
-                    McpError::invalid_params(format!("unknown tasks/list cursor: {cursor}"), None)
-                })?
-                .min(tasks.len()),
-        };
-        let end = usize::min(start + PAGE_SIZE, tasks.len());
-        let mut result = ListTasksResult::new(tasks[start..end].to_vec());
-        result.next_cursor = (end < tasks.len()).then(|| end.to_string());
-        Ok(result)
+        catalog::paginated_result("tasks/list", &tasks, request, |tasks, next_cursor| {
+            let mut result = ListTasksResult::new(tasks);
+            result.next_cursor = next_cursor;
+            result
+        })
     }
 
     pub async fn get_task_info_for_owner(
@@ -522,12 +529,7 @@ impl super::ToolRouter {
             let params =
                 serde_json::to_value(crate::legacy_tasks::GetTaskParams::new(upstream_task_id))
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let response = server
-                .client
-                .peer()
-                .send_request(crate::legacy_tasks::request("tasks/get", Some(params)))
-                .await
-                .map_err(map_service_error)?;
+            let response = ask_task_upstream(&server, "tasks/get", params).await?;
             if let Ok(result) = crate::legacy_tasks::parse_get_result(response) {
                 let (synced, cleanup) = {
                     let mut store = self.task_store.lock().await;
@@ -613,12 +615,7 @@ impl super::ToolRouter {
                 upstream_task_id,
             ))
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let response = server
-                .client
-                .peer()
-                .send_request(crate::legacy_tasks::request("tasks/result", Some(params)))
-                .await
-                .map_err(map_service_error)?;
+            let response = ask_task_upstream(&server, "tasks/result", params).await?;
             let mut payload = crate::legacy_tasks::parse_payload_result(response)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?
                 .0;
@@ -1255,18 +1252,18 @@ mod tests {
         /// only way a test can see the cancel).
         enqueue_cancelled: AtomicBool,
         enqueue_cancel_notify: tokio::sync::Notify,
-        hang_cancel: bool,
+        hang_task_requests: bool,
         cancel_log: std::sync::Mutex<Vec<String>>,
     }
 
     impl GatedTaskUpstreamState {
-        fn new(hang_cancel: bool, enqueue_gate_open: bool) -> Arc<Self> {
+        fn new(hang_task_requests: bool, enqueue_gate_open: bool) -> Arc<Self> {
             Arc::new(Self {
                 enqueue_gate: TestGate::new(enqueue_gate_open),
                 enqueue_entered: AtomicBool::new(false),
                 enqueue_cancelled: AtomicBool::new(false),
                 enqueue_cancel_notify: tokio::sync::Notify::new(),
-                hang_cancel,
+                hang_task_requests,
                 cancel_log: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -1382,7 +1379,7 @@ mod tests {
                         .expect("legacy cancel task id")
                         .to_string();
                     state.cancel_log.lock().unwrap().push(task_id);
-                    if !state.hang_cancel {
+                    if !state.hang_task_requests {
                         write_gated_legacy_response(
                             write.as_ref(),
                             serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
@@ -1390,6 +1387,7 @@ mod tests {
                         .await;
                     }
                 }
+                "tasks/get" | "tasks/result" if state.hang_task_requests => {}
                 "tasks/get" => {
                     let now = rmcp::task_manager::current_timestamp();
                     let task = Task::new(
@@ -1716,6 +1714,53 @@ mod tests {
             state.cancel_received_for("upstream-task-hung"),
             "the hung upstream must have received the forwarded cancel request"
         );
+    }
+
+    /// Asking a task-native upstream that never answers about its task
+    /// fails at the server's call timeout instead of waiting forever.
+    #[tokio::test(start_paused = true)]
+    async fn task_status_and_result_are_bounded_when_upstream_hangs() {
+        let state = GatedTaskUpstreamState::new(true, true);
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
+        sm.replace_server(
+            "hung",
+            connect_gated_task_upstream("hung", Arc::clone(&state), 5).await,
+        )
+        .await;
+
+        let owner = crate::downstream_identity::http_session_task_owner("session-hung-get");
+        let task = router
+            .task_store
+            .lock()
+            .await
+            .create_passthrough(
+                owner.clone(),
+                "hung_tool",
+                &upstream_working_task("upstream-task-hung"),
+                TaskUpstreamRef::Task {
+                    server_id: "hung".to_string(),
+                    task_id: "upstream-task-hung".to_string(),
+                },
+            )
+            .expect("create passthrough record");
+
+        let started = tokio::time::Instant::now();
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.get_task_info_for_owner(&owner, &task.task_id),
+        )
+        .await
+        .expect("tasks/get must give up within the call timeout");
+        assert!(status.is_err());
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.get_task_result_for_owner(&owner, &task.task_id),
+        )
+        .await
+        .expect("tasks/result must give up within the call timeout");
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
     /// Defect-2 regression test: a teardown that runs while the native

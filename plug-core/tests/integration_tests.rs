@@ -1409,7 +1409,8 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         .clone();
     let projected_page = modern_engine
         .tool_router()
-        .list_tools_page_for_client(ClientType::Unknown, None);
+        .list_tools_page_for_client(ClientType::Unknown, None)
+        .expect("first page");
     assert_eq!(projected_page.ttl_ms, Some(0));
     assert_eq!(
         projected_page.cache_scope,

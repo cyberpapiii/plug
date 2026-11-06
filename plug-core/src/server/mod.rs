@@ -1735,7 +1735,8 @@ impl ServerManager {
 
         let auth_token = resolve_upstream_auth(name, url, config).await?;
         let mut transport_config = LegacySseTransportConfig::with_uri(url)
-            .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs));
+            .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs))
+            .post_timeout(Duration::from_secs(config.timeout_secs));
         if let Some(token) = auth_token {
             transport_config = transport_config.auth_token(token.as_str());
         }
