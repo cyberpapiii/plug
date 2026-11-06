@@ -1,6 +1,7 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::future::Future;
+#[cfg(target_os = "macos")]
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
