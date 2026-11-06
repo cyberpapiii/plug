@@ -97,6 +97,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
   whose allow list does not name that tool.
 - The large result of a task called by its server's own tool name is no
   longer kept from the client that ran it.
+- A legacy SSE server that was away for a while is reconnected within a minute of coming back. Its wait between tries used to keep doubling with no limit, so after ten minutes away the next try came seventeen minutes later.
 
 ## [0.11.0] - 2026-10-07
 

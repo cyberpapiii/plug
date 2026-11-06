@@ -6,6 +6,7 @@
 pub mod activity;
 pub mod artifacts;
 pub mod auth;
+pub mod backoff;
 pub mod branding;
 pub mod circuit;
 pub mod client_detect;

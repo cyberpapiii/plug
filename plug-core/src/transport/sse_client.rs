@@ -7,12 +7,15 @@ use http::{HeaderName, header};
 use reqwest::StatusCode;
 use rmcp::RoleClient;
 use rmcp::model::{ClientJsonRpcMessage, ServerJsonRpcMessage};
-use rmcp::transport::common::client_side_sse::{ExponentialBackoff, SseRetryPolicy};
 use rmcp::transport::worker::{Worker, WorkerConfig, WorkerContext, WorkerQuitReason};
 use rmcp::transport::{Transport, WorkerTransport};
 use sse_stream::SseStream;
 
+use crate::backoff::Backoff;
+
 type BoxedSseStream = BoxStream<'static, Result<sse_stream::Sse, sse_stream::Error>>;
+
+const CHANNEL_CAPACITY: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -51,9 +54,7 @@ impl LegacySseError {
 pub struct LegacySseTransportConfig {
     pub uri: Arc<str>,
     pub auth_token: Option<Arc<str>>,
-    pub channel_buffer_capacity: usize,
     pub endpoint_wait_timeout: Duration,
-    pub retry_policy: Arc<dyn SseRetryPolicy>,
     /// Called when the server re-advertises a *different* POST endpoint after a
     /// stream reconnect.
     ///
@@ -74,7 +75,6 @@ impl std::fmt::Debug for LegacySseTransportConfig {
                 "auth_token",
                 &self.auth_token.as_ref().map(|_| "[REDACTED]"),
             )
-            .field("channel_buffer_capacity", &self.channel_buffer_capacity)
             .field("endpoint_wait_timeout", &self.endpoint_wait_timeout)
             .finish()
     }
@@ -82,15 +82,10 @@ impl std::fmt::Debug for LegacySseTransportConfig {
 
 impl LegacySseTransportConfig {
     pub fn with_uri(uri: impl Into<Arc<str>>) -> Self {
-        let mut retry_policy = ExponentialBackoff::default();
-        retry_policy.max_times = None;
-        retry_policy.base_duration = Duration::from_millis(1_000);
         Self {
             uri: uri.into(),
             auth_token: None,
-            channel_buffer_capacity: 16,
             endpoint_wait_timeout: Duration::from_secs(5),
-            retry_policy: Arc::new(retry_policy),
             session_observer: None,
         }
     }
@@ -166,7 +161,7 @@ impl Worker for LegacySseWorker {
     fn config(&self) -> WorkerConfig {
         let mut config = WorkerConfig::default();
         config.name = Some("LegacySseWorker".into());
-        config.channel_buffer_capacity = self.config.channel_buffer_capacity;
+        config.channel_buffer_capacity = CHANNEL_CAPACITY;
         config
     }
 
@@ -175,9 +170,9 @@ impl Worker for LegacySseWorker {
         mut context: WorkerContext<Self>,
     ) -> Result<(), WorkerQuitReason<Self::Error>> {
         let (response_tx, mut response_rx) =
-            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(self.config.channel_buffer_capacity);
+            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(CHANNEL_CAPACITY);
         let (notification_tx, mut notification_rx) =
-            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(self.config.channel_buffer_capacity);
+            tokio::sync::mpsc::channel::<ServerJsonRpcMessage>(CHANNEL_CAPACITY);
         let (endpoint_tx, endpoint_rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
         let transport_ct = context.cancellation_token.clone();
         let mut stream_task = tokio::spawn(run_sse_loop(
@@ -343,7 +338,7 @@ async fn run_sse_loop(
     ct: tokio_util::sync::CancellationToken,
 ) -> Result<(), WorkerQuitReason<LegacySseError>> {
     let mut last_event_id: Option<String> = None;
-    let mut retry_count = 0usize;
+    let mut retry_count = 0u32;
 
     loop {
         let mut stream = match open_sse_stream(
@@ -359,10 +354,9 @@ async fn run_sse_loop(
                 stream
             }
             Err(error) => {
-                let Some(delay) = config.retry_policy.retry(retry_count) else {
-                    return Err(WorkerQuitReason::fatal(error, "open legacy SSE stream"));
-                };
-                retry_count += 1;
+                tracing::debug!(error = %error, "could not open legacy SSE stream; redialing");
+                let delay = Backoff::STREAM.delay(retry_count);
+                retry_count = retry_count.saturating_add(1);
                 tokio::select! {
                     _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                     _ = tokio::time::sleep(delay) => continue,
@@ -412,20 +406,17 @@ async fn run_sse_loop(
                             }
                         }
                         Some(Err(error)) => {
-                            let Some(delay) = config.retry_policy.retry(retry_count) else {
-                                return Err(WorkerQuitReason::fatal(error.into(), "process legacy SSE stream"));
-                            };
-                            retry_count += 1;
+                            tracing::debug!(error = %error, "legacy SSE stream failed; redialing");
+                            let delay = Backoff::STREAM.delay(retry_count);
+                            retry_count = retry_count.saturating_add(1);
                             tokio::select! {
                                 _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                                 _ = tokio::time::sleep(delay) => break,
                             }
                         }
                         None => {
-                            let Some(delay) = config.retry_policy.retry(retry_count) else {
-                                return Err(WorkerQuitReason::TransportClosed);
-                            };
-                            retry_count += 1;
+                            let delay = Backoff::STREAM.delay(retry_count);
+                            retry_count = retry_count.saturating_add(1);
                             tokio::select! {
                                 _ = ct.cancelled() => return Err(WorkerQuitReason::Cancelled),
                                 _ = tokio::time::sleep(delay) => break,

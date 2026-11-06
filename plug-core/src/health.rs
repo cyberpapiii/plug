@@ -12,6 +12,7 @@ use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
+use crate::backoff::Backoff;
 use crate::config::Config;
 use crate::engine::Engine;
 use crate::proxy::ToolRouter;
@@ -252,41 +253,6 @@ fn spawn_proactive_recovery_once(
     true
 }
 
-/// Delay after the first failed recovery attempt. It doubles per failure.
-const RECOVERY_MIN_DELAY: Duration = Duration::from_secs(1);
-/// A server that stays down is retried this often for as long as it is down.
-const RECOVERY_MAX_DELAY: Duration = Duration::from_secs(60);
-
-/// The backoff of one recovery episode. An episode lasts until the server is
-/// back, so the delay keeps growing across failures instead of restarting at
-/// the floor every health interval.
-#[derive(Debug, Default)]
-struct RecoveryBackoff {
-    failures: u32,
-}
-
-impl RecoveryBackoff {
-    /// Count a failed attempt and return how long to wait before the next.
-    fn record_failure(&mut self) -> Duration {
-        self.failures += 1;
-        Self::delay_after(self.failures)
-    }
-
-    /// Whether the last failure is the first to wait the full cap.
-    fn just_reached_cap(&self) -> bool {
-        self.failures > 1
-            && Self::delay_after(self.failures) == RECOVERY_MAX_DELAY
-            && Self::delay_after(self.failures - 1) < RECOVERY_MAX_DELAY
-    }
-
-    fn delay_after(failures: u32) -> Duration {
-        let doublings = failures.saturating_sub(1).min(16);
-        RECOVERY_MIN_DELAY
-            .saturating_mul(1 << doublings)
-            .min(RECOVERY_MAX_DELAY)
-    }
-}
-
 /// Whether `server_name` still needs the recovery episode that is running for
 /// it. Someone else may have fixed it meanwhile (a reload, an operator
 /// restart, a reactive reconnect), or it may now need the user instead.
@@ -318,7 +284,10 @@ fn recovery_still_needed(engine: &Engine, server_name: &str) -> bool {
 async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: CancellationToken) {
     tracing::info!(server = %server_name, "starting proactive recovery");
     let started = tokio::time::Instant::now();
-    let mut backoff = RecoveryBackoff::default();
+    // An episode lasts until the server is back, so the wait keeps growing
+    // across failures instead of restarting at the floor every interval.
+    let backoff = Backoff::RECOVERY;
+    let mut failures: u32 = 0;
     let check_now = engine.server_manager().check_now_signal();
 
     loop {
@@ -339,7 +308,7 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
                 if engine.server_manager().get_upstream(server_name).is_some() {
                     tracing::info!(
                         server = %server_name,
-                        attempts = backoff.failures + 1,
+                        attempts = failures + 1,
                         elapsed_secs = started.elapsed().as_secs(),
                         "server recovered"
                     );
@@ -349,8 +318,10 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
             Err(error) => error,
         };
 
-        let delay = backoff.record_failure();
-        let attempts = backoff.failures;
+        let delay = backoff.jittered(failures);
+        let reached_cap = backoff.first_at_max(failures);
+        failures += 1;
+        let attempts = failures;
         if attempts == 1 {
             tracing::warn!(
                 server = %server_name,
@@ -358,12 +329,12 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
                 retry_in_secs = delay.as_secs(),
                 "recovery attempt failed; retrying with backoff"
             );
-        } else if backoff.just_reached_cap() {
+        } else if reached_cap {
             tracing::warn!(
                 server = %server_name,
                 attempts,
                 error = %error,
-                retry_every_secs = RECOVERY_MAX_DELAY.as_secs(),
+                retry_every_secs = backoff.max.as_secs(),
                 "server still down; retrying at the slowest rate"
             );
         } else {
@@ -376,19 +347,17 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
             );
         }
 
-        // Up to a tenth extra, so servers that failed together spread out.
-        let jitter = delay.mul_f64(rand::random_range(0.0..0.1));
         tokio::select! {
             biased;
             _ = cancel.cancelled() => {
                 tracing::debug!(server = %server_name, "proactive recovery cancelled during shutdown");
                 return;
             }
-            _ = tokio::time::sleep(delay + jitter) => {}
+            _ = tokio::time::sleep(delay) => {}
             _ = check_now.notified() => {
                 // The Mac woke or its network changed: what kept the server
                 // down may be gone, so start again from the shortest wait.
-                backoff = RecoveryBackoff::default();
+                failures = 0;
             }
         }
 
@@ -610,32 +579,6 @@ mod tests {
         );
 
         engine.shutdown().await;
-    }
-
-    #[test]
-    fn recovery_backoff_doubles_to_a_one_minute_cap() {
-        let mut backoff = super::RecoveryBackoff::default();
-        let delays: Vec<u64> = (0..12)
-            .map(|_| backoff.record_failure().as_secs())
-            .collect();
-        assert_eq!(delays, [1, 2, 4, 8, 16, 32, 60, 60, 60, 60, 60, 60]);
-
-        let mut backoff = super::RecoveryBackoff::default();
-        let reached_cap: Vec<bool> = (0..12)
-            .map(|_| {
-                backoff.record_failure();
-                backoff.just_reached_cap()
-            })
-            .collect();
-        assert_eq!(
-            reached_cap.iter().filter(|reached| **reached).count(),
-            1,
-            "the cap is announced once"
-        );
-        assert!(
-            reached_cap[6],
-            "the seventh failure is the first to wait 60s"
-        );
     }
 
     fn events_for<'a>(
