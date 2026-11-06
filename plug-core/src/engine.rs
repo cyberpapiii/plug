@@ -614,15 +614,22 @@ impl Engine {
                     if !name.contains('*') && self.tool_router.tool_behind(name).is_some())
             })
         });
-        if waiting
-            && let Err(error) = self
-                .apply_operator_mutation(
-                    config_path,
-                    crate::operator::OperatorMutation::PinToolBlocks,
-                )
-                .await
-        {
-            tracing::warn!(%error, "tool blocks stay stored by listed name");
+        if !waiting {
+            return;
+        }
+        let _guard = self.reload_lock.lock().await;
+        let router = &self.tool_router;
+        let saved = crate::operator::pin_tool_blocks_in_file(config_path, &|listed| {
+            router.tool_behind(listed)
+        })
+        .and_then(|_| {
+            crate::config::load_config(Some(&config_path.to_path_buf())).map_err(Into::into)
+        });
+        match saved {
+            Ok(config) => {
+                self.apply_reload(config).await;
+            }
+            Err(error) => tracing::warn!(%error, "tool blocks stay stored by listed name"),
         }
     }
 

@@ -48,7 +48,7 @@ final class PlugActions {
 
     /// Runs one change. `doing` finishes the sentence "Could not …", so a
     /// failure names what was being attempted.
-    func perform(_ doing: String, _ request: (String) -> IPCRequest) async {
+    func perform(_ doing: String, _ request: OperatorRequest) async {
         do { try await change { try await $0.send(request) } } catch { report(doing, error) }
     }
 
@@ -56,19 +56,15 @@ final class PlugActions {
     /// cannot start is refused with the daemon's reason.
     func addServer(_ name: String, _ config: ServerConfig, secretStore: String?) async throws {
         try await change { daemon in
-            _ = try await daemon.send { .validateServer(authToken: $0, name: name, server: config) }
-            _ = try await daemon.send {
-                .addServer(authToken: $0, name: name, server: config, secretStore: secretStore)
-            }
+            _ = try await daemon.send(.validateServer(name: name, server: config))
+            _ = try await daemon.send(.mutate(.addServer(name: name, server: config), secretStore: secretStore))
         }
     }
 
     func updateServer(_ name: String, _ config: ServerConfig, secretStore: String?) async throws {
         try await change { daemon in
-            _ = try await daemon.send { .validateServer(authToken: $0, name: name, server: config) }
-            _ = try await daemon.send {
-                .updateServer(authToken: $0, name: name, server: config, secretStore: secretStore)
-            }
+            _ = try await daemon.send(.validateServer(name: name, server: config))
+            _ = try await daemon.send(.mutate(.updateServer(name: name, server: config), secretStore: secretStore))
         }
     }
 
@@ -79,7 +75,7 @@ final class PlugActions {
         try await change { daemon in
             for server in servers {
                 do {
-                    _ = try await daemon.send { .addServer(authToken: $0, name: server.name, server: server.config) }
+                    _ = try await daemon.send(.mutate(.addServer(name: server.name, server: server.config)))
                 } catch {
                     failed[server.id] = error.localizedDescription
                 }
@@ -89,15 +85,15 @@ final class PlugActions {
     }
 
     func addAccount(server: String, label: String) async throws {
-        try await change { _ = try await $0.send { .addAccount(authToken: $0, server: server, account: label) } }
+        try await change { _ = try await $0.send(.mutate(.addAccount(server: server, account: label))) }
     }
 
     func addWatch(_ watch: WatchConfig) async throws {
-        try await change { _ = try await $0.send { .addWatch(authToken: $0, watch: watch) } }
+        try await change { _ = try await $0.send(.mutate(.addWatch(watch))) }
     }
 
     func nameClient(key: String, name: String) async throws {
-        try await change { _ = try await $0.send { .renameClient(authToken: $0, key: key, name: name) } }
+        try await change { _ = try await $0.send(.mutate(.renameClient(key: key, name: name))) }
     }
 
     /// The settings move first: if that fails, the old sign-in keeps both its
@@ -107,8 +103,8 @@ final class PlugActions {
             let from = DownstreamClient.clientKey(id: oldID)
             let to = DownstreamClient.clientKey(id: newID)
             try await change { daemon in
-                _ = try await daemon.send { .moveClientSettings(authToken: $0, from: from, to: to) }
-                _ = try await daemon.send { .revokeClient(authToken: $0, clientID: oldID) }
+                _ = try await daemon.send(.mutate(.moveClientSettings(from: from, to: to)))
+                _ = try await daemon.send(.revokeClient(clientID: oldID))
             }
         } catch { report("replace the old sign-in", error) }
     }
@@ -116,9 +112,7 @@ final class PlugActions {
     func setToolEnabled(_ tool: String, _ enabled: Bool) async {
         guard busyTools.insert(tool).inserted else { return }
         defer { busyTools.remove(tool) }
-        await perform("turn \(tool) \(enabled ? "on" : "off")") {
-            .setToolEnabled(authToken: $0, tool: tool, enabled: enabled)
-        }
+        await perform("turn \(tool) \(enabled ? "on" : "off")", .mutate(.setToolEnabled(tool: tool, enabled: enabled)))
     }
 
     /// The operations of the OpenAPI document at `spec`.

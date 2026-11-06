@@ -9,7 +9,11 @@ use crate::config::{
 };
 use crate::tool_patterns::is_disabled_tool;
 
-#[derive(Debug, Clone)]
+/// One change to the config file. The daemon applies it for the command
+/// line and the app, which send it in [`crate::ipc::OperatorRequest::Mutate`];
+/// the command line applies it itself to a file named with `--config`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
 pub enum OperatorMutation {
     AddServer {
         name: String,
@@ -60,9 +64,6 @@ pub enum OperatorMutation {
         target: String,
         blocked: bool,
     },
-    /// Nothing of its own: the file is saved with every tool block that can
-    /// be stored by server and tool stored that way.
-    PinToolBlocks,
     /// Watch a tool for change. See `crate::events`.
     AddWatch {
         watch: crate::events::WatchConfig,
@@ -234,7 +235,6 @@ pub fn apply_operator_mutation_knowing(
             set_client_block(&mut config, &key, kind, &target, blocked, tool_behind)?;
             OperatorMutationResult::server(None)
         }
-        OperatorMutation::PinToolBlocks => OperatorMutationResult::server(None),
         OperatorMutation::AddWatch { watch } => {
             config.events.watch.push(watch);
             // Only the event rules: the rest of the file was already accepted.
@@ -261,6 +261,15 @@ pub fn apply_operator_mutation_knowing(
     };
     persist_config_atomic(path, &config)?;
     Ok((config, result))
+}
+
+/// Save the file with every tool block that can be stored by server and
+/// tool stored that way, and nothing else changed.
+pub fn pin_tool_blocks_in_file(path: &Path, tool_behind: ToolBehind<'_>) -> anyhow::Result<Config> {
+    let mut config = load_editable_config(path)?;
+    pin_tool_blocks(&mut config, tool_behind);
+    persist_config_atomic(path, &config)?;
+    Ok(config)
 }
 
 /// The longest account label. It becomes part of every tool name.
@@ -1222,9 +1231,7 @@ blocked_tools = ["code__push", "Code__push"]
         assert_eq!(loaded.clients["pi"].blocked_tools[0], "Code__push".into());
 
         // Saving anything brings the old blocks over.
-        let (config, _) =
-            apply_operator_mutation_knowing(&path, OperatorMutation::PinToolBlocks, &tool_behind)
-                .unwrap();
+        let config = pin_tool_blocks_in_file(&path, &tool_behind).unwrap();
         assert_eq!(
             config.clients["pi"].blocked_tools,
             [
@@ -1238,8 +1245,7 @@ blocked_tools = ["code__push", "Code__push"]
         let reloaded = crate::config::load_config(Some(&path)).unwrap();
         assert_eq!(reloaded.clients, config.clients);
         // Without the tools known, nothing is touched.
-        let (unknowing, _) =
-            apply_operator_mutation(&path, OperatorMutation::PinToolBlocks).unwrap();
+        let unknowing = pin_tool_blocks_in_file(&path, &|_| None).unwrap();
         assert_eq!(unknowing.clients, config.clients);
 
         // A new block lands in the same form, whatever name the tool goes

@@ -123,12 +123,11 @@ async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
-    let request = plug_core::ipc::IpcRequest::RestartServer {
+    let request = plug_core::ipc::OperatorRequest::RestartServer {
         server_id: server_name.to_string(),
-        auth_token: String::new(),
     };
 
-    match crate::ipc_client::request(request).await {
+    match crate::ipc_client::operator(request).await {
         Ok(plug_core::ipc::IpcResponse::Ok) => Ok(true),
         Ok(plug_core::ipc::IpcResponse::Error { code, message }) => {
             anyhow::bail!("{code}: {message}");
@@ -424,10 +423,7 @@ async fn cmd_downstream_oauth_clients_via_daemon(
     match command {
         crate::DownstreamOauthClientCommands::List => {
             let response =
-                crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
-                    auth_token: String::new(),
-                })
-                .await?;
+                crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await?;
             let clients = match response {
                 plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot } => {
                     snapshot.downstream_clients
@@ -452,10 +448,11 @@ async fn cmd_downstream_oauth_clients_via_daemon(
                 ui::print_info_line("Revocation cancelled");
                 return Ok(());
             }
-            match crate::ipc_client::request(plug_core::ipc::IpcRequest::RevokeDownstreamClient {
-                auth_token: String::new(),
-                client_id: client_id.clone(),
-            })
+            match crate::ipc_client::operator(
+                plug_core::ipc::OperatorRequest::RevokeDownstreamClient {
+                    client_id: client_id.clone(),
+                },
+            )
             .await?
             {
                 plug_core::ipc::IpcResponse::DownstreamClientRevoked { .. } => {

@@ -912,10 +912,7 @@ fn require_canonical_daemon_owner() -> anyhow::Result<()> {
 }
 
 pub(crate) async fn cmd_daemon_stop() -> anyhow::Result<()> {
-    let req = plug_core::ipc::IpcRequest::Shutdown {
-        auth_token: String::new(),
-    };
-    match crate::ipc_client::request(req).await? {
+    match crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Shutdown).await? {
         plug_core::ipc::IpcResponse::Ok => {
             print_success_line("Stopped the shared background service.")
         }

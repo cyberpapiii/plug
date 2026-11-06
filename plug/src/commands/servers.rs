@@ -322,94 +322,11 @@ pub(crate) async fn apply_server_mutation(
     }
 
     crate::runtime::ensure_daemon_with_feedback(None, false).await?;
-    // `ipc_client` puts the daemon token in.
-    let auth_token = String::new();
-    let request = match mutation {
-        plug_core::operator::OperatorMutation::AddServer { name, server } => {
-            plug_core::ipc::IpcRequest::AddServer {
-                name,
-                server: Box::new(server),
-                auth_token,
-                secret_store: None,
-            }
-        }
-        plug_core::operator::OperatorMutation::UpdateServer { name, server } => {
-            plug_core::ipc::IpcRequest::UpdateServer {
-                name,
-                server: Box::new(server),
-                auth_token,
-                secret_store: None,
-            }
-        }
-        plug_core::operator::OperatorMutation::RemoveServer { name } => {
-            plug_core::ipc::IpcRequest::RemoveServer { name, auth_token }
-        }
-        plug_core::operator::OperatorMutation::AddAccount { server, account } => {
-            plug_core::ipc::IpcRequest::AddAccount {
-                server,
-                account,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetServerEnabled { name, enabled } => {
-            plug_core::ipc::IpcRequest::SetServerEnabled {
-                name,
-                enabled,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetToolEnabled { tool, enabled } => {
-            plug_core::ipc::IpcRequest::SetToolEnabled {
-                tool,
-                enabled,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::RenameClient { key, name } => {
-            plug_core::ipc::IpcRequest::RenameClient {
-                key,
-                name,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::MoveClientSettings { from, to } => {
-            plug_core::ipc::IpcRequest::MoveClientSettings {
-                from,
-                to,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetClientPlace { key, place } => {
-            plug_core::ipc::IpcRequest::SetClientPlace {
-                key,
-                place,
-                auth_token,
-            }
-        }
-        plug_core::operator::OperatorMutation::SetClientBlock {
-            key,
-            kind,
-            target,
-            blocked,
-        } => plug_core::ipc::IpcRequest::SetClientBlock {
-            key,
-            kind,
-            target,
-            blocked,
-            auth_token,
-        },
-        plug_core::operator::OperatorMutation::AddWatch { watch } => {
-            plug_core::ipc::IpcRequest::AddWatch { watch, auth_token }
-        }
-        plug_core::operator::OperatorMutation::RemoveWatch { event } => {
-            plug_core::ipc::IpcRequest::RemoveWatch { event, auth_token }
-        }
-        // Plug does this itself, with whatever else it saves.
-        plug_core::operator::OperatorMutation::PinToolBlocks => {
-            anyhow::bail!("Plug stores tool blocks by server itself")
-        }
+    let request = plug_core::ipc::OperatorRequest::Mutate {
+        mutation: Box::new(mutation),
+        secret_store: None,
     };
-    match crate::ipc_client::request(request).await? {
+    match crate::ipc_client::operator(request).await? {
         plug_core::ipc::IpcResponse::OperatorMutation { result, .. } => Ok(result),
         plug_core::ipc::IpcResponse::Error { message, .. } => anyhow::bail!(message),
         other => anyhow::bail!("unexpected daemon response: {other:?}"),

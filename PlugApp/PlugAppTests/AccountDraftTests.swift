@@ -18,8 +18,8 @@ final class AccountDraftTests: XCTestCase {
 
     func testAddingAnAccountNamesTheServerAndTheAccount() throws {
         let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let data = try encoder.encode(IPCRequest.addAccount(authToken: "t", server: "slack", account: "work"))
+        let data = try encoder.encode(OperatorMutation.addAccount(server: "slack", account: "work"))
         let sent = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: String])
-        XCTAssertEqual(sent, ["type": "AddAccount", "auth_token": "t", "server": "slack", "account": "work"])
+        XCTAssertEqual(sent, ["type": "AddAccount", "server": "slack", "account": "work"])
     }
 }

@@ -2,8 +2,8 @@ import Foundation
 @testable import Plug
 import PlugIPC
 
-/// A handshake as the daemon sends one (`testdata/ipc/operator_handshake_response.json`),
-/// decoded the way the app decodes it.
+/// A handshake as the daemon sends one (`handshake` in
+/// `testdata/ipc/responses.json`), decoded the way the app decodes it.
 func makeTestHandshake(
     version: String,
     executable: URL? = URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
@@ -11,10 +11,7 @@ func makeTestHandshake(
 ) -> OperatorHandshake {
     var object: [String: Any] = [
         "daemon_version": version,
-        "ipc_min": 3,
-        "ipc_max": 6,
         "ownership": ownership,
-        "capabilities": ["server_mutation", "server_config_read"],
     ]
     if let executable { object["daemon_executable"] = executable.path }
     let decoder = JSONDecoder()

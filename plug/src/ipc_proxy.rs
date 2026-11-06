@@ -2938,27 +2938,16 @@ mod tests {
         let req: IpcRequest =
             serde_json::from_slice(&frame).expect("parse operator handshake request");
         match req {
-            IpcRequest::OperatorHandshake {
-                client_version,
-                ipc_min,
-                ipc_max,
-            } => {
+            IpcRequest::OperatorHandshake { client_version } => {
                 assert_eq!(client_version, env!("CARGO_PKG_VERSION"));
-                assert!(ipc_min <= ipc::OPERATOR_IPC_MAX);
-                assert!(ipc_max >= ipc::OPERATOR_IPC_MIN);
                 fake_send(
                     writer,
                     &IpcResponse::OperatorHandshake {
-                        handshake: ipc::OperatorHandshake {
-                            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                            daemon_executable: Some(
-                                std::env::current_exe().expect("test executable path"),
-                            ),
-                            ipc_min: ipc::OPERATOR_IPC_MIN,
-                            ipc_max: ipc::OPERATOR_IPC_MAX,
-                            ownership: ipc::DaemonOwnershipMode::Unmanaged,
-                            capabilities: Vec::new(),
-                        },
+                        handshake: ipc::OperatorHandshake::new(
+                            env!("CARGO_PKG_VERSION").to_string(),
+                            Some(std::env::current_exe().expect("test executable path")),
+                            ipc::DaemonOwnershipMode::Unmanaged,
+                        ),
                     },
                 )
                 .await

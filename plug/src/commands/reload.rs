@@ -4,10 +4,7 @@ use crate::OutputFormat;
 use crate::ui::{print_info_line, print_success_line};
 
 pub(crate) async fn cmd_reload(output: &OutputFormat) -> anyhow::Result<()> {
-    let req = plug_core::ipc::IpcRequest::Reload {
-        auth_token: String::new(),
-    };
-    match crate::ipc_client::request(req).await? {
+    match crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Reload).await? {
         plug_core::ipc::IpcResponse::Reloaded { report } => {
             if matches!(output, OutputFormat::Json) {
                 println!("{}", serde_json::to_string_pretty(&report)?);

@@ -1,18 +1,12 @@
 import Foundation
 
-/// The daemon IPC protocol versions this app speaks, offered in the handshake.
-public let supportedIPCVersions: ClosedRange<UInt16> = 3...6
-
 public struct OperatorHandshake: Codable, Equatable, Sendable {
     public let daemonVersion: String
     public let daemonExecutable: URL?
-    public let ipcMin: UInt16
-    public let ipcMax: UInt16
     public let ownership: String
-    public let capabilities: [String]
 
     private enum CodingKeys: String, CodingKey {
-        case daemonVersion, daemonExecutable, ipcMin, ipcMax, ownership, capabilities
+        case daemonVersion, daemonExecutable, ownership
     }
 
     public init(from decoder: Decoder) throws {
@@ -25,10 +19,7 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
         } else {
             daemonExecutable = nil
         }
-        ipcMin = try container.decode(UInt16.self, forKey: .ipcMin)
-        ipcMax = try container.decode(UInt16.self, forKey: .ipcMax)
         ownership = try container.decode(String.self, forKey: .ownership)
-        capabilities = try container.decode([String].self, forKey: .capabilities)
     }
 }
 
@@ -546,6 +537,34 @@ extension ServerConfig {
         operations = try c.decodeIfPresent([String].self, forKey: .operations) ?? []
         tokenIn = try c.decodeIfPresent(String.self, forKey: .tokenIn)
     }
+
+    /// As the daemon writes a server, which leaves out an empty `operations`.
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encodeIfPresent(command, forKey: .command)
+        try c.encode(args, forKey: .args)
+        try c.encode(env, forKey: .env)
+        try c.encode(enabled, forKey: .enabled)
+        try c.encode(transport, forKey: .transport)
+        try c.encode(protocolMode, forKey: .protocolMode)
+        try c.encodeIfPresent(url, forKey: .url)
+        try c.encodeIfPresent(authToken, forKey: .authToken)
+        try c.encodeIfPresent(auth, forKey: .auth)
+        try c.encodeIfPresent(oauthClientID, forKey: .oauthClientID)
+        try c.encodeIfPresent(oauthScopes, forKey: .oauthScopes)
+        try c.encode(timeoutSecs, forKey: .timeoutSecs)
+        try c.encode(callTimeoutSecs, forKey: .callTimeoutSecs)
+        try c.encode(maxConcurrent, forKey: .maxConcurrent)
+        try c.encode(healthCheckIntervalSecs, forKey: .healthCheckIntervalSecs)
+        try c.encode(circuitBreakerEnabled, forKey: .circuitBreakerEnabled)
+        try c.encode(enrichment, forKey: .enrichment)
+        try c.encode(toolRenames, forKey: .toolRenames)
+        try c.encode(toolGroups, forKey: .toolGroups)
+        try c.encodeIfPresent(sandbox, forKey: .sandbox)
+        try c.encodeIfPresent(spec, forKey: .spec)
+        if !operations.isEmpty { try c.encode(operations, forKey: .operations) }
+        try c.encodeIfPresent(tokenIn, forKey: .tokenIn)
+    }
 }
 
 public struct ToolGroupRule: Codable, Equatable, Sendable {
@@ -594,148 +613,163 @@ public struct APIOperation: Decodable, Equatable, Sendable, Identifiable {
     }
 }
 
+/// What the app sends the daemon. Every request but these few needs the
+/// daemon's token and travels as `.operator`.
 public enum IPCRequest: Encodable, Equatable, Sendable {
-    case handshake(clientVersion: String, ipcMin: UInt16, ipcMax: UInt16)
-    case snapshot(authToken: String)
+    case handshake(clientVersion: String)
     /// Every server with what it said about itself, icons included.
     case status
-    case serverConfig(authToken: String, name: String)
-    case activity(authToken: String, afterSequence: UInt64, limit: Int, failuresOnly: Bool)
-    case validateServer(authToken: String, name: String, server: ServerConfig)
-    /// List the operations of an OpenAPI document before its server exists.
-    case describeAPI(authToken: String, spec: String)
-    /// `secretStore` names where the keys typed into the server are kept:
-    /// the Keychain when nil, or `file` for Plug's `.env` file.
-    case addServer(authToken: String, name: String, server: ServerConfig, secretStore: String? = nil)
-    case updateServer(authToken: String, name: String, server: ServerConfig, secretStore: String? = nil)
-    case removeServer(authToken: String, name: String)
-    /// Add a configured server again as `<server>-<account>`.
-    case addAccount(authToken: String, server: String, account: String)
-    case setServerEnabled(authToken: String, name: String, enabled: Bool)
     case listTools
-    case setToolEnabled(authToken: String, tool: String, enabled: Bool)
-    case restartServer(authToken: String, serverID: String)
-    case reload(authToken: String)
-    case revokeClient(authToken: String, clientID: String)
-    /// An empty name goes back to the name Plug works out.
-    case renameClient(authToken: String, key: String, name: String)
-    /// Hand one client's settings to another, replacing what that one had.
-    case moveClientSettings(authToken: String, from: String, to: String)
-    /// An empty place goes back to the place Plug works out.
-    case setClientPlace(authToken: String, key: String, place: String)
-    /// Keep a client from a server, or let it back in.
-    case setClientServerBlocked(authToken: String, key: String, server: String, blocked: Bool)
-    /// Keep a client from one tool, by the name Plug lists it under.
-    case setClientToolBlocked(authToken: String, key: String, tool: String, blocked: Bool)
-    /// Put a server or a tool on a client's allow list, or take it off.
-    case setClientServerAllowed(authToken: String, key: String, server: String, allowed: Bool)
-    case setClientToolAllowed(authToken: String, key: String, tool: String, allowed: Bool)
-    /// Start or end a client's allow list, leaving what it gets as it is.
-    case setClientAllowList(authToken: String, key: String, on: Bool)
-    /// Start watching a tool. The daemon checks the tool before it saves.
-    case addWatch(authToken: String, watch: WatchConfig)
-    case removeWatch(authToken: String, event: String)
-    case shutdown(authToken: String)
+    case `operator`(token: String, OperatorRequest)
 
     private enum CodingKeys: String, CodingKey {
-        case type, clientVersion, ipcMin, ipcMax, authToken, afterSequence, limit, failuresOnly
-        case name, server, enabled, serverID, clientID, tool, key, kind, target, blocked, place
-        case watch, event, account, spec, secretStore, from, to
+        case type, clientVersion, authToken, request
     }
 
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         switch self {
-        case let .handshake(version, min, max):
+        case let .handshake(version):
             try c.encode("OperatorHandshake", forKey: .type); try c.encode(version, forKey: .clientVersion)
-            try c.encode(min, forKey: .ipcMin); try c.encode(max, forKey: .ipcMax)
-        case let .snapshot(token):
-            try c.encode("OperatorSnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
         case .status:
             try c.encode("Status", forKey: .type)
-        case let .serverConfig(token, name):
-            try c.encode("GetServerConfig", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(name, forKey: .name)
-        case let .activity(token, after, limit, failures):
-            try c.encode("ActivitySnapshot", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(after, forKey: .afterSequence); try c.encode(limit, forKey: .limit)
-            try c.encode(failures, forKey: .failuresOnly)
-        case let .validateServer(token, name, server):
-            try c.encode("ValidateServer", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
-        case let .describeAPI(token, spec):
-            try c.encode("DescribeApi", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(spec, forKey: .spec)
-        case let .addServer(token, name, server, store):
-            try c.encode("AddServer", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
-            try c.encodeIfPresent(store, forKey: .secretStore)
-        case let .updateServer(token, name, server, store):
-            try c.encode("UpdateServer", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
-            try c.encodeIfPresent(store, forKey: .secretStore)
-        case let .removeServer(token, name):
-            try c.encode("RemoveServer", forKey: .type); try c.encode(token, forKey: .authToken); try c.encode(name, forKey: .name)
-        case let .addAccount(token, server, account):
-            try c.encode("AddAccount", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(server, forKey: .server); try c.encode(account, forKey: .account)
-        case let .setServerEnabled(token, name, enabled):
-            try c.encode("SetServerEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(name, forKey: .name); try c.encode(enabled, forKey: .enabled)
         case .listTools:
             try c.encode("ListTools", forKey: .type)
-        case let .setToolEnabled(token, tool, enabled):
-            try c.encode("SetToolEnabled", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(tool, forKey: .tool); try c.encode(enabled, forKey: .enabled)
-        case let .restartServer(token, serverID):
-            try c.encode("RestartServer", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(serverID, forKey: .serverID)
-        case let .reload(token):
-            try c.encode("Reload", forKey: .type); try c.encode(token, forKey: .authToken)
-        case let .revokeClient(token, clientID):
-            try c.encode("RevokeDownstreamClient", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(clientID, forKey: .clientID)
-        case let .renameClient(token, key, name):
-            try c.encode("RenameClient", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode(name, forKey: .name)
-        case let .moveClientSettings(token, from, to):
-            try c.encode("MoveClientSettings", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(from, forKey: .from); try c.encode(to, forKey: .to)
-        case let .setClientPlace(token, key, place):
-            try c.encode("SetClientPlace", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode(place, forKey: .place)
-        case let .setClientServerBlocked(token, key, server, blocked):
-            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode("server", forKey: .kind)
-            try c.encode(server, forKey: .target); try c.encode(blocked, forKey: .blocked)
-        case let .setClientToolBlocked(token, key, tool, blocked):
-            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode("tool", forKey: .kind)
-            try c.encode(tool, forKey: .target); try c.encode(blocked, forKey: .blocked)
-        // The daemon reads all three as a client block of another kind,
-        // with `blocked` meaning on the list.
-        case let .setClientServerAllowed(token, key, server, allowed):
-            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode("allowed_server", forKey: .kind)
-            try c.encode(server, forKey: .target); try c.encode(allowed, forKey: .blocked)
-        case let .setClientToolAllowed(token, key, tool, allowed):
-            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode("allowed_tool", forKey: .kind)
-            try c.encode(tool, forKey: .target); try c.encode(allowed, forKey: .blocked)
-        case let .setClientAllowList(token, key, on):
-            try c.encode("SetClientBlock", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(key, forKey: .key); try c.encode("allow_list", forKey: .kind)
-            try c.encode("*", forKey: .target); try c.encode(on, forKey: .blocked)
-        case let .addWatch(token, watch):
-            try c.encode("AddWatch", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(watch, forKey: .watch)
-        case let .removeWatch(token, event):
-            try c.encode("RemoveWatch", forKey: .type); try c.encode(token, forKey: .authToken)
-            try c.encode(event, forKey: .event)
-        case let .shutdown(token):
-            try c.encode("Shutdown", forKey: .type); try c.encode(token, forKey: .authToken)
+        case let .operator(token, request):
+            try c.encode("Operator", forKey: .type); try c.encode(token, forKey: .authToken)
+            try c.encode(request, forKey: .request)
         }
     }
+}
+
+/// A request only the holder of the daemon's token may make.
+public enum OperatorRequest: Encodable, Equatable, Sendable {
+    case snapshot
+    case activity(afterSequence: UInt64, limit: Int, failuresOnly: Bool)
+    case serverConfig(name: String)
+    case validateServer(name: String, server: ServerConfig)
+    /// List the operations of an OpenAPI document before its server exists.
+    case describeAPI(spec: String)
+    /// `secretStore` names where the keys typed into a server are kept: the
+    /// Keychain when nil, or `file` for Plug's `.env` file.
+    case mutate(OperatorMutation, secretStore: String? = nil)
+    case restartServer(serverID: String)
+    case reload
+    case revokeClient(clientID: String)
+    case shutdown
+
+    private enum CodingKeys: String, CodingKey {
+        case type, afterSequence, limit, failuresOnly, name, server, spec, mutation, secretStore
+        case serverID, clientID
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .snapshot:
+            try c.encode("Snapshot", forKey: .type)
+        case let .activity(after, limit, failures):
+            try c.encode("Activity", forKey: .type)
+            try c.encode(after, forKey: .afterSequence); try c.encode(limit, forKey: .limit)
+            try c.encode(failures, forKey: .failuresOnly)
+        case let .serverConfig(name):
+            try c.encode("GetServerConfig", forKey: .type); try c.encode(name, forKey: .name)
+        case let .validateServer(name, server):
+            try c.encode("ValidateServer", forKey: .type)
+            try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+        case let .describeAPI(spec):
+            try c.encode("DescribeApi", forKey: .type); try c.encode(spec, forKey: .spec)
+        case let .mutate(mutation, store):
+            try c.encode("Mutate", forKey: .type); try c.encode(mutation, forKey: .mutation)
+            try c.encodeIfPresent(store, forKey: .secretStore)
+        case let .restartServer(serverID):
+            try c.encode("RestartServer", forKey: .type); try c.encode(serverID, forKey: .serverID)
+        case .reload:
+            try c.encode("Reload", forKey: .type)
+        case let .revokeClient(clientID):
+            try c.encode("RevokeDownstreamClient", forKey: .type); try c.encode(clientID, forKey: .clientID)
+        case .shutdown:
+            try c.encode("Shutdown", forKey: .type)
+        }
+    }
+}
+
+/// One change to the config file, which the daemon saves and applies.
+public enum OperatorMutation: Encodable, Equatable, Sendable {
+    case addServer(name: String, server: ServerConfig)
+    case updateServer(name: String, server: ServerConfig)
+    case removeServer(name: String)
+    /// Add a configured server again as `<server>-<account>`.
+    case addAccount(server: String, account: String)
+    case setServerEnabled(name: String, enabled: Bool)
+    case setToolEnabled(tool: String, enabled: Bool)
+    /// An empty name goes back to the name Plug works out.
+    case renameClient(key: String, name: String)
+    /// Hand one client's settings to another, replacing what that one had.
+    case moveClientSettings(from: String, to: String)
+    /// An empty place goes back to the place Plug works out.
+    case setClientPlace(key: String, place: String)
+    /// For the allow-list kinds `blocked` means on the list.
+    case setClientBlock(key: String, kind: ClientBlockKind, target: String, blocked: Bool)
+    /// Start watching a tool. The daemon checks the tool before it saves.
+    case addWatch(WatchConfig)
+    case removeWatch(event: String)
+
+    private enum CodingKeys: String, CodingKey {
+        case type, name, server, enabled, tool, key, kind, target, blocked, place, watch, event
+        case account, from, to
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case let .addServer(name, server):
+            try c.encode("AddServer", forKey: .type)
+            try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+        case let .updateServer(name, server):
+            try c.encode("UpdateServer", forKey: .type)
+            try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+        case let .removeServer(name):
+            try c.encode("RemoveServer", forKey: .type); try c.encode(name, forKey: .name)
+        case let .addAccount(server, account):
+            try c.encode("AddAccount", forKey: .type)
+            try c.encode(server, forKey: .server); try c.encode(account, forKey: .account)
+        case let .setServerEnabled(name, enabled):
+            try c.encode("SetServerEnabled", forKey: .type)
+            try c.encode(name, forKey: .name); try c.encode(enabled, forKey: .enabled)
+        case let .setToolEnabled(tool, enabled):
+            try c.encode("SetToolEnabled", forKey: .type)
+            try c.encode(tool, forKey: .tool); try c.encode(enabled, forKey: .enabled)
+        case let .renameClient(key, name):
+            try c.encode("RenameClient", forKey: .type)
+            try c.encode(key, forKey: .key); try c.encode(name, forKey: .name)
+        case let .moveClientSettings(from, to):
+            try c.encode("MoveClientSettings", forKey: .type)
+            try c.encode(from, forKey: .from); try c.encode(to, forKey: .to)
+        case let .setClientPlace(key, place):
+            try c.encode("SetClientPlace", forKey: .type)
+            try c.encode(key, forKey: .key); try c.encode(place, forKey: .place)
+        case let .setClientBlock(key, kind, target, blocked):
+            try c.encode("SetClientBlock", forKey: .type)
+            try c.encode(key, forKey: .key); try c.encode(kind, forKey: .kind)
+            try c.encode(target, forKey: .target); try c.encode(blocked, forKey: .blocked)
+        case let .addWatch(watch):
+            try c.encode("AddWatch", forKey: .type); try c.encode(watch, forKey: .watch)
+        case let .removeWatch(event):
+            try c.encode("RemoveWatch", forKey: .type); try c.encode(event, forKey: .event)
+        }
+    }
+}
+
+/// What a per-client block names.
+public enum ClientBlockKind: String, Encodable, Sendable {
+    case server
+    case tool
+    /// A server on the client's allow list.
+    case allowedServer = "allowed_server"
+    case allowedTool = "allowed_tool"
+    /// The allow list itself; its target is `*`.
+    case allowList = "allow_list"
 }
 
 /// What reloading the configuration from disk changed.

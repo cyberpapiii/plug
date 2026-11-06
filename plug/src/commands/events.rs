@@ -119,10 +119,7 @@ pub(crate) async fn cmd_event_unwatch(
 async fn event_statuses(config_path: Option<&PathBuf>) -> anyhow::Result<Vec<EventStatus>> {
     if config_path.is_none()
         && let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) =
-            crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
-                auth_token: String::new(),
-            })
-            .await
+            crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await
     {
         return Ok(snapshot.events);
     }

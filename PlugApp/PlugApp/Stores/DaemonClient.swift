@@ -7,9 +7,9 @@ struct ServerOrigin: Equatable, Sendable {
     var upstream: UpstreamInfo?
 }
 
-/// How the app asks the daemon anything. Every request but the handshake
-/// carries the operator token, read from its file per request so a token the
-/// daemon rotated is picked up without a restart.
+/// How the app asks the daemon anything. An operator request carries the
+/// daemon's token, read from its file per request so a token the daemon
+/// rotated is picked up without a restart.
 @MainActor
 struct DaemonClient {
     let clientVersion: String
@@ -26,13 +26,12 @@ struct DaemonClient {
 
     func disconnect() async { await ipc.disconnect() }
 
-    /// Sends one request built around the token.
-    func send(_ request: (String) -> IPCRequest) async throws -> IPCResponse {
-        try await ipc.request(request(token()))
+    func send(_ request: OperatorRequest) async throws -> IPCResponse {
+        try await ipc.request(.operator(token: token(), request))
     }
 
     func snapshot() async throws -> OperatorSnapshot {
-        guard case let .snapshot(value) = try await send({ .snapshot(authToken: $0) }) else {
+        guard case let .snapshot(value) = try await send(.snapshot) else {
             throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
         }
         return value
@@ -40,9 +39,9 @@ struct DaemonClient {
 
     /// Nil when the daemon answered with something other than calls.
     func activity(after cursor: UInt64, limit: Int) async throws -> [ActivityEvent]? {
-        guard case let .activity(events) = try await send({
-            .activity(authToken: $0, afterSequence: cursor, limit: limit, failuresOnly: false)
-        }) else { return nil }
+        guard case let .activity(events) = try await send(
+            .activity(afterSequence: cursor, limit: limit, failuresOnly: false)
+        ) else { return nil }
         return events
     }
 
@@ -53,9 +52,8 @@ struct DaemonClient {
     }
 
     func serverConfig(name: String) async throws -> ServerConfig {
-        guard case let .serverConfig(returnedName, config) = try await send({
-            .serverConfig(authToken: $0, name: name)
-        }), returnedName == name else {
+        guard case let .serverConfig(returnedName, config) = try await send(.serverConfig(name: name)),
+              returnedName == name else {
             throw PlugIPCError.unexpectedResponse("ServerConfig")
         }
         return config
@@ -84,7 +82,7 @@ struct DaemonClient {
         let token = try token()
         let patient = PlugIPCClient(clientVersion: clientVersion, requestTimeout: 15)
         guard case let .apiDescribed(api) = try await patient.request(
-            .describeAPI(authToken: token, spec: spec)
+            .operator(token: token, .describeAPI(spec: spec))
         ) else {
             throw PlugIPCError.unexpectedResponse("ApiDescribed")
         }

@@ -19,7 +19,9 @@ use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
 use plug_core::http::server::{ClientRevocation, HttpState};
-use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse};
+use plug_core::ipc::{
+    self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse, OperatorRequest,
+};
 use plug_core::proxy::{ConnectorAfter, EndedSession};
 use plug_core::proxy::{DownstreamBridge, ToolRouter};
 
@@ -937,7 +939,13 @@ async fn handle_ipc_loop(
         ipc::send_chunked_response_with_id(writer, ids.ipc_id, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
-        if matches!(request, IpcRequest::Shutdown { .. }) {
+        if matches!(
+            request,
+            IpcRequest::Operator {
+                request: OperatorRequest::Shutdown,
+                ..
+            }
+        ) {
             ctx.cancel.cancel();
             break;
         }
@@ -1184,38 +1192,12 @@ fn deliver_reverse_reply(pending: &mut PendingReverse, reverse_id: u64, frame: &
     }
 }
 
-async fn dispatch_operator_mutation(
-    ctx: &ConnectionContext,
-    mutation: plug_core::operator::OperatorMutation,
-) -> IpcResponse {
-    dispatch_operator_mutation_keeping(ctx, mutation, None).await
-}
-
-async fn dispatch_operator_mutation_keeping(
-    ctx: &ConnectionContext,
-    mutation: plug_core::operator::OperatorMutation,
-    secret_store: Option<&str>,
-) -> IpcResponse {
-    match ctx
-        .engine
-        .apply_operator_mutation_keeping(&ctx.config_path, mutation, secret_store)
-        .await
-    {
-        Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
-        Err(error) => IpcResponse::Error {
-            code: "OPERATOR_MUTATION_FAILED".to_string(),
-            message: error.to_string(),
-        },
-    }
-}
-
 fn current_daemon_executable() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| std::fs::canonicalize(path).ok())
 }
 
-/// Dispatch a single IPC request to the appropriate Engine query.
 /// Drop upstream branding icons from an operator snapshot's server statuses.
 ///
 /// An icon is a base64 data URI, and a server that advertises a large one makes
@@ -1251,46 +1233,13 @@ fn tool_catalog_revision(ctx: &ConnectionContext) -> u64 {
     hasher.finish()
 }
 
-async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
-    if let Some(session_id) = request.connection_session_id()
-        && let Some(refusal) = reject_unowned_session(ctx, session_id)
-    {
-        return refusal;
-    }
+/// Answer a request that came with the daemon token.
+async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     match request {
-        IpcRequest::Status => {
-            let servers = ctx.server_manager.server_statuses();
-            IpcResponse::Status {
-                servers,
-                clients: ctx.client_registry.count(),
-                uptime_secs: ctx.started_at.elapsed().as_secs(),
-                runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-                resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
-            }
-        }
-        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
-            handshake: plug_core::ipc::OperatorHandshake {
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                daemon_executable: current_daemon_executable(),
-                ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
-                ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
-                ownership: crate::service::ipc_ownership(),
-                capabilities: vec![
-                    plug_core::ipc::OperatorCapability::ServerMutation,
-                    plug_core::ipc::OperatorCapability::ClientMutation,
-                    plug_core::ipc::OperatorCapability::AuthMutation,
-                    plug_core::ipc::OperatorCapability::ConfigMutation,
-                    plug_core::ipc::OperatorCapability::ActivityStream,
-                    plug_core::ipc::OperatorCapability::ToolMutation,
-                    plug_core::ipc::OperatorCapability::ServerConfigRead,
-                ],
-            },
-        },
-        IpcRequest::ActivitySnapshot {
+        OperatorRequest::Activity {
             after_sequence,
             limit,
             failures_only,
-            ..
         } => IpcResponse::ActivitySnapshot {
             events: ctx.engine.tool_router().activity_snapshot(
                 &plug_core::activity::ActivityFilter {
@@ -1300,7 +1249,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             ),
         },
-        IpcRequest::OperatorSnapshot { .. } => {
+        OperatorRequest::Snapshot => {
             // The configured servers come from the file, so the app can see a
             // server the daemon has not loaded. A file that does not parse,
             // often one saved mid-edit, must not blank the app while the
@@ -1443,7 +1392,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 }),
             }
         }
-        IpcRequest::GetServerConfig { name, .. } => {
+        OperatorRequest::GetServerConfig { name } => {
             let config = match load_editable_config(&ctx.config_path) {
                 Ok(config) => config,
                 Err(response) => return response,
@@ -1462,7 +1411,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::RevokeDownstreamClient { client_id, .. } => {
+        OperatorRequest::RevokeDownstreamClient { client_id } => {
             match ctx.http.revoke_downstream_client(client_id).await {
                 ClientRevocation::Revoked => IpcResponse::DownstreamClientRevoked {
                     client_id: client_id.clone(),
@@ -1481,7 +1430,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::ValidateServer { name, server, .. } => {
+        OperatorRequest::ValidateServer { name, server } => {
             match ctx.engine.validate_server_draft(name, server) {
                 Ok(server) => IpcResponse::ServerValidated { server },
                 Err(error) => IpcResponse::Error {
@@ -1490,7 +1439,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::DescribeApi { spec, .. } => {
+        OperatorRequest::DescribeApi { spec } => {
             match plug_core::openapi::describe(spec, API_DESCRIBE_TIMEOUT).await {
                 Ok(api) => IpcResponse::ApiDescribed { api },
                 Err(error) => IpcResponse::Error {
@@ -1499,150 +1448,35 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::AddServer {
-            name,
-            server,
+        OperatorRequest::Mutate {
+            mutation,
             secret_store,
-            ..
         } => {
-            dispatch_operator_mutation_keeping(
-                ctx,
-                plug_core::operator::OperatorMutation::AddServer {
-                    name: name.clone(),
-                    server: *server.clone(),
-                },
-                secret_store.as_deref(),
-            )
-            .await
-        }
-        IpcRequest::UpdateServer {
-            name,
-            server,
-            secret_store,
-            ..
-        } => {
-            dispatch_operator_mutation_keeping(
-                ctx,
-                plug_core::operator::OperatorMutation::UpdateServer {
-                    name: name.clone(),
-                    server: *server.clone(),
-                },
-                secret_store.as_deref(),
-            )
-            .await
-        }
-        IpcRequest::RemoveServer { name, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::RemoveServer { name: name.clone() },
-            )
-            .await
-        }
-        IpcRequest::AddAccount {
-            server, account, ..
-        } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::AddAccount {
-                    server: server.clone(),
-                    account: account.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::SetServerEnabled { name, enabled, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetServerEnabled {
-                    name: name.clone(),
-                    enabled: *enabled,
-                },
-            )
-            .await
-        }
-        IpcRequest::SetToolEnabled { tool, enabled, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetToolEnabled {
-                    tool: tool.clone(),
-                    enabled: *enabled,
-                },
-            )
-            .await
-        }
-        IpcRequest::RenameClient { key, name, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::RenameClient {
-                    key: key.clone(),
-                    name: name.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::MoveClientSettings { from, to, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::MoveClientSettings {
-                    from: from.clone(),
-                    to: to.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::SetClientPlace { key, place, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetClientPlace {
-                    key: key.clone(),
-                    place: place.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::SetClientBlock {
-            key,
-            kind,
-            target,
-            blocked,
-            ..
-        } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetClientBlock {
-                    key: key.clone(),
-                    kind: *kind,
-                    target: target.clone(),
-                    blocked: *blocked,
-                },
-            )
-            .await
-        }
-        IpcRequest::AddWatch { watch, .. } => {
-            if let Err(error) = ctx.engine.check_watch(watch) {
+            if let plug_core::operator::OperatorMutation::AddWatch { watch } = &**mutation
+                && let Err(error) = ctx.engine.check_watch(watch)
+            {
                 return IpcResponse::Error {
                     code: "OPERATOR_MUTATION_FAILED".to_string(),
                     message: error.to_string(),
                 };
             }
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::AddWatch {
-                    watch: watch.clone(),
+            match ctx
+                .engine
+                .apply_operator_mutation_keeping(
+                    &ctx.config_path,
+                    (**mutation).clone(),
+                    secret_store.as_deref(),
+                )
+                .await
+            {
+                Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
+                Err(error) => IpcResponse::Error {
+                    code: "OPERATOR_MUTATION_FAILED".to_string(),
+                    message: error.to_string(),
                 },
-            )
-            .await
+            }
         }
-        IpcRequest::RemoveWatch { event, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::RemoveWatch {
-                    event: event.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::RestartServer { server_id, .. } => {
+        OperatorRequest::RestartServer { server_id } => {
             match ctx.engine.restart_server(server_id).await {
                 Ok(()) => IpcResponse::Ok,
                 Err(e) => IpcResponse::Error {
@@ -1651,7 +1485,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::Reload { .. } => {
+        OperatorRequest::Reload => {
             // Load fresh config from disk and apply via Engine
             match plug_core::config::load_config(Some(&ctx.config_path)) {
                 Ok(new_config) => {
@@ -1670,8 +1504,35 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::Shutdown { .. } => IpcResponse::Ok,
+        OperatorRequest::Shutdown => IpcResponse::Ok,
+    }
+}
 
+async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
+    if let Some(session_id) = request.connection_session_id()
+        && let Some(refusal) = reject_unowned_session(ctx, session_id)
+    {
+        return refusal;
+    }
+    match request {
+        IpcRequest::Status => {
+            let servers = ctx.server_manager.server_statuses();
+            IpcResponse::Status {
+                servers,
+                clients: ctx.client_registry.count(),
+                uptime_secs: ctx.started_at.elapsed().as_secs(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+                resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
+            }
+        }
+        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
+            handshake: plug_core::ipc::OperatorHandshake::new(
+                env!("CARGO_PKG_VERSION").to_string(),
+                current_daemon_executable(),
+                crate::service::ipc_ownership(),
+            ),
+        },
+        IpcRequest::Operator { request, .. } => dispatch_operator(request, ctx).await,
         IpcRequest::Register {
             protocol_version,
             client_id,
@@ -2561,8 +2422,9 @@ mod tests {
         .unwrap();
 
         let response = dispatch_request(
-            &IpcRequest::OperatorSnapshot {
-                auth_token: "test-token".to_string(),
+            &IpcRequest::Operator {
+                auth_token: "test-token".to_string().into(),
+                request: OperatorRequest::Snapshot,
             },
             &mut ctx,
         )
@@ -2695,9 +2557,11 @@ mod tests {
             .expect("enqueue a task for the client");
 
         let response = dispatch_request(
-            &IpcRequest::RevokeDownstreamClient {
-                auth_token: "test-token".to_string(),
-                client_id: client.client_id.clone(),
+            &IpcRequest::Operator {
+                auth_token: "test-token".to_string().into(),
+                request: OperatorRequest::RevokeDownstreamClient {
+                    client_id: client.client_id.clone(),
+                },
             },
             &mut ctx,
         )

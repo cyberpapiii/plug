@@ -92,11 +92,9 @@ struct PlugIntentRunner {
         case let .signInClient(name, command):
             Task { await model.actions.signInClient(name: name, command: command) }
         case let .restartServer(name):
-            perform("restart \(name)") { .restartServer(authToken: $0, serverID: name) }
+            perform("restart \(name)", .restartServer(serverID: name))
         case let .setServerEnabled(name, enabled):
-            perform("turn \(name) \(enabled ? "on" : "off")") {
-                .setServerEnabled(authToken: $0, name: name, enabled: enabled)
-            }
+            perform("turn \(name) \(enabled ? "on" : "off")", .mutate(.setServerEnabled(name: name, enabled: enabled)))
         case let .editServer(name):
             router.reveal(server: name)
             router.sheet = .editServer(name)
@@ -113,35 +111,40 @@ struct PlugIntentRunner {
             Task { await model.actions.setAppLinked(target, false) }
         case let .removeServer(name):
             if router.selectedServer == name { router.selectedServer = nil }
-            perform("remove \(name)") { .removeServer(authToken: $0, name: name) }
+            perform("remove \(name)", .mutate(.removeServer(name: name)))
         case let .revokeClient(id):
-            perform("remove that client's access") { .revokeClient(authToken: $0, clientID: id) }
+            perform("remove that client's access", .revokeClient(clientID: id))
         case let .renameClient(key, name):
-            perform("rename the client") { .renameClient(authToken: $0, key: key, name: name) }
+            perform("rename the client", .mutate(.renameClient(key: key, name: name)))
         case let .replaceClient(oldID, newID):
             Task { await model.actions.replaceClient(oldID: oldID, newID: newID) }
         case let .setClientPlace(key, place):
-            perform("say where the client runs") { .setClientPlace(authToken: $0, key: key, place: place) }
+            perform("say where the client runs", .mutate(.setClientPlace(key: key, place: place)))
         case let .setClientServerBlocked(key, server, blocked):
-            perform("\(blocked ? "turn off" : "turn on") \(server) for that client") {
-                .setClientServerBlocked(authToken: $0, key: key, server: server, blocked: blocked)
-            }
+            perform(
+                "\(blocked ? "turn off" : "turn on") \(server) for that client",
+                .mutate(.setClientBlock(key: key, kind: .server, target: server, blocked: blocked))
+            )
         case let .setClientToolBlocked(key, tool, blocked):
-            perform("\(blocked ? "turn off" : "turn on") that tool for that client") {
-                .setClientToolBlocked(authToken: $0, key: key, tool: tool, blocked: blocked)
-            }
+            perform(
+                "\(blocked ? "turn off" : "turn on") that tool for that client",
+                .mutate(.setClientBlock(key: key, kind: .tool, target: tool, blocked: blocked))
+            )
         case let .setClientServerAllowed(key, server, allowed):
-            perform("\(allowed ? "turn on" : "turn off") \(server) for that client") {
-                .setClientServerAllowed(authToken: $0, key: key, server: server, allowed: allowed)
-            }
+            perform(
+                "\(allowed ? "turn on" : "turn off") \(server) for that client",
+                .mutate(.setClientBlock(key: key, kind: .allowedServer, target: server, blocked: allowed))
+            )
         case let .setClientToolAllowed(key, tool, allowed):
-            perform("\(allowed ? "turn on" : "turn off") that tool for that client") {
-                .setClientToolAllowed(authToken: $0, key: key, tool: tool, allowed: allowed)
-            }
+            perform(
+                "\(allowed ? "turn on" : "turn off") that tool for that client",
+                .mutate(.setClientBlock(key: key, kind: .allowedTool, target: tool, blocked: allowed))
+            )
         case let .setClientAllowList(key, on):
-            perform("change what that client gets of new servers") {
-                .setClientAllowList(authToken: $0, key: key, on: on)
-            }
+            perform(
+                "change what that client gets of new servers",
+                .mutate(.setClientBlock(key: key, kind: .allowList, target: "*", blocked: on))
+            )
         case .addServer:
             router.section = .servers
             router.sheet = .addServer
@@ -155,7 +158,7 @@ struct PlugIntentRunner {
             router.sheet = .addWatch
             showWindow()
         case let .removeWatch(event):
-            perform("stop watching \(event)") { .removeWatch(authToken: $0, event: event) }
+            perform("stop watching \(event)", .mutate(.removeWatch(event: event)))
         case .importServers:
             router.section = .servers
             router.sheet = .importServers
@@ -190,7 +193,7 @@ struct PlugIntentRunner {
         case .refresh:
             Task { await model.refresh(forceCatalog: true) }
         case .reloadConfiguration:
-            perform("reload the settings file") { .reload(authToken: $0) }
+            perform("reload the settings file", .reload)
         case .openLogs:
             NSWorkspace.shared.activateFileViewerSelecting([
                 PlugPaths.logs,
@@ -232,7 +235,7 @@ struct PlugIntentRunner {
         }
     }
 
-    private func perform(_ doing: String, _ request: @escaping (String) -> IPCRequest) {
+    private func perform(_ doing: String, _ request: OperatorRequest) {
         Task { await model.actions.perform(doing, request) }
     }
 }

@@ -19,7 +19,7 @@ use crate::types::{SecretString, ServerHealth, ServerStatus, UpstreamServerMetad
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
 pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
 /// Raw payload bytes per chunk when a logical daemon response exceeds one frame.
-pub const RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
+const RESPONSE_CHUNK_BYTES: usize = 512 * 1024;
 
 /// Opaque, per-registration capability authorizing out-of-band cancellation.
 /// It is serialized over the private IPC socket but always redacted in Debug.
@@ -79,17 +79,6 @@ pub fn proxy_request_ceiling(config: &crate::config::Config) -> std::time::Durat
     std::time::Duration::from_secs(longest.saturating_mul(2).saturating_add(60))
 }
 
-/// Inclusive operator IPC compatibility band advertised by the daemon.
-///
-/// Compatibility is range overlap, not a selected version. A client that
-/// advertises 3-4 still overlaps a daemon on this band. Handshake responses
-/// advertise these constants and ignore the client's range.
-///
-/// [`OPERATOR_IPC_MIN`] stays 3 until a capability is removed. The first
-/// removal must raise `MIN` and add a test that the retired band is rejected.
-pub const OPERATOR_IPC_MIN: u16 = 3;
-pub const OPERATOR_IPC_MAX: u16 = 6;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DaemonOwnershipMode {
@@ -99,31 +88,66 @@ pub enum DaemonOwnershipMode {
     AppManaged,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorCapability {
-    ServerMutation,
-    ClientMutation,
-    AuthMutation,
-    ConfigMutation,
-    ActivityStream,
-    /// Operator clients may turn individual merged tools on and off.
-    /// Added in operator IPC v5.
-    ToolMutation,
-    /// Operator clients may read one complete server definition before editing it.
-    /// Added in operator IPC v6 so updates preserve fields the editor does not expose.
-    ServerConfigRead,
-}
-
+/// The daemon's answer to [`IpcRequest::OperatorHandshake`]. A client goes
+/// on only when `daemon_version` is its own, so the rest of the protocol is
+/// one build talking to itself.
+///
+/// This is the one message a client of another build reads, to learn that it
+/// has to be restarted. Connectors from 0.8.8 on refuse a handshake that lacks
+/// any field they know, so its shape stays as it is.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OperatorHandshake {
     pub daemon_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub daemon_executable: Option<std::path::PathBuf>,
-    pub ipc_min: u16,
-    pub ipc_max: u16,
     pub ownership: DaemonOwnershipMode,
-    pub capabilities: Vec<OperatorCapability>,
+    #[serde(flatten)]
+    retired: RetiredHandshakeFields,
+}
+
+impl OperatorHandshake {
+    pub fn new(
+        daemon_version: String,
+        daemon_executable: Option<std::path::PathBuf>,
+        ownership: DaemonOwnershipMode,
+    ) -> Self {
+        Self {
+            daemon_version,
+            daemon_executable,
+            ownership,
+            retired: RetiredHandshakeFields::default(),
+        }
+    }
+}
+
+/// A version band and a capability list that connectors of older builds
+/// require. Nothing reads them now; they hold values those connectors accept.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+struct RetiredHandshakeFields {
+    ipc_min: u16,
+    ipc_max: u16,
+    capabilities: Vec<String>,
+}
+
+impl Default for RetiredHandshakeFields {
+    fn default() -> Self {
+        Self {
+            ipc_min: 3,
+            ipc_max: 6,
+            capabilities: [
+                "server_mutation",
+                "client_mutation",
+                "auth_mutation",
+                "config_mutation",
+                "activity_stream",
+                "tool_mutation",
+                "server_config_read",
+            ]
+            .map(String::from)
+            .to_vec(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -215,141 +239,25 @@ pub struct OperatorSnapshot {
     pub client_address: Option<String>,
 }
 
-/// Requests sent from CLI → daemon over Unix socket.
+/// Requests sent to the daemon over its Unix socket.
 ///
-/// Admin variants (RestartServer, Reload, Shutdown) require the daemon auth token.
-/// MCP proxy variants (Register, Deregister, McpRequest) use socket ACL — any
-/// process that can connect to the socket can register and proxy MCP calls.
-#[derive(Clone, Serialize, Deserialize)]
+/// [`IpcRequest::Operator`] carries everything that needs the daemon token.
+/// The proxy requests (Register, McpRequest and the rest) rely on the
+/// socket's file permissions instead: any process that can connect may
+/// register and proxy MCP calls.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcRequest {
     /// Query daemon status (servers, client count, uptime).
     Status,
 
-    /// Negotiate the operator API used by the CLI and native app.
-    OperatorHandshake {
-        client_version: String,
-        ipc_min: u16,
-        ipc_max: u16,
-    },
-    /// Read the bounded metadata-only activity ring.
-    ActivitySnapshot {
-        auth_token: String,
-        after_sequence: u64,
-        limit: usize,
-        failures_only: bool,
-    },
-    OperatorSnapshot {
-        auth_token: String,
-    },
-    GetServerConfig {
-        auth_token: String,
-        name: String,
-    },
-    RevokeDownstreamClient {
-        auth_token: String,
-        client_id: String,
-    },
-    ValidateServer {
-        auth_token: String,
-        name: String,
-        server: Box<crate::config::ServerConfig>,
-    },
-    /// List the operations of the OpenAPI document at `spec`, so a person
-    /// can choose among them before adding the server.
-    DescribeApi {
-        auth_token: String,
-        spec: String,
-    },
-    AddServer {
-        auth_token: String,
-        name: String,
-        server: Box<crate::config::ServerConfig>,
-        /// Where the keys typed into the server are kept: `keychain` when
-        /// absent, or `file` for Plug's `.env` file.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        secret_store: Option<String>,
-    },
-    UpdateServer {
-        auth_token: String,
-        name: String,
-        server: Box<crate::config::ServerConfig>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        secret_store: Option<String>,
-    },
-    RemoveServer {
-        auth_token: String,
-        name: String,
-    },
-    /// Add a configured server again as `<server>-<account>`.
-    AddAccount {
-        auth_token: String,
-        server: String,
-        account: String,
-    },
-    SetServerEnabled {
-        auth_token: String,
-        name: String,
-        enabled: bool,
-    },
-    /// Turn one merged tool on or off by editing `disabled_tools`.
-    SetToolEnabled {
-        auth_token: String,
-        tool: String,
-        enabled: bool,
-    },
-    /// Give a client a name by editing `clients`. An empty name removes it.
-    RenameClient {
-        auth_token: String,
-        key: String,
-        name: String,
-    },
-    /// Hand one client's settings to another by editing `clients`.
-    MoveClientSettings {
-        auth_token: String,
-        from: String,
-        to: String,
-    },
-    /// Say where a client runs by editing `clients`. An empty place removes
-    /// it.
-    SetClientPlace {
-        auth_token: String,
-        key: String,
-        place: String,
-    },
-    /// Keep a client from a server or a tool, or let it back in, by editing
-    /// `clients`.
-    SetClientBlock {
-        auth_token: String,
-        key: String,
-        kind: crate::operator::ClientBlockKind,
-        target: String,
-        blocked: bool,
-    },
-    /// Watch a tool for change by editing `events.watch`.
-    AddWatch {
-        auth_token: String,
-        watch: crate::events::WatchConfig,
-    },
-    /// Stop a watch, by event name.
-    RemoveWatch {
-        auth_token: String,
-        event: String,
-    },
+    /// Ask which daemon this is, before anything else.
+    OperatorHandshake { client_version: String },
 
-    /// Restart a specific upstream server.
-    RestartServer {
-        server_id: String,
-        auth_token: String,
-    },
-    /// Reload configuration from disk.
-    Reload {
-        auth_token: String,
-    },
-
-    /// Graceful daemon shutdown.
-    Shutdown {
-        auth_token: String,
+    /// A request only the holder of the daemon token may make.
+    Operator {
+        auth_token: SecretString,
+        request: OperatorRequest,
     },
 
     /// Register a new proxy client session with the daemon.
@@ -376,9 +284,7 @@ pub enum IpcRequest {
     },
 
     /// Deregister a proxy client session (clean disconnect).
-    Deregister {
-        session_id: String,
-    },
+    Deregister { session_id: String },
 
     /// Update a session's client info (sent after MCP initialize handshake).
     UpdateSession {
@@ -387,22 +293,16 @@ pub enum IpcRequest {
     },
 
     /// Liveness probe for long-lived proxy connections.
-    Ping {
-        session_id: String,
-    },
+    Ping { session_id: String },
 
     /// List all available tools across all servers.
     ListTools,
-    /// List live downstream sessions with explicit transport/scope.
+    /// List live downstream sessions.
     ListLiveSessions,
     /// Get the daemon runtime's synthesized MCP capabilities.
-    Capabilities {
-        session_id: String,
-    },
+    Capabilities { session_id: String },
     /// Query the daemon-authoritative modern downstream gate.
-    ModernDownstreamGate {
-        session_id: String,
-    },
+    ModernDownstreamGate { session_id: String },
 
     /// Proxy an MCP JSON-RPC request through the daemon's shared Engine.
     McpRequest {
@@ -456,237 +356,51 @@ pub enum IpcRequest {
     AuthStatus,
 }
 
-/// Custom Debug that redacts auth_token fields to prevent log leakage.
-impl fmt::Debug for IpcRequest {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Status => write!(f, "Status"),
-            Self::OperatorHandshake {
-                client_version,
-                ipc_min,
-                ipc_max,
-            } => f
-                .debug_struct("OperatorHandshake")
-                .field("client_version", client_version)
-                .field("ipc_min", ipc_min)
-                .field("ipc_max", ipc_max)
-                .finish(),
-            Self::ActivitySnapshot {
-                after_sequence,
-                limit,
-                failures_only,
-                ..
-            } => f
-                .debug_struct("ActivitySnapshot")
-                .field("auth_token", &"[REDACTED]")
-                .field("after_sequence", after_sequence)
-                .field("limit", limit)
-                .field("failures_only", failures_only)
-                .finish(),
-            Self::OperatorSnapshot { .. } => f
-                .debug_struct("OperatorSnapshot")
-                .field("auth_token", &"[REDACTED]")
-                .finish(),
-            Self::GetServerConfig { name, .. } => f
-                .debug_struct("GetServerConfig")
-                .field("auth_token", &"[REDACTED]")
-                .field("name", name)
-                .finish(),
-            Self::RevokeDownstreamClient { client_id, .. } => f
-                .debug_struct("RevokeDownstreamClient")
-                .field("auth_token", &"[REDACTED]")
-                .field("client_id", client_id)
-                .finish(),
-            Self::ValidateServer { name, .. } => f
-                .debug_struct("ValidateServer")
-                .field("auth_token", &"[REDACTED]")
-                .field("name", name)
-                .finish(),
-            Self::DescribeApi { spec, .. } => f
-                .debug_struct("DescribeApi")
-                .field("auth_token", &"[REDACTED]")
-                .field("spec", spec)
-                .finish(),
-            Self::AddServer { name, .. } => f
-                .debug_struct("AddServer")
-                .field("auth_token", &"[REDACTED]")
-                .field("name", name)
-                .finish(),
-            Self::UpdateServer { name, .. } => f
-                .debug_struct("UpdateServer")
-                .field("auth_token", &"[REDACTED]")
-                .field("name", name)
-                .finish(),
-            Self::RemoveServer { name, .. } => f
-                .debug_struct("RemoveServer")
-                .field("auth_token", &"[REDACTED]")
-                .field("name", name)
-                .finish(),
-            Self::AddAccount {
-                server, account, ..
-            } => f
-                .debug_struct("AddAccount")
-                .field("auth_token", &"[REDACTED]")
-                .field("server", server)
-                .field("account", account)
-                .finish(),
-            Self::RenameClient { key, name, .. } => f
-                .debug_struct("RenameClient")
-                .field("auth_token", &"[REDACTED]")
-                .field("key", key)
-                .field("name", name)
-                .finish(),
-            Self::MoveClientSettings { from, to, .. } => f
-                .debug_struct("MoveClientSettings")
-                .field("auth_token", &"[REDACTED]")
-                .field("from", from)
-                .field("to", to)
-                .finish(),
-            Self::SetClientPlace { key, place, .. } => f
-                .debug_struct("SetClientPlace")
-                .field("auth_token", &"[REDACTED]")
-                .field("key", key)
-                .field("place", place)
-                .finish(),
-            Self::SetClientBlock {
-                key,
-                kind,
-                target,
-                blocked,
-                ..
-            } => f
-                .debug_struct("SetClientBlock")
-                .field("auth_token", &"[REDACTED]")
-                .field("key", key)
-                .field("kind", kind)
-                .field("target", target)
-                .field("blocked", blocked)
-                .finish(),
-            Self::AddWatch { watch, .. } => f
-                .debug_struct("AddWatch")
-                .field("auth_token", &"[REDACTED]")
-                .field("event", &watch.event_name())
-                .finish(),
-            Self::RemoveWatch { event, .. } => f
-                .debug_struct("RemoveWatch")
-                .field("auth_token", &"[REDACTED]")
-                .field("event", event)
-                .finish(),
-            Self::SetServerEnabled { name, enabled, .. } => f
-                .debug_struct("SetServerEnabled")
-                .field("auth_token", &"[REDACTED]")
-                .field("name", name)
-                .field("enabled", enabled)
-                .finish(),
-            Self::SetToolEnabled { tool, enabled, .. } => f
-                .debug_struct("SetToolEnabled")
-                .field("auth_token", &"[REDACTED]")
-                .field("tool", tool)
-                .field("enabled", enabled)
-                .finish(),
-            Self::RestartServer { server_id, .. } => f
-                .debug_struct("RestartServer")
-                .field("server_id", server_id)
-                .field("auth_token", &"[REDACTED]")
-                .finish(),
-            Self::Reload { .. } => f
-                .debug_struct("Reload")
-                .field("auth_token", &"[REDACTED]")
-                .finish(),
-            Self::Shutdown { .. } => f
-                .debug_struct("Shutdown")
-                .field("auth_token", &"[REDACTED]")
-                .finish(),
-            Self::Register {
-                protocol_version,
-                client_id,
-                client_info,
-                adapter_version,
-                host,
-                link_target,
-            } => f
-                .debug_struct("Register")
-                .field("protocol_version", protocol_version)
-                .field("client_id", client_id)
-                .field("client_info", client_info)
-                .field("adapter_version", adapter_version)
-                .field("host", host)
-                .field("link_target", link_target)
-                .finish(),
-            Self::Deregister { session_id } => f
-                .debug_struct("Deregister")
-                .field("session_id", session_id)
-                .finish(),
-            Self::UpdateSession {
-                session_id,
-                client_info,
-            } => f
-                .debug_struct("UpdateSession")
-                .field("session_id", session_id)
-                .field("client_info", client_info)
-                .finish(),
-            Self::Ping { session_id } => f
-                .debug_struct("Ping")
-                .field("session_id", session_id)
-                .finish(),
-            Self::ListTools => write!(f, "ListTools"),
-            Self::ListLiveSessions => write!(f, "ListLiveSessions"),
-            Self::Capabilities { session_id } => f
-                .debug_struct("Capabilities")
-                .field("session_id", session_id)
-                .finish(),
-            Self::ModernDownstreamGate { session_id } => f
-                .debug_struct("ModernDownstreamGate")
-                .field("session_id", session_id)
-                .finish(),
-            Self::McpRequest {
-                session_id, method, ..
-            } => f
-                .debug_struct("McpRequest")
-                .field("session_id", session_id)
-                .field("method", method)
-                .finish(),
-            Self::McpRequestWithContext {
-                session_id,
-                method,
-                context,
-                ..
-            } => f
-                .debug_struct("McpRequestWithContext")
-                .field("session_id", session_id)
-                .field("method", method)
-                .field("context", context)
-                .finish(),
-            Self::CancelMcpRequest {
-                session_id,
-                client_id,
-                cancellation_capability: _,
-                request_id,
-                reason,
-            } => f
-                .debug_struct("CancelMcpRequest")
-                .field("session_id", session_id)
-                .field("client_id", client_id)
-                .field("cancellation_capability", &"[REDACTED]")
-                .field("request_id", request_id)
-                .field("reason", reason)
-                .finish(),
-            Self::UpdateRoots { session_id, .. } => f
-                .debug_struct("UpdateRoots")
-                .field("session_id", session_id)
-                .finish(),
-            Self::UpdateCapabilities { session_id, .. } => f
-                .debug_struct("UpdateCapabilities")
-                .field("session_id", session_id)
-                .finish(),
-            Self::RestoreResourceSubscriptions { session_id, uris } => f
-                .debug_struct("RestoreResourceSubscriptions")
-                .field("session_id", session_id)
-                .field("uris", uris)
-                .finish(),
-            Self::AuthStatus => write!(f, "AuthStatus"),
-        }
-    }
+/// What the owner of the daemon token asks of it: the command line and the
+/// app. It travels inside [`IpcRequest::Operator`], which carries the token.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum OperatorRequest {
+    /// The servers, clients, sessions and events, as the app shows them.
+    Snapshot,
+    /// Read the bounded metadata-only activity ring.
+    Activity {
+        after_sequence: u64,
+        limit: usize,
+        failures_only: bool,
+    },
+    /// One server's config, with its secrets replaced by placeholders.
+    GetServerConfig {
+        name: String,
+    },
+    RevokeDownstreamClient {
+        client_id: String,
+    },
+    /// Check a server that is not in the config yet.
+    ValidateServer {
+        name: String,
+        server: Box<crate::config::ServerConfig>,
+    },
+    /// List the operations of the OpenAPI document at `spec`, so a person
+    /// can choose among them before adding the server.
+    DescribeApi {
+        spec: String,
+    },
+    /// Change the config file and apply the change.
+    Mutate {
+        mutation: Box<crate::operator::OperatorMutation>,
+        /// Where the keys typed into a server being added or updated are
+        /// kept: `keychain` when absent, or `file` for Plug's `.env` file.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        secret_store: Option<String>,
+    },
+    RestartServer {
+        server_id: String,
+    },
+    /// Reload configuration from disk.
+    Reload,
+    /// Graceful daemon shutdown.
+    Shutdown,
 }
 
 impl IpcRequest {
@@ -710,27 +424,7 @@ impl IpcRequest {
             Self::CancelMcpRequest { .. }
             | Self::Status
             | Self::OperatorHandshake { .. }
-            | Self::ActivitySnapshot { .. }
-            | Self::OperatorSnapshot { .. }
-            | Self::GetServerConfig { .. }
-            | Self::RevokeDownstreamClient { .. }
-            | Self::ValidateServer { .. }
-            | Self::DescribeApi { .. }
-            | Self::AddServer { .. }
-            | Self::UpdateServer { .. }
-            | Self::RemoveServer { .. }
-            | Self::AddAccount { .. }
-            | Self::SetServerEnabled { .. }
-            | Self::SetToolEnabled { .. }
-            | Self::RenameClient { .. }
-            | Self::MoveClientSettings { .. }
-            | Self::SetClientPlace { .. }
-            | Self::SetClientBlock { .. }
-            | Self::AddWatch { .. }
-            | Self::RemoveWatch { .. }
-            | Self::RestartServer { .. }
-            | Self::Reload { .. }
-            | Self::Shutdown { .. }
+            | Self::Operator { .. }
             | Self::Register { .. }
             | Self::ListTools
             | Self::ListLiveSessions
@@ -1189,53 +883,13 @@ pub enum DaemonToProxyMessage {
     },
 }
 
-/// The `auth_token` field of a request that carries one, written once for
-/// both borrows. A request carries one exactly when it needs the daemon's
-/// token; Register, McpRequest and the other proxy requests rely on the
-/// socket's file permissions instead.
-macro_rules! auth_token_field {
-    ($request:expr) => {
-        match $request {
-            IpcRequest::RestartServer { auth_token, .. }
-            | IpcRequest::Reload { auth_token, .. }
-            | IpcRequest::Shutdown { auth_token, .. }
-            | IpcRequest::ActivitySnapshot { auth_token, .. }
-            | IpcRequest::OperatorSnapshot { auth_token, .. }
-            | IpcRequest::GetServerConfig { auth_token, .. }
-            | IpcRequest::RevokeDownstreamClient { auth_token, .. }
-            | IpcRequest::ValidateServer { auth_token, .. }
-            | IpcRequest::DescribeApi { auth_token, .. }
-            | IpcRequest::AddServer { auth_token, .. }
-            | IpcRequest::UpdateServer { auth_token, .. }
-            | IpcRequest::RemoveServer { auth_token, .. }
-            | IpcRequest::AddAccount { auth_token, .. }
-            | IpcRequest::SetServerEnabled { auth_token, .. }
-            | IpcRequest::SetToolEnabled { auth_token, .. }
-            | IpcRequest::RenameClient { auth_token, .. }
-            | IpcRequest::MoveClientSettings { auth_token, .. }
-            | IpcRequest::SetClientPlace { auth_token, .. }
-            | IpcRequest::SetClientBlock { auth_token, .. }
-            | IpcRequest::AddWatch { auth_token, .. }
-            | IpcRequest::RemoveWatch { auth_token, .. } => Some(auth_token),
-            _ => None,
-        }
-    };
-}
-
 impl IpcRequest {
     /// The daemon token this request presents, if it is one that needs it.
     pub fn auth_token(&self) -> Option<&str> {
-        auth_token_field!(self).map(String::as_str)
-    }
-
-    /// Where the daemon token goes, for a client that attaches it.
-    pub fn auth_token_mut(&mut self) -> Option<&mut String> {
-        auth_token_field!(self)
-    }
-
-    /// Whether the daemon refuses this request without its token.
-    pub fn requires_auth(&self) -> bool {
-        self.auth_token().is_some()
+        match self {
+            IpcRequest::Operator { auth_token, .. } => Some(auth_token.as_str()),
+            _ => None,
+        }
     }
 
     /// Requests the daemon runs on the connection loop even when tagged:
@@ -1248,7 +902,10 @@ impl IpcRequest {
             self,
             IpcRequest::Register { .. }
                 | IpcRequest::Deregister { .. }
-                | IpcRequest::Shutdown { .. }
+                | IpcRequest::Operator {
+                    request: OperatorRequest::Shutdown,
+                    ..
+                }
                 | IpcRequest::Ping { .. }
                 | IpcRequest::ModernDownstreamGate { .. }
         )
@@ -1498,17 +1155,29 @@ pub async fn send_chunked_response_with_id<W: tokio::io::AsyncWriteExt + Unpin>(
         return write_frame(writer, payload.as_ref()).await;
     }
 
-    let chunk_count = payload.len().div_ceil(RESPONSE_CHUNK_BYTES);
-    for (chunk_index, chunk) in payload.chunks(RESPONSE_CHUNK_BYTES).enumerate() {
-        let message = DaemonToProxyMessage::ResponseChunk {
-            chunk_index: chunk_index as u32,
-            chunk_count: chunk_count as u32,
-            payload_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
-        };
+    for message in response_chunks(&payload, RESPONSE_CHUNK_BYTES) {
         send_daemon_message(writer, &message).await?;
     }
-
     Ok(())
+}
+
+/// The `ResponseChunk` envelopes a response payload too large for one frame
+/// travels as, `chunk_bytes` of it in each.
+pub fn response_chunks(
+    payload: &[u8],
+    chunk_bytes: usize,
+) -> impl Iterator<Item = DaemonToProxyMessage> + '_ {
+    let chunk_count = payload.len().div_ceil(chunk_bytes) as u32;
+    payload
+        .chunks(chunk_bytes)
+        .enumerate()
+        .map(
+            move |(chunk_index, chunk)| DaemonToProxyMessage::ResponseChunk {
+                chunk_index: chunk_index as u32,
+                chunk_count,
+                payload_b64: base64::engine::general_purpose::STANDARD.encode(chunk),
+            },
+        )
 }
 
 /// Every `DaemonToProxyMessage` frame starts with its tag: serde writes an
@@ -1954,370 +1623,6 @@ mod tests {
     }
 
     #[test]
-    fn request_serialization_round_trip() {
-        let requests = vec![
-            IpcRequest::Status,
-            IpcRequest::OperatorHandshake {
-                client_version: "0.5.0".to_string(),
-                ipc_min: 3,
-                ipc_max: 4,
-            },
-            IpcRequest::ActivitySnapshot {
-                auth_token: "token".to_string(),
-                after_sequence: 7,
-                limit: 25,
-                failures_only: true,
-            },
-            IpcRequest::RestartServer {
-                server_id: "test-server".to_string(),
-                auth_token: "abc123".to_string(),
-            },
-            IpcRequest::Shutdown {
-                auth_token: "token".to_string(),
-            },
-            IpcRequest::Register {
-                protocol_version: IPC_PROTOCOL_VERSION,
-                client_id: "client-123".to_string(),
-                client_info: Some("claude-code".to_string()),
-                adapter_version: Some("0.6.5".to_string()),
-                host: None,
-                link_target: Some("cursor".to_string()),
-            },
-            IpcRequest::Register {
-                protocol_version: IPC_PROTOCOL_VERSION,
-                client_id: "client-456".to_string(),
-                client_info: None,
-                adapter_version: None,
-                host: None,
-                link_target: None,
-            },
-            IpcRequest::Deregister {
-                session_id: "sess-123".to_string(),
-            },
-            IpcRequest::UpdateSession {
-                session_id: "sess-123".to_string(),
-                client_info: "claude-code".to_string(),
-            },
-            IpcRequest::McpRequest {
-                session_id: "sess-123".to_string(),
-                method: "tools/list".to_string(),
-                params: None,
-            },
-            IpcRequest::McpRequest {
-                session_id: "sess-123".to_string(),
-                method: "tools/call".to_string(),
-                params: Some(serde_json::json!({"name": "test_tool", "arguments": {}})),
-            },
-            IpcRequest::AuthStatus,
-        ];
-
-        for req in &requests {
-            let json = serde_json::to_string(req).unwrap();
-            let deserialized: IpcRequest = serde_json::from_str(&json).unwrap();
-            // Verify round-trip produces valid JSON
-            let json2 = serde_json::to_string(&deserialized).unwrap();
-            assert_eq!(json, json2);
-        }
-    }
-
-    #[test]
-    fn operator_handshake_ignores_client_range_when_client_3_4_overlaps_daemon_3_6() {
-        let request = IpcRequest::OperatorHandshake {
-            client_version: "0.5.0".to_string(),
-            ipc_min: 3,
-            ipc_max: 4,
-        };
-        let response = IpcResponse::OperatorHandshake {
-            handshake: OperatorHandshake {
-                daemon_version: "0.5.0".to_string(),
-                daemon_executable: None,
-                ipc_min: OPERATOR_IPC_MIN,
-                ipc_max: OPERATOR_IPC_MAX,
-                ownership: DaemonOwnershipMode::AppManaged,
-                capabilities: vec![],
-            },
-        };
-
-        let IpcRequest::OperatorHandshake {
-            ipc_min: client_min,
-            ipc_max: client_max,
-            ..
-        } = request
-        else {
-            panic!("expected operator handshake request");
-        };
-        let IpcResponse::OperatorHandshake { handshake } = response else {
-            panic!("expected operator handshake response");
-        };
-
-        // Characterization: handshake advertises the daemon band, not a selected
-        // version derived from the client range.
-        assert_eq!(OPERATOR_IPC_MIN, 3);
-        assert_eq!(handshake.ipc_min, OPERATOR_IPC_MIN);
-        assert_eq!(handshake.ipc_max, OPERATOR_IPC_MAX);
-        assert_ne!(
-            (handshake.ipc_min, handshake.ipc_max),
-            (client_min, client_max)
-        );
-
-        // Client 3-4 still overlaps daemon 3-6.
-        assert!(client_min <= handshake.ipc_max && client_max >= handshake.ipc_min);
-    }
-
-    #[test]
-    fn operator_handshake_round_trips_with_compatibility_range() {
-        let response = IpcResponse::OperatorHandshake {
-            handshake: OperatorHandshake {
-                daemon_version: "0.5.0".to_string(),
-                daemon_executable: Some(std::path::PathBuf::from(
-                    "/Applications/Plug.app/Contents/Resources/plug",
-                )),
-                ipc_min: 3,
-                ipc_max: 4,
-                ownership: DaemonOwnershipMode::AppManaged,
-                capabilities: vec![OperatorCapability::ServerMutation],
-            },
-        };
-        let json = serde_json::to_value(&response).expect("serialize handshake");
-        assert_eq!(json["handshake"]["ipc_min"], 3);
-
-        let decoded: IpcResponse = serde_json::from_value(json).expect("decode handshake");
-        let IpcResponse::OperatorHandshake { handshake } = decoded else {
-            panic!("expected operator handshake");
-        };
-        assert_eq!(handshake.daemon_version, "0.5.0");
-        assert_eq!(
-            handshake.daemon_executable.as_deref(),
-            Some(std::path::Path::new(
-                "/Applications/Plug.app/Contents/Resources/plug"
-            ))
-        );
-        assert_eq!(handshake.ipc_max, 4);
-        assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
-    }
-
-    #[test]
-    fn operator_handshake_decodes_unknown_ownership() {
-        let response = serde_json::json!({
-            "type": "OperatorHandshake",
-            "handshake": {
-                "daemon_version": "0.7.0",
-                "ipc_min": 3,
-                "ipc_max": 6,
-                "ownership": "unknown",
-                "capabilities": []
-            }
-        });
-
-        let decoded: IpcResponse =
-            serde_json::from_value(response).expect("unknown ownership must decode");
-        let IpcResponse::OperatorHandshake { handshake } = decoded else {
-            panic!("expected operator handshake");
-        };
-        assert_eq!(handshake.ownership, DaemonOwnershipMode::Unknown);
-    }
-
-    #[test]
-    fn operator_handshake_ignores_legacy_stale_field() {
-        let leftover = serde_json::json!({
-            "type": "OperatorHandshake",
-            "handshake": {
-                "daemon_version": "0.7.0",
-                "ipc_min": 3,
-                "ipc_max": 6,
-                "ownership": "app_managed",
-                "stale": true,
-                "capabilities": []
-            }
-        });
-        let decoded: IpcResponse =
-            serde_json::from_value(leftover).expect("unknown stale key must be ignored");
-        let IpcResponse::OperatorHandshake { handshake } = decoded else {
-            panic!("expected operator handshake");
-        };
-        assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
-    }
-
-    #[test]
-    fn operator_handshake_decodes_without_daemon_executable() {
-        let old_response = serde_json::json!({
-            "type": "OperatorHandshake",
-            "handshake": {
-                "daemon_version": "0.5.0",
-                "ipc_min": 3,
-                "ipc_max": 4,
-                "ownership": "cli_managed",
-                "capabilities": []
-            }
-        });
-
-        let decoded: IpcResponse =
-            serde_json::from_value(old_response).expect("old handshake must remain compatible");
-        let IpcResponse::OperatorHandshake { handshake } = decoded else {
-            panic!("expected operator handshake");
-        };
-        assert_eq!(handshake.daemon_executable, None);
-    }
-
-    #[test]
-    fn response_serialization_round_trip() {
-        let responses = vec![
-            IpcResponse::Ok,
-            IpcResponse::Error {
-                code: "AUTH_FAILED".to_string(),
-                message: "invalid token".to_string(),
-            },
-            IpcResponse::Status {
-                servers: vec![],
-                clients: 0,
-                uptime_secs: 42,
-                runtime_version: "0.3.0".to_string(),
-                resource_subscriptions: 3,
-            },
-            IpcResponse::Tools {
-                tools: vec![IpcToolInfo {
-                    own_name: None,
-                    read_only: false,
-                    name: "Imessage__send".to_string(),
-                    server_id: "imessage".to_string(),
-                    disabled: false,
-                    disabled_by_pattern: None,
-                    description: Some("Send an iMessage".to_string()),
-                    title: Some("iMessage: Send".to_string()),
-                    icons: Some(vec![
-                        Icon::new("https://example.com/imessage.png").with_mime_type("image/png"),
-                    ]),
-                    risk: IpcToolRiskInfo::default(),
-                    source: None,
-                    upstream: Some(UpstreamServerMetadata {
-                        name: "iMessage Max".to_string(),
-                        version: "1.2.1".to_string(),
-                        title: Some("iMessage Max".to_string()),
-                        description: None,
-                        website_url: None,
-                        icons: Some(vec![
-                            Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
-                        ]),
-                        selected_protocol_version: None,
-                    }),
-                    trust: IpcTrustInfo::default(),
-                }],
-            },
-            IpcResponse::LiveSessions {
-                sessions: vec![IpcLiveSessionInfo {
-                    transport: LiveSessionTransport::DaemonProxy,
-                    client_id: Some("client-123".to_string()),
-                    session_id: "sess-456".to_string(),
-                    client_type: crate::types::ClientType::ClaudeCode,
-                    client_info: Some("claude-code".to_string()),
-                    adapter_version: Some("0.6.5".to_string()),
-                    host: None,
-                    grant: None,
-                    link_target: None,
-                    client_key: None,
-                    access_key: None,
-                    connected_secs: 12,
-                    last_activity_secs: Some(1),
-                }],
-                scope: LiveSessionInventoryScope::DaemonProxyOnly,
-            },
-            IpcResponse::Registered {
-                protocol_version: IPC_PROTOCOL_VERSION,
-                client_id: "client-123".to_string(),
-                session_id: "sess-456".to_string(),
-                modern_downstream_enabled: false,
-                cancellation_capability: IpcCancellationCapability::default(),
-                request_ceiling_ms: 660_000,
-            },
-            IpcResponse::Capabilities {
-                capabilities: serde_json::json!({"tools": {"listChanged": true}}),
-            },
-            IpcResponse::McpResponse {
-                payload: serde_json::json!({"tools": []}),
-            },
-            IpcResponse::ToolListChangedNotification,
-            IpcResponse::ResourceListChangedNotification,
-            IpcResponse::ResourceUpdatedNotification {
-                params: serde_json::json!({"uri": "file:///tmp/test.txt"}),
-            },
-            IpcResponse::PromptListChangedNotification,
-            IpcResponse::ProgressNotification {
-                params: serde_json::json!({"progressToken": "tok-1", "progress": 50, "total": 100}),
-            },
-            IpcResponse::CancelledNotification {
-                params: serde_json::json!({"requestId": 42, "reason": "user cancelled"}),
-            },
-            IpcResponse::AuthStatus {
-                servers: vec![IpcAuthServerInfo {
-                    name: "my-server".to_string(),
-                    url: Some("https://example.com".to_string()),
-                    authenticated: true,
-                    health: ServerHealth::Healthy,
-                    scopes: Some(vec!["read".to_string()]),
-                    token_expires_in_secs: Some(3600),
-                    warnings: vec![],
-                }],
-            },
-            IpcResponse::AuthStateChanged {
-                server_id: "my-server".to_string(),
-                state: ServerHealth::AuthRequired,
-            },
-        ];
-
-        for resp in &responses {
-            let json = serde_json::to_string(resp).unwrap();
-            let deserialized: IpcResponse = serde_json::from_str(&json).unwrap();
-            let json2 = serde_json::to_string(&deserialized).unwrap();
-            assert_eq!(json, json2);
-        }
-    }
-
-    #[test]
-    fn tools_response_json_includes_icons_and_upstream_metadata() {
-        let response = IpcResponse::Tools {
-            tools: vec![IpcToolInfo {
-                own_name: None,
-                read_only: false,
-                name: "Imessage__send".to_string(),
-                server_id: "imessage".to_string(),
-                disabled: false,
-                disabled_by_pattern: None,
-                description: None,
-                title: Some("iMessage: Send".to_string()),
-                icons: Some(vec![
-                    Icon::new("https://example.com/imessage.png").with_mime_type("image/png"),
-                ]),
-                risk: IpcToolRiskInfo::default(),
-                source: None,
-                upstream: Some(UpstreamServerMetadata {
-                    name: "iMessage Max".to_string(),
-                    version: "1.2.1".to_string(),
-                    title: Some("iMessage Max".to_string()),
-                    description: None,
-                    website_url: None,
-                    icons: Some(vec![
-                        Icon::new("data:image/png;base64,aGVsbG8=").with_mime_type("image/png"),
-                    ]),
-                    selected_protocol_version: Some("2025-11-25".to_string()),
-                }),
-                trust: IpcTrustInfo::default(),
-            }],
-        };
-
-        let json = serde_json::to_value(response).expect("serialize tools response");
-
-        assert_eq!(
-            json["tools"][0]["icons"][0]["src"],
-            "https://example.com/imessage.png"
-        );
-        assert_eq!(json["tools"][0]["upstream"]["name"], "iMessage Max");
-        assert_eq!(
-            json["tools"][0]["upstream"]["icons"][0]["src"],
-            "data:image/png;base64,aGVsbG8="
-        );
-    }
-
-    #[test]
     fn source_and_trust_metadata_do_not_expose_secrets() {
         let config = crate::config::ServerConfig {
             command: Some("uvx".to_string()),
@@ -2358,101 +1663,6 @@ mod tests {
     }
 
     #[test]
-    fn requires_auth_identifies_admin_commands() {
-        let requires_auth = |request: IpcRequest| request.requires_auth();
-        assert!(!requires_auth(IpcRequest::Status));
-
-        assert!(requires_auth(IpcRequest::RestartServer {
-            server_id: "s".to_string(),
-            auth_token: "t".to_string(),
-        }));
-        assert!(requires_auth(IpcRequest::Reload {
-            auth_token: "t".to_string(),
-        }));
-        assert!(requires_auth(IpcRequest::Shutdown {
-            auth_token: "t".to_string(),
-        }));
-        assert!(requires_auth(IpcRequest::OperatorSnapshot {
-            auth_token: "t".to_string(),
-        }));
-        assert!(requires_auth(IpcRequest::GetServerConfig {
-            auth_token: "t".to_string(),
-            name: "server".to_string(),
-        }));
-        assert!(requires_auth(IpcRequest::RevokeDownstreamClient {
-            auth_token: "t".to_string(),
-            client_id: "client".to_string(),
-        }));
-        assert!(requires_auth(IpcRequest::ActivitySnapshot {
-            auth_token: "t".to_string(),
-            after_sequence: 0,
-            limit: 500,
-            failures_only: false,
-        }));
-        assert!(requires_auth(IpcRequest::RemoveServer {
-            auth_token: "t".to_string(),
-            name: "server".to_string(),
-        }));
-
-        // MCP proxy variants do NOT require auth (socket ACL suffices)
-        assert!(!requires_auth(IpcRequest::Register {
-            protocol_version: IPC_PROTOCOL_VERSION,
-            client_id: "client-123".to_string(),
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            link_target: None,
-        }));
-        assert!(!requires_auth(IpcRequest::Deregister {
-            session_id: "s".to_string(),
-        }));
-        assert!(!requires_auth(IpcRequest::Capabilities {
-            session_id: "s".to_string(),
-        }));
-        assert!(!requires_auth(IpcRequest::ListLiveSessions));
-        assert!(!requires_auth(IpcRequest::UpdateSession {
-            session_id: "s".to_string(),
-            client_info: "claude-code".to_string(),
-        }));
-        assert!(!requires_auth(IpcRequest::McpRequest {
-            session_id: "s".to_string(),
-            method: "tools/list".to_string(),
-            params: None,
-        }));
-        assert!(!requires_auth(IpcRequest::McpRequestWithContext {
-            session_id: "s".to_string(),
-            method: "tools/list".to_string(),
-            params: None,
-            context: IpcMcpRequestContext {
-                request_id: RequestId::from(rmcp::model::NumberOrString::Number(1)),
-                protocol_version: "2026-07-28".to_string(),
-                client_name: Some("client".to_string()),
-                client_version: Some("1".to_string()),
-            },
-        }));
-        assert!(!requires_auth(IpcRequest::CancelMcpRequest {
-            session_id: "s".to_string(),
-            client_id: "client".to_string(),
-            cancellation_capability: IpcCancellationCapability::new("secret".to_string()),
-            request_id: RequestId::from(rmcp::model::NumberOrString::Number(1)),
-            reason: Some("stop".to_string()),
-        }));
-        assert!(!requires_auth(IpcRequest::AuthStatus));
-    }
-
-    #[test]
-    fn auth_token_reads_and_writes_the_one_field() {
-        assert_eq!(IpcRequest::Status.auth_token(), None);
-        let mut request = IpcRequest::RestartServer {
-            server_id: "s".to_string(),
-            auth_token: String::new(),
-        };
-        *request.auth_token_mut().expect("a token slot") = "my_token".to_string();
-        assert_eq!(request.auth_token(), Some("my_token"));
-        assert!(IpcRequest::Status.auth_token_mut().is_none());
-    }
-
-    #[test]
     fn ipc_client_response_serialization_round_trip() {
         let error_resp = IpcClientResponse::Error {
             message: "test error".to_string(),
@@ -2489,25 +1699,19 @@ mod tests {
     }
 
     #[test]
-    fn tagged_json_format() {
-        let req = IpcRequest::Status;
-        let json = serde_json::to_string(&req).unwrap();
-        assert_eq!(json, r#"{"type":"Status"}"#);
-
-        let resp = IpcResponse::Ok;
-        let json = serde_json::to_string(&resp).unwrap();
-        assert_eq!(json, r#"{"type":"Ok"}"#);
-    }
-
-    #[test]
-    fn debug_redacts_auth_token() {
-        let req = IpcRequest::RestartServer {
-            server_id: "srv".to_string(),
-            auth_token: "super_secret_token".to_string(),
+    fn only_operator_requests_carry_the_token_and_debug_never_shows_it() {
+        let request = IpcRequest::Operator {
+            auth_token: "super_secret_token".to_string().into(),
+            request: OperatorRequest::RestartServer {
+                server_id: "srv".to_string(),
+            },
         };
-        let debug_str = format!("{:?}", req);
-        assert!(!debug_str.contains("super_secret"));
-        assert!(debug_str.contains("[REDACTED]"));
+        assert_eq!(request.auth_token(), Some("super_secret_token"));
+        let debug = format!("{request:?}");
+        assert!(!debug.contains("super_secret"), "{debug}");
+        assert!(debug.contains("srv"), "{debug}");
+        assert_eq!(IpcRequest::Status.auth_token(), None);
+        assert_eq!(IpcRequest::AuthStatus.auth_token(), None);
     }
 
     #[test]
@@ -2676,307 +1880,5 @@ mod tests {
         let resp_json = serde_json::to_value(resp).unwrap();
         assert_eq!(resp_json["type"], "Capabilities");
         assert!(resp_json["capabilities"]["tools"].is_object());
-    }
-
-    mod golden_ipc_fixtures {
-        use super::*;
-
-        use std::path::PathBuf;
-
-        fn golden_dir() -> PathBuf {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("testdata")
-                .join("ipc")
-        }
-
-        fn read_golden(name: &str) -> String {
-            std::fs::read_to_string(golden_dir().join(name))
-                .unwrap_or_else(|e| panic!("read golden {name}: {e}"))
-        }
-
-        fn canonical_handshake_response() -> IpcResponse {
-            IpcResponse::OperatorHandshake {
-                handshake: OperatorHandshake {
-                    daemon_version: "0.7.0".to_string(),
-                    daemon_executable: None,
-                    ipc_min: OPERATOR_IPC_MIN,
-                    ipc_max: OPERATOR_IPC_MAX,
-                    ownership: DaemonOwnershipMode::AppManaged,
-                    capabilities: vec![
-                        OperatorCapability::ServerMutation,
-                        OperatorCapability::ServerConfigRead,
-                    ],
-                },
-            }
-        }
-
-        fn canonical_get_server_config_request() -> IpcRequest {
-            IpcRequest::GetServerConfig {
-                auth_token: "golden-auth-token".to_string(),
-                name: "workspace".to_string(),
-            }
-        }
-
-        fn canonical_server_config() -> crate::config::ServerConfig {
-            crate::config::ServerConfig {
-                command: Some("uvx".to_string()),
-                args: vec!["workspace-mcp".to_string()],
-                ..Default::default()
-            }
-        }
-
-        fn canonical_get_server_config_response() -> IpcResponse {
-            IpcResponse::ServerConfig {
-                name: "workspace".to_string(),
-                server: Box::new(canonical_server_config()),
-            }
-        }
-
-        fn assert_json_matches_canonical<T>(canonical: &T, golden_name: &str)
-        where
-            T: Serialize + for<'de> Deserialize<'de>,
-        {
-            let golden_text = read_golden(golden_name);
-            let golden_value: serde_json::Value =
-                serde_json::from_str(&golden_text).expect("golden must be valid JSON");
-            let canonical_value =
-                serde_json::to_value(canonical).expect("canonical value must serialize");
-            assert_eq!(
-                canonical_value, golden_value,
-                "golden {golden_name} drifted from current Rust IPC types"
-            );
-
-            let round_trip: T = serde_json::from_value(golden_value).expect("golden must decode");
-            assert_eq!(
-                serde_json::to_value(&round_trip).unwrap(),
-                canonical_value,
-                "golden {golden_name} must round-trip through Rust IPC types"
-            );
-        }
-
-        #[test]
-        #[ignore = "run manually to regenerate shared IPC golden JSON fixtures"]
-        fn write_golden_ipc_fixtures() {
-            std::fs::create_dir_all(golden_dir()).expect("create golden dir");
-            let fixtures = [
-                (
-                    "operator_handshake_response.json",
-                    serde_json::to_string_pretty(&canonical_handshake_response()).unwrap(),
-                ),
-                (
-                    "get_server_config_request.json",
-                    serde_json::to_string_pretty(&canonical_get_server_config_request()).unwrap(),
-                ),
-                (
-                    "get_server_config_response.json",
-                    serde_json::to_string_pretty(&canonical_get_server_config_response()).unwrap(),
-                ),
-            ];
-            for (name, contents) in fixtures {
-                std::fs::write(golden_dir().join(name), format!("{contents}\n"))
-                    .unwrap_or_else(|e| panic!("write golden {name}: {e}"));
-            }
-        }
-
-        #[test]
-        fn golden_operator_handshake_response_matches_rust_types() {
-            let response = canonical_handshake_response();
-            assert_json_matches_canonical(&response, "operator_handshake_response.json");
-
-            let IpcResponse::OperatorHandshake { handshake } = response else {
-                panic!("expected operator handshake response");
-            };
-            assert_eq!(handshake.ownership, DaemonOwnershipMode::AppManaged);
-            assert!(
-                handshake
-                    .capabilities
-                    .contains(&OperatorCapability::ServerConfigRead)
-            );
-        }
-
-        #[test]
-        fn golden_get_server_config_request_matches_rust_types() {
-            let request = canonical_get_server_config_request();
-            assert_json_matches_canonical(&request, "get_server_config_request.json");
-
-            let IpcRequest::GetServerConfig { name, .. } = request else {
-                panic!("expected GetServerConfig request");
-            };
-            assert_eq!(name, "workspace");
-        }
-
-        #[test]
-        fn golden_get_server_config_response_matches_rust_types() {
-            let response = canonical_get_server_config_response();
-            assert_json_matches_canonical(&response, "get_server_config_response.json");
-
-            let IpcResponse::ServerConfig { name, server } = response else {
-                panic!("expected ServerConfig response");
-            };
-            assert_eq!(name, "workspace");
-            assert_eq!(server.command.as_deref(), Some("uvx"));
-        }
-    }
-
-    /// The snapshot the app polls, with one server in every `ServerHealth`, so
-    /// the Swift decoder is pinned to the words the daemon really sends.
-    mod golden_operator_snapshot_fixture {
-        use super::*;
-        use std::path::PathBuf;
-
-        const NAME: &str = "operator_snapshot_response.json";
-
-        fn path() -> PathBuf {
-            PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join("..")
-                .join("testdata")
-                .join("ipc")
-                .join(NAME)
-        }
-
-        fn server(name: &str, health: ServerHealth, tool_count: usize) -> ServerStatus {
-            // Built from JSON so fields added to ServerStatus later take their
-            // serde defaults instead of breaking this fixture.
-            let mut status = serde_json::json!({
-                "server_id": name,
-                "health": health,
-                "tool_count": tool_count,
-            });
-            if health == ServerHealth::Failed {
-                status["error"] = serde_json::json!(
-                    "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)"
-                );
-            }
-            serde_json::from_value(status).expect("server status")
-        }
-
-        fn canonical_snapshot_response() -> IpcResponse {
-            let every_health = [
-                ("healthy", ServerHealth::Healthy, 12),
-                ("degraded", ServerHealth::Degraded, 4),
-                ("failed", ServerHealth::Failed, 0),
-                ("auth-required", ServerHealth::AuthRequired, 0),
-            ];
-            // A new ServerHealth variant fails to compile here until the
-            // fixture covers it too.
-            for (_, health, _) in &every_health {
-                match health {
-                    ServerHealth::Healthy
-                    | ServerHealth::Degraded
-                    | ServerHealth::Failed
-                    | ServerHealth::AuthRequired => {}
-                }
-            }
-            IpcResponse::OperatorSnapshot {
-                snapshot: Box::new(OperatorSnapshot {
-                    runtime_version: "0.7.0".to_string(),
-                    uptime_secs: 42,
-                    tool_catalog_revision: 7,
-                    ownership: DaemonOwnershipMode::AppManaged,
-                    configured_servers: every_health
-                        .iter()
-                        .map(|(name, health, _)| crate::operator::OperatorServerSummary {
-                            name: (*name).to_string(),
-                            enabled: true,
-                            transport: crate::config::TransportType::Stdio,
-                            oauth: matches!(health, ServerHealth::AuthRequired),
-                        })
-                        .collect(),
-                    servers: every_health
-                        .iter()
-                        .map(|(name, health, tools)| server(name, *health, *tools))
-                        .collect(),
-                    live_sessions: vec![IpcLiveSessionInfo {
-                        transport: LiveSessionTransport::DaemonProxy,
-                        client_id: Some("client-1".to_string()),
-                        session_id: "session-1".to_string(),
-                        client_type: crate::types::ClientType::ClaudeCode,
-                        client_info: Some("claude-code 2.0".to_string()),
-                        adapter_version: None,
-                        host: None,
-                        grant: None,
-                        link_target: None,
-                        client_key: None,
-                        access_key: None,
-                        connected_secs: 30,
-                        last_activity_secs: Some(2),
-                    }],
-                    client_visibility: vec![OperatorClientVisibility {
-                        session_id: "session-1".to_string(),
-                        client_type: crate::types::ClientType::ClaudeCode,
-                        visible_tool_count: 16,
-                        client_key: None,
-                    }],
-                    upstream_auth: vec![IpcAuthServerInfo {
-                        name: "auth-required".to_string(),
-                        url: Some("https://example.com/mcp".to_string()),
-                        authenticated: false,
-                        health: ServerHealth::AuthRequired,
-                        scopes: None,
-                        token_expires_in_secs: None,
-                        warnings: Vec::new(),
-                    }],
-                    downstream_clients: vec![crate::downstream_oauth::RegisteredClientSummary {
-                        client_id: "remote-1".to_string(),
-                        client_name: "Remote client".to_string(),
-                        redirect_uris: vec!["https://example.com/callback".to_string()],
-                        source: crate::downstream_oauth::ClientSource::DynamicRegistration,
-                        created_at: 1_700_000_000,
-                        last_used_at: None,
-                        expires_at: 1_800_000_000,
-                        signed_in: true,
-                    }],
-                    client_names: Vec::new(),
-                    client_places: Vec::new(),
-                    client_blocks: Vec::new(),
-                    events: Vec::new(),
-                    config_error: None,
-                    client_address: None,
-                }),
-            }
-        }
-
-        fn canonical_json() -> String {
-            let value = serde_json::to_value(canonical_snapshot_response()).unwrap();
-            format!("{}\n", serde_json::to_string_pretty(&value).unwrap())
-        }
-
-        #[test]
-        #[ignore = "run manually to regenerate the shared operator snapshot fixture"]
-        fn write_golden_operator_snapshot_fixture() {
-            std::fs::write(path(), canonical_json())
-                .unwrap_or_else(|e| panic!("write golden {NAME}: {e}"));
-        }
-
-        #[test]
-        fn golden_operator_snapshot_matches_rust_types() {
-            let golden = std::fs::read_to_string(path())
-                .unwrap_or_else(|e| panic!("read golden {NAME}: {e}"));
-            let golden_value: serde_json::Value =
-                serde_json::from_str(&golden).expect("golden must be valid JSON");
-            let canonical_value = serde_json::to_value(canonical_snapshot_response()).unwrap();
-            assert_eq!(
-                canonical_value, golden_value,
-                "golden {NAME} drifted from current Rust IPC types; rerun \
-                 write_golden_operator_snapshot_fixture"
-            );
-
-            let decoded: IpcResponse =
-                serde_json::from_value(golden_value).expect("golden must decode");
-            let IpcResponse::OperatorSnapshot { snapshot } = decoded else {
-                panic!("expected OperatorSnapshot response");
-            };
-            let healths: Vec<ServerHealth> = snapshot.servers.iter().map(|s| s.health).collect();
-            assert_eq!(
-                healths,
-                vec![
-                    ServerHealth::Healthy,
-                    ServerHealth::Degraded,
-                    ServerHealth::Failed,
-                    ServerHealth::AuthRequired,
-                ]
-            );
-        }
     }
 }

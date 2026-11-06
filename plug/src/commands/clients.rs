@@ -497,11 +497,7 @@ pub(crate) fn client_views(
 /// the daemon cannot be asked: the names are a nicety, not a need.
 pub(crate) async fn downstream_grants() -> Vec<plug_core::downstream_oauth::RegisteredClientSummary>
 {
-    match crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
-        auth_token: String::new(),
-    })
-    .await
-    {
+    match crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await {
         Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) => {
             snapshot.downstream_clients
         }

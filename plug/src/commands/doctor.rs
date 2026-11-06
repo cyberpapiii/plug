@@ -508,9 +508,7 @@ where
 }
 
 async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
-    use plug_core::ipc::{
-        DaemonOwnershipMode, IpcRequest, IpcResponse, OPERATOR_IPC_MAX, OPERATOR_IPC_MIN,
-    };
+    use plug_core::ipc::{DaemonOwnershipMode, IpcRequest, IpcResponse};
 
     let mut inspection_errors = Vec::new();
     let app = match crate::install::resolve_verified_app() {
@@ -530,8 +528,6 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
     let handshake = bounded_ipc_probe(
         crate::ipc_client::request(IpcRequest::OperatorHandshake {
             client_version: env!("CARGO_PKG_VERSION").to_string(),
-            ipc_min: OPERATOR_IPC_MIN,
-            ipc_max: OPERATOR_IPC_MAX,
         }),
         std::time::Duration::from_secs(2),
         "daemon operator handshake",
@@ -718,10 +714,7 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
     }
 
     if daemon_reachable {
-        let snapshot = crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
-            auth_token: String::new(),
-        })
-        .await;
+        let snapshot = crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await;
         if let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) = snapshot {
             // A registration the owner named is one they know about.
             let named = config

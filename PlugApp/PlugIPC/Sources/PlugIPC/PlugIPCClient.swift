@@ -24,8 +24,21 @@ public actor PlugIPCClient {
         self.socketURL = socketURL
         self.clientVersion = clientVersion
         self.requestTimeout = min(60, max(0.001, requestTimeout))
-        encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
+        encoder = Self.makeEncoder()
+        decoder = Self.makeDecoder()
+    }
+
+    /// The daemon's field names are snake case.
+    static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        return encoder
+    }
+
+    static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        return decoder
     }
 
     /// A client dropped while connected must not keep its socket. Callers are
@@ -48,11 +61,7 @@ public actor PlugIPCClient {
         if descriptor < 0 {
             descriptor = try Self.openSocket(path: socketURL.path, requestTimeout: requestTimeout)
         }
-        let response = try request(.handshake(
-            clientVersion: clientVersion,
-            ipcMin: supportedIPCVersions.lowerBound,
-            ipcMax: supportedIPCVersions.upperBound
-        ))
+        let response = try request(.handshake(clientVersion: clientVersion))
         guard case let .handshake(handshake) = response else { throw PlugIPCError.unexpectedResponse("handshake") }
         negotiated = handshake
         return handshake

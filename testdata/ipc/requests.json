@@ -1,0 +1,447 @@
+{
+  "activity": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Activity",
+      "after_sequence": 41,
+      "limit": 200,
+      "failures_only": false
+    }
+  },
+  "add_account": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "AddAccount",
+        "server": "workspace",
+        "account": "work"
+      }
+    }
+  },
+  "add_remote_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "AddServer",
+        "name": "notes",
+        "server": {
+          "command": null,
+          "args": [],
+          "env": {},
+          "enabled": true,
+          "transport": "sse",
+          "protocol": "legacy",
+          "url": "https://example.com/sse",
+          "auth_token": null,
+          "auth": "oauth",
+          "oauth_client_id": "plug",
+          "oauth_scopes": [
+            "read"
+          ],
+          "timeout_secs": 30,
+          "call_timeout_secs": 300,
+          "max_concurrent": 1,
+          "health_check_interval_secs": 60,
+          "circuit_breaker_enabled": true,
+          "enrichment": false,
+          "tool_renames": {},
+          "tool_groups": [],
+          "sandbox": null
+        }
+      }
+    }
+  },
+  "add_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "AddServer",
+        "name": "workspace",
+        "server": {
+          "command": "uvx",
+          "args": [
+            "workspace-mcp",
+            "--single-user"
+          ],
+          "env": {
+            "WORKSPACE_TOKEN": "$WORKSPACE_TOKEN"
+          },
+          "enabled": false,
+          "transport": "stdio",
+          "protocol": "legacy",
+          "url": null,
+          "auth_token": null,
+          "auth": null,
+          "oauth_client_id": null,
+          "oauth_scopes": null,
+          "timeout_secs": 45,
+          "call_timeout_secs": 600,
+          "max_concurrent": 2,
+          "health_check_interval_secs": 120,
+          "circuit_breaker_enabled": false,
+          "enrichment": false,
+          "tool_renames": {
+            "search": "find"
+          },
+          "tool_groups": [
+            {
+              "prefix": "Gmail",
+              "contains": [
+                "gmail"
+              ],
+              "strip": [
+                "gmail"
+              ]
+            }
+          ],
+          "sandbox": {
+            "enabled": true,
+            "allow_network": true,
+            "allow_read": [
+              "/Users/me/notes"
+            ],
+            "allow_write": [],
+            "profile_path": null
+          }
+        }
+      },
+      "secret_store": "file"
+    }
+  },
+  "add_watch": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "AddWatch",
+        "watch": {
+          "name": "inbox",
+          "server": "workspace",
+          "tool": "search_gmail_messages",
+          "arguments": {
+            "maxResults": 5,
+            "query": "is:unread"
+          },
+          "every_secs": 60,
+          "allow_writes": true
+        }
+      }
+    }
+  },
+  "allow_list": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetClientBlock",
+        "key": "claude-code",
+        "kind": "allow_list",
+        "target": "*",
+        "blocked": true
+      }
+    }
+  },
+  "allow_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetClientBlock",
+        "key": "claude-code",
+        "kind": "allowed_server",
+        "target": "github",
+        "blocked": true
+      }
+    }
+  },
+  "allow_tool": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetClientBlock",
+        "key": "claude-code",
+        "kind": "allowed_tool",
+        "target": "GitHub__search",
+        "blocked": false
+      }
+    }
+  },
+  "block_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetClientBlock",
+        "key": "claude-code",
+        "kind": "server",
+        "target": "slack",
+        "blocked": true
+      }
+    }
+  },
+  "block_tool": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetClientBlock",
+        "key": "claude-code",
+        "kind": "tool",
+        "target": "Gmail__send",
+        "blocked": false
+      }
+    }
+  },
+  "describe_api": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "DescribeApi",
+      "spec": "https://example.com/openapi.json"
+    }
+  },
+  "get_server_config": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "GetServerConfig",
+      "name": "workspace"
+    }
+  },
+  "handshake": {
+    "type": "OperatorHandshake",
+    "client_version": "0.9.0"
+  },
+  "list_tools": {
+    "type": "ListTools"
+  },
+  "move_client_settings": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "MoveClientSettings",
+        "from": "oauth:old",
+        "to": "oauth:new"
+      }
+    }
+  },
+  "reload": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Reload"
+    }
+  },
+  "remove_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "RemoveServer",
+        "name": "workspace"
+      }
+    }
+  },
+  "remove_watch": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "RemoveWatch",
+        "event": "workspace.inbox"
+      }
+    }
+  },
+  "rename_client": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "RenameClient",
+        "key": "oauth:abc",
+        "name": "Work laptop"
+      }
+    }
+  },
+  "restart_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "RestartServer",
+      "server_id": "workspace"
+    }
+  },
+  "revoke_client": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "RevokeDownstreamClient",
+      "client_id": "abc"
+    }
+  },
+  "set_client_place": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetClientPlace",
+        "key": "oauth:abc",
+        "place": "Studio Mac"
+      }
+    }
+  },
+  "set_server_enabled": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetServerEnabled",
+        "name": "workspace",
+        "enabled": false
+      }
+    }
+  },
+  "set_tool_enabled": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "SetToolEnabled",
+        "tool": "Gmail__send",
+        "enabled": true
+      }
+    }
+  },
+  "shutdown": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Shutdown"
+    }
+  },
+  "snapshot": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Snapshot"
+    }
+  },
+  "status": {
+    "type": "Status"
+  },
+  "update_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "Mutate",
+      "mutation": {
+        "type": "UpdateServer",
+        "name": "pets",
+        "server": {
+          "command": null,
+          "args": [],
+          "env": {},
+          "enabled": true,
+          "transport": "openapi",
+          "protocol": "legacy",
+          "url": null,
+          "auth_token": "••••••••",
+          "auth": null,
+          "oauth_client_id": null,
+          "oauth_scopes": null,
+          "timeout_secs": 30,
+          "call_timeout_secs": 300,
+          "max_concurrent": 4,
+          "health_check_interval_secs": 60,
+          "circuit_breaker_enabled": true,
+          "enrichment": false,
+          "tool_renames": {},
+          "tool_groups": [],
+          "sandbox": null,
+          "spec": "https://example.com/openapi.json",
+          "operations": [
+            "listPets"
+          ],
+          "token_in": "header:X-Api-Key"
+        }
+      }
+    }
+  },
+  "validate_server": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "ValidateServer",
+      "name": "workspace",
+      "server": {
+        "command": "uvx",
+        "args": [
+          "workspace-mcp",
+          "--single-user"
+        ],
+        "env": {
+          "WORKSPACE_TOKEN": "$WORKSPACE_TOKEN"
+        },
+        "enabled": false,
+        "transport": "stdio",
+        "protocol": "legacy",
+        "url": null,
+        "auth_token": null,
+        "auth": null,
+        "oauth_client_id": null,
+        "oauth_scopes": null,
+        "timeout_secs": 45,
+        "call_timeout_secs": 600,
+        "max_concurrent": 2,
+        "health_check_interval_secs": 120,
+        "circuit_breaker_enabled": false,
+        "enrichment": false,
+        "tool_renames": {
+          "search": "find"
+        },
+        "tool_groups": [
+          {
+            "prefix": "Gmail",
+            "contains": [
+              "gmail"
+            ],
+            "strip": [
+              "gmail"
+            ]
+          }
+        ],
+        "sandbox": {
+          "enabled": true,
+          "allow_network": true,
+          "allow_read": [
+            "/Users/me/notes"
+          ],
+          "allow_write": [],
+          "profile_path": null
+        }
+      }
+    }
+  }
+}

@@ -389,7 +389,7 @@ final class AppModelTests: XCTestCase {
         await model.start()
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
 
-        await model.actions.perform("restart demo") { .restartServer(authToken: $0, serverID: "demo") }
+        await model.actions.perform("restart demo", .restartServer(serverID: "demo"))
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
 
         server.catalogRevision = 2
@@ -1277,19 +1277,16 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                 Darwin.close(accepted)
                 return
             }
-            while let object = TestSocket.readRequest(accepted), let type = object["type"] as? String {
-                switch type {
+            while let request = TestSocket.readRequest(accepted), let outer = request["type"] as? String {
+                // An operator request names what it asks inside the envelope.
+                let object = outer == "Operator" ? request["request"] as? [String: Any] ?? [:] : request
+                switch object["type"] as? String ?? outer {
                 case "OperatorHandshake":
                     clientVersion = object["client_version"] as? String
                     events.append("ipc.handshake")
                     send(response: [
                         "type": "OperatorHandshake",
-                        "handshake": [
-                            // What the daemon sends, as in `testdata/ipc/operator_handshake_response.json`.
-                            "daemon_version": daemonVersion, "ipc_min": 3, "ipc_max": 6,
-                            "ownership": "app_managed",
-                            "capabilities": ["server_mutation", "server_config_read"],
-                        ],
+                        "handshake": ["daemon_version": daemonVersion, "ownership": "app_managed"],
                     ], to: accepted)
                 case "GetServerConfig":
                     events.append("ipc.getServerConfig")
@@ -1302,7 +1299,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                             "transport": "stdio",
                         ],
                     ], to: accepted)
-                case "OperatorSnapshot":
+                case "Snapshot":
                     events.append("ipc.snapshot")
                     _ = snapshotGate?.wait(timeout: .now() + 5)
                     send(response: [
@@ -1323,7 +1320,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                             "title": "Echo", "disabled": false,
                         ]],
                     ], to: accepted)
-                case "ActivitySnapshot":
+                case "Activity":
                     events.append("ipc.activity")
                     send(response: ["type": "ActivitySnapshot", "events": []], to: accepted)
                 default:

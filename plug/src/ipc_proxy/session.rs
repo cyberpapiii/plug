@@ -91,8 +91,6 @@ impl DaemonProxySession {
         let handshake = match setup
             .round_trip(IpcRequest::OperatorHandshake {
                 client_version: env!("CARGO_PKG_VERSION").to_string(),
-                ipc_min: ipc::OPERATOR_IPC_MIN,
-                ipc_max: ipc::OPERATOR_IPC_MAX,
             })
             .await?
         {
@@ -226,16 +224,6 @@ fn validate_proxy_daemon_handshake(
             respawn_resolves,
         }));
     }
-    if handshake.ipc_min > ipc::IPC_PROTOCOL_VERSION
-        || handshake.ipc_max < ipc::IPC_PROTOCOL_VERSION
-    {
-        anyhow::bail!(
-            "daemon/client IPC ranges do not overlap: daemon={}..={}, client={}",
-            handshake.ipc_min,
-            handshake.ipc_max,
-            ipc::IPC_PROTOCOL_VERSION
-        );
-    }
     let daemon_executable = handshake.daemon_executable.as_deref().ok_or_else(|| {
         anyhow::anyhow!("daemon did not report its executable; refusing an unverified session")
     })?;
@@ -340,14 +328,11 @@ mod tests {
         executable: Option<&str>,
         ownership: ipc::DaemonOwnershipMode,
     ) -> ipc::OperatorHandshake {
-        ipc::OperatorHandshake {
-            daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-            daemon_executable: executable.map(std::path::PathBuf::from),
-            ipc_min: ipc::IPC_PROTOCOL_VERSION,
-            ipc_max: ipc::IPC_PROTOCOL_VERSION,
+        ipc::OperatorHandshake::new(
+            env!("CARGO_PKG_VERSION").to_string(),
+            executable.map(std::path::PathBuf::from),
             ownership,
-            capabilities: Vec::new(),
-        }
+        )
     }
 
     #[test]
@@ -376,15 +361,10 @@ mod tests {
     }
 
     #[test]
-    fn proxy_handshake_rejects_version_and_protocol_mismatch() {
+    fn proxy_handshake_rejects_a_version_mismatch() {
         let expected = std::path::Path::new("/tmp/plug");
         let mut handshake = proxy_handshake(Some("/tmp/plug"), ipc::DaemonOwnershipMode::Unmanaged);
         handshake.daemon_version = "0.0.0".to_string();
-        assert!(validate_proxy_daemon_handshake(&handshake, expected, false).is_err());
-
-        handshake.daemon_version = env!("CARGO_PKG_VERSION").to_string();
-        handshake.ipc_min = ipc::IPC_PROTOCOL_VERSION + 1;
-        handshake.ipc_max = ipc::IPC_PROTOCOL_VERSION + 1;
         assert!(validate_proxy_daemon_handshake(&handshake, expected, false).is_err());
     }
 

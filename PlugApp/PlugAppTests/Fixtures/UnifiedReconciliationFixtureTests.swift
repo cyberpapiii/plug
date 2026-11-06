@@ -1297,6 +1297,13 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         }
 
         while let object = TestSocket.readRequest(connection), let type = object["type"] as? String {
+            // A registered connector tags its requests and matches each
+            // reply by the tag, as the daemon echoes it.
+            let reply = { (response: [String: Any]) in
+                var response = response
+                response["ipc_id"] = object["ipc_id"]
+                TestSocket.writeJSON(response, to: connection)
+            }
             lock.lock()
             let method = object["method"] as? String
             requestStorage.append(method.map { "\(type):\($0)" } ?? type)
@@ -1304,17 +1311,14 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             switch type {
             case "OperatorHandshake":
                 guard let executableURL, let daemonVersion else { break }
-                TestSocket.writeJSON([
+                reply([
                     "type": "OperatorHandshake",
                     "handshake": [
                         "daemon_version": daemonVersion,
                         "daemon_executable": executableURL.path,
-                        "ipc_min": 3,
-                        "ipc_max": 4,
                         "ownership": "app_managed",
-                        "capabilities": [],
                     ],
-                ], to: connection)
+                ])
             case "Register":
                 lock.lock()
                 registerStorage += 1
@@ -1323,37 +1327,38 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 sessionStorage.append(session)
                 let clientID = object["client_id"] as? String ?? "fixture-client"
                 lock.unlock()
-                TestSocket.writeJSON([
+                reply([
                     "type": "Registered",
                     "protocol_version": object["protocol_version"] as? Int ?? 3,
                     "client_id": clientID,
                     "session_id": session,
                     "modern_downstream_enabled": false,
                     "cancellation_capability": "fixture-cancellation",
-                ], to: connection)
+                    "request_ceiling_ms": 660_000,
+                ])
             case "Capabilities":
-                TestSocket.writeJSON(["type": "Capabilities", "capabilities": [:]], to: connection)
+                reply(["type": "Capabilities", "capabilities": [:]])
             case "UpdateSession", "UpdateCapabilities", "RestoreResourceSubscriptions":
                 if type == "UpdateCapabilities" && generation > 1 {
                     lock.lock()
                     replayStorage += 1
                     lock.unlock()
                 }
-                TestSocket.writeJSON(["type": "Ok"], to: connection)
+                reply(["type": "Ok"])
             case "Ping":
-                TestSocket.writeJSON(["type": "Pong"], to: connection)
+                reply(["type": "Pong"])
             case "ModernDownstreamGate":
-                TestSocket.writeJSON(["type": "ModernDownstreamGate", "enabled": false], to: connection)
+                reply(["type": "ModernDownstreamGate", "enabled": false])
             case "McpRequest", "McpRequestWithContext":
                 let method = object["method"] as? String ?? ""
                 switch method {
                 case "tools/list":
-                    TestSocket.writeJSON(["type": "McpResponse", "payload": ["tools": []]], to: connection)
+                    reply(["type": "McpResponse", "payload": ["tools": []]])
                 default:
-                    TestSocket.writeJSON(["type": "McpResponse", "payload": [:]], to: connection)
+                    reply(["type": "McpResponse", "payload": [:]])
                 }
             default:
-                TestSocket.writeJSON(["type": "Ok"], to: connection)
+                reply(["type": "Ok"])
             }
         }
     }

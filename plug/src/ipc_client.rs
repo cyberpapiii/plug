@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use plug_core::ipc::{self, DaemonFrame, DaemonFrameDecoder, IpcRequest, IpcResponse};
+use plug_core::ipc::{
+    self, DaemonFrame, DaemonFrameDecoder, IpcRequest, IpcResponse, OperatorRequest,
+};
 use tokio::net::UnixStream;
 use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 
@@ -126,11 +128,7 @@ impl Connection {
         }
     }
 
-    /// Send `request`, with the daemon token in it when it needs one.
-    pub(crate) async fn send(&mut self, mut request: IpcRequest) -> Result<(), IpcClientError> {
-        if let Some(slot) = request.auth_token_mut() {
-            *slot = read_auth_token()?;
-        }
+    pub(crate) async fn send(&mut self, request: IpcRequest) -> Result<(), IpcClientError> {
         let payload = serde_json::to_vec(&request).map_err(transport)?;
         ipc::write_frame(&mut self.writer, &payload)
             .await
@@ -171,6 +169,15 @@ impl Connection {
 /// Send one request on a connection of its own and read the reply.
 pub(crate) async fn request(request: IpcRequest) -> Result<IpcResponse, IpcClientError> {
     request_with_timeout(request, REQUEST_TIMEOUT).await
+}
+
+/// Send one request that needs the daemon token, read from its file.
+pub(crate) async fn operator(request: OperatorRequest) -> Result<IpcResponse, IpcClientError> {
+    self::request(IpcRequest::Operator {
+        auth_token: read_auth_token()?.into(),
+        request,
+    })
+    .await
 }
 
 pub(crate) async fn request_with_timeout(
@@ -287,10 +294,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A request that needs the token gets it from the token file without
-    /// the caller reading it.
+    /// An operator request gets the token from the token file without the
+    /// caller reading it.
     #[tokio::test]
-    async fn the_token_is_attached_to_requests_that_need_it() {
+    async fn the_token_is_attached_to_operator_requests() {
         let _guard = test_paths::lock().lock().await;
         let root = temp_root("token");
         test_paths::set(root.clone(), root.clone());
@@ -309,11 +316,7 @@ mod tests {
             request
         });
 
-        let response = request(IpcRequest::Reload {
-            auth_token: String::new(),
-        })
-        .await
-        .expect("reply");
+        let response = operator(OperatorRequest::Reload).await.expect("reply");
         assert!(matches!(response, IpcResponse::Ok));
         let sent = daemon.await.unwrap();
         assert_eq!(sent.auth_token(), Some("the-token"));
