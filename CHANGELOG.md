@@ -49,6 +49,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Stopping the daemon removes its socket, PID file and token every time. When launchd stopped it with SIGTERM, the daemon could exit before that cleanup ran and before HTTP finished shutting down.
+- A client whose connection died is noticed when the daemon next pushes it a notification. The daemon used to ignore the failed write and keep the connection until the client's next request.
+- `plug link`, `plug unlink` and `plug repair` replace a client's settings file in one step, keeping its permissions and any link to it. A crash or the client writing at the same moment could leave the file half written.
+- `plug tools disable --server <name>` writes its pattern with the configured `prefix_delimiter`, and `plug tools` groups tools by it. With a delimiter other than `__` the pattern matched nothing.
+- `plug tools disable` and `plug tools enable` change the config through the same checked edit as every other command, and the live daemon applies it at once. `--config` edits only that file. Turning a pattern back on says so when a wider pattern still keeps those tools off.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.
 - Asking a server that runs tasks itself for a task's status or result gives up after the server's `call_timeout_secs`. A server that never answered used to hold the client's request open for good.

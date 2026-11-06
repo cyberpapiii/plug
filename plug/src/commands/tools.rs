@@ -16,15 +16,20 @@ pub(crate) async fn cmd_tool_command(
     match command {
         ToolCommands::Disabled => cmd_tool_disabled(config_path, output),
         ToolCommands::Disable { server, patterns } => {
-            cmd_tool_disable(config_path, tool_patterns_for_server(server, patterns)?).await
+            let patterns = tool_patterns_for_server(config_path, server, patterns)?;
+            cmd_tool_disable(config_path, patterns).await
         }
         ToolCommands::Enable { server, patterns } => {
-            cmd_tool_enable(config_path, tool_patterns_for_server(server, patterns)?)
+            let patterns = tool_patterns_for_server(config_path, server, patterns)?;
+            cmd_tool_enable(config_path, patterns).await
         }
     }
 }
 
-pub(crate) fn tool_patterns_for_server(
+/// The patterns to change: those given, or every tool of `server`, named
+/// with the configured delimiter.
+fn tool_patterns_for_server(
+    config_path: Option<&std::path::PathBuf>,
     server: Option<String>,
     mut patterns: Vec<String>,
 ) -> anyhow::Result<Vec<String>> {
@@ -32,9 +37,32 @@ pub(crate) fn tool_patterns_for_server(
         if !patterns.is_empty() {
             anyhow::bail!("pass either patterns or `--server`, not both");
         }
-        patterns.push(format!("{server}__*"));
+        let (_, config) = load_editable_config(config_path)?;
+        patterns.push(format!("{server}{}*", config.prefix_delimiter));
     }
     Ok(patterns)
+}
+
+/// Turn each pattern on or off through the mutation every config edit
+/// takes, returning the disabled patterns afterwards.
+async fn set_patterns_enabled(
+    config_path: Option<&std::path::PathBuf>,
+    patterns: &[String],
+    enabled: bool,
+) -> anyhow::Result<Vec<String>> {
+    let mut disabled = Vec::new();
+    for pattern in patterns {
+        let result = crate::commands::servers::apply_server_mutation(
+            config_path,
+            plug_core::operator::OperatorMutation::SetToolEnabled {
+                tool: pattern.clone(),
+                enabled,
+            },
+        )
+        .await?;
+        disabled = result.disabled_tools.unwrap_or_default();
+    }
+    Ok(disabled)
 }
 
 pub(crate) async fn prompt_tool_actions(
@@ -53,7 +81,7 @@ pub(crate) async fn prompt_tool_actions(
             Ok(true)
         }
         Some(2) => {
-            cmd_tool_enable(config_path, Vec::new())?;
+            cmd_tool_enable(config_path, Vec::new()).await?;
             Ok(true)
         }
         Some(3) => {
@@ -103,7 +131,7 @@ pub(crate) async fn cmd_tool_disable(
     config_path: Option<&std::path::PathBuf>,
     mut patterns: Vec<String>,
 ) -> anyhow::Result<()> {
-    let (path, mut config) = load_editable_config(config_path)?;
+    let (_, config) = load_editable_config(config_path)?;
 
     if patterns.is_empty() {
         ensure_daemon_with_feedback(config_path, true).await?;
@@ -137,33 +165,25 @@ pub(crate) async fn cmd_tool_disable(
         }
     }
 
-    let mut added = Vec::new();
-    for pattern in patterns {
-        if !config
-            .disabled_tools
-            .iter()
-            .any(|existing| existing == &pattern)
-        {
-            config.disabled_tools.push(pattern.clone());
-            added.push(pattern);
-        }
-    }
-    config.disabled_tools.sort();
-    plug_core::operator::persist_config_atomic(&path, &config)?;
-
-    if added.is_empty() {
+    let before = config.disabled_tools;
+    let after = set_patterns_enabled(config_path, &patterns, false).await?;
+    let added = after
+        .iter()
+        .filter(|pattern| !before.contains(pattern))
+        .count();
+    if added == 0 {
         print_info_line("No new disabled tool patterns were added.");
     } else {
-        print_success_line(format!("Disabled {} tool pattern(s).", added.len()));
+        print_success_line(format!("Disabled {added} tool pattern(s)."));
     }
     Ok(())
 }
 
-pub(crate) fn cmd_tool_enable(
+pub(crate) async fn cmd_tool_enable(
     config_path: Option<&std::path::PathBuf>,
     mut patterns: Vec<String>,
 ) -> anyhow::Result<()> {
-    let (path, mut config) = load_editable_config(config_path)?;
+    let (_, config) = load_editable_config(config_path)?;
     if config.disabled_tools.is_empty() {
         print_info_line("No disabled tool patterns configured.");
         return Ok(());
@@ -185,16 +205,65 @@ pub(crate) fn cmd_tool_enable(
     }
 
     let before = config.disabled_tools.len();
-    config
-        .disabled_tools
-        .retain(|existing| !patterns.iter().any(|pattern| pattern == existing));
-    plug_core::operator::persist_config_atomic(&path, &config)?;
-
-    let removed = before.saturating_sub(config.disabled_tools.len());
+    let after = set_patterns_enabled(config_path, &patterns, true).await?;
+    let removed = before.saturating_sub(after.len());
     if removed == 0 {
         print_info_line("No matching disabled tool patterns were found.");
     } else {
-        print_success_line(format!("Re-enabled {} tool pattern(s).", removed));
+        print_success_line(format!("Re-enabled {removed} tool pattern(s)."));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_file(label: &str, config: &plug_core::config::Config) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "plug-tools-{label}-{}",
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).expect("create dir");
+        let path = dir.join("config.toml");
+        plug_core::operator::persist_config_atomic(&path, config).expect("write config");
+        path
+    }
+
+    #[test]
+    fn a_server_pattern_uses_the_configured_delimiter() {
+        let config = plug_core::config::Config {
+            prefix_delimiter: "::".to_string(),
+            ..Default::default()
+        };
+        let path = config_file("delimiter", &config);
+        let patterns = tool_patterns_for_server(Some(&path), Some("slack".to_string()), Vec::new())
+            .expect("patterns");
+        assert_eq!(patterns, ["slack::*"]);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// With `--config`, the edit lands in that file through the operator
+    /// mutation, and turning the tool back on refuses while a wider pattern
+    /// still covers it.
+    #[tokio::test]
+    async fn tool_edits_on_an_offline_config_go_through_the_mutation() {
+        let config = plug_core::config::Config {
+            disabled_tools: vec!["slack__*".to_string()],
+            ..Default::default()
+        };
+        let path = config_file("offline", &config);
+
+        cmd_tool_disable(Some(&path), vec!["github__create_issue".to_string()])
+            .await
+            .expect("disable");
+        let (_, written) = load_editable_config(Some(&path)).expect("reload");
+        assert_eq!(written.disabled_tools, ["github__create_issue", "slack__*"]);
+
+        let error = cmd_tool_enable(Some(&path), vec!["slack__send".to_string()])
+            .await
+            .expect_err("a wider pattern keeps the tool off");
+        assert!(error.to_string().contains("slack__*"), "{error}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
 }

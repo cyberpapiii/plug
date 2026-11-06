@@ -806,17 +806,15 @@ fn link_custom_client(transport: LinkTransport, http_url: &str) -> anyhow::Resul
     edit_file(&path, |existing| layout.link(existing, &entry))
 }
 
-/// Write `edit` of the file's contents back. A missing file is empty.
+/// Write `edit` of the file's contents back, whole or not at all. A missing
+/// file is empty.
 fn edit_file(path: &Path, edit: impl FnOnce(&str) -> anyhow::Result<String>) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
     let existing = match std::fs::read_to_string(path) {
         Ok(existing) => existing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
         Err(error) => return Err(error.into()),
     };
-    std::fs::write(path, edit(&existing)?)?;
+    plug_core::fs_perm::write_atomic_keeping_mode(path, edit(&existing)?.as_bytes())?;
     Ok(())
 }
 

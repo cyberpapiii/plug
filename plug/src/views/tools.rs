@@ -180,13 +180,18 @@ pub(crate) async fn cmd_tool_list(
         };
         let inventory_available = inventory_availability.runtime_available();
 
+        let delimiter = config.as_ref().map_or_else(
+            || plug_core::config::Config::default().prefix_delimiter,
+            |config| config.prefix_delimiter.clone(),
+        );
         let mut tools_by_prefix: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
         for t in &all_tools {
-            let (prefix, tool_name) = if let Some(idx) = t.name.find("__") {
-                (t.name[..idx].to_string(), t.name[idx + 2..].to_string())
-            } else {
-                (t.server_id.clone(), t.name.clone())
-            };
+            let (prefix, tool_name) =
+                if let Some((prefix, tool_name)) = t.name.split_once(delimiter.as_str()) {
+                    (prefix.to_string(), tool_name.to_string())
+                } else {
+                    (t.server_id.clone(), t.name.clone())
+                };
             tools_by_prefix.entry(prefix).or_default().push((
                 tool_name,
                 t.server_id.clone(),

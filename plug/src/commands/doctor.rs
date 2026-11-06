@@ -210,12 +210,14 @@ pub(crate) fn inspect_link(
         Some(_) if !write => {
             result.message = "Recognized legacy Plug command needs repair.".to_string();
         }
-        Some(updated) => match std::fs::write(&path, updated) {
-            Ok(()) => result.changed = true,
-            Err(error) => {
-                result.message = format!("Could not repair recognized Plug command: {error}");
+        Some(updated) => {
+            match plug_core::fs_perm::write_atomic_keeping_mode(&path, updated.as_bytes()) {
+                Ok(()) => result.changed = true,
+                Err(error) => {
+                    result.message = format!("Could not repair recognized Plug command: {error}");
+                }
             }
-        },
+        }
         None => {}
     }
     Some(result)

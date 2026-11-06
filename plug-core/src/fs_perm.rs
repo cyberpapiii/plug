@@ -1,4 +1,4 @@
-//! Filesystem helpers for secrets: owner-only directories and files.
+//! Filesystem helpers: owner-only directories and atomic file replacement.
 
 use std::io::Write as _;
 use std::path::Path;
@@ -24,7 +24,31 @@ pub fn ensure_dir_0700(path: &Path) -> std::io::Result<()> {
 /// written through), synced, and renamed over `path`. The rename replaces a
 /// link at `path` instead of following it.
 pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt as _;
+    replace_atomic(path, contents, Some(0o600))
+}
+
+/// Replace a file another program also owns, such as a client's settings,
+/// so that a crash or a concurrent reader never sees half of it. The file
+/// keeps its permissions; a new one gets the usual ones. A link at `path`
+/// is followed, so the file it points at is the one replaced.
+pub fn write_atomic_keeping_mode(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt as _;
+    match std::fs::canonicalize(path) {
+        Ok(target) => {
+            let mode = std::fs::metadata(&target)?.permissions().mode() & 0o7777;
+            replace_atomic(&target, contents, Some(mode))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            replace_atomic(path, contents, None)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Write `contents` to a temporary file beside `path` and rename it over
+/// `path`. `mode` is set exactly; `None` leaves the umask's default.
+fn replace_atomic(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -42,9 +66,14 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()>
     let written = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .mode(0o600)
+        // Owner-only until the exact mode is set, so the bytes are never
+        // readable by more than the final file allows.
+        .mode(if mode.is_some() { 0o600 } else { 0o666 })
         .open(&temporary)
         .and_then(|mut file| {
+            if let Some(mode) = mode {
+                file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+            }
             file.write_all(contents)?;
             file.sync_all()
         })
@@ -67,6 +96,39 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    #[test]
+    fn a_shared_file_keeps_its_mode_and_the_link_to_it() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = scratch_dir("keep-mode");
+        let target = dir.join("settings.json");
+        let link = dir.join("link.json");
+        std::fs::write(&target, "old").unwrap();
+        std::fs::set_permissions(&target, std::fs::Permissions::from_mode(0o640)).unwrap();
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+
+        write_atomic_keeping_mode(&link, b"new").unwrap();
+
+        assert!(
+            std::fs::symlink_metadata(&link)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o640);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_shared_file_that_did_not_exist_is_created() {
+        let dir = scratch_dir("keep-mode-new");
+        let path = dir.join("nested/settings.json");
+        write_atomic_keeping_mode(&path, b"{}").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
