@@ -41,7 +41,6 @@ use crate::mcp_http_headers::{
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
 use crate::session::{SessionSendOutcome, SessionStore, SseMessage, SseReplayKey};
-use crate::tasks::TaskOwner;
 
 /// rmcp header constant for session ID.
 const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -79,9 +78,8 @@ pub struct HttpState {
     pub(crate) client_capabilities: DashMap<String, ClientCapabilities>,
 }
 
-/// HTTP adapter for the shared `tools/call` dispatcher. Carries the per-call
-/// session identity, request id, and trace id the dispatcher needs, plus the
-/// session store so task creation can re-check the session's liveness.
+/// One HTTP request as the dispatcher sees it: a legacy request inside its
+/// session, or a stateless modern request identified by its credential.
 struct HttpDownstreamContext {
     session_id: Arc<str>,
     request_id: RequestId,
@@ -93,8 +91,79 @@ struct HttpDownstreamContext {
     protocol_era: crate::protocol::ProtocolEra,
     modern_direction_enabled: bool,
     cancellation: CancellationToken,
-    session_bound: bool,
     client_metadata: Option<crate::protocol::ClientMetadata>,
+    /// What a modern request declared in `_meta`. HTTP serves the modern
+    /// tasks extension, so a modern request always has one.
+    modern_task_client: Option<ClientCapabilities>,
+}
+
+impl HttpDownstreamContext {
+    /// `session` is the legacy session the request belongs to; a modern
+    /// request has none and goes by its credential's owner key instead.
+    fn new(
+        state: &HttpState,
+        auth_status: AuthStatus,
+        session: Option<&str>,
+        request_id: RequestId,
+        trace_id: Arc<str>,
+        request_meta: Option<&RequestMetaObject>,
+    ) -> Self {
+        let oauth_issuer = state
+            .downstream_oauth
+            .as_ref()
+            .map(|manager| Arc::<str>::from(manager.base_url()));
+        let (session_id, client_type, client_metadata, modern_task_client, protocol_era) =
+            match session {
+                Some(session_id) => (
+                    Arc::<str>::from(session_id),
+                    state
+                        .sessions
+                        .get_client_type(session_id)
+                        .unwrap_or(crate::types::ClientType::Unknown),
+                    None,
+                    None,
+                    crate::protocol::ProtocolEra::Legacy,
+                ),
+                None => {
+                    let client_info = request_meta.and_then(RequestMetaObject::client_info);
+                    (
+                        Arc::<str>::from(
+                            http_credential(&auth_status, oauth_issuer.as_deref())
+                                .principal()
+                                .owner_key(),
+                        ),
+                        client_info
+                            .as_ref()
+                            .map(|info| crate::client_detect::detect_client(&info.name))
+                            .unwrap_or(crate::types::ClientType::Unknown),
+                        client_info.map(|info| crate::protocol::ClientMetadata {
+                            name: Arc::from(info.name),
+                            version: Arc::from(info.version),
+                        }),
+                        Some(
+                            request_meta
+                                .and_then(RequestMetaObject::client_capabilities)
+                                .unwrap_or_default(),
+                        ),
+                        crate::protocol::ProtocolEra::Modern,
+                    )
+                }
+            };
+        Self {
+            session_id,
+            request_id,
+            client_type,
+            trace_id,
+            sessions: Arc::clone(&state.sessions),
+            auth_status,
+            oauth_issuer,
+            protocol_era,
+            modern_direction_enabled: state.router.modern_downstream_enabled(),
+            cancellation: CancellationToken::new(),
+            client_metadata,
+            modern_task_client,
+        }
+    }
 }
 
 /// What a request proved about its caller. `NoAuthRequired` is produced only
@@ -113,43 +182,6 @@ fn http_credential<'a>(
         AuthStatus::Authenticated(None) => HttpCredential::SharedBearer,
         AuthStatus::NoAuthRequired => HttpCredential::Loopback,
     }
-}
-
-fn modern_http_call_context(
-    state: &HttpState,
-    auth_status: &AuthStatus,
-    request_id: RequestId,
-    trace_id: Arc<str>,
-    meta: Option<&RequestMetaObject>,
-) -> DownstreamCallContext {
-    let client_info = meta.and_then(RequestMetaObject::client_info);
-    let oauth_issuer = state
-        .downstream_oauth
-        .as_ref()
-        .map(|manager| manager.base_url());
-    let client_id: Arc<str> = Arc::from(
-        http_credential(auth_status, oauth_issuer)
-            .principal()
-            .owner_key(),
-    );
-    let mut context = DownstreamCallContext::http(
-        client_id,
-        request_id,
-        client_info
-            .as_ref()
-            .map(|info| crate::client_detect::detect_client(&info.name))
-            .unwrap_or(crate::types::ClientType::Unknown),
-    )
-    .with_trace_id(trace_id)
-    .with_protocol(
-        crate::protocol::ProtocolEra::Modern,
-        crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(state.router.modern_downstream_enabled());
-    if let Some(info) = client_info {
-        context = context.with_client_metadata(info.name, info.version);
-    }
-    apply_http_auth(context, auth_status, oauth_issuer)
 }
 
 fn legacy_http_policy_context(
@@ -198,90 +230,6 @@ fn apply_http_auth(
     }
 }
 
-fn projected_modern_capabilities(
-    router: &ToolRouter,
-    context: &DownstreamCallContext,
-) -> ServerCapabilities {
-    let source = router.synthesized_capabilities_for_client(context.client_type);
-    let mut projected = ServerCapabilities::default();
-    if context
-        .policy_decision(crate::protocol::MethodFamily::ToolsList)
-        .is_allowed()
-        && context
-            .policy_decision(crate::protocol::MethodFamily::ToolsCall)
-            .is_allowed()
-    {
-        projected.tools = source.tools;
-    }
-    if context
-        .policy_decision(crate::protocol::MethodFamily::ResourcesList)
-        .is_allowed()
-        && context
-            .policy_decision(crate::protocol::MethodFamily::ResourcesRead)
-            .is_allowed()
-    {
-        projected.resources = source.resources;
-    }
-    if context
-        .policy_decision(crate::protocol::MethodFamily::PromptsList)
-        .is_allowed()
-        && context
-            .policy_decision(crate::protocol::MethodFamily::PromptsGet)
-            .is_allowed()
-    {
-        projected.prompts = source.prompts;
-    }
-    if context
-        .policy_decision(crate::protocol::MethodFamily::Completion)
-        .is_allowed()
-    {
-        projected.completions = source.completions;
-    }
-    crate::protocol::suppress_unimplemented_modern_capabilities(&mut projected);
-    if context
-        .policy_decision(crate::protocol::MethodFamily::Tasks)
-        .is_allowed()
-        && router.supports_tasks()
-    {
-        projected
-            .extensions
-            .get_or_insert_with(Default::default)
-            .insert(
-                rmcp::model::TASKS_EXTENSION_ID.to_string(),
-                Default::default(),
-            );
-    }
-    projected
-}
-
-fn admit_modern_task_operation(
-    router: &ToolRouter,
-    context: &DownstreamCallContext,
-    request_meta: Option<&RequestMetaObject>,
-) -> Result<TaskOwner, McpError> {
-    if !router.supports_tasks() {
-        return Err(McpError::new(
-            ErrorCode::METHOD_NOT_FOUND,
-            "tasks extension is not available",
-            None,
-        ));
-    }
-    if !request_meta
-        .and_then(RequestMetaObject::client_capabilities)
-        .is_some_and(|capabilities| capabilities.supports_tasks())
-    {
-        return Err(McpError::missing_required_client_capability(
-            ClientCapabilities::builder().enable_tasks().build(),
-        ));
-    }
-    context.authorize(crate::protocol::MethodFamily::Tasks)?;
-    context.ensure_principal_lifecycle_active()?;
-    let principal = context.principal().ok_or_else(|| {
-        crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
-    })?;
-    Ok(crate::downstream_identity::principal_task_owner(principal))
-}
-
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
         let mut context = DownstreamCallContext::http(
@@ -290,13 +238,7 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             self.client_type,
         )
         .with_trace_id(Arc::clone(&self.trace_id))
-        .with_protocol(
-            self.protocol_era,
-            match self.protocol_era {
-                crate::protocol::ProtocolEra::Legacy => crate::protocol::SUPPORTED_PROTOCOL_VERSION,
-                crate::protocol::ProtocolEra::Modern => crate::protocol::MODERN_PROTOCOL_VERSION,
-            },
-        )
+        .with_protocol(self.protocol_era, self.protocol_era.version_str())
         .with_modern_direction_enabled(self.modern_direction_enabled)
         .with_lifecycle(None, self.cancellation.clone(), None);
         if let Some(metadata) = &self.client_metadata {
@@ -306,28 +248,30 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
         apply_http_auth(context, &self.auth_status, self.oauth_issuer.as_deref())
     }
 
+    fn session_bound(&self) -> bool {
+        self.protocol_era == crate::protocol::ProtocolEra::Legacy
+    }
+
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        let session_id = self.session_bound.then_some(self.session_id.as_ref());
+        let session_id = self.session_bound().then_some(self.session_id.as_ref());
         Ok(http_credential(&self.auth_status, self.oauth_issuer.as_deref()).task_owner(session_id))
     }
 
-    fn supports_tasks(&self) -> bool {
-        true
-    }
-
-    /// Session-existence probe for the enqueue path's post-guard liveness
-    /// re-check. HTTP teardown (DELETE / idle expiry) removes the session
-    /// from this store BEFORE running task cleanup, and session ids are
-    /// server-minted UUIDv4 (never reused), so "still in the store" is a
-    /// sound "teardown has not started" signal — see the ordering argument
-    /// at the check site in `proxy::tasks`.
+    /// HTTP teardown (DELETE / idle expiry) removes the session from this
+    /// store BEFORE running task cleanup, and session ids are server-minted
+    /// UUIDv4 (never reused), so "still in the store" is a sound "teardown
+    /// has not started" signal.
     fn owner_liveness_probe(&self) -> Option<crate::tasks::OwnerLivenessProbe> {
-        if !self.session_bound {
+        if !self.session_bound() {
             return None;
         }
         let sessions = Arc::clone(&self.sessions);
         let session_id = Arc::clone(&self.session_id);
         Some(Arc::new(move || sessions.validate(&session_id).is_ok()))
+    }
+
+    fn modern_task_client(&self) -> Option<&ClientCapabilities> {
+        self.modern_task_client.as_ref()
     }
 }
 
@@ -1003,6 +947,11 @@ async fn post_mcp(
             reopen_lost_session(&state, &headers, &auth_status);
         }
     }
+    let method = raw_message
+        .get("method")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_owned);
+    let params = raw_message.get("params").cloned();
     let message: ClientJsonRpcMessage = serde_json::from_value(raw_message).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
         HttpError::MalformedJsonRpc {
@@ -1025,7 +974,18 @@ async fn post_mcp(
     // 3. Route based on message type
     match message {
         JsonRpcMessage::Request(req) => {
-            handle_request(req, &headers, &state, trace_id, auth_status, era).await
+            let method = method.unwrap_or_default();
+            handle_request(
+                req,
+                method,
+                params,
+                &headers,
+                &state,
+                trace_id,
+                auth_status,
+                era,
+            )
+            .await
         }
         JsonRpcMessage::Response(response) if era == crate::protocol::ProtocolEra::Legacy => {
             let session_id = extract_session_id(&headers)?;
@@ -1039,12 +999,15 @@ async fn post_mcp(
             match notification.notification {
                 ClientNotification::CancelledNotification(cancelled) => {
                     if let Some(request_id) = cancelled.params.request_id.clone() {
-                        let context = modern_http_call_context(
-                            &state,
-                            &auth_status,
-                            request_id,
-                            trace_id,
-                            None,
+                        let context = crate::dispatch::DownstreamContext::downstream_call_context(
+                            &HttpDownstreamContext::new(
+                                &state,
+                                auth_status,
+                                None,
+                                request_id,
+                                trace_id,
+                                None,
+                            ),
                         );
                         state
                             .router
@@ -1566,8 +1529,11 @@ async fn get_server_card(
 // ---------------------------------------------------------------------------
 
 /// Route a typed JSON-RPC request to the appropriate handler.
+#[allow(clippy::too_many_arguments)]
 async fn handle_request(
     req: JsonRpcRequest<ClientRequest>,
+    method: String,
+    params: Option<serde_json::Value>,
     headers: &HeaderMap,
     state: &Arc<HttpState>,
     trace_id: Arc<str>,
@@ -1594,90 +1560,41 @@ async fn handle_request(
         );
     }
     let request_meta = modern.then(|| rmcp::model::GetMeta::get_meta(&req.request).clone());
-    let policy_context = if modern {
-        modern_http_call_context(
+
+    if let ClientRequest::CustomRequest(custom) = &req.request
+        && modern
+        && matches!(
+            custom.method.as_str(),
+            "events/list" | "events/subscribe" | "events/unsubscribe"
+        )
+    {
+        let policy_context = HttpDownstreamContext::new(
             state,
-            &auth_status,
+            auth_status.clone(),
+            None,
             request_id.clone(),
             Arc::clone(&trace_id),
             request_meta.as_ref(),
-        )
-    } else {
-        legacy_http_policy_context(
-            state,
-            &auth_status,
-            request_id.clone(),
-            Arc::clone(&trace_id),
-        )
-    };
-    let _modern_request_lease = if modern {
-        match state.router.admit_modern_request(&policy_context) {
-            Ok(lease) => Some(lease),
+        );
+        let _modern_request_lease = match state.router.admit_modern_request(
+            &crate::dispatch::DownstreamContext::downstream_call_context(&policy_context),
+        ) {
+            Ok(lease) => lease,
             Err(error) => {
                 return json_response_for_era(
                     &ServerJsonRpcMessage::error(error, Some(request_id)),
                     era,
                 );
             }
-        }
-    } else {
-        None
-    };
+        };
+        return event_request(state, &auth_status, custom, request_id, era).await;
+    }
 
-    match req.request {
-        ClientRequest::DiscoverRequest(_) if modern => {
-            // Reaching this arm means the modern gate is already open (the
-            // fail-closed check above rejects `2026-07-28` otherwise), so the
-            // list is the full dual-era set — the same one stdio and IPC return
-            // from `supported_protocol_versions`. Legacy belongs in it: the same
-            // port still serves `2025-11-25` via `initialize`.
-            let mut result = DiscoverResult::new(
-                crate::protocol::supported_downstream_protocol_versions(true),
-                projected_modern_capabilities(state.router.as_ref(), &policy_context),
-            );
-            result.set_server_info(crate::branding::plug_implementation(env!(
-                "CARGO_PKG_VERSION"
-            )));
-            if events_discoverable(state, &auth_status) {
-                tracing::info!(
-                    method = "server/discover",
-                    status = 200,
-                    events_advertised = true,
-                    "MCP Events discovery outcome"
-                );
-                let mut value = serde_json::to_value(result)
-                    .map_err(|_| HttpError::Internal("discovery serialization failed".into()))?;
-                value["capabilities"]["events"] = json!({});
-                json_response_for_era(
-                    &ServerJsonRpcMessage::response(
-                        ServerResult::CustomResult(CustomResult::new(value)),
-                        request_id,
-                    ),
-                    era,
-                )
-            } else {
-                json_response_for_era(
-                    &ServerJsonRpcMessage::response(
-                        ServerResult::DiscoverResult(result),
-                        request_id,
-                    ),
-                    era,
-                )
-            }
-        }
+    // A legacy request belongs to a session, which only `initialize` opens.
+    let session_id = match &req.request {
+        _ if modern => None,
         ClientRequest::InitializeRequest(init_req) => {
-            if modern {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(
-                        McpError::method_not_found::<InitializeResultMethod>(),
-                        Some(request_id),
-                    ),
-                    era,
-                );
-            }
-            // Initialize: create session, return server info
             let session_id = state.sessions.create_session()?;
-
             let client_name = &init_req.params.client_info.name;
             let client_type = crate::client_detect::detect_client(client_name);
             tracing::info!(
@@ -1689,835 +1606,228 @@ async fn handle_request(
                 selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "HTTP client connected"
             );
-            // Store client type in session
             let _ = state.sessions.set_client_type(&session_id, client_type);
+            let policy_context = legacy_http_policy_context(
+                state,
+                &auth_status,
+                request_id.clone(),
+                Arc::clone(&trace_id),
+            );
             bind_session_to_caller(state, &session_id, &auth_status, &policy_context)?;
-
-            // Track roots capability for reverse-request roots fetching
             if init_req.params.capabilities.roots.is_some() {
                 state.roots_capable_sessions.insert(session_id.clone(), ());
             }
-
-            // Store client capabilities for bridge capability gating
             state
                 .client_capabilities
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
-
-            let mut result = build_initialize_result(state.router.as_ref(), client_type);
-            project_legacy_capabilities(&mut result, &policy_context);
-
-            let response_msg =
-                ServerJsonRpcMessage::response(ServerResult::InitializeResult(result), request_id);
-
-            json_response_with_session(&session_id, &response_msg)
+            Some(session_id)
         }
-
-        ClientRequest::PingRequest(_) => {
-            if modern {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(
-                        McpError::method_not_found::<PingRequestMethod>(),
-                        Some(request_id),
-                    ),
-                    era,
-                );
-            }
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::EmptyResult(EmptyResult {}),
-                request_id,
-            );
-            json_response(&response_msg)
-        }
-
-        ClientRequest::ListToolsRequest(list_req) => {
-            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::ToolsList) {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            let session_id_str = if modern {
-                None
-            } else {
-                let session_id = extract_session_id(headers)?;
-                validate_session_header(headers, state.sessions.as_ref())?;
-                Some(session_id)
-            };
-            let client_type = session_id_str
-                .as_deref()
-                .map(|session_id| {
-                    state
-                        .sessions
-                        .get_client_type(session_id)
-                        .unwrap_or(crate::types::ClientType::Unknown)
-                })
-                .unwrap_or(crate::types::ClientType::Unknown);
-            let lazy_session_key = session_id_str.as_deref().map(|session_id| {
-                crate::downstream_identity::DownstreamTransport::Http.lazy_session_key(session_id)
-            });
-            let result = state.router.list_tools_page_for_client_session(
-                client_type,
-                lazy_session_key.as_deref(),
-                policy_context.client_key.as_deref(),
-                list_req.params,
-            );
-            let response_msg =
-                ServerJsonRpcMessage::response(ServerResult::ListToolsResult(result), request_id);
-            json_response_for_era(&response_msg, era)
-        }
-
-        ClientRequest::CallToolRequest(call_req) => {
-            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::ToolsCall) {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            let session_id = if modern {
-                policy_context.client_id.to_string()
-            } else {
-                let session_id = extract_session_id(headers)?;
-                validate_session_header(headers, state.sessions.as_ref())?;
-                session_id
-            };
-            let client_type = if modern {
-                crate::types::ClientType::Unknown
-            } else {
-                state
-                    .sessions
-                    .get_client_type(&session_id)
-                    .unwrap_or(crate::types::ClientType::Unknown)
-            };
-            let cancellation = CancellationToken::new();
-            let ctx = HttpDownstreamContext {
-                session_id: Arc::<str>::from(session_id.as_str()),
-                request_id: request_id.clone(),
-                client_type,
-                trace_id: Arc::clone(&trace_id),
-                sessions: Arc::clone(&state.sessions),
-                auth_status,
-                oauth_issuer: state
-                    .downstream_oauth
-                    .as_ref()
-                    .map(|manager| Arc::<str>::from(manager.base_url())),
-                protocol_era: era,
-                modern_direction_enabled: state.router.modern_downstream_enabled(),
-                cancellation: cancellation.clone(),
-                session_bound: !modern,
-                client_metadata: request_meta
-                    .as_ref()
-                    .and_then(RequestMetaObject::client_info)
-                    .map(|info| crate::protocol::ClientMetadata {
-                        name: Arc::from(info.name),
-                        version: Arc::from(info.version),
-                    }),
-            };
-            let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
-            let downstream_target = downstream.notification_target();
-            let mut modern_notifications = modern.then(|| state.router.subscribe_notifications());
-            let mut cancellation_guard = HttpRequestCancellationGuard {
-                router: Arc::clone(&state.router),
-                context: downstream,
-                armed: modern,
-            };
-            // RMCP 3.x treats the request envelope's `extensions` as the
-            // canonical runtime home for wire-level `params._meta`: its
-            // deserializer deliberately removes `_meta` from the typed params
-            // and stores a `RequestMetaObject` in `extensions`. The shared
-            // dispatcher accepts params alone, so materialize that metadata
-            // back onto the params at this adapter boundary. Otherwise both
-            // progress tokens and Plug's rewritten legacy `params.task`
-            // marker disappear before dispatch, turning task-wrapped calls
-            // into synchronous calls.
-            let modern_tasks = modern
-                && request_meta
-                    .as_ref()
-                    .and_then(RequestMetaObject::client_capabilities)
-                    .is_some_and(|capabilities| capabilities.supports_tasks())
-                && state.router.supports_tasks();
-            let mut params = call_req.params;
-            if let Some(extension_meta) = call_req.extensions.get::<RequestMetaObject>() {
-                match params.meta.as_mut() {
-                    Some(params_meta) => params_meta.extend(extension_meta.clone()),
-                    None => params.meta = Some(extension_meta.clone()),
-                }
-            }
-            if modern_tasks {
-                params.meta.get_or_insert_with(Default::default).insert(
-                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-                    serde_json::json!({}),
-                );
-            }
-            // A call through a tunnel dies if nothing is sent for too long.
-            // A client that reads event streams gets one once the call runs
-            // long, kept open until the answer is ready.
-            if !modern
-                && headers
-                    .get(header::ACCEPT)
-                    .and_then(|value| value.to_str().ok())
-                    .is_some_and(|accept| accept.contains("text/event-stream"))
-            {
-                let router = Arc::clone(&state.router);
-                let call = async move {
-                    let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params).await;
-                    tool_call_message(outcome, request_id, false)
-                };
-                return answer_or_keep_open(call, LONG_CALL_AFTER).await;
-            }
-            let response_msg = tool_call_message(
-                crate::dispatch::dispatch_tools_call(&state.router, &ctx, params).await,
-                request_id,
-                modern_tasks,
-            );
-            cancellation_guard.disarm();
-            if let Some(receiver) = modern_notifications.as_mut() {
-                let notifications = drain_targeted_notifications(receiver, &downstream_target);
-                if !notifications.is_empty() {
-                    return modern_sse_response(&notifications, &response_msg);
-                }
-            }
-            json_response_for_era(&response_msg, era)
-        }
-
-        ClientRequest::CustomRequest(custom)
-            if modern
-                && matches!(
-                    custom.method.as_str(),
-                    "events/list" | "events/subscribe" | "events/unsubscribe"
-                ) =>
-        {
-            let subscription_method = match custom.method.as_str() {
-                "events/subscribe" => Some("events/subscribe"),
-                "events/unsubscribe" => Some("events/unsubscribe"),
-                _ => None,
-            };
-            if let Some(method) = subscription_method {
-                tracing::info!(
-                    method,
-                    status = "received",
-                    "MCP Events subscription request"
-                );
-            }
-            let sources = event_sources_for(state, &auth_status);
-            let has_scope = sources
-                .as_ref()
-                .is_some_and(|(claims, _)| claims.scopes.iter().any(|s| s == EVENT_SCOPE));
-            // Advertise a scope challenge only to an active client that can see
-            // events. This is incremental consent, never a grant or an event
-            // subscription.
-            if let Some(method) = subscription_method
-                && sources.is_some()
-                && !has_scope
-                && let Some(manager) = &state.downstream_oauth
-            {
-                tracing::info!(
-                    method,
-                    status = 403,
-                    missing_scope = EVENT_SCOPE,
-                    "MCP Events subscription outcome"
-                );
-                return Err(HttpError::InsufficientScopeWithMetadata {
-                    metadata_url: protected_resource_metadata_url(manager.base_url()),
-                    scope: EVENT_SCOPE.to_string(),
-                });
-            }
-            let params = custom.params.unwrap_or_else(|| json!({}));
-            // Static catalog discovery must precede incremental subscription consent.
-            let result = match sources.filter(|_| subscription_method.is_none() || has_scope) {
-                None => Err(crate::events::denied()),
-                Some((claims, sources)) => match custom.method.as_str() {
-                    "events/list" => {
-                        if params
-                            .as_object()
-                            .is_none_or(|p| p.keys().any(|k| k != "_meta" && k != "cursor"))
-                            || params.get("cursor").is_some_and(|v| !v.is_null())
-                        {
-                            Err(crate::events::invalid("invalid event list parameters"))
-                        } else {
-                            tracing::info!(
-                                method = "events/list",
-                                status = 200,
-                                "MCP Events discovery outcome"
-                            );
-                            let events: Vec<_> = sources
-                                .iter()
-                                .flat_map(|source| source.catalog(&claims.client_id))
-                                .collect();
-                            Ok(json!({ "events": events }))
-                        }
-                    }
-                    method => match params["name"]
-                        .as_str()
-                        .and_then(|name| sources.iter().find(|source| source.owns(name)))
-                    {
-                        None => Err(crate::events::invalid("unsupported event")),
-                        Some(source) if method == "events/subscribe" => {
-                            source.subscribe(&claims.client_id, &params).await
-                        }
-                        Some(source) => source.unsubscribe(&claims.client_id, &params).await,
-                    },
-                },
-            };
-            if let Some(method) = subscription_method {
-                tracing::info!(
-                    method,
-                    status = if result.is_ok() {
-                        "200"
-                    } else {
-                        "jsonrpc_error"
-                    },
-                    "MCP Events subscription outcome"
-                );
-            }
-            let response = match result {
-                Ok(value) => ServerJsonRpcMessage::response(
-                    ServerResult::CustomResult(CustomResult::new(value)),
-                    request_id,
-                ),
-                Err(error) => ServerJsonRpcMessage::error(
-                    McpError::new(
-                        ErrorCode(error.code),
-                        error.message,
-                        error.reason.map(|reason| json!({"reason":reason})),
-                    ),
-                    Some(request_id),
-                ),
-            };
-            json_response_for_era(&response, era)
-        }
-
-        ClientRequest::CustomRequest(custom)
-            if !modern && custom.method.starts_with("plug/legacy/tasks/") =>
-        {
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let client_type = state
-                .sessions
-                .get_client_type(&session_id)
-                .unwrap_or(crate::types::ClientType::Unknown);
-            let ctx = HttpDownstreamContext {
-                session_id: Arc::<str>::from(session_id.as_str()),
-                request_id: request_id.clone(),
-                client_type,
-                trace_id: Arc::clone(&trace_id),
-                sessions: Arc::clone(&state.sessions),
-                auth_status,
-                oauth_issuer: state
-                    .downstream_oauth
-                    .as_ref()
-                    .map(|manager| Arc::<str>::from(manager.base_url())),
-                protocol_era: era,
-                modern_direction_enabled: false,
-                cancellation: CancellationToken::new(),
-                session_bound: true,
-                client_metadata: None,
-            };
-            let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
-            if let Err(error) = downstream.authorize(crate::protocol::MethodFamily::Tasks) {
-                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
-            }
-            let owner = match crate::dispatch::DownstreamContext::task_owner(&ctx) {
-                Ok(owner) => owner,
-                Err(error) => {
-                    return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
-                }
-            };
-            let result = match custom.method.as_str() {
-                "plug/legacy/tasks/list" => {
-                    let params = custom
-                        .params_as::<PaginatedRequestParams>()
-                        .map_err(|_| HttpError::BadRequest("invalid task params".into()))?;
-                    state
-                        .router
-                        .list_tasks_for_owner(&owner, params)
-                        .await
-                        .and_then(|v| {
-                            serde_json::to_value(v)
-                                .map_err(|e| ErrorData::internal_error(e.to_string(), None))
-                        })
-                }
-                "plug/legacy/tasks/get" => match legacy_task_params(&custom) {
-                    Ok(params) => state
-                        .router
-                        .get_task_info_for_owner(&owner, &params.task_id)
-                        .await
-                        .and_then(json_task_value),
-                    Err(e) => Err(e),
-                },
-                "plug/legacy/tasks/result" => match legacy_task_params(&custom) {
-                    Ok(params) => state
-                        .router
-                        .get_task_result_for_owner(&owner, &params.task_id)
-                        .await
-                        .and_then(json_task_value),
-                    Err(e) => Err(e),
-                },
-                "plug/legacy/tasks/cancel" => match legacy_task_params(&custom) {
-                    Ok(params) => state
-                        .router
-                        .cancel_task_for_owner(&owner, &params.task_id)
-                        .await
-                        .and_then(json_task_value),
-                    Err(e) => Err(e),
-                },
-                _ => Err(ErrorData::new(
-                    ErrorCode::METHOD_NOT_FOUND,
-                    "method not supported",
-                    None,
-                )),
-            };
-            match result {
-                Ok(value) => Ok(axum::Json(
-                    serde_json::json!({"jsonrpc":"2.0","id":request_id,"result":value}),
-                )
-                .into_response()),
-                Err(error) => json_response(&ServerJsonRpcMessage::error(error, Some(request_id))),
-            }
-        }
-
-        ClientRequest::GetTaskRequest(task_req) if modern => {
-            let owner = match admit_modern_task_operation(
-                state.router.as_ref(),
-                &policy_context,
-                request_meta.as_ref(),
-            ) {
-                Ok(owner) => owner,
-                Err(error) => {
-                    return json_response_for_era(
-                        &ServerJsonRpcMessage::error(error, Some(request_id)),
-                        era,
-                    );
-                }
-            };
-            let response = match state
-                .router
-                .get_modern_task_for_owner(&owner, &task_req.params.task_id)
-                .await
-            {
-                Ok(result) => {
-                    ServerJsonRpcMessage::response(ServerResult::GetTaskResult(result), request_id)
-                }
-                Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
-            };
-            json_response_for_era(&response, era)
-        }
-
-        ClientRequest::CancelTaskRequest(task_req) if modern => {
-            let owner = match admit_modern_task_operation(
-                state.router.as_ref(),
-                &policy_context,
-                request_meta.as_ref(),
-            ) {
-                Ok(owner) => owner,
-                Err(error) => {
-                    return json_response_for_era(
-                        &ServerJsonRpcMessage::error(error, Some(request_id)),
-                        era,
-                    );
-                }
-            };
-            let response = match state
-                .router
-                .cancel_task_for_owner(&owner, &task_req.params.task_id)
-                .await
-            {
-                Ok(_) => ServerJsonRpcMessage::response(
-                    ServerResult::TaskAckResult(TaskAckResult::new()),
-                    request_id,
-                ),
-                Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
-            };
-            json_response_for_era(&response, era)
-        }
-
-        ClientRequest::UpdateTaskRequest(task_req) if modern => {
-            let error = match admit_modern_task_operation(
-                state.router.as_ref(),
-                &policy_context,
-                request_meta.as_ref(),
-            ) {
-                Ok(owner) => match state
-                    .router
-                    .validate_task_owner(&owner, &task_req.params.task_id)
-                    .await
-                {
-                    Ok(()) => McpError::new(
-                        ErrorCode::INVALID_REQUEST,
-                        "this task has no outstanding input request",
-                        None,
-                    ),
-                    Err(error) => error,
-                },
-                Err(error) => error,
-            };
-            json_response_for_era(&ServerJsonRpcMessage::error(error, Some(request_id)), era)
-        }
-
-        ClientRequest::ListResourcesRequest(list_req) => {
-            if let Err(error) =
-                policy_context.authorize(crate::protocol::MethodFamily::ResourcesList)
-            {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            let result = state
-                .router
-                .list_resources_page(list_req.params, policy_context.client_key.as_deref());
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::ListResourcesResult(result),
-                request_id,
-            );
-            json_response_for_era(&response_msg, era)
-        }
-
-        ClientRequest::ListResourceTemplatesRequest(list_req) => {
-            if let Err(error) =
-                policy_context.authorize(crate::protocol::MethodFamily::ResourcesList)
-            {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            let result = state.router.list_resource_templates_page(
-                list_req.params,
-                policy_context.client_key.as_deref(),
-            );
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::ListResourceTemplatesResult(result),
-                request_id,
-            );
-            json_response_for_era(&response_msg, era)
-        }
-
-        ClientRequest::ReadResourceRequest(read_req) => {
-            if let Err(error) =
-                policy_context.authorize(crate::protocol::MethodFamily::ResourcesRead)
-            {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            match state
-                .router
-                .read_resource(&read_req.params.uri, policy_context.client_key.as_deref())
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::ReadResourceResult(result),
-                        request_id,
-                    );
-                    json_response_for_era(&response_msg, era)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response_for_era(&response_msg, era)
-                }
-            }
-        }
-
-        ClientRequest::ListPromptsRequest(list_req) => {
-            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::PromptsList)
-            {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            let result = state
-                .router
-                .list_prompts_page(list_req.params, policy_context.client_key.as_deref());
-            let response_msg =
-                ServerJsonRpcMessage::response(ServerResult::ListPromptsResult(result), request_id);
-            json_response_for_era(&response_msg, era)
-        }
-
-        ClientRequest::GetPromptRequest(prompt_req) => {
-            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::PromptsGet)
-            {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            match state
-                .router
-                .get_prompt(
-                    &prompt_req.params.name,
-                    prompt_req.params.arguments,
-                    policy_context.client_key.as_deref(),
-                )
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::GetPromptResult(result),
-                        request_id,
-                    );
-                    json_response_for_era(&response_msg, era)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response_for_era(&response_msg, era)
-                }
-            }
-        }
-
-        ClientRequest::SubscribeRequest(sub_req) => {
-            if modern {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(
-                        McpError::method_not_found::<SubscribeRequestMethod>(),
-                        Some(request_id),
-                    ),
-                    era,
-                );
-            }
-            if let Err(error) =
-                policy_context.authorize(crate::protocol::MethodFamily::ResourcesSubscribe)
-            {
-                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
-            }
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let target = NotificationTarget::Http {
-                session_id: Arc::from(session_id.as_str()),
-            };
-            match state
-                .router
-                .subscribe_resource(
-                    &sub_req.params.uri,
-                    target,
-                    policy_context.client_key.as_deref(),
-                )
-                .await
-            {
-                Ok(()) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::EmptyResult(().into()),
-                        request_id,
-                    );
-                    json_response(&response_msg)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
-        }
-
-        ClientRequest::UnsubscribeRequest(unsub_req) => {
-            if modern {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(
-                        McpError::method_not_found::<UnsubscribeRequestMethod>(),
-                        Some(request_id),
-                    ),
-                    era,
-                );
-            }
-            if let Err(error) =
-                policy_context.authorize(crate::protocol::MethodFamily::ResourcesSubscribe)
-            {
-                return json_response(&ServerJsonRpcMessage::error(error, Some(request_id)));
-            }
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            let target = NotificationTarget::Http {
-                session_id: Arc::from(session_id.as_str()),
-            };
-            match state
-                .router
-                .unsubscribe_resource(&unsub_req.params.uri, &target)
-                .await
-            {
-                Ok(()) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::EmptyResult(().into()),
-                        request_id,
-                    );
-                    json_response(&response_msg)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response(&response_msg)
-                }
-            }
-        }
-
-        ClientRequest::CompleteRequest(complete_req) => {
-            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::Completion)
-            {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            match state
-                .router
-                .complete_request(complete_req.params, policy_context.client_key.as_deref())
-                .await
-            {
-                Ok(result) => {
-                    let response_msg = ServerJsonRpcMessage::response(
-                        ServerResult::CompleteResult(result),
-                        request_id,
-                    );
-                    json_response_for_era(&response_msg, era)
-                }
-                Err(mcp_err) => {
-                    let response_msg = ServerJsonRpcMessage::error(mcp_err, Some(request_id));
-                    json_response_for_era(&response_msg, era)
-                }
-            }
-        }
-
-        ClientRequest::SetLevelRequest(set_level_req) => {
-            // Not a per-session preference in plug: the effective level is
-            // recalculated across every downstream client and forwarded to
-            // every upstream, so one principal moves the verbosity of the
-            // whole daemon. That is a shared-state write and needs a scope.
-            if let Err(error) = policy_context.authorize(crate::protocol::MethodFamily::Logging) {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(error, Some(request_id)),
-                    era,
-                );
-            }
-            if modern {
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(
-                        McpError::method_not_found::<SetLevelRequestMethod>(),
-                        Some(request_id),
-                    ),
-                    era,
-                );
-            }
-            let session_id = extract_session_id(headers)?;
-            validate_session_header(headers, state.sessions.as_ref())?;
-            tracing::info!(
-                session = %session_id,
-                level = ?set_level_req.params.level,
-                "HTTP client set log level"
-            );
-            state
-                .router
-                .set_client_log_level(&session_id, set_level_req.params.level);
-            state.router.forward_set_level_to_upstreams().await;
-            let response_msg = ServerJsonRpcMessage::response(
-                ServerResult::EmptyResult(EmptyResult {}),
-                request_id,
-            );
-            json_response(&response_msg)
-        }
-
         _ => {
-            // Unsupported method — return JSON-RPC method not found error
-            if !modern {
-                validate_session_header(headers, state.sessions.as_ref())?;
-            }
-            let error = ErrorData::new(ErrorCode::METHOD_NOT_FOUND, "method not supported", None);
-            let response_msg = ServerJsonRpcMessage::error(error, Some(request_id));
-            json_response_for_era(&response_msg, era)
+            let session_id = extract_session_id(headers)?;
+            state.sessions.validate(&session_id)?;
+            Some(session_id)
         }
+    };
+    let ctx = HttpDownstreamContext::new(
+        state,
+        auth_status,
+        session_id.as_deref(),
+        request_id.clone(),
+        trace_id,
+        request_meta.as_ref(),
+    );
+
+    if matches!(req.request, ClientRequest::CallToolRequest(_)) {
+        // A call through a tunnel dies if nothing is sent for too long. A
+        // client that reads event streams gets one once the call runs long,
+        // kept open until the answer is ready.
+        if !modern
+            && headers
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|accept| accept.contains("text/event-stream"))
+        {
+            let router = Arc::clone(&state.router);
+            let call = async move {
+                let outcome = crate::dispatch::handle(&router, &ctx, &method, params).await;
+                dispatch_message(outcome, request_id)
+            };
+            return answer_or_keep_open(call, LONG_CALL_AFTER).await;
+        }
+        let downstream = crate::dispatch::DownstreamContext::downstream_call_context(&ctx);
+        let downstream_target = downstream.notification_target();
+        let mut modern_notifications = modern.then(|| state.router.subscribe_notifications());
+        // Streamable HTTP has no other channel to say a modern caller went
+        // away: a dropped POST cancels the call it carried.
+        let mut cancellation_guard = HttpRequestCancellationGuard {
+            router: Arc::clone(&state.router),
+            context: downstream,
+            armed: modern,
+        };
+        let message = dispatch_message(
+            crate::dispatch::handle(&state.router, &ctx, &method, params).await,
+            request_id,
+        );
+        cancellation_guard.disarm();
+        if let Some(receiver) = modern_notifications.as_mut() {
+            let notifications = drain_targeted_notifications(receiver, &downstream_target);
+            if !notifications.is_empty() {
+                return modern_sse_response(&notifications, &message);
+            }
+        }
+        return json_response_for_era(&message, era);
     }
+
+    let mut outcome = crate::dispatch::handle(&state.router, &ctx, &method, params).await;
+    if matches!(req.request, ClientRequest::DiscoverRequest(_))
+        && let Ok(result) = outcome.as_mut()
+        && events_discoverable(state, &ctx.auth_status)
+    {
+        tracing::info!(
+            method = "server/discover",
+            status = 200,
+            events_advertised = true,
+            "MCP Events discovery outcome"
+        );
+        result["capabilities"]["events"] = json!({});
+    }
+    let message = dispatch_message(outcome, request_id);
+    match (&req.request, session_id) {
+        (ClientRequest::InitializeRequest(_), Some(session_id)) => {
+            json_response_with_session(&session_id, &message)
+        }
+        _ => json_response_for_era(&message, era),
+    }
+}
+
+fn dispatch_message(
+    outcome: Result<serde_json::Value, McpError>,
+    request_id: RequestId,
+) -> ServerJsonRpcMessage {
+    match outcome {
+        Ok(result) => ServerJsonRpcMessage::response(
+            ServerResult::CustomResult(CustomResult::new(result)),
+            request_id,
+        ),
+        Err(error) => ServerJsonRpcMessage::error(error, Some(request_id)),
+    }
+}
+
+/// MCP Events: an HTTP-only, modern-only surface whose callers are OAuth
+/// grants. See `crate::events`.
+async fn event_request(
+    state: &Arc<HttpState>,
+    auth_status: &AuthStatus,
+    custom: &CustomRequest,
+    request_id: RequestId,
+    era: crate::protocol::ProtocolEra,
+) -> Result<Response, HttpError> {
+    let subscription_method = match custom.method.as_str() {
+        "events/subscribe" => Some("events/subscribe"),
+        "events/unsubscribe" => Some("events/unsubscribe"),
+        _ => None,
+    };
+    if let Some(method) = subscription_method {
+        tracing::info!(
+            method,
+            status = "received",
+            "MCP Events subscription request"
+        );
+    }
+    let sources = event_sources_for(state, auth_status);
+    let has_scope = sources
+        .as_ref()
+        .is_some_and(|(claims, _)| claims.scopes.iter().any(|s| s == EVENT_SCOPE));
+    // Advertise a scope challenge only to an active client that can see
+    // events. This is incremental consent, never a grant or an event
+    // subscription.
+    if let Some(method) = subscription_method
+        && sources.is_some()
+        && !has_scope
+        && let Some(manager) = &state.downstream_oauth
+    {
+        tracing::info!(
+            method,
+            status = 403,
+            missing_scope = EVENT_SCOPE,
+            "MCP Events subscription outcome"
+        );
+        return Err(HttpError::InsufficientScopeWithMetadata {
+            metadata_url: protected_resource_metadata_url(manager.base_url()),
+            scope: EVENT_SCOPE.to_string(),
+        });
+    }
+    let params = custom.params.clone().unwrap_or_else(|| json!({}));
+    // Static catalog discovery must precede incremental subscription consent.
+    let result = match sources.filter(|_| subscription_method.is_none() || has_scope) {
+        None => Err(crate::events::denied()),
+        Some((claims, sources)) => match custom.method.as_str() {
+            "events/list" => {
+                if params
+                    .as_object()
+                    .is_none_or(|p| p.keys().any(|k| k != "_meta" && k != "cursor"))
+                    || params.get("cursor").is_some_and(|v| !v.is_null())
+                {
+                    Err(crate::events::invalid("invalid event list parameters"))
+                } else {
+                    tracing::info!(
+                        method = "events/list",
+                        status = 200,
+                        "MCP Events discovery outcome"
+                    );
+                    let events: Vec<_> = sources
+                        .iter()
+                        .flat_map(|source| source.catalog(&claims.client_id))
+                        .collect();
+                    Ok(json!({ "events": events }))
+                }
+            }
+            method => match params["name"]
+                .as_str()
+                .and_then(|name| sources.iter().find(|source| source.owns(name)))
+            {
+                None => Err(crate::events::invalid("unsupported event")),
+                Some(source) if method == "events/subscribe" => {
+                    source.subscribe(&claims.client_id, &params).await
+                }
+                Some(source) => source.unsubscribe(&claims.client_id, &params).await,
+            },
+        },
+    };
+    if let Some(method) = subscription_method {
+        tracing::info!(
+            method,
+            status = if result.is_ok() {
+                "200"
+            } else {
+                "jsonrpc_error"
+            },
+            "MCP Events subscription outcome"
+        );
+    }
+    let response = match result {
+        Ok(mut value) => {
+            crate::protocol::rewrite_modern_result(&mut value);
+            ServerJsonRpcMessage::response(
+                ServerResult::CustomResult(CustomResult::new(value)),
+                request_id,
+            )
+        }
+        Err(error) => ServerJsonRpcMessage::error(
+            McpError::new(
+                ErrorCode(error.code),
+                error.message,
+                error.reason.map(|reason| json!({"reason":reason})),
+            ),
+            Some(request_id),
+        ),
+    };
+    json_response_for_era(&response, era)
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn legacy_task_params(
-    request: &CustomRequest,
-) -> Result<crate::legacy_tasks::TaskIdParams, ErrorData> {
-    request
-        .params_as::<crate::legacy_tasks::TaskIdParams>()
-        .map_err(|error| ErrorData::invalid_params(error.to_string(), None))?
-        .ok_or_else(|| ErrorData::invalid_params("missing task params", None))
-}
-
-fn json_task_value<T: serde::Serialize>(value: T) -> Result<serde_json::Value, ErrorData> {
-    serde_json::to_value(value).map_err(|error| ErrorData::internal_error(error.to_string(), None))
-}
-
-/// Drop the advertised `logging` capability for a principal that cannot use it.
-///
-/// `logging/setLevel` is scope-gated, and the legacy `initialize` result builds
-/// its capabilities from the upstream union with no reference to the caller, so
-/// without this a six-scope token is told logging exists and then denied when it
-/// tries. The modern era already projects every capability through policy.
-/// Legacy still advertises the other families unconditionally — a wider
-/// advertisement/enforcement mismatch that predates the logging scope and is
-/// tracked separately.
-/// Narrow the legacy `initialize` result to what this principal may actually use.
-///
-/// The modern era already does this in `projected_modern_capabilities`. Legacy
-/// built its result from the upstream capability union alone, with no reference
-/// to the caller's grant, while `/mcp` enforced per-request scopes — so a
-/// narrowed token was told that resources, prompts, and completion exist and was
-/// then denied the moment it used them.
-///
-/// Same policy source as every other gate: `decide_method` via
-/// `policy_decision`. This only reshapes the answer. The two projections differ
-/// in that legacy has no tasks extension to gate and does not run
-/// `suppress_unimplemented_modern_capabilities`, which is a modern-era concern.
-///
-/// A family is advertised only when every method behind it is allowed. The
-/// scopes are coarser than the families — one `resources:read` covers list,
-/// read, and subscribe — so in practice these checks move together; requiring
-/// all of them keeps the projection honest if that granularity ever splits.
-fn project_legacy_capabilities(result: &mut InitializeResult, context: &DownstreamCallContext) {
-    use crate::protocol::MethodFamily;
-
-    let allows = |families: &[MethodFamily]| {
-        families
-            .iter()
-            .all(|family| context.policy_decision(*family).is_allowed())
-    };
-    let capabilities = &mut result.capabilities;
-
-    if !allows(&[MethodFamily::ToolsList, MethodFamily::ToolsCall]) {
-        capabilities.tools = None;
-    }
-    if !allows(&[
-        MethodFamily::ResourcesList,
-        MethodFamily::ResourcesRead,
-        MethodFamily::ResourcesSubscribe,
-    ]) {
-        capabilities.resources = None;
-    }
-    if !allows(&[MethodFamily::PromptsList, MethodFamily::PromptsGet]) {
-        capabilities.prompts = None;
-    }
-    if !allows(&[MethodFamily::Completion]) {
-        capabilities.completions = None;
-    }
-    if !allows(&[MethodFamily::Logging, MethodFamily::LoggingRead]) {
-        capabilities.logging = None;
-    }
-}
 
 /// Whether a session opened under `grant` may be sent `notification`. See
 /// [`crate::proxy::ToolRouter::client_may_be_told`].
@@ -2552,18 +1862,6 @@ fn broadcast_audience_for(context: &DownstreamCallContext) -> crate::session::Br
             .policy_decision(MethodFamily::LoggingRead)
             .is_allowed(),
     }
-}
-
-/// Build the InitializeResult (same as ProxyHandler::get_info).
-fn build_initialize_result(
-    router: &ToolRouter,
-    client_type: crate::types::ClientType,
-) -> InitializeResult {
-    InitializeResult::new(router.synthesized_capabilities_for_client(client_type))
-        .with_server_info(crate::branding::plug_implementation(env!(
-            "CARGO_PKG_VERSION"
-        )))
-        .with_protocol_version(crate::protocol::supported_protocol_version())
 }
 
 /// Extract the host from an Origin header value.
@@ -2738,14 +2036,7 @@ fn json_response_for_era(
     } else {
         StatusCode::OK
     };
-    let mut value = serde_json::to_value(msg)
-        .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
-    if era == crate::protocol::ProtocolEra::Legacy {
-        crate::protocol::rewrite_legacy_response(&mut value, false);
-    } else {
-        crate::protocol::rewrite_modern_response(&mut value);
-    }
-    let body = serde_json::to_vec(&value)
+    let body = serde_json::to_vec(msg)
         .map_err(|e| HttpError::Internal(format!("failed to serialize response: {e}")))?;
 
     let mut response = (status, body).into_response();
@@ -2805,34 +2096,6 @@ const LONG_CALL_AFTER: Duration = Duration::from_secs(45);
 /// How often a held-open reply says it is still there.
 const LONG_CALL_KEEP_ALIVE: Duration = Duration::from_secs(15);
 
-fn tool_call_message(
-    outcome: Result<crate::dispatch::ToolCallOutcome, McpError>,
-    request_id: RequestId,
-    modern_tasks: bool,
-) -> ServerJsonRpcMessage {
-    match outcome {
-        Ok(crate::dispatch::ToolCallOutcome::Called(result)) => {
-            ServerJsonRpcMessage::response(ServerResult::CallToolResult(result), request_id)
-        }
-        Ok(crate::dispatch::ToolCallOutcome::InputRequired(result)) => {
-            ServerJsonRpcMessage::response(ServerResult::InputRequiredResult(result), request_id)
-        }
-        Ok(crate::dispatch::ToolCallOutcome::TaskCreated(result)) => {
-            let result = if modern_tasks {
-                ServerResult::CreateTaskResult(rmcp::model::CreateTaskResult::new(
-                    (&result.task).into(),
-                ))
-            } else {
-                ServerResult::CustomResult(CustomResult::new(
-                    serde_json::to_value(result).expect("legacy task result serializes"),
-                ))
-            };
-            ServerJsonRpcMessage::response(result, request_id)
-        }
-        Err(mcp_err) => ServerJsonRpcMessage::error(mcp_err, Some(request_id)),
-    }
-}
-
 /// Answer a legacy request with plain JSON when it finishes within `patience`.
 /// Past that the reply becomes an event stream that carries keep-alives until
 /// the one message is ready, so nothing between Plug and the client gives up
@@ -2850,9 +2113,8 @@ async fn answer_or_keep_open(
     }
     let stream = futures::stream::once(async move {
         let message = call.await;
-        let mut value = serde_json::to_value(&message).unwrap_or(serde_json::Value::Null);
-        crate::protocol::rewrite_legacy_response(&mut value, false);
-        Ok::<Event, Infallible>(Event::default().data(value.to_string()))
+        let data = serde_json::to_string(&message).unwrap_or_else(|_| "null".to_string());
+        Ok::<Event, Infallible>(Event::default().data(data))
     });
     let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(LONG_CALL_KEEP_ALIVE))
@@ -2888,11 +2150,7 @@ fn modern_sse_response(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let mut response_value = serde_json::to_value(response_message).map_err(|error| {
-        HttpError::Internal(format!("failed to serialize SSE response: {error}"))
-    })?;
-    crate::protocol::rewrite_modern_response(&mut response_value);
-    payloads.push(serde_json::to_string(&response_value).map_err(|error| {
+    payloads.push(serde_json::to_string(response_message).map_err(|error| {
         HttpError::Internal(format!("failed to serialize SSE response: {error}"))
     })?);
 
@@ -3986,13 +3244,20 @@ mod tests {
         capabilities.prompts = Some(Default::default());
         capabilities.completions = Some(Default::default());
         capabilities.logging = Some(serde_json::Map::new());
+        capabilities.experimental = Some(
+            [(
+                crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+                serde_json::Map::new(),
+            )]
+            .into_iter()
+            .collect(),
+        );
         capabilities
     }
 
     #[test]
     fn legacy_initialize_projects_capabilities_through_the_principal_scopes() {
         fn advertised(scopes: &[&str]) -> ServerCapabilities {
-            let mut result = InitializeResult::new(every_legacy_capability());
             let context = DownstreamCallContext::http(
                 "cap-session",
                 RequestId::Number(1),
@@ -4002,8 +3267,7 @@ mod tests {
                 crate::types::PrincipalId::configured_credential("cap-test", 0),
                 scopes.iter().map(ToString::to_string),
             );
-            project_legacy_capabilities(&mut result, &context);
-            result.capabilities
+            crate::dispatch::project_capabilities(every_legacy_capability(), &context, false)
         }
 
         // Telling a client a capability exists and then denying every method
@@ -4015,7 +3279,8 @@ mod tests {
             tools_only.resources.is_none()
                 && tools_only.prompts.is_none()
                 && tools_only.completions.is_none()
-                && tools_only.logging.is_none(),
+                && tools_only.logging.is_none()
+                && tools_only.experimental.is_none(),
             "a tools-only grant must not be offered the other families"
         );
 
@@ -4065,17 +3330,17 @@ mod tests {
         assert!(pinned.logging.is_none());
 
         // A loopback listener that requires no auth keeps the whole union.
-        let mut local = InitializeResult::new(every_legacy_capability());
-        project_legacy_capabilities(
-            &mut local,
+        let local = crate::dispatch::project_capabilities(
+            every_legacy_capability(),
             &DownstreamCallContext::http(
                 "loopback",
                 RequestId::Number(2),
                 crate::types::ClientType::Unknown,
             )
             .with_local_principal(HttpCredential::Loopback.principal()),
+            false,
         );
-        assert_eq!(local.capabilities, every_legacy_capability());
+        assert_eq!(local, every_legacy_capability());
     }
 
     #[tokio::test]
@@ -4151,48 +3416,6 @@ mod tests {
         );
     }
 
-    // A tools/call answer proxied from a `2025-11-25` upstream reaches the
-    // serializer with no `resultType`, because that field did not exist on the
-    // revision the upstream answered on. Plug advertises `2026-07-28`
-    // downstream, where the field is mandatory and the absent-means-complete
-    // bridge no longer applies, so a strict modern client rejects the whole
-    // response unless this seam fills it in.
-    #[test]
-    fn modern_era_completes_a_result_proxied_from_a_legacy_upstream() {
-        let mut proxied =
-            ServerResult::CallToolResult(CallToolResult::success(vec![ContentBlock::text("ok")]));
-        proxied.strip_result_type_for_legacy_peer();
-        let message = ServerJsonRpcMessage::response(proxied, RequestId::Number(1));
-
-        let response =
-            json_response_for_era(&message, crate::protocol::ProtocolEra::Modern).unwrap();
-        let body =
-            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
-                .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        assert_eq!(value["result"]["resultType"], "complete");
-        assert_eq!(value["result"]["content"][0]["text"], "ok");
-    }
-
-    // The legacy era keeps its historical wire shape: no modern discriminator.
-    #[test]
-    fn legacy_era_still_omits_the_modern_result_discriminator() {
-        let message = ServerJsonRpcMessage::response(
-            ServerResult::CallToolResult(CallToolResult::success(vec![ContentBlock::text("ok")])),
-            RequestId::Number(1),
-        );
-
-        let response =
-            json_response_for_era(&message, crate::protocol::ProtocolEra::Legacy).unwrap();
-        let body =
-            futures::executor::block_on(axum::body::to_bytes(response.into_body(), usize::MAX))
-                .unwrap();
-        let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-
-        assert!(value["result"].get("resultType").is_none());
-    }
-
     #[tokio::test]
     async fn modern_discovery_is_default_off_then_sessionless_when_enabled() {
         let state = test_state();
@@ -4231,6 +3454,46 @@ mod tests {
         assert!(value["result"]["capabilities"]["extensions"].is_null());
         assert!(value["result"]["capabilities"]["experimental"].is_null());
         assert!(value["result"]["capabilities"]["logging"].is_null());
+    }
+
+    /// A modern caller as the dispatcher sees it, for the admission matrix.
+    struct ModernTaskCaller {
+        call: DownstreamCallContext,
+        client: ClientCapabilities,
+    }
+
+    impl crate::dispatch::DownstreamContext for ModernTaskCaller {
+        fn downstream_call_context(&self) -> DownstreamCallContext {
+            self.call.clone()
+        }
+
+        fn session_bound(&self) -> bool {
+            false
+        }
+
+        fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
+            Ok(crate::downstream_identity::principal_task_owner(
+                self.call.principal().expect("principal"),
+            ))
+        }
+
+        fn modern_task_client(&self) -> Option<&ClientCapabilities> {
+            Some(&self.client)
+        }
+    }
+
+    fn admit_modern_task_operation(
+        router: &ToolRouter,
+        call: &DownstreamCallContext,
+        meta: Option<&RequestMetaObject>,
+    ) -> Result<crate::tasks::TaskOwner, McpError> {
+        let caller = ModernTaskCaller {
+            call: call.clone(),
+            client: meta
+                .and_then(RequestMetaObject::client_capabilities)
+                .unwrap_or_default(),
+        };
+        crate::dispatch::admit_modern_task(router, &caller, call)
     }
 
     #[test]
@@ -4410,7 +3673,13 @@ mod tests {
             crate::types::PrincipalId::configured_credential("test", 1),
             ["tools:read".to_string()],
         );
-        let capabilities = projected_modern_capabilities(state.router.as_ref(), &context);
+        let capabilities = crate::dispatch::project_capabilities(
+            state
+                .router
+                .synthesized_capabilities_for_client(context.client_type),
+            &context,
+            state.router.supports_tasks(),
+        );
         assert!(
             context
                 .policy_decision(crate::protocol::MethodFamily::ToolsList)

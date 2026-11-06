@@ -2213,15 +2213,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             // way to learn otherwise. This is the one answer that must not be
             // partial.
             ctx.engine.wait_until_ready().await;
-            let client_type = ctx
-                .client_registry
-                .client_info(session_id)
-                .map(|info| plug_core::client_detect::detect_client(&info))
-                .unwrap_or(plug_core::types::ClientType::Unknown);
-            let caps = ctx
-                .engine
-                .tool_router()
-                .synthesized_capabilities_for_client(client_type);
+            let caps = plug_core::dispatch::server_capabilities(
+                ctx.engine.tool_router(),
+                &mcp_dispatch::ipc_context(ctx, session_id, None),
+            );
             match serde_json::to_value(caps) {
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },
                 Err(error) => IpcResponse::Error {

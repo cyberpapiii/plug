@@ -2431,35 +2431,27 @@ fn ipc_context_has_distinct_identity_from_stdio() {
     assert_eq!(DownstreamTransport::Ipc.lazy_session_key("sess-1"), ipc_key,);
 }
 
-// ── dispatch::dispatch_tools_call characterization (U1) ──────────────────
-//
-// These pin the shared adapter's contract before the three transports are
-// migrated onto it (U2/U3/U4). End-to-end behavior across every transport is
-// covered by the integration suites and the parity matrix (U6); here we prove
-// the sync/task branch decision and error propagation in isolation.
+// ── dispatch: tools/call ─────────────────────────────────────────────────
 
-/// Mock transport context for exercising `dispatch_tools_call` without a live
-/// transport. `supports_tasks` is configurable so we can prove the task-gate.
-struct MockDownstream {
-    supports_tasks: bool,
+fn local_caller() -> crate::dispatch::IpcContext {
+    let mut ctx =
+        crate::dispatch::IpcContext::new("test-client", RequestId::from(NumberOrString::Number(1)));
+    ctx.registry_client_id = Some(Arc::from("test-owner"));
+    ctx
 }
 
-impl crate::dispatch::DownstreamContext for MockDownstream {
-    fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::stdio(
-            Arc::<str>::from("test-client"),
-            RequestId::from(NumberOrString::Number(1)),
-            ClientType::Unknown,
-        )
-    }
-
-    fn supports_tasks(&self) -> bool {
-        self.supports_tasks
-    }
-
-    fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        Ok(TaskOwner::new(Arc::<str>::from("test-owner")))
-    }
+async fn dispatch_call(
+    router: &Arc<ToolRouter>,
+    ctx: &dyn crate::dispatch::DownstreamContext,
+    params: CallToolRequestParams,
+) -> Result<serde_json::Value, McpError> {
+    crate::dispatch::handle(
+        router,
+        ctx,
+        "tools/call",
+        Some(serde_json::to_value(params).expect("params serialize")),
+    )
+    .await
 }
 
 /// OAuth-backed transport context whose tool scope is intentionally narrower
@@ -2486,8 +2478,8 @@ impl crate::dispatch::DownstreamContext for ScopedTaskDownstream {
         )
     }
 
-    fn supports_tasks(&self) -> bool {
-        true
+    fn session_bound(&self) -> bool {
+        false
     }
 
     fn task_owner(&self) -> Result<TaskOwner, McpError> {
@@ -2540,12 +2532,10 @@ fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
 #[tokio::test]
 async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
     let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
+    let ctx = local_caller();
     let params = CallToolRequestParams::new("");
 
-    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+    let err = dispatch_call(&router, &ctx, params)
         .await
         .expect_err("empty tool name must error");
 
@@ -2557,9 +2547,7 @@ async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
 #[tokio::test]
 async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
     let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: false,
-    };
+    let ctx = local_caller();
 
     for (key, value) in [
         ("plug.dev/legacy-task-support", serde_json::json!(true)),
@@ -2574,7 +2562,7 @@ async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
             .meta
             .get_or_insert_with(Default::default)
             .insert(key.to_string(), value);
-        let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+        let error = dispatch_call(&router, &ctx, params)
             .await
             .expect_err("hostile metadata must fail before route lookup");
         assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "hostile key: {key}");
@@ -2588,13 +2576,11 @@ async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
 #[tokio::test]
 async fn dispatch_tools_call_rejects_oversized_request_state_before_route_effects() {
     let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: false,
-    };
+    let ctx = local_caller();
     let mut params = CallToolRequestParams::new("Mock__tool");
     params.request_state = Some("x".repeat(4 * 1024 + 1));
 
-    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+    let error = dispatch_call(&router, &ctx, params)
         .await
         .expect_err("oversized requestState must fail before route lookup");
     assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
@@ -2621,9 +2607,7 @@ fn mrtr_pair_policy_activates_only_native_modern_rounds() {
 #[tokio::test]
 async fn hostile_task_extension_is_rejected_before_durable_record_creation() {
     let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
+    let ctx = local_caller();
     let mut params = CallToolRequestParams::new("Mock__tool");
     let meta = params.meta.get_or_insert_with(Default::default);
     meta.insert(
@@ -2635,13 +2619,15 @@ async fn hostile_task_extension_is_rejected_before_durable_record_creation() {
         serde_json::json!("someone-else"),
     );
 
-    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+    let error = dispatch_call(&router, &ctx, params)
         .await
         .expect_err("hostile task metadata must fail before durable creation");
     assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
     assert_eq!(
         router
-            .task_count_for_owner(&TaskOwner::new(Arc::<str>::from("test-owner")))
+            .task_count_for_owner(
+                &crate::dispatch::DownstreamContext::task_owner(&ctx).expect("owner")
+            )
             .await,
         0
     );
@@ -2682,22 +2668,20 @@ fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
 #[tokio::test]
 async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
     let router = router_with_unrouted_single_route();
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
+    let ctx = local_caller();
     let mut params = CallToolRequestParams::new("Mock__tool");
     params.meta.get_or_insert_with(Default::default).insert(
         crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
         serde_json::json!({}),
     );
 
-    let outcome = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+    let outcome = dispatch_call(&router, &ctx, params)
         .await
         .expect("task-augmented call should enqueue a local passthrough task");
 
     assert!(
-        matches!(outcome, crate::dispatch::ToolCallOutcome::TaskCreated(_)),
-        "expected TaskCreated outcome, got {outcome:?}"
+        outcome.get("task").is_some(),
+        "expected a created task, got {outcome:?}"
     );
     let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
     assert_eq!(activity.len(), 1);
@@ -2722,7 +2706,7 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
         serde_json::json!({}),
     );
 
-    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+    let err = dispatch_call(&router, &ctx, params)
         .await
         .expect_err("tools scope alone must not authorize durable task creation");
 
@@ -2731,33 +2715,6 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
     let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
     assert_eq!(activity.len(), 1);
     assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_task_param_without_task_support_takes_sync_path() {
-    let router = router_with_unrouted_single_route();
-    // stdio-like: cannot return a task result, so a task-augmented call must
-    // fall through to the synchronous path (preserving today's behavior).
-    let ctx = MockDownstream {
-        supports_tasks: false,
-    };
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-
-    // expect_err is itself the branch-distinction proof: the task path returns
-    // Ok(TaskCreated) (see the sibling test), so an Err means the sync path ran.
-    let err = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
-        .await
-        .expect_err("sync path with no upstream must error, not create a task");
-
-    // And it is specifically the sync path's no-upstream ServerUnavailable error.
-    assert!(
-        err.message.to_lowercase().contains("unavailable"),
-        "expected a sync-path ServerUnavailable error, got {err:?}"
-    );
 }
 
 // ─── refresh_tools ↔ subscription race tests ────────────────────────────────
@@ -3988,9 +3945,7 @@ async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect()
     upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let ctx = MockDownstream {
-        supports_tasks: true,
-    };
+    let ctx = local_caller();
     let owner = crate::dispatch::DownstreamContext::task_owner(&ctx).unwrap();
     let mut params = CallToolRequestParams::new("Modern__tool");
     params.meta.get_or_insert_with(Default::default).insert(
@@ -3998,7 +3953,7 @@ async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect()
         serde_json::json!({}),
     );
 
-    let error = crate::dispatch::dispatch_tools_call(&router, &ctx, params)
+    let error = dispatch_call(&router, &ctx, params)
         .await
         .expect_err("legacy task cannot target a modern upstream");
     assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);

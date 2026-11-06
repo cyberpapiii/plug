@@ -1,113 +1,442 @@
-//! Transport-agnostic dispatch for MCP method handling.
+//! The one MCP method dispatcher. Every downstream transport delegates here.
 //!
-//! The routing core (`ToolRouter::call_tool_with_context` / `enqueue_tool_task`)
-//! is already transport-agnostic and shared by every downstream transport. What
-//! each transport currently hand-rolls is the *adapter shell* around that core:
-//! extract the progress token, build the per-call downstream context, decide
-//! sync-vs-task, invoke the router, and encode the outcome onto the wire.
-//!
-//! This module owns that shell once for the `tools/call` method family. Each
-//! transport supplies a [`DownstreamContext`] (its identity, task-owner derivation,
-//! and whether it can return a task-augmented result) and encodes the returned
-//! [`ToolCallOutcome`] into its own wire format. Wire framing, param parsing, and
-//! transport-specific pre-validation stay in the transport shim.
-//!
-//! Only `tools/call` is migrated here today; other method families remain on their
-//! per-transport paths until their own follow-up migrations.
+//! A transport owns its framing, works out who the caller is and which session
+//! the request belongs to, and hands over the method name and raw params as a
+//! [`DownstreamContext`]. This module owns everything per method: the era's
+//! method set, authorization, task admission, routing to the [`ToolRouter`],
+//! capability projection, and the era's result vocabulary. A new MCP method is
+//! added here and nowhere else.
 
 use std::sync::Arc;
 
 use rmcp::ErrorData as McpError;
-use rmcp::model::{CallToolRequestParams, CallToolResult, InputRequiredResult, RequestParamsMeta};
+use rmcp::model::{
+    CallToolRequestParams, ClientCapabilities, CompleteRequestParams, DiscoverResult, ErrorCode,
+    GetPromptRequestParams, InitializeResult, PaginatedRequestParams, ReadResourceRequestParams,
+    RequestId, RequestParamsMeta, ServerCapabilities, SetLevelRequestParams,
+    SubscribeRequestParams, UnsubscribeRequestParams,
+};
+use serde::Serialize;
+use serde::de::DeserializeOwned;
+use serde_json::Value;
 
-use crate::legacy_tasks::CreateTaskResult;
+use crate::protocol::{MethodFamily, ProtocolEra};
 use crate::proxy::continuations::{MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES};
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 use crate::tasks::{OwnerLivenessProbe, TaskOwner};
+use crate::types::ClientType;
 
-/// Outcome of dispatching a `tools/call`.
-///
-/// A plain call returns a [`CallToolResult`]; a task-augmented call (the request
-/// carries a `task` field and the transport supports it) returns a
-/// [`CreateTaskResult`]. Each transport encodes the variant it receives into its
-/// own response envelope.
-#[derive(Debug)]
-pub enum ToolCallOutcome {
-    /// A synchronous tool result.
-    Called(CallToolResult),
-    /// A native modern upstream requires another client round.
-    InputRequired(InputRequiredResult),
-    /// A background task was created for a task-augmented call.
-    TaskCreated(CreateTaskResult),
-}
-
-/// What the shared `tools/call` dispatcher needs from a transport.
-///
-/// This abstracts only the per-transport adapter bits. Reverse-request
-/// forwarding (elicitation/sampling), progress, and cancellation continue to flow
-/// through the [`DownstreamCallContext`] this trait builds and the existing bridge
-/// registration — the trait does not abstract the bridge mechanism itself.
+/// What the dispatcher needs to know about the caller of one request.
 pub trait DownstreamContext: Send + Sync {
-    /// Build the per-call downstream context the router uses to route reverse
-    /// requests, progress, and cancellation back to this client.
+    /// Who is calling, in which era, with what trust. Built once per request.
     fn downstream_call_context(&self) -> DownstreamCallContext;
 
-    /// Whether this transport can return a [`CreateTaskResult`] for a
-    /// task-augmented call.
-    ///
-    /// stdio's `tools/call` handler can only return a [`CallToolResult`], so it
-    /// returns `false`; a task-augmented call over stdio falls through to a
-    /// synchronous call, preserving today's "task param ignored on stdio"
-    /// behavior. HTTP and IPC return `true`.
-    fn supports_tasks(&self) -> bool {
-        true
-    }
+    /// Whether the caller holds a session that per-connection state (the lazy
+    /// tool catalog, resource subscriptions, log level) can hang on. A modern
+    /// HTTP request is stateless and holds none.
+    fn session_bound(&self) -> bool;
 
-    /// Derive the task owner for a task-augmented call.
-    ///
-    /// Only invoked when [`supports_tasks`](Self::supports_tasks) is `true` and the
-    /// request carries a task. May fail when the transport cannot resolve the
-    /// owning client (e.g. an IPC session that vanished mid-call).
+    /// Who owns the durable tasks this caller creates.
     fn task_owner(&self) -> Result<TaskOwner, McpError>;
 
-    /// Liveness probe for the task owner's downstream session, re-checked by
-    /// `enqueue_tool_task` right after it registers its owner-create guard.
-    /// Closes the race where a session teardown completes *entirely* before
-    /// the enqueue registers anything, so the teardown's tombstone never sees
-    /// the create (see the ordering argument at the check site in
+    /// Re-checked by `enqueue_tool_task` after it registers its owner-create
+    /// guard, closing the race where the owner's session is torn down entirely
+    /// before the enqueue registers anything (see the check site in
     /// `proxy::tasks`).
-    ///
-    /// Default `None`: the transport has no teardown path that could race
-    /// task creation (stdio), so there is nothing to probe.
     fn owner_liveness_probe(&self) -> Option<OwnerLivenessProbe> {
+        None
+    }
+
+    /// The capabilities a modern client declares on this request, when the
+    /// transport can serve the modern tasks extension. `None` means it cannot:
+    /// the extension is neither advertised nor admitted.
+    fn modern_task_client(&self) -> Option<&ClientCapabilities> {
         None
     }
 }
 
-/// Shared `tools/call` adapter.
-///
-/// Owns the progress-extraction → context-build → sync/task branch → router-invoke
-/// step once for every transport. Callers pass already-parsed params (each
-/// transport keeps its own param parsing and pre-validation) and encode the
-/// returned [`ToolCallOutcome`] into their wire format. The routing core is called
-/// unchanged.
-pub async fn dispatch_tools_call(
+/// A `plug connect` session as the daemon sees it. Local, so trusted.
+pub struct IpcContext {
+    pub session_id: Arc<str>,
+    /// The client id the connection registered with; it owns the session's
+    /// durable tasks. `None` once the session is gone.
+    pub registry_client_id: Option<Arc<str>>,
+    pub request_id: RequestId,
+    pub client_type: ClientType,
+    pub client_key: Option<Arc<str>>,
+    /// The revision the downstream client negotiated with `plug connect`.
+    pub protocol_version: Arc<str>,
+    pub client_metadata: Option<crate::protocol::ClientMetadata>,
+    pub modern_enabled: bool,
+    pub owner_liveness: Option<OwnerLivenessProbe>,
+}
+
+impl IpcContext {
+    /// A legacy request from `session_id` with nothing else known about it.
+    pub fn new(session_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
+        Self {
+            session_id: session_id.into(),
+            registry_client_id: None,
+            request_id,
+            client_type: ClientType::Unknown,
+            client_key: None,
+            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            client_metadata: None,
+            modern_enabled: false,
+            owner_liveness: None,
+        }
+    }
+}
+
+impl DownstreamContext for IpcContext {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        let era = ProtocolEra::of(&self.protocol_version);
+        let context = DownstreamCallContext::ipc(
+            Arc::clone(&self.session_id),
+            self.request_id.clone(),
+            self.client_type,
+            self.registry_client_id.as_deref(),
+        )
+        .with_client_key(self.client_key.clone())
+        .with_protocol(era, Arc::clone(&self.protocol_version))
+        .with_modern_direction_enabled(self.modern_enabled && era == ProtocolEra::Modern);
+        match &self.client_metadata {
+            Some(metadata) => context
+                .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version)),
+            None => context,
+        }
+    }
+
+    fn session_bound(&self) -> bool {
+        true
+    }
+
+    fn task_owner(&self) -> Result<TaskOwner, McpError> {
+        self.registry_client_id
+            .as_deref()
+            .map(crate::downstream_identity::ipc_task_owner)
+            .ok_or_else(|| McpError::internal_error("UNKNOWN_SESSION: session not found", None))
+    }
+
+    fn owner_liveness_probe(&self) -> Option<OwnerLivenessProbe> {
+        self.owner_liveness.clone()
+    }
+}
+
+/// Strip from a legacy method the private prefix HTTP gives the SEP-1686 task
+/// methods so RMCP 3.x can parse them; see [`crate::protocol::rewrite_legacy_request`].
+pub const LEGACY_METHOD_PREFIX: &str = "plug/legacy/";
+
+/// Answer one MCP request. The result is in the vocabulary of the caller's era.
+pub async fn handle(
     router: &Arc<ToolRouter>,
     ctx: &dyn DownstreamContext,
-    params: CallToolRequestParams,
-) -> Result<ToolCallOutcome, McpError> {
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, McpError> {
+    let call = ctx.downstream_call_context();
+    let era = call.protocol_era;
+    let _modern_request_lease = match era {
+        ProtocolEra::Modern => {
+            if !router.modern_downstream_enabled() {
+                return Err(McpError::unsupported_protocol_version(
+                    ProtocolEra::Modern.version(),
+                    &crate::protocol::supported_downstream_protocol_versions(false),
+                ));
+            }
+            Some(router.admit_modern_request(&call)?)
+        }
+        ProtocolEra::Legacy => None,
+    };
+    let method = match era {
+        ProtocolEra::Legacy => method.strip_prefix(LEGACY_METHOD_PREFIX).unwrap_or(method),
+        ProtocolEra::Modern => method,
+    };
+    let mut result = route(router, ctx, call, method, params).await?;
+    match era {
+        ProtocolEra::Legacy => crate::protocol::rewrite_legacy_result(&mut result, false),
+        ProtocolEra::Modern => crate::protocol::rewrite_modern_result(&mut result),
+    }
+    Ok(result)
+}
+
+async fn route(
+    router: &Arc<ToolRouter>,
+    ctx: &dyn DownstreamContext,
+    call: DownstreamCallContext,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, McpError> {
+    let era = call.protocol_era;
+    let client_key = call.client_key.clone();
+    let client_key = client_key.as_deref();
+    match method {
+        // The modern era discovers instead. `plug connect` accepts a modern
+        // `initialize` locally, so a modern one never reaches here from it.
+        "initialize" => {
+            legacy_only(era, method)?;
+            to_value(initialize_result(server_capabilities(router, ctx)))
+        }
+        "server/discover" => {
+            modern_only(era, method)?;
+            let mut result = DiscoverResult::new(
+                crate::protocol::supported_downstream_protocol_versions(true),
+                server_capabilities(router, ctx),
+            );
+            result.set_server_info(plug_implementation());
+            to_value(result)
+        }
+        "ping" => {
+            legacy_only(era, method)?;
+            Ok(serde_json::json!({}))
+        }
+        "tools/list" => {
+            call.authorize(MethodFamily::ToolsList)?;
+            let lazy_session_key = ctx
+                .session_bound()
+                .then(|| call.transport.lazy_session_key(&call.client_id));
+            to_value(router.list_tools_page_for_client_session(
+                call.client_type,
+                lazy_session_key.as_deref(),
+                client_key,
+                optional_params::<PaginatedRequestParams>(params, method)?,
+            ))
+        }
+        "tools/call" => tools_call(router, ctx, call, params).await,
+        "resources/list" => {
+            call.authorize(MethodFamily::ResourcesList)?;
+            to_value(router.list_resources_page(
+                optional_params::<PaginatedRequestParams>(params, method)?,
+                client_key,
+            ))
+        }
+        "resources/templates/list" => {
+            call.authorize(MethodFamily::ResourcesList)?;
+            to_value(router.list_resource_templates_page(
+                optional_params::<PaginatedRequestParams>(params, method)?,
+                client_key,
+            ))
+        }
+        "resources/read" => {
+            call.authorize(MethodFamily::ResourcesRead)?;
+            let request: ReadResourceRequestParams = required_params(params, method)?;
+            to_value(router.read_resource(&request.uri, client_key).await?)
+        }
+        "resources/subscribe" => {
+            legacy_only(era, method)?;
+            call.authorize(MethodFamily::ResourcesSubscribe)?;
+            let request: SubscribeRequestParams = required_params(params, method)?;
+            router
+                .subscribe_resource(&request.uri, call.notification_target(), client_key)
+                .await?;
+            Ok(serde_json::json!({}))
+        }
+        "resources/unsubscribe" => {
+            legacy_only(era, method)?;
+            call.authorize(MethodFamily::ResourcesSubscribe)?;
+            let request: UnsubscribeRequestParams = required_params(params, method)?;
+            router
+                .unsubscribe_resource(&request.uri, &call.notification_target())
+                .await?;
+            Ok(serde_json::json!({}))
+        }
+        "prompts/list" => {
+            call.authorize(MethodFamily::PromptsList)?;
+            to_value(router.list_prompts_page(
+                optional_params::<PaginatedRequestParams>(params, method)?,
+                client_key,
+            ))
+        }
+        "prompts/get" => {
+            call.authorize(MethodFamily::PromptsGet)?;
+            let request: GetPromptRequestParams = required_params(params, method)?;
+            to_value(
+                router
+                    .get_prompt(&request.name, request.arguments, client_key)
+                    .await?,
+            )
+        }
+        "completion/complete" => {
+            call.authorize(MethodFamily::Completion)?;
+            let request: CompleteRequestParams = required_params(params, method)?;
+            to_value(router.complete_request(request, client_key).await?)
+        }
+        // Not a per-session preference: the effective level is recalculated
+        // across every downstream client and forwarded to every upstream, so
+        // one caller moves the verbosity of the whole daemon.
+        "logging/setLevel" => {
+            legacy_only(era, method)?;
+            call.authorize(MethodFamily::Logging)?;
+            let request: SetLevelRequestParams = required_params(params, method)?;
+            tracing::info!(
+                client_id = %call.client_id,
+                level = ?request.level,
+                "downstream client set log level"
+            );
+            router.set_client_log_level(&call.client_id, request.level);
+            router.forward_set_level_to_upstreams().await;
+            Ok(serde_json::json!({}))
+        }
+        "tasks/list" | "tasks/get" | "tasks/result" | "tasks/cancel" | "tasks/update" => {
+            match era {
+                ProtocolEra::Legacy => legacy_task_method(router, ctx, &call, method, params).await,
+                ProtocolEra::Modern => modern_task_method(router, ctx, &call, method, params).await,
+            }
+        }
+        _ => Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "method not supported",
+            None,
+        )),
+    }
+}
+
+/// The SEP-1686 task methods, owned by the caller's task owner.
+async fn legacy_task_method(
+    router: &Arc<ToolRouter>,
+    ctx: &dyn DownstreamContext,
+    call: &DownstreamCallContext,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, McpError> {
+    call.authorize(MethodFamily::Tasks)?;
+    let owner = ctx.task_owner()?;
+    if method == "tasks/list" {
+        let request = optional_params::<PaginatedRequestParams>(params, method)?;
+        return to_value(router.list_tasks_for_owner(&owner, request).await?);
+    }
+    let request: crate::legacy_tasks::TaskIdParams = required_params(params, method)?;
+    match method {
+        "tasks/get" => to_value(
+            router
+                .get_task_info_for_owner(&owner, &request.task_id)
+                .await?,
+        ),
+        "tasks/result" => to_value(
+            router
+                .get_task_result_for_owner(&owner, &request.task_id)
+                .await?,
+        ),
+        "tasks/cancel" => to_value(
+            router
+                .cancel_task_for_owner(&owner, &request.task_id)
+                .await?,
+        ),
+        _ => Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "method not supported",
+            None,
+        )),
+    }
+}
+
+/// The 2026-07-28 tasks extension methods.
+async fn modern_task_method(
+    router: &Arc<ToolRouter>,
+    ctx: &dyn DownstreamContext,
+    call: &DownstreamCallContext,
+    method: &str,
+    params: Option<Value>,
+) -> Result<Value, McpError> {
+    match method {
+        "tasks/get" => {
+            let request: rmcp::model::GetTaskParams = required_params(params, method)?;
+            let owner = admit_modern_task(router, ctx, call)?;
+            to_value(
+                router
+                    .get_modern_task_for_owner(&owner, &request.task_id)
+                    .await?,
+            )
+        }
+        "tasks/cancel" => {
+            let request: rmcp::model::CancelTaskParams = required_params(params, method)?;
+            let owner = admit_modern_task(router, ctx, call)?;
+            router
+                .cancel_task_for_owner(&owner, &request.task_id)
+                .await?;
+            to_value(rmcp::model::TaskAckResult::new())
+        }
+        "tasks/update" => {
+            let request: rmcp::model::UpdateTaskParams = required_params(params, method)?;
+            let owner = admit_modern_task(router, ctx, call)?;
+            router.validate_task_owner(&owner, &request.task_id).await?;
+            Err(McpError::invalid_request(
+                "this task has no outstanding input request",
+                None,
+            ))
+        }
+        _ => Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "method not supported",
+            None,
+        )),
+    }
+}
+
+/// Whether a modern caller may use the tasks extension, and as whom.
+pub(crate) fn admit_modern_task(
+    router: &ToolRouter,
+    ctx: &dyn DownstreamContext,
+    call: &DownstreamCallContext,
+) -> Result<TaskOwner, McpError> {
+    if !router.supports_tasks() {
+        return Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            "tasks extension is not available",
+            None,
+        ));
+    }
+    if !ctx
+        .modern_task_client()
+        .is_some_and(ClientCapabilities::supports_tasks)
+    {
+        return Err(McpError::missing_required_client_capability(
+            ClientCapabilities::builder().enable_tasks().build(),
+        ));
+    }
+    call.authorize(MethodFamily::Tasks)?;
+    call.ensure_principal_lifecycle_active()?;
+    ctx.task_owner()
+}
+
+async fn tools_call(
+    router: &Arc<ToolRouter>,
+    ctx: &dyn DownstreamContext,
+    call: DownstreamCallContext,
+    params: Option<Value>,
+) -> Result<Value, McpError> {
+    let era = call.protocol_era;
+    let mut params =
+        params.ok_or_else(|| McpError::invalid_params("tools/call requires params", None))?;
+    if era == ProtocolEra::Legacy {
+        crate::protocol::rewrite_legacy_call_params(&mut params);
+    }
+    let params: CallToolRequestParams = serde_json::from_value(params)
+        .map_err(|error| McpError::invalid_params(format!("tools/call: {error}"), None))?;
+    // A modern client asks for a task by declaring the tasks extension; a
+    // legacy one by the SEP-1686 `task` parameter, carried under
+    // `LEGACY_TASK_REQUEST_KEY` once rewritten.
+    let modern_task = era == ProtocolEra::Modern
+        && ctx
+            .modern_task_client()
+            .is_some_and(ClientCapabilities::supports_tasks)
+        && router.supports_tasks();
+    let legacy_task = params
+        .meta
+        .as_ref()
+        .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY));
+
     let started = std::time::Instant::now();
-    let downstream = ctx.downstream_call_context();
-    let client = downstream.client_id.to_string();
-    let client_type = downstream.client_type.to_string();
-    let client_label = downstream
+    let client = call.client_id.to_string();
+    let client_type = call.client_type.to_string();
+    let client_label = call
         .client_metadata
         .as_ref()
         .map(crate::protocol::ClientMetadata::display_label);
-    let client_key = downstream.client_key.as_deref().map(str::to_string);
+    let activity_client_key = call.client_key.as_deref().map(str::to_string);
     let tool = params.name.to_string();
     let server = router.server_for_tool(&tool);
-    let result = dispatch_tools_call_inner(router, ctx, params).await;
+    let result = tools_call_inner(router, ctx, call, params, modern_task || legacy_task).await;
     router.record_activity(crate::activity::ActivityEvent {
         sequence: 0,
         occurred_at_ms: 0,
@@ -117,7 +446,7 @@ pub async fn dispatch_tools_call(
         tool: Some(tool),
         client_type: Some(client_type),
         client_label,
-        client_key,
+        client_key: activity_client_key,
         latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         outcome: if result.is_ok() {
             crate::activity::ActivityOutcome::Success
@@ -129,30 +458,38 @@ pub async fn dispatch_tools_call(
             .err()
             .and_then(|error| crate::activity::activity_reason(&error.message)),
     });
-    result
+    match result? {
+        ToolCallOutcome::Called(result) => to_value(result),
+        ToolCallOutcome::InputRequired(result) => to_value(result),
+        ToolCallOutcome::TaskCreated(result) if modern_task => {
+            to_value(rmcp::model::CreateTaskResult::new((&result.task).into()))
+        }
+        ToolCallOutcome::TaskCreated(result) => to_value(result),
+    }
 }
 
-async fn dispatch_tools_call_inner(
+enum ToolCallOutcome {
+    Called(rmcp::model::CallToolResult),
+    InputRequired(rmcp::model::InputRequiredResult),
+    TaskCreated(crate::legacy_tasks::CreateTaskResult),
+}
+
+async fn tools_call_inner(
     router: &Arc<ToolRouter>,
     ctx: &dyn DownstreamContext,
+    call: DownstreamCallContext,
     params: CallToolRequestParams,
+    task_requested: bool,
 ) -> Result<ToolCallOutcome, McpError> {
     // Admit unknown metadata once, before routing, task creation, buffering,
     // or forwarding. Typed MCP fields remain owned by their typed adapters.
     let extensions = crate::types::ExtensionEnvelope::from_peer_meta(params.meta.as_deref())
         .map_err(|error| McpError::invalid_params(error.to_string(), None))?;
     let progress_token = params.progress_token();
-    let downstream = ctx
-        .downstream_call_context()
-        .with_extension_envelope(extensions);
+    let downstream = call.with_extension_envelope(extensions);
 
-    downstream.authorize(crate::protocol::MethodFamily::ToolsCall)?;
+    downstream.authorize(MethodFamily::ToolsCall)?;
 
-    let task_requested = params
-        .meta
-        .as_ref()
-        .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY))
-        && ctx.supports_tasks();
     let has_continuation = params.input_responses.is_some() || params.request_state.is_some();
     if params
         .request_state
@@ -182,7 +519,7 @@ async fn dispatch_tools_call_inner(
     )?;
 
     if task_requested {
-        downstream.authorize(crate::protocol::MethodFamily::Tasks)?;
+        downstream.authorize(MethodFamily::Tasks)?;
         let owner = ctx.task_owner()?;
         let result = router
             .clone()
@@ -195,40 +532,366 @@ async fn dispatch_tools_call_inner(
                 Some(downstream),
             )
             .await?;
-        Ok(ToolCallOutcome::TaskCreated(result))
-    } else {
-        match router
-            .call_tool_round_with_context(params, progress_token, Some(downstream))
-            .await?
-        {
-            rmcp::model::CallToolResponse::Complete(result) => Ok(ToolCallOutcome::Called(result)),
-            rmcp::model::CallToolResponse::InputRequired(result) => {
-                if result
-                    .request_state
+        return Ok(ToolCallOutcome::TaskCreated(result));
+    }
+    match router
+        .call_tool_round_with_context(params, progress_token, Some(downstream))
+        .await?
+    {
+        rmcp::model::CallToolResponse::Complete(result) => Ok(ToolCallOutcome::Called(result)),
+        rmcp::model::CallToolResponse::InputRequired(result) => {
+            if result
+                .request_state
+                .as_ref()
+                .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
+                || result
+                    .input_requests
                     .as_ref()
-                    .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
-                    || result
-                        .input_requests
-                        .as_ref()
-                        .is_some_and(|requests| requests.len() > MRTR_MAX_ITEMS)
-                    || serde_json::to_vec(&result)
-                        .is_ok_and(|encoded| encoded.len() > MRTR_MAX_BYTES)
-                {
-                    return Err(McpError::invalid_request(
-                        "upstream multi-round response exceeds Plug's bounded continuation limits",
-                        None,
-                    ));
-                }
-                Ok(ToolCallOutcome::InputRequired(result))
+                    .is_some_and(|requests| requests.len() > MRTR_MAX_ITEMS)
+                || serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() > MRTR_MAX_BYTES)
+            {
+                return Err(McpError::invalid_request(
+                    "upstream multi-round response exceeds Plug's bounded continuation limits",
+                    None,
+                ));
             }
-            rmcp::model::CallToolResponse::Task(_) => Err(McpError::internal_error(
-                "upstream unexpectedly returned a task from synchronous dispatch".to_string(),
-                None,
-            )),
-            _ => Err(McpError::internal_error(
-                "unsupported upstream tools/call response".to_string(),
-                None,
-            )),
+            Ok(ToolCallOutcome::InputRequired(result))
         }
+        rmcp::model::CallToolResponse::Task(_) => Err(McpError::internal_error(
+            "upstream unexpectedly returned a task from synchronous dispatch".to_string(),
+            None,
+        )),
+        _ => Err(McpError::internal_error(
+            "unsupported upstream tools/call response".to_string(),
+            None,
+        )),
+    }
+}
+
+/// What this caller is told the server can do. Advertisement reads the same
+/// policy that enforcement does, so a caller is never told about a family it
+/// would then be denied. A family is advertised only when every method behind
+/// it is allowed.
+pub fn server_capabilities(router: &ToolRouter, ctx: &dyn DownstreamContext) -> ServerCapabilities {
+    let call = ctx.downstream_call_context();
+    project_capabilities(
+        router.synthesized_capabilities_for_client(call.client_type),
+        &call,
+        ctx.modern_task_client().is_some() && router.supports_tasks(),
+    )
+}
+
+/// Narrow `capabilities` to what `call` may use in its era. `modern_tasks`
+/// says whether the modern tasks extension can be served at all.
+pub(crate) fn project_capabilities(
+    mut capabilities: ServerCapabilities,
+    call: &DownstreamCallContext,
+    modern_tasks: bool,
+) -> ServerCapabilities {
+    let allows = |families: &[MethodFamily]| {
+        families
+            .iter()
+            .all(|family| call.policy_decision(*family).is_allowed())
+    };
+    if !allows(&[MethodFamily::ToolsList, MethodFamily::ToolsCall]) {
+        capabilities.tools = None;
+    }
+    if !allows(&[
+        MethodFamily::ResourcesList,
+        MethodFamily::ResourcesRead,
+        MethodFamily::ResourcesSubscribe,
+    ]) {
+        capabilities.resources = None;
+    }
+    if !allows(&[MethodFamily::PromptsList, MethodFamily::PromptsGet]) {
+        capabilities.prompts = None;
+    }
+    if !allows(&[MethodFamily::Completion]) {
+        capabilities.completions = None;
+    }
+    match call.protocol_era {
+        ProtocolEra::Legacy => {
+            if !allows(&[MethodFamily::Logging, MethodFamily::LoggingRead]) {
+                capabilities.logging = None;
+            }
+            if !allows(&[MethodFamily::Tasks])
+                && let Some(experimental) = capabilities.experimental.as_mut()
+            {
+                experimental.remove(crate::protocol::LEGACY_TASKS_CAPABILITY_KEY);
+                if experimental.is_empty() {
+                    capabilities.experimental = None;
+                }
+            }
+        }
+        // 2026-07-28 removed `logging/setLevel` and `resources/subscribe`.
+        // Extensions stay unadvertised until their bridges exist; tasks is the
+        // one Plug serves, and only where the transport can.
+        ProtocolEra::Modern => {
+            capabilities.logging = None;
+            capabilities.experimental = None;
+            capabilities.extensions = None;
+            if let Some(resources) = capabilities.resources.as_mut() {
+                resources.subscribe = None;
+            }
+            if modern_tasks && allows(&[MethodFamily::Tasks]) {
+                capabilities
+                    .extensions
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        rmcp::model::TASKS_EXTENSION_ID.to_string(),
+                        Default::default(),
+                    );
+            }
+        }
+    }
+    capabilities
+}
+
+/// The legacy `initialize` answer around a set of capabilities.
+pub fn initialize_result(capabilities: ServerCapabilities) -> InitializeResult {
+    InitializeResult::new(capabilities)
+        .with_server_info(plug_implementation())
+        .with_protocol_version(crate::protocol::supported_protocol_version())
+}
+
+fn plug_implementation() -> rmcp::model::Implementation {
+    crate::branding::plug_implementation(env!("CARGO_PKG_VERSION"))
+}
+
+fn legacy_only(era: ProtocolEra, method: &str) -> Result<(), McpError> {
+    match era {
+        ProtocolEra::Legacy => Ok(()),
+        ProtocolEra::Modern => Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            method.to_string(),
+            None,
+        )),
+    }
+}
+
+fn modern_only(era: ProtocolEra, method: &str) -> Result<(), McpError> {
+    match era {
+        ProtocolEra::Modern => Ok(()),
+        ProtocolEra::Legacy => Err(McpError::new(
+            ErrorCode::METHOD_NOT_FOUND,
+            method.to_string(),
+            None,
+        )),
+    }
+}
+
+fn required_params<T: DeserializeOwned>(
+    params: Option<Value>,
+    method: &str,
+) -> Result<T, McpError> {
+    let params = params
+        .ok_or_else(|| McpError::invalid_params(format!("{method} requires params"), None))?;
+    serde_json::from_value(params)
+        .map_err(|error| McpError::invalid_params(format!("{method}: {error}"), None))
+}
+
+fn optional_params<T: DeserializeOwned>(
+    params: Option<Value>,
+    method: &str,
+) -> Result<Option<T>, McpError> {
+    match params {
+        None | Some(Value::Null) => Ok(None),
+        Some(params) => serde_json::from_value(params)
+            .map(Some)
+            .map_err(|error| McpError::invalid_params(format!("{method}: {error}"), None)),
+    }
+}
+
+fn to_value<T: Serialize>(value: T) -> Result<Value, McpError> {
+    serde_json::to_value(value).map_err(|error| McpError::internal_error(error.to_string(), None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::proxy::RouterConfig;
+    use crate::server::ServerManager;
+
+    fn router() -> Arc<ToolRouter> {
+        Arc::new(ToolRouter::new(
+            Arc::new(ServerManager::new()),
+            RouterConfig::default(),
+        ))
+    }
+
+    fn caller(protocol_version: &str) -> IpcContext {
+        let mut ctx = IpcContext::new("session-1", RequestId::Number(1));
+        ctx.registry_client_id = Some(Arc::from("client-1"));
+        ctx.protocol_version = Arc::from(protocol_version);
+        ctx.modern_enabled = true;
+        ctx
+    }
+
+    #[test]
+    fn an_ipc_caller_keeps_its_protocol_client_and_principal() {
+        let mut ctx = caller(crate::protocol::MODERN_PROTOCOL_VERSION);
+        ctx.client_metadata = Some(crate::protocol::ClientMetadata {
+            name: Arc::from("modern-client"),
+            version: Arc::from("2.0"),
+        });
+        let call = ctx.downstream_call_context();
+
+        assert_eq!(call.request_id, RequestId::Number(1));
+        assert_eq!(call.protocol_era, ProtocolEra::Modern);
+        assert!(call.modern_direction_enabled);
+        assert_eq!(call.protocol_version.as_ref(), "2026-07-28");
+        assert_eq!(
+            call.principal(),
+            Some(&crate::downstream_identity::ipc_registry_principal(
+                "client-1"
+            ))
+        );
+        let metadata = call.client_metadata.expect("client metadata");
+        assert_eq!(metadata.name.as_ref(), "modern-client");
+        assert_eq!(metadata.version.as_ref(), "2.0");
+    }
+
+    #[tokio::test]
+    async fn a_modern_request_is_refused_while_the_gate_is_shut() {
+        let router = router();
+        let error = handle(
+            &router,
+            &caller(crate::protocol::MODERN_PROTOCOL_VERSION),
+            "tools/list",
+            None,
+        )
+        .await
+        .expect_err("gate is shut");
+        assert_eq!(error.code, ErrorCode::UNSUPPORTED_PROTOCOL_VERSION);
+    }
+
+    #[tokio::test]
+    async fn each_era_answers_only_its_own_methods() {
+        let router = router();
+        router.set_modern_downstream_enabled(true);
+        let legacy = caller(crate::protocol::SUPPORTED_PROTOCOL_VERSION);
+        let modern = caller(crate::protocol::MODERN_PROTOCOL_VERSION);
+
+        for method in [
+            "initialize",
+            "ping",
+            "resources/subscribe",
+            "resources/unsubscribe",
+            "logging/setLevel",
+        ] {
+            let error = handle(&router, &modern, method, Some(serde_json::json!({})))
+                .await
+                .expect_err(method);
+            assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND, "{method}");
+        }
+        let error = handle(&router, &legacy, "server/discover", None)
+            .await
+            .expect_err("discovery is modern");
+        assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+        for ctx in [&legacy, &modern] {
+            let error = handle(&router, ctx, "subscriptions/listen", None)
+                .await
+                .expect_err("unknown method");
+            assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
+        }
+
+        assert_eq!(
+            handle(&router, &legacy, "ping", None).await.unwrap(),
+            serde_json::json!({})
+        );
+        let discovered = handle(&router, &modern, "server/discover", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            discovered["supportedVersions"],
+            serde_json::json!(["2025-11-25", "2026-07-28"])
+        );
+    }
+
+    // A result proxied from a `2025-11-25` upstream carries no `resultType`;
+    // `2026-07-28` makes it mandatory and a strict modern client rejects the
+    // response without it. A legacy peer must never see it, nor the modern
+    // catalog cache directives.
+    #[tokio::test]
+    async fn results_speak_the_callers_era() {
+        let router = router();
+        router.set_modern_downstream_enabled(true);
+
+        let legacy = handle(
+            &router,
+            &caller(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
+            "tools/list",
+            None,
+        )
+        .await
+        .unwrap();
+        for key in ["resultType", "ttlMs", "cacheScope"] {
+            assert!(legacy.get(key).is_none(), "legacy result carries {key}");
+        }
+
+        let modern = handle(
+            &router,
+            &caller(crate::protocol::MODERN_PROTOCOL_VERSION),
+            "prompts/list",
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(modern["resultType"], "complete");
+    }
+
+    #[tokio::test]
+    async fn malformed_params_are_invalid_params() {
+        let router = router();
+        let legacy = caller(crate::protocol::SUPPORTED_PROTOCOL_VERSION);
+        for (method, params) in [
+            ("resources/read", None),
+            ("prompts/get", Some(serde_json::json!({ "name": 7 }))),
+            ("tools/call", None),
+            (
+                "logging/setLevel",
+                Some(serde_json::json!({ "level": "loud" })),
+            ),
+            ("tasks/get", Some(serde_json::json!({}))),
+        ] {
+            let error = handle(&router, &legacy, method, params)
+                .await
+                .expect_err(method);
+            assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "{method}");
+        }
+    }
+
+    #[test]
+    fn the_modern_projection_advertises_only_what_the_modern_era_serves() {
+        let mut source = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_resources_subscribe()
+            .enable_logging()
+            .build();
+        source.experimental = Some(
+            [(
+                crate::protocol::LEGACY_TASKS_CAPABILITY_KEY.to_string(),
+                serde_json::Map::new(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+
+        let legacy = caller(crate::protocol::SUPPORTED_PROTOCOL_VERSION).downstream_call_context();
+        assert_eq!(project_capabilities(source.clone(), &legacy, true), source);
+
+        let modern = caller(crate::protocol::MODERN_PROTOCOL_VERSION).downstream_call_context();
+        let projected = project_capabilities(source.clone(), &modern, false);
+        assert!(projected.tools.is_some());
+        assert!(projected.logging.is_none());
+        assert!(projected.experimental.is_none());
+        assert!(projected.extensions.is_none());
+        assert_eq!(projected.resources.as_ref().and_then(|r| r.subscribe), None);
+        assert!(
+            project_capabilities(source, &modern, true)
+                .extensions
+                .is_some_and(|extensions| extensions.contains_key(rmcp::model::TASKS_EXTENSION_ID))
+        );
     }
 }

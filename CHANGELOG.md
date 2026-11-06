@@ -9,6 +9,8 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- A client connected through `plug connect` gets the JSON-RPC error codes an HTTP client gets. Bad parameters, an unknown method and a protocol version Plug does not serve now arrive as invalid params (`-32602`), method not found (`-32601`) and unsupported protocol version, where they used to arrive as an internal error (`-32603`) whose message began with a code such as `INVALID_PARAMS:`.
+- A remote client whose grant leaves out `tasks:use` is no longer told at `initialize` that Plug runs tasks, the way it is not told about other families its grant cannot use.
 - `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
 - `plug link` and `plug unlink` answer `--output json` with the clients they changed.
 - `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.

@@ -1315,11 +1315,7 @@ impl ServerHandler for IpcProxyHandler {
             .read()
             .map(|caps| caps.clone())
             .unwrap_or_default();
-        InitializeResult::new(capabilities)
-            .with_server_info(plug_core::branding::plug_implementation(env!(
-                "CARGO_PKG_VERSION"
-            )))
-            .with_protocol_version(plug_core::protocol::supported_protocol_version())
+        plug_core::dispatch::initialize_result(capabilities)
     }
 
     fn initialize(
@@ -1444,26 +1440,30 @@ impl ServerHandler for IpcProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<DiscoverResult, McpError>> + Send + '_ {
         async move {
-            if !self.refresh_modern_gate().await? {
-                return Err(McpError::unsupported_protocol_version(
-                    plug_core::protocol::ProtocolEra::Modern.version(),
-                    &self.supported_protocol_versions(),
-                ));
-            }
             let client_info = context.client_info().ok_or_else(|| {
                 McpError::invalid_params("discover requires client implementation metadata", None)
             })?;
             let capabilities = context.client_capabilities().ok_or_else(|| {
                 McpError::invalid_params("discover requires client capability metadata", None)
             })?;
+            let mut request_context = Self::request_context(&context);
+            request_context.protocol_version =
+                plug_core::protocol::MODERN_PROTOCOL_VERSION.to_string();
+            // Discovery opens the session the way a modern `initialize` would.
             let initialize = InitializeRequestParams::new(capabilities, client_info)
                 .with_protocol_version(plug_core::protocol::ProtocolEra::Modern.version());
-            let mut info = self.initialize(initialize, context).await?;
-            plug_core::protocol::suppress_unimplemented_modern_capabilities(&mut info.capabilities);
-            Ok(DiscoverResult::from_server_info(
-                self.supported_protocol_versions().into_owned(),
-                info,
-            ))
+            self.initialize(initialize, context).await?;
+            let response = self
+                .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
+                    IpcRequest::McpRequestWithContext {
+                        session_id: session_id.to_string(),
+                        method: "server/discover".to_string(),
+                        params: None,
+                        context: request_context.clone(),
+                    }
+                })
+                .await?;
+            decode_mcp(response, "server/discover")
         }
     }
 
@@ -3419,7 +3419,12 @@ mod tests {
             )
             .await;
 
-            let expected = ["UpdateSession", "UpdateCapabilities", "Capabilities"];
+            let expected = [
+                "UpdateSession",
+                "UpdateCapabilities",
+                "Capabilities",
+                "server/discover",
+            ];
             let mut lifecycle_index = 0;
             while lifecycle_index < expected.len() {
                 let frame = ipc::read_frame(&mut reader)
@@ -3447,6 +3452,15 @@ mod tests {
                         .expect("send authoritative gate response");
                         continue;
                     }
+                    IpcRequest::McpRequestWithContext {
+                        method, context, ..
+                    } if method == "server/discover" => {
+                        assert_eq!(
+                            context.protocol_version,
+                            plug_core::protocol::MODERN_PROTOCOL_VERSION
+                        );
+                        "server/discover"
+                    }
                     IpcRequest::McpRequest { method, .. }
                     | IpcRequest::McpRequestWithContext { method, .. } => {
                         panic!("discover lifecycle must not forward {method} over IPC")
@@ -3454,13 +3468,21 @@ mod tests {
                     other => panic!("unexpected lifecycle IPC request: {other:?}"),
                 };
                 assert_eq!(observed, expected[lifecycle_index]);
-                let response = if observed == "Capabilities" {
-                    IpcResponse::Capabilities {
+                let response = match observed {
+                    "Capabilities" => IpcResponse::Capabilities {
                         capabilities: serde_json::to_value(&daemon_capabilities)
                             .expect("serialize capabilities"),
-                    }
-                } else {
-                    IpcResponse::Ok
+                    },
+                    // What the daemon's dispatcher answers for a `plug connect`
+                    // session: its modern projection of the capabilities.
+                    "server/discover" => IpcResponse::McpResponse {
+                        payload: serde_json::to_value(DiscoverResult::new(
+                            plug_core::protocol::supported_downstream_protocol_versions(true),
+                            ServerCapabilities::builder().enable_tools().build(),
+                        ))
+                        .expect("serialize discovery"),
+                    },
+                    _ => IpcResponse::Ok,
                 };
                 ipc::send_response(&mut writer, &response)
                     .await

@@ -66,6 +66,7 @@ struct StdioDownstreamContext {
     client_metadata: Option<crate::protocol::ClientMetadata>,
     modern_direction_enabled: bool,
     cancellation: CancellationToken,
+    modern_task_client: Option<ClientCapabilities>,
 }
 
 impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
@@ -95,10 +96,12 @@ impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
         context
     }
 
-    /// Modern RMCP can return the SEP-2663 task result union. Legacy stdio
-    /// still rejects the removed task-augmented request shape.
-    fn supports_tasks(&self) -> bool {
-        self.protocol_version == ProtocolVersion::V_2026_07_28
+    fn session_bound(&self) -> bool {
+        true
+    }
+
+    fn modern_task_client(&self) -> Option<&ClientCapabilities> {
+        self.modern_task_client.as_ref()
     }
 
     fn task_owner(&self) -> Result<TaskOwner, McpError> {
@@ -270,6 +273,7 @@ impl ProxyHandler {
             }),
             modern_direction_enabled: self.router.modern_downstream_enabled(),
             cancellation,
+            modern_task_client: None,
         }
     }
 
@@ -729,11 +733,6 @@ impl ServerHandler for ProxyHandler {
             let modern = context
                 .protocol_version()
                 .is_some_and(|version| version == ProtocolVersion::V_2026_07_28);
-            let modern_tasks = modern
-                && context
-                    .client_capabilities()
-                    .is_some_and(|capabilities| capabilities.supports_tasks())
-                && self.router.supports_tasks();
             if request
                 .meta
                 .as_ref()
@@ -744,41 +743,30 @@ impl ServerHandler for ProxyHandler {
                     None,
                 ));
             }
-            if modern_tasks {
-                request.meta.get_or_insert_with(Default::default).insert(
-                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-                    serde_json::json!({}),
-                );
-            }
-
             let protocol_version = context
                 .protocol_version()
                 .unwrap_or_else(crate::protocol::supported_protocol_version);
-            let ctx = self.downstream_context_for_call(
+            let mut ctx = self.downstream_context_for_call(
                 context.id.clone(),
                 protocol_version,
                 context.client_info(),
                 context.ct.clone(),
             );
-            let _modern_request_lease = if modern {
-                Some(
-                    self.router
-                        .admit_modern_request(&ctx.downstream_call_context())?,
-                )
-            } else {
-                None
-            };
-            match crate::dispatch::dispatch_tools_call(&self.router, &ctx, request).await? {
-                crate::dispatch::ToolCallOutcome::Called(result) => Ok(result.into()),
-                crate::dispatch::ToolCallOutcome::InputRequired(result) => Ok(result.into()),
-                crate::dispatch::ToolCallOutcome::TaskCreated(result) if modern_tasks => {
-                    Ok(rmcp::model::CreateTaskResult::new((&result.task).into()).into())
-                }
-                crate::dispatch::ToolCallOutcome::TaskCreated(_) => Err(McpError::internal_error(
-                    "legacy stdio unexpectedly produced a task result".to_string(),
-                    None,
-                )),
+            if modern {
+                ctx.modern_task_client = Some(context.client_capabilities().unwrap_or_default());
             }
+            let params = serde_json::to_value(&request)
+                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+            let value =
+                crate::dispatch::handle(&self.router, &ctx, "tools/call", Some(params)).await?;
+            let decoded = if value.get("task").is_some() && modern {
+                serde_json::from_value::<rmcp::model::CreateTaskResult>(value).map(Into::into)
+            } else if value.get("resultType").and_then(|v| v.as_str()) == Some("input_required") {
+                serde_json::from_value::<rmcp::model::InputRequiredResult>(value).map(Into::into)
+            } else {
+                serde_json::from_value::<CallToolResult>(value).map(Into::into)
+            };
+            decoded.map_err(|e| McpError::internal_error(e.to_string(), None))
         }
     }
 
