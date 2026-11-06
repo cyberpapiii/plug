@@ -7,11 +7,12 @@
 pub mod owner;
 pub mod paths;
 
-pub use owner::{
+pub use owner::OwnerCredentialSummary;
+use owner::{
     OwnerApprovalChallenge, OwnerAuthenticationCeremony, OwnerBootstrap, OwnerCredential,
-    OwnerCredentialSummary, OwnerRegistrationCeremony, OwnerRegistrationChallenge, OwnerSecurity,
-    PublicKeyCredential, RegisterPublicKeyCredential,
+    OwnerRegistrationCeremony, OwnerRegistrationChallenge, OwnerSecurity,
 };
+use passkey_auth::{AuthenticationResponse, RegistrationResponse};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
@@ -936,7 +937,7 @@ impl DownstreamOauthManager {
     pub async fn finish_owner_registration(
         &self,
         ceremony_id: &str,
-        response: RegisterPublicKeyCredential,
+        response: RegistrationResponse,
     ) -> Result<OwnerCredentialSummary, DownstreamOauthError> {
         self.ensure_durable()?;
         let now = epoch_secs();
@@ -1062,7 +1063,7 @@ impl DownstreamOauthManager {
     pub async fn finish_owner_approval(
         &self,
         ceremony_id: &str,
-        response: PublicKeyCredential,
+        response: AuthenticationResponse,
     ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
         self.ensure_durable()?;
         let now = epoch_secs();
@@ -3081,8 +3082,8 @@ mod tests {
         assert_eq!(manager.state.lock().await.pending_codes.len(), 1);
     }
 
-    fn malformed_owner_assertion() -> PublicKeyCredential {
-        PublicKeyCredential {
+    fn malformed_owner_assertion() -> AuthenticationResponse {
+        AuthenticationResponse {
             id: "malformed".to_string(),
             authenticator_data: "malformed".to_string(),
             signature: "malformed".to_string(),
@@ -3565,7 +3566,7 @@ mod tests {
             .await
             .expect("finish owner approval after restart");
         assert!(redirect.location.contains("state=restart-state"));
-        let replay = PublicKeyCredential {
+        let replay = AuthenticationResponse {
             id: "malformed".to_string(),
             authenticator_data: "malformed".to_string(),
             signature: "malformed".to_string(),

@@ -11,11 +11,12 @@ use serde_json::json;
 
 use crate::downstream_oauth::{
     AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError, DownstreamOauthManager,
-    PublicKeyCredential, RegisterPublicKeyCredential, paths, resource_scopes,
+    paths, resource_scopes,
 };
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{get, post};
+use passkey_auth::{AuthenticationResponse, RegistrationResponse};
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct OAuthAuthorizeParams {
@@ -39,7 +40,7 @@ pub(super) struct OAuthConsentChallengeRequest {
 pub(super) enum OAuthConsentDecision {
     Approve {
         ceremony_id: String,
-        credential: PublicKeyCredential,
+        credential: AuthenticationResponse,
     },
     Deny {
         consent_id: String,
@@ -55,7 +56,7 @@ pub(super) struct OAuthOwnerEnrollmentChallengeRequest {
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct OAuthOwnerEnrollmentCompleteRequest {
     ceremony_id: String,
-    credential: RegisterPublicKeyCredential,
+    credential: RegistrationResponse,
 }
 
 pub(super) async fn get_oauth_authorization_server_metadata(

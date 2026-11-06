@@ -1,6 +1,6 @@
 use passkey_auth::{
-    AuthenticationChallenge, AuthenticationResponse, AuthenticationState, PasskeyCredential,
-    RegistrationChallenge, RegistrationResponse, RegistrationState, Webauthn,
+    AuthenticationChallenge, AuthenticationState, PasskeyCredential, RegistrationChallenge,
+    RegistrationState, Webauthn,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -10,12 +10,6 @@ use super::DownstreamOauthError;
 pub const MAX_OWNER_CREDENTIALS: usize = 5;
 pub const MAX_OWNER_CHALLENGES: usize = 10;
 pub const OWNER_CEREMONY_LIFETIME_SECS: u64 = 300;
-
-pub type Passkey = PasskeyCredential;
-pub type PasskeyRegistration = RegistrationState;
-pub type PasskeyAuthentication = AuthenticationState;
-pub type RegisterPublicKeyCredential = RegistrationResponse;
-pub type PublicKeyCredential = AuthenticationResponse;
 
 #[derive(Debug, Serialize)]
 pub struct OwnerRegistrationChallenge {
@@ -41,7 +35,7 @@ pub struct OwnerCredentialSummary {
 pub struct OwnerCredential {
     pub id: String,
     pub label: String,
-    pub passkey: Passkey,
+    pub passkey: PasskeyCredential,
     pub created_at: u64,
     pub last_used_at: Option<u64>,
 }
@@ -58,7 +52,7 @@ pub struct OwnerRegistrationCeremony {
     pub bootstrap_hash: String,
     #[serde(default)]
     pub issuer_hash: String,
-    pub state: PasskeyRegistration,
+    pub state: RegistrationState,
     pub expires_at: u64,
 }
 
@@ -74,7 +68,7 @@ pub struct OwnerAuthenticationCeremony {
     pub decision: String,
     #[serde(default)]
     pub credential_ids: Vec<String>,
-    pub state: PasskeyAuthentication,
+    pub state: AuthenticationState,
     pub expires_at: u64,
 }
 
@@ -405,7 +399,7 @@ pub(crate) mod tests {
             security
                 .webauthn
                 .start_registration(b"owner", "owner@plug.local", "Plug owner", &[]);
-        let registration_state: PasskeyRegistration = serde_json::from_slice(
+        let registration_state: RegistrationState = serde_json::from_slice(
             &serde_json::to_vec(&registration_state).expect("serialize registration state"),
         )
         .expect("deserialize registration state");
@@ -432,7 +426,7 @@ pub(crate) mod tests {
         let (authentication_challenge, authentication_state) = security
             .webauthn
             .start_authentication(std::slice::from_ref(&credential.id));
-        let authentication_state: PasskeyAuthentication = serde_json::from_slice(
+        let authentication_state: AuthenticationState = serde_json::from_slice(
             &serde_json::to_vec(&authentication_state).expect("serialize authentication state"),
         )
         .expect("deserialize authentication state");

@@ -4,7 +4,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::get;
 use serde_json::json;
@@ -21,10 +21,7 @@ pub(super) fn discovery_router(state: Arc<HttpState>) -> Router {
         .with_state(state)
 }
 
-pub(super) async fn get_server_card(
-    State(state): State<Arc<HttpState>>,
-    _headers: HeaderMap,
-) -> impl IntoResponse {
+pub(super) async fn get_server_card(State(state): State<Arc<HttpState>>) -> impl IntoResponse {
     let mut remote = json!({
         "type": "streamable-http",
         "url": "/mcp",

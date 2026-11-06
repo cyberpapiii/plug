@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, StatusCode, header};
 use axum::middleware::{self};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
@@ -561,24 +561,13 @@ pub(super) async fn get_mcp(
         .sessions
         .set_sse_sender(&session_id, tx, last_event_id)?;
 
-    // 4. Build SSE response with appropriate headers
     let session_store = Arc::clone(&state.sessions);
     let keepalive_session_id = session_id.clone();
     let sse = sse_stream_with_heartbeat(rx, state.cancel.clone(), move || {
         let _ = session_store.validate(&keepalive_session_id);
     });
     let mut response = sse.into_response();
-    response
-        .headers_mut()
-        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        "X-Content-Type-Options",
-        HeaderValue::from_static("nosniff"),
-    );
-
+    mark_private(&mut response, true);
     Ok(response)
 }
 

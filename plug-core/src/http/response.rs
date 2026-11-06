@@ -39,9 +39,18 @@ pub(super) fn header_mismatch_response(
     response
 }
 
-/// Build a JSON response from a ServerJsonRpcMessage.
-pub(super) fn json_response(msg: &ServerJsonRpcMessage) -> Result<Response, HttpError> {
-    json_response_for_era(msg, crate::protocol::ProtocolEra::Legacy)
+/// An `/mcp` answer is the caller's alone: never cached or sniffed. A
+/// stream also asks proxies not to buffer it.
+pub(super) fn mark_private(response: &mut Response, stream: bool) {
+    let headers = response.headers_mut();
+    headers.insert(
+        "X-Content-Type-Options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    if stream {
+        headers.insert("X-Accel-Buffering", HeaderValue::from_static("no"));
+    }
 }
 
 pub(super) fn json_response_for_era(
@@ -76,13 +85,7 @@ pub(super) fn json_response_for_era(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/json"),
     );
-    response.headers_mut().insert(
-        "X-Content-Type-Options",
-        HeaderValue::from_static("nosniff"),
-    );
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    mark_private(&mut response, false);
     if era == crate::protocol::ProtocolEra::Modern {
         response.headers_mut().insert(
             PROTOCOL_VERSION_HEADER,
@@ -113,7 +116,7 @@ pub(super) async fn answer_or_keep_open(
 
     let mut call = Box::pin(call);
     tokio::select! {
-        message = &mut call => return json_response(&message),
+        message = &mut call => return json_response_for_era(&message, crate::protocol::ProtocolEra::Legacy),
         _ = tokio::time::sleep(patience) => {}
     }
     let stream = futures::stream::once(async move {
@@ -124,16 +127,7 @@ pub(super) async fn answer_or_keep_open(
     let mut response = Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(LONG_CALL_KEEP_ALIVE))
         .into_response();
-    response
-        .headers_mut()
-        .insert("X-Accel-Buffering", HeaderValue::from_static("no"));
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        "X-Content-Type-Options",
-        HeaderValue::from_static("nosniff"),
-    );
+    mark_private(&mut response, true);
     Ok(response)
 }
 
@@ -165,13 +159,7 @@ pub(super) fn modern_sse_response(
             .map(|payload| Ok::<Event, Infallible>(Event::default().data(payload))),
     );
     let mut response = Sse::new(stream).into_response();
-    response
-        .headers_mut()
-        .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    response.headers_mut().insert(
-        "X-Content-Type-Options",
-        HeaderValue::from_static("nosniff"),
-    );
+    mark_private(&mut response, false);
     response.headers_mut().insert(
         PROTOCOL_VERSION_HEADER,
         HeaderValue::from_static(crate::protocol::MODERN_PROTOCOL_VERSION),
@@ -183,7 +171,7 @@ pub(super) fn json_response_with_session(
     session_id: &str,
     msg: &ServerJsonRpcMessage,
 ) -> Result<Response, HttpError> {
-    let mut response = json_response(msg)?;
+    let mut response = json_response_for_era(msg, crate::protocol::ProtocolEra::Legacy)?;
     response.headers_mut().insert(
         SESSION_ID_HEADER,
         HeaderValue::from_str(session_id)
