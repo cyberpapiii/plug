@@ -413,7 +413,8 @@ pub enum PrincipalId {
         config_id: String,
         generation: u64,
     },
-    StdioProcess {
+    /// A caller that proved nothing, counted only for quotas.
+    Anonymous {
         instance_id: Uuid,
     },
     DaemonIpc {
@@ -441,8 +442,8 @@ impl PrincipalId {
         }
     }
 
-    pub fn stdio_process(instance_id: Uuid) -> Self {
-        Self::StdioProcess { instance_id }
+    pub fn anonymous(instance_id: Uuid) -> Self {
+        Self::Anonymous { instance_id }
     }
 
     pub fn daemon_ipc(registry_id: Uuid) -> Self {
@@ -513,7 +514,7 @@ mod tests {
     #[test]
     fn principal_tags_prevent_cross_domain_collisions() {
         let id = Uuid::from_u128(7);
-        assert_ne!(PrincipalId::stdio_process(id), PrincipalId::daemon_ipc(id));
+        assert_ne!(PrincipalId::anonymous(id), PrincipalId::daemon_ipc(id));
     }
 
     #[test]

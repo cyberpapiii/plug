@@ -1,4 +1,6 @@
 use super::*;
+use rmcp::handler::server::ServerHandler;
+use rmcp::service::{RequestContext, RoleServer};
 
 fn expected_meta_tool_names() -> Vec<&'static str> {
     vec!["plug__search_tools"]
@@ -88,27 +90,19 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
         "a loopback listener that requires no auth keeps full local access"
     );
 
-    // Stdio and IPC are local by construction and must stay trusted.
-    for context in [
-        DownstreamCallContext::stdio(
-            "stdio-client",
-            RequestId::Number(6),
-            crate::types::ClientType::Unknown,
-        ),
-        DownstreamCallContext::ipc(
-            "ipc-client",
-            RequestId::Number(7),
-            ClientType::Unknown,
-            None,
-        ),
-    ] {
-        assert!(context.local_trust, "local transports keep local trust");
-        assert!(
-            context
-                .authorize(crate::protocol::MethodFamily::ToolsCall)
-                .is_ok()
-        );
-    }
+    // IPC is local by construction and must stay trusted.
+    let context = DownstreamCallContext::ipc(
+        "ipc-client",
+        RequestId::Number(7),
+        ClientType::Unknown,
+        None,
+    );
+    assert!(context.local_trust, "local transports keep local trust");
+    assert!(
+        context
+            .authorize(crate::protocol::MethodFamily::ToolsCall)
+            .is_ok()
+    );
 }
 
 #[test]
@@ -129,10 +123,15 @@ fn downstream_context_preserves_supplied_http_trace_id() {
 #[test]
 fn client_metadata_never_changes_principal_identity() {
     let request = RequestId::from(NumberOrString::Number(1));
-    let original =
-        DownstreamCallContext::stdio("process-instance", request.clone(), ClientType::Unknown);
-    let changed = DownstreamCallContext::stdio("process-instance", request, ClientType::ClaudeCode)
-        .with_client_metadata("forged-client", "999");
+    let original = DownstreamCallContext::ipc(
+        "process-instance",
+        request.clone(),
+        ClientType::Unknown,
+        None,
+    );
+    let changed =
+        DownstreamCallContext::ipc("process-instance", request, ClientType::ClaudeCode, None)
+            .with_client_metadata("forged-client", "999");
     assert_eq!(original.principal, changed.principal);
     assert_ne!(original.client_metadata, changed.client_metadata);
 }
@@ -216,52 +215,6 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
     assert_eq!(with(None, None), Some(false));
 }
 
-#[test]
-fn get_info_returns_correct_server_info() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, RouterConfig::default());
-    let info = handler.get_info();
-
-    assert_eq!(info.server_info.name, "plug");
-    assert_eq!(info.server_info.title.as_deref(), Some("Plug"));
-    assert_eq!(
-        info.server_info.description.as_deref(),
-        Some("MCP multiplexer")
-    );
-    assert_eq!(
-        info.server_info.website_url.as_deref(),
-        Some("https://github.com/cyberpapiii/plug")
-    );
-    let icons = info.server_info.icons.as_ref().expect("plug icons");
-    assert_plug_icons_sequence(icons);
-    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-    assert_eq!(info.protocol_version.as_str(), LATEST_PROTOCOL_VERSION);
-    assert!(info.capabilities.tools.is_none());
-    assert!(info.capabilities.resources.is_none());
-}
-
-fn assert_plug_icons_sequence(icons: &[Icon]) {
-    let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
-    assert_eq!(icons.len(), expected_sizes.len() + 1);
-
-    for (icon, expected_size) in icons.iter().zip(expected_sizes) {
-        assert!(icon.src.starts_with("data:image/png;base64,"));
-        assert_eq!(icon.mime_type.as_deref(), Some("image/png"));
-        assert_eq!(
-            icon.sizes
-                .as_ref()
-                .and_then(|sizes| sizes.first())
-                .map(String::as_str),
-            Some(expected_size)
-        );
-    }
-
-    let svg = icons.last().expect("svg fallback icon");
-    assert!(svg.src.starts_with("data:image/svg+xml;base64,"));
-    assert_eq!(svg.mime_type.as_deref(), Some("image/svg+xml"));
-    assert_eq!(svg.sizes.as_deref(), Some(&["any".to_string()][..]));
-}
-
 #[tokio::test(start_paused = true)]
 async fn schedule_tool_list_changed_refresh_debounces_bursts() {
     let sm = Arc::new(ServerManager::new());
@@ -323,16 +276,6 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
     assert_eq!(second, ProtocolNotification::ToolListChanged);
-}
-
-#[tokio::test]
-async fn refresh_tools_with_no_servers() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, RouterConfig::default());
-    handler.refresh_tools().await;
-
-    let tools = handler.router().list_tools();
-    assert!(tools.is_empty());
 }
 
 #[tokio::test]
@@ -1003,7 +946,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
         .with_indexes(),
     ));
 
-    let session_key = DownstreamTransport::Stdio.lazy_session_key("client-a");
+    let session_key = DownstreamTransport::Ipc.lazy_session_key("client-a");
     assert_eq!(
         router
             .list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None)
@@ -1014,7 +957,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
     let mut args = serde_json::Map::new();
     args.insert("query".to_string(), serde_json::json!("commit"));
     let downstream =
-        DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::OpenCode);
+        DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::OpenCode, None);
     router
         .handle_search_tools(Some(args), Some(&downstream))
         .expect("search and load tool");
@@ -1067,7 +1010,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
     ));
 
     let downstream =
-        DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::OpenCode);
+        DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::OpenCode, None);
     for index in 0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5) {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -1080,7 +1023,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
             .expect("search and load tool");
     }
 
-    let session_key = DownstreamTransport::Stdio.lazy_session_key("client-a");
+    let session_key = DownstreamTransport::Ipc.lazy_session_key("client-a");
     let visible =
         router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
     let names = visible
@@ -1132,7 +1075,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
 
     let mut notifications = router.subscribe_notifications();
     let downstream =
-        DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::OpenCode);
+        DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::OpenCode, None);
     let mut args = serde_json::Map::new();
     args.insert("query".to_string(), serde_json::json!("commit"));
     router
@@ -1141,7 +1084,7 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
     assert_eq!(
         notifications.try_recv().expect("search notification"),
         ProtocolNotification::ToolListChangedFor {
-            target: NotificationTarget::Stdio {
+            target: NotificationTarget::Ipc {
                 client_id: Arc::from("client-a"),
             },
         }
@@ -1193,7 +1136,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
         .with_indexes(),
     ));
 
-    let session_key = DownstreamTransport::Stdio.lazy_session_key("client-a");
+    let session_key = DownstreamTransport::Ipc.lazy_session_key("client-a");
     router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
 
     let err = router
@@ -1201,10 +1144,11 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
             "git__commit",
             None,
             None,
-            Some(DownstreamCallContext::stdio(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1221,10 +1165,11 @@ async fn bridge_session_rejects_unloaded_direct_tool_call_before_tools_list() {
             "git__commit",
             None,
             None,
-            Some(DownstreamCallContext::stdio(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1244,10 +1189,11 @@ async fn bridge_session_rejects_unloaded_task_tool_call() {
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
             None,
-            Some(DownstreamCallContext::stdio(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1269,10 +1215,11 @@ async fn bridge_session_rejects_task_wrapped_search_meta_tool() {
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
             None,
-            Some(DownstreamCallContext::stdio(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1292,10 +1239,11 @@ async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
             "plug__invoke_tool",
             Some(args),
             None,
-            Some(DownstreamCallContext::stdio(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1327,10 +1275,11 @@ async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
             "plug__search_tools",
             Some(args),
             None,
-            Some(DownstreamCallContext::stdio(
+            Some(DownstreamCallContext::ipc(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
+                None,
             )),
         )
         .await
@@ -1586,10 +1535,11 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
                 "Queued__tool",
                 None,
                 None,
-                Some(DownstreamCallContext::stdio(
+                Some(DownstreamCallContext::ipc(
                     "queued-client",
                     RequestId::Number(1),
                     ClientType::Unknown,
+                    None,
                 )),
             )
             .await
@@ -1695,10 +1645,11 @@ async fn route_upstream_progress_publishes_targeted_notification() {
         .register_active_call(
             42,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-1"),
                     RequestId::from(NumberOrString::Number(1)),
                     crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "upstream".to_string(),
                 upstream_request_id: None,
@@ -1723,7 +1674,7 @@ async fn route_upstream_progress_publishes_targeted_notification() {
         ProtocolNotification::Progress { target, params } => {
             assert_eq!(
                 target,
-                NotificationTarget::Stdio {
+                NotificationTarget::Ipc {
                     client_id: Arc::from("client-1"),
                 }
             );
@@ -1751,7 +1702,7 @@ fn resource_subscription_registry_lifecycle() {
     let config = RouterConfig::default();
     let router = ToolRouter::new(sm, config);
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("test-client"),
     };
 
@@ -1973,7 +1924,7 @@ fn set_roots_for_target_returns_true_on_first_insert() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots = vec![make_root("file:///project-a", Some("Project A"))];
@@ -1986,7 +1937,7 @@ fn set_roots_for_target_returns_false_when_unchanged() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots = vec![make_root("file:///project-a", Some("Project A"))];
@@ -2001,7 +1952,7 @@ fn set_roots_for_target_returns_true_when_changed() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots_a = vec![make_root("file:///project-a", Some("Project A"))];
@@ -2016,7 +1967,7 @@ fn clear_roots_for_target_returns_true_when_existed() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let roots = vec![make_root("file:///project-a", None)];
@@ -2030,7 +1981,7 @@ fn clear_roots_for_target_returns_false_when_not_existed() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-nonexistent"),
     };
     assert!(!router.clear_roots_for_target(&target));
@@ -2042,7 +1993,7 @@ fn list_roots_union_deduplicates_by_uri() {
     let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Client 1 has roots A and B
-    let target1 = NotificationTarget::Stdio {
+    let target1 = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     router.set_roots_for_target(
@@ -2080,7 +2031,7 @@ fn list_roots_union_is_sorted_by_uri() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     router.set_roots_for_target(
@@ -2109,7 +2060,7 @@ fn clear_roots_removes_from_union() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
 
-    let target1 = NotificationTarget::Stdio {
+    let target1 = NotificationTarget::Ipc {
         client_id: Arc::from("client-1"),
     };
     let target2 = NotificationTarget::Http {
@@ -2157,10 +2108,11 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
                     crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2209,10 +2161,11 @@ fn test_route_upstream_progress_restores_downstream_token() {
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
                     crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2241,7 +2194,7 @@ fn test_route_upstream_progress_restores_downstream_token() {
         ProtocolNotification::Progress { target, params } => {
             assert_eq!(
                 target,
-                NotificationTarget::Stdio {
+                NotificationTarget::Ipc {
                     client_id: Arc::from("client-a"),
                 }
             );
@@ -2263,10 +2216,11 @@ fn test_anonymous_upstream_cancellation_preserves_active_call() {
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
                     crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2295,10 +2249,11 @@ fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
                     crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: None,
@@ -2344,10 +2299,11 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
         .register_active_call(
             1,
             ActiveCallRecord {
-                downstream: DownstreamCallContext::stdio(
+                downstream: DownstreamCallContext::ipc(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
                     crate::types::ClientType::Unknown,
+                    None,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
@@ -2388,203 +2344,17 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
 #[test]
 fn test_downstream_context_notification_target() {
     assert_eq!(
-        DownstreamCallContext::stdio(
+        DownstreamCallContext::ipc(
             Arc::from("client-a"),
             RequestId::from(NumberOrString::Number(1)),
-            crate::types::ClientType::Unknown
+            crate::types::ClientType::Unknown,
+            None
         )
         .notification_target(),
-        NotificationTarget::Stdio {
+        NotificationTarget::Ipc {
             client_id: Arc::from("client-a"),
         },
     );
-}
-
-/// The IPC identity split (KTD3): an IPC downstream context has a first-class
-/// `Ipc` notification target and an `ipc:` lazy-session-key namespace, distinct
-/// from the `Stdio` masquerade it replaced. A stdio and an IPC client with the
-/// same id now resolve to different lazy buckets and different targets — the
-/// correctness win the split delivers.
-#[test]
-fn ipc_context_has_distinct_identity_from_stdio() {
-    let ipc = DownstreamCallContext::ipc(
-        Arc::from("sess-1"),
-        RequestId::from(NumberOrString::Number(1)),
-        ClientType::Unknown,
-        None,
-    );
-    assert_eq!(
-        ipc.notification_target(),
-        NotificationTarget::Ipc {
-            client_id: Arc::from("sess-1"),
-        },
-    );
-
-    // Distinct lazy-session-key namespaces: a stdio and an IPC client sharing an
-    // id no longer collide in the lazy working-set map.
-    let ipc_key = DownstreamTransport::Ipc.lazy_session_key("sess-1");
-    let stdio_key = DownstreamTransport::Stdio.lazy_session_key("sess-1");
-    assert_eq!(ipc_key, "ipc:sess-1");
-    assert_ne!(ipc_key, stdio_key);
-    // A reconnecting IPC client with the same session id resolves to the same
-    // namespaced key — its working set is not orphaned by the namespace change.
-    assert_eq!(DownstreamTransport::Ipc.lazy_session_key("sess-1"), ipc_key,);
-}
-
-// ── dispatch: tools/call ─────────────────────────────────────────────────
-
-fn local_caller() -> crate::dispatch::IpcContext {
-    let mut ctx =
-        crate::dispatch::IpcContext::new("test-client", RequestId::from(NumberOrString::Number(1)));
-    ctx.registry_client_id = Some(Arc::from("test-owner"));
-    ctx
-}
-
-async fn dispatch_call(
-    router: &Arc<ToolRouter>,
-    ctx: &dyn crate::dispatch::DownstreamContext,
-    params: CallToolRequestParams,
-) -> Result<serde_json::Value, McpError> {
-    crate::dispatch::handle(
-        router,
-        ctx,
-        "tools/call",
-        Some(serde_json::to_value(params).expect("params serialize")),
-    )
-    .await
-}
-
-/// OAuth-backed transport context whose tool scope is intentionally narrower
-/// than its task scope. Task-wrapped tools/call must pass both checks.
-struct ScopedTaskDownstream {
-    scopes: std::collections::BTreeSet<String>,
-}
-
-impl crate::dispatch::DownstreamContext for ScopedTaskDownstream {
-    fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::http(
-            "session-scoped",
-            RequestId::from(NumberOrString::Number(1)),
-            ClientType::Unknown,
-        )
-        .with_trace_id(Arc::<str>::from("00000000000000000000000000000001"))
-        .with_authorization(
-            crate::types::PrincipalId::downstream_oauth(
-                "https://issuer.example",
-                "client-a",
-                "https://plug.example/mcp",
-            ),
-            self.scopes.clone(),
-        )
-    }
-
-    fn session_bound(&self) -> bool {
-        false
-    }
-
-    fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        Ok(TaskOwner::new(
-            crate::types::PrincipalId::downstream_oauth(
-                "https://issuer.example",
-                "client-a",
-                "https://plug.example/mcp",
-            )
-            .owner_key(),
-        ))
-    }
-}
-
-/// Build a router with a single route to a server that has no registered
-/// upstream. The sync path then fails with `ServerUnavailable`, while the task
-/// path falls through to a local passthrough task and succeeds — making the two
-/// branches observably distinct.
-fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
-    let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
-    let mut routes = HashMap::new();
-    routes.insert(
-        "Mock__tool".to_string(),
-        ("mock-server".to_string(), "tool".to_string()),
-    );
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-    router
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_empty_name_returns_tool_not_found() {
-    let router = router_with_unrouted_single_route();
-    let ctx = local_caller();
-    let params = CallToolRequestParams::new("");
-
-    let err = dispatch_call(&router, &ctx, params)
-        .await
-        .expect_err("empty tool name must error");
-
-    // Canonical shape: an unknown/empty tool name routes to ToolNotFound
-    // (the stdio/HTTP behavior, now shared), which maps to METHOD_NOT_FOUND.
-    assert_eq!(err.code, ErrorCode::METHOD_NOT_FOUND);
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_rejects_hostile_extensions_before_route_effects() {
-    let router = router_with_unrouted_single_route();
-    let ctx = local_caller();
-
-    for (key, value) in [
-        ("plug.dev/legacy-task-support", serde_json::json!(true)),
-        (
-            "attacker.example/authorization",
-            serde_json::json!("Bearer stolen"),
-        ),
-        ("attacker.example/value", serde_json::json!("Bearer stolen")),
-    ] {
-        let mut params = CallToolRequestParams::new("Mock__tool");
-        params
-            .meta
-            .get_or_insert_with(Default::default)
-            .insert(key.to_string(), value);
-        let error = dispatch_call(&router, &ctx, params)
-            .await
-            .expect_err("hostile metadata must fail before route lookup");
-        assert_eq!(error.code, ErrorCode::INVALID_PARAMS, "hostile key: {key}");
-        assert!(
-            !error.message.to_lowercase().contains("unavailable"),
-            "a route effect occurred before extension admission for {key}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_rejects_oversized_request_state_before_route_effects() {
-    let router = router_with_unrouted_single_route();
-    let ctx = local_caller();
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.request_state = Some("x".repeat(4 * 1024 + 1));
-
-    let error = dispatch_call(&router, &ctx, params)
-        .await
-        .expect_err("oversized requestState must fail before route lookup");
-    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-    assert!(!error.message.to_lowercase().contains("unavailable"));
 }
 
 #[test]
@@ -2602,35 +2372,6 @@ fn mrtr_pair_policy_activates_only_native_modern_rounds() {
     assert!(!mrtr_pair_supported(Legacy, Modern, true, false));
     assert!(!mrtr_pair_supported(Legacy, Modern, false, false));
     assert!(!mrtr_pair_supported(Modern, Modern, false, true));
-}
-
-#[tokio::test]
-async fn hostile_task_extension_is_rejected_before_durable_record_creation() {
-    let router = router_with_unrouted_single_route();
-    let ctx = local_caller();
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    let meta = params.meta.get_or_insert_with(Default::default);
-    meta.insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-    meta.insert(
-        "attacker.example/principal".to_string(),
-        serde_json::json!("someone-else"),
-    );
-
-    let error = dispatch_call(&router, &ctx, params)
-        .await
-        .expect_err("hostile task metadata must fail before durable creation");
-    assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
-    assert_eq!(
-        router
-            .task_count_for_owner(
-                &crate::dispatch::DownstreamContext::task_owner(&ctx).expect("owner")
-            )
-            .await,
-        0
-    );
 }
 
 #[test]
@@ -2663,58 +2404,6 @@ fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
             assert_eq!(admitted, source, "pair {downstream:?} -> {upstream:?}");
         }
     }
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
-    let router = router_with_unrouted_single_route();
-    let ctx = local_caller();
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-
-    let outcome = dispatch_call(&router, &ctx, params)
-        .await
-        .expect("task-augmented call should enqueue a local passthrough task");
-
-    assert!(
-        outcome.get("task").is_some(),
-        "expected a created task, got {outcome:?}"
-    );
-    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
-    assert_eq!(activity.len(), 1);
-    assert_eq!(activity[0].method, "tools/call");
-    assert_eq!(
-        activity[0].outcome,
-        crate::activity::ActivityOutcome::Success
-    );
-}
-
-#[tokio::test]
-async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_record() {
-    let router = router_with_unrouted_single_route();
-    let ctx = ScopedTaskDownstream {
-        scopes: std::collections::BTreeSet::from(["tools:read".to_string()]),
-    };
-    let owner =
-        crate::dispatch::DownstreamContext::task_owner(&ctx).expect("stable principal owner");
-    let mut params = CallToolRequestParams::new("Mock__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
-    );
-
-    let err = dispatch_call(&router, &ctx, params)
-        .await
-        .expect_err("tools scope alone must not authorize durable task creation");
-
-    assert_eq!(err.code, ErrorCode(-32005));
-    assert_eq!(router.task_count_for_owner(&owner).await, 0);
-    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
-    assert_eq!(activity.len(), 1);
-    assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
 }
 
 // ─── refresh_tools ↔ subscription race tests ────────────────────────────────
@@ -3135,7 +2824,7 @@ fn subscribable_test_server_config() -> crate::config::ServerConfig {
 }
 
 fn sub_target(id: &str) -> NotificationTarget {
-    NotificationTarget::Stdio {
+    NotificationTarget::Ipc {
         client_id: Arc::from(id),
     }
 }
@@ -3945,19 +3634,17 @@ async fn legacy_task_to_modern_upstream_is_rejected_before_task_or_tool_effect()
     upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let ctx = local_caller();
-    let owner = crate::dispatch::DownstreamContext::task_owner(&ctx).unwrap();
-    let mut params = CallToolRequestParams::new("Modern__tool");
-    params.meta.get_or_insert_with(Default::default).insert(
-        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-        serde_json::json!({}),
+    let downstream = DownstreamCallContext::ipc(
+        "test-client",
+        RequestId::Number(1),
+        ClientType::Unknown,
+        None,
     );
 
-    let error = dispatch_call(&router, &ctx, params)
-        .await
+    let error = router
+        .ensure_tool_round_supported("Modern__tool", &downstream, false, true)
         .expect_err("legacy task cannot target a modern upstream");
     assert_eq!(error.code, ErrorCode::METHOD_NOT_FOUND);
-    assert_eq!(router.task_count_for_owner(&owner).await, 0);
     assert_eq!(
         state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
         0
@@ -4786,7 +4473,7 @@ fn router_with_client_blocks(config: RouterConfig) -> ToolRouter {
 }
 
 fn context_for(client_key: Option<&str>) -> DownstreamCallContext {
-    DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::Unknown)
+    DownstreamCallContext::ipc("client-a", RequestId::Number(1), ClientType::Unknown, None)
         .with_client_key(client_key)
 }
 
@@ -5422,10 +5109,10 @@ async fn a_blocked_resource_or_prompt_answers_as_one_that_does_not_exist() {
 #[test]
 fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     let router = router_with_blocked_resources_and_prompts();
-    let cursor = NotificationTarget::Stdio {
+    let cursor = NotificationTarget::Ipc {
         client_id: Arc::from("cursor-session"),
     };
-    let zed = NotificationTarget::Stdio {
+    let zed = NotificationTarget::Ipc {
         client_id: Arc::from("zed-session"),
     };
     // Both subscribed before `cursor` was kept from `git`.

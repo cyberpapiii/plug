@@ -5,7 +5,7 @@
 
 //! Integration tests for plug-core.
 //!
-//! These tests exercise the ProxyHandler, client detection, and config
+//! These tests exercise the MCP dispatcher, client detection, and config
 //! loading at the unit level without spawning child processes.
 
 use std::collections::HashMap;
@@ -29,22 +29,15 @@ use plug_core::config::{
 use plug_core::engine::Engine;
 use plug_core::http::server::{HttpState, build_router};
 use plug_core::oauth;
-use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::session::SessionStore;
 use plug_core::test_helpers::{collect_sse_events, mock_server};
 use plug_core::types::ClientType;
 use rmcp::ErrorData as McpError;
-use rmcp::ServiceExt as _;
-use rmcp::handler::client::ClientHandler;
-use rmcp::handler::server::ServerHandler;
 use rmcp::model::{
-    CallToolRequestParams, ClientCapabilities, ClientInfo, CreateMessageRequestParams,
-    CreateMessageResult, ElicitRequestParams, ElicitResult, ElicitationAction,
-    ElicitationCapability, FormElicitationCapability, Implementation, ReadResourceRequestParams,
-    ResourceContents, SamplingCapability, SamplingMessage, UrlElicitationCapability,
+    CallToolRequestParams, CreateMessageRequestParams, CreateMessageResult, ElicitRequestParams,
+    ElicitResult, ElicitationAction, ReadResourceRequestParams, ResourceContents, SamplingMessage,
 };
-use rmcp::service::RequestContext;
 use rmcp::transport::auth::CredentialStore;
 use rmcp::transport::auth::{StoredCredentials, VendorExtraTokenFields};
 use tokio::sync::Mutex;
@@ -1181,12 +1174,95 @@ async fn mock_initialized_notification_server_error_oauth_mcp_handler(
     }
 }
 
-#[derive(Clone)]
-struct TestClient;
+/// A `plug connect` session, asking the dispatcher the way the daemon does.
+struct Downstream {
+    router: Arc<plug_core::proxy::ToolRouter>,
+    session_id: Arc<str>,
+    next_request: std::sync::atomic::AtomicI64,
+}
 
-impl ClientHandler for TestClient {
-    fn get_info(&self) -> ClientInfo {
-        ClientInfo::default()
+impl Downstream {
+    fn connect(router: Arc<plug_core::proxy::ToolRouter>) -> Self {
+        Self {
+            router,
+            session_id: Arc::from(uuid::Uuid::new_v4().to_string()),
+            next_request: std::sync::atomic::AtomicI64::new(1),
+        }
+    }
+
+    /// Connect a client that answers Plug's reverse requests with `bridge`.
+    fn connect_with_bridge(
+        router: Arc<plug_core::proxy::ToolRouter>,
+        bridge: Arc<dyn plug_core::proxy::DownstreamBridge>,
+    ) -> Self {
+        let downstream = Self::connect(router);
+        downstream.router.register_downstream_bridge(
+            plug_core::notifications::NotificationTarget::Ipc {
+                client_id: Arc::clone(&downstream.session_id),
+            },
+            bridge,
+        );
+        downstream
+    }
+
+    /// Kept so call sites read like an rmcp client's.
+    fn peer(&self) -> &Self {
+        self
+    }
+
+    async fn request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<T, McpError> {
+        let request_id = self
+            .next_request
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let ctx = plug_core::dispatch::IpcContext::new(
+            Arc::clone(&self.session_id),
+            rmcp::model::RequestId::Number(request_id),
+        );
+        let value = plug_core::dispatch::handle(&self.router, &ctx, method, params).await?;
+        Ok(serde_json::from_value(value).expect("result has the method's shape"))
+    }
+
+    async fn call_tool(
+        &self,
+        params: CallToolRequestParams,
+    ) -> Result<rmcp::model::CallToolResult, McpError> {
+        self.request("tools/call", Some(serde_json::to_value(params).unwrap()))
+            .await
+    }
+
+    async fn read_resource(
+        &self,
+        params: ReadResourceRequestParams,
+    ) -> Result<rmcp::model::ReadResourceResult, McpError> {
+        self.request(
+            "resources/read",
+            Some(serde_json::to_value(params).unwrap()),
+        )
+        .await
+    }
+
+    async fn list_all_tools(&self) -> Result<Vec<rmcp::model::Tool>, McpError> {
+        let mut tools = Vec::new();
+        let mut cursor = None;
+        loop {
+            let page: rmcp::model::ListToolsResult = self
+                .request("tools/list", Some(serde_json::json!({ "cursor": cursor })))
+                .await?;
+            tools.extend(page.tools);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                return Ok(tools);
+            }
+        }
+    }
+
+    async fn list_all_resources(&self) -> Result<Vec<rmcp::model::Resource>, McpError> {
+        let page: rmcp::model::ListResourcesResult = self.request("resources/list", None).await?;
+        Ok(page.resources)
     }
 }
 
@@ -1479,20 +1555,6 @@ async fn reserve_unused_local_port() -> u16 {
     listener.local_addr().expect("ephemeral local addr").port()
 }
 
-// ---------------------------------------------------------------------------
-// ProxyHandler: list_tools with no upstream servers
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_proxy_handler_refresh_tools_empty() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
-    handler.refresh_tools().await;
-
-    let info = handler.get_info();
-    assert!(info.capabilities.tools.is_none());
-}
-
 // A connected upstream that stalls on resource listing must be skipped after
 // its per-server call_timeout_secs, not allowed to block the whole refresh.
 #[tokio::test]
@@ -1616,7 +1678,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
         router.list_resources().iter().any(|r| r.uri == uri),
         "resource should be present after a healthy listing"
     );
-    let target = NotificationTarget::Stdio {
+    let target = NotificationTarget::Ipc {
         client_id: Arc::from("c1"),
     };
     // Subscribe a notification receiver BEFORE subscribing so we capture the
@@ -1688,22 +1750,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
 }
 
 // ---------------------------------------------------------------------------
-// ProxyHandler: get_info returns correct server info
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_proxy_handler_get_info() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
-    let info = handler.get_info();
-
-    assert_eq!(info.server_info.name, "plug");
-    assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
-    assert!(info.capabilities.tools.is_none());
-}
-
-// ---------------------------------------------------------------------------
-// ProxyHandler: routing table is empty with no servers
+// ServerManager: no tools with no servers
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1713,36 +1760,6 @@ async fn test_server_manager_tools_empty() {
     assert!(
         tools.is_empty(),
         "expected no tools from empty ServerManager"
-    );
-}
-
-// ---------------------------------------------------------------------------
-// ProxyHandler: resources and prompts capabilities
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_resources_capability_omitted_until_upstream_support() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
-    let info = handler.get_info();
-
-    assert!(
-        info.capabilities.resources.is_none(),
-        "resources capability should be omitted until upstream support exists"
-    );
-}
-
-#[test]
-fn test_prompts_not_advertised() {
-    let sm = Arc::new(ServerManager::new());
-    let handler = ProxyHandler::new(sm, plug_core::proxy::RouterConfig::default());
-    let info = handler.get_info();
-
-    // prompts is None in capabilities (default), which means list_prompts
-    // falls back to the trait default returning an empty list.
-    assert!(
-        info.capabilities.prompts.is_none(),
-        "prompts should not be explicitly advertised"
     );
 }
 
@@ -2410,7 +2427,7 @@ async fn test_http_upstream_crash_restart_recovers_cleanly() {
 }
 
 #[tokio::test]
-async fn test_stdio_end_to_end_proxy_path() {
+async fn test_end_to_end_proxy_path() {
     let mut config = Config::default();
     config
         .servers
@@ -2419,20 +2436,7 @@ async fn test_stdio_end_to_end_proxy_path() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let tools = client.peer().list_all_tools().await.expect("list tools");
     let names = tools
@@ -2618,19 +2622,7 @@ async fn an_mcp_app_reaches_the_client_whole() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let tools = client.peer().list_all_tools().await.expect("list tools");
     let widget = tools
@@ -2696,20 +2688,7 @@ async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let tools = client.peer().list_all_tools().await.expect("list tools");
     let names = tools
@@ -2733,7 +2712,7 @@ async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
 }
 
 #[tokio::test]
-async fn test_stdio_structured_content_passes_through_end_to_end() {
+async fn test_structured_content_passes_through_end_to_end() {
     let mut config = Config::default();
     config
         .servers
@@ -2742,20 +2721,7 @@ async fn test_stdio_structured_content_passes_through_end_to_end() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let result = client
         .call_tool(CallToolRequestParams::new("Mock__structured"))
@@ -2774,7 +2740,7 @@ async fn test_stdio_structured_content_passes_through_end_to_end() {
 }
 
 #[tokio::test]
-async fn test_stdio_resource_link_passes_through_end_to_end() {
+async fn test_resource_link_passes_through_end_to_end() {
     let mut config = Config::default();
     config
         .servers
@@ -2783,20 +2749,7 @@ async fn test_stdio_resource_link_passes_through_end_to_end() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let result = client
         .call_tool(CallToolRequestParams::new("Mock__resource_link"))
@@ -2815,7 +2768,7 @@ async fn test_stdio_resource_link_passes_through_end_to_end() {
 }
 
 #[tokio::test]
-async fn test_stdio_oversized_tool_result_spills_to_artifact_link() {
+async fn test_oversized_tool_result_spills_to_artifact_link() {
     let mut config = Config::default();
     config
         .servers
@@ -2824,20 +2777,7 @@ async fn test_stdio_oversized_tool_result_spills_to_artifact_link() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let result = client
         .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
@@ -2860,7 +2800,7 @@ async fn test_stdio_oversized_tool_result_spills_to_artifact_link() {
 }
 
 #[tokio::test]
-async fn test_stdio_artifact_manifest_is_readable() {
+async fn test_artifact_manifest_is_readable() {
     let mut config = Config::default();
     config
         .servers
@@ -2869,20 +2809,7 @@ async fn test_stdio_artifact_manifest_is_readable() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let result = client
         .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
@@ -2915,7 +2842,7 @@ async fn test_stdio_artifact_manifest_is_readable() {
 }
 
 #[tokio::test]
-async fn test_stdio_artifact_chunk_is_readable() {
+async fn test_artifact_chunk_is_readable() {
     let mut config = Config::default();
     config
         .servers
@@ -2924,20 +2851,7 @@ async fn test_stdio_artifact_chunk_is_readable() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let result = client
         .call_tool(CallToolRequestParams::new("Mock__artifact_text"))
@@ -2968,7 +2882,7 @@ async fn test_stdio_artifact_chunk_is_readable() {
 }
 
 #[tokio::test]
-async fn test_stdio_attachment_like_tool_result_spills_to_artifact_link() {
+async fn test_attachment_like_tool_result_spills_to_artifact_link() {
     let mut config = Config::default();
     config
         .servers
@@ -2977,20 +2891,7 @@ async fn test_stdio_attachment_like_tool_result_spills_to_artifact_link() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(4096);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = TestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect(engine.tool_router().clone());
 
     let result = client
         .call_tool(CallToolRequestParams::new("Mock__attachment_blob"))
@@ -3244,26 +3145,8 @@ async fn test_multi_client_shared_engine_isolation() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    async fn connect_client(
-        router: Arc<plug_core::proxy::ToolRouter>,
-    ) -> rmcp::service::RunningService<rmcp::RoleClient, TestClient> {
-        let proxy_handler = ProxyHandler::from_router(router);
-        let (server_transport, client_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let server = proxy_handler
-                .serve(server_transport)
-                .await
-                .expect("start proxy server");
-            let _ = server.waiting().await;
-        });
-        TestClient
-            .serve(client_transport)
-            .await
-            .expect("connect client")
-    }
-
-    let client_a = connect_client(engine.tool_router().clone()).await;
-    let client_b = connect_client(engine.tool_router().clone()).await;
+    let client_a = Downstream::connect(engine.tool_router().clone());
+    let client_b = Downstream::connect(engine.tool_router().clone());
 
     let call_a = tokio::spawn(async move {
         client_a
@@ -4536,43 +4419,32 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
 /// A test client that advertises elicitation + sampling capabilities
 /// and handles reverse requests from upstream servers.
 #[derive(Clone)]
+/// A downstream client that accepts every elicitation and answers every
+/// sampling request, as Plug's bridge to it sees it.
 struct ReverseRequestTestClient;
 
-#[allow(clippy::manual_async_fn)]
-impl ClientHandler for ReverseRequestTestClient {
-    fn get_info(&self) -> ClientInfo {
-        let mut caps = ClientCapabilities::default();
-        caps.sampling = Some(SamplingCapability::default());
-        caps.elicitation = Some(
-            ElicitationCapability::new()
-                .with_form(FormElicitationCapability::default())
-                .with_url(UrlElicitationCapability::default()),
-        );
-        ClientInfo::new(caps, Implementation::new("reverse-test-client", "1.0"))
-    }
-
+impl plug_core::proxy::DownstreamBridge for ReverseRequestTestClient {
     fn create_elicitation(
         &self,
         _request: ElicitRequestParams,
-        _context: RequestContext<rmcp::RoleClient>,
-    ) -> impl Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
-        async {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
+        Box::pin(async {
             Ok(ElicitResult::new(ElicitationAction::Accept)
                 .with_content(serde_json::json!({"answer": "test-elicitation-response"})))
-        }
+        })
     }
 
     fn create_message(
         &self,
         _request: CreateMessageRequestParams,
-        _context: RequestContext<rmcp::RoleClient>,
-    ) -> impl Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
-        async {
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>>
+    {
+        Box::pin(async {
             Ok(CreateMessageResult::new(
                 SamplingMessage::assistant_text("test-sampling-response"),
                 "mock-model".to_string(),
             ))
-        }
+        })
     }
 }
 
@@ -4599,11 +4471,11 @@ fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -
 }
 
 // ---------------------------------------------------------------------------
-// Stdio: elicitation reverse-request round trip
+// Elicitation reverse-request round trip
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_stdio_elicitation_reverse_request_round_trip() {
+async fn test_elicitation_reverse_request_round_trip() {
     let mut config = Config::default();
     config.servers.insert(
         "mock".to_string(),
@@ -4613,20 +4485,10 @@ async fn test_stdio_elicitation_reverse_request_round_trip() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(8192);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = ReverseRequestTestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect_with_bridge(
+        engine.tool_router().clone(),
+        Arc::new(ReverseRequestTestClient),
+    );
 
     // Verify tools are available
     let tools = client.peer().list_all_tools().await.expect("list tools");
@@ -4659,11 +4521,11 @@ async fn test_stdio_elicitation_reverse_request_round_trip() {
 }
 
 // ---------------------------------------------------------------------------
-// Stdio: sampling reverse-request round trip
+// Sampling reverse-request round trip
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_stdio_sampling_reverse_request_round_trip() {
+async fn test_sampling_reverse_request_round_trip() {
     let mut config = Config::default();
     config.servers.insert(
         "mock".to_string(),
@@ -4673,20 +4535,10 @@ async fn test_stdio_sampling_reverse_request_round_trip() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let proxy_handler = ProxyHandler::from_router(engine.tool_router().clone());
-    let (server_transport, client_transport) = tokio::io::duplex(8192);
-    tokio::spawn(async move {
-        let server = proxy_handler
-            .serve(server_transport)
-            .await
-            .expect("start stdio proxy server");
-        let _ = server.waiting().await;
-    });
-
-    let client = ReverseRequestTestClient
-        .serve(client_transport)
-        .await
-        .expect("connect stdio client");
+    let client = Downstream::connect_with_bridge(
+        engine.tool_router().clone(),
+        Arc::new(ReverseRequestTestClient),
+    );
 
     let tools = client.peer().list_all_tools().await.expect("list tools");
     assert!(

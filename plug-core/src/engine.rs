@@ -229,7 +229,6 @@ impl Engine {
         &self.cancel
     }
 
-    /// Get a reference to the ToolRouter (for ProxyHandler/HTTP handlers).
     pub fn tool_router(&self) -> &Arc<ToolRouter> {
         &self.tool_router
     }

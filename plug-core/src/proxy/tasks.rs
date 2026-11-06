@@ -146,8 +146,8 @@ impl super::ToolRouter {
         // re-registered client accepts the create, which is benign — the same
         // `ipc:<client_id>` owner is live again and owns the record — and the
         // tombstone catch-all remains the backstop, with a bounded spurious
-        // refusal as the worst case. stdio passes `None`: it has no teardown
-        // path that calls task cleanup, so its owner is always live.
+        // refusal as the worst case. A caller with no session to tear down
+        // passes `None`.
         if let Some(owner_is_live) = owner_liveness
             && !owner_is_live()
         {
@@ -1414,6 +1414,8 @@ mod tests {
     // window or prove teardown stays bounded against an unresponsive upstream.
 
     use rmcp::ServiceExt as _;
+    use rmcp::handler::server::ServerHandler;
+    use rmcp::service::{RequestContext, RoleServer};
 
     use crate::server::{UpstreamClientHandler, UpstreamServer};
     use crate::types::ServerHealth;

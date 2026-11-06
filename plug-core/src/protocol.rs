@@ -74,19 +74,6 @@ pub enum ProtocolEra {
     Modern,
 }
 
-/// Remove modern capabilities whose transport/ownership bridges are not yet
-/// implemented. Keep this projection shared by HTTP and direct RMCP handlers
-/// so discovery cannot outrun dispatch.
-pub fn suppress_unimplemented_modern_capabilities(
-    capabilities: &mut rmcp::model::ServerCapabilities,
-) {
-    capabilities.extensions = None;
-    capabilities.experimental = None;
-    if let Some(resources) = capabilities.resources.as_mut() {
-        resources.subscribe = None;
-    }
-}
-
 impl ProtocolEra {
     /// The era a negotiated or declared version belongs to. Anything but the
     /// modern revision is served as legacy.
@@ -474,11 +461,9 @@ pub fn supported_protocol_version() -> ProtocolVersion {
 
 /// Every downstream protocol revision Plug will speak, oldest first.
 ///
-/// All three downstream transports answer version queries from this one list:
-/// stdio and IPC through `ServerHandler::supported_protocol_versions`, HTTP
-/// through the `server/discover` result. They diverged once — HTTP advertised
-/// only `2026-07-28` — which told a modern client that Plug had dropped the
-/// legacy revision it still serves on the very same port.
+/// `plug connect` answers version negotiation and the dispatcher answers
+/// `server/discover` from this one list. Legacy belongs in it: the same
+/// listener still serves `2025-11-25` through `initialize`.
 pub fn supported_downstream_protocol_versions(modern_enabled: bool) -> Vec<ProtocolVersion> {
     let mut versions = vec![supported_protocol_version()];
     if modern_enabled {
@@ -541,8 +526,8 @@ pub fn rewrite_legacy_request(value: &mut serde_json::Value) {
 }
 
 /// Rewrite the removed SEP-1686 `task` parameter on a bare tools/call params
-/// object. The HTTP and stdio adapters call [`rewrite_legacy_request`] on a
-/// complete JSON-RPC envelope; daemon IPC carries params without that envelope.
+/// object. HTTP calls [`rewrite_legacy_request`] on a complete JSON-RPC
+/// envelope; the dispatcher sees params without one.
 pub fn rewrite_legacy_call_params(value: &mut serde_json::Value) {
     let Some(params) = value.as_object_mut() else {
         return;
@@ -902,21 +887,6 @@ mod tests {
             classify_http_request_era(&notification, Some(MODERN_PROTOCOL_VERSION)),
             Ok(ProtocolEra::Modern)
         );
-    }
-
-    #[test]
-    fn modern_projection_suppresses_upstream_subscription_capability() {
-        let mut capabilities = rmcp::model::ServerCapabilities::default();
-        let mut resources = rmcp::model::ResourcesCapability::default();
-        resources.subscribe = Some(true);
-        resources.list_changed = Some(true);
-        capabilities.resources = Some(resources);
-
-        suppress_unimplemented_modern_capabilities(&mut capabilities);
-
-        let resources = capabilities.resources.expect("resources remain advertised");
-        assert_eq!(resources.subscribe, None);
-        assert_eq!(resources.list_changed, Some(true));
     }
 
     #[test]

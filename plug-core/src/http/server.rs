@@ -489,7 +489,7 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                // Unlike stdio/daemon (one fan-out task per client, comparing
+                                // Unlike the daemon (one fan-out task per client, comparing
                                 // target to "self"), this task is shared by every HTTP session,
                                 // so a targeted resolution names which session to route to
                                 // rather than answering "is this me?". See
@@ -3444,9 +3444,9 @@ mod tests {
             .unwrap();
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(value["result"]["resultType"], "complete");
-        // Both revisions, matching what stdio and IPC advertise: the same port
-        // still serves `2025-11-25` through `initialize`, so omitting it would
-        // tell a modern client that legacy support had been dropped.
+        // Both revisions: the same port still serves `2025-11-25` through
+        // `initialize`, so omitting it would tell a modern client that legacy
+        // support had been dropped.
         assert_eq!(
             value["result"]["supportedVersions"],
             json!([SUPPORTED_PROTOCOL_VERSION, "2026-07-28"])

@@ -1783,7 +1783,7 @@ mod tests {
     }
 
     fn client(id: &str) -> NotificationTarget {
-        NotificationTarget::Stdio {
+        NotificationTarget::Ipc {
             client_id: Arc::from(id),
         }
     }

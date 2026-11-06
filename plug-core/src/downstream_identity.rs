@@ -18,7 +18,6 @@ use crate::types::{ClientType, PrincipalId};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DownstreamTransport {
-    Stdio,
     Http,
     /// Daemon IPC client (`plug connect` over the Unix socket).
     Ipc,
@@ -29,7 +28,6 @@ impl DownstreamTransport {
     pub fn notification_target(self, client_id: &Arc<str>) -> NotificationTarget {
         let client_id = Arc::clone(client_id);
         match self {
-            Self::Stdio => NotificationTarget::Stdio { client_id },
             Self::Http => NotificationTarget::Http {
                 session_id: client_id,
             },
@@ -40,7 +38,6 @@ impl DownstreamTransport {
     /// The key of `client_id`'s lazy tool session on this transport.
     pub fn lazy_session_key(self, client_id: &str) -> String {
         match self {
-            Self::Stdio => format!("stdio:{client_id}"),
             Self::Http => format!("http:{client_id}"),
             Self::Ipc => format!("ipc:{client_id}"),
         }
@@ -156,11 +153,6 @@ impl ClientHost {
 
 // ── Principals: who a caller is authorized as ───────────────────────────
 
-/// The principal of an in-process stdio client.
-pub fn stdio_principal(client_id: &str) -> PrincipalId {
-    PrincipalId::stdio_process(stable_instance_uuid("stdio", client_id))
-}
-
 /// The principal of a `plug connect` session: the connector's registry
 /// client id, which outlives one session, or the session itself for a
 /// connector that registered without one.
@@ -184,7 +176,7 @@ pub fn ipc_registry_principal(registry_client_id: &str) -> PrincipalId {
 /// per-principal modern request quota. It can own nothing: durable methods
 /// still require a principal.
 pub fn quota_principal_for_anonymous(client_id: &str) -> PrincipalId {
-    PrincipalId::stdio_process(stable_instance_uuid("modern-request", client_id))
+    PrincipalId::anonymous(stable_instance_uuid("modern-request", client_id))
 }
 
 /// What an HTTP request proved about who sent it.
@@ -240,10 +232,6 @@ impl HttpCredential<'_> {
 
 pub fn principal_task_owner(principal: &PrincipalId) -> TaskOwner {
     TaskOwner::new(principal.owner_key())
-}
-
-pub fn stdio_task_owner(client_id: &str) -> TaskOwner {
-    TaskOwner::new(Arc::<str>::from(format!("stdio:{client_id}")))
 }
 
 /// The owner of a connector's tasks: its registry client id, so they survive
@@ -407,6 +395,5 @@ mod tests {
             ipc_principal("session-a", None),
             ipc_principal("session-b", None)
         );
-        assert_ne!(stdio_principal("x"), ipc_principal("x", None));
     }
 }

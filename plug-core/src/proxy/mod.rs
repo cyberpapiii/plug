@@ -10,18 +10,15 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::ServerHandler;
 use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
-use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, RoleServer};
+use rmcp::service::{Peer, PeerRequestOptions};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::ArtifactStore;
-use crate::branding;
 use crate::circuit::CircuitBreakerError;
-use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
 use crate::downstream_identity::DownstreamTransport;
 use crate::engine::Engine;
@@ -47,12 +44,6 @@ const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
-#[cfg(test)]
-const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
-
-fn plug_implementation() -> Implementation {
-    branding::plug_implementation(env!("CARGO_PKG_VERSION"))
-}
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
@@ -383,7 +374,6 @@ fn mrtr_pair_supported(
         && upstream_era == crate::protocol::ProtocolEra::Modern)
 }
 
-/// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
 /// Backs [`ToolRouter::catalog_revision`]. See that method for why it is
 /// process-global instead of a field.
 static CATALOG_REVISION: AtomicU64 = AtomicU64::new(0);
@@ -565,24 +555,6 @@ impl DownstreamCallContext {
             principal_lifecycle: None,
             extension_envelope: None,
         }
-    }
-
-    /// An in-process stdio client. Local by construction, so trusted.
-    pub fn stdio(
-        client_id: impl Into<Arc<str>>,
-        request_id: RequestId,
-        client_type: ClientType,
-    ) -> Self {
-        let client_id = client_id.into();
-        let principal = crate::downstream_identity::stdio_principal(&client_id);
-        Self::new(
-            DownstreamTransport::Stdio,
-            client_id,
-            request_id,
-            client_type,
-            Some(principal),
-            true,
-        )
     }
 
     /// A `plug connect` session. Local by construction, so trusted; see
@@ -871,7 +843,6 @@ pub(crate) struct ContinuationInsertGate {
 /// Abstraction for forwarding reverse requests (elicitation, sampling) to a downstream client.
 ///
 /// Each transport implements this trait differently:
-/// - stdio: calls `Peer<RoleServer>` methods directly
 /// - HTTP: sends JSON-RPC request via SSE, awaits POST response via oneshot channel
 /// - daemon IPC: sends `IpcClientRequest` to the proxy over Unix socket
 pub trait DownstreamBridge: Send + Sync {
@@ -4440,10 +4411,11 @@ mod lifecycle_regression_tests {
             RouterConfig::default(),
         ));
         let mut notifications = router.subscribe_notifications();
-        let context = DownstreamCallContext::stdio(
+        let context = DownstreamCallContext::ipc(
             "same-principal",
             RequestId::from(NumberOrString::Number(77)),
             crate::types::ClientType::Unknown,
+            None,
         )
         .with_protocol(
             crate::protocol::ProtocolEra::Modern,
@@ -4565,12 +4537,10 @@ mod call_metadata_regression_tests {
 mod catalog;
 mod completion;
 pub mod continuations;
-mod handler;
 mod skills;
 mod subscriptions;
 mod tasks;
 pub(crate) use catalog::*;
-pub use handler::ProxyHandler;
 
 #[cfg(test)]
 mod tests;

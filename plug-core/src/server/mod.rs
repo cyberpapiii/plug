@@ -2815,7 +2815,7 @@ mod tests {
     use super::*;
 
     use crate::config::{ServerConfig, TransportType};
-    use crate::proxy::{ProxyHandler, RouterConfig};
+    use crate::proxy::RouterConfig;
 
     fn stdio_test_config(command: &str, args: &[&str], timeout_secs: u64) -> ServerConfig {
         ServerConfig {
@@ -3189,19 +3189,18 @@ mod tests {
             "availability for a server absent from config must be dropped"
         );
     }
+    use rmcp::ServiceExt;
     use rmcp::handler::server::ServerHandler;
     use rmcp::model::RequestParamsMeta;
     use rmcp::model::{
-        CallToolRequest, CallToolRequestParams, CallToolResponse, CallToolResult,
-        ClientJsonRpcMessage, ClientRequest, ContentBlock, GetPromptResponse, GetPromptResult,
-        Icon, Implementation, InitializeResult, ListPromptsResult, ListResourceTemplatesResult,
-        ListResourcesResult, ListToolsResult, NumberOrString, ProgressNotificationParam,
-        ProgressToken, Prompt, PromptMessage, ReadResourceResponse, ReadResourceResult,
-        RequestMetaObject as Meta, Resource, ResourceContents, ResourceTemplate, Role,
-        ServerCapabilities, ServerInfo, ServerJsonRpcMessage, ServerResult, Tool,
+        CallToolRequestParams, CallToolResponse, CallToolResult, ClientJsonRpcMessage,
+        ClientRequest, ContentBlock, GetPromptResponse, GetPromptResult, Icon, Implementation,
+        InitializeResult, ListPromptsResult, ListResourceTemplatesResult, ListResourcesResult,
+        ListToolsResult, Prompt, PromptMessage, ReadResourceResponse, ReadResourceResult,
+        RequestId, Resource, ResourceContents, ResourceTemplate, Role, ServerCapabilities,
+        ServerInfo, ServerJsonRpcMessage, ServerResult, Tool,
     };
-    use rmcp::service::{Peer, PeerRequestOptions, RequestContext, RoleClient, RoleServer};
-    use rmcp::{ClientHandler, ServiceExt};
+    use rmcp::service::{Peer, RequestContext, RoleServer};
     use tokio::sync::{Notify, watch};
 
     #[test]
@@ -3633,19 +3632,56 @@ mod tests {
         }
     }
 
-    struct ToolListChangedClient {
-        signal: Arc<Notify>,
-        notifications: Arc<AtomicUsize>,
+    /// Count the `tools/list_changed` broadcasts every downstream client is sent.
+    fn watch_tool_list_changed(
+        router: &Arc<crate::proxy::ToolRouter>,
+    ) -> (Arc<Notify>, Arc<AtomicUsize>) {
+        let signal = Arc::new(Notify::new());
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let mut receiver = router.subscribe_notifications();
+        let (task_signal, task_notifications) = (Arc::clone(&signal), Arc::clone(&notifications));
+        tokio::spawn(async move {
+            loop {
+                match receiver.recv().await {
+                    Ok(crate::notifications::ProtocolNotification::ToolListChanged) => {
+                        task_notifications.fetch_add(1, Ordering::SeqCst);
+                        task_signal.notify_one();
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        });
+        (signal, notifications)
     }
 
-    impl ClientHandler for ToolListChangedClient {
-        async fn on_tool_list_changed(
-            &self,
-            _context: rmcp::service::NotificationContext<RoleClient>,
-        ) {
-            self.notifications.fetch_add(1, Ordering::SeqCst);
-            self.signal.notify_one();
-        }
+    /// A `plug connect` session asking the dispatcher.
+    fn downstream_caller(request_id: i64) -> crate::dispatch::IpcContext {
+        crate::dispatch::IpcContext::new("downstream", RequestId::Number(request_id))
+    }
+
+    async fn dispatch_tools_call(
+        router: &Arc<crate::proxy::ToolRouter>,
+        ctx: &crate::dispatch::IpcContext,
+        params: CallToolRequestParams,
+    ) -> Result<CallToolResult, McpError> {
+        let value = crate::dispatch::handle(
+            router,
+            ctx,
+            "tools/call",
+            Some(serde_json::to_value(params).expect("params serialize")),
+        )
+        .await?;
+        Ok(serde_json::from_value(value).expect("tool result"))
+    }
+
+    async fn dispatch_tools_list(router: &Arc<crate::proxy::ToolRouter>) -> Vec<Tool> {
+        let value = crate::dispatch::handle(router, &downstream_caller(0), "tools/list", None)
+            .await
+            .expect("list tools");
+        serde_json::from_value::<ListToolsResult>(value)
+            .expect("tool list")
+            .tools
     }
 
     #[derive(Clone)]
@@ -3977,22 +4013,6 @@ mod tests {
             },
             result_request_count,
         )
-    }
-
-    struct ProgressClient {
-        progress_signal: Arc<Notify>,
-        progress: Arc<Mutex<Vec<ProgressNotificationParam>>>,
-    }
-
-    impl ClientHandler for ProgressClient {
-        async fn on_progress(
-            &self,
-            params: ProgressNotificationParam,
-            _context: rmcp::service::NotificationContext<RoleClient>,
-        ) {
-            self.progress.lock().unwrap().push(params);
-            self.progress_signal.notify_one();
-        }
     }
 
     struct CatalogServer;
@@ -4551,7 +4571,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn upstream_tool_list_changed_refreshes_router_and_notifies_stdio_client() {
+    async fn upstream_tool_list_changed_refreshes_router_and_notifies_downstream() {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
@@ -4612,25 +4632,7 @@ mod tests {
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
-        let proxy_handler = ProxyHandler::from_router(router.clone());
-        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let server = proxy_handler
-                .serve(proxy_server_transport)
-                .await
-                .expect("start proxy server");
-            let _ = server.waiting().await;
-        });
-
-        let signal = Arc::new(Notify::new());
-        let notifications = Arc::new(AtomicUsize::new(0));
-        let downstream_client = ToolListChangedClient {
-            signal: Arc::clone(&signal),
-            notifications: Arc::clone(&notifications),
-        }
-        .serve(downstream_transport)
-        .await
-        .expect("connect downstream client");
+        let (signal, notifications) = watch_tool_list_changed(&router);
 
         upstream_server
             .set_tools_and_notify(vec![make_tool("echo"), make_tool("extra")])
@@ -4638,7 +4640,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), signal.notified())
             .await
-            .expect("downstream stdio client should receive tools/list_changed");
+            .expect("downstream should be told tools/list_changed");
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(router.tool_count(), 2);
@@ -4649,17 +4651,19 @@ mod tests {
             .expect("tool exists")
             .name
             .to_string();
-        let result = downstream_client
-            .call_tool(CallToolRequestParams::new(exposed_tool_name))
-            .await
-            .expect("tool call succeeds");
+        let result = dispatch_tools_call(
+            &router,
+            &downstream_caller(1),
+            CallToolRequestParams::new(exposed_tool_name),
+        )
+        .await
+        .expect("tool call succeeds");
         assert!(!result.content.is_empty());
         assert_eq!(router.active_call_count(), 0);
     }
 
     #[tokio::test]
-    async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_stdio_delivery()
-     {
+    async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_delivery() {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
@@ -4720,25 +4724,7 @@ mod tests {
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
-        let proxy_handler = ProxyHandler::from_router(router.clone());
-        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let server = proxy_handler
-                .serve(proxy_server_transport)
-                .await
-                .expect("start proxy server");
-            let _ = server.waiting().await;
-        });
-
-        let signal = Arc::new(Notify::new());
-        let notifications = Arc::new(AtomicUsize::new(0));
-        let _downstream_client = ToolListChangedClient {
-            signal: Arc::clone(&signal),
-            notifications: Arc::clone(&notifications),
-        }
-        .serve(downstream_transport)
-        .await
-        .expect("connect downstream client");
+        let (signal, notifications) = watch_tool_list_changed(&router);
 
         upstream_server
             .tools_tx
@@ -4750,7 +4736,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), signal.notified())
             .await
-            .expect("downstream stdio client should receive tools/list_changed");
+            .expect("downstream should be told tools/list_changed");
         tokio::time::sleep(Duration::from_secs(1)).await;
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
@@ -5052,28 +5038,7 @@ mod tests {
             .await;
         router.refresh_tools().await;
 
-        let proxy_handler = ProxyHandler::from_router(router.clone());
-        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let server = proxy_handler
-                .serve(proxy_server_transport)
-                .await
-                .expect("start proxy server");
-            let _ = server.waiting().await;
-        });
-
-        let downstream_client = ToolListChangedClient {
-            signal: Arc::new(Notify::new()),
-            notifications: Arc::new(AtomicUsize::new(0)),
-        }
-        .serve(downstream_transport)
-        .await
-        .expect("connect downstream client");
-
-        let visible_tools = downstream_client
-            .list_all_tools()
-            .await
-            .expect("list tools");
+        let visible_tools = dispatch_tools_list(&router).await;
         let visible_names = visible_tools
             .iter()
             .map(|tool| tool.name.to_string())
@@ -5085,15 +5050,15 @@ mod tests {
             "query".to_string(),
             serde_json::Value::String("echo".to_string()),
         );
-        downstream_client
-            .call_tool(CallToolRequestParams::new("plug__search_tools").with_arguments(search_args))
-            .await
-            .expect("search and load hidden tool");
+        dispatch_tools_call(
+            &router,
+            &downstream_caller(1),
+            CallToolRequestParams::new("plug__search_tools").with_arguments(search_args),
+        )
+        .await
+        .expect("search and load hidden tool");
 
-        let visible_tools = downstream_client
-            .list_all_tools()
-            .await
-            .expect("list tools after load");
+        let visible_tools = dispatch_tools_list(&router).await;
         assert!(
             visible_tools
                 .iter()
@@ -5106,10 +5071,13 @@ mod tests {
             "message".to_string(),
             serde_json::Value::String("hello".to_string()),
         );
-        let result = downstream_client
-            .call_tool(CallToolRequestParams::new("Upstream__echo").with_arguments(call_args))
-            .await
-            .expect("call loaded tool directly");
+        let result = dispatch_tools_call(
+            &router,
+            &downstream_caller(2),
+            CallToolRequestParams::new("Upstream__echo").with_arguments(call_args),
+        )
+        .await
+        .expect("call loaded tool directly");
 
         let rendered = format!("{result:?}");
         assert!(
@@ -5120,7 +5088,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stdio_progress_and_cancellation_route_end_to_end() {
+    async fn downstream_cancellation_reaches_the_upstream() {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
@@ -5175,83 +5143,43 @@ mod tests {
             .await;
         router.refresh_tools().await;
 
-        let proxy_handler = ProxyHandler::from_router(router.clone());
-        let proxy_client_id = proxy_handler.client_id();
-        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let server = proxy_handler
-                .serve(proxy_server_transport)
-                .await
-                .expect("start proxy server");
-            let _ = server.waiting().await;
-        });
-
-        let progress_signal = Arc::new(Notify::new());
-        let progress = Arc::new(Mutex::new(Vec::new()));
-        let downstream_client = ProgressClient {
-            progress_signal: Arc::clone(&progress_signal),
-            progress: Arc::clone(&progress),
-        }
-        .serve(downstream_transport)
-        .await
-        .expect("connect downstream progress client");
-
         let prefixed_tool_name = router
             .list_tools()
             .first()
             .expect("tool exists")
             .name
             .to_string();
-        let progress_token =
-            ProgressToken(NumberOrString::String(Arc::from("downstream-progress")));
-        let mut params = CallToolRequestParams::new(prefixed_tool_name);
-        params.set_progress_token(progress_token.clone());
-
-        let mut options = PeerRequestOptions::default();
-        options.meta = Some(Meta::with_progress_token(progress_token.clone()));
-
-        let handle = downstream_client
-            .send_cancellable_request(
-                rmcp::model::ClientRequest::CallToolRequest(CallToolRequest::new(params)),
-                options,
-            )
-            .await
-            .expect("start downstream call");
-        let downstream_request_id = handle.id.clone();
-
-        router.publish_protocol_notification(
-            crate::notifications::ProtocolNotification::Progress {
-                target: crate::notifications::NotificationTarget::Stdio {
-                    client_id: proxy_client_id,
-                },
-                params: ProgressNotificationParam::new(progress_token.clone(), 0.5)
-                    .with_message("halfway"),
-            },
-        );
-
-        tokio::time::timeout(Duration::from_secs(5), progress_signal.notified())
-            .await
-            .expect("progress should be delivered to downstream client");
-
-        let received = progress.lock().unwrap().clone();
-        assert_eq!(received.len(), 1);
-        assert_eq!(received[0].progress_token, progress_token);
-        assert_eq!(received[0].message.as_deref(), Some("halfway"));
-
-        downstream_client
-            .notify_cancelled(rmcp::model::CancelledNotificationParam::new(
-                Some(downstream_request_id),
-                Some("user cancelled".to_string()),
-            ))
-            .await
-            .expect("send downstream cancellation");
-
-        match handle.await_response().await {
-            Err(rmcp::service::ServiceError::Cancelled { reason }) => {
-                assert_eq!(reason.as_deref(), Some("user cancelled"));
+        let call = {
+            let router = Arc::clone(&router);
+            tokio::spawn(async move {
+                dispatch_tools_call(
+                    &router,
+                    &downstream_caller(41),
+                    CallToolRequestParams::new(prefixed_tool_name),
+                )
+                .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while router.active_call_count() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
-            other => panic!("unexpected response state: {other:?}"),
-        }
+        })
+        .await
+        .expect("the call reaches the upstream");
+
+        router.forward_cancel_from_downstream(
+            &crate::proxy::DownstreamCallContext::ipc(
+                "downstream",
+                RequestId::Number(41),
+                crate::types::ClientType::Unknown,
+                None,
+            ),
+            Some("user cancelled".to_string()),
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(5), call)
+            .await
+            .expect("the cancelled call ends");
 
         let _cancelled = cancelled_request
             .lock()
@@ -5687,7 +5615,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_sse_tool_list_changed_reaches_downstream_stdio_client() {
+    async fn legacy_sse_tool_list_changed_reaches_downstream() {
         let server_manager = Arc::new(ServerManager::new());
         let router = Arc::new(crate::proxy::ToolRouter::new(
             server_manager.clone(),
@@ -5709,26 +5637,7 @@ mod tests {
             .expect("start legacy SSE upstream");
         router.refresh_tools().await;
 
-        // Wire up a downstream stdio client to receive notifications.
-        let proxy_handler = ProxyHandler::from_router(router.clone());
-        let (proxy_server_transport, downstream_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let server = proxy_handler
-                .serve(proxy_server_transport)
-                .await
-                .expect("start proxy server");
-            let _ = server.waiting().await;
-        });
-
-        let signal = Arc::new(Notify::new());
-        let notifications = Arc::new(AtomicUsize::new(0));
-        let _downstream_client = ToolListChangedClient {
-            signal: Arc::clone(&signal),
-            notifications: Arc::clone(&notifications),
-        }
-        .serve(downstream_transport)
-        .await
-        .expect("connect downstream client");
+        let (signal, notifications) = watch_tool_list_changed(&router);
 
         // Trigger a tool list changed notification from the legacy SSE server.
         legacy_server
@@ -5737,7 +5646,7 @@ mod tests {
 
         tokio::time::timeout(Duration::from_secs(5), signal.notified())
             .await
-            .expect("downstream stdio client should receive tools/list_changed");
+            .expect("downstream should be told tools/list_changed");
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(router.tool_count(), 2);

@@ -41,12 +41,10 @@ pub enum ProtocolNotification {
     },
 }
 
-// `Stdio` = an in-process stdio client served directly by a `ProxyHandler`/
-// `StdioBridge`. `Ipc` = a daemon IPC client served over the Unix socket
-// (`plug connect`) — a first-class identity rather than masquerading as `Stdio`.
+/// One downstream connection: a legacy HTTP session, or a `plug connect`
+/// session on the daemon socket.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NotificationTarget {
-    Stdio { client_id: Arc<str> },
     Http { session_id: Arc<str> },
     Ipc { client_id: Arc<str> },
 }
@@ -189,8 +187,8 @@ pub mod fanout {
         Progress(&'a NotificationTarget),
         Cancelled(&'a NotificationTarget),
         ResourceUpdated(&'a NotificationTarget),
-        /// `LoggingMessage` / `TokenRefreshExchanged` — broadcast; today's
-        /// stdio and HTTP sites render both via `as_logging_message_params()`.
+        /// `LoggingMessage` / `TokenRefreshExchanged` — broadcast; HTTP renders
+        /// both via `as_logging_message_params()`.
         Logging,
         /// `AuthStateChanged` — broadcast, but NOT necessarily rendered the
         /// same way as `Logging` on every transport (daemon IPC renders it
@@ -244,7 +242,7 @@ pub mod fanout {
         ///
         /// `Broadcast` always returns `true`. `ToTarget` returns `true` only
         /// when the resolved target equals `identity` exactly — both the
-        /// `NotificationTarget` variant (`Stdio`/`Http`/`Ipc`) AND the id
+        /// `NotificationTarget` variant (`Http`/`Ipc`) AND the id
         /// must match, matching every fan-out site's existing `matches!`
         /// check today. A target for a different transport, or a different
         /// client on the same transport, resolves to `false` (dropped) —
@@ -276,12 +274,6 @@ pub mod fanout {
     mod tests {
         use super::*;
         use std::sync::Arc;
-
-        fn stdio(id: &str) -> NotificationTarget {
-            NotificationTarget::Stdio {
-                client_id: Arc::from(id),
-            }
-        }
 
         fn http(id: &str) -> NotificationTarget {
             NotificationTarget::Http {
@@ -361,7 +353,7 @@ pub mod fanout {
 
         #[test]
         fn classify_tool_list_changed_for_is_targeted() {
-            let target = stdio("client-1");
+            let target = ipc("client-1");
             let notification = ProtocolNotification::ToolListChangedFor {
                 target: target.clone(),
             };
@@ -399,7 +391,7 @@ pub mod fanout {
 
         #[test]
         fn classify_resource_updated_is_targeted() {
-            let target = stdio("client-3");
+            let target = ipc("client-3");
             let notification = ProtocolNotification::ResourceUpdated {
                 target: target.clone(),
                 params: resource_updated_params(),
@@ -472,7 +464,7 @@ pub mod fanout {
 
         #[test]
         fn resolve_targeted_classes_resolve_to_target() {
-            let target = stdio("client-1");
+            let target = ipc("client-1");
             assert_eq!(
                 resolve(NotificationClass::ToolListChangedFor(&target)),
                 ResolvedDelivery::ToTarget(&target)
@@ -496,21 +488,8 @@ pub mod fanout {
 
         #[test]
         fn deliver_to_broadcast_is_always_true() {
-            assert!(ResolvedDelivery::Broadcast.deliver_to(&stdio("anyone")));
             assert!(ResolvedDelivery::Broadcast.deliver_to(&http("anyone")));
             assert!(ResolvedDelivery::Broadcast.deliver_to(&ipc("anyone")));
-        }
-
-        #[test]
-        fn deliver_to_target_matching_identity_is_true() {
-            let target = stdio("client-1");
-            assert!(ResolvedDelivery::ToTarget(&target).deliver_to(&stdio("client-1")));
-        }
-
-        #[test]
-        fn deliver_to_target_mismatched_id_same_variant_is_false() {
-            let target = stdio("client-1");
-            assert!(!ResolvedDelivery::ToTarget(&target).deliver_to(&stdio("client-2")));
         }
 
         #[test]
@@ -518,9 +497,8 @@ pub mod fanout {
             // Same string id, different transport variant — must not match.
             // This is the "progress token resolved to a target on a
             // different transport" case; every site today silently drops it.
-            let target = stdio("shared-id");
+            let target = ipc("shared-id");
             assert!(!ResolvedDelivery::ToTarget(&target).deliver_to(&http("shared-id")));
-            assert!(!ResolvedDelivery::ToTarget(&target).deliver_to(&ipc("shared-id")));
         }
 
         #[test]
