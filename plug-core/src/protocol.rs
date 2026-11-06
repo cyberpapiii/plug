@@ -295,6 +295,10 @@ pub enum ProtocolOutcome {
     QuotaExceeded,
 }
 
+/// The JSON-RPC code for a caller that has not proved it may do this: a
+/// missing or rejected credential, or an events client without a grant.
+pub const AUTHORIZATION_REQUIRED_CODE: i32 = -32001;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OutcomeEncoding {
     pub code: i32,
@@ -306,7 +310,12 @@ pub struct OutcomeEncoding {
 impl ProtocolOutcome {
     pub fn encode(self, era: ProtocolEra) -> OutcomeEncoding {
         let (legacy_code, modern_code, message, retryable) = match self {
-            Self::AuthorizationRequired => (-32001, -32001, "authorization required", false),
+            Self::AuthorizationRequired => (
+                AUTHORIZATION_REQUIRED_CODE,
+                AUTHORIZATION_REQUIRED_CODE,
+                "authorization required",
+                false,
+            ),
             Self::UpstreamUnavailable => (-32002, -32002, "upstream unavailable", true),
             Self::UnsupportedBridge => (-32601, -32601, "unsupported protocol bridge", false),
             Self::RetryableTransition => (-32003, -32003, "retryable transition", true),

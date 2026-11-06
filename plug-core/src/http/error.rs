@@ -78,7 +78,10 @@ impl IntoResponse for HttpError {
             HttpError::Unauthorized => {
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": -32001, "message": "authentication required" },
+                    "error": {
+                        "code": crate::protocol::AUTHORIZATION_REQUIRED_CODE,
+                        "message": "authentication required",
+                    },
                     "id": null
                 });
                 let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();
@@ -93,7 +96,10 @@ impl IntoResponse for HttpError {
             } => {
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": -32001, "message": "authentication required" },
+                    "error": {
+                        "code": crate::protocol::AUTHORIZATION_REQUIRED_CODE,
+                        "message": "authentication required",
+                    },
                     "id": null
                 });
                 let mut response = (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response();

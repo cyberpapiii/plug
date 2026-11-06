@@ -72,7 +72,7 @@ impl EventError {
     /// The status an ingest endpoint answers with.
     pub fn http_status(&self) -> StatusCode {
         match self.code {
-            -32001 => StatusCode::UNAUTHORIZED,
+            crate::protocol::AUTHORIZATION_REQUIRED_CODE => StatusCode::UNAUTHORIZED,
             -32602 => StatusCode::BAD_REQUEST,
             _ => StatusCode::SERVICE_UNAVAILABLE,
         }
@@ -88,7 +88,7 @@ pub(crate) fn invalid(message: &'static str) -> EventError {
 }
 pub(crate) fn denied() -> EventError {
     EventError {
-        code: -32001,
+        code: crate::protocol::AUTHORIZATION_REQUIRED_CODE,
         message: "event access denied",
         reason: None,
     }
