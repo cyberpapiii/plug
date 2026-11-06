@@ -45,22 +45,13 @@ pub(crate) struct LiveInventoryAvailability {
 pub(crate) struct LiveSessionTransportCounts {
     pub(crate) daemon_proxy: usize,
     pub(crate) http: usize,
-    pub(crate) sse: usize,
 }
 
 impl LiveSessionTransportCounts {
-    /// `19 local, 1 HTTP`. No downstream session reports itself as SSE today
-    /// (a legacy GET SSE stream belongs to its HTTP session), so the SSE count
-    /// shows only when it is non-zero.
+    /// `19 local, 1 HTTP`. A legacy GET SSE stream belongs to its HTTP
+    /// session, so it counts as HTTP.
     pub(crate) fn summary(&self) -> String {
-        let mut parts = vec![
-            format!("{} local", self.daemon_proxy),
-            format!("{} HTTP", self.http),
-        ];
-        if self.sse > 0 {
-            parts.push(format!("{} SSE", self.sse));
-        }
-        parts.join(", ")
+        format!("{} local, {} HTTP", self.daemon_proxy, self.http)
     }
 }
 
@@ -96,7 +87,6 @@ pub(crate) fn live_session_transport_counts(
         match session.transport {
             plug_core::ipc::LiveSessionTransport::DaemonProxy => counts.daemon_proxy += 1,
             plug_core::ipc::LiveSessionTransport::Http => counts.http += 1,
-            plug_core::ipc::LiveSessionTransport::Sse => counts.sse += 1,
         }
     }
     counts
@@ -1028,15 +1018,12 @@ mod tests {
     }
 
     #[test]
-    fn transport_summary_shows_sse_only_when_something_reports_it() {
-        let mut counts = LiveSessionTransportCounts {
+    fn transport_summary_counts_local_and_http_sessions() {
+        let counts = LiveSessionTransportCounts {
             daemon_proxy: 19,
             http: 1,
-            sse: 0,
         };
         assert_eq!(counts.summary(), "19 local, 1 HTTP");
-        counts.sse = 2;
-        assert_eq!(counts.summary(), "19 local, 1 HTTP, 2 SSE");
     }
 
     #[test]
@@ -1409,7 +1396,6 @@ mod tests {
         assert_eq!(metadata.session_count, 2);
         assert_eq!(metadata.session_transports.daemon_proxy, 1);
         assert_eq!(metadata.session_transports.http, 1);
-        assert_eq!(metadata.session_transports.sse, 0);
         assert!(!metadata.availability.partial);
         assert!(metadata.http_sessions_included);
     }

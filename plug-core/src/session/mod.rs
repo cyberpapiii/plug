@@ -193,7 +193,6 @@ pub fn live_sessions(
     let transport_order = |transport: LiveSessionTransport| match transport {
         LiveSessionTransport::DaemonProxy => 0,
         LiveSessionTransport::Http => 1,
-        LiveSessionTransport::Sse => 2,
     };
     let mut sessions = local;
     sessions.extend(http.snapshots().into_iter().map(Into::into));

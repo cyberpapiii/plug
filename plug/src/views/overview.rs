@@ -809,7 +809,6 @@ mod tests {
             session_transports: LiveSessionTransportCounts {
                 daemon_proxy: 1,
                 http: 1,
-                sse: 0,
             },
             scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
             availability: LiveInventoryAvailability {
@@ -899,7 +898,6 @@ mod tests {
             session_transports: LiveSessionTransportCounts {
                 daemon_proxy: 0,
                 http: 1,
-                sse: 0,
             },
             scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
             availability: LiveInventoryAvailability {
@@ -952,7 +950,6 @@ mod tests {
             session_transports: LiveSessionTransportCounts {
                 daemon_proxy: 0,
                 http: 0,
-                sse: 0,
             },
             scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
             availability: LiveInventoryAvailability {
@@ -1063,28 +1060,11 @@ mod tests {
                 connected_secs: 20,
                 last_activity_secs: Some(2),
             },
-            plug_core::ipc::IpcLiveSessionInfo {
-                transport: plug_core::ipc::LiveSessionTransport::Sse,
-                client_id: None,
-                session_id: "s3".to_string(),
-                client_type: plug_core::types::ClientType::Cursor,
-                client_info: Some("Cursor".to_string()),
-                adapter_version: None,
-                host: None,
-                grant: None,
-                link_target: None,
-                client_key: None,
-                access_key: None,
-                target: None,
-                connected_secs: 30,
-                last_activity_secs: Some(3),
-            },
         ];
 
         let counts = live_session_transport_counts(&sessions);
         assert_eq!(counts.daemon_proxy, 1);
         assert_eq!(counts.http, 1);
-        assert_eq!(counts.sse, 1);
     }
 
     #[test]
@@ -1094,7 +1074,6 @@ mod tests {
             session_transports: LiveSessionTransportCounts {
                 daemon_proxy: 2,
                 http: 0,
-                sse: 0,
             },
             scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             availability: LiveInventoryAvailability {

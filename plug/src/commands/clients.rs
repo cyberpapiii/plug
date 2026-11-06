@@ -445,7 +445,6 @@ pub(crate) fn live_transport_name(transport: plug_core::ipc::LiveSessionTranspor
     match transport {
         plug_core::ipc::LiveSessionTransport::DaemonProxy => "daemon_proxy",
         plug_core::ipc::LiveSessionTransport::Http => "http",
-        plug_core::ipc::LiveSessionTransport::Sse => "sse",
     }
 }
 

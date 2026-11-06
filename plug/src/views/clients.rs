@@ -576,7 +576,6 @@ mod tests {
             session_transports: LiveSessionTransportCounts {
                 daemon_proxy: 0,
                 http: 1,
-                sse: 0,
             },
             scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             availability: LiveInventoryAvailability {

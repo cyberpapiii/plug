@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `plug clients --output json` no longer has `live_session_transports.sse`. No session ever counted there: a legacy SSE stream belongs to its HTTP session.
 - `plug import --output json` no longer has a `source` field holding the client's internal variant name. `source_target` and `source_name` name the client, as before.
 - A server's `enrichment` setting is ignored, and changing it no longer says Plug must restart. It had stopped doing anything: Plug reads every tool's safety hints from its name and gives every tool its own title.
 - `plug doctor` and the app no longer list a "Tool names" check. It always passed and only said whether tool prefixing was on.
