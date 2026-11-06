@@ -74,8 +74,8 @@ impl Generations {
 struct History {
     /// Supervised restarts since the server last settled healthy.
     supervised_restarts: u32,
-    /// The most recent restart of any kind. Wall clock, so a Mac that slept
-    /// through the wait does not wait it out again.
+    /// When the most recent recovery episode started. Wall clock, so a Mac
+    /// that slept through the wait does not wait it out again.
     last_restart: Option<SystemTime>,
     last_operator_restart: Option<Instant>,
     /// A caller saw the connection go bad in a way health does not show (a

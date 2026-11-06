@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use super::{SecretError, SecretStore};
 use crate::types::SecretString;
 
-pub use crate::config::FILE;
+use crate::config::FILE;
 
 pub struct File {
     path: PathBuf,

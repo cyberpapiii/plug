@@ -1,5 +1,6 @@
 //! The one retry schedule: a delay that doubles from `min` to `max`, plus up
-//! to `jitter` of itself at random so servers that failed together spread out.
+//! to `jitter` of itself at random, which spreads out servers that failed
+//! together when it is not zero.
 
 use std::time::Duration;
 

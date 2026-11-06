@@ -445,21 +445,13 @@ async fn health_check_server(
 
     // Use the first list_tools page as a lightweight liveness probe rather than
     // enumerating the full merged surface on every health cycle.
-    let result = tokio::time::timeout(PROBE_TIMEOUT, async {
-        upstream
-            .client
-            .peer()
-            .list_tools(None)
-            .await
-            .map_err(|e| anyhow::anyhow!("health probe failed: {e}"))
-    })
-    .await;
+    let result = tokio::time::timeout(PROBE_TIMEOUT, upstream.client.peer().list_tools(None)).await;
 
     let success = matches!(result, Ok(Ok(_)));
 
-    // A server that works on one call at a time and is busy with one cannot
-    // answer the ping until it is done. Silence then is not a fault, and
-    // counting it would restart the server under a long call.
+    // A server whose call slots are all taken may not answer the ping until
+    // a call is done. Silence then is not a fault, and counting it would
+    // restart the server under a long call.
     if result.is_err() && mgr.busy_with_a_call(name) {
         tracing::debug!(server = %name, "health ping unanswered while a call is running; not counted");
         return None;
@@ -506,39 +498,6 @@ mod tests {
         assert!(!super::network_changed(None, None));
     }
 
-    /// A server that failed to start must be retried without first waiting out a
-    /// whole health-check interval. The common case is a local upstream that is
-    /// still binding its port when the daemon starts at login: it is ready
-    /// seconds later, but the daemon used to leave it down until the first tick.
-    #[tokio::test(start_paused = true)]
-    async fn startup_failure_is_retried_before_one_health_interval_elapses() {
-        const INTERVAL_SECS: u64 = 600;
-
-        let mut config = Config::default();
-        config
-            .servers
-            .insert("dead".to_string(), unstartable_server_config(INTERVAL_SECS));
-
-        let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
-
-        // Well past the health task's start jitter (<= 10s) but far short of the
-        // 600s interval, so only an unconsumed first tick can have fired.
-        tokio::time::sleep(Duration::from_secs(60)).await;
-
-        let restarts = engine
-            .server_manager()
-            .metrics_snapshot_or_default("dead")
-            .restart_count;
-        assert!(
-            restarts >= 1,
-            "a server that failed to start should be retried within the first \
-             health interval, but no recovery episode ran in 60s of a {INTERVAL_SECS}s interval"
-        );
-
-        engine.shutdown().await;
-    }
-
     /// The 0-10s start stagger exists to spread pings to servers that are up.
     /// A server that failed at boot has nothing to ping and should go straight
     /// to recovery, not sit out a random share of the stagger first.
@@ -550,7 +509,7 @@ mod tests {
             .insert("dead".to_string(), unstartable_server_config(600));
 
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
         tokio::time::sleep(Duration::from_millis(500)).await;
 
@@ -590,7 +549,7 @@ mod tests {
             .servers
             .insert("dead".to_string(), unstartable_server_config(60));
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
         tokio::time::sleep(Duration::from_secs(3600)).await;
         engine.shutdown().await;
@@ -647,8 +606,12 @@ mod tests {
     }
 
     /// Recovery reports success once, with how many attempts it took.
+    ///
+    /// Real time: the upstream is a real process, and a paused clock would
+    /// fire its start timeout while the runtime waits on the child's pipes.
     #[tokio::test]
     async fn recovery_logs_once_when_the_server_comes_back() {
+        let mock = plug_test_harness::mock_server_bin();
         let capture = crate::test_log::EventCapture::default();
         let _default = tracing::subscriber::set_default(capture.clone());
 
@@ -661,12 +624,19 @@ mod tests {
         config.servers.insert("late".to_string(), server);
 
         let engine = Engine::new(config);
-        engine.start().await.expect("a failed start is not fatal");
+        engine.start().await;
 
-        // The upstream appears after the first recovery attempt has failed.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        std::os::unix::fs::symlink(plug_test_harness::mock_server_bin(), &command)
-            .expect("install the upstream");
+        // The upstream appears once the first recovery attempt has failed.
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while !events_for(&capture.events(), "late")
+                .any(|event| event.fields.contains("recovery attempt failed"))
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the first recovery attempt should fail");
+        std::os::unix::fs::symlink(mock, &command).expect("install the upstream");
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
         while engine.server_manager().get_upstream("late").is_none() {

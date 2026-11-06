@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::engine::Engine;
 
-/// Debounce interval for config file changes.
 const DEBOUNCE_MS: u64 = 500;
 
 /// Spawn a background task that watches `config.toml` for changes.
@@ -185,7 +184,7 @@ mod tests {
             write_config(&config_path, &Config::default());
 
             let engine = Engine::new(Config::default());
-            engine.start().await.expect("engine start");
+            engine.start().await;
             let seen_config = Arc::clone(&engine.config());
 
             let ready = spawn_config_watcher(
@@ -256,13 +255,6 @@ mod tests {
         async fn shutdown(self) {
             self.engine.shutdown().await;
         }
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn watcher_smoke_spawns_and_cancels_cleanly() {
-        let fixture = WatcherFixture::new().await;
-        assert!(fixture.engine.server_statuses().is_empty());
-        fixture.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread")]

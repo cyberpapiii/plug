@@ -1268,18 +1268,9 @@ mod tests {
         let capabilities = gated_legacy_task_capabilities();
 
         UpstreamServer {
-            name: name.to_string(),
             config: gated_task_server_config(call_timeout_secs),
-            client,
-            tools,
             capabilities,
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: crate::server::ConnectionGeneration::new(),
-            child_pid: None,
-            stderr_tail: None,
+            ..UpstreamServer::for_tests(name.to_string(), client, tools)
         }
     }
 
@@ -2291,18 +2282,8 @@ mod tests {
             .expect("connect gated call upstream test client");
 
         UpstreamServer {
-            name: name.to_string(),
             config: gated_task_server_config(call_timeout_secs),
-            client,
-            tools,
-            capabilities: ServerCapabilities::default(),
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: crate::server::ConnectionGeneration::new(),
-            child_pid: None,
-            stderr_tail: None,
+            ..UpstreamServer::for_tests(name.to_string(), client, tools)
         }
     }
 
@@ -2612,7 +2593,7 @@ mod tests {
             .extend(["--fail-mode".to_string(), "crash".to_string()]);
         config.servers.insert("mock".to_string(), mock);
         let engine = crate::engine::Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let router = Arc::clone(engine.tool_router());
 
         let owner = crate::downstream_identity::http_session_task_owner("session-crash");

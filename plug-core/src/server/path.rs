@@ -41,14 +41,7 @@ pub(crate) fn resolve_stdio_command(command: &str, login_path: Option<&OsStr>) -
     configured
 }
 
-/// The PATH for stdio servers: the user's login-shell PATH on macOS, `None`
-/// elsewhere. A successful probe is cached for the life of the process and
-/// saved next to the config. A failed one is not cached: after a reboot the
-/// login shell can take longer than the probe allows, and caching that
-/// failure left every Node server unable to find `node` until the daemon
-/// restarted. Until a probe succeeds, callers get the PATH an earlier probe
-/// saved, so a boot does not wait on the shell, or else the inherited PATH
-/// plus the standard Homebrew directories.
+/// The PATH for stdio servers. See [`stdio_path`].
 pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
     stdio_path().await.0
 }
@@ -76,49 +69,57 @@ impl StdioPathSource {
     }
 }
 
-/// [`stdio_login_path`] and where it came from.
+/// The PATH for stdio servers and where it came from: the user's login-shell
+/// PATH on macOS, `None` elsewhere.
+///
+/// A successful probe is cached for the life of the process and saved next to
+/// the config. A failed one is not cached: after a reboot the login shell can
+/// take longer than the probe allows, and caching that failure left every Node
+/// server unable to find `node` until the daemon restarted. Until a probe
+/// succeeds, callers get the PATH an earlier probe saved, so a boot does not
+/// wait on the shell, or else the inherited PATH plus the standard Homebrew
+/// directories.
 pub(super) async fn stdio_path() -> (Option<&'static OsStr>, StdioPathSource) {
-    // Unit tests use the test runner's PATH. A real login shell can outlive
-    // Tokio's paused clock and consume a test's virtual retry window. The
-    // probe and cache have their own tests below with controlled inputs.
-    #[cfg(all(target_os = "macos", test))]
+    #[cfg(target_os = "macos")]
     {
-        static PATH: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
-        (
-            PATH.get_or_init(|| std::env::var_os("PATH")).as_deref(),
-            StdioPathSource::Inherited,
-        )
-    }
-    #[cfg(all(target_os = "macos", not(test)))]
-    {
-        static CACHE: LoginPathCache = LoginPathCache::new();
-        static FALLBACK: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
-        let store = Some(crate::paths::dir().join(SAVED_LOGIN_PATH_FILE));
-        let probed = cached_login_path(
-            &CACHE,
-            LOGIN_SHELL_PROBE_RETRY,
-            store,
-            probe_login_shell_path(
-                "/bin/zsh",
-                &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
-                LOGIN_SHELL_PROBE_TIMEOUT,
-            ),
-        )
-        .await;
-        match probed {
-            Some(path) => (Some(path), StdioPathSource::LoginShell),
-            None => (
-                Some(
-                    FALLBACK
-                        .get_or_init(|| fallback_stdio_path(std::env::var_os("PATH")))
-                        .as_os_str(),
-                ),
-                StdioPathSource::Fallback,
-            ),
-        }
+        static STDIO_PATH: StdioPath = StdioPath::new();
+        let (probe, store) = login_shell_probe();
+        STDIO_PATH
+            .resolve(LOGIN_SHELL_PROBE_RETRY, store, probe)
+            .await
     }
     #[cfg(not(target_os = "macos"))]
     (None, StdioPathSource::Inherited)
+}
+
+/// The probe [`stdio_path`] runs, and the file its result is saved to.
+///
+/// An interactive login shell runs the user's dotfiles, which can hang, so a
+/// stuck shell delays the first stdio start by at most five seconds.
+#[cfg(all(target_os = "macos", not(test)))]
+fn login_shell_probe() -> (
+    impl Future<Output = Option<OsString>> + Send + 'static,
+    Option<PathBuf>,
+) {
+    (
+        probe_login_shell_path(
+            "/bin/zsh",
+            &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
+            Duration::from_secs(5),
+        ),
+        Some(crate::paths::dir().join(SAVED_LOGIN_PATH_FILE)),
+    )
+}
+
+/// Unit tests answer with the test runner's PATH and save nothing: a real
+/// login shell runs the developer's dotfiles, and its wait can outlive a
+/// paused Tokio clock and use up a test's virtual retry window.
+#[cfg(all(target_os = "macos", test))]
+fn login_shell_probe() -> (
+    impl Future<Output = Option<OsString>> + Send + 'static,
+    Option<PathBuf>,
+) {
+    (async { std::env::var_os("PATH") }, None)
 }
 
 /// The PATH launchd gives an agent. The daemon runs with this when Plug.app
@@ -159,6 +160,42 @@ pub(super) fn spawn_error(
         )
     } else {
         anyhow::anyhow!("failed to spawn `{command}`: {error}")
+    }
+}
+
+/// The login-shell PATH cache, and the fallback used until a probe succeeds.
+#[cfg(target_os = "macos")]
+struct StdioPath {
+    cache: LoginPathCache,
+    fallback: std::sync::OnceLock<OsString>,
+}
+
+#[cfg(target_os = "macos")]
+impl StdioPath {
+    const fn new() -> Self {
+        Self {
+            cache: LoginPathCache::new(),
+            fallback: std::sync::OnceLock::new(),
+        }
+    }
+
+    async fn resolve(
+        &'static self,
+        retry_after: Duration,
+        store: Option<PathBuf>,
+        probe: impl Future<Output = Option<OsString>> + Send + 'static,
+    ) -> (Option<&'static OsStr>, StdioPathSource) {
+        match cached_login_path(&self.cache, retry_after, store, probe).await {
+            Some(path) => (Some(path), StdioPathSource::LoginShell),
+            None => (
+                Some(
+                    self.fallback
+                        .get_or_init(|| fallback_stdio_path(std::env::var_os("PATH")))
+                        .as_os_str(),
+                ),
+                StdioPathSource::Fallback,
+            ),
+        }
     }
 }
 
@@ -271,13 +308,8 @@ fn fallback_stdio_path(inherited: Option<OsString>) -> OsString {
 }
 
 /// A failed probe is retried on the next stdio start after this long.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(target_os = "macos")]
 const LOGIN_SHELL_PROBE_RETRY: Duration = Duration::from_secs(30);
-
-/// An interactive login shell runs the user's dotfiles, which can hang. A stuck
-/// shell delays the first stdio start by at most this long, never forever.
-#[cfg(all(target_os = "macos", not(test)))]
-const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 #[cfg(target_os = "macos")]
 async fn probe_login_shell_path(
@@ -295,7 +327,7 @@ async fn probe_login_shell_path(
         Ok(_) => None,
         Err(_) => {
             tracing::warn!(
-                "login shell PATH probe timed out after {timeout:?}; using inherited PATH"
+                "login shell PATH probe timed out after {timeout:?}; using the saved or fallback PATH"
             );
             None
         }
@@ -340,44 +372,61 @@ mod tests {
         assert_eq!(path, Some(OsString::from("/bin:/opt/bin")));
     }
 
+    /// A probe that answers `path` once the returned sender fires.
     #[cfg(target_os = "macos")]
-    #[tokio::test]
+    fn gated_probe(
+        path: &'static str,
+    ) -> (
+        tokio::sync::oneshot::Sender<()>,
+        impl Future<Output = Option<OsString>> + Send + 'static,
+    ) {
+        let (release, released) = tokio::sync::oneshot::channel();
+        (release, async move {
+            released.await.ok().map(|()| OsString::from(path))
+        })
+    }
+
+    /// Yield until `cache` holds a PATH, failing after a virtual second.
+    #[cfg(target_os = "macos")]
+    async fn wait_for_cached_path(cache: &LoginPathCache) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while cache.path.get().is_none() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the probe should fill the cache");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test(start_paused = true)]
     async fn login_shell_probe_survives_a_cancelled_caller() {
         static CACHE: LoginPathCache = LoginPathCache::new();
-        let probe = || {
-            probe_login_shell_path(
-                "/bin/sh",
-                &["-c", "sleep 0.3; echo __PLUG_STDIO_PATH__/bin"],
-                Duration::from_secs(5),
-            )
-        };
+        let (release, probe) = gated_probe("/bin");
 
         let cancelled = tokio::time::timeout(
             Duration::from_millis(50),
-            cached_login_path(&CACHE, Duration::from_secs(30), None, probe()),
+            cached_login_path(&CACHE, Duration::from_secs(30), None, probe),
         )
         .await;
         assert!(cancelled.is_err(), "caller should time out mid-probe");
 
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        release.send(()).unwrap();
+        wait_for_cached_path(&CACHE).await;
         assert_eq!(
-            CACHE.path.get(),
-            Some(&OsString::from("/bin")),
+            cached_login_path(&CACHE, Duration::from_secs(30), None, async { None }).await,
+            Some(OsStr::new("/bin")),
             "the probe must finish and fill the cache after its caller is gone"
-        );
-        assert_eq!(
-            cached_login_path(&CACHE, Duration::from_secs(30), None, probe()).await,
-            Some(OsStr::new("/bin"))
         );
     }
 
     /// After a reboot the login shell can miss the probe's deadline. That
     /// failure must not stick for the life of the daemon.
     #[cfg(target_os = "macos")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_failed_login_shell_probe_is_retried_later() {
         static CACHE: LoginPathCache = LoginPathCache::new();
-        let retry = Duration::from_millis(300);
+        let retry = Duration::from_secs(30);
         let failing = || async { None };
         let working = || async { Some(OsString::from("/opt/homebrew/bin")) };
 
@@ -390,7 +439,7 @@ mod tests {
             None,
             "a probe inside the retry window is skipped"
         );
-        tokio::time::sleep(retry * 2).await;
+        tokio::time::advance(retry).await;
         assert_eq!(
             cached_login_path(&CACHE, retry, None, working()).await,
             Some(OsStr::new("/opt/homebrew/bin"))
@@ -402,31 +451,25 @@ mod tests {
         );
     }
 
-    /// Right after a reboot the probe can take its full 5s timeout. A PATH
-    /// saved by an earlier probe must be used at once, not after the probe.
+    /// Right after a reboot the probe can take its full timeout. A PATH saved
+    /// by an earlier probe must be used at once, not after the probe.
     #[cfg(target_os = "macos")]
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn a_saved_login_path_is_used_without_waiting_for_the_probe() {
         static CACHE: LoginPathCache = LoginPathCache::new();
         let dir = tempfile::tempdir().unwrap();
         let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
         std::fs::write(&store, "/saved/bin:/usr/bin\n").unwrap();
-        let slow = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            Some(OsString::from("/probed/bin"))
-        };
+        let (release, probe) = gated_probe("/probed/bin");
 
-        let started = std::time::Instant::now();
         assert_eq!(
-            cached_login_path(&CACHE, Duration::from_secs(30), Some(store.clone()), slow).await,
-            Some(OsStr::new("/saved/bin:/usr/bin"))
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "the saved PATH must not wait for the probe"
+            cached_login_path(&CACHE, Duration::from_secs(30), Some(store.clone()), probe).await,
+            Some(OsStr::new("/saved/bin:/usr/bin")),
+            "the saved PATH is answered while the probe is still running"
         );
 
-        tokio::time::sleep(Duration::from_millis(600)).await;
+        release.send(()).unwrap();
+        wait_for_cached_path(&CACHE).await;
         assert_eq!(
             cached_login_path(
                 &CACHE,
@@ -444,6 +487,28 @@ mod tests {
             let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600);
         }
+    }
+
+    /// Until a probe succeeds, stdio servers get the inherited PATH plus
+    /// Homebrew, and errors say so.
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn a_failed_probe_falls_back_to_homebrew() {
+        static STDIO_PATH: StdioPath = StdioPath::new();
+        let (path, source) = STDIO_PATH
+            .resolve(Duration::from_secs(30), None, async { None })
+            .await;
+        assert_eq!(source, StdioPathSource::Fallback);
+        let path = path.expect("fallback PATH");
+        assert!(std::env::split_paths(path).any(|dir| dir == Path::new("/opt/homebrew/bin")));
+
+        let (path, source) = STDIO_PATH
+            .resolve(Duration::ZERO, None, async {
+                Some(OsString::from("/login/bin"))
+            })
+            .await;
+        assert_eq!(source, StdioPathSource::LoginShell);
+        assert_eq!(path, Some(OsStr::new("/login/bin")));
     }
 
     #[cfg(target_os = "macos")]

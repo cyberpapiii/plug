@@ -287,14 +287,13 @@ mod tests {
         })
     }
 
-    /// Trip the breaker by recording `n` failures (must be >= threshold).
+    /// Trip the breaker by recording exactly `threshold` failures.
     fn trip(cb: &CircuitBreaker) {
         for _ in 0..cb.config.failure_threshold {
             cb.on_failure();
         }
     }
 
-    // 1. Closed state always allows calls.
     #[test]
     fn closed_allows_calls() {
         let cb = default_breaker();
@@ -303,7 +302,6 @@ mod tests {
         assert!(cb.call_allowed().is_ok());
     }
 
-    // 2. After threshold failures the breaker opens and rejects calls.
     #[test]
     fn opens_after_threshold_failures() {
         let cb = breaker_with(3, 30, 2);
@@ -316,7 +314,6 @@ mod tests {
         assert!(cb.call_allowed().is_err());
     }
 
-    // 3. A success resets the failure count so the breaker stays closed.
     #[test]
     fn success_resets_failure_count() {
         let cb = breaker_with(3, 30, 2);
@@ -328,7 +325,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
-    // 4. Open state rejects immediately (before duration elapses).
     #[test]
     fn open_rejects_calls() {
         let cb = breaker_with(1, 9999, 2);
@@ -338,7 +334,6 @@ mod tests {
         assert!(cb.call_allowed().is_err());
     }
 
-    // 5. After open_duration the breaker transitions to HalfOpen and allows probes.
     #[tokio::test(start_paused = true)]
     async fn transitions_to_half_open_after_duration() {
         let cb = breaker_with(1, 30, 2);
@@ -351,7 +346,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
 
-    // 6. A success in HalfOpen closes the breaker.
     #[tokio::test(start_paused = true)]
     async fn half_open_success_closes() {
         let cb = breaker_with(1, 30, 2);
@@ -365,7 +359,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
-    // 7. A failure in HalfOpen re-opens the breaker.
     #[tokio::test(start_paused = true)]
     async fn half_open_failure_reopens() {
         let cb = breaker_with(1, 30, 2);
@@ -379,7 +372,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
-    // 8. Only probe_count calls are allowed while in HalfOpen.
     #[tokio::test(start_paused = true)]
     async fn probe_count_limits_half_open() {
         let cb = breaker_with(1, 30, 2);
@@ -410,7 +402,6 @@ mod tests {
         assert!(cb.call_allowed().is_err());
     }
 
-    // 9. reset() forces the breaker back to Closed.
     #[test]
     fn reset_forces_closed() {
         let cb = breaker_with(1, 9999, 2);
@@ -422,8 +413,7 @@ mod tests {
         assert!(cb.call_allowed().is_ok());
     }
 
-    // 10. Many concurrent failures don't cause corruption.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_trip_idempotent() {
         use std::sync::Arc;
 

@@ -193,17 +193,14 @@ async fn serve_until(
     // The IPC socket binds at once; local clients see servers arrive through
     // `list_changed`. Remote clients cannot be told the catalog grew, so HTTP
     // binds only after the whole catalog has started.
-    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+    let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
     let startup = {
         let engine = engine.clone();
         let config_path = config_path.clone();
         tokio::spawn(async move {
-            let started = engine.start().await;
-            let ready = started.is_ok();
-            let _ = started_tx.send(started);
-            if ready {
-                engine.pin_tool_blocks(&config_path).await;
-            }
+            engine.start().await;
+            let _ = started_tx.send(());
+            engine.pin_tool_blocks(&config_path).await;
         })
     };
     let http_runtime = build_configured_http_runtime(&engine.config(), &engine)?;
@@ -221,9 +218,8 @@ async fn serve_until(
             started = started_rx => started,
             () = cancel.cancelled() => return Ok(()),
         };
-        match started {
-            Ok(result) => result?,
-            Err(_) => anyhow::bail!("daemon startup ended without reporting a result"),
+        if started.is_err() {
+            anyhow::bail!("daemon startup ended without reporting a result");
         }
         serve_router(http_router, &http_config, cancel.clone()).await
     };
@@ -522,7 +518,7 @@ mod tests {
     #[tokio::test]
     async fn serve_router_supports_https() {
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(plug_core::http::server::HttpState::new(
             engine.tool_router().clone(),
@@ -709,7 +705,7 @@ mod tests {
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
 
         let daemon_engine = Arc::clone(&engine);
         let daemon_config_path = config_path.clone();

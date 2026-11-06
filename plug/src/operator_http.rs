@@ -540,7 +540,7 @@ mod tests {
     }
     async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state_path = unique_temp_dir("owner-operator").join("oauth.json");
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
@@ -918,7 +918,7 @@ mod tests {
         .expect("reopen CIMD fixture");
 
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(
             plug_core::http::server::HttpState::new(
@@ -1086,7 +1086,7 @@ mod tests {
             plug_core::test_helpers::mock_server("echo"),
         );
         let engine = plug_core::engine::Engine::new(config);
-        engine.start().await.expect("engine start");
+        engine.start().await;
         let tool_router = engine.tool_router().clone();
 
         let oauth_path = std::env::temp_dir().join(format!(

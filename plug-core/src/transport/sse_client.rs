@@ -756,7 +756,6 @@ mod tests {
     /// own timeout, not a fixed one.
     #[tokio::test]
     async fn a_post_gives_up_after_the_configured_timeout() {
-        crate::tls::ensure_rustls_provider_installed();
         let app = axum::Router::new().route(
             "/messages",
             axum::routing::post(std::future::pending::<axum::http::StatusCode>),
@@ -825,7 +824,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn preinitialize_notifications_are_replayed_after_initialize_response() {
-        crate::tls::ensure_rustls_provider_installed();
         let server_url = spawn_legacy_sse_server_with_early_logging().await;
         let signal = Arc::new(Notify::new());
         let payloads = Arc::new(Mutex::new(Vec::new()));
@@ -857,7 +855,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn responses_are_not_blocked_by_notification_backlog() {
-        crate::tls::ensure_rustls_provider_installed();
         let server_url = spawn_legacy_sse_server_with_noisy_call().await;
         let handler = Arc::new(LoggingCaptureClient {
             signal: Arc::new(Notify::new()),
