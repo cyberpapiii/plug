@@ -700,16 +700,22 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Events {
             command: Some(commands::events::EventCommands::Unwatch { event }),
         }) => commands::events::cmd_event_unwatch(cli.config.as_ref(), event).await?,
-        Some(Commands::Tools { command, server }) => {
-            commands::tools::cmd_tool_command(
+        Some(Commands::Tools {
+            command: None,
+            server,
+        }) => {
+            views::tools::cmd_tool_list(
                 cli.config.as_ref(),
-                command,
-                server,
                 &cli.output,
                 cli.verbose,
+                server.as_deref(),
             )
             .await?
         }
+        Some(Commands::Tools {
+            command: Some(command),
+            ..
+        }) => commands::tools::cmd_tool_command(cli.config.as_ref(), command, &cli.output).await?,
         Some(Commands::Link {
             targets,
             all,
@@ -721,28 +727,24 @@ async fn main() -> anyhow::Result<()> {
             all,
             yes,
             transport.map(Into::into),
+            &cli.output,
         )?,
         Some(Commands::Unlink { targets, all, yes }) => {
-            commands::clients::cmd_unlink(targets, all, yes)?
+            commands::clients::cmd_unlink(targets, all, yes, &cli.output)?
         }
         Some(Commands::Server { command }) => {
             commands::servers::cmd_server_command(cli.config.as_ref(), command, &cli.output).await?
         }
         Some(Commands::Import {
             clients,
-            all,
+            all: _,
             dry_run,
             yes,
-        }) => commands::misc::cmd_import(
-            cli.config.as_ref(),
-            clients,
-            all,
-            dry_run,
-            yes,
-            &cli.output,
-        )?,
+        }) => {
+            commands::import::cmd_import(cli.config.as_ref(), clients, dry_run, yes, &cli.output)?
+        }
         Some(Commands::Doctor) => {
-            let exit_code = commands::misc::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
+            let exit_code = commands::doctor::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
             if exit_code != 0 {
                 // Flush before process::exit, which bypasses destructors.
                 // Rust's stdout is line-buffered so the trailing-newline
@@ -757,11 +759,11 @@ async fn main() -> anyhow::Result<()> {
             targets,
             all,
             dry_run,
-        }) => commands::misc::cmd_repair(cli.config.as_ref(), targets, all, dry_run, &cli.output)?,
+        }) => commands::repair::cmd_repair(targets, all, dry_run, &cli.output)?,
         Some(Commands::Setup { yes, transport }) => {
-            commands::misc::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
+            commands::setup::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
         }
-        Some(Commands::Reload) => commands::misc::cmd_reload(&cli.output).await?,
+        Some(Commands::Reload) => commands::reload::cmd_reload(&cli.output).await?,
         Some(Commands::Config { path, command }) => {
             commands::config::cmd_config(cli.config.as_ref(), path, command, &cli.output)?
         }
@@ -776,6 +778,7 @@ async fn main() -> anyhow::Result<()> {
             all,
             yes,
             transport.map(Into::into),
+            &cli.output,
         )?,
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
@@ -783,13 +786,15 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Secret { command }) => {
             commands::secrets::cmd_secret(cli.config.as_ref(), command).await?
         }
-        Some(Commands::UninstallCleanup) => commands::misc::cmd_uninstall_cleanup(&cli.output)?,
+        Some(Commands::UninstallCleanup) => {
+            commands::uninstall::cmd_uninstall_cleanup(&cli.output)?
+        }
     }
 
     Ok(())
 }
 
-impl From<ClientLinkTransport> for plug_core::export::ExportTransport {
+impl From<ClientLinkTransport> for plug_core::clients::LinkTransport {
     fn from(value: ClientLinkTransport) -> Self {
         match value {
             ClientLinkTransport::Stdio => Self::Stdio,

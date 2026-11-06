@@ -1012,7 +1012,6 @@ pub(crate) async fn cmd_server_set_enabled(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::commands::config::save_config;
 
     fn test_config_path(prefix: &str) -> std::path::PathBuf {
         let dir =
@@ -1181,7 +1180,7 @@ mod tests {
         let config_path = test_config_path("remote-to-stdio");
         let mut config = plug_core::config::Config::default();
         config.servers.insert("demo".to_string(), remote_server());
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1215,7 +1214,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("echo"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1251,7 +1250,7 @@ mod tests {
         server.oauth_client_id = Some("client-123".to_string());
         server.oauth_scopes = Some(vec!["read".to_string()]);
         config.servers.insert("demo".to_string(), server);
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         cmd_server_edit(
             Some(&config_path),
@@ -1330,7 +1329,7 @@ mod tests {
         server.env.insert("OLD".to_string(), "1".to_string());
         server.env.insert("KEEP".to_string(), "yes".to_string());
         config.servers.insert("demo".to_string(), server);
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         cmd_server_edit(
             Some(&config_path),
@@ -1368,7 +1367,7 @@ mod tests {
         let config_path = test_config_path("remote-env-flags");
         let mut config = plug_core::config::Config::default();
         config.servers.insert("demo".to_string(), remote_server());
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1402,7 +1401,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("node"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         // JSON mode with a field flag must apply the change, not echo the
         // unedited config and return success (the review #8 regression).
@@ -1440,7 +1439,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("node"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         let error = cmd_server_edit(
             Some(&config_path),
@@ -1475,7 +1474,7 @@ mod tests {
         config
             .servers
             .insert("demo".to_string(), stdio_server("node"));
-        save_config(&config_path, &config).unwrap();
+        plug_core::operator::persist_config_atomic(&config_path, &config).unwrap();
 
         // JSON mode must not drop into the interactive server picker; absent
         // --name it must fail with a clear error.

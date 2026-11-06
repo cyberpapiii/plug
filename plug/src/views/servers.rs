@@ -92,7 +92,6 @@ pub(crate) async fn cmd_server_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut started = false;
 
     loop {
         let (availability, live_status) = daemon_query(
@@ -131,7 +130,7 @@ pub(crate) async fn cmd_server_list(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "runtime_available": true,
-                            "status_source": "live_daemon",
+                            "status_source": super::status_source(availability),
                             "servers": servers,
                         }))?
                     );
@@ -169,9 +168,6 @@ pub(crate) async fn cmd_server_list(
                                     .count()
                             ),
                         );
-                        if started {
-                            println!();
-                        }
                         print_heading("Summary");
                         print_label_value("Running", style(healthy).green().bold());
                         print_label_value("Unsteady", style(degraded).yellow().bold());
@@ -329,11 +325,7 @@ pub(crate) async fn cmd_server_list(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "runtime_available": false,
-                        "status_source": if availability.daemon_reachable() {
-                            "ipc_unavailable"
-                        } else {
-                            "config_only"
-                        },
+                        "status_source": super::status_source(availability),
                         "daemon_running": availability.daemon_reachable(),
                         "servers": config.servers,
                         "server_inventory": server_inventory,
@@ -351,7 +343,6 @@ pub(crate) async fn cmd_server_list(
             break;
         }
         println!();
-        started = false;
     }
     Ok(())
 }

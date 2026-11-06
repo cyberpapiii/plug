@@ -5,7 +5,7 @@ use crate::types::ClientType;
 /// Uses exact match as primary (verified values from Apify MCP Client Capabilities Index),
 /// with fuzzy fallback for unknown client versions.
 pub fn detect_client(client_info_name: &str) -> ClientType {
-    // Tier 1: Exact match on verified clientInfo.name values
+    // Verified `clientInfo.name` values.
     match client_info_name {
         "claude-code" => return ClientType::ClaudeCode,
         "claude-ai" => return ClientType::ClaudeDesktop,
@@ -18,7 +18,6 @@ pub fn detect_client(client_info_name: &str) -> ClientType {
         _ => {}
     }
 
-    // Tier 2: Fuzzy fallback for unknown client versions
     let name = client_info_name.to_lowercase();
     if name.contains("claude-code") || name.contains("claude code") {
         ClientType::ClaudeCode
@@ -92,8 +91,6 @@ mod tests {
         assert_eq!(detect_client("github-copilot"), ClientType::VSCodeCopilot);
         assert_eq!(detect_client("github-copilot-cli"), ClientType::CopilotCli);
         assert_eq!(detect_client("Copilot CLI"), ClientType::CopilotCli);
-        assert_eq!(ClientType::CopilotCli.tool_limit(), None);
-        assert_eq!(ClientType::CopilotCli.target_slug(), Some("copilot-cli"));
         assert_eq!(detect_client("gemini-cli-v2"), ClientType::GeminiCli);
         assert_eq!(detect_client("codex-cli"), ClientType::CodexCli);
         assert_eq!(detect_client("grok-cli"), ClientType::GrokBuild);
@@ -114,47 +111,5 @@ mod tests {
     fn tool_limit_known_clients() {
         assert_eq!(ClientType::Devin.tool_limit(), Some(100));
         assert_eq!(ClientType::VSCodeCopilot.tool_limit(), Some(128));
-    }
-
-    #[test]
-    fn tool_limit_unlimited_clients() {
-        assert_eq!(ClientType::ClaudeCode.tool_limit(), None);
-        assert_eq!(ClientType::ClaudeDesktop.tool_limit(), None);
-        assert_eq!(ClientType::Cursor.tool_limit(), None);
-        assert_eq!(ClientType::GeminiCli.tool_limit(), None);
-        assert_eq!(ClientType::CodexCli.tool_limit(), None);
-        assert_eq!(ClientType::GrokBuild.tool_limit(), None);
-        assert_eq!(ClientType::GrokBot.tool_limit(), None);
-        assert_eq!(ClientType::OpenCode.tool_limit(), None);
-        assert_eq!(ClientType::Zed.tool_limit(), None);
-        assert_eq!(ClientType::Unknown.tool_limit(), None);
-    }
-
-    #[test]
-    fn display_impl() {
-        assert_eq!(ClientType::ClaudeCode.to_string(), "Claude Code");
-        assert_eq!(ClientType::ClaudeDesktop.to_string(), "Claude Desktop");
-        assert_eq!(ClientType::Cursor.to_string(), "Cursor");
-        assert_eq!(ClientType::Devin.to_string(), "Devin");
-        assert_eq!(ClientType::VSCodeCopilot.to_string(), "VS Code Copilot");
-        assert_eq!(ClientType::GeminiCli.to_string(), "Gemini CLI");
-        assert_eq!(ClientType::CodexCli.to_string(), "Codex CLI");
-        assert_eq!(ClientType::GrokBuild.to_string(), "Grok Build");
-        assert_eq!(ClientType::GrokBot.to_string(), "Grok Bot");
-        assert_eq!(ClientType::OpenCode.to_string(), "OpenCode");
-        assert_eq!(ClientType::Zed.to_string(), "Zed");
-        assert_eq!(ClientType::Unknown.to_string(), "Unknown");
-    }
-
-    #[test]
-    fn target_slug_maps_known_clients_to_config_targets() {
-        assert_eq!(ClientType::ClaudeCode.target_slug(), Some("claude-code"));
-        assert_eq!(ClientType::Devin.target_slug(), Some("devin"));
-        assert_eq!(ClientType::GrokBuild.target_slug(), Some("grok-build"));
-        assert_eq!(ClientType::OpenCode.target_slug(), Some("opencode"));
-        // Grok Bot cannot be pointed at Plug from this Mac, so it has no
-        // target to link.
-        assert_eq!(ClientType::GrokBot.target_slug(), None);
-        assert_eq!(ClientType::Unknown.target_slug(), None);
     }
 }

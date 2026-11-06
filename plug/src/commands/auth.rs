@@ -44,20 +44,21 @@ fn auth_status_source_text(live: bool) -> &'static str {
     }
 }
 
+/// `status_scope` repeats `status_source` for readers of older output.
+fn auth_status_source(live: bool) -> &'static str {
+    if live {
+        crate::runtime::DaemonQueryAvailability::Available.status_source()
+    } else {
+        "stored_credentials_only"
+    }
+}
+
 fn auth_status_json(servers: Vec<serde_json::Value>, live: bool) -> serde_json::Value {
     serde_json::json!({
         "runtime_available": live,
         "servers": servers,
-        "status_source": if live {
-            "live_daemon"
-        } else {
-            "stored_credentials_only"
-        },
-        "status_scope": if live {
-            "live_daemon"
-        } else {
-            "stored_credentials_only"
-        }
+        "status_source": auth_status_source(live),
+        "status_scope": auth_status_source(live)
     })
 }
 
@@ -142,7 +143,6 @@ async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
     }
 }
 
-/// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
     config_path: Option<&PathBuf>,
     command: crate::AuthCommands,
@@ -246,15 +246,6 @@ impl LocalOperatorClient {
         &self,
         method: reqwest::Method,
         child_segment: Option<&str>,
-    ) -> anyhow::Result<reqwest::Response> {
-        self.send_authenticated_with_allow_empty(method, child_segment, false)
-            .await
-    }
-
-    async fn send_authenticated_with_allow_empty(
-        &self,
-        method: reqwest::Method,
-        child_segment: Option<&str>,
         allow_empty: bool,
     ) -> anyhow::Result<reqwest::Response> {
         let endpoint = match child_segment {
@@ -288,7 +279,7 @@ fn local_operator_client(
     if operator_token.is_empty() {
         anyhow::bail!("the local operator token is empty");
     }
-    let scheme = if cfg.http.tls_cert_path.is_some() && cfg.http.tls_key_path.is_some() {
+    let scheme = if cfg.http.tls_enabled() {
         "https"
     } else {
         "http"
@@ -334,7 +325,7 @@ async fn cmd_downstream_oauth_clients(
     match command {
         crate::DownstreamOauthClientCommands::List => {
             let response = operator
-                .send_authenticated(reqwest::Method::GET, None)
+                .send_authenticated(reqwest::Method::GET, None, false)
                 .await?;
             if !response.status().is_success() {
                 anyhow::bail!(
@@ -363,7 +354,7 @@ async fn cmd_downstream_oauth_clients(
                 return Ok(());
             }
             let response = operator
-                .send_authenticated(reqwest::Method::DELETE, Some(&client_id))
+                .send_authenticated(reqwest::Method::DELETE, Some(&client_id), false)
                 .await?;
             match response.status() {
                 reqwest::StatusCode::NO_CONTENT => ui::print_success_line(format!(
@@ -492,12 +483,6 @@ struct OwnerBootstrapResponse {
     enrollment_url: String,
 }
 
-fn owner_credentials_json(
-    credentials: &[plug_core::downstream_oauth::OwnerCredentialSummary],
-) -> serde_json::Value {
-    serde_json::to_value(credentials).expect("owner credential summaries serialize")
-}
-
 fn owner_enrollment_manual_url(
     enrollment_url: &str,
     no_browser: bool,
@@ -547,7 +532,7 @@ async fn fetch_owner_credentials(
     operator: &LocalOperatorClient,
 ) -> anyhow::Result<Vec<plug_core::downstream_oauth::OwnerCredentialSummary>> {
     let response = operator
-        .send_authenticated(reqwest::Method::GET, None)
+        .send_authenticated(reqwest::Method::GET, None, false)
         .await?;
     if !response.status().is_success() {
         anyhow::bail!(
@@ -567,7 +552,7 @@ async fn cmd_downstream_oauth_owner(
         crate::OwnerCommands::Enroll { no_browser } => {
             let operator = local_operator_client(config_path, "/_plug/oauth/owner/bootstrap")?;
             let response = operator
-                .send_authenticated(reqwest::Method::POST, None)
+                .send_authenticated(reqwest::Method::POST, None, false)
                 .await?;
             if !response.status().is_success() {
                 anyhow::bail!(
@@ -622,10 +607,7 @@ async fn cmd_downstream_oauth_owner(
             let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
             let credentials = fetch_owner_credentials(&operator).await?;
             match output {
-                OutputFormat::Json => println!(
-                    "{}",
-                    serde_json::to_string_pretty(&owner_credentials_json(&credentials))?
-                ),
+                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&credentials)?),
                 OutputFormat::Text => {
                     if credentials.is_empty() {
                         ui::print_info_line("No owner passkeys are enrolled");
@@ -672,11 +654,7 @@ async fn cmd_downstream_oauth_owner(
 
             let mut allow_empty = yes || removing_final;
             let mut response = operator
-                .send_authenticated_with_allow_empty(
-                    reqwest::Method::DELETE,
-                    Some(&credential_id),
-                    allow_empty,
-                )
+                .send_authenticated(reqwest::Method::DELETE, Some(&credential_id), allow_empty)
                 .await?;
             if response.status() == reqwest::StatusCode::CONFLICT && !allow_empty {
                 let current = fetch_owner_credentials(&operator).await?;
@@ -704,11 +682,7 @@ async fn cmd_downstream_oauth_owner(
                 }
                 allow_empty = true;
                 response = operator
-                    .send_authenticated_with_allow_empty(
-                        reqwest::Method::DELETE,
-                        Some(&credential_id),
-                        allow_empty,
-                    )
+                    .send_authenticated(reqwest::Method::DELETE, Some(&credential_id), allow_empty)
                     .await?;
             }
             match response.status() {
@@ -730,8 +704,6 @@ async fn cmd_downstream_oauth_owner(
     }
     Ok(())
 }
-
-// login
 
 async fn cmd_auth_login(
     config_path: Option<&PathBuf>,
@@ -847,7 +819,6 @@ async fn cmd_auth_login(
             .configure_client(oauth_config)
             .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
     } else {
-        // Dynamic client registration
         if has_persisted_credentials {
             ui::print_warning_line(format!(
                 "Stored credentials for '{server_name}' do not include reusable dynamic registration metadata. Plug will register one new OAuth client so future reauth can reuse it safely."
@@ -889,7 +860,6 @@ async fn cmd_auth_login(
     }
 
     let (code, csrf_state, callback_issuer) = if let Some(listener) = callback_listener {
-        // Localhost callback: wait for the OAuth redirect with a 120s timeout.
         ui::print_info_line("Waiting for OAuth callback on localhost...");
         await_oauth_callback(listener, Duration::from_secs(120)).await?
     } else {
@@ -1063,8 +1033,6 @@ async fn cmd_auth_complete(
     Ok(())
 }
 
-// inject
-
 /// Persist an externally obtained token for `server_name`.
 ///
 /// For an OAuth server the store is bound to the server's discovered
@@ -1187,8 +1155,6 @@ async fn cmd_auth_inject(
 
     Ok(())
 }
-
-// status
 
 async fn cmd_auth_status(
     config_path: Option<&PathBuf>,
@@ -1375,16 +1341,8 @@ async fn cmd_auth_status(
                         .map(|s| s.warnings.clone())
                         .unwrap_or_else(|| snapshot.as_ref().map(|snapshot| snapshot.warnings.clone()).unwrap_or_default()),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
-                    "status_source": if live.is_some() {
-                        "live_daemon"
-                    } else {
-                        "stored_credentials_only"
-                    },
-                    "status_scope": if live.is_some() {
-                        "live_daemon"
-                    } else {
-                        "stored_credentials_only"
-                    },
+                    "status_source": auth_status_source(live.is_some()),
+                    "status_scope": auth_status_source(live.is_some()),
                 }));
             }
             println!(
@@ -1499,7 +1457,6 @@ async fn await_oauth_callback_inner(
         .to_string();
     let issuer = params.get("iss").cloned();
 
-    // Respond with a success page and close.
     let success_html = callback_page(
         "Authentication successful",
         "<p>You can close this tab and return to the terminal.</p>",
@@ -1540,8 +1497,6 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
 }
-
-// logout
 
 async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
     let store = oauth::get_or_create_store(server_name);
@@ -1786,7 +1741,7 @@ mod tests {
             last_used_at: None,
         }];
 
-        let json = owner_credentials_json(&credentials);
+        let json = serde_json::to_value(&credentials).unwrap();
         let item = &json.as_array().expect("array")[0];
         assert_eq!(item["credential_id"], "credential-1");
         assert!(item.get("passkey").is_none());
@@ -1879,7 +1834,7 @@ mod tests {
         };
 
         let error = operator
-            .send_authenticated(reqwest::Method::GET, None)
+            .send_authenticated(reqwest::Method::GET, None, false)
             .await
             .expect_err("rogue proof must fail");
         assert!(

@@ -10,7 +10,6 @@ use serde::Serialize;
 pub const APP_BUNDLE_ID: &str = "com.cyberpapiii.plug";
 pub const DEVELOPER_TEAM_ID: &str = "HJF7LN64XX";
 
-const LOOP_MARKER: &str = "PLUG_APP_EXEC";
 const BUNDLE_EXECUTABLE: &str = "Contents/Resources/plug";
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -34,25 +33,6 @@ pub struct ShadowInstallation {
     pub kind: String,
     pub path: PathBuf,
     pub verified_plug_owned: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct UnifiedInstallSnapshot {
-    pub app: Option<VerifiedAppInstallation>,
-    pub shell_resolution: Option<PathBuf>,
-    pub daemon_version: Option<String>,
-    pub daemon_executable: Option<PathBuf>,
-    pub ownership: plug_core::ipc::DaemonOwnershipMode,
-    pub linked_clients: Vec<crate::commands::clients::ClientRepairItem>,
-    pub adapters: Vec<AdapterVersionState>,
-    pub shadows: Vec<ShadowInstallation>,
-    pub launchd_jobs: Vec<crate::service::LaunchdJobRecord>,
-    pub daemon_inspection_complete: bool,
-    pub adapter_inspection_complete: bool,
-    pub launchd_inspection_complete: bool,
-    pub app_service_daemon_invocation_verified: bool,
-    pub inspection_errors: Vec<String>,
-    pub client_repair_needed: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -136,40 +116,18 @@ fn canonical_client_command_from(
     )
 }
 
-#[allow(dead_code)] // Exposed for focused decision tests and diagnostic callers.
-pub fn delegation_decision(
+/// The app's own executable stays, so the exec below cannot loop.
+fn delegation_decision(
     current: &Path,
     app: Option<&VerifiedAppInstallation>,
     dev: bool,
-) -> Result<DelegationDecision> {
-    delegation_decision_with_loop(current, app, dev, false)
-}
-
-fn delegation_decision_with_loop(
-    current: &Path,
-    app: Option<&VerifiedAppInstallation>,
-    dev: bool,
-    loop_marker: bool,
-) -> Result<DelegationDecision> {
-    let Some(app) = app else {
-        return Ok(DelegationDecision::Stay);
-    };
-    if dev {
-        return Ok(DelegationDecision::Stay);
+) -> DelegationDecision {
+    match app {
+        Some(app) if !dev && !paths_match(current, &app.executable_path) => {
+            DelegationDecision::Exec(app.executable_path.clone())
+        }
+        _ => DelegationDecision::Stay,
     }
-
-    // The marker is intentionally not an externally usable bypass: a forged
-    // marker on a standalone executable still delegates. The canonical path
-    // comparison is the durable loop guard after exec.
-    if loop_marker && paths_match(current, &app.executable_path) {
-        return Ok(DelegationDecision::Stay);
-    }
-
-    if paths_match(current, &app.executable_path) {
-        return Ok(DelegationDecision::Stay);
-    }
-
-    Ok(DelegationDecision::Exec(app.executable_path.clone()))
 }
 
 /// Re-exec a standalone macOS command through a freshly verified Plug.app.
@@ -197,9 +155,8 @@ pub fn maybe_delegate_to_app() -> Result<()> {
         }
 
         let app = resolve_verified_app()?;
-        let loop_marker = std::env::var_os(LOOP_MARKER).is_some();
 
-        match delegation_decision_with_loop(&current, app.as_ref(), false, loop_marker)? {
+        match delegation_decision(&current, app.as_ref(), false) {
             DelegationDecision::Stay => Ok(()),
             DelegationDecision::Exec(executable) => {
                 use std::{io, os::unix::process::CommandExt, process::Stdio};
@@ -207,7 +164,6 @@ pub fn maybe_delegate_to_app() -> Result<()> {
                 let mut command = Command::new(&executable);
                 command
                     .args(std::env::args_os().skip(1))
-                    .env(LOOP_MARKER, "1")
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit());
@@ -433,7 +389,7 @@ fn cleanup_launchd_plan(
     let mut remove_labels = Vec::new();
     let mut preserved = Vec::new();
     for job in jobs {
-        if job.label == "com.plug.daemon"
+        if job.label == crate::service::LABEL
             && proven_daemon_invocations.contains(&job.label)
             && matches!(
                 crate::service::classify_launchd_program(
@@ -516,13 +472,10 @@ fn login_user_id() -> Result<String> {
     Ok(String::from_utf8(uid.stdout)?.trim().to_string())
 }
 
-pub fn prove_app_daemon_invocation(label: &str, app: &VerifiedAppInstallation) -> Result<bool> {
-    if label != "com.plug.daemon" {
-        return Ok(false);
-    }
+pub fn prove_app_daemon_invocation(app: &VerifiedAppInstallation) -> Result<bool> {
     let uid = login_user_id()?;
     let mut command = Command::new("/bin/launchctl");
-    command.args(["print", &format!("gui/{uid}/{label}")]);
+    command.args(["print", &format!("gui/{uid}/{}", crate::service::LABEL)]);
     let output = bounded_output(command, std::time::Duration::from_secs(2))?;
     if !output.status.success() {
         return Ok(false);
@@ -534,7 +487,7 @@ pub fn prove_app_daemon_invocation(label: &str, app: &VerifiedAppInstallation) -
         .collect::<Vec<_>>()
         .windows(2)
         .any(|lines| lines == ["serve", "--daemon"]);
-    let identifies_app = output.contains("parent bundle identifier = com.cyberpapiii.plug")
+    let identifies_app = output.contains(&format!("parent bundle identifier = {APP_BUNDLE_ID}"))
         || output.contains(&format!("program = {}", app.executable_path.display()));
     Ok(has_daemon_arguments && identifies_app)
 }
@@ -577,7 +530,9 @@ pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
     let mut proven_daemon_invocations = std::collections::BTreeSet::new();
     if let Some(app) = app.as_ref() {
         for job in &jobs {
-            if prove_app_daemon_invocation(&job.label, app).unwrap_or(false) {
+            if job.label == crate::service::LABEL
+                && prove_app_daemon_invocation(app).unwrap_or(false)
+            {
                 proven_daemon_invocations.insert(job.label.clone());
             }
         }
@@ -621,12 +576,7 @@ pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
     Ok(UninstallCleanupReport { items })
 }
 
-fn verify_candidate(
-    bundle_version: &str,
-    executable_version: &str,
-    signature_valid: bool,
-) -> Result<()> {
-    ensure!(signature_valid, "Plug.app signature verification failed");
+fn verify_candidate(bundle_version: &str, executable_version: &str) -> Result<()> {
     ensure!(
         bundle_version == executable_version,
         "Plug.app version {bundle_version} does not match embedded plug version {executable_version}"
@@ -671,7 +621,7 @@ fn verify_app_bundle(bundle_path: &Path) -> Result<VerifiedAppInstallation> {
     verify_codesign(bundle_path)?;
     let bundle_version = bundle_version(bundle_path)?;
     let executable_version = executable_version(&executable_path)?;
-    verify_candidate(&bundle_version, &executable_version, true)?;
+    verify_candidate(&bundle_version, &executable_version)?;
 
     Ok(VerifiedAppInstallation {
         bundle_path: bundle_path.to_path_buf(),
@@ -782,7 +732,7 @@ mod tests {
     #[test]
     fn absent_app_stays() {
         assert_eq!(
-            delegation_decision(Path::new("/usr/local/bin/plug"), None, false).unwrap(),
+            delegation_decision(Path::new("/usr/local/bin/plug"), None, false),
             DelegationDecision::Stay,
         );
     }
@@ -791,7 +741,7 @@ mod tests {
     fn bundle_executable_stays() {
         let app = app("/Applications/Plug.app");
         assert_eq!(
-            delegation_decision(&app.executable_path, Some(&app), false).unwrap(),
+            delegation_decision(&app.executable_path, Some(&app), false),
             DelegationDecision::Stay,
         );
     }
@@ -800,7 +750,7 @@ mod tests {
     fn stray_executable_delegates_to_verified_bundle() {
         let app = app("/Applications/Plug.app");
         assert_eq!(
-            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), false).unwrap(),
+            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), false),
             DelegationDecision::Exec(app.executable_path),
         );
     }
@@ -809,33 +759,23 @@ mod tests {
     fn development_mode_stays() {
         let app = app("/Applications/Plug.app");
         assert_eq!(
-            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), true).unwrap(),
+            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), true),
             DelegationDecision::Stay,
         );
     }
 
     #[test]
     fn mismatched_versions_and_invalid_signatures_fail_verification() {
-        assert!(verify_candidate("0.6.4", "0.6.5", true).is_err());
-        assert!(verify_candidate("0.6.4", "0.6.4", false).is_err());
+        assert!(verify_candidate("0.6.4", "0.6.5").is_err());
+        assert!(verify_candidate("0.6.4", "0.6.4").is_ok());
     }
 
     #[test]
     fn moved_registered_app_delegates() {
         let app = app("/Volumes/External Applications/Plug.app");
         assert_eq!(
-            delegation_decision(Path::new("/usr/local/bin/plug"), Some(&app), false).unwrap(),
+            delegation_decision(Path::new("/usr/local/bin/plug"), Some(&app), false),
             DelegationDecision::Exec(app.executable_path),
-        );
-    }
-
-    #[test]
-    fn loop_marker_prevents_a_second_delegation() {
-        let app = app("/Applications/Plug.app");
-        assert_eq!(
-            super::delegation_decision_with_loop(&app.executable_path, Some(&app), false, true,)
-                .unwrap(),
-            DelegationDecision::Stay,
         );
     }
 

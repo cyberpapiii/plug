@@ -858,11 +858,7 @@ fn build_configured_http_runtime(
 }
 
 fn local_http_inventory_url(http: &plug_core::config::HttpConfig) -> String {
-    let scheme = if http.tls_cert_path.is_some() && http.tls_key_path.is_some() {
-        "https"
-    } else {
-        "http"
-    };
+    let scheme = if http.tls_enabled() { "https" } else { "http" };
     let authority = local_operator_connection_authority(&http.bind_address, http.port);
     format!("{scheme}://{authority}{OPERATOR_LIVE_SESSIONS_PATH}")
 }

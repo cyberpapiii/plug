@@ -935,8 +935,8 @@ pub const CUSTOM_CLIENT_PREFIX: &str = "custom:";
 /// the owner named in the app. Anything else is dropped, so a key is never
 /// made from free text.
 pub fn link_target_key(target: &str) -> Option<String> {
-    if let Some(known) = crate::config::canonical_client_target(target) {
-        return Some(known.to_string());
+    if let Some(known) = crate::clients::ClientTarget::from_slug(target) {
+        return Some(known.slug().to_string());
     }
     let slug = target.strip_prefix(CUSTOM_CLIENT_PREFIX)?;
     let shaped = !slug.is_empty()

@@ -2,9 +2,7 @@ use dialoguer::Select;
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::{
-    all_client_targets, client_display_name, client_views, cmd_link, cmd_unlink, live_session_views,
-};
+use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
 use crate::runtime::{
     LiveClientSupport, daemon_running, fetch_live_sessions, live_inventory_metadata,
 };
@@ -12,6 +10,7 @@ use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_success_line, print_warning_line,
 };
+use plug_core::clients::ClientTarget;
 
 fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
     match scope {
@@ -105,14 +104,15 @@ fn client_list_json(
 
 fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     let (path, mut config) = crate::commands::config::load_editable_config(config_path)?;
-    let targets = all_client_targets();
+    let targets: Vec<ClientTarget> = ClientTarget::listed().collect();
     let labels = targets
         .iter()
-        .map(|(display, target)| {
-            let policy = plug_core::config::resolve_lazy_tool_policy_for_target(&config, target);
+        .map(|target| {
+            let policy =
+                plug_core::config::resolve_lazy_tool_policy_for_target(&config, target.slug());
             format!(
                 "{:<20} {} ({})",
-                display,
+                target.display_name(),
                 policy.mode.label(),
                 policy.origin.label()
             )
@@ -127,13 +127,14 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
     let Some(target_index) = target_selection else {
         return Ok(());
     };
-    let target = targets[target_index].1;
+    let target = targets[target_index];
+    let slug = target.slug();
 
     let mode_options = ["auto", "standard", "native", "bridge"];
     let current = config
         .lazy_tools
         .clients
-        .get(target)
+        .get(slug)
         .copied()
         .unwrap_or(plug_core::types::LazyToolSetting::Auto);
     let default = match current {
@@ -154,34 +155,34 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
 
     match mode_index {
         0 => {
-            config.lazy_tools.clients.remove(target);
+            config.lazy_tools.clients.remove(slug);
         }
         1 => {
             config.lazy_tools.clients.insert(
-                target.to_string(),
+                slug.to_string(),
                 plug_core::types::LazyToolSetting::Standard,
             );
         }
         2 => {
-            config.lazy_tools.clients.insert(
-                target.to_string(),
-                plug_core::types::LazyToolSetting::Native,
-            );
+            config
+                .lazy_tools
+                .clients
+                .insert(slug.to_string(), plug_core::types::LazyToolSetting::Native);
         }
         3 => {
-            config.lazy_tools.clients.insert(
-                target.to_string(),
-                plug_core::types::LazyToolSetting::Bridge,
-            );
+            config
+                .lazy_tools
+                .clients
+                .insert(slug.to_string(), plug_core::types::LazyToolSetting::Bridge);
         }
         _ => unreachable!(),
     }
 
-    crate::commands::config::save_config(&path, &config)?;
-    let policy = plug_core::config::resolve_lazy_tool_policy_for_target(&config, target);
+    plug_core::operator::persist_config_atomic(&path, &config)?;
+    let policy = plug_core::config::resolve_lazy_tool_policy_for_target(&config, slug);
     print_success_line(format!(
         "{} lazy tools: {} ({})",
-        client_display_name(target),
+        target,
         policy.mode.label(),
         policy.origin.label()
     ));
@@ -206,11 +207,18 @@ fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
 
     match selection {
         Some(1) => {
-            cmd_link(None, Vec::new(), false, false, None)?;
+            cmd_link(
+                config_path,
+                Vec::new(),
+                false,
+                false,
+                None,
+                &OutputFormat::Text,
+            )?;
             Ok(true)
         }
         Some(2) => {
-            cmd_unlink(Vec::new(), false, false)?;
+            cmd_unlink(Vec::new(), false, false, &OutputFormat::Text)?;
             Ok(true)
         }
         Some(3) => {
@@ -331,7 +339,6 @@ pub(crate) async fn cmd_client_list(
     verbose: bool,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut started = false;
 
     loop {
         let daemon_error = if daemon_running().await {
@@ -368,9 +375,6 @@ pub(crate) async fn cmd_client_list(
         }
 
         print_banner("◆", "Clients", "The clients that use Plug");
-        if started {
-            println!();
-        }
         if matches!(
             live_client_support,
             LiveClientSupport::DaemonRestartRequired
@@ -522,7 +526,6 @@ pub(crate) async fn cmd_client_list(
             break;
         }
         println!();
-        started = false;
     }
     Ok(())
 }
@@ -560,6 +563,7 @@ mod tests {
         let live_sessions = vec![LiveSessionView {
             session_id: "session-1".to_string(),
             client_type: "claude_desktop".to_string(),
+            target: None,
             transport: "http".to_string(),
             client_id: None,
             client_info: Some("Claude Desktop".to_string()),
@@ -742,6 +746,7 @@ mod tests {
         LiveSessionView {
             session_id: format!("{client_type}-{connected_secs}"),
             client_type: client_type.to_string(),
+            target: None,
             transport: transport.to_string(),
             client_id: None,
             client_info: None,

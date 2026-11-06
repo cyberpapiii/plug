@@ -9,6 +9,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
+- `plug link` and `plug unlink` answer `--output json` with the clients they changed.
+- `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.
+- `plug` on its own suggests the same next steps in text as it lists in `--output json`.
+- `plug repair` writes `connect --client <name>` into Codex and Goose settings too, as it already did for JSON settings, and keeps the comments in a Goose file when it links Plug.
 - Plug rests when its window is covered, minimized or on another desktop, the way it does when the window is closed. It used to keep checking every two seconds, and the Clients page every five, for a window no one could see. It catches up the moment the window is back on screen.
 - The menu bar icon is a little larger and sits a point to the right, so it reads as centred and the same size as the icons beside it.
 - Start Plug has a sunrise beside it in the menu bar panel, to pair with the moon for off.
@@ -35,6 +40,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug import` finds the servers in OpenCode and Kilo Code settings, which keep them under `mcp`, and imports an entry marked `"type": "sse"` as SSE where it came in as HTTP.
+- `plug import` and `plug setup` refuse to write into a config that does not load. They used to add servers to the end of the broken file.
+- `plug unlink` from Codex no longer deletes a server called `plugin` that follows Plug's entry.
+- A Plug command or server name with a quote, backslash or dot in it is written to Codex settings and to Plug's config as valid TOML.
+- `plug link --yes` no longer asks how to link.
+- `plug doctor --config <path>` reads that config for every check. One check read the default config.
+- Linking or unlinking from the `plug clients` menu uses the config given with `--config`.
+- `plug tools -v` no longer crashes on a tool description with accented or other non-ASCII letters near the cut-off.
 - The sidebar slides all the way back in. It used to slide about halfway and then jump to its place.
 - The title in the window's bar no longer jumps when the sidebar slides back in. The count under it fades in and the title glides up to make room.
 - A server's page no longer jumps a moment after it opens. The Settings row showed late and pushed every row below it down; a page opened before now shows it at once.
