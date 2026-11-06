@@ -231,7 +231,11 @@ private struct PlugStageHost: NSViewRepresentable {
 }
 
 private final class PlugStageView: NSHostingView<PlugHostedStage> {
-    var onSeen: ((Bool) -> Void)?
+    private lazy var watch = WindowSightWatch(view: self)
+    var onSeen: ((Bool) -> Void)? {
+        get { watch.onSeen }
+        set { watch.onSeen = newValue }
+    }
 
     // Clicks pass through to the character, which takes them.
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
@@ -239,27 +243,12 @@ private final class PlugStageView: NSHostingView<PlugHostedStage> {
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        let centre = NotificationCenter.default
-        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
-        if let newWindow {
-            centre.addObserver(
-                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
-            )
-        }
+        watch.watch(newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        look()
-    }
-
-    /// Closed, covered, minimized or on another desktop, the window is not
-    /// on screen. Said a moment later, never in the middle of an update.
-    @objc private func look() {
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            self.onSeen?(self.window?.occlusionState.contains(.visible) ?? false)
-        }
+        watch.look()
     }
 }
 

@@ -52,7 +52,7 @@ struct SettingsView: View {
                 if windowOpen {
                     PlugHeadline(model: model, run: run)
                 } else {
-                    Color.clear.frame(height: 40)
+                    Color.clear.frame(height: PlugHeadline.characterSize)
                 }
             }
             plug
