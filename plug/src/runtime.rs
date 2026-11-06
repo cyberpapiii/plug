@@ -26,96 +26,6 @@ const OPERATOR_ALLOW_EMPTY_HEADER: &str = "x-plug-operator-allow-empty";
 const OPERATOR_PROOF_LIFETIME: Duration = Duration::from_secs(10);
 const MAX_OPERATOR_PROOFS: usize = 64;
 
-#[derive(Debug, Clone, Copy, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum LiveClientSupport {
-    Supported,
-    DaemonRestartRequired,
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct LiveInventoryAvailability {
-    pub(crate) partial: bool,
-    pub(crate) unavailable_sources: Vec<&'static str>,
-}
-
-#[derive(Debug, Clone, Copy, serde::Serialize, Default)]
-pub(crate) struct LiveSessionTransportCounts {
-    pub(crate) daemon_proxy: usize,
-    pub(crate) http: usize,
-    pub(crate) sse: usize,
-}
-
-impl LiveSessionTransportCounts {
-    /// `19 local, 1 HTTP`. No downstream session reports itself as SSE today
-    /// (a legacy GET SSE stream belongs to its HTTP session), so the SSE count
-    /// shows only when it is non-zero.
-    pub(crate) fn summary(&self) -> String {
-        let mut parts = vec![
-            format!("{} local", self.daemon_proxy),
-            format!("{} HTTP", self.http),
-        ];
-        if self.sse > 0 {
-            parts.push(format!("{} SSE", self.sse));
-        }
-        parts.join(", ")
-    }
-}
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub(crate) struct LiveInventoryMetadata {
-    pub(crate) session_count: usize,
-    pub(crate) session_transports: LiveSessionTransportCounts,
-    pub(crate) scope: plug_core::ipc::LiveSessionInventoryScope,
-    pub(crate) availability: LiveInventoryAvailability,
-    pub(crate) http_sessions_included: bool,
-}
-
-pub(crate) fn live_inventory_availability(
-    scope: plug_core::ipc::LiveSessionInventoryScope,
-) -> LiveInventoryAvailability {
-    match scope {
-        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => LiveInventoryAvailability {
-            partial: false,
-            unavailable_sources: Vec::new(),
-        },
-        plug_core::ipc::LiveSessionInventoryScope::Unavailable => LiveInventoryAvailability {
-            partial: true,
-            unavailable_sources: vec!["daemon_proxy", "http"],
-        },
-    }
-}
-
-pub(crate) fn live_session_transport_counts(
-    sessions: &[plug_core::ipc::IpcLiveSessionInfo],
-) -> LiveSessionTransportCounts {
-    let mut counts = LiveSessionTransportCounts::default();
-    for session in sessions {
-        match session.transport {
-            plug_core::ipc::LiveSessionTransport::DaemonProxy => counts.daemon_proxy += 1,
-            plug_core::ipc::LiveSessionTransport::Http => counts.http += 1,
-            plug_core::ipc::LiveSessionTransport::Sse => counts.sse += 1,
-        }
-    }
-    counts
-}
-
-pub(crate) fn live_inventory_metadata(
-    sessions: &[plug_core::ipc::IpcLiveSessionInfo],
-    scope: plug_core::ipc::LiveSessionInventoryScope,
-) -> LiveInventoryMetadata {
-    LiveInventoryMetadata {
-        session_count: sessions.len(),
-        session_transports: live_session_transport_counts(sessions),
-        availability: live_inventory_availability(scope),
-        http_sessions_included: matches!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-        ),
-        scope,
-    }
-}
-
 struct OperatorHttpState {
     http_state: Arc<plug_core::http::server::HttpState>,
     operator_token: Arc<str>,
@@ -712,31 +622,6 @@ fn build_configured_http_runtime(
     })
 }
 
-/// Every live downstream session, as the daemon reports them.
-pub(crate) async fn fetch_live_sessions() -> (
-    Vec<plug_core::ipc::IpcLiveSessionInfo>,
-    plug_core::ipc::LiveSessionInventoryScope,
-    LiveClientSupport,
-) {
-    match crate::ipc_client::request(plug_core::ipc::IpcRequest::ListLiveSessions).await {
-        Ok(plug_core::ipc::IpcResponse::LiveSessions { sessions, scope }) => {
-            (sessions, scope, LiveClientSupport::Supported)
-        }
-        Ok(response) if response.error_code() == Some(plug_core::ipc::IpcErrorCode::ParseError) => {
-            (
-                Vec::new(),
-                plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-                LiveClientSupport::DaemonRestartRequired,
-            )
-        }
-        _ => (
-            Vec::new(),
-            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            LiveClientSupport::Supported,
-        ),
-    }
-}
-
 pub(crate) async fn ensure_daemon_with_feedback(
     config_path: Option<&std::path::PathBuf>,
     announce: bool,
@@ -1041,18 +926,6 @@ mod tests {
     }
 
     #[test]
-    fn transport_summary_shows_sse_only_when_something_reports_it() {
-        let mut counts = LiveSessionTransportCounts {
-            daemon_proxy: 19,
-            http: 1,
-            sse: 0,
-        };
-        assert_eq!(counts.summary(), "19 local, 1 HTTP");
-        counts.sse = 2;
-        assert_eq!(counts.summary(), "19 local, 1 HTTP, 2 SSE");
-    }
-
-    #[test]
     fn restart_advice_sends_app_users_to_the_app() {
         assert!(restart_advice_for(true).contains("Plug.app"));
         assert!(!restart_advice_for(true).contains("plug stop"));
@@ -1348,73 +1221,6 @@ mod tests {
                 .contains("failed to bind downstream HTTP address"),
             "unexpected preflight error: {error}"
         );
-    }
-
-    #[test]
-    fn live_inventory_availability_marks_missing_sources() {
-        let complete = live_inventory_availability(
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        );
-        assert!(!complete.partial);
-        assert!(complete.unavailable_sources.is_empty());
-
-        let unavailable =
-            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
-        assert!(unavailable.partial);
-        assert_eq!(
-            unavailable.unavailable_sources,
-            vec!["daemon_proxy", "http"]
-        );
-    }
-
-    #[test]
-    fn live_inventory_metadata_reports_counts_and_availability() {
-        let sessions = vec![
-            plug_core::ipc::IpcLiveSessionInfo {
-                transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
-                client_id: Some("daemon".to_string()),
-                session_id: "daemon-1".to_string(),
-                client_type: plug_core::types::ClientType::ClaudeCode,
-                client_info: Some("Claude Code".to_string()),
-                adapter_version: Some("0.6.5".to_string()),
-                host: None,
-                grant: None,
-                link_target: None,
-                client_key: None,
-                access_key: None,
-                target: None,
-                connected_secs: 10,
-                last_activity_secs: None,
-            },
-            plug_core::ipc::IpcLiveSessionInfo {
-                transport: plug_core::ipc::LiveSessionTransport::Http,
-                client_id: None,
-                session_id: "http-1".to_string(),
-                client_type: plug_core::types::ClientType::ClaudeDesktop,
-                client_info: None,
-                adapter_version: None,
-                host: None,
-                grant: None,
-                link_target: None,
-                client_key: None,
-                access_key: None,
-                target: None,
-                connected_secs: 5,
-                last_activity_secs: Some(1),
-            },
-        ];
-
-        let metadata = live_inventory_metadata(
-            &sessions,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        );
-
-        assert_eq!(metadata.session_count, 2);
-        assert_eq!(metadata.session_transports.daemon_proxy, 1);
-        assert_eq!(metadata.session_transports.http, 1);
-        assert_eq!(metadata.session_transports.sse, 0);
-        assert!(!metadata.availability.partial);
-        assert!(metadata.http_sessions_included);
     }
 
     #[tokio::test]

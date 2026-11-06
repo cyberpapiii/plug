@@ -4,42 +4,12 @@ use dialoguer::console::style;
 use crate::OutputFormat;
 use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
 use crate::ipc_client::daemon_running;
-use crate::runtime::{LiveClientSupport, fetch_live_sessions, live_inventory_metadata};
 use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_success_line, print_warning_line,
 };
+use crate::views::live::{self, LiveClientSupport, fetch_live_sessions};
 use plug_core::clients::ClientTarget;
-
-fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
-    match scope {
-        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
-            "Live session inventory includes both daemon proxy and downstream HTTP sessions."
-        }
-        plug_core::ipc::LiveSessionInventoryScope::Unavailable => {
-            "Live session inventory is unavailable from both daemon proxy and downstream HTTP sources."
-        }
-    }
-}
-
-fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
-    match scope {
-        plug_core::ipc::LiveSessionInventoryScope::TransportComplete => "transport-complete",
-        plug_core::ipc::LiveSessionInventoryScope::Unavailable => "unavailable",
-    }
-}
-
-fn live_inventory_summary(inventory: &crate::runtime::LiveInventoryMetadata) -> String {
-    let scope = live_inventory_scope_label(inventory.scope);
-    if inventory.availability.partial {
-        format!(
-            "{scope} (missing: {})",
-            inventory.availability.unavailable_sources.join(", ")
-        )
-    } else {
-        scope.to_string()
-    }
-}
 
 fn configured_client_state_text(client: &crate::commands::clients::ClientView) -> String {
     match client.live_sessions {
@@ -69,7 +39,7 @@ fn configured_client_lazy_tool_text(client: &crate::commands::clients::ClientVie
 fn client_list_json(
     clients: &[crate::commands::clients::ClientView],
     live_sessions: &[crate::commands::clients::LiveSessionView],
-    inventory: &crate::runtime::LiveInventoryMetadata,
+    inventory: &live::LiveInventory,
     live_client_support: LiveClientSupport,
     live_inventory_scope: plug_core::ipc::LiveSessionInventoryScope,
     daemon_error: Option<&str>,
@@ -82,9 +52,6 @@ fn client_list_json(
         "live_session_transports": inventory.session_transports,
         "live_client_support": live_client_support,
         "live_inventory_scope": live_inventory_scope,
-        "inventory_partial": inventory.availability.partial,
-        "inventory_unavailable_sources": inventory.availability.unavailable_sources,
-        "http_sessions_included": inventory.http_sessions_included,
         "daemon_error": daemon_error,
         "config_error": config_error,
         "lazy_tool_policy_scope": "configured",
@@ -344,7 +311,7 @@ pub(crate) async fn cmd_client_list(
             Some("daemon not running".to_string())
         };
         let (live, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
-        let inventory = live_inventory_metadata(&live, live_inventory_scope);
+        let inventory = live::inventory(&live, live_inventory_scope);
         let config_result = plug_core::config::load_config(config_path);
         let config_error = config_result.as_ref().err().map(|error| error.to_string());
         let config = config_result.ok();
@@ -412,8 +379,7 @@ pub(crate) async fn cmd_client_list(
             && daemon_error.is_none()
             && matches!(live_client_support, LiveClientSupport::Supported)
         {
-            print_label_value("Live Inventory", live_inventory_summary(&inventory));
-            print_info_line(live_inventory_scope_text(live_inventory_scope));
+            print_label_value("Live Inventory", live::scope_summary(live_inventory_scope));
             print_label_value("Live Transports", inventory.session_transports.summary());
             if inventory.session_count > 0 {
                 print_info_line(
@@ -528,14 +494,11 @@ pub(crate) async fn cmd_client_list(
 mod tests {
     use super::{
         LiveSessionGroup, client_list_json, configured_client_lazy_tool_text,
-        configured_client_link_text, configured_client_state_text, live_inventory_scope_label,
-        live_inventory_scope_text, live_inventory_summary, live_session_groups,
+        configured_client_link_text, configured_client_state_text, live_session_groups,
         unlinked_clients_text,
     };
     use crate::commands::clients::{ClientView, LiveSessionView};
-    use crate::runtime::{
-        LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts,
-    };
+    use crate::views::live::{LiveInventory, LiveSessionTransportCounts};
 
     #[test]
     fn client_list_json_includes_inventory_contract_fields() {
@@ -570,26 +533,20 @@ mod tests {
             connected_secs: 12,
             last_activity_secs: Some(3),
         }];
-        let inventory = LiveInventoryMetadata {
+        let inventory = LiveInventory {
             session_count: 1,
             session_transports: LiveSessionTransportCounts {
                 daemon_proxy: 0,
                 http: 1,
-                sse: 0,
             },
             scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            availability: LiveInventoryAvailability {
-                partial: true,
-                unavailable_sources: vec!["daemon_proxy", "http"],
-            },
-            http_sessions_included: false,
         };
 
         let json = client_list_json(
             &clients,
             &live_sessions,
             &inventory,
-            crate::runtime::LiveClientSupport::Supported,
+            crate::views::live::LiveClientSupport::Supported,
             plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             Some("daemon unavailable"),
             Some("invalid lazy config"),
@@ -598,34 +555,10 @@ mod tests {
         assert_eq!(json["live_session_count"], 1);
         assert_eq!(json["live_session_transports"]["http"], 1);
         assert_eq!(json["live_inventory_scope"], "unavailable");
-        assert_eq!(json["inventory_partial"], true);
-        assert_eq!(json["inventory_unavailable_sources"][0], "daemon_proxy");
-        assert_eq!(json["http_sessions_included"], false);
         assert_eq!(json["daemon_error"], "daemon unavailable");
         assert_eq!(json["config_error"], "invalid lazy config");
         assert_eq!(json["lazy_tool_policy_scope"], "configured");
         assert_eq!(json["restart_required_for_lazy_tool_config_changes"], true);
-    }
-
-    #[test]
-    fn live_inventory_scope_label_uses_stable_short_states() {
-        assert_eq!(
-            live_inventory_scope_label(
-                plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-            ),
-            "transport-complete"
-        );
-        assert_eq!(
-            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::Unavailable),
-            "unavailable"
-        );
-    }
-
-    #[test]
-    fn live_inventory_scope_text_says_when_nothing_could_be_read() {
-        let unavailable =
-            live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
-        assert!(unavailable.contains("unavailable"));
     }
 
     #[test]
@@ -694,25 +627,6 @@ mod tests {
         assert_eq!(
             configured_client_lazy_tool_text(&client),
             "lazy tools: bridge (client_override) - configured for this client target"
-        );
-    }
-
-    #[test]
-    fn live_inventory_summary_collapses_scope_and_availability() {
-        let inventory = LiveInventoryMetadata {
-            session_count: 0,
-            session_transports: LiveSessionTransportCounts::default(),
-            scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
-            availability: LiveInventoryAvailability {
-                partial: true,
-                unavailable_sources: vec!["daemon_proxy", "http"],
-            },
-            http_sessions_included: false,
-        };
-
-        assert_eq!(
-            live_inventory_summary(&inventory),
-            "unavailable (missing: daemon_proxy, http)"
         );
     }
 
