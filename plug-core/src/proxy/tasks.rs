@@ -470,12 +470,27 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         request: Option<PaginatedRequestParams>,
     ) -> Result<ListTasksResult, McpError> {
-        let (result, cleanup) = {
+        let (tasks, cleanup) = {
             let mut store = self.task_store.lock().await;
-            let result = store.list_for_owner(owner, request);
-            (result, store.take_expired_cleanup())
+            let tasks = store.list_for_owner(owner);
+            (tasks, store.take_expired_cleanup())
         };
         self.finish_expired_task_cleanup(cleanup).await;
+        // A cursor past the end, left by tasks that expired between pages,
+        // is the last page. One Plug never gave out is refused: answering it
+        // with the first page again would loop a client that follows it.
+        let start = match request.and_then(|params| params.cursor) {
+            None => 0,
+            Some(cursor) => cursor
+                .parse::<usize>()
+                .map_err(|_| {
+                    McpError::invalid_params(format!("unknown tasks/list cursor: {cursor}"), None)
+                })?
+                .min(tasks.len()),
+        };
+        let end = usize::min(start + PAGE_SIZE, tasks.len());
+        let mut result = ListTasksResult::new(tasks[start..end].to_vec());
+        result.next_cursor = (end < tasks.len()).then(|| end.to_string());
         Ok(result)
     }
 
@@ -857,13 +872,12 @@ impl super::ToolRouter {
         })
     }
 
-    /// Count of task records currently stored for `owner`. Tasks are
-    /// owner-scoped so this cannot observe another owner's records; it
-    /// exists as a test probe for teardown-cleanup assertions.
+    /// How many task records `owner` has.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub async fn task_count_for_owner(&self, owner: &TaskOwner) -> usize {
         let (count, cleanup) = {
             let mut store = self.task_store.lock().await;
-            let count = store.list_for_owner(owner, None).tasks.len();
+            let count = store.list_for_owner(owner).len();
             (count, store.take_expired_cleanup())
         };
         self.finish_expired_task_cleanup(cleanup).await;
@@ -2723,5 +2737,33 @@ mod tests {
             "unexpected status: {message}"
         );
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_tasks_cursor_plug_never_gave_out_is_refused_not_restarted() {
+        let router = Arc::new(ToolRouter::new(
+            Arc::new(ServerManager::new()),
+            RouterConfig::default(),
+        ));
+        let owner = TaskOwner::new(Arc::<str>::from("cursor-owner"));
+        router
+            .task_store
+            .lock()
+            .await
+            .create(owner.clone(), "Mock__echo")
+            .expect("task");
+        let page = |cursor: &str| {
+            let mut request = PaginatedRequestParams::default();
+            request.cursor = Some(cursor.to_string());
+            router.list_tasks_for_owner(&owner, Some(request))
+        };
+
+        let error = page("not-a-cursor").await.expect_err("an unknown cursor");
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        // Past the end, as tasks expiring between pages leave it: the last
+        // page, empty, not the first one again.
+        let past_end = page("7").await.expect("a cursor past the end");
+        assert!(past_end.tasks.is_empty());
+        assert!(past_end.next_cursor.is_none());
     }
 }

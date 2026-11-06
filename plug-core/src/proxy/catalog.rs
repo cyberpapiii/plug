@@ -178,13 +178,16 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
     }
 }
 
+/// Items in one page of a list Plug answers. Claude Desktop's remote
+/// connector ignores `nextCursor`, so it sees only the first page: every
+/// tool has to fit on it.
+pub(crate) const PAGE_SIZE: usize = 500;
+
 pub(crate) fn paginated_result<T: Clone, R>(
     items: &[T],
     request: Option<PaginatedRequestParams>,
     build: impl FnOnce(Vec<T>, Option<String>) -> R,
 ) -> R {
-    const PAGE_SIZE: usize = 500;
-
     let start = request
         .as_ref()
         .and_then(|params| params.cursor.as_ref())
