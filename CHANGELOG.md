@@ -48,6 +48,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A key kept in a password manager's command-line tool, such as 1Password's `op`, is read with the login shell's PATH as it is when each server starts. Plug used to keep the PATH from the first start that read a key, so if the login shell had not answered by then, the tool stayed not found until Plug restarted.
 - Plug no longer replaces its HTTP bearer or operator token when it cannot read the token file, which disconnected every client holding the token. It replaces the token only when the file is missing or holds something else, and writes it as a new owner-only file put in place in one step, so a link planted at the token's path is replaced rather than written through.
 - A remote client that goes on using a session Plug timed out can still be asked to fill in a form, to sample, and for its roots. The reopened session used to forget what the client said it supports at `initialize`, so those requests stopped until the client connected again. After Plug restarts this is still not known until the client initializes again.
 - A tool whose name is not plain ASCII can be called on a server that speaks the 2026-07-28 protocol. Plug left out the `Mcp-Name` header such a server requires, so the server refused the call; it now sends the name Base64-wrapped, as the protocol says, and reads that form when a client sends it.

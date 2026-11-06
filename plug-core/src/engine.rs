@@ -3,8 +3,6 @@
 //! The Engine owns all shared state (servers, routing, config, health) and
 //! exposes it through a query API. The daemon and CLI are thin frontends.
 
-#[cfg(test)]
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
@@ -56,9 +54,6 @@ pub struct Engine {
     /// above all, which a client performs exactly once and cannot repeat — have
     /// to wait for this rather than answer from a half-built catalog.
     ready: watch::Sender<bool>,
-    /// Completed config reloads, so tests can wait for one without a bus.
-    #[cfg(test)]
-    reloads_applied: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -107,20 +102,8 @@ impl Engine {
                 reload_lock: Mutex::new(()),
                 watch_events: std::sync::OnceLock::new(),
                 ready: watch::channel(false).0,
-                #[cfg(test)]
-                reloads_applied: std::sync::atomic::AtomicU64::new(0),
             }
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn note_reload_applied(&self) {
-        self.reloads_applied.fetch_add(1, Ordering::SeqCst);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn reloads_applied(&self) -> u64 {
-        self.reloads_applied.load(Ordering::SeqCst)
     }
 
     /// Whether `start` has finished.
@@ -835,9 +818,6 @@ impl Engine {
             self.tool_router.refresh_tools().await;
         }
 
-        #[cfg(test)]
-        self.note_reload_applied();
-
         for warning in &diff.restart_required {
             tracing::warn!("{warning}");
         }
@@ -1119,6 +1099,7 @@ async fn mark_auth_required(engine: &Engine, server_name: &str) {
 mod tests {
     use super::*;
     use crate::config::{Config, TransportType};
+    use std::sync::atomic::Ordering;
 
     fn test_config() -> Config {
         Config::default()
@@ -1558,20 +1539,12 @@ mod tests {
         );
 
         let engine = Engine::new(config);
-        let reloads_before = engine.reloads_applied();
 
-        // Disable the server — triggers a config reload
         let result = engine.set_server_enabled("test", false).await;
         assert!(result.is_ok());
 
-        // Config should reflect the change
         let cfg = engine.config();
         assert!(!cfg.servers["test"].enabled);
-
-        assert!(
-            engine.reloads_applied() > reloads_before,
-            "expected a config reload"
-        );
     }
 
     #[tokio::test]

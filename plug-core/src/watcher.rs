@@ -168,8 +168,9 @@ mod tests {
         _dir: TempDir,
         config_path: PathBuf,
         engine: Arc<Engine>,
-        /// Reloads already observed by `wait_for_reload`.
-        seen_reloads: u64,
+        /// The config the last reload `wait_for_reload` saw put in place.
+        /// Every reload stores a new one, even of an unchanged file.
+        seen_config: Arc<Config>,
     }
 
     impl WatcherFixture {
@@ -180,7 +181,7 @@ mod tests {
 
             let engine = Engine::new(Config::default());
             engine.start().await.expect("engine start");
-            let seen_reloads = engine.reloads_applied();
+            let seen_config = Arc::clone(&engine.config());
 
             let ready = spawn_config_watcher(
                 engine.clone(),
@@ -197,7 +198,7 @@ mod tests {
                 _dir: dir,
                 config_path,
                 engine,
-                seen_reloads,
+                seen_config,
             };
 
             // FSEvents can report a file event that predates registration.
@@ -222,9 +223,9 @@ mod tests {
         async fn wait_for_reload(&mut self, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
-                let applied = self.engine.reloads_applied();
-                if applied > self.seen_reloads {
-                    self.seen_reloads = applied;
+                let current = Arc::clone(&self.engine.config());
+                if !Arc::ptr_eq(&current, &self.seen_config) {
+                    self.seen_config = current;
                     return true;
                 }
                 if tokio::time::Instant::now() >= deadline {

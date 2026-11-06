@@ -2443,7 +2443,6 @@ fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
 use rmcp::ServiceExt as _;
 
 use crate::server::{UpstreamClientHandler, UpstreamServer};
-use crate::types::ServerHealth;
 
 /// Async gate: `wait()` parks until `open()`. Same shape as the registry
 /// unit tests' Gate, but per-URI on the upstream side.
@@ -2795,7 +2794,6 @@ async fn connect_subscribable_upstream(
         selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
-        health: ServerHealth::Healthy,
         child_pid: None,
         stderr_tail: None,
     }
@@ -2835,7 +2833,6 @@ async fn connect_modern_tool_upstream(
         selected_protocol_version: crate::protocol::MODERN_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
-        health: ServerHealth::Healthy,
         child_pid: None,
         stderr_tail: None,
     }

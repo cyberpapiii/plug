@@ -1207,7 +1207,6 @@ mod tests {
     use rmcp::service::{RequestContext, RoleServer};
 
     use crate::server::{UpstreamClientHandler, UpstreamServer};
-    use crate::types::ServerHealth;
 
     /// Async gate: `wait()` parks until `open()`. Same shape as the gates in
     /// `proxy::tests`.
@@ -1474,7 +1473,6 @@ mod tests {
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
             connection: crate::server::ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
             child_pid: None,
             stderr_tail: None,
         }
@@ -2451,7 +2449,6 @@ mod tests {
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
             connection: crate::server::ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
             child_pid: None,
             stderr_tail: None,
         }
