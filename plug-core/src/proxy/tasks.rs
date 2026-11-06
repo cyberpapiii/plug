@@ -674,9 +674,10 @@ impl super::ToolRouter {
     /// idle-session expiry loop, which is a single serialized loop — an
     /// unbounded hang here would permanently stop idle cleanup daemon-wide.
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
-        // Durable task and continuation ownership share the authenticated
-        // principal key. Teardown/revocation must invalidate both before any
-        // asynchronous upstream cleanup can be delayed or cancelled.
+        // Revoked before any upstream cleanup can be delayed or cancelled.
+        // The key matches a continuation's owner only for a principal-owned
+        // task, so a session's teardown also revokes by its principal
+        // (`sessions.rs`).
         self.continuation_registry.revoke_owner_key(owner.as_key());
         let drained = self.task_store.lock().await.cleanup_owner(owner);
 
@@ -989,11 +990,9 @@ mod tests {
 
         router.cleanup_tasks_for_owner(&owner_a).await;
 
-        // Give the runtime a moment to run anything it might (incorrectly)
-        // have scheduled for abort before asserting it never happened.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // An aborted task is dropped within a few scheduler turns.
         assert!(
-            !dropped.load(Ordering::SeqCst),
+            !yield_until(&dropped).await,
             "teardown for a different owner must not touch this task"
         );
         assert_eq!(router.task_count_for_owner(&owner_b).await, 1);

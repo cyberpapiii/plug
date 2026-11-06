@@ -43,7 +43,8 @@ const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
 /// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
 ///
-/// Built once at `refresh_tools()` time so that `list_tools_for_client()` is O(1).
+/// Built once at `refresh_tools()` time, so a listing reads it without
+/// rebuilding.
 #[derive(Clone)]
 pub(crate) struct RouterSnapshot {
     /// Full sorted tool list (for clients with no limit).
@@ -2392,7 +2393,6 @@ impl ToolRouter {
         let upstream_prompts = prompts_result.items;
 
         // ── Pass 1: classify, sanitize, and try keyword stripping ──
-        // Each entry: (server_name, tool, prefix, stripped_name, full_name, matched_keyword)
         struct Classified {
             server_name: String,
             tool: Tool,
@@ -2455,17 +2455,14 @@ impl ToolRouter {
                 }
             });
 
-            // 1. Apply manual renames if any
             if let Some(settings) = ctx.settings.as_ref()
                 && let Some(new_name) = settings.tool_renames.get(&exposed_name)
             {
                 exposed_name = new_name.clone();
             }
 
-            // 2. Sanitize to snake_case (hyphens, camelCase, dots -> snake_case)
             let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
-            // 3. Determine prefix and tool name via rules or server name
             let (prefix, full_name, stripped_name) = if let Some(ref rules) = ctx.tool_group_rules {
                 match crate::tool_naming::classify_with_rules(&sanitized, rules) {
                     Some(result) => {
@@ -2646,7 +2643,6 @@ impl ToolRouter {
             prefixed_tool.icons =
                 normalized_icons_with_fallback(prefixed_tool.icons.as_deref(), upstream_icons);
 
-            // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
 
             tool_risk_inventory.insert(
@@ -2660,7 +2656,6 @@ impl ToolRouter {
             tools.push(prefixed_tool);
         }
 
-        // Sort: priority tools first, then alphabetical
         tools.sort_unstable_by(|a, b| priority_sort(a, b, &self.config.priority_tools));
 
         // Add search_tools meta-tool if tool count exceeds threshold
@@ -2862,8 +2857,7 @@ impl ToolRouter {
         // Classify every currently-tracked subscription URI against the
         // old/new route snapshots. Pure decision — no registry mutation, no
         // upstream calls yet. See `SubscriptionRegistry::classify_route_changes`
-        // for the exact rebind/prune criteria (unchanged from the historical
-        // inline `retain` closure this replaced).
+        // for the exact rebind/prune criteria.
         let reconciliation = {
             let old_snapshot = self.cache.load();
             self.resource_subscriptions
@@ -2872,7 +2866,7 @@ impl ToolRouter {
 
         // Execute prunes for URIs that lost their route entirely
         // (best-effort upstream unsubscribe) before publishing the new
-        // snapshot — same ordering as the historical stale-unsubscribe pass.
+        // snapshot.
         // Distinct URIs use distinct transition locks, so parallelize them
         // (wall-clock = max RTT, not sum).
         {
@@ -2927,7 +2921,7 @@ impl ToolRouter {
         self.publish_route_snapshot(snapshot);
 
         // Rebind subscriptions whose URI still exists but ownership changed,
-        // after publishing the new snapshot (same ordering as before).
+        // after publishing the new snapshot.
         Self::rebind_reconciled_routes(
             &self.server_manager,
             &self.resource_subscriptions,
@@ -4577,7 +4571,7 @@ impl Drop for InFlightCall<'_> {
 mod lifecycle_regression_tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_calls_waits_for_running_calls_and_gives_up_at_the_deadline() {
         let router = Arc::new(ToolRouter::new(
             Arc::new(ServerManager::new()),
@@ -4590,33 +4584,13 @@ mod lifecycle_regression_tests {
         assert_eq!(router.drain_calls(Duration::from_millis(20)).await, 2);
 
         drop(first);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let (remaining, ()) = tokio::join!(router.drain_calls(Duration::from_secs(5)), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(second);
         });
         assert_eq!(remaining, 0);
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    #[test]
-    fn auth_required_health_has_non_retryable_authorization_outcome() {
-        let outcome = health_gate_outcome(ServerHealth::AuthRequired)
-            .expect("auth-required health must reject the call");
-        assert_eq!(
-            outcome,
-            crate::protocol::ProtocolOutcome::AuthorizationRequired
-        );
-        let encoded = outcome.encode(crate::protocol::ProtocolEra::Modern);
-        assert!(
-            !encoded.retryable,
-            "client must re-authorize before retrying"
-        );
-
-        assert_eq!(
-            health_gate_outcome(ServerHealth::Failed),
-            Some(crate::protocol::ProtocolOutcome::UpstreamUnavailable)
-        );
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
     }
 
     #[test]

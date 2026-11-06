@@ -28,7 +28,7 @@ use crate::types::ClientType;
 
 /// What the dispatcher needs to know about the caller of one request.
 pub trait DownstreamContext: Send + Sync {
-    /// Who is calling, in which era, with what trust. Built once per request.
+    /// Who is calling, in which era, with what trust.
     fn downstream_call_context(&self) -> DownstreamCallContext;
 
     /// Whether the caller holds a session that per-connection state (the lazy

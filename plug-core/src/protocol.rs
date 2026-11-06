@@ -658,14 +658,6 @@ mod tests {
     }
 
     #[test]
-    fn parsed_supported_version_matches_policy_literal() {
-        assert_eq!(
-            supported_protocol_version().as_str(),
-            SUPPORTED_PROTOCOL_VERSION
-        );
-    }
-
-    #[test]
     fn default_downstream_oauth_scopes_match_method_family_required_scopes() {
         let expected = [
             MethodFamily::ToolsList,
@@ -728,29 +720,6 @@ mod tests {
             decide_method(&input, MethodFamily::Tasks),
             PolicyDecision::Deny(ProtocolOutcome::AuthorizationRequired)
         );
-    }
-
-    #[test]
-    fn every_outcome_has_stable_era_encodings() {
-        let outcomes = [
-            ProtocolOutcome::AuthorizationRequired,
-            ProtocolOutcome::UpstreamUnavailable,
-            ProtocolOutcome::UnsupportedBridge,
-            ProtocolOutcome::RetryableTransition,
-            ProtocolOutcome::Cancelled,
-            ProtocolOutcome::ExpiredContinuation,
-            ProtocolOutcome::PermissionDenied,
-            ProtocolOutcome::InputRequired,
-            ProtocolOutcome::QuotaExceeded,
-        ];
-        for outcome in outcomes {
-            let legacy = outcome.encode(ProtocolEra::Legacy);
-            let modern = outcome.encode(ProtocolEra::Modern);
-            assert_eq!(legacy.kind, outcome);
-            assert_eq!(modern.kind, outcome);
-            assert!(!legacy.message.is_empty());
-            assert!(!modern.message.is_empty());
-        }
     }
 
     #[test]

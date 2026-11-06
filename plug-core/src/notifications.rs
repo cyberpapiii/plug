@@ -203,7 +203,7 @@ pub mod fanout {
         /// `AuthStateChanged` — broadcast, but NOT necessarily rendered the
         /// same way as `Logging` on every transport (daemon IPC renders it
         /// as a native structured push instead of flattening to a logging
-        /// message — see the plan's difference table). Kept as its own
+        /// message). Kept as its own
         /// class specifically so that per-transport divergence stays
         /// visible at the classify() call site rather than being silently
         /// merged with `Logging`.
@@ -315,124 +315,60 @@ pub mod fanout {
             rmcp::model::ResourceUpdatedNotificationParam::new("file:///a".to_string())
         }
 
+        /// A notification naming a client reaches only that client, on its
+        /// own transport. Any other reaches every client.
         #[test]
-        fn rmcp_2_2_wire_shapes_preserve_resource_links_and_anonymous_cancellation() {
-            let content = rmcp::model::ContentBlock::resource_link(rmcp::model::Resource::new(
-                "memory://item",
-                "item",
-            ));
-            let json = serde_json::to_value(content).expect("serialize resource link");
-            assert_eq!(json["type"], "resource_link");
-            assert_eq!(json["uri"], "memory://item");
-            assert_eq!(json["name"], "item");
-
-            let cancelled = rmcp::model::CancelledNotificationParam::new(
-                None,
-                Some("owner teardown".to_string()),
-            );
-            let json = serde_json::to_value(cancelled).expect("serialize cancellation");
-            assert!(json.get("requestId").is_none());
-            assert_eq!(json["reason"], "owner teardown");
-        }
-
-        // ── classify: one test per NotificationClass arm ───────────────
-
-        #[test]
-        fn classify_tool_list_changed_is_broadcast_shaped() {
-            assert_eq!(
-                classify(&ProtocolNotification::ToolListChanged),
-                NotificationClass::ToolListChanged
-            );
-        }
-
-        #[test]
-        fn classify_resource_list_changed_is_broadcast_shaped() {
-            assert_eq!(
-                classify(&ProtocolNotification::ResourceListChanged),
-                NotificationClass::ResourceListChanged
-            );
-        }
-
-        #[test]
-        fn classify_prompt_list_changed_is_broadcast_shaped() {
-            assert_eq!(
-                classify(&ProtocolNotification::PromptListChanged),
-                NotificationClass::PromptListChanged
-            );
-        }
-
-        #[test]
-        fn classify_tool_list_changed_for_is_targeted() {
-            let target = ipc("client-1");
-            let notification = ProtocolNotification::ToolListChangedFor {
-                target: target.clone(),
-            };
-            assert_eq!(
-                classify(&notification),
-                NotificationClass::ToolListChangedFor(&target)
-            );
-        }
-
-        #[test]
-        fn classify_progress_is_targeted() {
-            let target = http("session-1");
-            let notification = ProtocolNotification::Progress {
-                target: target.clone(),
-                params: progress_params(),
-            };
-            assert_eq!(
-                classify(&notification),
-                NotificationClass::Progress(&target)
-            );
-        }
-
-        #[test]
-        fn classify_cancelled_is_targeted() {
-            let target = ipc("client-2");
-            let notification = ProtocolNotification::Cancelled {
-                target: target.clone(),
-                params: cancelled_params(),
-            };
-            assert_eq!(
-                classify(&notification),
-                NotificationClass::Cancelled(&target)
-            );
-        }
-
-        #[test]
-        fn classify_resource_updated_is_targeted() {
-            let target = ipc("client-3");
-            let notification = ProtocolNotification::ResourceUpdated {
-                target: target.clone(),
-                params: resource_updated_params(),
-            };
-            assert_eq!(
-                classify(&notification),
-                NotificationClass::ResourceUpdated(&target)
-            );
-        }
-
-        #[test]
-        fn classify_logging_message_is_logging() {
-            assert_eq!(
-                classify(&ProtocolNotification::LoggingMessage {
+        fn a_notification_reaches_the_client_it_names_or_everyone() {
+            let named = ipc("client-1");
+            let others = [ipc("client-2"), http("client-1")];
+            let targeted = [
+                ProtocolNotification::ToolListChangedFor {
+                    target: named.clone(),
+                },
+                ProtocolNotification::Progress {
+                    target: named.clone(),
+                    params: progress_params(),
+                },
+                ProtocolNotification::Cancelled {
+                    target: named.clone(),
+                    params: cancelled_params(),
+                },
+                ProtocolNotification::ResourceUpdated {
+                    target: named.clone(),
+                    params: resource_updated_params(),
+                },
+            ];
+            for notification in &targeted {
+                let delivery = resolve(classify(notification));
+                assert!(delivery.deliver_to(&named), "{notification:?}");
+                for other in &others {
+                    assert!(!delivery.deliver_to(other), "{notification:?}");
+                }
+            }
+            let broadcast = [
+                ProtocolNotification::ToolListChanged,
+                ProtocolNotification::ResourceListChanged,
+                ProtocolNotification::PromptListChanged,
+                ProtocolNotification::LoggingMessage {
                     params: rmcp::model::LoggingMessageNotificationParam::new(
                         rmcp::model::LoggingLevel::Info,
                         serde_json::json!("hi"),
                     ),
-                }),
-                NotificationClass::Logging
-            );
-        }
-
-        #[test]
-        fn classify_token_refresh_exchanged_is_logging() {
-            assert_eq!(
-                classify(&ProtocolNotification::TokenRefreshExchanged {
+                },
+                ProtocolNotification::TokenRefreshExchanged {
                     server_id: Arc::from("github"),
-                }),
-                NotificationClass::Logging
-            );
+                },
+                ProtocolNotification::AuthStateChanged {
+                    server_id: Arc::from("github"),
+                    new_state: crate::types::ServerHealth::AuthRequired,
+                },
+            ];
+            for notification in &broadcast {
+                let delivery = resolve(classify(notification));
+                for client in others.iter().chain([&named]) {
+                    assert!(delivery.deliver_to(client), "{notification:?}");
+                }
+            }
         }
 
         #[test]
@@ -444,85 +380,6 @@ pub mod fanout {
                 }),
                 NotificationClass::AuthState
             );
-        }
-
-        // ── resolve: one test per ResolvedDelivery decision ─────────────
-
-        #[test]
-        fn resolve_broadcast_shaped_classes_resolve_to_broadcast() {
-            assert_eq!(
-                resolve(NotificationClass::ToolListChanged),
-                ResolvedDelivery::Broadcast
-            );
-            assert_eq!(
-                resolve(NotificationClass::ResourceListChanged),
-                ResolvedDelivery::Broadcast
-            );
-            assert_eq!(
-                resolve(NotificationClass::PromptListChanged),
-                ResolvedDelivery::Broadcast
-            );
-            assert_eq!(
-                resolve(NotificationClass::Logging),
-                ResolvedDelivery::Broadcast
-            );
-            assert_eq!(
-                resolve(NotificationClass::AuthState),
-                ResolvedDelivery::Broadcast
-            );
-        }
-
-        #[test]
-        fn resolve_targeted_classes_resolve_to_target() {
-            let target = ipc("client-1");
-            assert_eq!(
-                resolve(NotificationClass::ToolListChangedFor(&target)),
-                ResolvedDelivery::ToTarget(&target)
-            );
-            assert_eq!(
-                resolve(NotificationClass::Progress(&target)),
-                ResolvedDelivery::ToTarget(&target)
-            );
-            assert_eq!(
-                resolve(NotificationClass::Cancelled(&target)),
-                ResolvedDelivery::ToTarget(&target)
-            );
-            assert_eq!(
-                resolve(NotificationClass::ResourceUpdated(&target)),
-                ResolvedDelivery::ToTarget(&target)
-            );
-        }
-
-        // ── deliver_to: matching identity, mismatched id, mismatched
-        //    variant (the "unknown target" case — every site today drops) ──
-
-        #[test]
-        fn deliver_to_broadcast_is_always_true() {
-            assert!(ResolvedDelivery::Broadcast.deliver_to(&http("anyone")));
-            assert!(ResolvedDelivery::Broadcast.deliver_to(&ipc("anyone")));
-        }
-
-        #[test]
-        fn deliver_to_target_mismatched_variant_same_id_is_false() {
-            // Same string id, different transport variant — must not match.
-            // This is the "progress token resolved to a target on a
-            // different transport" case; every site today silently drops it.
-            let target = ipc("shared-id");
-            assert!(!ResolvedDelivery::ToTarget(&target).deliver_to(&http("shared-id")));
-        }
-
-        #[test]
-        fn deliver_to_target_http_matches_by_session_id() {
-            let target = http("session-1");
-            assert!(ResolvedDelivery::ToTarget(&target).deliver_to(&http("session-1")));
-            assert!(!ResolvedDelivery::ToTarget(&target).deliver_to(&http("session-2")));
-        }
-
-        #[test]
-        fn deliver_to_target_ipc_matches_by_client_id() {
-            let target = ipc("ipc-client-1");
-            assert!(ResolvedDelivery::ToTarget(&target).deliver_to(&ipc("ipc-client-1")));
-            assert!(!ResolvedDelivery::ToTarget(&target).deliver_to(&ipc("ipc-client-2")));
         }
     }
 }

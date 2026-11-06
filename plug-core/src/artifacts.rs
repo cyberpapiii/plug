@@ -217,9 +217,9 @@ impl ArtifactStore {
     }
 
     /// Whose result the artifact at `uri` holds: the server, its own name
-    /// for the tool, and the name Plug listed the tool under. The server is
-    /// unknown for a task's result, and either can be for an artifact kept
-    /// before it was recorded.
+    /// for the tool, and the name Plug listed the tool under. The server and
+    /// the tool can be unknown for an artifact kept before they were
+    /// recorded.
     pub fn source(&self, uri: &str) -> Option<(Option<String>, Option<String>, String)> {
         let request = parse_artifact_uri(uri)?;
         let record = self.records.get(&request.id)?;

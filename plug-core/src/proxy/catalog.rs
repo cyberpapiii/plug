@@ -159,7 +159,7 @@ pub(crate) fn sanitize_description(desc: &str) -> String {
         .collect()
 }
 
-/// Sort comparator: priority tools first (by priority_tools index), then alphabetical.
+/// Priority tools first, in `priority_tools` order, then alphabetical.
 pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> std::cmp::Ordering {
     let a_priority = priority_tools
         .iter()
@@ -534,7 +534,7 @@ pub(crate) fn build_invoke_tool_meta_tool() -> Tool {
 }
 
 impl super::ToolRouter {
-    /// Get the current list of tools (zero-copy via Arc). Returns all tools.
+    /// The tools a client of unknown type sees.
     pub fn list_tools(&self) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
         match self.config.lazy_surface_for_client(ClientType::Unknown) {
@@ -685,7 +685,8 @@ impl super::ToolRouter {
         capabilities
     }
 
-    /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
+    /// The tools a client of `client_type` sees, with no per-client blocks
+    /// applied.
     pub fn list_tools_for_client(&self, client_type: ClientType) -> Arc<Vec<Tool>> {
         self.list_tools_for_client_session(client_type, None, None)
     }
@@ -789,8 +790,7 @@ impl super::ToolRouter {
     /// subscriptions survive a catalog refresh rather than being pruned.
     ///
     /// Counts tracked URIs regardless of transition state (Pending/Active/
-    /// Draining), matching the historical `DashMap::len()` semantics this
-    /// replaced.
+    /// Draining).
     pub fn active_subscription_count(&self) -> usize {
         self.resource_subscriptions.len()
     }

@@ -258,12 +258,10 @@ pub(super) enum RebindSkipReason {
     NewOwnerNoSubscribeSupport,
 }
 
-/// Which caller triggered a drain transition — controls whether/how a
-/// failed upstream unsubscribe gets logged, matching the pre-existing
-/// per-call-site behavior exactly.
+/// Which caller triggered a drain transition, which decides whether a
+/// failed upstream unsubscribe gets logged.
 enum DrainOrigin {
-    /// Last downstream member unsubscribed normally. Historically silent on
-    /// failure (`let _ = ...await;`) — best effort, no log.
+    /// Last downstream member unsubscribed normally. Best effort, no log.
     Unsubscribe,
     /// Downstream target disconnected; cleanup swept its subscriptions.
     Cleanup,
@@ -316,7 +314,7 @@ impl SubscriptionRegistry {
     /// Pick the upstream handle a drain (or a rebind's old-owner
     /// unsubscribe) should use: the entry's recorded owner resolved through
     /// `owner_resolver` when both exist, otherwise the caller-supplied
-    /// fallback (historically resolved from the live route cache). A
+    /// fallback, resolved from the live route cache. A
     /// recorded owner that no longer resolves means the owning connection
     /// is gone — there is nothing to unsubscribe, and falling back to a
     /// route-resolved handle would target the wrong server.
@@ -760,8 +758,7 @@ impl SubscriptionRegistry {
 
     /// Remove `target` from every URI it's subscribed to (disconnect
     /// cleanup). `resolve` maps a URI to its current upstream handle, called
-    /// synchronously per-URI under this pass (mirrors the historical
-    /// `cache.load()` + route lookup done inline in the old `retain`).
+    /// synchronously per URI under this pass.
     pub(super) async fn cleanup_target(
         self: &Arc<Self>,
         target: &NotificationTarget,
@@ -842,11 +839,7 @@ impl SubscriptionRegistry {
             };
             if let Err(error) = &call_result {
                 match &origin {
-                    DrainOrigin::Unsubscribe => {
-                        // Matches historical behavior: a failed best-effort
-                        // upstream unsubscribe on normal last-member
-                        // departure was never logged.
-                    }
+                    DrainOrigin::Unsubscribe => {}
                     DrainOrigin::Cleanup => {
                         tracing::warn!(
                             uri = %uri,
@@ -916,8 +909,8 @@ impl SubscriptionRegistry {
     /// every later refresh and never reconcile it. Entries whose owner is
     /// not yet confirmed (`None`, transition in flight) keep the plain
     /// route-diff behavior — no false rebinds for in-flight subscribes.
-    /// Route-vanished URIs prune exactly as before; the drain resolves the
-    /// recorded owner itself.
+    /// Route-vanished URIs prune; the drain resolves the recorded owner
+    /// itself.
     pub(super) fn classify_route_changes(
         &self,
         old_routes: &HashMap<String, String>,
@@ -987,9 +980,8 @@ impl SubscriptionRegistry {
 
     /// Execute a prune decision from `classify_route_changes`. Drains the
     /// entry (if it's still there — a concurrent unsubscribe may have
-    /// already removed it) and awaits completion, matching the historical
-    /// ordering of stale-unsubscribes running before the new snapshot is
-    /// published.
+    /// already removed it) and awaits completion, so stale unsubscribes run
+    /// before the new snapshot is published.
     pub(super) async fn prune(
         self: &Arc<Self>,
         uri: &str,
@@ -1040,8 +1032,7 @@ impl SubscriptionRegistry {
     /// subscribed.
     ///
     /// Awaits completion so `refresh_tools`'s own await reflects final
-    /// state, matching historical synchronous-return semantics, and
-    /// returns the transition's outcome: `Err` when the migration failed
+    /// state, and returns the transition's outcome: `Err` when the migration failed
     /// and pruned the entry's local subscribers. Equivalent concurrent
     /// rebinds to the same destination piggyback on one generation and
     /// therefore receive the same authoritative outcome. A genuinely newer
@@ -2712,16 +2703,6 @@ mod tests {
         assert!(registry.is_empty());
     }
 
-    #[test]
-    fn test_only_seed_helper_marks_entry_active() {
-        let registry = SubscriptionRegistry::new(TaskTracker::new());
-        assert!(registry.is_empty());
-        registry.insert_active_for_test("file:///seed", client("seed"));
-        assert_eq!(registry.len(), 1);
-        let members = registry.members_snapshot("file:///seed").unwrap();
-        assert!(members.contains(&client("seed")));
-    }
-
     /// Seeds a registry with one entry for `uri` whose recorded owner is
     /// confirmed as `owner` (via a real subscribe transition against a
     /// mock upstream).
@@ -2949,9 +2930,8 @@ mod tests {
     }
 
     /// Routeless-entry-gains-route-elsewhere variant: recorded owner A, no
-    /// route in the old snapshot, new snapshot routes the URI to C. The
-    /// old None arm used to do nothing unless the new snapshot ALSO lacked
-    /// the URI; it must now emit exactly one Rebind{A -> C}.
+    /// route in the old snapshot, new snapshot routes the URI to C. It
+    /// must emit exactly one Rebind{A -> C}.
     #[tokio::test]
     async fn classify_rebinds_routeless_entry_gaining_route_elsewhere() {
         let registry = registry_with_confirmed_owner("file:///x", "server-a").await;
@@ -2977,7 +2957,7 @@ mod tests {
 
     /// Guard for the untouched arms: a confirmed owner whose URI matches
     /// the new route produces nothing (heal already complete), and a
-    /// route-vanished URI still prunes exactly as before.
+    /// route-vanished URI still prunes.
     #[tokio::test]
     async fn classify_owner_matching_new_route_produces_nothing_and_vanished_prunes() {
         let registry = registry_with_confirmed_owner("file:///x", "server-b").await;

@@ -20,8 +20,8 @@ pub(crate) const DEFAULT_STALE_IN_FLIGHT_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 /// session is still live. Checked by `enqueue_tool_task` immediately after it
 /// registers its [`OwnerCreateGuard`], closing the race where a teardown
 /// completes *entirely* before the enqueue registers anything (so the
-/// tombstone never sees the create). `None` means the transport has no
-/// teardown path that could race task creation (stdio).
+/// tombstone never sees the create). `None` means the caller has no
+/// teardown that could race task creation.
 pub type OwnerLivenessProbe = Arc<dyn Fn() -> bool + Send + Sync>;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -99,13 +99,9 @@ pub(crate) struct ExpiredTaskCleanup {
 
 type CancelledTaskParts = (Task, Option<TaskUpstreamRef>, Option<JoinHandle<()>>);
 
-/// Outcome of [`TaskStore::set_upstream_request`].
-///
-/// `Missing` and "recorded with no pending cancel" must be distinguishable:
-/// the old `Option<String>` return conflated them, so a record that vanished
-/// between the upstream send and this call (owner teardown draining the
-/// store) could never trigger an upstream cancellation from the dispatch
-/// path.
+/// Outcome of [`TaskStore::set_upstream_request`]. `Missing` means the
+/// record vanished between the upstream send and this call (owner teardown
+/// drained the store), so the caller must cancel the upstream request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpstreamRecordOutcome {
     /// No record exists for the task id: the owner was torn down (or the

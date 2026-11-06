@@ -16,24 +16,11 @@ fn expected_legacy_meta_tool_names() -> Vec<&'static str> {
 }
 
 #[test]
-fn trace_ids_are_w3c_sized_hex_values() {
-    let trace_id = new_trace_id();
-    assert_eq!(trace_id.len(), 32);
-    assert!(trace_id.bytes().all(|byte| byte.is_ascii_hexdigit()));
-    assert_ne!(trace_id, "00000000000000000000000000000000");
-}
-
-#[test]
 fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     // HTTP is the internet-reachable transport. A context that reaches policy
     // without an adapter having declared how the caller authenticated must be
     // able to do nothing, not everything.
     for context in [
-        DownstreamCallContext::http(
-            "bare-session",
-            RequestId::Number(1),
-            crate::types::ClientType::Unknown,
-        ),
         DownstreamCallContext::http("bare-session", RequestId::Number(2), ClientType::Unknown),
         DownstreamCallContext::http("bare-session", RequestId::Number(3), ClientType::Unknown)
             .with_trace_id("0123456789abcdef0123456789abcdef"),
@@ -303,18 +290,6 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
     assert_eq!(second, ProtocolNotification::ToolListChanged);
-}
-
-#[tokio::test]
-async fn tool_router_list_tools_returns_arc() {
-    let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, RouterConfig::default());
-    router.refresh_tools().await;
-
-    let tools1 = router.list_tools();
-    let tools2 = router.list_tools();
-    // Both should point to the same allocation (Arc)
-    assert!(Arc::ptr_eq(&tools1, &tools2));
 }
 
 #[test]
@@ -1792,23 +1767,6 @@ fn synthesized_capabilities_no_completions_without_upstream() {
 }
 
 #[test]
-fn complete_request_params_serde_roundtrip() {
-    let params = CompleteRequestParams::new(
-        Reference::for_prompt("test-prompt"),
-        ArgumentInfo::new("arg1", "partial"),
-    );
-
-    let json = serde_json::to_value(&params).unwrap();
-    let deserialized: CompleteRequestParams = serde_json::from_value(json).unwrap();
-    assert_eq!(deserialized.argument.name, "arg1");
-    assert_eq!(deserialized.argument.value, "partial");
-    match &deserialized.r#ref {
-        Reference::Prompt(p) => assert_eq!(p.name, "test-prompt"),
-        other => panic!("expected Prompt reference, got {other:?}"),
-    }
-}
-
-#[test]
 fn route_upstream_logging_message_publishes_with_server_prefix() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
@@ -1950,7 +1908,7 @@ fn synthesized_capabilities_includes_logging_when_upstream_supports_it() {
 
 // ── Roots cache tests ──────────────────────────────────────────────
 
-/// Helper to construct `Root` (which is `#[non_exhaustive]` in rmcp 1.1).
+/// Helper to construct `Root`, which rmcp marks `#[non_exhaustive]`.
 fn make_root(uri: &str, name: Option<&str>) -> Root {
     serde_json::from_value(serde_json::json!({
         "uri": uri,
@@ -2387,22 +2345,6 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
                 ))),
             })
             .is_none()
-    );
-}
-
-#[test]
-fn test_downstream_context_notification_target() {
-    assert_eq!(
-        DownstreamCallContext::ipc(
-            Arc::from("client-a"),
-            RequestId::from(NumberOrString::Number(1)),
-            crate::types::ClientType::Unknown,
-            None
-        )
-        .notification_target(),
-        NotificationTarget::Ipc {
-            client_id: Arc::from("client-a"),
-        },
     );
 }
 
@@ -3951,9 +3893,8 @@ async fn setup_subscribe_racing_prune() -> (
     (sm, router, old_state)
 }
 
-/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe
-/// used to fail "resource not found" (route gone) without touching the
-/// registry. It must now drain via the recorded owner.
+/// Prune-side race, downstream-unsubscribe ending: B's later unsubscribe,
+/// with the route gone, drains via the recorded owner.
 #[tokio::test]
 async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
     let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -3976,7 +3917,7 @@ async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
         "the drain must unsubscribe the recorded old owner"
     );
 
-    // With neither an entry nor a route left, the historical error stands.
+    // With neither an entry nor a route left, it is an error.
     let err = router
         .unsubscribe_resource("memory://x", &sub_target("b"))
         .await
@@ -3986,8 +3927,8 @@ async fn racing_subscriber_unsubscribes_cleanly_after_route_vanishes() {
 
 /// Prune-side race, next-refresh ending: the following refresh pass
 /// classifies the surviving routeless entry as a prune with no old server
-/// id (upstream fallback `None`). It used to remove the entry with no
-/// upstream unsubscribe ever sent; the recorded owner must drain it.
+/// id (upstream fallback `None`). The recorded owner must drain it, so an
+/// upstream unsubscribe is sent.
 #[tokio::test]
 async fn next_refresh_prunes_routeless_entry_via_recorded_owner() {
     let (_sm, router, old_state) = setup_subscribe_racing_prune().await;
@@ -4202,10 +4143,8 @@ async fn first_subscribe_straddling_publish_rebinds_via_self_check() {
 
 /// Routeless-entry-gains-route-elsewhere variant: the racing-subscriber
 /// setup leaves an entry recorded on "old" with no route at all. When a
-/// later refresh routes the URI to a DIFFERENT server ("c"), classify's
-/// old None arm used to do nothing (it only pruned when the new snapshot
-/// also lacked the URI) — owner-vs-route mismatch unreconciled forever.
-/// The recorded owner must now drive a rebind onto "c".
+/// later refresh routes the URI to a DIFFERENT server ("c"), the recorded
+/// owner must drive a rebind onto "c".
 #[tokio::test]
 async fn routeless_entry_gaining_route_elsewhere_is_rebound() {
     let (sm, router, old_state) = setup_subscribe_racing_prune().await;

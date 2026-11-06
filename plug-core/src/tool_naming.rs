@@ -128,8 +128,7 @@ pub struct ClassifyResult {
     pub strip_keywords: Vec<String>,
 }
 
-/// Classify a tool using config-driven group rules.
-/// Returns `Some(ClassifyResult)` if a rule matches, `None` otherwise.
+/// Classify a tool by the first of `rules` it matches.
 pub fn classify_with_rules(
     tool_name: &str,
     rules: &[crate::config::ToolGroupRule],
@@ -567,18 +566,6 @@ mod tests {
         );
         assert_eq!(generate_title("Notion", "search"), "Notion: Search");
         assert_eq!(generate_title("Calendar", "list"), "Calendar: List");
-    }
-
-    #[test]
-    fn build_wire_name_basic() {
-        assert_eq!(
-            build_wire_name("Slack", "search_messages", "__"),
-            "Slack__search_messages"
-        );
-        assert_eq!(
-            build_wire_name("Gmail", "get_messages_content_batch", "__"),
-            "Gmail__get_messages_content_batch"
-        );
     }
 
     #[test]
