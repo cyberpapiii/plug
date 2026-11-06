@@ -183,21 +183,30 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
 /// tool has to fit on it.
 pub(crate) const PAGE_SIZE: usize = 500;
 
+/// The page of `items` that `request`'s cursor points at, built by `build`.
+///
+/// A cursor past the end, left by items that went away between pages, is
+/// the last page. One Plug never gave out is refused: answering it with the
+/// first page again would loop a client that follows it.
 pub(crate) fn paginated_result<T: Clone, R>(
+    method: &str,
     items: &[T],
     request: Option<PaginatedRequestParams>,
     build: impl FnOnce(Vec<T>, Option<String>) -> R,
-) -> R {
-    let start = request
-        .as_ref()
-        .and_then(|params| params.cursor.as_ref())
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .filter(|idx| *idx < items.len())
-        .unwrap_or(0);
+) -> Result<R, McpError> {
+    let start = match request.and_then(|params| params.cursor) {
+        None => 0,
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| {
+                McpError::invalid_params(format!("unknown {method} cursor: {cursor}"), None)
+            })?
+            .min(items.len()),
+    };
     let end = usize::min(start + PAGE_SIZE, items.len());
     let next_cursor = (end < items.len()).then(|| end.to_string());
 
-    build(items[start..end].to_vec(), next_cursor)
+    Ok(build(items[start..end].to_vec(), next_cursor))
 }
 
 /// Cache directives for Plug's synthesized multi-upstream catalog pages.
@@ -539,7 +548,7 @@ impl super::ToolRouter {
         &self,
         client_type: ClientType,
         request: Option<PaginatedRequestParams>,
-    ) -> ListToolsResult {
+    ) -> Result<ListToolsResult, McpError> {
         self.list_tools_page_for_client_session(client_type, None, None, request)
     }
 
@@ -549,15 +558,17 @@ impl super::ToolRouter {
         session_key: Option<&str>,
         client_key: Option<&str>,
         request: Option<PaginatedRequestParams>,
-    ) -> ListToolsResult {
+    ) -> Result<ListToolsResult, McpError> {
         let tools = self.list_tools_for_client_session(client_type, session_key, client_key);
-        paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
-            meta: None,
-            next_cursor,
-            tools,
-            ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
-            cache_scope: Some(synthesized_catalog_cache_scope()),
-            ..Default::default()
+        paginated_result("tools/list", &tools, request, |tools, next_cursor| {
+            ListToolsResult {
+                meta: None,
+                next_cursor,
+                tools,
+                ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
+                cache_scope: Some(synthesized_catalog_cache_scope()),
+                ..Default::default()
+            }
         })
     }
 
@@ -814,18 +825,21 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
         client_key: Option<&str>,
-    ) -> ListResourcesResult {
+    ) -> Result<ListResourcesResult, McpError> {
         let resources = self.list_resources_for_client(client_key);
-        paginated_result(&resources, request, |resources, next_cursor| {
-            ListResourcesResult {
+        paginated_result(
+            "resources/list",
+            &resources,
+            request,
+            |resources, next_cursor| ListResourcesResult {
                 meta: None,
                 next_cursor,
                 resources,
                 ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
                 cache_scope: Some(synthesized_catalog_cache_scope()),
                 ..Default::default()
-            }
-        })
+            },
+        )
     }
 
     pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
@@ -861,9 +875,10 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
         client_key: Option<&str>,
-    ) -> ListResourceTemplatesResult {
+    ) -> Result<ListResourceTemplatesResult, McpError> {
         let resource_templates = self.list_resource_templates_for_client(client_key);
         paginated_result(
+            "resources/templates/list",
             &resource_templates,
             request,
             |resource_templates, next_cursor| ListResourceTemplatesResult {
@@ -907,9 +922,9 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
         client_key: Option<&str>,
-    ) -> ListPromptsResult {
+    ) -> Result<ListPromptsResult, McpError> {
         let prompts = self.list_prompts_for_client(client_key);
-        paginated_result(&prompts, request, |prompts, next_cursor| {
+        paginated_result("prompts/list", &prompts, request, |prompts, next_cursor| {
             ListPromptsResult {
                 meta: None,
                 next_cursor,

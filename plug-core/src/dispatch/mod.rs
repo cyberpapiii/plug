@@ -200,7 +200,7 @@ async fn route(
                 lazy_session_key.as_deref(),
                 client_key,
                 optional_params::<PaginatedRequestParams>(params, method)?,
-            ))
+            )?)
         }
         "tools/call" => tools_call(router, ctx, call, params).await,
         "resources/list" => {
@@ -208,14 +208,14 @@ async fn route(
             to_value(router.list_resources_page(
                 optional_params::<PaginatedRequestParams>(params, method)?,
                 client_key,
-            ))
+            )?)
         }
         "resources/templates/list" => {
             call.authorize(MethodFamily::ResourcesList)?;
             to_value(router.list_resource_templates_page(
                 optional_params::<PaginatedRequestParams>(params, method)?,
                 client_key,
-            ))
+            )?)
         }
         "resources/read" => {
             call.authorize(MethodFamily::ResourcesRead)?;
@@ -245,7 +245,7 @@ async fn route(
             to_value(router.list_prompts_page(
                 optional_params::<PaginatedRequestParams>(params, method)?,
                 client_key,
-            ))
+            )?)
         }
         "prompts/get" => {
             call.authorize(MethodFamily::PromptsGet)?;

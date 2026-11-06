@@ -108,8 +108,7 @@ pub(super) async fn send_ipc_control_notification(
             let notif = IpcResponse::LoggingNotification {
                 params: serde_json::to_value(
                     plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
-                        skipped as u64,
-                        "ipc",
+                        skipped, "ipc",
                     ),
                 )
                 .unwrap_or_default(),

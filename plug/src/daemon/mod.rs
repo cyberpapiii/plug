@@ -155,6 +155,7 @@ fn lock_with_retry(
 fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .read(true)
         .open(pid_path)
@@ -945,11 +946,10 @@ async fn handle_ipc_loop(
                     Err(TryRecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "IPC logging notification lagged");
                         let synthetic = IpcResponse::LoggingNotification {
-                            params: serde_json::json!({
-                                "level": "warning",
-                                "logger": "plug",
-                                "data": format!("skipped {skipped} log messages")
-                            }),
+                            params: serde_json::to_value(
+                                plug_core::notifications::ProtocolNotification::lagged_logging_params(skipped),
+                            )
+                            .unwrap_or_default(),
                         };
                         ipc::send_response(writer, &synthetic).await.ok();
                     }
@@ -973,7 +973,7 @@ async fn handle_ipc_loop(
                         let notif = IpcResponse::LoggingNotification {
                             params: serde_json::to_value(
                                 plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
-                                    skipped as u64,
+                                    skipped,
                                     "ipc",
                                 ),
                             )
@@ -1106,11 +1106,8 @@ async fn send_ipc_logging_notification(
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC logging notification lagged");
             let synthetic = IpcResponse::LoggingNotification {
-                params: serde_json::json!({
-                    "level": "warning",
-                    "logger": "plug",
-                    "data": format!("skipped {skipped} log messages")
-                }),
+                params: serde_json::to_value(ProtocolNotification::lagged_logging_params(skipped))
+                    .unwrap_or_default(),
             };
             ipc::send_response(writer, &synthetic).await.ok();
         }
@@ -2012,14 +2009,12 @@ pub async fn shutdown_signal(cancel: CancellationToken, _router: Arc<ToolRouter>
 /// Must be called BEFORE any other tracing subscriber is initialized.
 pub fn setup_file_logging(
     log_directory: &std::path::Path,
+    filter: tracing_subscriber::EnvFilter,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     ensure_dir(log_directory)?;
 
     let file_appender = ReopeningLog::open(log_directory, LOG_FILE_CHECK_EVERY)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| crate::default_log_filter("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -2366,7 +2361,7 @@ mod tests {
 
     pub(super) fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
         let config = plug_core::config::load_config(Some(&config_path)).unwrap();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         let client_registry = ClientRegistry::new();
         test_connection_context(
             &engine,
@@ -2542,7 +2537,7 @@ allowed_servers = ["slack"]
         config
             .servers
             .insert("mock".to_string(), mock_server("echo"));
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
         let oauth_path =
             std::env::temp_dir().join(format!("plug-daemon-revoke-{}.json", uuid::Uuid::new_v4()));
@@ -2643,6 +2638,7 @@ allowed_servers = ["slack"]
 
         let claiming = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&pid_file)
@@ -2799,7 +2795,7 @@ allowed_servers = ["slack"]
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
 
         let startup = {
             let engine = engine.clone();
@@ -2866,7 +2862,7 @@ allowed_servers = ["slack"]
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
 
         let result = run_daemon(engine, config_path).await;
         assert!(result.is_err(), "losing concurrent start should fail");
@@ -2907,7 +2903,7 @@ allowed_servers = ["slack"]
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
 
         let result = run_daemon(engine, config_path).await;
         assert!(
@@ -3172,7 +3168,7 @@ allowed_servers = ["slack"]
             for (name, server) in servers {
                 config.servers.insert(name.to_string(), server);
             }
-            let engine = Arc::new(Engine::new(config));
+            let engine = Engine::new(config);
             engine.start().await.expect("engine start");
 
             // Short unique socket path in /tmp — a Unix socket path must fit in
@@ -3406,7 +3402,7 @@ allowed_servers = ["slack"]
     #[tokio::test]
     async fn idle_registered_connection_services_reverse_request_without_new_client_frame() {
         let config = plug_core::config::Config::default();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
 
         let socket_path = std::path::PathBuf::from(format!(
@@ -3525,7 +3521,7 @@ allowed_servers = ["slack"]
     /// without sending another request.
     #[tokio::test]
     async fn registered_connection_is_pushed_modern_gate_changes() {
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
 
         let socket_path = std::path::PathBuf::from(format!(
@@ -3595,7 +3591,7 @@ allowed_servers = ["slack"]
     #[tokio::test]
     async fn failed_deregister_does_not_kill_reverse_channel() {
         let config = plug_core::config::Config::default();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
 
         let socket_path = std::path::PathBuf::from(format!(
@@ -3884,7 +3880,7 @@ allowed_servers = ["slack"]
         config
             .servers
             .insert("mock".to_string(), parity_mock_config());
-        Arc::new(Engine::new(config))
+        Engine::new(config)
     }
 
     /// HTTP: drive a `tools/call` through the real axum router and return the raw
@@ -4580,7 +4576,7 @@ allowed_servers = ["slack"]
             plug_core::ipc::IPC_PROTOCOL_VERSION + 1,
         ] {
             let client_registry = ClientRegistry::new();
-            let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+            let engine = Engine::new(plug_core::config::Config::default());
             let mut ctx = test_connection_context(
                 &engine,
                 CancellationToken::new(),

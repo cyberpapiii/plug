@@ -26,7 +26,6 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-#[cfg(unix)]
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 
 use crate::config::HttpConfig;
@@ -119,7 +118,6 @@ pub(crate) fn inspect_owner_enrollment_in_dir(
         }
         Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
     };
-    #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt as _;
         let Ok(metadata) = file.metadata() else {
@@ -145,7 +143,7 @@ pub(crate) fn inspect_owner_enrollment_in_dir(
 
 #[derive(Debug, Clone)]
 pub struct DownstreamOauthManager {
-    pub config: DownstreamOauthConfig,
+    config: DownstreamOauthConfig,
     pub owner_security: Arc<OwnerSecurity>,
     state: Arc<Mutex<DownstreamOauthState>>,
     principal_lifecycles: Arc<dashmap::DashMap<String, Arc<PrincipalLifecycleState>>>,
@@ -382,12 +380,6 @@ pub struct AccessTokenClaims {
     pub scopes: Vec<String>,
     pub resource: String,
     pub principal_lifecycle: PrincipalLifecycleLease,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum AccessTokenValidation {
-    Valid(AccessTokenClaims),
-    Invalid,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -834,6 +826,11 @@ impl DownstreamOauthManager {
     /// The protected resource tokens from this issuer are bound to.
     pub fn resource(&self) -> String {
         self.url(paths::MCP)
+    }
+
+    /// The scopes a client may be granted.
+    pub fn scopes(&self) -> &[String] {
+        &self.config.oauth_scopes
     }
 
     #[cfg(test)]
@@ -1731,28 +1728,24 @@ impl DownstreamOauthManager {
         &self,
         token: &str,
         resource: &str,
-    ) -> AccessTokenValidation {
+    ) -> Option<AccessTokenClaims> {
         if self.durability_degraded() {
-            return AccessTokenValidation::Invalid;
+            return None;
         }
         let guard = self.state.lock().await;
-        let Some(record) = guard.access_tokens.get(token) else {
-            return AccessTokenValidation::Invalid;
-        };
+        let record = guard.access_tokens.get(token)?;
         if record.expires_at <= epoch_secs()
             || record.resource != resource
             || !guard.clients.contains_key(&record.client_id)
         {
-            return AccessTokenValidation::Invalid;
+            return None;
         }
-        AccessTokenValidation::Valid(AccessTokenClaims {
+        Some(AccessTokenClaims {
             client_id: record.client_id.clone(),
             scopes: record.scopes.clone(),
             resource: record.resource.clone(),
             principal_lifecycle: {
-                let Some(lifecycle) = self.principal_lifecycles.get(&record.client_id) else {
-                    return AccessTokenValidation::Invalid;
-                };
+                let lifecycle = self.principal_lifecycles.get(&record.client_id)?;
                 let generation = lifecycle.generation.load(Ordering::SeqCst);
                 let lease = PrincipalLifecycleLease {
                     state: Arc::clone(lifecycle.value()),
@@ -1779,7 +1772,7 @@ impl DownstreamOauthManager {
                     }),
                 };
                 if !lease.is_active() {
-                    return AccessTokenValidation::Invalid;
+                    return None;
                 }
                 lease
             },
@@ -2329,16 +2322,10 @@ fn issue_token_pair(
     }
 }
 
-fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
-    let query = pairs
-        .iter()
-        .fold(
-            url::form_urlencoded::Serializer::new(String::new()),
-            |mut serializer, (key, value)| {
-                serializer.append_pair(key, value);
-                serializer
-            },
-        )
+/// `base` with `pairs` appended to its query.
+pub(crate) fn redirect_with_params(base: &str, pairs: &[(&str, &str)]) -> String {
+    let query = url::form_urlencoded::Serializer::new(String::new())
+        .extend_pairs(pairs)
         .finish();
     format!(
         "{base}{}{query}",
@@ -2494,7 +2481,6 @@ fn persist_bytes(
     let tmp = temporary_state_path(path);
     let mut options = std::fs::OpenOptions::new();
     options.create_new(true).write(true);
-    #[cfg(unix)]
     options.mode(0o600);
     {
         use std::io::Write as _;
@@ -2508,7 +2494,6 @@ fn persist_bytes(
             return Err(DownstreamOauthError::Persistence(error.to_string()));
         }
     }
-    #[cfg(unix)]
     if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
         let _ = std::fs::remove_file(&tmp);
         return Err(DownstreamOauthError::Persistence(error.to_string()));
@@ -2563,12 +2548,10 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
     let lock_path = path.with_extension("lock");
     let mut options = std::fs::OpenOptions::new();
     options.create(true).read(true).write(true);
-    #[cfg(unix)]
     options.mode(0o600);
     let file = options
         .open(&lock_path)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    #[cfg(unix)]
     std::fs::set_permissions(&lock_path, std::fs::Permissions::from_mode(0o600))
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
     // A restart that races the previous writer's exit is not a second writer.
@@ -2627,15 +2610,7 @@ fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
         }
     }
 
-    #[cfg(unix)]
-    {
-        std::fs::File::open(dir)?.sync_all()
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = dir;
-        Ok(())
-    }
+    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -4008,7 +3983,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(state_dir);
     }
 
-    #[cfg(unix)]
     #[tokio::test]
     async fn owner_enrollment_probe_rejects_state_visible_to_other_users() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -4147,7 +4121,7 @@ mod tests {
         let manager = DownstreamOauthManager::new_with_state_path(wider, path)
             .expect("v3 state with scope_model loads");
         let resource = manager.resource();
-        let AccessTokenValidation::Valid(claims) = manager
+        let Some(claims) = manager
             .validate_access_token_for("access-existing", &resource)
             .await
         else {
@@ -4288,7 +4262,7 @@ mod tests {
         let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let resource = "https://plug.example.com/mcp";
-        let AccessTokenValidation::Valid(open) = manager
+        let Some(open) = manager
             .validate_access_token_for(&tokens.access_token, resource)
             .await
         else {
@@ -4374,12 +4348,12 @@ mod tests {
                 .any(|listed| listed.client_id == client.client_id && listed.signed_in)
         );
         for pair in [&first, &second] {
-            assert!(matches!(
+            assert!(
                 manager
                     .validate_access_token_for(&pair.access_token, resource)
-                    .await,
-                AccessTokenValidation::Valid(_)
-            ));
+                    .await
+                    .is_some()
+            );
         }
 
         // A third process that sat idle for an hour still holds the first
@@ -4394,12 +4368,12 @@ mod tests {
             .exchange_refresh_token(&client.client_id, &original_refresh, resource)
             .await
             .expect("the idle process, an hour later, renews too");
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(&first.access_token, resource)
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .await
+                .is_some()
+        );
 
         // Another client presenting the spent token is not that race.
         let other = register(&manager, "Other", "http://localhost:8788/callback").await;
@@ -4453,7 +4427,7 @@ mod tests {
         let rotated_refresh = rotated.refresh_token.expect("rotated refresh token");
 
         // The rotated pair works before the replay.
-        let AccessTokenValidation::Valid(open_under_it) = manager
+        let Some(open_under_it) = manager
             .validate_access_token_for(&rotated.access_token, "https://plug.example.com/mcp")
             .await
         else {
@@ -4485,7 +4459,7 @@ mod tests {
             manager
                 .validate_access_token_for(&rotated.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid,
+            None,
             "the descendant access token must not outlive the replay"
         );
         assert!(
@@ -4541,15 +4515,10 @@ mod tests {
         ));
 
         assert!(
-            matches!(
-                manager
-                    .validate_access_token_for(
-                        &bystander.access_token,
-                        "https://plug.example.com/mcp",
-                    )
-                    .await,
-                AccessTokenValidation::Valid(_)
-            ),
+            manager
+                .validate_access_token_for(&bystander.access_token, "https://plug.example.com/mcp",)
+                .await
+                .is_some(),
             "an unrelated authorization for the same client must survive"
         );
     }
@@ -4612,7 +4581,7 @@ mod tests {
             manager
                 .validate_access_token_for(&original.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
         // While the directory still cannot be synced, nothing new is issued.
         fail_next_parent_dir_sync_attempts_for_tests(1);
@@ -4664,7 +4633,7 @@ mod tests {
             .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
-            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            Some(claims) => claims.principal_lifecycle,
             other => panic!("expected valid token before revoke, got {other:?}"),
         };
         fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
@@ -4678,7 +4647,7 @@ mod tests {
             manager
                 .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
         let disk = load_persisted_state(&path).expect("read committed revocation");
         assert!(disk.revoked_client_ids.contains(&client.client_id));
@@ -4705,7 +4674,7 @@ mod tests {
             restarted
                 .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp",)
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
     }
 
@@ -5560,12 +5529,12 @@ mod tests {
 
         let cursor_tokens = issue_tokens(&manager, &cursor).await;
         let access = cursor_tokens.access_token.clone();
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(&access, "https://plug.example.com/mcp")
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .await
+                .is_some()
+        );
         assert_eq!(
             manager
                 .exchange_refresh_token(
@@ -5587,12 +5556,12 @@ mod tests {
             .expect("rotate refresh token");
         assert_ne!(rotated.refresh_token, cursor_tokens.refresh_token);
         // The original access token outlives the rotation itself.
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(&access, "https://plug.example.com/mcp")
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .await
+                .is_some()
+        );
         age_spent_refresh_tokens(&manager).await;
         assert_eq!(
             manager
@@ -5612,21 +5581,21 @@ mod tests {
             manager
                 .validate_access_token_for(&access, "https://plug.example.com/mcp")
                 .await,
-            AccessTokenValidation::Invalid
+            None
         );
         // Claude's earlier attempt with Cursor's live token did not revoke
         // anything, so client isolation still holds: only reuse of a spent
         // token trips the revocation.
         let claude_tokens = issue_tokens(&manager, &claude).await;
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(
                     &claude_tokens.access_token,
                     "https://plug.example.com/mcp"
                 )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -5703,12 +5672,12 @@ mod tests {
         let restarted = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("restart manager");
         assert_eq!(restarted.list_clients().await.len(), 1);
-        assert!(matches!(
+        assert!(
             restarted
                 .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
+                .await
+                .is_some()
+        );
         assert!(
             restarted
                 .revoke_client(&client.client_id)
@@ -5719,13 +5688,12 @@ mod tests {
         let after_revoke = DownstreamOauthManager::new_with_state_path(test_config(), path.clone())
             .expect("restart after revoke");
         assert!(after_revoke.list_clients().await.is_empty());
-        assert!(matches!(
+        assert!(
             after_revoke
                 .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
-                .await,
-            AccessTokenValidation::Invalid
-        ));
-        #[cfg(unix)]
+                .await
+                .is_none()
+        );
         assert_eq!(
             std::fs::metadata(&path)
                 .expect("state metadata")
@@ -5745,7 +5713,7 @@ mod tests {
             .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
-            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            Some(claims) => claims.principal_lifecycle,
             other => panic!("token must validate before revocation: {other:?}"),
         };
 
@@ -5764,7 +5732,7 @@ mod tests {
             .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
-            AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
+            Some(claims) => claims.principal_lifecycle,
             other => panic!("token must validate before expiry: {other:?}"),
         };
         manager
@@ -5847,13 +5815,10 @@ mod tests {
         let (resume_tx, resume_rx) = tokio::sync::oneshot::channel();
 
         let request = tokio::spawn(async move {
-            let claims = match request_manager
+            let claims = request_manager
                 .validate_access_token_for(&access_token, &request_manager.resource())
                 .await
-            {
-                AccessTokenValidation::Valid(claims) => claims,
-                other => panic!("token must validate before barrier: {other:?}"),
-            };
+                .expect("token must validate before barrier");
             validated_tx.send(()).expect("signal validated request");
             resume_rx.await.expect("release request after revocation");
 

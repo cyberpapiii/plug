@@ -333,6 +333,7 @@ pub(crate) async fn apply_server_mutation(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // one per CLI flag
 pub(crate) async fn cmd_server_add(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,
@@ -627,6 +628,7 @@ pub(crate) async fn cmd_server_add_account(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // one per CLI flag
 pub(crate) async fn cmd_server_edit(
     config_path: Option<&std::path::PathBuf>,
     name: Option<String>,

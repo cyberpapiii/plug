@@ -83,6 +83,9 @@ pub struct HttpState {
     /// What each session's client declared at `initialize`.
     pub(crate) client_capabilities: Arc<DashMap<String, ClientCapabilities>>,
     pub(crate) lapsed_capabilities: Arc<LapsedCapabilities>,
+    /// Held while a lapsed session's teardown runs and while a session is
+    /// reopened, so the one never undoes the other.
+    pub(super) session_turnover: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub(super) type PendingClientRequests = DashMap<(String, i64), oneshot::Sender<ClientResult>>;
@@ -179,6 +182,7 @@ impl HttpState {
             reverse_request_counter: AtomicU64::new(1),
             client_capabilities: Arc::default(),
             lapsed_capabilities: Arc::default(),
+            session_turnover: Arc::default(),
         };
         let (lapsed_tx, mut lapsed_rx) = mpsc::unbounded_channel::<String>();
         state
@@ -187,8 +191,15 @@ impl HttpState {
             .expect("a session store serves one HttpState");
         state.sessions.spawn_cleanup_task(state.cancel.clone());
         let held = state.held_for_sessions();
+        let sessions = Arc::clone(&state.sessions);
+        let turnover = Arc::clone(&state.session_turnover);
         tokio::spawn(async move {
             while let Some(session_id) = lapsed_rx.recv().await {
+                let _turn = turnover.lock().await;
+                // Its client came back for it before this ran, and has it again.
+                if sessions.is_open(&session_id) {
+                    continue;
+                }
                 held.release(&session_id, true).await;
             }
         });
@@ -371,7 +382,7 @@ pub(super) async fn post_mcp(
         crate::protocol::rewrite_legacy_request(&mut raw_message);
         // `initialize` opens a session of its own.
         if raw_message.get("method").and_then(|method| method.as_str()) != Some("initialize") {
-            reopen_lost_session(&state, &headers, &auth_status);
+            reopen_lost_session(&state, &headers, &auth_status).await;
         }
     }
     let method = raw_message
@@ -567,7 +578,7 @@ pub(super) async fn get_mcp(
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let session_id = extract_session_id(&headers)?;
-    reopen_lost_session(&state, &headers, &auth_status);
+    reopen_lost_session(&state, &headers, &auth_status).await;
     state.sessions.validate(&session_id)?;
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
@@ -917,13 +928,10 @@ mod tests {
     async fn legacy_oauth_principal_scopes_gate_method_families() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
-        let claims = match manager
+        let claims = manager
             .validate_access_token_for(&access_token, &manager.resource())
             .await
-        {
-            AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("issued token must validate, got {other:?}"),
-        };
+            .expect("issued token must validate");
         let state = test_state();
         let context = legacy_http_policy_context(
             &state,

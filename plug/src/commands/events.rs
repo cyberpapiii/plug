@@ -115,14 +115,26 @@ pub(crate) async fn cmd_event_unwatch(
 }
 
 /// The watches and how they are doing: from the daemon when it runs and no
-/// other config was named, else from the file alone.
-async fn event_statuses(config_path: Option<&PathBuf>) -> anyhow::Result<Vec<EventStatus>> {
-    if config_path.is_none()
-        && let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) =
-            crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await
-    {
-        return Ok(snapshot.events);
+/// other config was named, else from the file alone. The note says why a
+/// running daemon was not asked.
+async fn event_statuses(
+    config_path: Option<&PathBuf>,
+) -> anyhow::Result<(Vec<EventStatus>, Option<String>)> {
+    let mut note = None;
+    if config_path.is_none() {
+        match crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await {
+            Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) => {
+                return Ok((snapshot.events, None));
+            }
+            Err(crate::ipc_client::IpcClientError::NotRunning) => {}
+            Ok(plug_core::ipc::IpcResponse::Error { message, .. }) => note = Some(message),
+            Ok(_) => note = Some("unexpected reply".to_string()),
+            Err(error) => note = Some(error.to_string()),
+        }
     }
+    let note = note.map(|why| {
+        format!("Could not read live status from Plug ({why}); showing the settings file.")
+    });
     let config = plug_core::config::load_config(config_path)?;
     let mut statuses: Vec<EventStatus> = config
         .events
@@ -131,7 +143,7 @@ async fn event_statuses(config_path: Option<&PathBuf>) -> anyhow::Result<Vec<Eve
         .map(EventStatus::waiting)
         .collect();
     statuses.sort_by(|a, b| a.name.cmp(&b.name));
-    Ok(statuses)
+    Ok((statuses, note))
 }
 
 fn ago(timestamp: Option<u64>) -> String {
@@ -169,8 +181,11 @@ pub(crate) async fn cmd_event_list(
     config_path: Option<&PathBuf>,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    let statuses = event_statuses(config_path).await?;
+    let (statuses, note) = event_statuses(config_path).await?;
     if matches!(output, OutputFormat::Json) {
+        if let Some(note) = note {
+            eprintln!("{note}");
+        }
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({ "events": statuses }))?
@@ -178,6 +193,9 @@ pub(crate) async fn cmd_event_list(
         return Ok(());
     }
     print_heading("Events");
+    if let Some(note) = note {
+        crate::ui::print_warning_line(note);
+    }
     if statuses.is_empty() {
         print_info_line("Nothing is watched.");
         print_info_line(style("Start with: plug events watch <server> <tool>").dim());

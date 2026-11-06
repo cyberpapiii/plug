@@ -2,25 +2,15 @@
 //! what it prints. This is how any password manager with a command-line tool
 //! becomes a store, with nothing added to Plug.
 
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::{SecretError, SecretStore, valid_name};
 use crate::types::SecretString;
 
 pub use crate::config::secrets::{NAME, OP};
-
-/// The login shell's PATH. The service starts with a bare one, and a
-/// password manager's tool is rarely in `/usr/bin`.
-static LOGIN_PATH: OnceLock<OsString> = OnceLock::new();
-
-/// Give command stores the PATH a terminal would have.
-pub fn use_login_path(path: OsString) {
-    let _ = LOGIN_PATH.set(path);
-}
 
 pub struct Command {
     id: String,
@@ -95,7 +85,6 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<
 /// process group, so this reaches a helper that would otherwise live on
 /// holding the pipes open.
 fn stop(child: &mut std::process::Child) {
-    #[cfg(unix)]
     let _ = std::process::Command::new("/bin/kill")
         .args(["-KILL", "--", &format!("-{}", child.id())])
         .stdin(Stdio::null())
@@ -108,6 +97,16 @@ fn stop(child: &mut std::process::Child) {
 
 impl SecretStore for Command {
     fn get(&self, name: &str) -> Result<Option<SecretString>, SecretError> {
+        self.get_on(name, None)
+    }
+
+    /// The service starts with a bare PATH, and a password manager's tool is
+    /// rarely in `/usr/bin`, so a server's start passes the login shell's.
+    fn get_on(
+        &self,
+        name: &str,
+        path: Option<&OsStr>,
+    ) -> Result<Option<SecretString>, SecretError> {
         let mut argv = self.argv.iter().map(|arg| arg.replace(NAME, name));
         let program = argv
             .next()
@@ -118,10 +117,9 @@ impl SecretStore for Command {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = LOGIN_PATH.get() {
+        if let Some(path) = path {
             command.env("PATH", path);
         }
-        #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -339,5 +337,36 @@ mod tests {
         let op = Command::one_password();
         assert!(op.accepts("//Private/My Item/password"));
         assert!(!op.accepts("github") && !op.accepts("//"));
+    }
+
+    /// The tool is found on the PATH of the start that asks, so a PATH the
+    /// login shell gave later is used and not the first one ever seen.
+    #[test]
+    fn the_tool_is_found_on_the_path_of_the_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("plug-test-vault-tool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'from-path'\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = Command::new(
+            "vault",
+            vec!["plug-test-vault-tool".to_string()],
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            store
+                .get_on("github", Some(OsStr::new("/nonexistent")))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_on("github", Some(dir.path().as_os_str()))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "from-path"
+        );
     }
 }

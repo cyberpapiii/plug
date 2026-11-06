@@ -1632,33 +1632,55 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
         .with_indexes(),
     ));
 
-    let first = router.list_tools_page_for_client(ClientType::Unknown, Some(Default::default()));
+    let first = router
+        .list_tools_page_for_client(ClientType::Unknown, Some(Default::default()))
+        .unwrap();
     assert_eq!(first.tools.len(), 500);
     assert_eq!(first.next_cursor.as_deref(), Some("500"));
 
     let mut second_request = PaginatedRequestParams::default();
     second_request.cursor = first.next_cursor;
-    let second = router.list_tools_page_for_client(ClientType::Unknown, Some(second_request));
+    let second = router
+        .list_tools_page_for_client(ClientType::Unknown, Some(second_request))
+        .unwrap();
     assert_eq!(second.tools.len(), 250);
     assert!(second.next_cursor.is_none());
 }
 
 #[test]
 fn paginated_result_returns_mid_cursor_page_from_borrowed_slice() {
-    // `paginated_result` now takes `&[T]` instead of an owned `Vec<T>`; this
-    // pins that a mid-cursor page sliced from a borrowed input still returns
-    // the same items and next_cursor as the old owned-Vec implementation.
     let items: Vec<i32> = (0..750).collect();
 
     let mut request = PaginatedRequestParams::default();
     request.cursor = Some("500".to_string());
 
-    let (page, next_cursor) = paginated_result(&items, Some(request), |page, next_cursor| {
-        (page, next_cursor)
-    });
+    let (page, next_cursor) =
+        paginated_result("tools/list", &items, Some(request), |page, next_cursor| {
+            (page, next_cursor)
+        })
+        .unwrap();
 
     assert_eq!(page, items[500..750].to_vec());
     assert!(next_cursor.is_none());
+}
+
+/// A cursor Plug never gave out is refused, so a client that follows it is
+/// not sent back to the first page forever. One past the end, left by items
+/// that went away between pages, is the last page.
+#[test]
+fn a_page_for_an_unknown_cursor_is_refused_and_one_past_the_end_is_empty() {
+    let items: Vec<i32> = (0..10).collect();
+    let page = |cursor: &str| {
+        let mut request = PaginatedRequestParams::default();
+        request.cursor = Some(cursor.to_string());
+        paginated_result("tools/list", &items, Some(request), |page, next| {
+            (page, next)
+        })
+    };
+
+    let error = page("not-a-cursor").unwrap_err();
+    assert_eq!(error.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+    assert_eq!(page("500").unwrap(), (Vec::new(), None));
 }
 
 #[tokio::test]
@@ -2443,7 +2465,6 @@ fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
 use rmcp::ServiceExt as _;
 
 use crate::server::{UpstreamClientHandler, UpstreamServer};
-use crate::types::ServerHealth;
 
 /// Async gate: `wait()` parks until `open()`. Same shape as the registry
 /// unit tests' Gate, but per-URI on the upstream side.
@@ -2771,7 +2792,7 @@ async fn connect_subscribable_upstream(
     let handler = Arc::new(UpstreamClientHandler::new_for_tests(
         Arc::from(name.to_string()),
         Arc::clone(&tools),
-        std::sync::Weak::new(),
+        crate::server::no_events(),
     ));
     let client = handler
         .serve(client_transport)
@@ -2795,7 +2816,6 @@ async fn connect_subscribable_upstream(
         selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
-        health: ServerHealth::Healthy,
         child_pid: None,
         stderr_tail: None,
     }
@@ -2817,7 +2837,7 @@ async fn connect_modern_tool_upstream(
     let handler = Arc::new(UpstreamClientHandler::new_for_tests_with_protocol(
         Arc::from(name.to_string()),
         Arc::clone(&tools),
-        std::sync::Weak::new(),
+        crate::server::no_events(),
         rmcp::model::ProtocolVersion::V_2026_07_28,
     ));
     let client = handler
@@ -2835,7 +2855,6 @@ async fn connect_modern_tool_upstream(
         selected_protocol_version: crate::protocol::MODERN_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
-        health: ServerHealth::Healthy,
         child_pid: None,
         stderr_tail: None,
     }
@@ -4606,12 +4625,9 @@ fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
         );
     }
 
-    let page = router.list_tools_page_for_client_session(
-        ClientType::ClaudeCode,
-        None,
-        Some("cursor"),
-        None,
-    );
+    let page = router
+        .list_tools_page_for_client_session(ClientType::ClaudeCode, None, Some("cursor"), None)
+        .unwrap();
     assert_eq!(tool_names(&page.tools), ["slack__post"]);
 
     assert!(
@@ -5024,32 +5040,45 @@ fn a_blocked_client_is_not_listed_the_resources_and_prompts_of_that_server() {
     let router = router_with_blocked_resources_and_prompts();
 
     let blocked = Some("cursor");
-    let resources = router.list_resources_page(None, blocked).resources;
+    let resources = router.list_resources_page(None, blocked).unwrap().resources;
     assert_eq!(resources.len(), 1);
     assert_eq!(resources[0].uri, "slack://inbox");
     let templates = router
         .list_resource_templates_page(None, blocked)
+        .unwrap()
         .resource_templates;
     assert_eq!(templates.len(), 1);
     assert_eq!(templates[0].uri_template, "slack://channel/{id}");
-    let prompts = router.list_prompts_page(None, blocked).prompts;
+    let prompts = router.list_prompts_page(None, blocked).unwrap().prompts;
     assert_eq!(prompts.len(), 1);
     assert_eq!(prompts[0].name, "slack__digest");
 
     // No entry, and no key at all, both get everything.
     for unblocked in [Some("claude-code"), None] {
         assert_eq!(
-            router.list_resources_page(None, unblocked).resources.len(),
+            router
+                .list_resources_page(None, unblocked)
+                .unwrap()
+                .resources
+                .len(),
             2
         );
         assert_eq!(
             router
                 .list_resource_templates_page(None, unblocked)
+                .unwrap()
                 .resource_templates
                 .len(),
             2
         );
-        assert_eq!(router.list_prompts_page(None, unblocked).prompts.len(), 2);
+        assert_eq!(
+            router
+                .list_prompts_page(None, unblocked)
+                .unwrap()
+                .prompts
+                .len(),
+            2
+        );
     }
 }
 

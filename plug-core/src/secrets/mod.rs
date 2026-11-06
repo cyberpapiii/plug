@@ -15,13 +15,11 @@ pub mod file;
 
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
-#[cfg(not(target_os = "linux"))]
-use keyring as platform_keyring;
-#[cfg(target_os = "linux")]
-use keyring_core as platform_keyring;
+use crate::platform_keyring;
 
 use crate::config::ServerConfig;
 use crate::types::SecretString;
@@ -82,6 +80,15 @@ pub enum SecretError {
 /// Something that keeps secrets by name. Calls may block.
 pub trait SecretStore: Send + Sync {
     fn get(&self, name: &str) -> Result<Option<SecretString>, SecretError>;
+    /// [`SecretStore::get`], finding any program the store runs on `path`.
+    fn get_on(
+        &self,
+        name: &str,
+        path: Option<&OsStr>,
+    ) -> Result<Option<SecretString>, SecretError> {
+        let _ = path;
+        self.get(name)
+    }
     fn set(&self, name: &str, value: &SecretString) -> Result<(), SecretError>;
     fn remove(&self, name: &str) -> Result<(), SecretError>;
 
@@ -524,7 +531,11 @@ impl Stores {
     }
 
     /// The value `value` refers to, or `None` when it is not a reference.
-    async fn follow(&self, value: &str) -> Result<Option<SecretString>, SecretError> {
+    async fn follow(
+        &self,
+        value: &str,
+        path: Option<&'static OsStr>,
+    ) -> Result<Option<SecretString>, SecretError> {
         let Some((id, name)) = self.parse(value) else {
             return Ok(None);
         };
@@ -532,7 +543,7 @@ impl Stores {
         // The store stops itself at its own limit; this is the backstop.
         let limit = store.timeout() + Duration::from_secs(2);
         let owned = name.to_string();
-        let read = tokio::task::spawn_blocking(move || store.get(&owned));
+        let read = tokio::task::spawn_blocking(move || store.get_on(&owned, path));
         let outcome = match tokio::time::timeout(limit, read).await {
             Err(_) => Err(SecretError::TimedOut {
                 store: id.to_string(),
@@ -571,19 +582,21 @@ impl Stores {
 
     /// `config` with every reference in it replaced by its value: the bearer
     /// token and the values of `env`. A config with no reference is returned
-    /// as it is, and no store is touched.
+    /// as it is, and no store is touched. A store that runs a program finds
+    /// it on `path`.
     pub async fn resolve_server<'a>(
         &self,
         config: &'a ServerConfig,
+        path: Option<&'static OsStr>,
     ) -> Result<Cow<'a, ServerConfig>, SecretError> {
         let mut resolved = Cow::Borrowed(config);
         if let Some(token) = &config.auth_token
-            && let Some(secret) = self.follow(token.as_str()).await?
+            && let Some(secret) = self.follow(token.as_str(), path).await?
         {
             resolved.to_mut().auth_token = Some(secret);
         }
         for (key, value) in &config.env {
-            if let Some(secret) = self.follow(value).await? {
+            if let Some(secret) = self.follow(value, path).await? {
                 resolved
                     .to_mut()
                     .env
@@ -697,7 +710,7 @@ TOKEN = "keychain:github"
 LEVEL = "debug:verbose"
 "#,
         );
-        let resolved = stores().resolve_server(&config).await.unwrap();
+        let resolved = stores().resolve_server(&config, None).await.unwrap();
         assert_eq!(resolved.auth_token.as_ref().unwrap().as_str(), "ghp_value");
         assert_eq!(resolved.env["TOKEN"], "ghp_value");
         assert_eq!(resolved.env["LEVEL"], "debug:verbose");
@@ -710,7 +723,7 @@ LEVEL = "debug:verbose"
         let config = server("command = \"server\"\nauth_token = \"plain\"\n");
         let resolved = Stores::default()
             .with(KEYCHAIN, Arc::new(Locked))
-            .resolve_server(&config)
+            .resolve_server(&config, None)
             .await
             .unwrap();
         assert!(matches!(resolved, Cow::Borrowed(_)));
@@ -719,14 +732,14 @@ LEVEL = "debug:verbose"
     #[tokio::test]
     async fn a_reference_that_cannot_be_read_says_which_and_why() {
         let missing = server("command = \"server\"\nauth_token = \"keychain:absent\"\n");
-        let error = stores().resolve_server(&missing).await.unwrap_err();
+        let error = stores().resolve_server(&missing, None).await.unwrap_err();
         assert_eq!(
             error.to_string(),
             "no secret named `absent` in keychain; run `plug secret set absent`"
         );
 
         let locked = server("command = \"server\"\n[env]\nKEY = \"vault:api\"\n");
-        let error = stores().resolve_server(&locked).await.unwrap_err();
+        let error = stores().resolve_server(&locked, None).await.unwrap_err();
         assert_eq!(error.to_string(), "waiting for vault: it is locked");
     }
 
@@ -754,7 +767,7 @@ LEVEL = "debug:verbose"
         let stores = Stores::default().with("flaky", Arc::new(Flaky(Default::default())));
         let config = server("command = \"server\"\nauth_token = \"flaky:kept-across-lock\"\n");
         for _ in 0..2 {
-            let resolved = stores.resolve_server(&config).await.unwrap();
+            let resolved = stores.resolve_server(&config, None).await.unwrap();
             assert_eq!(resolved.auth_token.as_ref().unwrap().as_str(), "first-read");
         }
     }

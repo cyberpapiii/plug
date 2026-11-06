@@ -1,12 +1,9 @@
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
-#[cfg(target_os = "macos")]
-use std::ffi::OsString;
 use std::future::Future;
 use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -18,10 +15,10 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
     ElicitRequestParams, ElicitResult, ElicitationCapability, FormElicitationCapability,
-    Implementation, InitializedNotification, LoggingMessageNotificationParam,
-    ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
-    ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
-    SetLevelRequestParams, Tool, UrlElicitationCapability,
+    Implementation, InitializedNotification, ListRootsResult, LoggingLevel,
+    LoggingMessageNotificationParam, ProgressNotificationParam, Prompt, RequestId, Resource,
+    ResourceTemplate, ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability,
+    ServerCapabilities, SetLevelRequestParams, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
@@ -33,12 +30,13 @@ use sse_stream::{Error as SseError, Sse};
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType, UpstreamProtocolMode};
-use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 mod failure;
+pub(crate) mod path;
 use failure::StderrTail;
+use path::{resolve_stdio_command, spawn_error, stdio_path};
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
@@ -159,8 +157,7 @@ struct InitializedNotificationCompatHttpClient {
     server_name: Arc<str>,
     /// Shared with the `UpstreamServer` this client backs.
     connection: ConnectionGeneration,
-    /// Weak so a client outliving the router cannot keep it alive.
-    tool_router: std::sync::Weak<ToolRouter>,
+    events: Weak<dyn UpstreamEvents>,
     /// The `Mcp-Session-Id` most recently seen on the wire.
     ///
     /// rmcp keeps the live session id private to its transport worker and
@@ -188,13 +185,13 @@ impl InitializedNotificationCompatHttpClient {
     fn new(
         server_name: Arc<str>,
         connection: ConnectionGeneration,
-        tool_router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: crate::upstream_http::client(reqwest::redirect::Policy::default())?,
             server_name,
             connection,
-            tool_router,
+            events,
             last_session_id: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -227,7 +224,7 @@ impl InitializedNotificationCompatHttpClient {
                     "upstream HTTP session replaced; treating as a new connection"
                 );
                 *last = Some(Arc::clone(session_id));
-                on_upstream_session_replaced(&self.connection, &self.tool_router);
+                on_upstream_session_replaced(&self.connection, &self.events);
             }
             None => *last = Some(Arc::clone(session_id)),
         }
@@ -281,319 +278,6 @@ fn build_stdio_command(
         let _ = sandbox;
         anyhow::bail!("stdio sandboxing is currently implemented only on macOS")
     }
-}
-
-/// Resolve a bare stdio command through PATH, then through `login_path` (the
-/// user's login-shell PATH from [`stdio_login_path`]).
-pub(crate) fn resolve_stdio_command(command: &str, login_path: Option<&OsStr>) -> PathBuf {
-    let configured = PathBuf::from(command);
-    if configured.components().count() > 1 {
-        return configured;
-    }
-
-    if let Some(path) = std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .map(|dir| dir.join(command))
-            .find(|path| path.is_file())
-    }) {
-        return path;
-    }
-
-    // SMAppService launch agents intentionally receive launchd's minimal
-    // PATH. Resolve through the user's login PATH, which is also inherited
-    // by the child below so script launchers such as `#!/usr/bin/env node`
-    // can find their own interpreter.
-    if let Some(path) = login_path.and_then(|paths| {
-        std::env::split_paths(paths)
-            .map(|dir| dir.join(command))
-            .find(|path| path.is_file())
-    }) {
-        return path;
-    }
-
-    configured
-}
-
-/// The PATH for stdio servers: the user's login-shell PATH on macOS, `None`
-/// elsewhere. A successful probe is cached for the life of the process and
-/// saved next to the config. A failed one is not cached: after a reboot the
-/// login shell can take longer than the probe allows, and caching that
-/// failure left every Node server unable to find `node` until the daemon
-/// restarted. Until a probe succeeds, callers get the PATH an earlier probe
-/// saved, so a boot does not wait on the shell, or else the inherited PATH
-/// plus the standard Homebrew directories.
-pub(crate) async fn stdio_login_path() -> Option<&'static OsStr> {
-    stdio_path().await.0
-}
-
-/// Where the PATH handed to stdio servers came from, for error messages.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum StdioPathSource {
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    LoginShell,
-    /// The login-shell probe failed; see [`fallback_stdio_path`].
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-    Fallback,
-    /// Not macOS: the daemon's own PATH.
-    #[cfg_attr(target_os = "macos", allow(dead_code))]
-    Inherited,
-}
-
-impl StdioPathSource {
-    fn describe(self) -> &'static str {
-        match self {
-            Self::LoginShell => "the login shell PATH",
-            Self::Fallback => "the fallback PATH (the login shell PATH probe failed)",
-            Self::Inherited => "PATH",
-        }
-    }
-}
-
-/// [`stdio_login_path`] and where it came from.
-async fn stdio_path() -> (Option<&'static OsStr>, StdioPathSource) {
-    // Unit tests use the test runner's PATH. A real login shell can outlive
-    // Tokio's paused clock and consume a test's virtual retry window. The
-    // probe and cache have their own tests below with controlled inputs.
-    #[cfg(all(target_os = "macos", test))]
-    {
-        static PATH: std::sync::OnceLock<Option<OsString>> = std::sync::OnceLock::new();
-        (
-            PATH.get_or_init(|| std::env::var_os("PATH")).as_deref(),
-            StdioPathSource::Inherited,
-        )
-    }
-    #[cfg(all(target_os = "macos", not(test)))]
-    {
-        static CACHE: LoginPathCache = LoginPathCache::new();
-        static FALLBACK: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
-        let store = Some(crate::paths::dir().join(SAVED_LOGIN_PATH_FILE));
-        let probed = cached_login_path(
-            &CACHE,
-            LOGIN_SHELL_PROBE_RETRY,
-            store,
-            probe_login_shell_path(
-                "/bin/zsh",
-                &["-lic", "printf '__PLUG_STDIO_PATH__%s\\n' \"$PATH\""],
-                LOGIN_SHELL_PROBE_TIMEOUT,
-            ),
-        )
-        .await;
-        match probed {
-            Some(path) => (Some(path), StdioPathSource::LoginShell),
-            None => (
-                Some(
-                    FALLBACK
-                        .get_or_init(|| fallback_stdio_path(std::env::var_os("PATH")))
-                        .as_os_str(),
-                ),
-                StdioPathSource::Fallback,
-            ),
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    (None, StdioPathSource::Inherited)
-}
-
-/// The PATH launchd gives an agent. The daemon runs with this when Plug.app
-/// starts it.
-#[cfg(target_os = "macos")]
-const LAUNCHD_PATH: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
-
-/// Resolve a bare `command` the way the daemon does when its login-shell
-/// probe fails: launchd's PATH plus Homebrew. `None` if it is not found there,
-/// and always `None` off macOS, where there is no such fallback.
-pub(crate) fn resolve_without_login_shell(command: &str) -> Option<PathBuf> {
-    #[cfg(target_os = "macos")]
-    {
-        let path = fallback_stdio_path(Some(OsString::from(LAUNCHD_PATH)));
-        std::env::split_paths(&path)
-            .map(|dir| dir.join(command))
-            .find(|path| path.is_file())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = command;
-        None
-    }
-}
-
-/// A spawn failure that names the command and, when it was not found, the
-/// PATH that was searched. Never includes args or env, which can hold secrets.
-fn spawn_error(command: &str, error: &std::io::Error, source: StdioPathSource) -> anyhow::Error {
-    let bare = Path::new(command).components().count() == 1;
-    if error.kind() == std::io::ErrorKind::NotFound && bare {
-        anyhow::anyhow!(
-            "failed to spawn `{command}`: not found on {}",
-            source.describe()
-        )
-    } else {
-        anyhow::anyhow!("failed to spawn `{command}`: {error}")
-    }
-}
-
-#[cfg(target_os = "macos")]
-struct LoginPathCache {
-    path: std::sync::OnceLock<OsString>,
-    /// The PATH an earlier successful probe saved to disk, read once.
-    saved: std::sync::OnceLock<Option<OsString>>,
-    /// When the last probe failed. The lock also keeps concurrent server
-    /// starts from probing at once.
-    last_failure: tokio::sync::Mutex<Option<tokio::time::Instant>>,
-}
-
-#[cfg(target_os = "macos")]
-impl LoginPathCache {
-    const fn new() -> Self {
-        Self {
-            path: std::sync::OnceLock::new(),
-            saved: std::sync::OnceLock::new(),
-            last_failure: tokio::sync::Mutex::const_new(None),
-        }
-    }
-}
-
-/// The cached login PATH, probing when there is none and the last failure
-/// is older than `retry_after`. The probe runs on a spawned task, so a caller
-/// cancelled mid-probe (a start timeout shorter than the probe's) cannot
-/// leave it half done and make the next start pay for it again.
-///
-/// When `store` holds a PATH from an earlier successful probe, callers get it
-/// at once and the probe refreshes the cache and the file in the background.
-/// Right after a reboot the probe can take its full timeout, and every stdio
-/// server would otherwise wait on it.
-#[cfg(target_os = "macos")]
-async fn cached_login_path(
-    cache: &'static LoginPathCache,
-    retry_after: Duration,
-    store: Option<PathBuf>,
-    probe: impl Future<Output = Option<OsString>> + Send + 'static,
-) -> Option<&'static OsStr> {
-    if let Some(path) = cache.path.get() {
-        return Some(path);
-    }
-    let saved = cache
-        .saved
-        .get_or_init(|| store.as_deref().and_then(read_saved_login_path));
-    let refresh = tokio::spawn(async move {
-        let mut last_failure = cache.last_failure.lock().await;
-        if cache.path.get().is_some() || last_failure.is_some_and(|at| at.elapsed() < retry_after) {
-            return;
-        }
-        match probe.await {
-            Some(path) => {
-                if let Some(store) = &store {
-                    save_login_path(store, &path);
-                }
-                let _ = cache.path.set(path);
-            }
-            None => *last_failure = Some(tokio::time::Instant::now()),
-        }
-    });
-    if let Some(saved) = saved {
-        return Some(saved);
-    }
-    let _ = refresh.await;
-    cache.path.get().map(OsString::as_os_str)
-}
-
-/// The file in the config directory that holds the last successful probe's
-/// PATH.
-#[cfg(target_os = "macos")]
-const SAVED_LOGIN_PATH_FILE: &str = "login-shell-path";
-
-/// A saved PATH, or `None` when the file is missing, not UTF-8, or names no
-/// absolute directory.
-#[cfg(target_os = "macos")]
-fn read_saved_login_path(store: &Path) -> Option<OsString> {
-    let contents = std::fs::read_to_string(store).ok()?;
-    let path = contents.trim();
-    std::env::split_paths(path)
-        .any(|dir| dir.is_absolute())
-        .then(|| OsString::from(path))
-}
-
-/// Save the PATH atomically, readable only by the user. A failure costs the
-/// next boot the probe's wait and nothing else, so it is only logged.
-#[cfg(target_os = "macos")]
-fn save_login_path(store: &Path, path: &OsStr) {
-    use std::io::Write;
-    use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::fs::OpenOptionsExt;
-
-    let temp = store.with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-    let result = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&temp)
-        .and_then(|mut file| {
-            file.write_all(path.as_bytes())?;
-            file.sync_all()
-        })
-        .and_then(|()| std::fs::rename(&temp, store));
-    if let Err(error) = result {
-        let _ = std::fs::remove_file(&temp);
-        tracing::debug!(%error, path = %store.display(), "could not save the login shell PATH");
-    }
-}
-
-/// The inherited PATH plus the Homebrew directories where `node`, `npx`, and
-/// `uvx` usually live. launchd gives the daemon only the system directories.
-#[cfg(target_os = "macos")]
-fn fallback_stdio_path(inherited: Option<OsString>) -> OsString {
-    let mut dirs: Vec<PathBuf> = inherited
-        .as_deref()
-        .map(|paths| std::env::split_paths(paths).collect())
-        .unwrap_or_default();
-    for extra in ["/opt/homebrew/bin", "/usr/local/bin"] {
-        if !dirs.iter().any(|dir| dir == Path::new(extra)) {
-            dirs.push(PathBuf::from(extra));
-        }
-    }
-    std::env::join_paths(dirs).unwrap_or_default()
-}
-
-/// A failed probe is retried on the next stdio start after this long.
-#[cfg(all(target_os = "macos", not(test)))]
-const LOGIN_SHELL_PROBE_RETRY: Duration = Duration::from_secs(30);
-
-/// An interactive login shell runs the user's dotfiles, which can hang. A stuck
-/// shell delays the first stdio start by at most this long, never forever.
-#[cfg(all(target_os = "macos", not(test)))]
-const LOGIN_SHELL_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[cfg(target_os = "macos")]
-async fn probe_login_shell_path(
-    program: &str,
-    args: &[&str],
-    timeout: Duration,
-) -> Option<OsString> {
-    let output = tokio::process::Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::null())
-        .kill_on_drop(true)
-        .output();
-    match tokio::time::timeout(timeout, output).await {
-        Ok(Ok(output)) if output.status.success() => login_shell_path(&output.stdout),
-        Ok(_) => None,
-        Err(_) => {
-            tracing::warn!(
-                "login shell PATH probe timed out after {timeout:?}; using inherited PATH"
-            );
-            None
-        }
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn login_shell_path(stdout: &[u8]) -> Option<OsString> {
-    const MARKER: &str = "__PLUG_STDIO_PATH__";
-    String::from_utf8_lossy(stdout)
-        .lines()
-        .map(str::trim)
-        .filter_map(|line| line.strip_prefix(MARKER))
-        .find(|path| !path.is_empty())
-        .map(OsString::from)
 }
 
 fn apply_stdio_environment(command: &mut tokio::process::Command, login_path: Option<&OsStr>) {
@@ -739,10 +423,104 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
     }
 }
 
+/// What an upstream connection tells the downstream side, and the requests
+/// a server sends back to its client. Weak everywhere it is held: the
+/// downstream side owns the server manager.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates redundant must_use on boxed futures"
+)]
+#[async_trait::async_trait]
+pub trait UpstreamEvents: Send + Sync {
+    /// The roots of every downstream client, as one list.
+    fn list_roots(&self) -> ListRootsResult;
+    async fn elicit(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: ElicitRequestParams,
+    ) -> Result<ElicitResult, McpError>;
+    async fn create_message(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: CreateMessageRequestParams,
+    ) -> Result<CreateMessageResult, McpError>;
+    fn tools_changed(self: Arc<Self>);
+    fn resources_changed(self: Arc<Self>);
+    fn prompts_changed(self: Arc<Self>);
+    fn progress(&self, server: &str, params: ProgressNotificationParam);
+    fn cancelled(&self, server: &str, params: CancelledNotificationParam);
+    fn resource_updated(&self, server: &str, params: ResourceUpdatedNotificationParam);
+    fn logging_message(&self, server: &str, params: LoggingMessageNotificationParam);
+    /// The level a newly connected server should log at.
+    fn log_level(&self) -> LoggingLevel;
+}
+
+/// An `UpstreamEvents` that is never there: events go nowhere.
+pub(crate) fn no_events() -> Weak<dyn UpstreamEvents> {
+    enum Absent {}
+    #[async_trait::async_trait]
+    impl UpstreamEvents for Absent {
+        fn list_roots(&self) -> ListRootsResult {
+            match *self {}
+        }
+        async fn elicit(
+            &self,
+            _: &str,
+            _: RequestId,
+            _: ElicitRequestParams,
+        ) -> Result<ElicitResult, McpError> {
+            match *self {}
+        }
+        async fn create_message(
+            &self,
+            _: &str,
+            _: RequestId,
+            _: CreateMessageRequestParams,
+        ) -> Result<CreateMessageResult, McpError> {
+            match *self {}
+        }
+        fn tools_changed(self: Arc<Self>) {
+            match *self {}
+        }
+        fn resources_changed(self: Arc<Self>) {
+            match *self {}
+        }
+        fn prompts_changed(self: Arc<Self>) {
+            match *self {}
+        }
+        fn progress(&self, _: &str, _: ProgressNotificationParam) {
+            match *self {}
+        }
+        fn cancelled(&self, _: &str, _: CancelledNotificationParam) {
+            match *self {}
+        }
+        fn resource_updated(&self, _: &str, _: ResourceUpdatedNotificationParam) {
+            match *self {}
+        }
+        fn logging_message(&self, _: &str, _: LoggingMessageNotificationParam) {
+            match *self {}
+        }
+        fn log_level(&self) -> LoggingLevel {
+            match *self {}
+        }
+    }
+    Weak::<Absent>::new()
+}
+
+/// Where a new connection reports: the downstream side, and the manager's
+/// check-now signal for a stdio server whose process stops.
+#[derive(Clone)]
+struct Reporting {
+    events: Weak<dyn UpstreamEvents>,
+    check_now: Arc<tokio::sync::Notify>,
+}
+
 pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
     tools: Arc<ArcSwap<Vec<Tool>>>,
-    router: std::sync::Weak<ToolRouter>,
+    events: Weak<dyn UpstreamEvents>,
     /// Bound on the re-list a `tools/list_changed` notification triggers: the
     /// server's `call_timeout_secs`, the same bound every other listing uses.
     list_timeout: Duration,
@@ -754,13 +532,13 @@ impl UpstreamClientHandler {
     pub(crate) fn new(
         server_id: &str,
         tools: Arc<ArcSwap<Vec<Tool>>>,
-        router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
         list_timeout: Duration,
     ) -> Self {
         Self {
             server_id: Arc::from(server_id),
             tools,
-            router,
+            events,
             list_timeout,
             protocol_version: crate::protocol::supported_protocol_version(),
         }
@@ -770,21 +548,21 @@ impl UpstreamClientHandler {
     pub(crate) fn new_for_tests(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
-        router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
     ) -> Self {
-        Self::new(&server_id, tools, router, Duration::from_secs(300))
+        Self::new(&server_id, tools, events, Duration::from_secs(300))
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_tests_with_protocol(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
-        router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
         protocol_version: rmcp::model::ProtocolVersion,
     ) -> Self {
         Self {
             protocol_version,
-            ..Self::new_for_tests(server_id, tools, router)
+            ..Self::new_for_tests(server_id, tools, events)
         }
     }
 }
@@ -828,14 +606,12 @@ impl ClientHandler for UpstreamClientHandler {
         _context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<rmcp::model::ListRootsResult, rmcp::ErrorData>> + Send + '_
     {
-        let router = self.router.clone();
-        async move {
-            if let Some(router) = router.upgrade() {
-                Ok(router.list_roots_union())
-            } else {
-                Ok(rmcp::model::ListRootsResult::default())
-            }
-        }
+        let roots = self
+            .events
+            .upgrade()
+            .map(|events| events.list_roots())
+            .unwrap_or_default();
+        std::future::ready(Ok(roots))
     }
 
     fn create_elicitation(
@@ -843,14 +619,12 @@ impl ClientHandler for UpstreamClientHandler {
         request: ElicitRequestParams,
         context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         let request_id = context.id.clone();
         async move {
-            if let Some(router) = router.upgrade() {
-                router
-                    .create_elicitation_from_upstream(server_id.as_ref(), request_id, request)
-                    .await
+            if let Some(events) = events.upgrade() {
+                events.elicit(server_id.as_ref(), request_id, request).await
             } else {
                 Err(McpError::internal_error(
                     "router unavailable during upstream elicitation".to_string(),
@@ -865,13 +639,13 @@ impl ClientHandler for UpstreamClientHandler {
         request: CreateMessageRequestParams,
         context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         let request_id = context.id.clone();
         async move {
-            if let Some(router) = router.upgrade() {
-                router
-                    .create_message_from_upstream(server_id.as_ref(), request_id, request)
+            if let Some(events) = events.upgrade() {
+                events
+                    .create_message(server_id.as_ref(), request_id, request)
                     .await
             } else {
                 Err(McpError::internal_error(
@@ -887,7 +661,7 @@ impl ClientHandler for UpstreamClientHandler {
         context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
         let tools = Arc::clone(&self.tools);
-        let router = self.router.clone();
+        let events = self.events.clone();
         let peer = context.peer.clone();
         let server_id = Arc::clone(&self.server_id);
         let list_timeout = self.list_timeout;
@@ -897,8 +671,8 @@ impl ClientHandler for UpstreamClientHandler {
                 Ok(Ok(fresh_tools)) => {
                     tools.store(Arc::new(fresh_tools));
 
-                    if let Some(router) = router.upgrade() {
-                        router.schedule_tool_list_changed_refresh();
+                    if let Some(events) = events.upgrade() {
+                        events.tools_changed();
                     }
                 }
                 Ok(Err(error)) => {
@@ -923,15 +697,15 @@ impl ClientHandler for UpstreamClientHandler {
         &self,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         async move {
-            if let Some(router) = router.upgrade() {
+            if let Some(events) = events.upgrade() {
                 tracing::debug!(
                     server = %server_id,
                     "received resources/list_changed from upstream"
                 );
-                router.schedule_resource_list_changed_refresh();
+                events.resources_changed();
             }
         }
     }
@@ -940,15 +714,15 @@ impl ClientHandler for UpstreamClientHandler {
         &self,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         async move {
-            if let Some(router) = router.upgrade() {
+            if let Some(events) = events.upgrade() {
                 tracing::debug!(
                     server = %server_id,
                     "received prompts/list_changed from upstream"
                 );
-                router.schedule_prompt_list_changed_refresh();
+                events.prompts_changed();
             }
         }
     }
@@ -958,13 +732,10 @@ impl ClientHandler for UpstreamClientHandler {
         params: ProgressNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.route_upstream_progress(server_id.as_ref(), params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.progress(&self.server_id, params);
         }
+        std::future::ready(())
     }
 
     fn on_cancelled(
@@ -972,28 +743,21 @@ impl ClientHandler for UpstreamClientHandler {
         params: CancelledNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.route_upstream_cancelled(server_id.as_ref(), params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.cancelled(&self.server_id, params);
         }
+        std::future::ready(())
     }
 
     fn on_resource_updated(
         &self,
-        mut params: ResourceUpdatedNotificationParam,
+        params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.name_skill_server(&server_id, &mut params.uri);
-                router.route_upstream_resource_updated(params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.resource_updated(&self.server_id, params);
         }
+        std::future::ready(())
     }
 
     fn on_logging_message(
@@ -1001,13 +765,10 @@ impl ClientHandler for UpstreamClientHandler {
         params: LoggingMessageNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.route_upstream_logging_message(server_id.as_ref(), params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.logging_message(&self.server_id, params);
         }
+        std::future::ready(())
     }
 }
 
@@ -1033,7 +794,6 @@ pub struct UpstreamServer {
     /// being rebuilt when a transport re-establishes the upstream session
     /// underneath us. See [`ConnectionGeneration`].
     pub(crate) connection: ConnectionGeneration,
-    pub health: ServerHealth,
     /// Process id of a stdio server, so retirement can send SIGTERM to a
     /// server that does not exit when its stdin closes.
     pub(crate) child_pid: Option<u32>,
@@ -1103,11 +863,11 @@ impl ConnectionGeneration {
 /// flapping upstream costs one refresh, not one per flap.
 fn on_upstream_session_replaced(
     connection: &ConnectionGeneration,
-    tool_router: &std::sync::Weak<ToolRouter>,
+    events: &Weak<dyn UpstreamEvents>,
 ) {
     connection.advance();
-    if let Some(router) = tool_router.upgrade() {
-        router.schedule_resource_list_changed_refresh();
+    if let Some(events) = events.upgrade() {
+        events.resources_changed();
     }
 }
 
@@ -1234,7 +994,7 @@ pub struct ServerManager {
     /// Cleared when it starts; shown in status while it is unhealthy.
     last_errors: DashMap<String, String>,
     semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
-    tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
+    events: Weak<dyn UpstreamEvents>,
     /// Grace-period retirement tasks spawned by `replace_server` for
     /// old-generation upstreams still held by in-flight requests. Tracked so
     /// `shutdown_all` can force them to retire immediately instead of leaving
@@ -1302,7 +1062,14 @@ impl ServerManager {
         }
     }
 
+    /// A manager whose servers report to no one, for running upstreams
+    /// without a router.
     pub fn new() -> Self {
+        Self::reporting_to(no_events())
+    }
+
+    /// A manager whose servers report to `events`.
+    pub fn reporting_to(events: Weak<dyn UpstreamEvents>) -> Self {
         let (shutdown_signal, _shutdown_signal_rx) = tokio::sync::watch::channel(false);
         Self {
             servers: ArcSwap::from_pointee(HashMap::new()),
@@ -1318,7 +1085,7 @@ impl ServerManager {
             availability: DashMap::new(),
             last_errors: DashMap::new(),
             semaphores: DashMap::new(),
-            tool_router: std::sync::RwLock::new(None),
+            events,
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             replacement_grace: REPLACEMENT_GRACE,
             shutdown_signal,
@@ -1482,18 +1249,18 @@ impl ServerManager {
         }
     }
 
-    pub fn set_tool_router(&self, router: std::sync::Weak<ToolRouter>) {
-        if let Ok(mut guard) = self.tool_router.write() {
-            *guard = Some(router);
+    fn reporting(&self) -> Reporting {
+        Reporting {
+            events: self.events.clone(),
+            check_now: Arc::clone(&self.check_now),
         }
     }
 
-    fn tool_router(&self) -> std::sync::Weak<ToolRouter> {
-        self.tool_router
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
-            .unwrap_or_default()
+    /// Tell the downstream side the merged tool list may have changed.
+    pub(crate) fn tools_changed(&self) {
+        if let Some(events) = self.events.upgrade() {
+            events.tools_changed();
+        }
     }
 
     fn insert_upstream(
@@ -1564,17 +1331,12 @@ impl ServerManager {
             let permits = Arc::clone(&permits);
             let name_clone = name.clone();
             let sc = server_config.clone();
-            let tool_router = self.tool_router();
+            let reporting = self.reporting();
             let modern_upstream_gate_state = self.modern_upstream_gate_state();
             join_set.spawn(async move {
                 let _permit = permits.acquire_owned().await;
-                let result = Self::start_server_with_router(
-                    &name_clone,
-                    &sc,
-                    tool_router,
-                    modern_upstream_gate_state,
-                )
-                .await;
+                let result =
+                    Self::connect(&name_clone, &sc, reporting, modern_upstream_gate_state).await;
                 (name_clone, result)
             });
         }
@@ -1627,13 +1389,8 @@ impl ServerManager {
         config: &ServerConfig,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        let result = Self::start_server_with_router(
-            name,
-            config,
-            self.tool_router(),
-            modern_upstream_gate_state,
-        )
-        .await;
+        let result =
+            Self::connect(name, config, self.reporting(), modern_upstream_gate_state).await;
         if let Err(error) = &result {
             self.record_error(name, config, error);
         }
@@ -1653,21 +1410,23 @@ impl ServerManager {
     /// the transport and nowhere else: the server keeps the config as the
     /// person wrote it, and an error that quotes the value is redacted here,
     /// while the value is still known.
-    async fn start_server_with_router(
+    async fn connect(
         name: &str,
         config: &ServerConfig,
-        tool_router: std::sync::Weak<ToolRouter>,
+        reporting: Reporting,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let stores = crate::secrets::Stores::current();
-        if stores.refers(config)
-            && let (Some(path), _) = stdio_path().await
-        {
-            crate::secrets::command::use_login_path(path.to_os_string());
-        }
-        let resolved = stores.resolve_server(config).await?;
+        // A store that is a command finds its tool on the PATH a terminal
+        // would have.
+        let path = if stores.refers(config) {
+            stdio_path().await.0
+        } else {
+            None
+        };
+        let resolved = stores.resolve_server(config, path).await?;
         let result =
-            Self::start_resolved(name, &resolved, tool_router, modern_upstream_gate_state).await;
+            Self::start_resolved(name, &resolved, reporting, modern_upstream_gate_state).await;
         if matches!(resolved, std::borrow::Cow::Borrowed(_)) {
             return result;
         }
@@ -1696,9 +1455,10 @@ impl ServerManager {
     async fn start_resolved(
         name: &str,
         config: &ServerConfig,
-        tool_router: std::sync::Weak<ToolRouter>,
+        reporting: Reporting,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
+        let Reporting { events, check_now } = reporting;
         if name == "plug" {
             anyhow::bail!("recursion shield: ignoring upstream server named 'plug'");
         }
@@ -1749,9 +1509,7 @@ impl ServerManager {
                             name,
                             stderr,
                             failure::config_secrets(config),
-                            tool_router
-                                .upgrade()
-                                .map(|router| router.server_manager().check_now_signal()),
+                            check_now,
                         )
                     });
                     if let Some(tail) = &stderr_tail {
@@ -1762,7 +1520,7 @@ impl ServerManager {
                     let handler = Arc::new(UpstreamClientHandler::new(
                         name,
                         Arc::clone(&tools),
-                        tool_router.clone(),
+                        events.clone(),
                         Duration::from_secs(config.call_timeout_secs),
                     ));
 
@@ -1820,7 +1578,7 @@ impl ServerManager {
                         InitializedNotificationCompatHttpClient::new(
                             Arc::from(name),
                             connection.clone(),
-                            tool_router.clone(),
+                            events.clone(),
                         )?,
                         transport_config,
                     );
@@ -1829,7 +1587,7 @@ impl ServerManager {
                     let handler = Arc::new(UpstreamClientHandler::new(
                         name,
                         Arc::clone(&tools),
-                        tool_router.clone(),
+                        events.clone(),
                         Duration::from_secs(config.call_timeout_secs),
                     ));
 
@@ -1871,7 +1629,7 @@ impl ServerManager {
                                 Self::connect_sse_upstream(
                                     name,
                                     config,
-                                    tool_router,
+                                    events,
                                     modern_upstream_gate_state,
                                 )
                                 .await
@@ -1888,13 +1646,8 @@ impl ServerManager {
                             effective_protocol_mode
                         );
                     }
-                    Self::connect_sse_upstream(
-                        name,
-                        config,
-                        tool_router,
-                        modern_upstream_gate_state,
-                    )
-                    .await
+                    Self::connect_sse_upstream(name, config, events, modern_upstream_gate_state)
+                        .await
                 }
                 TransportType::OpenApi => {
                     let document = crate::openapi::load(name, config).await?;
@@ -1903,9 +1656,14 @@ impl ServerManager {
                     // in-process pipe. It stops when the client side drops.
                     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
                     let adapter = crate::openapi::OpenApiServer::new(document, config)?;
+                    let server_name = name.to_string();
                     tokio::spawn(async move {
-                        if let Ok(service) = adapter.serve(server_io).await {
-                            let _ = service.waiting().await;
+                        let ended = match adapter.serve(server_io).await {
+                            Ok(service) => service.waiting().await.map(|_| ()).map_err(|e| e.to_string()),
+                            Err(error) => Err(error.to_string()),
+                        };
+                        if let Err(error) = ended {
+                            tracing::debug!(server = %server_name, %error, "OpenAPI adapter stopped");
                         }
                     });
 
@@ -1913,7 +1671,7 @@ impl ServerManager {
                     let handler = Arc::new(UpstreamClientHandler::new(
                         name,
                         Arc::clone(&tools),
-                        tool_router.clone(),
+                        events.clone(),
                         Duration::from_secs(config.call_timeout_secs),
                     ));
                     let client: McpClient = handler
@@ -1967,7 +1725,7 @@ impl ServerManager {
     async fn connect_sse_upstream(
         name: &str,
         config: &ServerConfig,
-        tool_router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let url = config
@@ -1977,7 +1735,8 @@ impl ServerManager {
 
         let auth_token = resolve_upstream_auth(name, url, config).await?;
         let mut transport_config = LegacySseTransportConfig::with_uri(url)
-            .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs));
+            .endpoint_wait_timeout(Duration::from_secs(config.timeout_secs))
+            .post_timeout(Duration::from_secs(config.timeout_secs));
         if let Some(token) = auth_token {
             transport_config = transport_config.auth_token(token.as_str());
         }
@@ -1995,8 +1754,8 @@ impl ServerManager {
         let connection = ConnectionGeneration::new();
         let transport_config = transport_config.session_observer({
             let connection = connection.clone();
-            let tool_router = tool_router.clone();
-            Arc::new(move || on_upstream_session_replaced(&connection, &tool_router))
+            let events = events.clone();
+            Arc::new(move || on_upstream_session_replaced(&connection, &events))
         });
 
         let transport = LegacySseClientTransport::from_config(transport_config)?;
@@ -2005,7 +1764,7 @@ impl ServerManager {
         let handler = Arc::new(UpstreamClientHandler::new(
             name,
             Arc::clone(&tools),
-            tool_router,
+            events,
             Duration::from_secs(config.call_timeout_secs),
         ));
 
@@ -2104,7 +1863,6 @@ impl ServerManager {
             selected_protocol_version,
             protocol_gate_state: modern_upstream_gate_state,
             connection,
-            health: ServerHealth::Healthy,
             child_pid: None,
             stderr_tail: None,
         })
@@ -2365,8 +2123,7 @@ impl ServerManager {
                 let health = self
                     .health
                     .get(&upstream.name)
-                    .map(|h| h.health)
-                    .unwrap_or(upstream.health);
+                    .map_or(ServerHealth::Healthy, |h| h.health);
                 let auth_status = Self::auth_status_from_configured_auth(
                     Self::configured_auth_for_server(&upstream.config),
                     health,
@@ -2569,10 +2326,10 @@ impl ServerManager {
         if upstream.capabilities.logging.is_none() {
             return;
         }
-        let Some(router) = self.tool_router().upgrade() else {
+        let Some(events) = self.events.upgrade() else {
             return;
         };
-        let params = SetLevelRequestParams::new(router.log_level());
+        let params = SetLevelRequestParams::new(events.log_level());
         let peer = upstream.client.peer().clone();
         let name = name.to_string();
         tokio::spawn(async move {
@@ -2800,16 +2557,14 @@ async fn resolve_upstream_auth(
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::convert::Infallible;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
 
     use axum::extract::State;
     use axum::http::{HeaderMap, StatusCode};
-    use axum::response::sse::{Event, Sse};
     use axum::response::{IntoResponse, Response};
-    use axum::routing::{get, post};
+    use axum::routing::post;
     use axum::{Json, Router};
 
     use super::*;
@@ -2870,201 +2625,6 @@ mod tests {
         starting.abort();
     }
 
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn login_shell_probe_gives_up_on_a_hung_shell() {
-        let started = std::time::Instant::now();
-        let path =
-            probe_login_shell_path("/bin/sh", &["-c", "sleep 30"], Duration::from_millis(200))
-                .await;
-        assert_eq!(path, None);
-        assert!(started.elapsed() < Duration::from_secs(5));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn login_shell_probe_reads_marked_path() {
-        let path = probe_login_shell_path(
-            "/bin/sh",
-            &["-c", "echo noise; echo __PLUG_STDIO_PATH__/bin:/opt/bin"],
-            Duration::from_secs(5),
-        )
-        .await;
-        assert_eq!(path, Some(OsString::from("/bin:/opt/bin")));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn login_shell_probe_survives_a_cancelled_caller() {
-        static CACHE: LoginPathCache = LoginPathCache::new();
-        let probe = || {
-            probe_login_shell_path(
-                "/bin/sh",
-                &["-c", "sleep 0.3; echo __PLUG_STDIO_PATH__/bin"],
-                Duration::from_secs(5),
-            )
-        };
-
-        let cancelled = tokio::time::timeout(
-            Duration::from_millis(50),
-            cached_login_path(&CACHE, Duration::from_secs(30), None, probe()),
-        )
-        .await;
-        assert!(cancelled.is_err(), "caller should time out mid-probe");
-
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(
-            CACHE.path.get(),
-            Some(&OsString::from("/bin")),
-            "the probe must finish and fill the cache after its caller is gone"
-        );
-        assert_eq!(
-            cached_login_path(&CACHE, Duration::from_secs(30), None, probe()).await,
-            Some(OsStr::new("/bin"))
-        );
-    }
-
-    /// After a reboot the login shell can miss the probe's deadline. That
-    /// failure must not stick for the life of the daemon.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn a_failed_login_shell_probe_is_retried_later() {
-        static CACHE: LoginPathCache = LoginPathCache::new();
-        let retry = Duration::from_millis(300);
-        let failing = || async { None };
-        let working = || async { Some(OsString::from("/opt/homebrew/bin")) };
-
-        assert_eq!(
-            cached_login_path(&CACHE, retry, None, failing()).await,
-            None
-        );
-        assert_eq!(
-            cached_login_path(&CACHE, retry, None, working()).await,
-            None,
-            "a probe inside the retry window is skipped"
-        );
-        tokio::time::sleep(retry * 2).await;
-        assert_eq!(
-            cached_login_path(&CACHE, retry, None, working()).await,
-            Some(OsStr::new("/opt/homebrew/bin"))
-        );
-        assert_eq!(
-            cached_login_path(&CACHE, retry, None, failing()).await,
-            Some(OsStr::new("/opt/homebrew/bin")),
-            "a successful probe is kept"
-        );
-    }
-
-    /// Right after a reboot the probe can take its full 5s timeout. A PATH
-    /// saved by an earlier probe must be used at once, not after the probe.
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn a_saved_login_path_is_used_without_waiting_for_the_probe() {
-        static CACHE: LoginPathCache = LoginPathCache::new();
-        let dir = tempfile::tempdir().unwrap();
-        let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
-        std::fs::write(&store, "/saved/bin:/usr/bin\n").unwrap();
-        let slow = async {
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            Some(OsString::from("/probed/bin"))
-        };
-
-        let started = std::time::Instant::now();
-        assert_eq!(
-            cached_login_path(&CACHE, Duration::from_secs(30), Some(store.clone()), slow).await,
-            Some(OsStr::new("/saved/bin:/usr/bin"))
-        );
-        assert!(
-            started.elapsed() < Duration::from_millis(200),
-            "the saved PATH must not wait for the probe"
-        );
-
-        tokio::time::sleep(Duration::from_millis(600)).await;
-        assert_eq!(
-            cached_login_path(
-                &CACHE,
-                Duration::from_secs(30),
-                Some(store.clone()),
-                async { None }
-            )
-            .await,
-            Some(OsStr::new("/probed/bin")),
-            "the background probe replaces the saved PATH"
-        );
-        assert_eq!(std::fs::read_to_string(&store).unwrap(), "/probed/bin");
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
-            assert_eq!(mode, 0o600);
-        }
-    }
-
-    #[cfg(target_os = "macos")]
-    #[tokio::test]
-    async fn a_successful_probe_is_saved_for_the_next_boot() {
-        static CACHE: LoginPathCache = LoginPathCache::new();
-        let dir = tempfile::tempdir().unwrap();
-        let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
-
-        assert_eq!(
-            cached_login_path(
-                &CACHE,
-                Duration::from_secs(30),
-                Some(store.clone()),
-                async { Some(OsString::from("/probed/bin")) }
-            )
-            .await,
-            Some(OsStr::new("/probed/bin"))
-        );
-        assert_eq!(
-            read_saved_login_path(&store),
-            Some(OsString::from("/probed/bin"))
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn an_unusable_saved_login_path_is_ignored() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = dir.path().join(SAVED_LOGIN_PATH_FILE);
-        assert_eq!(read_saved_login_path(&store), None, "missing");
-        std::fs::write(&store, "").unwrap();
-        assert_eq!(read_saved_login_path(&store), None, "empty");
-        std::fs::write(&store, " \n").unwrap();
-        assert_eq!(read_saved_login_path(&store), None, "blank");
-        std::fs::write(&store, "relative/bin").unwrap();
-        assert_eq!(read_saved_login_path(&store), None, "no absolute dir");
-        std::fs::write(&store, [0xff, 0xfe, b'/']).unwrap();
-        assert_eq!(read_saved_login_path(&store), None, "not UTF-8");
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn fallback_stdio_path_adds_homebrew_once() {
-        assert_eq!(
-            fallback_stdio_path(Some(OsString::from("/usr/bin:/bin"))),
-            OsString::from("/usr/bin:/bin:/opt/homebrew/bin:/usr/local/bin")
-        );
-        assert_eq!(
-            fallback_stdio_path(Some(OsString::from("/opt/homebrew/bin:/usr/bin"))),
-            OsString::from("/opt/homebrew/bin:/usr/bin:/usr/local/bin")
-        );
-        assert_eq!(
-            fallback_stdio_path(None),
-            OsString::from("/opt/homebrew/bin:/usr/local/bin")
-        );
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn login_shell_path_ignores_shell_noise() {
-        assert_eq!(
-            login_shell_path(b"welcome from shell config\n__PLUG_STDIO_PATH__/bin:/opt/bin\n"),
-            Some(OsString::from("/bin:/opt/bin"))
-        );
-        assert_eq!(login_shell_path(b"/bin:/opt/bin\n"), None);
-    }
-
     fn session_watcher() -> (
         InitializedNotificationCompatHttpClient,
         ConnectionGeneration,
@@ -3078,7 +2638,7 @@ mod tests {
             // Dangling: these tests exercise the generation half of the
             // reaction, and a router that cannot be upgraded simply skips the
             // refresh kick.
-            std::sync::Weak::new(),
+            no_events(),
         )
         .expect("build the HTTP client");
         (client, connection)
@@ -3872,7 +3432,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3892,7 +3452,6 @@ mod tests {
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
             connection: ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
             child_pid: None,
             stderr_tail: None,
         }
@@ -3933,7 +3492,7 @@ mod tests {
         let handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("eof-ignorer"),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client: McpClient = rmcp::service::serve_directly(handler, transport, None);
         let upstream = UpstreamServer {
@@ -3947,7 +3506,6 @@ mod tests {
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
             connection: ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
             child_pid,
             stderr_tail: None,
         };
@@ -3977,7 +3535,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            Arc::downgrade(router),
+            Arc::downgrade(router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4007,7 +3565,6 @@ mod tests {
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
                 connection: ConnectionGeneration::new(),
-                health: ServerHealth::Healthy,
                 child_pid: None,
                 stderr_tail: None,
             },
@@ -4253,7 +3810,7 @@ mod tests {
         let upstream_handler_a = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("replace-test"),
             Arc::clone(&tools_a),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client_a: McpClient = upstream_handler_a
             .serve(client_transport_a)
@@ -4279,7 +3836,6 @@ mod tests {
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
                 connection: ConnectionGeneration::new(),
-                health: ServerHealth::Healthy,
                 child_pid: None,
                 stderr_tail: None,
             },
@@ -4311,7 +3867,7 @@ mod tests {
         let upstream_handler_b = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("replace-test"),
             Arc::clone(&tools_b),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client_b: McpClient = upstream_handler_b
             .serve(client_transport_b)
@@ -4337,7 +3893,6 @@ mod tests {
                 selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
                 protocol_gate_state: 0,
                 connection: ConnectionGeneration::new(),
-                health: ServerHealth::Healthy,
                 child_pid: None,
                 stderr_tail: None,
             },
@@ -4572,12 +4127,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_tool_list_changed_refreshes_router_and_notifies_downstream() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer = Arc::clone(&upstream_server.peer);
@@ -4599,7 +4150,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4623,7 +4174,6 @@ mod tests {
                         .to_string(),
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
-                    health: ServerHealth::Healthy,
                     child_pid: None,
                     stderr_tail: None,
                 },
@@ -4664,12 +4214,8 @@ mod tests {
 
     #[tokio::test]
     async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_delivery() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer = Arc::clone(&upstream_server.peer);
@@ -4691,7 +4237,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4715,7 +4261,6 @@ mod tests {
                         .to_string(),
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
-                    health: ServerHealth::Healthy,
                     child_pid: None,
                     stderr_tail: None,
                 },
@@ -4745,12 +4290,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_native_upstream_pass_through_proxies_task_lifecycle() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream, task_result_request_count) = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4884,12 +4425,8 @@ mod tests {
         // collect. This proves the forwarded `CancelTaskRequest` lands by
         // querying the upstream mock directly (bypassing the router, whose
         // record is gone after cleanup).
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream, _task_result_request_count) = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4976,14 +4513,10 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_lazy_mode_exposes_search_and_loaded_direct_tool_calls() {
-        let server_manager = Arc::new(ServerManager::new());
         let mut config = RouterConfig::default();
         config.lazy_tools.mode = crate::types::LazyToolSetting::Bridge;
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            config,
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(config);
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream_server, tools_rx) =
             MutableToolServer::new(vec![make_tool_with_description("echo", "Echo input")]);
@@ -5006,7 +4539,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -5030,7 +4563,6 @@ mod tests {
                         .to_string(),
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
-                    health: ServerHealth::Healthy,
                     child_pid: None,
                     stderr_tail: None,
                 },
@@ -5089,12 +4621,8 @@ mod tests {
 
     #[tokio::test]
     async fn downstream_cancellation_reaches_the_upstream() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let upstream_server = ProgressCancelServer::new();
         let cancelled_request = Arc::clone(&upstream_server.cancelled_request);
@@ -5111,7 +4639,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -5135,7 +4663,6 @@ mod tests {
                         .to_string(),
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
-                    health: ServerHealth::Healthy,
                     child_pid: None,
                     stderr_tail: None,
                 },
@@ -5191,12 +4718,8 @@ mod tests {
 
     #[tokio::test]
     async fn router_refreshes_resources_and_prompts_and_routes_reads() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         tokio::spawn(async move {
@@ -5211,7 +4734,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("catalog"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -5240,7 +4763,6 @@ mod tests {
                         .to_string(),
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
-                    health: ServerHealth::Healthy,
                     child_pid: None,
                     stderr_tail: None,
                 },
@@ -5311,230 +4833,104 @@ mod tests {
 
     // ── Legacy SSE test mock server ──────────────────────────────────────
 
-    #[derive(Clone)]
-    struct LegacySseTestAppState {
-        tools: Arc<tokio::sync::RwLock<Vec<Tool>>>,
-        tx: tokio::sync::broadcast::Sender<sse_stream::Sse>,
-        expected_auth: Option<String>,
-        reject_post_on_stream_path: bool,
-        last_message_headers: Arc<tokio::sync::RwLock<HashMap<String, String>>>,
-    }
-
-    #[derive(Clone)]
+    /// A legacy SSE upstream with a tool list, recording the `Mcp-*` headers
+    /// of the last message it received.
     struct LegacySseTestServer {
-        state: LegacySseTestAppState,
+        server: crate::transport::sse_client::mock::LegacySse,
+        tools: Arc<Mutex<Vec<Tool>>>,
+        last_message_headers: Arc<Mutex<HashMap<String, String>>>,
     }
 
     impl LegacySseTestServer {
-        async fn spawn(
-            initial_tools: Vec<Tool>,
-            expected_auth: Option<&str>,
-            reject_post_on_stream_path: bool,
-        ) -> (Self, String) {
-            let (tx, _) = tokio::sync::broadcast::channel(32);
-            let state = LegacySseTestAppState {
-                tools: Arc::new(tokio::sync::RwLock::new(initial_tools)),
-                tx,
-                expected_auth: expected_auth.map(str::to_string),
-                reject_post_on_stream_path,
-                last_message_headers: Arc::new(tokio::sync::RwLock::new(HashMap::new())),
-            };
-            let app = Router::new()
-                .route("/mcp", get(legacy_sse_stream).post(legacy_sse_stream_post))
-                .route("/messages", post(legacy_sse_messages))
-                .with_state(state.clone());
-
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-                .await
-                .expect("bind legacy SSE test server");
-            let addr = listener.local_addr().expect("legacy SSE local addr");
-            tokio::spawn(async move {
-                axum::serve(listener, app)
-                    .await
-                    .expect("serve legacy SSE test server");
-            });
-
+        async fn spawn(initial_tools: Vec<Tool>, bearer: Option<&str>) -> (Self, String) {
+            let tools = Arc::new(Mutex::new(initial_tools));
+            let last_message_headers = Arc::new(Mutex::new(HashMap::new()));
+            let (server, url) = crate::transport::sse_client::mock::LegacySse::spawn(bearer, {
+                let tools = Arc::clone(&tools);
+                let last_message_headers = Arc::clone(&last_message_headers);
+                move |server, headers, message| {
+                    {
+                        let mut last = last_message_headers.lock().unwrap();
+                        last.clear();
+                        for name in ["Mcp-Method", "Mcp-Name"] {
+                            if let Some(value) =
+                                headers.get(name).and_then(|value| value.to_str().ok())
+                            {
+                                last.insert(name.to_string(), value.to_string());
+                            }
+                        }
+                    }
+                    let ClientJsonRpcMessage::Request(request) = message else {
+                        return;
+                    };
+                    let result = match request.request {
+                        ClientRequest::InitializeRequest(_) => {
+                            let mut caps = ServerCapabilities::default();
+                            let mut tools = rmcp::model::ToolsCapability::default();
+                            tools.list_changed = Some(true);
+                            caps.tools = Some(tools);
+                            ServerResult::InitializeResult(
+                                InitializeResult::new(caps).with_server_info(Implementation::new(
+                                    "legacy-sse-server",
+                                    "1.0",
+                                )),
+                            )
+                        }
+                        ClientRequest::ListToolsRequest(_) => ServerResult::ListToolsResult(
+                            ListToolsResult::with_all_items(tools.lock().unwrap().clone()),
+                        ),
+                        ClientRequest::CallToolRequest(call) => {
+                            ServerResult::CallToolResult(CallToolResult::success(vec![
+                                ContentBlock::text(format!(
+                                    "legacy sse called {}",
+                                    call.params.name
+                                )),
+                            ]))
+                        }
+                        ClientRequest::CustomRequest(custom) if custom.method == "tasks/list" => {
+                            ServerResult::CustomResult(rmcp::model::CustomResult::new(
+                                serde_json::json!({"tasks": []}),
+                            ))
+                        }
+                        _ => return,
+                    };
+                    server.respond(request.id, result);
+                }
+            })
+            .await;
             (
-                Self { state },
-                format!("http://127.0.0.1:{}/mcp", addr.port()),
+                Self {
+                    server,
+                    tools,
+                    last_message_headers,
+                },
+                url,
             )
         }
 
-        async fn set_tools_and_notify(&self, tools: Vec<Tool>) {
-            *self.state.tools.write().await = tools;
-            let notification = ServerJsonRpcMessage::notification(
+        fn set_tools_and_notify(&self, tools: Vec<Tool>) {
+            *self.tools.lock().unwrap() = tools;
+            self.server.send(&ServerJsonRpcMessage::notification(
                 rmcp::model::ServerNotification::ToolListChangedNotification(
                     rmcp::model::ToolListChangedNotification::default(),
                 ),
-            );
-            self.state
-                .tx
-                .send(
-                    sse_stream::Sse::default().data(
-                        serde_json::to_string(&notification).expect("serialize notification"),
-                    ),
-                )
-                .expect("broadcast tool list changed");
+            ));
         }
 
-        async fn last_message_headers(&self) -> HashMap<String, String> {
-            self.state.last_message_headers.read().await.clone()
+        fn last_message_headers(&self) -> HashMap<String, String> {
+            self.last_message_headers.lock().unwrap().clone()
         }
-    }
-
-    fn legacy_sse_authorized(headers: &HeaderMap, expected: &Option<String>) -> bool {
-        match expected {
-            None => true,
-            Some(expected) => headers
-                .get(axum::http::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                .is_some_and(|value| value == format!("Bearer {expected}")),
-        }
-    }
-
-    async fn legacy_sse_stream(
-        State(state): State<LegacySseTestAppState>,
-        headers: HeaderMap,
-    ) -> Result<Sse<impl futures::Stream<Item = Result<Event, Infallible>>>, StatusCode> {
-        if !legacy_sse_authorized(&headers, &state.expected_auth) {
-            return Err(StatusCode::UNAUTHORIZED);
-        }
-
-        let mut rx = state.tx.subscribe();
-        let stream = async_stream::stream! {
-            yield Ok(Event::default().event("endpoint").data("/messages"));
-            loop {
-                match rx.recv().await {
-                    Ok(event) => yield Ok(event_to_axum(event)),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        };
-        Ok(Sse::new(stream))
-    }
-
-    async fn legacy_sse_stream_post(
-        State(state): State<LegacySseTestAppState>,
-        headers: HeaderMap,
-    ) -> StatusCode {
-        if !legacy_sse_authorized(&headers, &state.expected_auth) {
-            return StatusCode::UNAUTHORIZED;
-        }
-        if state.reject_post_on_stream_path {
-            StatusCode::METHOD_NOT_ALLOWED
-        } else {
-            StatusCode::ACCEPTED
-        }
-    }
-
-    async fn legacy_sse_messages(
-        State(state): State<LegacySseTestAppState>,
-        headers: HeaderMap,
-        Json(message): Json<ClientJsonRpcMessage>,
-    ) -> StatusCode {
-        if !legacy_sse_authorized(&headers, &state.expected_auth) {
-            return StatusCode::UNAUTHORIZED;
-        }
-        {
-            let mut last_headers = state.last_message_headers.write().await;
-            last_headers.clear();
-            for name in ["Mcp-Method", "Mcp-Name"] {
-                if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
-                    last_headers.insert(name.to_string(), value.to_string());
-                }
-            }
-        }
-
-        match message {
-            ClientJsonRpcMessage::Request(request) => match request.request {
-                ClientRequest::InitializeRequest(_) => {
-                    let mut caps = ServerCapabilities::default();
-                    let mut tools = rmcp::model::ToolsCapability::default();
-                    tools.list_changed = Some(true);
-                    caps.tools = Some(tools);
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::InitializeResult(
-                            InitializeResult::new(caps)
-                                .with_server_info(Implementation::new("legacy-sse-server", "1.0")),
-                        ),
-                        request.id,
-                    );
-                    let _ =
-                        state.tx.send(sse_stream::Sse::default().data(
-                            serde_json::to_string(&response).expect("serialize init response"),
-                        ));
-                }
-                ClientRequest::ListToolsRequest(_) => {
-                    let tools = state.tools.read().await.clone();
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::ListToolsResult(ListToolsResult::with_all_items(tools)),
-                        request.id,
-                    );
-                    let _ =
-                        state.tx.send(sse_stream::Sse::default().data(
-                            serde_json::to_string(&response).expect("serialize tools response"),
-                        ));
-                }
-                ClientRequest::CallToolRequest(call) => {
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::CallToolResult(CallToolResult::success(vec![
-                            ContentBlock::text(format!("legacy sse called {}", call.params.name)),
-                        ])),
-                        request.id,
-                    );
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&response).expect("serialize tool call response"),
-                    ));
-                }
-                ClientRequest::CustomRequest(custom) if custom.method == "tasks/list" => {
-                    let response = ServerJsonRpcMessage::response(
-                        ServerResult::CustomResult(rmcp::model::CustomResult::new(
-                            serde_json::json!({"tasks": []}),
-                        )),
-                        request.id,
-                    );
-                    let _ = state.tx.send(sse_stream::Sse::default().data(
-                        serde_json::to_string(&response).expect("serialize tasks/list response"),
-                    ));
-                }
-                _ => {}
-            },
-            ClientJsonRpcMessage::Notification(_) => {}
-            ClientJsonRpcMessage::Response(_) => {}
-            ClientJsonRpcMessage::Error(_) => {}
-        }
-
-        StatusCode::ACCEPTED
-    }
-
-    fn event_to_axum(event: sse_stream::Sse) -> Event {
-        let mut axum_event = Event::default();
-        if let Some(kind) = event.event {
-            axum_event = axum_event.event(kind);
-        }
-        if let Some(data) = event.data {
-            axum_event = axum_event.data(data);
-        }
-        if let Some(id) = event.id {
-            axum_event = axum_event.id(id);
-        }
-        axum_event
     }
 
     // ── Legacy SSE integration tests ─────────────────────────────────────
 
     #[tokio::test]
     async fn explicit_sse_upstream_connects_and_routes_tool_calls() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (legacy_server, url) =
-            LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token"), false).await;
+            LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token")).await;
 
         let mut config = test_server_config();
         config.transport = TransportType::Sse;
@@ -5566,7 +4962,7 @@ mod tests {
             .await
             .expect("legacy SSE tool call");
         assert!(format!("{result:?}").contains("legacy sse called echo"));
-        let headers = legacy_server.last_message_headers().await;
+        let headers = legacy_server.last_message_headers();
         assert_eq!(
             headers.get("Mcp-Method").map(String::as_str),
             Some("tools/call")
@@ -5576,18 +4972,13 @@ mod tests {
 
     #[tokio::test]
     async fn http_upstream_falls_back_to_legacy_sse() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
-        // reject_post_on_stream_path=true → the mock returns 405 on POST to /mcp,
-        // which signals to the HTTP transport that this is a legacy SSE server.
-        // No auth here so the POST gets 405 (not 401) to trigger fallback.
-        let (_legacy_server, url) =
-            LegacySseTestServer::spawn(vec![make_tool("echo")], None, true).await;
+        // The mock refuses a POST to /mcp with 405, which tells the HTTP
+        // transport it is a legacy SSE server. No auth here, so the POST gets
+        // 405, not 401.
+        let (_legacy_server, url) = LegacySseTestServer::spawn(vec![make_tool("echo")], None).await;
 
         let mut config = test_server_config();
         config.transport = TransportType::Http;
@@ -5616,15 +5007,10 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sse_tool_list_changed_reaches_downstream() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
-        let (legacy_server, url) =
-            LegacySseTestServer::spawn(vec![make_tool("echo")], None, false).await;
+        let (legacy_server, url) = LegacySseTestServer::spawn(vec![make_tool("echo")], None).await;
 
         let mut config = test_server_config();
         config.transport = TransportType::Sse;
@@ -5640,9 +5026,7 @@ mod tests {
         let (signal, notifications) = watch_tool_list_changed(&router);
 
         // Trigger a tool list changed notification from the legacy SSE server.
-        legacy_server
-            .set_tools_and_notify(vec![make_tool("echo"), make_tool("extra")])
-            .await;
+        legacy_server.set_tools_and_notify(vec![make_tool("echo"), make_tool("extra")]);
 
         tokio::time::timeout(Duration::from_secs(5), signal.notified())
             .await
@@ -5722,12 +5106,8 @@ mod tests {
     /// came back after a failure logged at its own default forever.
     #[tokio::test]
     async fn replace_server_applies_the_effective_log_level() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
         router.set_client_log_level("client", rmcp::model::LoggingLevel::Debug);
 
         let seen = Arc::new(Mutex::new(None));
@@ -5747,7 +5127,7 @@ mod tests {
         let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("logging"),
             Arc::new(ArcSwap::from_pointee(Vec::new())),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ))
         .serve(client_transport)
         .await
@@ -5775,7 +5155,6 @@ mod tests {
                         .to_string(),
                     protocol_gate_state: 0,
                     connection: ConnectionGeneration::new(),
-                    health: ServerHealth::Healthy,
                     child_pid: None,
                     stderr_tail: None,
                 },
@@ -5838,7 +5217,7 @@ mod tests {
         let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("silent"),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ))
         .serve(client_transport)
         .await
@@ -5854,7 +5233,6 @@ mod tests {
             selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
             protocol_gate_state: 0,
             connection: ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
             child_pid: None,
             stderr_tail: None,
         });
@@ -5898,7 +5276,7 @@ mod tests {
         let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("silent"),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ))
         .serve(client_transport)
         .await
@@ -6012,18 +5390,5 @@ mod tests {
             *entry = HealthState::new();
         }
         assert_eq!(mgr.server_statuses()[0].error, None);
-    }
-
-    #[test]
-    fn spawn_error_names_the_command_and_the_path_searched() {
-        let not_found = std::io::Error::from(std::io::ErrorKind::NotFound);
-        assert_eq!(
-            spawn_error("npx", &not_found, StdioPathSource::Fallback).to_string(),
-            "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)"
-        );
-        assert_eq!(
-            spawn_error("/opt/tool", &not_found, StdioPathSource::LoginShell).to_string(),
-            format!("failed to spawn `/opt/tool`: {not_found}")
-        );
     }
 }

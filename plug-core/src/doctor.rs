@@ -460,11 +460,11 @@ async fn check_env_vars(config: &Config, config_path: &Path) -> CheckResult {
 
 /// Check 5: each stdio server's command binary is found in PATH.
 async fn check_server_binaries(config: &Config) -> CheckResult {
-    let login_path = crate::server::stdio_login_path().await;
+    let login_path = crate::server::path::stdio_login_path().await;
     server_binaries_result(
         config,
         |binary| which(binary, login_path),
-        crate::server::resolve_without_login_shell,
+        crate::server::path::resolve_without_login_shell,
     )
 }
 
@@ -546,7 +546,7 @@ fn server_binaries_result(
 
 /// Simple which-like lookup in PATH.
 fn which(binary: &str, login_path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
-    let path = crate::server::resolve_stdio_command(binary, login_path);
+    let path = crate::server::path::resolve_stdio_command(binary, login_path);
     path.is_file().then_some(path)
 }
 

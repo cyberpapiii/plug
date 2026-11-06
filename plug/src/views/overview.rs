@@ -173,6 +173,7 @@ fn print_next_actions(actions: &[(&str, &str)]) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn overview_json(
     config_exists: bool,
     config_path: &std::path::Path,
@@ -205,6 +206,7 @@ fn overview_json(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn status_json(
     uptime_secs: u64,
     daemon_proxy_client_count: usize,

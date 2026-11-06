@@ -1168,15 +1168,21 @@ async fn cmd_auth_status(
         return Ok(());
     }
 
-    let live_auth_status =
+    let (live_auth_status, live_unavailable_reason) =
         match crate::ipc_client::request(plug_core::ipc::IpcRequest::AuthStatus).await {
-            Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => Some(
-                servers
-                    .into_iter()
-                    .map(|s| (s.name.clone(), s))
-                    .collect::<std::collections::HashMap<_, _>>(),
+            Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => (
+                Some(
+                    servers
+                        .into_iter()
+                        .map(|s| (s.name.clone(), s))
+                        .collect::<std::collections::HashMap<_, _>>(),
+                ),
+                None,
             ),
-            _ => None,
+            Err(crate::ipc_client::IpcClientError::NotRunning) => (None, None),
+            Ok(plug_core::ipc::IpcResponse::Error { message, .. }) => (None, Some(message)),
+            Ok(_) => (None, Some("unexpected reply".to_string())),
+            Err(error) => (None, Some(error.to_string())),
         };
 
     match output {
@@ -1189,9 +1195,10 @@ async fn cmd_auth_status(
                 style(auth_status_source_text(live_auth_status.is_some())).dim()
             );
             if live_auth_status.is_none() {
-                ui::print_warning_line(
-                    "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status.",
-                );
+                ui::print_warning_line(match &live_unavailable_reason {
+                    Some(reason) => format!("Live daemon auth state is unavailable: {reason}"),
+                    None => "Live daemon auth state is unavailable. Start the shared service with `plug start` for authoritative runtime auth status.".to_string(),
+                });
             }
             println!();
 

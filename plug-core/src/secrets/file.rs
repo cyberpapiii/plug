@@ -40,35 +40,8 @@ impl File {
         if !content.is_empty() {
             content.push('\n');
         }
-        let parent = self
-            .path
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        std::fs::create_dir_all(parent).map_err(Self::unavailable)?;
-        let temp = self
-            .path
-            .with_extension(format!("{}.tmp", uuid::Uuid::new_v4().simple()));
-        let written = (|| -> std::io::Result<()> {
-            #[cfg(unix)]
-            {
-                use std::io::Write;
-                use std::os::unix::fs::OpenOptionsExt;
-                let mut file = std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(&temp)?;
-                file.write_all(content.as_bytes())?;
-                file.sync_all()?;
-            }
-            #[cfg(not(unix))]
-            std::fs::write(&temp, &content)?;
-            std::fs::rename(&temp, &self.path)
-        })();
-        if written.is_err() {
-            let _ = std::fs::remove_file(&temp);
-        }
-        written.map_err(Self::unavailable)
+        crate::fs_perm::write_private_atomic(&self.path, content.as_bytes())
+            .map_err(Self::unavailable)
     }
 }
 
@@ -158,7 +131,6 @@ mod tests {
         assert!(!path.exists());
 
         store.set("API", &"value".to_string().into()).unwrap();
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;

@@ -124,6 +124,11 @@ mod tests {
         let token = generate_auth_token();
         write_token_file(&path, &token).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(&path).is_ok() {
+            // Root reads through permissions, so there is no read error to test.
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
 
         let loaded = load_or_generate_token(&path);
 

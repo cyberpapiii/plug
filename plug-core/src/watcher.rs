@@ -63,12 +63,17 @@ async fn run_watcher(
     let mut debouncer = new_debouncer(
         Duration::from_millis(DEBOUNCE_MS),
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
-            if let Ok(events) = result {
-                for event in events {
-                    if event.kind == DebouncedEventKind::Any {
-                        // Non-blocking send — if channel is full, skip
-                        let _ = tx.try_send(event.path);
-                    }
+            let events = match result {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(%error, "config file watcher error; a change may be missed");
+                    return;
+                }
+            };
+            for event in events {
+                // A full channel already holds a change to reload for.
+                if event.kind == DebouncedEventKind::Any {
+                    let _ = tx.try_send(event.path);
                 }
             }
         },
@@ -168,8 +173,9 @@ mod tests {
         _dir: TempDir,
         config_path: PathBuf,
         engine: Arc<Engine>,
-        /// Reloads already observed by `wait_for_reload`.
-        seen_reloads: u64,
+        /// The config the last reload `wait_for_reload` saw put in place.
+        /// Every reload stores a new one, even of an unchanged file.
+        seen_config: Arc<Config>,
     }
 
     impl WatcherFixture {
@@ -178,9 +184,9 @@ mod tests {
             let config_path = dir.path().join("config.toml");
             write_config(&config_path, &Config::default());
 
-            let engine = Arc::new(Engine::new(Config::default()));
+            let engine = Engine::new(Config::default());
             engine.start().await.expect("engine start");
-            let seen_reloads = engine.reloads_applied();
+            let seen_config = Arc::clone(&engine.config());
 
             let ready = spawn_config_watcher(
                 engine.clone(),
@@ -197,7 +203,7 @@ mod tests {
                 _dir: dir,
                 config_path,
                 engine,
-                seen_reloads,
+                seen_config,
             };
 
             // FSEvents can report a file event that predates registration.
@@ -222,9 +228,9 @@ mod tests {
         async fn wait_for_reload(&mut self, timeout: Duration) -> bool {
             let deadline = tokio::time::Instant::now() + timeout;
             loop {
-                let applied = self.engine.reloads_applied();
-                if applied > self.seen_reloads {
-                    self.seen_reloads = applied;
+                let current = Arc::clone(&self.engine.config());
+                if !Arc::ptr_eq(&current, &self.seen_config) {
+                    self.seen_config = current;
                     return true;
                 }
                 if tokio::time::Instant::now() >= deadline {

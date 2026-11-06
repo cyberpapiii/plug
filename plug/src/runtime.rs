@@ -412,7 +412,7 @@ async fn operator_remove_owner_credential(
     let path = original_uri.path();
     let allow_empty = exact_header(&headers, OPERATOR_ALLOW_EMPTY_HEADER) == Some("true");
     if let Err(status) =
-        operator_proof_authorized(&state, &headers, "DELETE", &path, allow_empty).await
+        operator_proof_authorized(&state, &headers, "DELETE", path, allow_empty).await
     {
         return status;
     }
@@ -455,7 +455,7 @@ async fn operator_revoke_oauth_client(
     headers: HeaderMap,
 ) -> StatusCode {
     let path = original_uri.path();
-    if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", &path, false).await {
+    if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", path, false).await {
         return status;
     }
     match state.http_state.revoke_downstream_client(&client_id).await {
@@ -659,7 +659,7 @@ fn build_configured_http_runtime(
     let watch_events = downstream_oauth.clone().and_then(|oauth| {
         plug_core::events::WatchEvents::open(
             &plug_core::paths::events_dir().join("watch"),
-            Arc::new(plug_core::events::RuntimeWatchAccess::new(engine, oauth)),
+            Arc::new(plug_core::engine::RuntimeWatchAccess::new(engine, oauth)),
             Arc::new(plug_core::events::HttpsDelivery),
         )
         .inspect_err(|error| tracing::warn!(%error, "watch events unavailable"))
@@ -790,7 +790,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         .unwrap_or_else(plug_core::paths::default_config_path);
     let config = plug_core::config::load_config(Some(&config_path))?;
     preflight_http_bind(&config.http)?;
-    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
+    let engine = plug_core::engine::Engine::new(config);
 
     // Upstream startup no longer gates the IPC socket. `Engine::start` waits on
     // third-party server processes, so it can run for tens of seconds, and
@@ -933,7 +933,7 @@ pub(crate) fn restart_advice() -> &'static str {
 
 fn restart_advice_for(app_installed: bool) -> &'static str {
     if app_installed {
-        "Restart Plug from Plug.app (Settings → Service → Restart)"
+        "Restart Plug from Plug.app (Settings → Plug → Restart)"
     } else {
         "Run `plug stop`, then `plug start`"
     }
@@ -1171,9 +1171,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_router_supports_https() {
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(plug_core::http::server::HttpState::new(
@@ -1428,9 +1426,7 @@ mod tests {
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
 
         let daemon_engine = Arc::clone(&engine);
@@ -1469,9 +1465,7 @@ mod tests {
     }
 
     async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state_path = unique_temp_dir("owner-operator").join("oauth.json");
@@ -1850,9 +1844,7 @@ mod tests {
         )
         .expect("reopen CIMD fixture");
 
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(
@@ -1893,12 +1885,12 @@ mod tests {
         .await
         .expect("authenticated CIMD revocation");
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(&tokens.access_token, &manager.resource(),)
-                .await,
-            plug_core::downstream_oauth::AccessTokenValidation::Invalid
-        ));
+                .await
+                .is_none()
+        );
 
         server.abort();
         engine.shutdown().await;
@@ -2027,7 +2019,7 @@ mod tests {
             "mock".to_string(),
             plug_core::test_helpers::mock_server("echo"),
         );
-        let engine = Arc::new(plug_core::engine::Engine::new(config));
+        let engine = plug_core::engine::Engine::new(config);
         engine.start().await.expect("engine start");
         let tool_router = engine.tool_router().clone();
 
@@ -2094,13 +2086,10 @@ mod tests {
 
         // Barrier: middleware validation has completed and captured the old
         // client generation, but task dispatch has not begun.
-        let claims = match manager
+        let claims = manager
             .validate_access_token_for(&tokens.access_token, &manager.resource())
             .await
-        {
-            plug_core::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("token must validate before revocation: {other:?}"),
-        };
+            .expect("token must validate before revocation");
         let principal = plug_core::types::PrincipalId::downstream_oauth(
             manager.base_url(),
             claims.client_id.clone(),

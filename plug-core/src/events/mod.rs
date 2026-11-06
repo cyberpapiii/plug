@@ -1,8 +1,8 @@
 //! MCP Events: remote clients subscribe to an event and Plug posts each one to
 //! their webhook. `hub` is the subscription engine every source shares; a
 //! source decides what its events are and when one happens. Plug has two:
-//! watching a tool (`watch`) and Slack (`crate::slack_events`).
-mod access;
+//! watching a tool (`watch`) and Slack (`slack_events`). The daemon opens
+//! each and hands the HTTP transport the list.
 mod delivery;
 mod hub;
 #[cfg(test)]
@@ -17,7 +17,7 @@ use serde_json::Value;
 pub use crate::config::{
     EVENT_SCOPE, EventsConfig, MIN_WATCH_SECS, WatchConfig, events_missing, events_possible,
 };
-pub use access::RuntimeWatchAccess;
+
 pub use delivery::{DeliveryResponse, EventDelivery, HttpsDelivery};
 pub(crate) use delivery::{hmac_sha256, validate_url};
 pub(crate) use hub::MAX_QUEUE;
