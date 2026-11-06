@@ -312,30 +312,25 @@ async fn cmd_downstream_oauth_clients(
     command: crate::DownstreamOauthClientCommands,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
-    if config_path.is_none() {
-        return cmd_downstream_oauth_clients_via_daemon(command, output).await;
-    }
-    let operator = local_operator_client(config_path, crate::runtime::OPERATOR_OAUTH_CLIENTS_PATH)?;
+    // `--config` names a Plug served from that file, reached over its
+    // operator routes; without it, the daemon answers.
+    let operator = match config_path {
+        Some(_) => Some(local_operator_client(
+            config_path,
+            crate::runtime::OPERATOR_OAUTH_CLIENTS_PATH,
+        )?),
+        None => {
+            crate::runtime::ensure_daemon_with_feedback(None, false).await?;
+            None
+        }
+    };
 
     match command {
         crate::DownstreamOauthClientCommands::List => {
-            let response = operator
-                .send_authenticated(reqwest::Method::GET, None, false)
-                .await?;
-            if !response.status().is_success() {
-                anyhow::bail!(
-                    "the running Plug service rejected the client-list request ({})",
-                    response.status()
-                );
-            }
-            let clients = response
-                .json::<Vec<plug_core::downstream_oauth::RegisteredClientSummary>>()
-                .await?;
+            let clients = list_registered_clients(operator.as_ref()).await?;
             match output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
-                OutputFormat::Text => {
-                    print_registered_clients(&clients);
-                }
+                OutputFormat::Text => print_registered_clients(&clients),
             }
         }
         crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
@@ -348,21 +343,68 @@ async fn cmd_downstream_oauth_clients(
                 ui::print_info_line("Revocation cancelled");
                 return Ok(());
             }
-            let response = operator
-                .send_authenticated(reqwest::Method::DELETE, Some(&client_id), false)
-                .await?;
-            match response.status() {
-                reqwest::StatusCode::NO_CONTENT => ui::print_success_line(format!(
-                    "Revoked {client_id} and all of its downstream OAuth grants"
-                )),
-                reqwest::StatusCode::NOT_FOUND => anyhow::bail!("registered client not found"),
-                status => {
-                    anyhow::bail!("the running Plug service rejected the revocation ({status})")
-                }
-            }
+            revoke_registered_client(operator.as_ref(), &client_id).await?;
+            ui::print_success_line(format!(
+                "Revoked {client_id} and all of its downstream OAuth grants"
+            ));
         }
     }
     Ok(())
+}
+
+async fn list_registered_clients(
+    operator: Option<&LocalOperatorClient>,
+) -> anyhow::Result<Vec<plug_core::downstream_oauth::RegisteredClientSummary>> {
+    let Some(operator) = operator else {
+        return match crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await? {
+            plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot } => {
+                Ok(snapshot.downstream_clients)
+            }
+            plug_core::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!("{code}: {message}")
+            }
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        };
+    };
+    let response = operator
+        .send_authenticated(reqwest::Method::GET, None, false)
+        .await?;
+    if !response.status().is_success() {
+        anyhow::bail!(
+            "the running Plug service rejected the client-list request ({})",
+            response.status()
+        );
+    }
+    Ok(response.json().await?)
+}
+
+async fn revoke_registered_client(
+    operator: Option<&LocalOperatorClient>,
+    client_id: &str,
+) -> anyhow::Result<()> {
+    let Some(operator) = operator else {
+        return match crate::ipc_client::operator(
+            plug_core::ipc::OperatorRequest::RevokeDownstreamClient {
+                client_id: client_id.to_string(),
+            },
+        )
+        .await?
+        {
+            plug_core::ipc::IpcResponse::DownstreamClientRevoked { .. } => Ok(()),
+            plug_core::ipc::IpcResponse::Error { code, message } => {
+                anyhow::bail!("{code}: {message}")
+            }
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        };
+    };
+    let response = operator
+        .send_authenticated(reqwest::Method::DELETE, Some(client_id), false)
+        .await?;
+    match response.status() {
+        reqwest::StatusCode::NO_CONTENT => Ok(()),
+        reqwest::StatusCode::NOT_FOUND => anyhow::bail!("registered client not found"),
+        status => anyhow::bail!("the running Plug service rejected the revocation ({status})"),
+    }
 }
 
 fn print_registered_clients(clients: &[plug_core::downstream_oauth::RegisteredClientSummary]) {
@@ -413,61 +455,6 @@ fn registered_client_timeline(
         "Registered {}, last used {last_used}, {expiry}{sign_in}",
         ago(registered.created_at)
     )
-}
-
-async fn cmd_downstream_oauth_clients_via_daemon(
-    command: crate::DownstreamOauthClientCommands,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
-    crate::runtime::ensure_daemon_with_feedback(None, false).await?;
-    match command {
-        crate::DownstreamOauthClientCommands::List => {
-            let response =
-                crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Snapshot).await?;
-            let clients = match response {
-                plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot } => {
-                    snapshot.downstream_clients
-                }
-                plug_core::ipc::IpcResponse::Error { code, message } => {
-                    anyhow::bail!("{code}: {message}")
-                }
-                other => anyhow::bail!("unexpected daemon response: {other:?}"),
-            };
-            match output {
-                OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&clients)?),
-                OutputFormat::Text => print_registered_clients(&clients),
-            }
-        }
-        crate::DownstreamOauthClientCommands::Revoke { client_id, yes } => {
-            if !yes
-                && !dialoguer::Confirm::new()
-                    .with_prompt(format!("Revoke {client_id} and all of its Plug tokens?"))
-                    .default(false)
-                    .interact()?
-            {
-                ui::print_info_line("Revocation cancelled");
-                return Ok(());
-            }
-            match crate::ipc_client::operator(
-                plug_core::ipc::OperatorRequest::RevokeDownstreamClient {
-                    client_id: client_id.clone(),
-                },
-            )
-            .await?
-            {
-                plug_core::ipc::IpcResponse::DownstreamClientRevoked { .. } => {
-                    ui::print_success_line(format!(
-                        "Revoked {client_id} and all of its downstream OAuth grants"
-                    ));
-                }
-                plug_core::ipc::IpcResponse::Error { code, message } => {
-                    anyhow::bail!("{code}: {message}")
-                }
-                other => anyhow::bail!("unexpected daemon response: {other:?}"),
-            }
-        }
-    }
-    Ok(())
 }
 
 #[derive(serde::Deserialize)]
@@ -704,57 +691,144 @@ async fn cmd_downstream_oauth_owner(
     Ok(())
 }
 
+/// The OAuth server `server_name` names, and its URL.
+fn oauth_server<'a>(
+    cfg: &'a config::Config,
+    server_name: &str,
+) -> anyhow::Result<(&'a plug_core::config::ServerConfig, &'a str)> {
+    let server_config = cfg
+        .servers
+        .get(server_name)
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
+    if !server_config.is_oauth() {
+        anyhow::bail!(
+            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
+        );
+    }
+    let url = server_config
+        .url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
+    Ok((server_config, url))
+}
+
+/// A sign-in to one server, bound to the authority its metadata names.
+struct SignIn {
+    manager: rmcp::transport::auth::AuthorizationManager,
+    credentials: oauth::CompositeCredentialStore,
+    authority: oauth::VerifiedOAuthAuthority,
+}
+
+impl SignIn {
+    /// Discover the server's authorization metadata, verify its authority
+    /// and bind the server's stored credentials to it.
+    async fn start(server_name: &str, url: &str) -> anyhow::Result<Self> {
+        let mut manager = plug_core::tls::authorization_manager(url)
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
+
+        // `set_credential_store` takes ownership, so these are fresh instances
+        // over the same file and Keychain entries the daemon's stores read.
+        let credentials = oauth::CompositeCredentialStore::new(server_name.to_string());
+        manager.set_credential_store(credentials.clone());
+        manager.set_state_store(oauth::CompositeStateStore::new(server_name.to_string()));
+
+        ui::print_info_line("Discovering authorization server metadata...");
+        let metadata = manager
+            .resolve_metadata()
+            .await
+            .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
+        let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
+            .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
+        credentials
+            .bind_verified_authority(&authority)
+            .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
+        manager.set_metadata(metadata.metadata);
+        Ok(Self {
+            manager,
+            credentials,
+            authority,
+        })
+    }
+
+    /// Use the configured OAuth client, or the registration kept from an
+    /// earlier sign-in. False when there is neither.
+    fn configure_known_client(
+        &mut self,
+        server_config: &plug_core::config::ServerConfig,
+        reusable_registration: Option<&plug_core::oauth::DynamicOauthClientRegistration>,
+        redirect_uri: &str,
+        scopes: &[String],
+    ) -> anyhow::Result<bool> {
+        let oauth_config = if let Some(client_id) = &server_config.oauth_client_id {
+            ui::print_info_line("Using configured OAuth client...");
+            rmcp::transport::auth::OAuthClientConfig::new(
+                client_id.clone(),
+                redirect_uri.to_string(),
+            )
+            .with_scopes(scopes.to_vec())
+        } else if let Some(registration) = reusable_registration {
+            ui::print_info_line("Reusing existing OAuth client registration...");
+            registration.to_oauth_client_config(scopes.to_vec())
+        } else {
+            return Ok(false);
+        };
+        self.manager
+            .configure_client(oauth_config)
+            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
+        Ok(true)
+    }
+
+    /// Check the callback came from the verified authority, trade the code
+    /// for a token, and tell the running daemon.
+    async fn finish(
+        self,
+        server_name: &str,
+        code: &str,
+        csrf_state: &str,
+        callback_issuer: Option<&str>,
+    ) -> anyhow::Result<()> {
+        self.authority
+            .validate_callback_issuer(callback_issuer)
+            .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
+        ui::print_info_line("Exchanging authorization code for token...");
+        self.manager
+            .exchange_code_for_token(code, csrf_state)
+            .await
+            .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
+        ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
+        report_live_refresh(server_name, "Credentials were saved").await;
+        Ok(())
+    }
+}
+
+/// Ask the running daemon to pick up `server_name`'s new credentials and say
+/// how that went; `done` says what already happened to them.
+async fn report_live_refresh(server_name: &str, done: &str) {
+    match refresh_live_daemon_server(server_name).await {
+        Ok(true) => ui::print_info_line(format!(
+            "Refreshed live daemon state for server '{server_name}'"
+        )),
+        Ok(false) => {}
+        Err(err) => ui::print_warning_line(format!(
+            "{done}, but the running service did not reload them automatically: {err}. Next: {}.",
+            crate::runtime::restart_advice()
+        )),
+    }
+}
+
 async fn cmd_auth_login(
     config_path: Option<&PathBuf>,
     server_name: &str,
     no_browser: bool,
 ) -> anyhow::Result<()> {
     let cfg = config::load_config(config_path)?;
-    let server_config = cfg
-        .servers
-        .get(server_name)
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
-
-    if !server_config.is_oauth() {
-        anyhow::bail!(
-            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
-        );
-    }
-
-    let url = server_config
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
+    let (server_config, url) = oauth_server(&cfg, server_name)?;
 
     ui::print_info_line(format!(
         "Starting OAuth login for server '{server_name}'..."
     ));
-
-    let mut auth_manager = plug_core::tls::authorization_manager(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
-
-    // Create stores for the AuthorizationManager. We create fresh instances
-    // rather than reusing the global registry's Arc because set_credential_store
-    // takes ownership. The file/keyring paths are the same, so credentials
-    // saved by the manager will be visible to the global store on next load.
-    let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
-    let state_store = oauth::CompositeStateStore::new(server_name.to_string());
-    auth_manager.set_credential_store(cred_store.clone());
-    auth_manager.set_state_store(state_store);
-
-    ui::print_info_line("Discovering authorization server metadata...");
-    let metadata = auth_manager
-        .resolve_metadata()
-        .await
-        .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
-    let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
-        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
-    cred_store
-        .bind_verified_authority(&authority)
-        .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
-    auth_manager.set_metadata(metadata.metadata);
-
+    let mut sign_in = SignIn::start(server_name, url).await?;
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
     let PersistedOauthClientState {
@@ -801,21 +875,12 @@ async fn cmd_auth_login(
             None => default_dynamic_oauth_redirect_uri(),
         });
 
-    if let Some(ref client_id) = server_config.oauth_client_id {
-        ui::print_info_line("Using configured OAuth client...");
-        let oauth_config =
-            rmcp::transport::auth::OAuthClientConfig::new(client_id.clone(), redirect_uri.clone())
-                .with_scopes(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else if let Some(registration) = reusable_registration.as_ref() {
-        ui::print_info_line("Reusing existing OAuth client registration...");
-        let oauth_config = registration.to_oauth_client_config(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else {
+    if !sign_in.configure_known_client(
+        server_config,
+        reusable_registration.as_ref(),
+        &redirect_uri,
+        &scopes,
+    )? {
         if has_persisted_credentials {
             ui::print_warning_line(format!(
                 "Stored credentials for '{server_name}' do not include reusable dynamic registration metadata. Plug will register one new OAuth client so future reauth can reuse it safely."
@@ -823,17 +888,20 @@ async fn cmd_auth_login(
         }
         ui::print_info_line("Registering client with authorization server...");
         let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-        let reg_config = auth_manager
+        let reg_config = sign_in
+            .manager
             .register_client("plug", &redirect_uri, &scope_refs)
             .await
             .map_err(|e| anyhow::anyhow!("client registration failed: {e}"))?;
-        cred_store
+        sign_in
+            .credentials
             .remember_dynamic_client_registration(&reg_config)
             .map_err(|e| anyhow::anyhow!("failed to persist OAuth client registration: {e}"))?;
     }
 
     let scope_refs: Vec<&str> = scopes.iter().map(String::as_str).collect();
-    let auth_url = auth_manager
+    let auth_url = sign_in
+        .manager
         .get_authorization_url(&scope_refs)
         .await
         .map_err(|e| anyhow::anyhow!("failed to get authorization URL: {e}"))?;
@@ -887,36 +955,10 @@ async fn cmd_auth_login(
         (code, state, None)
     };
 
-    authority
-        .validate_callback_issuer(callback_issuer.as_deref())
-        .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
-
-    ui::print_info_line("Exchanging authorization code for token...");
-    auth_manager
-        .exchange_code_for_token(&code, &csrf_state)
+    sign_in
+        .finish(server_name, &code, &csrf_state, callback_issuer.as_deref())
         .await
-        .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
-
-    ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => {
-            ui::print_info_line(format!(
-                "Refreshed live daemon state for server '{server_name}'"
-            ));
-        }
-        Ok(false) => {}
-        Err(err) => {
-            ui::print_warning_line(format!(
-                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: {}.",
-                crate::runtime::restart_advice()
-            ));
-        }
-    }
-
-    Ok(())
 }
-
-// complete (non-interactive code exchange)
 
 /// Non-interactive OAuth code exchange for agents that obtained an authorization
 /// code through an external mechanism (e.g. a separate browser step orchestrated
@@ -930,45 +972,8 @@ async fn cmd_auth_complete(
     callback_issuer: Option<&str>,
 ) -> anyhow::Result<()> {
     let cfg = config::load_config(config_path)?;
-    let server_config = cfg
-        .servers
-        .get(server_name)
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' not found in config"))?;
-
-    if !server_config.is_oauth() {
-        anyhow::bail!(
-            "server '{server_name}' is not configured for OAuth (set auth = \"oauth\" in config)"
-        );
-    }
-
-    let url = server_config
-        .url
-        .as_deref()
-        .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
-
-    let mut auth_manager = plug_core::tls::authorization_manager(url)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
-
-    let cred_store = oauth::CompositeCredentialStore::new(server_name.to_string());
-    let state_store = oauth::CompositeStateStore::new(server_name.to_string());
-    auth_manager.set_credential_store(cred_store.clone());
-    auth_manager.set_state_store(state_store);
-
-    let metadata = auth_manager
-        .resolve_metadata()
-        .await
-        .map_err(|e| anyhow::anyhow!("metadata discovery failed: {e}"))?;
-    let authority = oauth::VerifiedOAuthAuthority::verify(url, &metadata.metadata)
-        .map_err(|e| anyhow::anyhow!("OAuth authority verification failed: {e}"))?;
-    authority
-        .validate_callback_issuer(callback_issuer)
-        .map_err(|e| anyhow::anyhow!("OAuth callback issuer validation failed: {e}"))?;
-    cred_store
-        .bind_verified_authority(&authority)
-        .map_err(|e| anyhow::anyhow!("stored credential binding conflict: {e}"))?;
-    auth_manager.set_metadata(metadata.metadata);
-
+    let (server_config, url) = oauth_server(&cfg, server_name)?;
+    let mut sign_in = SignIn::start(server_name, url).await?;
     let scopes: Vec<String> = server_config.oauth_scopes.clone().unwrap_or_default();
 
     let PersistedOauthClientState {
@@ -980,19 +985,12 @@ async fn cmd_auth_complete(
         .map(|registration| registration.redirect_uri.clone())
         .unwrap_or_else(default_dynamic_oauth_redirect_uri);
 
-    if let Some(ref client_id) = server_config.oauth_client_id {
-        let oauth_config =
-            rmcp::transport::auth::OAuthClientConfig::new(client_id.clone(), redirect_uri.clone())
-                .with_scopes(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else if let Some(registration) = reusable_registration.as_ref() {
-        let oauth_config = registration.to_oauth_client_config(scopes.clone());
-        auth_manager
-            .configure_client(oauth_config)
-            .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
-    } else {
+    if !sign_in.configure_known_client(
+        server_config,
+        reusable_registration.as_ref(),
+        &redirect_uri,
+        &scopes,
+    )? {
         anyhow::bail!(
             "server '{server_name}' has no reusable OAuth client registration for non-interactive completion. {} Start the login flow first with `plug auth login --server {server_name} --no-browser` or configure `oauth_client_id`.",
             if has_persisted_credentials {
@@ -1003,29 +1001,9 @@ async fn cmd_auth_complete(
         );
     }
 
-    ui::print_info_line("Exchanging authorization code for token...");
-    auth_manager
-        .exchange_code_for_token(code, csrf_state)
+    sign_in
+        .finish(server_name, code, csrf_state, callback_issuer)
         .await
-        .map_err(|e| anyhow::anyhow!("token exchange failed: {e}"))?;
-
-    ui::print_success_line(format!("Successfully authenticated server '{server_name}'"));
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => {
-            ui::print_info_line(format!(
-                "Refreshed live daemon state for server '{server_name}'"
-            ));
-        }
-        Ok(false) => {}
-        Err(err) => {
-            ui::print_warning_line(format!(
-                "Credentials were saved, but the running service did not reload them automatically: {err}. Next: {}.",
-                crate::runtime::restart_advice()
-            ));
-        }
-    }
-
-    Ok(())
 }
 
 /// Persist an externally obtained token for `server_name`.
@@ -1122,13 +1100,7 @@ async fn cmd_auth_inject(
     )
     .await?;
 
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => ui::print_info_line("Refreshed live daemon server state"),
-        Ok(false) => {}
-        Err(err) => ui::print_warning_line(format!(
-            "Stored credentials but failed to refresh the live daemon state: {err}"
-        )),
-    }
+    report_live_refresh(server_name, "Credentials were stored").await;
 
     ui::print_success_line(format!("Injected credentials for server '{server_name}'"));
 
@@ -1356,8 +1328,6 @@ async fn cmd_auth_status(
     Ok(())
 }
 
-// localhost callback listener
-
 /// Accepts a single GET request to `/callback`, extracts `code` and `state`
 /// query parameters, returns a success page to the browser, and shuts down.
 ///
@@ -1504,20 +1474,7 @@ async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("failed to clear credentials: {e}"))?;
 
     ui::print_success_line(format!("Logged out from server '{server_name}'"));
-    match refresh_live_daemon_server(server_name).await {
-        Ok(true) => {
-            ui::print_info_line(format!(
-                "Refreshed live daemon state for server '{server_name}'"
-            ));
-        }
-        Ok(false) => {}
-        Err(err) => {
-            ui::print_warning_line(format!(
-                "Stored credentials were cleared, but the running service did not reload them automatically: {err}. Next: {}.",
-                crate::runtime::restart_advice()
-            ));
-        }
-    }
+    report_live_refresh(server_name, "Stored credentials were cleared").await;
 
     Ok(())
 }
