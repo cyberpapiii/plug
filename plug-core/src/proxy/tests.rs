@@ -4967,6 +4967,12 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
         Some(("git".to_string(), "commit".to_string()))
     );
     assert_eq!(router.tool_behind("git__nothing"), None);
+    // An MCP App calls a tool by its server's own name.
+    assert_eq!(
+        router.tool_behind("commit"),
+        Some(("git".to_string(), "commit".to_string()))
+    );
+    assert_eq!(router.server_for_tool("commit").as_deref(), Some("git"));
     assert_eq!(
         router.listed_name("git", "commit").as_deref(),
         Some("git__commit")

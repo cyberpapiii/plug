@@ -436,14 +436,7 @@ impl super::ToolRouter {
         // its handle was attached would detach the future, which would keep
         // running and holding its server's call slot. No await is held
         // across this scope other than acquiring the lock itself.
-        // The way the call itself routes, so a tool called by its server's
-        // own name is recorded too.
-        let behind = self
-            .cache
-            .load()
-            .resolve_route(tool_name)
-            .filter(|(server, _)| server != crate::tool_naming::INTERNAL_SERVER_ID)
-            .cloned();
+        let behind = self.tool_behind(tool_name);
         let created = {
             let mut store = self.task_store.lock().await;
             let task = match task_quota_lease {

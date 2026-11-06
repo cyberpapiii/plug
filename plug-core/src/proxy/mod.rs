@@ -1209,11 +1209,9 @@ impl ToolRouter {
     /// The server and the server's own name behind `listed`, a name Plug
     /// lists a tool under. Plug's own tools have neither.
     pub fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
-        let cache = self.cache.load();
-        cache
-            .routes
-            .get(listed)
-            .or_else(|| cache.routes_lower.get(&listed.to_ascii_lowercase()))
+        self.cache
+            .load()
+            .resolve_route(listed)
             .filter(|(server, _)| server != crate::tool_naming::INTERNAL_SERVER_ID)
             .cloned()
     }

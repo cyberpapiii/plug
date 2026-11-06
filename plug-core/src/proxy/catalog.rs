@@ -572,13 +572,11 @@ impl super::ToolRouter {
         })
     }
 
-    /// Resolve the upstream server that owns a merged tool name.
+    /// The server a call to `name` goes to.
     pub fn server_for_tool(&self, name: &str) -> Option<String> {
-        let snapshot = self.cache.load();
-        snapshot
-            .routes
-            .get(name)
-            .or_else(|| snapshot.routes_lower.get(&name.to_ascii_lowercase()))
+        self.cache
+            .load()
+            .resolve_route(name)
             .map(|(server, _)| server.clone())
     }
 
