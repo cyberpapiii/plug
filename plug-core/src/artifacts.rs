@@ -3,7 +3,6 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use dashmap::DashMap;
-use directories::ProjectDirs;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolResult, ContentBlock, MetaObject as Meta, ReadResourceResult, Resource,
@@ -70,9 +69,7 @@ struct ArtifactMetadata {
 
 impl ArtifactStore {
     pub fn new() -> Self {
-        let base_dir = ProjectDirs::from("", "", "plug")
-            .map(|dirs| dirs.cache_dir().join("artifacts"))
-            .unwrap_or_else(|| std::env::temp_dir().join("plug-artifacts"));
+        let base_dir = crate::paths::artifacts_dir();
         if let Err(error) = std::fs::create_dir_all(&base_dir) {
             tracing::warn!(
                 path = %base_dir.display(),

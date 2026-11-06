@@ -151,7 +151,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
 }
 
 async fn check_downstream_oauth_owner(config: &Config) -> CheckResult {
-    let state_dir = crate::config::config_dir().join("downstream_oauth");
+    let state_dir = crate::paths::downstream_oauth_dir();
     check_downstream_oauth_owner_with_state_dir(config, &state_dir).await
 }
 
@@ -687,13 +687,7 @@ async fn check_client_limits(_config: &Config) -> CheckResult {
 async fn check_pid_staleness() -> CheckResult {
     let name = "pid_staleness".to_string();
 
-    let pid_path = directories::ProjectDirs::from("", "", "plug")
-        .map(|dirs| {
-            dirs.runtime_dir()
-                .unwrap_or(dirs.data_dir())
-                .join("plug.pid")
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/plug.pid"));
+    let pid_path = crate::paths::pid_path();
 
     if !pid_path.exists() {
         return CheckResult {
@@ -765,13 +759,7 @@ fn is_process_running(pid: u32) -> bool {
 }
 
 fn running_daemon_pid() -> Option<u32> {
-    let pid_path = directories::ProjectDirs::from("", "", "plug")
-        .map(|dirs| {
-            dirs.runtime_dir()
-                .unwrap_or(dirs.data_dir())
-                .join("plug.pid")
-        })
-        .unwrap_or_else(|| std::path::PathBuf::from("/tmp/plug.pid"));
+    let pid_path = crate::paths::pid_path();
     let pid_str = std::fs::read_to_string(pid_path).ok()?;
     let pid = pid_str.trim().parse::<u32>().ok()?;
     is_process_running(pid).then_some(pid)

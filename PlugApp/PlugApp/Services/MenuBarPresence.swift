@@ -1,4 +1,5 @@
 import Foundation
+import PlugIPC
 
 /// Whether Plug's menu bar icon comes back after something else closed the
 /// app. The daemon does the reopening and reads one file to know whether it
@@ -8,7 +9,7 @@ struct MenuBarPresence {
     static let preferenceKey = "keepInMenuBar"
     static var standard: MenuBarPresence {
         MenuBarPresence(
-            marker: URL.homeDirectory.appending(path: "Library/Application Support/plug/menu-bar-hidden"),
+            marker: PlugPaths.marker(PlugPaths.menuBarHiddenMarker),
             defaults: .standard
         )
     }

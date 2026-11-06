@@ -68,7 +68,7 @@ fn oauth_integration_test_lock() -> &'static tokio::sync::Mutex<()> {
 #[test]
 fn oauth_integration_credentials_are_isolated_from_the_user_profile() {
     let _ = oauth_integration_test_lock();
-    let production = plug_core::config::config_dir().join("tokens");
+    let production = plug_core::paths::tokens_dir();
     let actual = oauth::tokens_dir();
 
     assert_ne!(actual, production);

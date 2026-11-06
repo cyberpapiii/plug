@@ -32,6 +32,7 @@ pub mod notifications;
 pub mod oauth;
 pub mod openapi;
 pub mod operator;
+pub mod paths;
 pub mod protocol;
 pub mod proxy;
 pub mod reload;

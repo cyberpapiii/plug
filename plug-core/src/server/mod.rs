@@ -366,7 +366,7 @@ async fn stdio_path() -> (Option<&'static OsStr>, StdioPathSource) {
     {
         static CACHE: LoginPathCache = LoginPathCache::new();
         static FALLBACK: std::sync::OnceLock<OsString> = std::sync::OnceLock::new();
-        let store = Some(crate::config::config_dir().join(SAVED_LOGIN_PATH_FILE));
+        let store = Some(crate::paths::dir().join(SAVED_LOGIN_PATH_FILE));
         let probed = cached_login_path(
             &CACHE,
             LOGIN_SHELL_PROBE_RETRY,

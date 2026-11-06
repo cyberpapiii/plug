@@ -112,7 +112,7 @@ pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     INIT.get_or_init(|| {
-        platform_keyring::Entry::new("plug", "oauth:store-init")
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, "oauth:store-init")
             .map(drop)
             .map_err(|error| error.to_string())
     })
@@ -217,7 +217,7 @@ pub fn tokens_dir() -> PathBuf {
     if let Some(environment) = test_credential_environment() {
         return environment.tokens_dir.clone();
     }
-    config::config_dir().join("tokens")
+    crate::paths::tokens_dir()
 }
 
 /// Normalize an `expires_in` value: apply defaults and clamping.
@@ -828,7 +828,7 @@ impl CompositeCredentialStore {
         }
 
         let user = format!("oauth:{}", self.server_name);
-        match platform_keyring::Entry::new("plug", &user) {
+        match platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, &user) {
             Ok(entry) => Some(entry),
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring entry creation failed");
@@ -2651,7 +2651,7 @@ mod tests {
 
     #[test]
     fn unit_tests_do_not_use_the_real_plug_token_directory() {
-        let production = config::config_dir().join("tokens");
+        let production = crate::paths::tokens_dir();
         let actual = tokens_dir();
 
         assert_ne!(

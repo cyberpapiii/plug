@@ -100,7 +100,7 @@ pub enum OwnerEnrollmentStatus {
 }
 
 pub fn inspect_owner_enrollment(config: &DownstreamOauthConfig) -> OwnerEnrollmentStatus {
-    let state_dir = crate::config::config_dir().join("downstream_oauth");
+    let state_dir = crate::paths::downstream_oauth_dir();
     inspect_owner_enrollment_in_dir(config, &state_dir)
 }
 
@@ -703,7 +703,7 @@ impl DownstreamOauthManager {
     }
 
     pub fn try_new(config: DownstreamOauthConfig) -> Result<Self, DownstreamOauthError> {
-        let state_dir = crate::config::config_dir().join("downstream_oauth");
+        let state_dir = crate::paths::downstream_oauth_dir();
         Self::try_new_with_state_dir(config, &state_dir)
     }
 

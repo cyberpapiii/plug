@@ -250,7 +250,7 @@ pub(crate) async fn cmd_overview(
 ) -> anyhow::Result<()> {
     let config_path = config_path
         .cloned()
-        .unwrap_or_else(plug_core::config::default_config_path);
+        .unwrap_or_else(plug_core::paths::default_config_path);
     let config_exists = config_path.exists();
     let linked = linked_topology();
     let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();

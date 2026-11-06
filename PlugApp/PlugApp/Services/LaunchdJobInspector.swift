@@ -1,5 +1,6 @@
 import Darwin
 import Foundation
+import PlugIPC
 
 protocol LaunchdJobInspecting: Sendable {
     func daemonJobs(
@@ -15,8 +16,8 @@ enum LaunchdJobInspectionError: Error, Equatable {
 
 struct LaunchdJobInspector: LaunchdJobInspecting {
     private static let daemonLabel = DaemonServiceManager.daemonLabel
-    private static let appProgramIdentifier = "Contents/Resources/plug"
-    private static let appArguments = [appProgramIdentifier, "serve", "--daemon"]
+    private static let appProgramIdentifier = PlugPaths.bundledBinary
+    private static let appArguments = [appProgramIdentifier] + PlugPaths.daemonArguments
 
     private let records: @Sendable () async throws -> [LaunchdJobRecord]
 

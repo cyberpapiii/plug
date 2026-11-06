@@ -226,7 +226,7 @@ impl Keychain {
             reason,
         };
         crate::oauth::initialize_platform_keyring().map_err(unavailable)?;
-        platform_keyring::Entry::new("plug", &format!("secret:{name}"))
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, &format!("secret:{name}"))
             .map_err(|error| unavailable(error.to_string()))
     }
 
@@ -286,7 +286,7 @@ impl Stores {
         Self::with_keychain_and_file(
             Arc::new(Keychain),
             file::File::new(crate::config::env::env_file_path(
-                &crate::config::default_config_path(),
+                &crate::paths::default_config_path(),
             )),
         )
     }

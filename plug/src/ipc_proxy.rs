@@ -2079,7 +2079,7 @@ mod tests {
         .unwrap_or_else(|_| {
             panic!(
                 "daemon ready timeout (socket path: {}, task_finished: {})",
-                crate::daemon::socket_path().display(),
+                plug_core::paths::socket_path().display(),
                 handle.is_finished()
             )
         });
@@ -3155,7 +3155,7 @@ mod tests {
     }
 
     fn bind_fake_daemon_socket() -> UnixListener {
-        let path = crate::daemon::socket_path();
+        let path = plug_core::paths::socket_path();
         std::fs::create_dir_all(path.parent().expect("socket path has a parent"))
             .expect("create daemon socket directory");
         let _ = std::fs::remove_file(&path);

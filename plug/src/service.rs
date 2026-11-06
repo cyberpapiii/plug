@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-pub(crate) const LABEL: &str = "com.plug.daemon";
+use plug_core::paths::{
+    APP_BUNDLE_ID, BUNDLED_BINARY, DAEMON_ARGS, DAEMON_LABEL, SERVICE_DISABLED_MARKER,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchdJobRecord {
@@ -72,7 +74,7 @@ fn cli_plist_path() -> PathBuf {
     dirs::home_dir()
         .unwrap_or_else(|| PathBuf::from("."))
         .join("Library/LaunchAgents")
-        .join(format!("{LABEL}.plist"))
+        .join(format!("{DAEMON_LABEL}.plist"))
 }
 
 /// The leftover-path classify table, shared with `LegacyPlugProgram` in
@@ -168,19 +170,20 @@ fn app_managed_launchd_evidence(output: &str) -> bool {
         .any(|line| line.trim() == "managed_by = com.apple.xpc.ServiceManagement");
     let parent_is_plug = output
         .lines()
-        .any(|line| line.trim() == "parent bundle identifier = com.cyberpapiii.plug");
+        .any(|line| line.trim().strip_prefix("parent bundle identifier = ") == Some(APP_BUNDLE_ID));
     let program_identifier_is_plug = output.lines().any(|line| {
         line.trim()
             .strip_prefix("program identifier = ")
             .is_some_and(|value| {
-                value == "Contents/Resources/plug" || value.starts_with("Contents/Resources/plug (")
+                value == BUNDLED_BINARY
+                    || value
+                        .strip_prefix(BUNDLED_BINARY)
+                        .is_some_and(|rest| rest.starts_with(" ("))
             })
     });
     let arguments = parse_launchd_arguments(output);
-    let arguments_identify_daemon = arguments.first().map(String::as_str)
-        == Some("Contents/Resources/plug")
-        && arguments.get(1).map(String::as_str) == Some("serve")
-        && arguments.get(2).map(String::as_str) == Some("--daemon");
+    let arguments_identify_daemon = arguments.first().map(String::as_str) == Some(BUNDLED_BINARY)
+        && arguments[1..] == DAEMON_ARGS;
 
     managed_by_service_management
         && parent_is_plug
@@ -288,7 +291,7 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
     let uid = user_id()?;
     let plist_path = cli_plist_path();
     let output = Command::new("launchctl")
-        .args(["print", &format!("gui/{uid}/{LABEL}")])
+        .args(["print", &format!("gui/{uid}/{DAEMON_LABEL}")])
         .output()?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(ServiceState {
@@ -323,11 +326,8 @@ fn xml_escape(value: &str) -> String {
 }
 
 pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String {
-    let mut arguments = vec![
-        executable.display().to_string(),
-        "serve".to_string(),
-        "--daemon".to_string(),
-    ];
+    let mut arguments = vec![executable.display().to_string()];
+    arguments.extend(DAEMON_ARGS.map(str::to_string));
     if let Some(path) = config_path {
         arguments.push("--config".to_string());
         arguments.push(path.display().to_string());
@@ -337,12 +337,12 @@ pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String
         .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
         .collect::<Vec<_>>()
         .join("\n");
-    let log = crate::daemon::log_dir().join("launchd.log");
+    let log = plug_core::paths::log_dir().join("launchd.log");
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0"><dict>
-  <key>Label</key><string>{LABEL}</string>
+  <key>Label</key><string>{DAEMON_LABEL}</string>
   <key>ProgramArguments</key><array>
 {arguments}
   </array>
@@ -371,7 +371,7 @@ fn install_cli_plist(path: &Path, config_path: Option<&Path>) -> anyhow::Result<
         .parent()
         .ok_or_else(|| anyhow::anyhow!("invalid LaunchAgent path"))?;
     std::fs::create_dir_all(parent)?;
-    std::fs::create_dir_all(crate::daemon::log_dir())?;
+    std::fs::create_dir_all(plug_core::paths::log_dir())?;
     let contents = render_cli_plist(&executable, config_path);
     let temp = path.with_extension("plist.tmp");
     std::fs::write(&temp, contents)?;
@@ -421,7 +421,7 @@ async fn wait_for_daemon_socket(started: bool, already_starting: bool) -> anyhow
             // budget would only delay the report.
             anyhow::bail!(
                 "daemon exited during startup; see {}",
-                crate::daemon::log_dir().display()
+                plug_core::paths::log_dir().display()
             );
         }
         if std::time::Instant::now() >= deadline {
@@ -433,17 +433,17 @@ async fn wait_for_daemon_socket(started: bool, already_starting: bool) -> anyhow
     anyhow::bail!(
         "daemon did not start within {}s; open Plug.app to finish setup, then view {}",
         STARTUP_BUDGET.as_secs(),
-        crate::daemon::log_dir().display()
+        plug_core::paths::log_dir().display()
     )
 }
 
 pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> {
-    ensure_service_enabled(&crate::daemon::socket_path().with_file_name("service-disabled"))?;
+    ensure_service_enabled(&plug_core::paths::marker(SERVICE_DISABLED_MARKER))?;
     if crate::daemon::connect_to_daemon().await.is_some() {
         return Ok(false);
     }
     #[cfg(test)]
-    if crate::daemon::test_runtime_paths_active() {
+    if plug_core::paths::test::active() {
         anyhow::bail!("test daemon unavailable; refusing to mutate launchd");
     }
     // A held runtime lock with no socket means a daemon claimed the singleton
@@ -463,11 +463,11 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
             // No `-k`: a daemon that started a moment ago and has not taken
             // the runtime lock yet would be killed in the middle of starting.
             // Without it launchd starts the job only if it is not running.
-            launchctl(&["kickstart".into(), format!("gui/{uid}/{LABEL}")])?;
+            launchctl(&["kickstart".into(), format!("gui/{uid}/{DAEMON_LABEL}")])?;
         }
         StartupAction::RepairCli => {
             if state.loaded {
-                launchctl(&["bootout".into(), format!("gui/{uid}/{LABEL}")])?;
+                launchctl(&["bootout".into(), format!("gui/{uid}/{DAEMON_LABEL}")])?;
             }
             install_cli_plist(&state.plist_path, config_path)?;
             launchctl(&[
@@ -478,7 +478,7 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
             launchctl(&[
                 "kickstart".into(),
                 "-k".into(),
-                format!("gui/{uid}/{LABEL}"),
+                format!("gui/{uid}/{DAEMON_LABEL}"),
             ])?;
         }
         StartupAction::InstallCli => {
@@ -491,7 +491,7 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
             launchctl(&[
                 "kickstart".into(),
                 "-k".into(),
-                format!("gui/{uid}/{LABEL}"),
+                format!("gui/{uid}/{DAEMON_LABEL}"),
             ])?;
         }
         StartupAction::OpenApp => {
@@ -526,7 +526,7 @@ mod tests {
     fn intentional_off_blocks_connector_start_until_marker_is_removed() {
         let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
         std::fs::create_dir(&directory).unwrap();
-        let marker = directory.join("service-disabled");
+        let marker = directory.join(SERVICE_DISABLED_MARKER);
         assert!(ensure_service_enabled(&marker).is_ok());
         std::fs::write(&marker, "").unwrap();
         assert_eq!(
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn canonical_label_targeting_unrelated_software_is_unknown() {
         let job = LaunchdJobRecord {
-            label: LABEL.to_string(),
+            label: DAEMON_LABEL.to_string(),
             program: PathBuf::from("/Applications/Other.app/Contents/MacOS/other"),
         };
 
@@ -940,7 +940,7 @@ arguments = {
             uuid::Uuid::new_v4().as_fields().0
         ));
         crate::daemon::set_test_runtime_paths(root.clone(), root.clone());
-        let socket = crate::daemon::socket_path();
+        let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
             .expect("create runtime dir");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");

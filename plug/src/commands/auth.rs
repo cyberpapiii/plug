@@ -119,7 +119,7 @@ async fn bind_reusable_callback_listener(
 }
 
 async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
-    if !crate::daemon::socket_path().exists() {
+    if !plug_core::paths::socket_path().exists() {
         return Ok(false);
     }
 

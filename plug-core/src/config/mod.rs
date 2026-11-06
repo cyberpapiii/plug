@@ -1053,18 +1053,6 @@ pub fn load_editable_config(path: &Path) -> Result<Config, figment::Error> {
         .extract()
 }
 
-/// Returns the plug config directory (e.g. `~/.config/plug/`).
-pub fn config_dir() -> PathBuf {
-    directories::ProjectDirs::from("", "", "plug")
-        .map(|dirs| dirs.config_dir().to_path_buf())
-        .unwrap_or_else(|| PathBuf::from("~/.config/plug"))
-}
-
-/// Returns the default config file path.
-pub fn default_config_path() -> PathBuf {
-    config_dir().join("config.toml")
-}
-
 /// The config as Plug runs it: the file under `PLUG_` environment overrides,
 /// with `$NAME` expanded, and valid.
 #[allow(clippy::result_large_err)]
@@ -1072,7 +1060,9 @@ pub fn load_config(config_path: Option<&PathBuf>) -> Result<Config, figment::Err
     use figment::Figment;
     use figment::providers::{Env, Format, Serialized, Toml};
 
-    let path = config_path.cloned().unwrap_or_else(default_config_path);
+    let path = config_path
+        .cloned()
+        .unwrap_or_else(crate::paths::default_config_path);
 
     let mut config: Config = Figment::new()
         .merge(Serialized::defaults(Config::default()))

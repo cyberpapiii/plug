@@ -229,7 +229,7 @@ pub(crate) async fn cmd_doctor(
 ) -> anyhow::Result<i32> {
     let resolved = config_path
         .cloned()
-        .unwrap_or_else(plug_core::config::default_config_path);
+        .unwrap_or_else(plug_core::paths::default_config_path);
     let config = plug_core::config::load_config(config_path)?;
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
     report.checks.extend(runtime_doctor_checks(&config).await);
@@ -384,7 +384,7 @@ fn unified_install_check_from_snapshot(snapshot: &UnifiedInstallSnapshot) -> Che
         drift.push(format!("daemon ownership is {:?}", snapshot.ownership));
     }
     let expected_service_present = snapshot.launchd_jobs.iter().any(|job| {
-        job.label == crate::service::LABEL
+        job.label == plug_core::paths::DAEMON_LABEL
             && crate::install::paths_match(&job.program, &app.executable_path)
     });
     if !expected_service_present {
@@ -436,7 +436,7 @@ fn unified_install_check_from_snapshot(snapshot: &UnifiedInstallSnapshot) -> Che
     let mut leftover_legacy_jobs = Vec::new();
     let mut unknown_launchd_jobs = Vec::new();
     for job in &snapshot.launchd_jobs {
-        let is_expected_current = job.label == crate::service::LABEL
+        let is_expected_current = job.label == plug_core::paths::DAEMON_LABEL
             && crate::install::paths_match(&job.program, app_executable);
         if is_expected_current {
             continue;
@@ -615,7 +615,7 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
     let app_service_daemon_invocation_verified = match app.as_ref() {
         Some(app)
             if launchd_jobs.iter().any(|job| {
-                job.label == crate::service::LABEL
+                job.label == plug_core::paths::DAEMON_LABEL
                     && crate::install::paths_match(&job.program, &app.executable_path)
             }) =>
         {

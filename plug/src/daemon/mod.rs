@@ -25,14 +25,24 @@ use plug_core::session::SessionStore;
 mod framing;
 use framing::FrameReader;
 
-mod paths;
 #[cfg(test)]
-pub(crate) use paths::{
-    clear_test_runtime_paths, runtime_paths_test_lock, set_test_runtime_paths,
-    test_runtime_paths_active,
+pub(crate) use plug_core::paths::test::{
+    clear as clear_test_runtime_paths, lock as runtime_paths_test_lock,
+    set as set_test_runtime_paths,
 };
-use paths::{ensure_dir, pid_path, runtime_dir, set_file_permissions_0600, token_path};
-pub use paths::{log_dir, socket_path};
+use plug_core::paths::{log_dir, pid_path, socket_path, token_path};
+
+/// Create a directory, and any missing parents, readable by this user only.
+fn ensure_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    plug_core::fs_perm::ensure_dir_0700(path)
+        .with_context(|| format!("failed to create directory: {}", path.display()))
+}
+
+fn set_file_permissions_0600(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
 
 mod registry;
 use registry::ClientRegistry;
@@ -192,7 +202,7 @@ pub(crate) struct DaemonRuntimeLock {
 /// must own this lock before loading OAuth credentials or spawning upstreams;
 /// every loser exits without touching either.
 pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
-    ensure_dir(&runtime_dir())?;
+    ensure_dir(&plug_core::paths::dir())?;
     let pid_file_path = pid_path();
     let file = acquire_pid_lock(&pid_file_path)?;
     Ok(DaemonRuntimeLock {
@@ -367,7 +377,7 @@ pub(crate) async fn run_daemon_with_lock(
     downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
     runtime_lock: DaemonRuntimeLock,
 ) -> anyhow::Result<()> {
-    let rt_dir = runtime_dir();
+    let rt_dir = plug_core::paths::dir();
     let log_directory = log_dir();
 
     // Create directories with secure permissions
@@ -2583,7 +2593,7 @@ fn daily_log_appender(
 ) -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
     Ok(tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("plug.log")
+        .filename_prefix(plug_core::paths::LOG_FILE_PREFIX)
         .max_log_files(LOG_FILES_KEPT)
         .build(log_directory)?)
 }
@@ -2616,9 +2626,12 @@ impl ReopeningLog {
 
     fn has_a_file(&self) -> bool {
         std::fs::read_dir(&self.directory).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().starts_with("plug.log"))
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(plug_core::paths::LOG_FILE_PREFIX)
+            })
         })
     }
 
@@ -2955,7 +2968,7 @@ mod tests {
     #[test]
     fn daemon_tests_do_not_use_the_real_plug_token_directory() {
         let config_path = temp_config_path("credential-isolation");
-        let production = plug_core::config::config_dir().join("tokens");
+        let production = plug_core::paths::dir().join("tokens");
         let actual = plug_core::oauth::tokens_dir();
 
         assert_ne!(actual, production);
@@ -3362,7 +3375,7 @@ mod tests {
         std::fs::create_dir_all(&state_root).expect("create state root");
         set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
-        std::fs::create_dir_all(runtime_dir()).expect("create daemon runtime dir");
+        std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
 
         let marker = state_root.join("upstream-started");
@@ -3492,7 +3505,7 @@ mod tests {
         std::fs::create_dir_all(&state_root).expect("create state root");
         set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
-        let rt_dir = runtime_dir();
+        let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
         let token_file = token_path();
         std::fs::write(&token_file, "stable-token").expect("write seed token");
@@ -3533,7 +3546,7 @@ mod tests {
         std::fs::create_dir_all(&state_root).expect("create state root");
         set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
-        let rt_dir = runtime_dir();
+        let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
         let token_file = token_path();
         std::fs::write(&token_file, "stable-token").expect("write seed token");

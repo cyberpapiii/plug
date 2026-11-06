@@ -1,4 +1,5 @@
 import Foundation
+import PlugIPC
 import Security
 
 struct AppSignatureEvidence: Equatable, Sendable {
@@ -22,8 +23,8 @@ protocol AppInstallationInspecting: Sendable {
 }
 
 struct AppInstallationInspector: AppInstallationInspecting {
-    static let bundleIdentifier = "com.cyberpapiii.plug"
-    static let teamID = "HJF7LN64XX"
+    static let bundleIdentifier = PlugPaths.appBundleID
+    static let teamID = PlugPaths.teamID
 
     /// The code-signing requirement a Plug binary meets: Apple-anchored, with
     /// this identifier, signed by Plug's team.
@@ -75,7 +76,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
             throw AppInstallationError.missingMetadata
         }
 
-        let executableURL = bundleURL.appending(path: "Contents/Resources/plug")
+        let executableURL = bundleURL.appending(path: PlugPaths.bundledBinary)
         let embeddedVersion = try await embeddedVersionReader(executableURL)
         guard embeddedVersion == appVersion else {
             throw AppInstallationError.versionMismatch(app: appVersion, embedded: embeddedVersion)
