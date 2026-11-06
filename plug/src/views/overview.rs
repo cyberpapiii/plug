@@ -247,8 +247,7 @@ pub(crate) async fn cmd_overview(
     let config_exists = config_path.exists();
     let linked = linked_topology();
     let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();
-    let (live_clients, live_inventory_scope, live_client_support) =
-        fetch_live_sessions(Some(&config_path)).await;
+    let (live_clients, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
     let live_client_count = live_clients.len();
     let inventory = live_inventory_metadata(&live_clients, live_inventory_scope);
 
@@ -492,7 +491,7 @@ pub(crate) async fn cmd_status(
         live_status
     {
         let (live_sessions, live_inventory_scope, live_client_support) =
-            fetch_live_sessions(config_path).await;
+            fetch_live_sessions().await;
         let inventory = live_inventory_metadata(&live_sessions, live_inventory_scope);
         if matches!(output, OutputFormat::Text) {
             print_banner("◆", "Plug", "Plug is running");

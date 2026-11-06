@@ -205,7 +205,7 @@ fn resolve_client_key_by(
 /// The connected clients, with the names and places already given, so a
 /// client can be picked by one.
 async fn connected_clients(config_path: Option<&PathBuf>) -> Vec<LiveSessionView> {
-    let (live, _, _) = crate::runtime::fetch_live_sessions(config_path).await;
+    let (live, _, _) = crate::runtime::fetch_live_sessions().await;
     let config = plug_core::config::load_config(config_path).ok();
     live_session_views(&live, config.as_ref(), &downstream_grants().await)
 }

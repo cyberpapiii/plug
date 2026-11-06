@@ -1,11 +1,11 @@
 use std::net::SocketAddr;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::OutputFormat;
 use crate::daemon;
 use crate::ui::{print_banner, print_info_line, print_success_line};
+use anyhow::Context as _;
 use axum::extract::{DefaultBodyLimit, OriginalUri, Path as AxumPath, State};
 use axum::http::header::{CACHE_CONTROL, HOST, PRAGMA, REFERRER_POLICY};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
@@ -19,8 +19,6 @@ const OPERATOR_OAUTH_CLIENTS_PATH: &str = "/_plug/oauth/clients";
 const OPERATOR_OWNER_BOOTSTRAP_PATH: &str = "/_plug/oauth/owner/bootstrap";
 const OPERATOR_OWNER_CREDENTIALS_PATH: &str = "/_plug/oauth/owner/credentials";
 const OPERATOR_PROOF_PATH: &str = "/_plug/operator/proof";
-#[cfg(test)]
-const OPERATOR_TOKEN_HEADER: &str = "x-plug-operator-token";
 const OPERATOR_CLIENT_NONCE_HEADER: &str = "x-plug-operator-client-nonce";
 const OPERATOR_SERVER_NONCE_HEADER: &str = "x-plug-operator-server-nonce";
 const OPERATOR_PROOF_HEADER: &str = "x-plug-operator-proof";
@@ -715,9 +713,7 @@ fn build_configured_http_runtime(
 }
 
 /// Every live downstream session, as the daemon reports them.
-pub(crate) async fn fetch_live_sessions(
-    _config_path: Option<&PathBuf>,
-) -> (
+pub(crate) async fn fetch_live_sessions() -> (
     Vec<plug_core::ipc::IpcLiveSessionInfo>,
     plug_core::ipc::LiveSessionInventoryScope,
     LiveClientSupport,
@@ -974,30 +970,46 @@ async fn serve_router(
     cancel: CancellationToken,
 ) -> anyhow::Result<()> {
     let addr: SocketAddr = format!("{}:{}", http.bind_address, http.port).parse()?;
+    let listener = std::net::TcpListener::bind(addr)
+        .with_context(|| format!("failed to bind HTTP on {addr}"))?;
+    tracing::info!(%addr, tls = http.tls_enabled(), "serving HTTP");
+    serve_listener(listener, router, http, cancel).await
+}
+
+/// Serve `router` on a bound listener, over TLS when `http` configures it,
+/// until `cancel` fires; then shut down gracefully.
+async fn serve_listener(
+    listener: std::net::TcpListener,
+    router: Router,
+    http: &plug_core::config::HttpConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
+    listener.set_nonblocking(true)?;
     let handle = axum_server::Handle::new();
     let shutdown_handle = handle.clone();
     tokio::spawn(async move {
         cancel.cancelled().await;
         shutdown_handle.graceful_shutdown(Some(std::time::Duration::from_secs(5)));
     });
+    let service = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
 
-    if let (Some(cert_path), Some(key_path)) = (&http.tls_cert_path, &http.tls_key_path) {
-        plug_core::tls::ensure_rustls_provider_installed();
-        let tls_config =
-            axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
-        println!("serving on https://{addr}");
-        axum_server::bind_rustls(addr, tls_config)
-            .handle(handle)
-            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await?;
-    } else {
-        println!("serving on http://{addr}");
-        axum_server::bind(addr)
-            .handle(handle)
-            .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-            .await?;
+    match (&http.tls_cert_path, &http.tls_key_path) {
+        (Some(cert_path), Some(key_path)) => {
+            plug_core::tls::ensure_rustls_provider_installed();
+            let tls_config =
+                axum_server::tls_rustls::RustlsConfig::from_pem_file(cert_path, key_path).await?;
+            axum_server::from_tcp_rustls(listener, tls_config)?
+                .handle(handle)
+                .serve(service)
+                .await?;
+        }
+        _ => {
+            axum_server::from_tcp(listener)?
+                .handle(handle)
+                .serve(service)
+                .await?;
+        }
     }
-
     Ok(())
 }
 
@@ -1094,7 +1106,6 @@ mod tests {
     )> {
         let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
-        drop(listener);
 
         let cert = generate_simple_self_signed(vec!["localhost".into(), "127.0.0.1".into()])?;
         let cert_der = cert.cert.der().clone();
@@ -1113,25 +1124,17 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let http = plug_core::config::HttpConfig {
-            modern_downstream_enabled: false,
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            public_base_url: None,
-            oauth_scopes: None,
-            slack_events: None,
             bind_address: "127.0.0.1".to_string(),
             port: addr.port(),
-            allowed_origins: Vec::new(),
             tls_cert_path: Some(cert_path),
             tls_key_path: Some(key_path),
-            session_timeout_secs: 1800,
-            max_sessions: 100,
-            sse_channel_capacity: 32,
+            ..Default::default()
         };
 
         tokio::spawn({
             let cancel = cancel.clone();
             async move {
-                let _ = serve_router(router, &http, cancel).await;
+                let _ = serve_listener(listener, router, &http, cancel).await;
             }
         });
 
@@ -1192,7 +1195,6 @@ mod tests {
         let (addr, cancel, cert_der) = spawn_https_test_server(router)
             .await
             .expect("start https test server");
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
         let initialize_body = serde_json::json!({
             "jsonrpc": "2.0",
@@ -1651,7 +1653,6 @@ mod tests {
                         .method("POST")
                         .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
                         .header("host", "127.0.0.1:3282")
-                        .header(OPERATOR_TOKEN_HEADER, "operator-secret")
                         .header(forwarded_header, "203.0.113.4")
                         .body(Body::empty())
                         .expect("request"),
@@ -1983,7 +1984,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn operator_owner_boundary_rejects_missing_token_and_non_loopback_host() {
+    async fn operator_owner_boundary_rejects_a_missing_or_wrong_proof_and_non_loopback_host() {
         let (app, state_path) = owner_operator_test_router().await;
         let missing = app
             .clone()
@@ -1999,19 +2000,14 @@ mod tests {
             .expect("response");
         assert_eq!(missing.status(), StatusCode::UNAUTHORIZED);
 
-        let wrong = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
-                    .header("host", "127.0.0.1:3282")
-                    .header(OPERATOR_TOKEN_HEADER, "wrong-token")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
+        let wrong = proof_authenticated_request(
+            &app,
+            "POST",
+            OPERATOR_OWNER_BOOTSTRAP_PATH,
+            "wrong-token",
+            false,
+        )
+        .await;
         assert_eq!(wrong.status(), StatusCode::UNAUTHORIZED);
 
         let public_host = app
@@ -2021,7 +2017,6 @@ mod tests {
                     .method("POST")
                     .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
                     .header("host", "plug.example.com")
-                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
                     .body(Body::empty())
                     .expect("request"),
             )
@@ -2036,7 +2031,6 @@ mod tests {
                     .uri(OPERATOR_OWNER_BOOTSTRAP_PATH)
                     .header("host", "127.0.0.1:3282")
                     .header("host", "127.0.0.1:3282")
-                    .header(OPERATOR_TOKEN_HEADER, "operator-secret")
                     .body(Body::empty())
                     .expect("request"),
             )

@@ -343,8 +343,7 @@ pub(crate) async fn cmd_client_list(
         } else {
             Some("daemon not running".to_string())
         };
-        let (live, live_inventory_scope, live_client_support) =
-            fetch_live_sessions(config_path).await;
+        let (live, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
         let inventory = live_inventory_metadata(&live, live_inventory_scope);
         let config_result = plug_core::config::load_config(config_path);
         let config_error = config_result.as_ref().err().map(|error| error.to_string());

@@ -17,6 +17,8 @@ pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// result carries no pagination or task state, so this is the value a modern
 /// client would infer from an absent field on an earlier-revision server.
 pub const RESULT_TYPE_COMPLETE: &str = "complete";
+/// SEP-2322 discriminator for a result that asks the client for input first.
+pub const RESULT_TYPE_INPUT_REQUIRED: &str = "input_required";
 
 /// Classify an HTTP JSON-RPC envelope before any era-specific rewriting or
 /// typed deserialization occurs.

@@ -196,39 +196,43 @@ impl SharedConnection {
 /// Forward a push that has an MCP notification to the downstream peer.
 async fn notify_peer(peer: &Peer<RoleServer>, push: IpcResponse) {
     fn params<T: serde::de::DeserializeOwned>(params: serde_json::Value) -> Option<T> {
-        serde_json::from_value(params).ok()
+        let parsed = serde_json::from_value(params);
+        if let Err(error) = &parsed {
+            tracing::warn!(%error, "daemon push carried unreadable params");
+        }
+        parsed.ok()
     }
-    match push {
-        IpcResponse::LoggingNotification { params: p } => {
-            if let Some(p) = params::<LoggingMessageNotificationParam>(p) {
-                let _ = peer.notify_logging_message(p).await;
-            }
+    let sent = match push {
+        IpcResponse::LoggingNotification { params: p } => match params(p) {
+            Some(p) => peer.notify_logging_message(p).await,
+            None => return,
+        },
+        IpcResponse::ToolListChangedNotification => peer.notify_tool_list_changed().await,
+        IpcResponse::ResourceListChangedNotification => peer.notify_resource_list_changed().await,
+        IpcResponse::ResourceUpdatedNotification { params: p } => match params(p) {
+            Some(p) => peer.notify_resource_updated(p).await,
+            None => return,
+        },
+        IpcResponse::PromptListChangedNotification => peer.notify_prompt_list_changed().await,
+        IpcResponse::ProgressNotification { params: p } => match params(p) {
+            Some(p) => peer.notify_progress(p).await,
+            None => return,
+        },
+        IpcResponse::CancelledNotification { params: p } => match params(p) {
+            Some(p) => peer.notify_cancelled(p).await,
+            None => return,
+        },
+        other => {
+            debug_assert!(
+                !other.is_push(),
+                "a daemon push has no route to the client: {other:?}"
+            );
+            tracing::warn!("ignored a daemon message that is not a push");
+            return;
         }
-        IpcResponse::ToolListChangedNotification => {
-            let _ = peer.notify_tool_list_changed().await;
-        }
-        IpcResponse::ResourceListChangedNotification => {
-            let _ = peer.notify_resource_list_changed().await;
-        }
-        IpcResponse::ResourceUpdatedNotification { params: p } => {
-            if let Some(p) = params::<ResourceUpdatedNotificationParam>(p) {
-                let _ = peer.notify_resource_updated(p).await;
-            }
-        }
-        IpcResponse::PromptListChangedNotification => {
-            let _ = peer.notify_prompt_list_changed().await;
-        }
-        IpcResponse::ProgressNotification { params: p } => {
-            if let Some(p) = params::<ProgressNotificationParam>(p) {
-                let _ = peer.notify_progress(p).await;
-            }
-        }
-        IpcResponse::CancelledNotification { params: p } => {
-            if let Some(p) = params::<CancelledNotificationParam>(p) {
-                let _ = peer.notify_cancelled(p).await;
-            }
-        }
-        _ => {}
+    };
+    if let Err(error) = sent {
+        tracing::debug!(%error, "could not forward a daemon push to the client");
     }
 }
 
@@ -1202,7 +1206,7 @@ impl ServerHandler for IpcProxyHandler {
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<InitializeResult, McpError>> + Send + '_ {
         async move {
-            // Same deliberate leniency as the stdio handler: `plug connect`
+            // Deliberately lenient: `plug connect`
             // speaks RMCP's initialize lifecycle and has no era header to
             // classify, so a `2026-07-28` initialize is the only way a
             // modern-aware local client can connect. The HTTP adapter, which
@@ -1421,7 +1425,9 @@ impl ServerHandler for IpcProxyHandler {
                 Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
                     (&task.task).into(),
                 )))
-            } else if payload.get("resultType").and_then(|v| v.as_str()) == Some("input_required") {
+            } else if payload.get("resultType").and_then(|v| v.as_str())
+                == Some(plug_core::protocol::RESULT_TYPE_INPUT_REQUIRED)
+            {
                 serde_json::from_value::<rmcp::model::InputRequiredResult>(payload)
                     .map(Into::into)
                     .map_err(|e| {
@@ -1451,7 +1457,7 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             let method = request
                 .method
-                .strip_prefix("plug/legacy/")
+                .strip_prefix(plug_core::dispatch::LEGACY_METHOD_PREFIX)
                 .ok_or_else(|| {
                     McpError::new(ErrorCode::METHOD_NOT_FOUND, request.method.clone(), None)
                 })?
@@ -1803,31 +1809,6 @@ mod tests {
                 )
             });
         (engine, handle)
-    }
-
-    // Wire-contract guard for the daemon-IPC progress regression: `call_tool`
-    // must serialize the full `CallToolRequestParams` so `_meta.progressToken`
-    // survives to the daemon. The previous hand-built `{name, arguments}`
-    // object dropped it, silently disabling progress on the default
-    // `plug connect` path. (End-to-end progress delivery over the daemon is
-    // a separate harness gap — the mock server emits no progress.)
-    #[test]
-    fn ipc_tools_call_params_preserve_progress_token() {
-        let mut request = CallToolRequestParams::new("Mock__echo");
-        request.meta = Some(Meta::with_progress_token(ProgressToken(
-            NumberOrString::Number(42),
-        )));
-
-        let params = serde_json::to_value(&request).expect("serialize call params");
-
-        assert_eq!(
-            params
-                .get("_meta")
-                .and_then(|m| m.get("progressToken"))
-                .and_then(|t| t.as_i64()),
-            Some(42),
-            "serialized IPC tools/call params must carry _meta.progressToken"
-        );
     }
 
     #[tokio::test]
@@ -3164,8 +3145,7 @@ mod tests {
     /// `IpcProxyHandler::initialize` performs the FIRST time a downstream
     /// MCP client connects (`UpdateSession`, `UpdateCapabilities`, a
     /// `Capabilities` refresh) — NOT repeated on later reconnects, which
-    /// only redo OperatorHandshake+Register+Capabilities (see
-    /// `reconnect_reregisters_with_register_and_capabilities_only` below).
+    /// only redo OperatorHandshake+Register+Capabilities.
     /// Returns once the daemon side has answered the final `Capabilities`
     /// refresh, matching the point at which production populates
     /// `shared.peer`.
@@ -3587,7 +3567,7 @@ mod tests {
             );
 
             // ...followed by a replay of the client capabilities negotiated
-            // before the restart (plan 007) — assert it matches exactly.
+            // before the restart — assert it matches exactly.
             let frame = fake_read_frame(&mut reader2)
                 .await
                 .expect("read replayed capabilities frame")
@@ -4360,8 +4340,8 @@ mod tests {
             // reconnect_replays_client_capabilities) — not the full
             // initialize() sequence, which only runs once per downstream
             // client lifetime. It IS followed by a replay of the client
-            // capabilities negotiated during connection 1's initialize
-            // (plan 007) — consume and ack that before the retried
+            // capabilities negotiated during connection 1's initialize —
+            // consume and ack that before the retried
             // tools/call.
             let (stream2, _) = listener.accept().await.expect("accept 2");
             let (mut reader2, mut writer2, _seen2) =
@@ -4557,7 +4537,7 @@ mod tests {
             // the full initialize() sequence, which only runs once per
             // downstream client lifetime. It IS followed by a replay of the
             // client capabilities negotiated during connection 1's
-            // initialize (plan 007) — consume and ack that before the
+            // initialize — consume and ack that before the
             // retried tools/call.
             let replay_frame = fake_read_frame(&mut reader2)
                 .await
@@ -4624,8 +4604,8 @@ mod tests {
         // failure triggers a reconnect, but the ORIGINAL request is not
         // resent — the call surfaces REQUEST_RETRY_UNSAFE instead. Confirms
         // "not a hang, not a panic": this returns promptly (well within 5s,
-        // via the 150ms test-shortened watchdog) with an error, whereas
-        // before plan 009 the same scenario hung until this outer timeout.
+        // via the 150ms test-shortened watchdog) with an error rather than
+        // hanging until this outer timeout.
         let first_attempt = tokio::time::timeout(
             Duration::from_secs(5),
             client.call_tool(CallToolRequestParams::new("whatever")),
@@ -4771,7 +4751,7 @@ mod tests {
         payload: serde_json::Value,
     ) -> (
         rmcp::service::RunningService<rmcp::RoleClient, TestClient>,
-        JoinHandle<()>,
+        JoinHandle<IpcRequest>,
     ) {
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4790,6 +4770,7 @@ mod tests {
             fake_send(&mut writer, &IpcResponse::McpResponse { payload })
                 .await
                 .expect("send scripted reply");
+            req
         });
 
         let session = DaemonProxySession::establish(None, client_id.to_string(), None, None)
@@ -4839,6 +4820,44 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
+        let _ = std::fs::remove_dir_all(&temp);
+    }
+
+    /// A client's progress token reaches the daemon with its `tools/call`,
+    /// or progress never comes back on the `plug connect` path.
+    #[tokio::test]
+    async fn a_tool_call_carries_the_progress_token_to_the_daemon() {
+        let _guard = daemon_test_lock().lock().await;
+        let temp = unique_temp_dir("progress-token");
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
+
+        let payload = serde_json::to_value(CallToolResult::success(Vec::new()))
+            .expect("serialize call result");
+        let (client, daemon_task) =
+            proxy_with_one_scripted_reply("client-progress-token", "tools/call", payload).await;
+
+        let mut request = CallToolRequestParams::new("Mock__echo");
+        request.meta = Some(Meta::with_progress_token(ProgressToken(
+            NumberOrString::Number(42),
+        )));
+        tokio::time::timeout(Duration::from_secs(5), client.call_tool(request))
+            .await
+            .expect("call timeout")
+            .expect("call result");
+
+        let sent = daemon_task.await.expect("daemon task join");
+        let (IpcRequest::McpRequest { params, .. }
+        | IpcRequest::McpRequestWithContext { params, .. }) = sent
+        else {
+            panic!("expected a tools/call, got {sent:?}");
+        };
+        // The rmcp client numbers progress tokens itself.
+        assert!(
+            params
+                .as_ref()
+                .is_some_and(|p| p["_meta"]["progressToken"].is_number()),
+            "{params:?}"
+        );
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -5318,8 +5337,8 @@ mod tests {
             DaemonProxySession::establish(None, "client-request-ceiling".to_string(), None, None)
                 .await
                 .expect("establish daemon proxy session");
-        // The heartbeat stays on: its pongs are what used to keep the
-        // watchdog from ever firing on the lost call.
+        // The heartbeat stays on: its pongs must not keep the watchdog
+        // from firing on the lost call.
         let proxy = Arc::new(IpcProxyHandler::new(session, None));
 
         let error = tokio::time::timeout(Duration::from_secs(5), spawn_tool_call(&proxy, "lost"))
