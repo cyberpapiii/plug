@@ -634,11 +634,10 @@ fn build_configured_http_runtime(
                 &event_config.app_id,
             )?
             .load(&plug_core::slack_events::credentials::KeychainSigningSecrets)?;
-            let key = plug_core::slack_events::state_key(event_config)?;
             plug_core::slack_events::SlackEvents::open(
                 event_config.clone(),
                 secret,
-                &plug_core::paths::dir().join("slack-events").join(key),
+                &plug_core::slack_events::state_dir(event_config)?,
                 Arc::new(plug_core::slack_events::RuntimeAccess::new(
                     engine,
                     oauth,

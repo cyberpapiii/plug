@@ -10,12 +10,10 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 
-use super::hub::{Access, Hub, Pending, Source, SourceState};
+use super::hub::{Access, Hub, Pending, Source, SourceState, subscription_id};
 use crate::config::{MIN_WATCH_SECS, WatchConfig};
 
-use super::{
-    EventDelivery, EventError, EventSource, MAX_BODY, invalid, iso_time, now, unavailable,
-};
+use super::{EventDelivery, EventError, EventSource, invalid, now, unavailable};
 
 /// How many watched tools are called at once. The rest wait their turn.
 pub(super) const CHECKS_AT_ONCE: usize = 8;
@@ -207,8 +205,7 @@ impl Source for WatchSource {
         event: &str,
         url: &str,
     ) -> Result<String, EventError> {
-        let key = serde_json::to_vec(&json!([client_id, event, url])).map_err(|_| unavailable())?;
-        Ok(format!("sub_{}", hex::encode(Sha256::digest(key))))
+        subscription_id(&json!([client_id, event, url]))
     }
 
     async fn permits(&self, client_id: &str, event: &str) -> Access {
@@ -399,19 +396,12 @@ impl Hub<WatchSource> {
         };
         let timestamp = now();
         let event_id = format!("evt_{}", uuid::Uuid::new_v4());
-        let body = serde_json::to_vec(&json!({
-            "eventId": event_id,
-            "name": event,
-            "timestamp": iso_time(timestamp)?,
-            "cursor": null,
-            "data": {"result": result},
-        }))
-        .map_err(|_| unavailable())?;
-        if body.len() > MAX_BODY {
+        let Some(body) = Pending::body(&event_id, &event, timestamp, json!({"result": &result}))?
+        else {
             tracing::warn!(event = %event, "watch skipped: the result exceeds the size limit");
             source.note(&event, WatchHealth::TooLarge, false);
             return Ok(());
-        }
+        };
         let hash = hex::encode(Sha256::digest(
             serde_json::to_vec(&result).map_err(|_| unavailable())?,
         ));
@@ -431,17 +421,17 @@ impl Hub<WatchSource> {
                 .map(|s| s.id.clone())
                 .collect();
             for subscription_id in subscribers {
-                if next.queue.len() >= super::MAX_QUEUE {
-                    tracing::warn!(event = %event, "event dropped: the delivery queue is full");
-                    break;
-                }
-                next.queue.push(Pending::new(
+                let pending = Pending::new(
                     subscription_id,
                     event_id.clone(),
                     None,
                     body.clone(),
                     timestamp,
-                ));
+                );
+                if !next.enqueue(pending) {
+                    tracing::warn!(event = %event, "event dropped: the delivery queue is full");
+                    break;
+                }
             }
         }
         self.commit(&mut state, next)?;

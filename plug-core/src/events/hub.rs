@@ -3,7 +3,6 @@
 //! says what its events are, who may have them, and when one happens.
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +13,7 @@ use fs4::FileExt;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockWriteGuard};
 use tokio_util::sync::CancellationToken;
@@ -90,6 +90,25 @@ impl Pending {
         }
     }
 
+    /// The MCP event envelope for `data`, or `None` when it is larger than
+    /// an event may be.
+    pub(crate) fn body(
+        event_id: &str,
+        name: &str,
+        at: u64,
+        data: Value,
+    ) -> Result<Option<Vec<u8>>, EventError> {
+        let body = serde_json::to_vec(&json!({
+            "eventId": event_id,
+            "name": name,
+            "timestamp": iso_time(at)?,
+            "cursor": null,
+            "data": data,
+        }))
+        .map_err(|_| unavailable())?;
+        Ok((body.len() <= MAX_BODY).then_some(body))
+    }
+
     fn is(&self, other: &Pending) -> bool {
         self.subscription_id == other.subscription_id && self.event_id == other.event_id
     }
@@ -126,6 +145,15 @@ impl<X: SourceState> State<X> {
 
     pub(crate) fn live(&self, at: u64) -> impl Iterator<Item = &Subscription> {
         self.subscriptions.iter().filter(move |s| s.expires > at)
+    }
+
+    /// Queue `pending` unless the queue is full. Returns whether it was queued.
+    pub(crate) fn enqueue(&mut self, pending: Pending) -> bool {
+        if self.queue.len() >= MAX_QUEUE {
+            return false;
+        }
+        self.queue.push(pending);
+        true
     }
 
     /// End the subscriptions `gone` picks, with what is queued for them.
@@ -195,7 +223,8 @@ pub trait Source: Send + Sync + Sized + 'static {
     /// The event a subscribe request's `name` and `arguments` ask for.
     fn resolve(&self, name: &Value, arguments: &Value) -> Result<String, EventError>;
     /// The ID of `client_id`'s subscription to `event` at `url`. Subscribing
-    /// again with the same three refreshes that subscription.
+    /// again with the same three refreshes that subscription. Build it with
+    /// `subscription_id`.
     fn subscription_id(
         &self,
         client_id: &str,
@@ -226,6 +255,12 @@ pub trait Source: Send + Sync + Sized + 'static {
     }
     /// Start whatever makes the source's events, until `cancel` fires.
     fn start(_hub: &Arc<Hub<Self>>, _cancel: &CancellationToken) {}
+}
+
+/// A subscription ID derived from everything that identifies it.
+pub(crate) fn subscription_id(identity: &Value) -> Result<String, EventError> {
+    let key = serde_json::to_vec(identity).map_err(|_| unavailable())?;
+    Ok(format!("sub_{}", hex::encode(Sha256::digest(key))))
 }
 
 /// Secrets and event bodies never implement Debug or enter diagnostics.
@@ -261,7 +296,16 @@ impl<S: Source> Hub<S> {
         check_private(dir, true)?;
         let path = dir.join("state.json");
         let lock_path = dir.join("state.lock");
-        let lock = private_open(&lock_path, false)?;
+        let lock = {
+            use std::os::unix::fs::OpenOptionsExt;
+            OpenOptions::new()
+                .write(true)
+                .read(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(&lock_path)?
+        };
         check_private(&lock_path, false)?;
         FileExt::try_lock(&lock).map_err(|_| anyhow::anyhow!("event state already in use"))?;
         let state = if path.exists() {
@@ -347,23 +391,7 @@ impl<S: Source> Hub<S> {
         if bytes.len() > MAX_STATE_BYTES {
             return Err(unavailable());
         }
-        let result = (|| -> std::io::Result<()> {
-            let temp = self
-                .path
-                .with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
-            let mut file = private_open(&temp, true)?;
-            file.write_all(&bytes)?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&temp, &self.path)?;
-            File::open(
-                self.path
-                    .parent()
-                    .ok_or_else(|| std::io::Error::other("state directory missing"))?,
-            )?
-            .sync_all()
-        })();
-        if let Err(error) = result {
+        if let Err(error) = crate::fs_perm::write_private_atomic(&self.path, &bytes) {
             tracing::error!(source = S::LABEL, %error, "event state could not be saved; events stop until restart");
             self.degraded.store(true, Ordering::Release);
             return Err(unavailable());
@@ -456,6 +484,10 @@ impl<S: Source> Hub<S> {
     }
 
     pub(crate) async fn deliver_one(&self) -> Result<(), EventError> {
+        // Degrading logged once; nothing more is sent until restart.
+        if self.is_degraded() {
+            return Ok(());
+        }
         let _gate = self.delivery_gate.read().await;
         let timestamp = now();
         let (subscription, pending) = {
@@ -481,7 +513,7 @@ impl<S: Source> Hub<S> {
         };
         let subscription = match (access, subscription) {
             (Access::Allowed, Some(subscription)) => subscription,
-            (Access::Unavailable, _) => return Err(unavailable()),
+            (Access::Unavailable, _) => return self.retry_later(&pending, timestamp).await,
             _ => {
                 let mut state = self.state.lock().await;
                 let mut next = state.clone();
@@ -502,16 +534,8 @@ impl<S: Source> Hub<S> {
                     next.source.forget_origin(origin);
                     return self.commit(&mut state, next);
                 }
-                Access::Unavailable => {
-                    let mut state = self.state.lock().await;
-                    let mut next = state.clone();
-                    next.retry(&pending, timestamp);
-                    return self.commit(&mut state, next);
-                }
+                Access::Unavailable => return self.retry_later(&pending, timestamp).await,
             }
-        }
-        if self.is_degraded() {
-            return Err(unavailable());
         }
         let old = subscription
             .old_secret
@@ -561,6 +585,14 @@ impl<S: Source> Hub<S> {
                 "event delivery will retry"
             );
         }
+        self.commit(&mut state, next)
+    }
+
+    /// Access could not be told: send `pending` again after its backoff.
+    async fn retry_later(&self, pending: &Pending, at: u64) -> Result<(), EventError> {
+        let mut state = self.state.lock().await;
+        let mut next = state.clone();
+        next.retry(pending, at);
         self.commit(&mut state, next)
     }
 
@@ -731,18 +763,6 @@ fn same_secret(subscription: &Subscription, secret: &str) -> bool {
             .as_bytes()
             .ct_eq(secret.as_bytes()),
     )
-}
-
-fn private_open(path: &Path, exclusive: bool) -> std::io::Result<File> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut options = OpenOptions::new();
-    options.write(true).read(true).mode(0o600);
-    if exclusive {
-        options.create_new(true);
-    } else {
-        options.create(true).truncate(false);
-    }
-    options.open(path)
 }
 
 fn check_private(path: &Path, directory: bool) -> anyhow::Result<()> {

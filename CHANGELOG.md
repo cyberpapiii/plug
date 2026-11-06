@@ -49,6 +49,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Only the client named in `subscriber_client_id` may subscribe to Slack events. Another remote client with the events scope used to be let in.
+- Setting `owner_proof_until` for Slack events keeps the existing subscription. A client that subscribed again during the window used to get a second subscription next to the first.
+- When Plug cannot tell whether a client may still have an event, it tries that event again after the usual wait. It used to ask again on every delivery tick and log a warning each time.
+- Event delivery that stopped because its state could not be saved stays quiet until Plug restarts. It used to keep checking access and log a warning on every delivery tick.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.
 - Asking a server that runs tasks itself for a task's status or result gives up after the server's `call_timeout_secs`. A server that never answered used to hold the client's request open for good.

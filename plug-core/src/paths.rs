@@ -115,6 +115,12 @@ pub fn events_dir() -> PathBuf {
     dir().join("events")
 }
 
+/// Slack event state, one folder a source config. It predates
+/// `events_dir`, and existing installs keep their state here.
+pub fn slack_events_dir() -> PathBuf {
+    dir().join("slack-events")
+}
+
 /// Large tool results kept for a client to read in parts.
 pub fn artifacts_dir() -> PathBuf {
     home().join("Library/Caches/plug/artifacts")
