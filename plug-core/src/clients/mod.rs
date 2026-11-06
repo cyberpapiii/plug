@@ -117,6 +117,11 @@ pub struct ClientInfo {
     pub name: &'static str,
     /// What the client is taken for when it connects.
     pub live: Option<ClientType>,
+    /// The `clientInfo.name` values it is known to send.
+    pub reports: &'static [&'static str],
+    /// For a version that sends another name: groups of words, lowercase,
+    /// one of which the name holds all of. The longest match wins.
+    pub reports_like: &'static [&'static [&'static str]],
     /// The file `plug link` writes, relative to the home folder.
     pub user_path: &'static str,
     /// The file `plug link --project` would write, relative to the current
@@ -160,6 +165,8 @@ const fn row(target: ClientTarget, slug: &'static str, name: &'static str) -> Cl
         aliases: &[],
         name,
         live: None,
+        reports: &[],
+        reports_like: &[],
         user_path: "",
         project_path: None,
         import_also: &[],
@@ -173,6 +180,8 @@ const fn row(target: ClientTarget, slug: &'static str, name: &'static str) -> Cl
 static REGISTRY: [ClientInfo; 30] = [
     ClientInfo {
         live: Some(ClientType::ClaudeDesktop),
+        reports: &["claude-ai"],
+        reports_like: &[&["claude"]],
         user_path: "Library/Application Support/Claude/claude_desktop_config.json",
         ..row(
             ClientTarget::ClaudeDesktop,
@@ -182,6 +191,8 @@ static REGISTRY: [ClientInfo; 30] = [
     },
     ClientInfo {
         live: Some(ClientType::ClaudeCode),
+        reports: &["claude-code"],
+        reports_like: &[&["claude-code"], &["claude code"]],
         user_path: ".claude.json",
         project_path: Some(".mcp.json"),
         layout: json(&["mcpServers"], EntryShape::ClaudeCode),
@@ -189,6 +200,8 @@ static REGISTRY: [ClientInfo; 30] = [
     },
     ClientInfo {
         live: Some(ClientType::Cursor),
+        reports: &["cursor-vscode"],
+        reports_like: &[&["cursor"]],
         user_path: ".cursor/mcp.json",
         project_path: Some(".cursor/mcp.json"),
         ..row(ClientTarget::Cursor, "cursor", "Cursor")
@@ -200,6 +213,8 @@ static REGISTRY: [ClientInfo; 30] = [
     ClientInfo {
         aliases: &["windsurf"],
         live: Some(ClientType::Devin),
+        reports: &["windsurf-client"],
+        reports_like: &[&["devin"], &["cascade"], &["windsurf"], &["codeium"]],
         user_path: ".config/devin/mcp_config.json",
         project_path: Some(".devin/mcp_config.json"),
         import_also: &[Place::Home(".codeium/windsurf/mcp_config.json")],
@@ -212,6 +227,8 @@ static REGISTRY: [ClientInfo; 30] = [
     // https://code.visualstudio.com/docs/copilot/customization/mcp-servers
     ClientInfo {
         live: Some(ClientType::VSCodeCopilot),
+        reports: &["Visual-Studio-Code"],
+        reports_like: &[&["copilot"], &["vscode"]],
         user_path: "Library/Application Support/Code/User/mcp.json",
         project_path: Some(".vscode/mcp.json"),
         import_also: &[Place::Home(".vscode/mcp.json")],
@@ -224,11 +241,14 @@ static REGISTRY: [ClientInfo; 30] = [
     },
     // The project files Copilot CLI reads, `.mcp.json` and `.github/mcp.json`,
     // are shared with clients that reject its extra fields, so it is linked
-    // in its user file only.
+    // in its user file only. Its `clientInfo.name` is not documented; any
+    // other Copilot is taken for VS Code, which keeps its tool ceiling.
     // https://docs.github.com/en/copilot/how-tos/copilot-cli/customize-copilot/add-mcp-servers
     ClientInfo {
         aliases: &["copilot"],
         live: Some(ClientType::CopilotCli),
+        reports: &[],
+        reports_like: &[&["copilot", "cli"]],
         user_path: ".copilot/mcp-config.json",
         import_also: &[Place::Here(".github/mcp.json")],
         layout: json(&["mcpServers"], EntryShape::CopilotCli),
@@ -241,6 +261,8 @@ static REGISTRY: [ClientInfo; 30] = [
     ClientInfo {
         aliases: &["gemini"],
         live: Some(ClientType::GeminiCli),
+        reports: &["gemini-cli-mcp-client"],
+        reports_like: &[&["gemini"]],
         user_path: ".gemini/settings.json",
         project_path: Some(".gemini/settings.json"),
         ..row(ClientTarget::GeminiCli, "gemini-cli", "Gemini CLI")
@@ -248,6 +270,8 @@ static REGISTRY: [ClientInfo; 30] = [
     ClientInfo {
         aliases: &["codex"],
         live: Some(ClientType::CodexCli),
+        reports: &[],
+        reports_like: &[&["codex"]],
         user_path: ".codex/config.toml",
         import_also: &[Place::Here(".codex/config.toml")],
         layout: TOML_MCP_SERVERS,
@@ -258,6 +282,8 @@ static REGISTRY: [ClientInfo; 30] = [
     ClientInfo {
         aliases: &["grok"],
         live: Some(ClientType::GrokBuild),
+        reports: &[],
+        reports_like: &[&["grok"]],
         user_path: ".grok/config.toml",
         project_path: Some(".grok/config.toml"),
         layout: TOML_MCP_SERVERS,
@@ -265,6 +291,8 @@ static REGISTRY: [ClientInfo; 30] = [
     },
     ClientInfo {
         live: Some(ClientType::OpenCode),
+        reports: &["opencode"],
+        reports_like: &[&["opencode"]],
         user_path: ".config/opencode/opencode.json",
         project_path: Some("opencode.json"),
         layout: OPENCODE,
@@ -272,6 +300,8 @@ static REGISTRY: [ClientInfo; 30] = [
     },
     ClientInfo {
         live: Some(ClientType::Zed),
+        reports: &["Zed"],
+        reports_like: &[&["zed"]],
         user_path: ".config/zed/settings.json",
         layout: json(&["context_servers"], EntryShape::Standard),
         ..row(ClientTarget::Zed, "zed", "Zed")

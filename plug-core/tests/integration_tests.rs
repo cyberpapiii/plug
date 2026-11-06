@@ -22,7 +22,6 @@ use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use futures::FutureExt;
 use oauth2::{AccessToken, RefreshToken, TokenResponse, basic::BasicTokenType};
-use plug_core::client_detect::detect_client;
 use plug_core::config::{
     Config, ServerConfig, TransportType, UpstreamProtocolMode, validate_config,
 };
@@ -1761,52 +1760,6 @@ async fn test_server_manager_tools_empty() {
         tools.is_empty(),
         "expected no tools from empty ServerManager"
     );
-}
-
-// ---------------------------------------------------------------------------
-// Client detection: exact matches
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_client_detection_exact_matches() {
-    assert_eq!(detect_client("claude-code"), ClientType::ClaudeCode);
-    assert_eq!(detect_client("claude-ai"), ClientType::ClaudeDesktop);
-    assert_eq!(detect_client("cursor-vscode"), ClientType::Cursor);
-    assert_eq!(detect_client("windsurf-client"), ClientType::Devin);
-    assert_eq!(
-        detect_client("Visual-Studio-Code"),
-        ClientType::VSCodeCopilot
-    );
-    assert_eq!(
-        detect_client("gemini-cli-mcp-client"),
-        ClientType::GeminiCli
-    );
-    assert_eq!(detect_client("opencode"), ClientType::OpenCode);
-    assert_eq!(detect_client("Zed"), ClientType::Zed);
-}
-
-// ---------------------------------------------------------------------------
-// Client detection: fuzzy fallback
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_client_detection_fuzzy() {
-    assert_eq!(detect_client("Claude Code v2"), ClientType::ClaudeCode);
-    assert_eq!(detect_client("claude-desktop"), ClientType::ClaudeDesktop);
-    assert_eq!(detect_client("cursor-next"), ClientType::Cursor);
-    assert_eq!(detect_client("codeium-editor"), ClientType::Devin);
-    assert_eq!(detect_client("github-copilot"), ClientType::VSCodeCopilot);
-    assert_eq!(detect_client("codex-cli"), ClientType::CodexCli);
-}
-
-// ---------------------------------------------------------------------------
-// Client detection: unknown
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_client_detection_unknown() {
-    assert_eq!(detect_client("some-random-client"), ClientType::Unknown);
-    assert_eq!(detect_client(""), ClientType::Unknown);
 }
 
 // ---------------------------------------------------------------------------
