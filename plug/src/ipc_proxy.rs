@@ -4559,7 +4559,7 @@ mod tests {
     async fn silent_daemon_stall_triggers_reconnect() {
         let _guard = daemon_test_lock().lock().await;
         // Real Unix socket reads don't complete under tokio::time::pause, so
-        // (per plans/009) use the test-only override instead of paused time.
+        // use the test-only override instead of paused time.
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
         let temp = unique_temp_dir("stall");
         set_test_runtime_paths(temp.join("r"), temp.join("s"));
