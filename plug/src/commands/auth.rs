@@ -245,7 +245,7 @@ impl LocalOperatorClient {
             Some(segment) => self.child_endpoint(segment)?,
             None => self.endpoint.clone(),
         };
-        crate::runtime::send_authenticated_operator_request(
+        crate::operator_http::send_authenticated_operator_request(
             &self.client,
             endpoint,
             &self.host_authority,
@@ -278,9 +278,11 @@ fn local_operator_client(
         "http"
     };
     let host_authority =
-        crate::runtime::local_operator_authority(&cfg.http.bind_address, cfg.http.port);
-    let connection_authority =
-        crate::runtime::local_operator_connection_authority(&cfg.http.bind_address, cfg.http.port);
+        crate::operator_http::local_operator_authority(&cfg.http.bind_address, cfg.http.port);
+    let connection_authority = crate::operator_http::local_operator_connection_authority(
+        &cfg.http.bind_address,
+        cfg.http.port,
+    );
     let endpoint =
         reqwest::Url::parse(&format!("{scheme}://{connection_authority}{endpoint_path}"))?;
     let client = plug_core::tls::http_client_builder()
@@ -315,7 +317,7 @@ async fn cmd_downstream_oauth_clients(
     let operator = match config_path {
         Some(_) => Some(local_operator_client(
             config_path,
-            crate::runtime::OPERATOR_OAUTH_CLIENTS_PATH,
+            crate::operator_http::OPERATOR_OAUTH_CLIENTS_PATH,
         )?),
         None => {
             crate::runtime::ensure_daemon_with_feedback(None, false).await?;
@@ -527,8 +529,10 @@ async fn cmd_downstream_oauth_owner(
 ) -> anyhow::Result<()> {
     match command {
         crate::OwnerCommands::Enroll { no_browser } => {
-            let operator =
-                local_operator_client(config_path, crate::runtime::OPERATOR_OWNER_BOOTSTRAP_PATH)?;
+            let operator = local_operator_client(
+                config_path,
+                crate::operator_http::OPERATOR_OWNER_BOOTSTRAP_PATH,
+            )?;
             let response = operator
                 .send_authenticated(reqwest::Method::POST, None, false)
                 .await?;
@@ -584,7 +588,7 @@ async fn cmd_downstream_oauth_owner(
         crate::OwnerCommands::List => {
             let operator = local_operator_client(
                 config_path,
-                crate::runtime::OPERATOR_OWNER_CREDENTIALS_PATH,
+                crate::operator_http::OPERATOR_OWNER_CREDENTIALS_PATH,
             )?;
             let credentials = fetch_owner_credentials(&operator).await?;
             match output {
@@ -609,7 +613,7 @@ async fn cmd_downstream_oauth_owner(
         crate::OwnerCommands::Remove { credential_id, yes } => {
             let operator = local_operator_client(
                 config_path,
-                crate::runtime::OPERATOR_OWNER_CREDENTIALS_PATH,
+                crate::operator_http::OPERATOR_OWNER_CREDENTIALS_PATH,
             )?;
             let credentials = fetch_owner_credentials(&operator).await?;
             let Some(credential) = credentials
@@ -1748,7 +1752,7 @@ mod tests {
         let protected_route_state = protected_route_hit.clone();
         let app = axum::Router::new()
             .route(
-                crate::runtime::OPERATOR_PROOF_PATH,
+                crate::operator_http::OPERATOR_PROOF_PATH,
                 axum::routing::post(|headers: axum::http::HeaderMap| async move {
                     assert!(!headers.contains_key("x-plug-operator-token"));
                     axum::Json(serde_json::json!({
@@ -1758,7 +1762,7 @@ mod tests {
                 }),
             )
             .route(
-                crate::runtime::OPERATOR_OWNER_CREDENTIALS_PATH,
+                crate::operator_http::OPERATOR_OWNER_CREDENTIALS_PATH,
                 axum::routing::get(move |headers: axum::http::HeaderMap| {
                     let protected_route_state = protected_route_state.clone();
                     async move {

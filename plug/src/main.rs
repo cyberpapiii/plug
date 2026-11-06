@@ -35,6 +35,7 @@ mod daemon;
 mod install;
 mod ipc_client;
 mod ipc_proxy;
+mod operator_http;
 mod runtime;
 mod service;
 mod ui;
