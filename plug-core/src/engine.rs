@@ -540,7 +540,7 @@ impl Engine {
             let file_before = std::fs::read(config_path).ok();
             let (mutation, kept_for, before, staged) = self
                 .keep_typed_secrets(config_path, mutation, store.to_string())
-                .await;
+                .await?;
             let router = &self.tool_router;
             let result = match crate::operator::apply_operator_mutation_knowing(
                 config_path,
@@ -557,11 +557,18 @@ impl Engine {
                     // Nothing was saved, so the stores go back to what they
                     // held: a refused change must not replace a working key.
                     let store = store.to_string();
-                    let failed = tokio::task::spawn_blocking(move || {
+                    let failed = match tokio::task::spawn_blocking(move || {
                         crate::secrets::Stores::current().put_back(&store, staged)
                     })
                     .await
-                    .unwrap_or_default();
+                    {
+                        Ok(failed) => failed,
+                        Err(join) => {
+                            return Err(error.context(format!(
+                                "the stored keys could not be put back: {join}"
+                            )));
+                        }
+                    };
                     if failed.is_empty() {
                         return Err(error);
                     }
@@ -577,7 +584,7 @@ impl Engine {
             let report = self.apply_reload(config).await;
             if let Some((name, server)) = before {
                 let config = self.config.load_full();
-                let _ = tokio::task::spawn_blocking(move || {
+                let forgotten = tokio::task::spawn_blocking(move || {
                     crate::secrets::Stores::current().forget(
                         &name,
                         &server,
@@ -585,6 +592,9 @@ impl Engine {
                     );
                 })
                 .await;
+                if let Err(error) = forgotten {
+                    tracing::warn!(%error, "keys the change no longer uses stay stored");
+                }
             }
             (result, report, kept_for)
         };
@@ -638,25 +648,26 @@ impl Engine {
         config_path: &std::path::Path,
         mutation: crate::operator::OperatorMutation,
         store: String,
-    ) -> (
+    ) -> anyhow::Result<(
         crate::operator::OperatorMutation,
         Option<String>,
         Option<(String, ServerConfig)>,
         Vec<(String, Option<crate::types::SecretString>)>,
-    ) {
+    )> {
         use crate::operator::OperatorMutation;
         let keep = |name: String, mut server: ServerConfig| async move {
             let owner = name.clone();
-            match tokio::task::spawn_blocking(move || {
+            tokio::task::spawn_blocking(move || {
                 let kept =
                     crate::secrets::Stores::current().keep_staged(&store, &owner, &mut server);
                 (server, kept)
             })
             .await
-            {
-                Ok((server, kept)) => Ok((name, server, kept)),
-                Err(error) => Err(anyhow::anyhow!(error)),
-            }
+            // Writing the server with its keys still typed into it would put
+            // them in the file in the clear.
+            .map_err(|error| {
+                anyhow::anyhow!("the keys typed into `{name}` could not be stored: {error}")
+            })
         };
         let before = |name: &str| {
             self.config
@@ -667,16 +678,13 @@ impl Engine {
         };
         match mutation {
             OperatorMutation::AddServer { name, server } => {
-                let (server, staged) = match keep(name.clone(), server.clone()).await {
-                    Ok((_, server, staged)) => (server, staged),
-                    Err(_) => (server, Vec::new()),
-                };
-                (
+                let (server, staged) = keep(name.clone(), server).await?;
+                Ok((
                     OperatorMutation::AddServer { name, server },
                     None,
                     None,
                     staged,
-                )
+                ))
             }
             OperatorMutation::UpdateServer { name, mut server } => {
                 let before = before(&name);
@@ -686,11 +694,8 @@ impl Engine {
                 if let Ok(file) = crate::operator::load_editable_config(config_path) {
                     server.restore_redacted_secrets(file.servers.get(&name));
                 }
-                let (server, staged) = match keep(name.clone(), server.clone()).await {
-                    Ok((_, server, staged)) => (server, staged),
-                    Err(_) => (server, Vec::new()),
-                };
-                (
+                let (server, staged) = keep(name.clone(), server).await?;
+                Ok((
                     OperatorMutation::UpdateServer {
                         name: name.clone(),
                         server,
@@ -698,18 +703,18 @@ impl Engine {
                     (!staged.is_empty()).then_some(name),
                     before,
                     staged,
-                )
+                ))
             }
             OperatorMutation::RemoveServer { name } => {
                 let before = before(&name);
-                (
+                Ok((
                     OperatorMutation::RemoveServer { name },
                     None,
                     before,
                     Vec::new(),
-                )
+                ))
             }
-            other => (other, None, None, Vec::new()),
+            other => Ok((other, None, None, Vec::new())),
         }
     }
 

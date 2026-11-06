@@ -1216,14 +1216,6 @@ pub(crate) struct ListingResult<T> {
     pub degraded: BTreeSet<String>,
 }
 
-fn circuit_state_label(state: crate::circuit::CircuitState) -> &'static str {
-    match state {
-        crate::circuit::CircuitState::Closed => "closed",
-        crate::circuit::CircuitState::Open => "open",
-        crate::circuit::CircuitState::HalfOpen => "half-open",
-    }
-}
-
 /// Owns the connected upstream servers and the per-server state every call
 /// path reads: health, call guards, metrics and the last-known-good catalog.
 ///
@@ -1422,7 +1414,7 @@ impl ServerManager {
     fn circuit_state_for(&self, server_id: &str) -> &'static str {
         self.circuit_breakers
             .get(server_id)
-            .map(|cb| circuit_state_label(cb.state()))
+            .map(|cb| cb.state().label())
             .unwrap_or("closed")
     }
 
