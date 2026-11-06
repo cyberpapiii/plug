@@ -27,7 +27,6 @@ use axum::{Router, extract::DefaultBodyLimit};
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -622,7 +621,7 @@ pub(super) async fn handle_request(
         _ => None,
     };
     if let Some(method) = discovery_method {
-        tracing::info!(
+        tracing::debug!(
             method,
             protocol_era = if modern { "modern" } else { "legacy" },
             selected_event_client = events_discoverable(state, &auth_status),
@@ -657,7 +656,7 @@ pub(super) async fn handle_request(
                 );
             }
         };
-        return event_request(state, &auth_status, custom, request_id, era).await;
+        return event_request(state, &auth_status, custom, request_id).await;
     }
 
     // A legacy request belongs to a session, which only `initialize` opens.
@@ -739,19 +738,7 @@ pub(super) async fn handle_request(
         return json_response_for_era(&message, era);
     }
 
-    let mut outcome = crate::dispatch::handle(&state.router, &ctx, &method, params).await;
-    if matches!(req.request, ClientRequest::DiscoverRequest(_))
-        && let Ok(result) = outcome.as_mut()
-        && events_discoverable(state, &ctx.auth_status)
-    {
-        tracing::info!(
-            method = "server/discover",
-            status = 200,
-            events_advertised = true,
-            "MCP Events discovery outcome"
-        );
-        result["capabilities"]["events"] = json!({});
-    }
+    let outcome = crate::dispatch::handle(&state.router, &ctx, &method, params).await;
     let message = dispatch_message(outcome, request_id);
     match (&req.request, session_id) {
         (ClientRequest::InitializeRequest(_), Some(session_id)) => {

@@ -53,6 +53,12 @@ pub trait DownstreamContext: Send + Sync {
     fn modern_task_client(&self) -> Option<&ClientCapabilities> {
         None
     }
+
+    /// Whether `server/discover` tells this caller about MCP Events. Only
+    /// HTTP serves them, and only to an OAuth client that can see a source.
+    fn events_discoverable(&self) -> bool {
+        false
+    }
 }
 
 /// A `plug connect` session as the daemon sees it. Local, so trusted.
@@ -184,7 +190,12 @@ async fn route(
                 server_capabilities(router, ctx),
             );
             result.set_server_info(plug_implementation());
-            to_value(result)
+            let mut result = to_value(result)?;
+            // rmcp's `ServerCapabilities` has no field for MCP Events.
+            if ctx.events_discoverable() {
+                result["capabilities"]["events"] = serde_json::json!({});
+            }
+            Ok(result)
         }
         "ping" => {
             legacy_only(era, method)?;

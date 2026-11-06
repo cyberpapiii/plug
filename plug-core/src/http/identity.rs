@@ -25,6 +25,7 @@ pub(super) struct HttpDownstreamContext {
     /// What a modern request declared in `_meta`. HTTP serves the modern
     /// tasks extension, so a modern request always has one.
     pub(super) modern_task_client: Option<ClientCapabilities>,
+    pub(super) events_discoverable: bool,
 }
 
 impl HttpDownstreamContext {
@@ -78,6 +79,8 @@ impl HttpDownstreamContext {
                     )
                 }
             };
+        let events_discoverable = protocol_era == crate::protocol::ProtocolEra::Modern
+            && super::events::events_discoverable(state, &auth_status);
         Self {
             session_id,
             request_id,
@@ -91,6 +94,7 @@ impl HttpDownstreamContext {
             cancellation: CancellationToken::new(),
             client_metadata,
             modern_task_client,
+            events_discoverable,
         }
     }
 }
@@ -190,6 +194,10 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
 
     fn modern_task_client(&self) -> Option<&ClientCapabilities> {
         self.modern_task_client.as_ref()
+    }
+
+    fn events_discoverable(&self) -> bool {
+        self.events_discoverable
     }
 }
 
