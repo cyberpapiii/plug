@@ -15,7 +15,7 @@ const WRAPPERS: &[&str] = &["sh", "bash", "zsh", "fish", "dash", "env", "npx", "
 const MAX_HOPS: usize = 6;
 
 /// The host of this process, read once. `None` when the process table cannot
-/// be read; a session without a host is shown as it was before.
+/// be read; a session without a host is shown without one.
 pub(crate) fn current() -> Option<ClientHost> {
     #[cfg(test)]
     return None;

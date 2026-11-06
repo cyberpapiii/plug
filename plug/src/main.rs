@@ -722,9 +722,7 @@ async fn run() -> anyhow::Result<()> {
             let exit_code = commands::doctor::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
             if exit_code != 0 {
                 // Flush before process::exit, which bypasses destructors.
-                // Rust's stdout is line-buffered so the trailing-newline
-                // output is already flushed, but make it explicit so a
-                // future non-newline write can't be truncated when piped.
+                // `exit` skips destructors, so stdout is flushed by hand.
                 use std::io::Write as _;
                 let _ = std::io::stdout().flush();
                 std::process::exit(exit_code);
@@ -885,8 +883,8 @@ mod tests {
     }
 
     /// RMCP matches concurrent stdio requests to replies by id, so a stdio
-    /// server with `max_concurrent > 1` is valid and must not warn. The warning
-    /// used to fire on every config load, which the app does every poll.
+    /// server with `max_concurrent > 1` is valid and must not warn: the app
+    /// loads the config on every poll.
     #[test]
     fn validating_a_concurrent_stdio_server_logs_nothing() {
         let server: plug_core::config::ServerConfig = serde_json::from_value(serde_json::json!({

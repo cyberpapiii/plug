@@ -44,7 +44,6 @@ fn auth_status_source_text(live: bool) -> &'static str {
     }
 }
 
-/// `status_scope` repeats `status_source` for readers of older output.
 fn auth_status_source(live: bool) -> &'static str {
     if live {
         crate::ipc_client::DaemonQueryAvailability::Available.status_source()
@@ -58,7 +57,6 @@ fn auth_status_json(servers: Vec<serde_json::Value>, live: bool) -> serde_json::
         "runtime_available": live,
         "servers": servers,
         "status_source": auth_status_source(live),
-        "status_scope": auth_status_source(live)
     })
 }
 
@@ -1312,7 +1310,6 @@ async fn cmd_auth_status(
                         .unwrap_or_else(|| snapshot.as_ref().map(|snapshot| snapshot.warnings.clone()).unwrap_or_default()),
                     "recovery_hint": auth_recovery_hint(name, has_creds, health),
                     "status_source": auth_status_source(live.is_some()),
-                    "status_scope": auth_status_source(live.is_some()),
                 }));
             }
             println!(
@@ -1671,7 +1668,6 @@ mod tests {
         let json = auth_status_json(servers, true);
         assert_eq!(json["runtime_available"], true);
         assert_eq!(json["status_source"], "live_daemon");
-        assert_eq!(json["status_scope"], "live_daemon");
         assert_eq!(json["servers"][0]["name"], "notion");
         assert_eq!(
             json["servers"][0]["warnings"][0],
@@ -1684,7 +1680,6 @@ mod tests {
         let json = auth_status_json(Vec::new(), false);
         assert_eq!(json["runtime_available"], false);
         assert_eq!(json["status_source"], "stored_credentials_only");
-        assert_eq!(json["status_scope"], "stored_credentials_only");
         assert!(json["servers"].as_array().is_some());
         assert_eq!(json["servers"].as_array().unwrap().len(), 0);
     }

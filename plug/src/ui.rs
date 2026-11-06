@@ -293,7 +293,10 @@ pub(crate) fn summarize_server_transport(
 pub(crate) fn server_place(server: Option<&plug_core::config::ServerConfig>) -> &'static str {
     match server.map(|server| &server.transport) {
         Some(plug_core::config::TransportType::Stdio) => "On this Mac",
-        Some(_) => "Over the network",
+        Some(plug_core::config::TransportType::OpenApi) => "Web API",
+        Some(plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse) => {
+            "Over the network"
+        }
         None => "",
     }
 }
