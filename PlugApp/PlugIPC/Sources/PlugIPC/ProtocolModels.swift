@@ -348,11 +348,15 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public var events: [EventStatus]?
     /// The address a client Plug has no switch for is given to reach it.
     public var clientAddress: String?
+    /// What joins a server's prefix to a tool's name in the names clients
+    /// call: `Server__tool` by default, as the config sets it.
+    public var prefixDelimiter: String
 
+    /// Before the first read nothing is known, so no name is split.
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, toolCatalogRevision: 0, ownership: .unmanaged,
         configuredServers: [], servers: [], liveSessions: [],
-        upstreamAuth: [], downstreamClients: []
+        upstreamAuth: [], downstreamClients: [], prefixDelimiter: ""
     )
 }
 

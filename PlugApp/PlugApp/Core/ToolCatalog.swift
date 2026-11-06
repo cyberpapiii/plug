@@ -5,7 +5,8 @@ import PlugIPC
 ///
 /// Tools arrive from the daemon under their merged name (`figma__get_file`),
 /// which is what a client actually calls. People read them per server, so the
-/// server prefix is stripped for display and kept for every action.
+/// server prefix is stripped for display and kept for every action. The
+/// delimiter between the two is the daemon's (`OperatorSnapshot.prefixDelimiter`).
 struct ToolFacts: Identifiable, Equatable, Sendable {
     var id: String { name }
     let name: String
@@ -25,6 +26,7 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
     let shortName: String
 
     init(
+        delimiter: String,
         name: String,
         server: String,
         summary: String? = nil,
@@ -40,8 +42,8 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
         self.lockedByPattern = lockedByPattern
         self.ownName = ownName
         self.isReadOnly = isReadOnly
-        let prefix = "\(server)__"
-        if name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased()) {
+        let prefix = "\(server)\(delimiter)"
+        if !delimiter.isEmpty, name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased()) {
             shortName = String(name.dropFirst(prefix.count))
         } else {
             shortName = name
@@ -50,8 +52,9 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
 }
 
 extension ToolFacts {
-    init(_ info: ToolInfo) {
+    init(_ info: ToolInfo, delimiter: String) {
         self.init(
+            delimiter: delimiter,
             name: info.name,
             server: info.serverId,
             summary: info.description ?? info.title,
@@ -96,9 +99,10 @@ struct ToolCatalog: Equatable, Sendable {
 
     /// The names a server's tools are filed under for clients, in order.
     /// More than one means Plug splits the server into groups.
-    static func groups(ofNames names: [String]) -> [String] {
-        Set(names.compactMap { name in
-            name.range(of: "__").map { String(name[..<$0.lowerBound]) }
+    static func groups(ofNames names: [String], delimiter: String) -> [String] {
+        guard !delimiter.isEmpty else { return [] }
+        return Set(names.compactMap { name in
+            name.range(of: delimiter).map { String(name[..<$0.lowerBound]) }
         })
         .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
     }

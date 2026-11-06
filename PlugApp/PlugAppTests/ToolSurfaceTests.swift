@@ -7,15 +7,17 @@ import PlugIPC
 /// honestly out of reach because a wildcard covers them.
 final class ToolCatalogTests: XCTestCase {
     private let catalog = ToolCatalog([
-        ToolFacts(name: "figma__get_file", server: "figma", summary: "Read a design file"),
-        ToolFacts(name: "figma__export_frame", server: "figma", summary: "Export an image"),
+        ToolFacts(delimiter: "__", name: "figma__get_file", server: "figma", summary: "Read a design file"),
+        ToolFacts(delimiter: "__", name: "figma__export_frame", server: "figma", summary: "Export an image"),
         ToolFacts(
+            delimiter: "__",
             name: "notion__search",
             server: "notion",
             summary: "Search pages",
             isOn: false
         ),
         ToolFacts(
+            delimiter: "__",
             name: "notion__append_block",
             server: "notion",
             isOn: false,
@@ -25,18 +27,18 @@ final class ToolCatalogTests: XCTestCase {
 
     func testShortNameDropsTheServerPrefixTheGroupAlreadyStates() {
         XCTAssertEqual(
-            ToolFacts(name: "figma__get_file", server: "figma").shortName,
+            ToolFacts(delimiter: "__", name: "figma__get_file", server: "figma").shortName,
             "get_file"
         )
     }
 
     func testShortNameKeepsNamesThatDoNotCarryThePrefix() {
-        XCTAssertEqual(ToolFacts(name: "search", server: "notion").shortName, "search")
+        XCTAssertEqual(ToolFacts(delimiter: "__", name: "search", server: "notion").shortName, "search")
     }
 
     func testShortNameMatchesThePrefixRegardlessOfCase() {
         XCTAssertEqual(
-            ToolFacts(name: "Figma__Get_File", server: "figma").shortName,
+            ToolFacts(delimiter: "__", name: "Figma__Get_File", server: "figma").shortName,
             "Get_File"
         )
     }
@@ -100,7 +102,8 @@ final class ToolCatalogTests: XCTestCase {
                 title: "Append block",
                 disabled: true,
                 disabledByPattern: "notion__append*"
-            )
+            ),
+            delimiter: "__"
         )
         XCTAssertEqual(facts.server, "notion")
         XCTAssertEqual(facts.summary, "Append block")
@@ -110,7 +113,8 @@ final class ToolCatalogTests: XCTestCase {
 
     func testDescriptionIsPreferredOverTitleWhenBothArrive() {
         let facts = ToolFacts(
-            ToolInfo(name: "figma__get_file", serverId: "figma", description: "Read a design file", title: "Get file")
+            ToolInfo(name: "figma__get_file", serverId: "figma", description: "Read a design file", title: "Get file"),
+            delimiter: "__"
         )
         XCTAssertEqual(facts.summary, "Read a design file")
         XCTAssertTrue(facts.isOn)
@@ -119,10 +123,10 @@ final class ToolCatalogTests: XCTestCase {
 
     func testPatternListsEveryToolItCovers() {
         let catalog = ToolCatalog([
-            ToolFacts(name: "notion__search", server: "notion", isOn: false, lockedByPattern: "notion__*"),
-            ToolFacts(name: "notion__append", server: "notion", isOn: false, lockedByPattern: "notion__*"),
-            ToolFacts(name: "figma__get_file", server: "figma"),
-            ToolFacts(name: "figma__delete", server: "figma", isOn: false),
+            ToolFacts(delimiter: "__", name: "notion__search", server: "notion", isOn: false, lockedByPattern: "notion__*"),
+            ToolFacts(delimiter: "__", name: "notion__append", server: "notion", isOn: false, lockedByPattern: "notion__*"),
+            ToolFacts(delimiter: "__", name: "figma__get_file", server: "figma"),
+            ToolFacts(delimiter: "__", name: "figma__delete", server: "figma", isOn: false),
         ])
         XCTAssertEqual(
             catalog.tools(coveredBy: "notion__*").map(\.shortName),
@@ -389,11 +393,11 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(
             ToolCatalog.groups(ofNames: [
                 "Gmail__search_messages", "GoogleDrive__list_items", "Gmail__send_message", "Workspace__start",
-            ]),
+            ], delimiter: "__"),
             ["Gmail", "GoogleDrive", "Workspace"]
         )
-        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Slack__channels_list", "Slack__users_search"]), ["Slack"])
-        XCTAssertEqual(ToolCatalog.groups(ofNames: ["unprefixed"]), [])
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Slack__channels_list", "Slack__users_search"], delimiter: "__"), ["Slack"])
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["unprefixed"], delimiter: "__"), [])
     }
 
     func testClientsAreGroupedByWhereTheyRun() throws {
@@ -420,7 +424,7 @@ final class AppRosterTests: XCTestCase {
         )
         // The daemon's own reply, read the way the app reads it.
         let snapshot = try decoder.decode(OperatorSnapshot.self, from: Data(#"""
-        {"runtime_version":"1","uptime_secs":1,"tool_catalog_revision":0,"ownership":"app_managed","configured_servers":[],
+        {"runtime_version":"1","uptime_secs":1,"tool_catalog_revision":0,"ownership":"app_managed","prefix_delimiter":"__","configured_servers":[],
          "servers":[],"live_sessions":[],"upstream_auth":[],"downstream_clients":[],
          "client_places":[{"key":"claude-code","place":"Work laptop"}]}
         """#.utf8))
@@ -561,7 +565,7 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(access("pi").state(ofTool: "slack__post"), .on)
         XCTAssertEqual(access("cursor").state(ofTool: "slack__post"), .off)
         let tools = ["git__commit", "git__log", "slack__dm", "slack__post"].map {
-            ToolFacts(name: $0, server: String($0.prefix(while: { $0 != "_" })))
+            ToolFacts(delimiter: "__", name: $0, server: String($0.prefix(while: { $0 != "_" })))
         }
         XCTAssertEqual(access("pi").offCount(among: tools), 3)
         XCTAssertEqual(access("claude-code").offCount(among: tools), 0)
@@ -597,7 +601,7 @@ final class AppRosterTests: XCTestCase {
 
         // On a server that is on the list whole, a tool's switch is a block.
         // On one that is not, it puts the tool on the list or takes it off.
-        let tool = { ToolFacts(name: $0, server: $1) }
+        let tool = { ToolFacts(delimiter: "__", name: $0, server: $1) }
         XCTAssertEqual(radar.state(of: tool("slack__post", "slack")), .on)
         XCTAssertEqual(radar.state(of: tool("slack__dm", "slack")), .off)
         XCTAssertFalse(radar.isListedSingly(tool("slack__dm", "slack")))
@@ -793,13 +797,24 @@ final class PopoverRecentTests: XCTestCase {
     }
 
     func testCallFactsSplitTheServerPrefix() {
-        let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"))
+        let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"), delimiter: "__")
         XCTAssertEqual(call.server, "Figma")
         XCTAssertEqual(call.tool, "get_file")
     }
 
+    /// The delimiter is the daemon's, whatever the config sets it to.
+    func testCallFactsSplitOnTheDaemonsDelimiter() {
+        let dotted = CallFacts(event(1, tool: "Figma.get_file", server: "figma"), delimiter: ".")
+        XCTAssertEqual(dotted.server, "Figma")
+        XCTAssertEqual(dotted.tool, "get_file")
+        let whole = CallFacts(event(1, tool: "Figma__get_file", server: "figma"), delimiter: ".")
+        XCTAssertEqual(whole.tool, "Figma__get_file")
+        XCTAssertEqual(ToolFacts(delimiter: ".", name: "figma.get_file", server: "figma").shortName, "get_file")
+        XCTAssertEqual(ToolCatalog.groups(ofNames: ["Gmail.search", "Drive.list"], delimiter: "."), ["Drive", "Gmail"])
+    }
+
     func testCallFactsKeepAnUnprefixedName() {
-        let call = CallFacts(event(1, tool: "search", server: "notion"))
+        let call = CallFacts(event(1, tool: "search", server: "notion"), delimiter: "__")
         XCTAssertEqual(call.server, "notion")
         XCTAssertEqual(call.tool, "search")
     }

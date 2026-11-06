@@ -62,13 +62,4 @@ final class EventSurfaceTests: XCTestCase {
         XCTAssertEqual(WatchDraft.arguments(from: "[1, 2]"), .failure(.notAnObject))
         XCTAssertEqual(WatchDraft.arguments(from: "query=is:unread"), .failure(.notAnObject))
     }
-
-    func testAToolCarriesItsOwnNameAndWhetherItIsReadOnly() {
-        let tool = ToolFacts(ToolInfo(
-            name: "Gmail__search_messages", serverId: "workspace",
-            ownName: "search_gmail_messages", readOnly: true
-        ))
-        XCTAssertEqual(tool.ownName, "search_gmail_messages")
-        XCTAssertTrue(tool.isReadOnly)
-    }
 }

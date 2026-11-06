@@ -1382,6 +1382,7 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
                     client_blocks,
                     events,
                     client_address: Some(config.http.mcp_url()),
+                    prefix_delimiter: config.prefix_delimiter.clone(),
                 }),
             }
         }

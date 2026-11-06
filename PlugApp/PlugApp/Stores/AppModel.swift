@@ -212,7 +212,9 @@ final class AppModel {
         let place = event.clientKey.flatMap { key in
             snapshot.clientPlaces?.first { $0.key == key }?.place
         }
-        return CallFacts(event, ownerName: name, grantName: grant, place: place)
+        return CallFacts(
+            event, delimiter: snapshot.prefixDelimiter, ownerName: name, grantName: grant, place: place
+        )
     }
 
     /// The names and places the owner gave clients. The Clients page asks
@@ -532,7 +534,8 @@ final class AppModel {
         // it would answer differently, so it is asked for only then.
         let revision = value.toolCatalogRevision
         if forceCatalog || !toolCatalog.isCurrent(at: revision), let tools = try await daemon.tools() {
-            toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)), revision: revision)
+            let delimiter = value.prefixDelimiter
+            toolCatalog = ToolCatalog(tools.map { ToolFacts($0, delimiter: delimiter) }, revision: revision)
         }
         if connectionState != .ready { connectionState = .ready }
         if connectionError != nil { connectionError = nil }

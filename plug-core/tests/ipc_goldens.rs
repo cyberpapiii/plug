@@ -487,6 +487,8 @@ fn snapshot() -> OperatorSnapshot {
             }])
             .collect(),
         client_address: Some("https://plug.example.com/mcp".to_string()),
+        // Not the default, so the app is seen reading it.
+        prefix_delimiter: ".".to_string(),
     }
 }
 

@@ -16,9 +16,19 @@ struct CallFacts: Equatable, Sendable {
     let grantName: String?
     /// Where the owner says this client runs.
     let place: String?
+    /// What joins the server half of a tool name to the tool half. Empty
+    /// leaves the name whole, for a reader that only asks how a call went.
+    let delimiter: String
 
-    init(_ event: ActivityEvent, ownerName: String? = nil, grantName: String? = nil, place: String? = nil) {
+    init(
+        _ event: ActivityEvent,
+        delimiter: String = "",
+        ownerName: String? = nil,
+        grantName: String? = nil,
+        place: String? = nil
+    ) {
         self.event = event
+        self.delimiter = delimiter
         self.ownerName = ownerName
         self.grantName = grantName
         self.place = place
@@ -48,7 +58,7 @@ struct CallFacts: Equatable, Sendable {
     /// a word; the tool half stands alone.
     private var parts: (server: String?, tool: String) {
         guard let tool = event.tool, !tool.isEmpty else { return (event.server, event.method) }
-        guard let range = tool.range(of: "__"), range.lowerBound > tool.startIndex,
+        guard !delimiter.isEmpty, let range = tool.range(of: delimiter), range.lowerBound > tool.startIndex,
               range.upperBound < tool.endIndex
         else { return (event.server, tool) }
         return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))

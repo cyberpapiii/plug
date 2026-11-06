@@ -1044,7 +1044,7 @@ final class AppModelTests: XCTestCase {
             }
             let payload = """
             {
-              "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "toolCatalogRevision": 0,
+              "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "toolCatalogRevision": 0, "prefixDelimiter": "__",
               "ownership": "app_managed", "configuredServers": [], "servers": [], "liveSessions": [],
               "upstreamAuth": [\(auth.joined(separator: ","))], "downstreamClients": []
             }
@@ -1071,7 +1071,7 @@ final class AppModelTests: XCTestCase {
             : "[]"
         let payload = """
         {
-          "runtimeVersion": "\(currentTestAppVersion)",
+          "runtimeVersion": "\(currentTestAppVersion)", "prefixDelimiter": "__",
           "uptimeSecs": 1,
           "toolCatalogRevision": 0,
           "ownership": "app_managed",
@@ -1297,7 +1297,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                     send(response: [
                         "type": "OperatorSnapshot",
                         "snapshot": [
-                            "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app_managed",
+                            "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app_managed", "prefix_delimiter": "__",
                             "tool_catalog_revision": catalogRevision,
                             "configured_servers": [], "servers": [], "live_sessions": [],
                             "upstream_auth": [], "downstream_clients": [],
