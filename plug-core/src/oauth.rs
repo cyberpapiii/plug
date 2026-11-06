@@ -1,8 +1,9 @@
-//! OAuth credential store and auth manager for upstream MCP server authentication.
+//! OAuth sign-in to upstream MCP servers: authority discovery and binding,
+//! token storage, refresh, and telling an auth refusal from other failures.
 //!
-//! Provides [`CompositeCredentialStore`] (OS keyring + file fallback) and
-//! [`CompositeStateStore`] (file-based PKCE state) that implement the rmcp
-//! `CredentialStore` and `StateStore` traits respectively.
+//! [`CompositeCredentialStore`] (Keychain plus a file mirror) and
+//! [`CompositeStateStore`] (file-based PKCE state) implement rmcp's
+//! `CredentialStore` and `StateStore` traits.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,19 +25,17 @@ use crate::platform_keyring;
 
 use crate::config;
 
-/// Default token lifetime when `expires_in` is missing or invalid.
+/// Assumed when `expires_in` is missing or invalid.
 pub const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 
-/// Refresh window — refresh this many seconds before expiry.
+/// How long before expiry a token is refreshed.
 pub const TOKEN_REFRESH_WINDOW_SECS: u64 = 300;
 
-/// Minimum clamped `expires_in` value.
+/// `expires_in` is clamped into `MIN_EXPIRES_IN..=MAX_EXPIRES_IN`.
 const MIN_EXPIRES_IN: u64 = 60;
-
-/// Maximum clamped `expires_in` value.
 const MAX_EXPIRES_IN: u64 = 86400;
 
-/// Short-lived threshold: if `expires_in < 600`, use the 50% rule.
+/// A token living shorter than this is refreshed at half its lifetime.
 const SHORT_LIVED_THRESHOLD: u64 = 600;
 
 /// Seconds added to every wall-clock read in the token-expiry and
@@ -69,12 +68,18 @@ const fn test_clock_skew_secs() -> u64 {
     0
 }
 
-/// Move the OAuth clock forward by `secs` for the rest of this process, so a
-/// test can drive a background token refresh without sleeping through a real
-/// token lifetime.
+/// Move the OAuth clock forward by `secs`, so a test can drive a background
+/// token refresh without sleeping through a real token lifetime. The skew is
+/// process-wide: undo it with [`reset_test_clock`].
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn advance_test_clock(secs: u64) {
     TEST_CLOCK_SKEW_SECS.fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Put the OAuth clock back on the wall clock.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_test_clock() {
+    TEST_CLOCK_SKEW_SECS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -122,8 +127,9 @@ static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
 /// Process-local credential backend used by tests.
 ///
 /// OAuth tests must never touch the operator's login Keychain or production
-/// token directory. Integration-test binaries opt in explicitly; this crate's
-/// unit tests install it lazily on first credential access.
+/// token directory. Any build with `cfg(test)` or the dev-only `test-helpers`
+/// feature installs it on first credential access, so no test has to remember
+/// to.
 #[cfg(any(test, feature = "test-helpers"))]
 struct TestCredentialEnvironment {
     tokens_dir: PathBuf,
@@ -135,44 +141,29 @@ struct TestCredentialEnvironment {
 #[cfg(any(test, feature = "test-helpers"))]
 static TEST_CREDENTIAL_ENVIRONMENT: OnceLock<TestCredentialEnvironment> = OnceLock::new();
 
-/// Isolate OAuth credentials for the current test process.
+/// Isolate OAuth credentials for the current test process under
+/// `tokens_dir`. The first install wins: a later call, or the automatic one on
+/// first credential access, keeps the directory already chosen.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn install_test_credential_environment(tokens_dir: PathBuf) {
-    let environment = TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
-        tokens_dir: tokens_dir.clone(),
+    TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
+        tokens_dir,
         keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
         keyring_reads: std::sync::Mutex::new(std::collections::HashMap::new()),
         failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
     });
-    assert_eq!(
-        environment.tokens_dir, tokens_dir,
-        "test credential environment was already installed with a different token directory"
-    );
 }
 
 /// Seed only the isolated test keyring, without creating a token-file mirror.
-/// Panics unless `install_test_credential_environment` ran first.
 #[cfg(any(test, feature = "test-helpers"))]
 pub fn seed_test_keyring_credentials(server_name: &str, credentials: &StoredCredentials) {
-    let environment = TEST_CREDENTIAL_ENVIRONMENT
-        .get()
-        .expect("test credential environment must be installed before seeding its keyring");
+    let environment = test_credential_environment().expect("test credential environment");
     let json = serde_json::to_string(credentials).expect("serialize test credentials");
     environment
         .keyring
         .lock()
         .expect("test keyring mutex poisoned")
         .insert(server_name.to_string(), json);
-}
-
-#[cfg(test)]
-fn ensure_unit_test_credential_environment() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        install_test_credential_environment(
-            std::env::temp_dir().join(format!("plug-oauth-unit-tests-{}", std::process::id())),
-        );
-    });
 }
 
 /// Whether credentials go to the isolated test backend instead of the
@@ -182,10 +173,14 @@ pub(crate) fn uses_test_credentials() -> bool {
     test_credential_environment().is_some()
 }
 
+/// The isolated test backend, installed on first use. Always `Some`; the
+/// `Option` lets callers fall through to the real stores without the
+/// fall-through becoming unreachable code in test builds.
 #[cfg(any(test, feature = "test-helpers"))]
 fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
-    #[cfg(test)]
-    ensure_unit_test_credential_environment();
+    install_test_credential_environment(
+        std::env::temp_dir().join(format!("plug-oauth-tests-{}", std::process::id())),
+    );
     TEST_CREDENTIAL_ENVIRONMENT.get()
 }
 
@@ -194,21 +189,19 @@ fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
 /// Callers may share the returned `Arc` freely; stores are lazily
 /// created and live for the process lifetime.
 pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
-    #[cfg(test)]
-    ensure_unit_test_credential_environment();
     STORES
         .entry(server_name.to_string())
         .or_insert_with(|| Arc::new(CompositeCredentialStore::new(server_name.to_string())))
         .clone()
 }
 
-/// The `tokens` directory in Plug's config directory.
 /// The file a server's sign-in is mirrored to.
 pub(crate) fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
     let safe = config::sanitize_server_name_for_path(server_name)?;
     Ok(tokens_dir().join(format!("{safe}.json")))
 }
 
+/// The `tokens` directory in Plug's config directory.
 pub fn tokens_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(environment) = test_credential_environment() {
@@ -846,8 +839,6 @@ impl CompositeCredentialStore {
         Ok(())
     }
 
-    // -- keyring helpers --------------------------------------------------
-
     fn keyring_entry(&self) -> Option<platform_keyring::Entry> {
         if let Err(error) = initialize_platform_keyring() {
             debug!(server = %self.server_name, %error, "keyring initialization failed");
@@ -934,8 +925,6 @@ impl CompositeCredentialStore {
             }
         }
     }
-
-    // -- file helpers -----------------------------------------------------
 
     fn token_file_path(&self) -> Result<PathBuf, AuthError> {
         token_file_path(&self.server_name).map_err(|e| {
@@ -1054,8 +1043,6 @@ impl CompositeCredentialStore {
     fn registration_clear(&self) {
         self.clear_json_file(self.registration_file_path(), "registration file");
     }
-
-    // -- cache helpers ----------------------------------------------------
 
     fn update_cache(&self, creds: &StoredCredentials) {
         let cached = creds.token_response.as_ref().map(|tr| {
@@ -1679,10 +1666,9 @@ pub async fn refresh_access_token(
 
     match auth_manager.refresh_token().await {
         Ok(_) => {
-            // rmcp's refresh_token() saves via the refresh store and updates its
-            // in-memory cache. Copy that fresh credential bundle into the shared
-            // store cache instead of re-reading persisted storage and re-hitting
-            // the keychain.
+            // rmcp's refresh_token() saves the new bundle through the refresh
+            // store. Read it back from there and copy it into the shared
+            // store's cache.
             let refreshed = match CredentialStore::load(&refresh_store).await {
                 Ok(Some(creds)) => creds,
                 Ok(None) => {
@@ -1758,7 +1744,6 @@ mod tests {
         assert_eq!(store.delimiters[2], "");
     }
 
-    /// Token just received — should not need refresh.
     #[test]
     fn test_token_needs_refresh_not_due() {
         let now = SystemTime::now()
@@ -1768,7 +1753,6 @@ mod tests {
         assert!(!token_needs_refresh(now, Some(3600)));
     }
 
-    /// Token near expiry — should need refresh.
     #[test]
     fn test_token_needs_refresh_due() {
         let now = SystemTime::now()
@@ -1780,7 +1764,6 @@ mod tests {
         assert!(token_needs_refresh(now - 3500, Some(3600)));
     }
 
-    /// When `expires_in` is `None`, uses the default lifetime.
     #[test]
     fn test_token_needs_refresh_none_expires_in() {
         let now = SystemTime::now()
@@ -1806,7 +1789,6 @@ mod tests {
         assert!(token_needs_refresh(now - 70, Some(120))); // 70 >= 60
     }
 
-    /// Basic computation of time until refresh window.
     #[test]
     fn test_time_until_refresh_window() {
         let now = SystemTime::now()
@@ -2033,8 +2015,6 @@ mod tests {
         let store = CompositeCredentialStore::new("../evil".to_string());
         assert!(store.token_file_path().is_err());
     }
-
-    // -- refresh_access_token tests ----------------------------------------
 
     /// Helper: build a synthetic token response for test fixtures.
     fn make_test_token(
@@ -2397,73 +2377,103 @@ mod tests {
         ));
     }
 
-    /// Authority discovery precedes even an empty-store check, so an
-    /// unreachable resource fails without inspecting local credential state.
-    #[tokio::test]
-    async fn test_refresh_no_credentials() {
-        let name = format!("refresh-nocreds-{}", std::process::id());
-        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::TransientError(_)));
+    /// Discover the empty local authority at `resource_url`, bind the shared
+    /// store to it, and save `credentials` as that bound pair.
+    async fn save_bound_to_local_authority(
+        name: &str,
+        resource_url: &str,
+        credentials: Option<StoredCredentials>,
+    ) -> Arc<CompositeCredentialStore> {
+        let manager = crate::tls::authorization_manager(resource_url)
+            .await
+            .unwrap();
+        let resolution = manager.resolve_metadata().await.unwrap();
+        let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata).unwrap();
+        let store = get_or_create_store(name);
+        store.bind_verified_authority(&authority).unwrap();
+        if let Some(credentials) = credentials {
+            CredentialStore::save(store.as_ref(), credentials)
+                .await
+                .unwrap();
+        }
+        store
     }
 
-    /// An unreachable authority cannot cause an injected credential to be
-    /// loaded before issuer binding.
     #[tokio::test]
-    async fn test_refresh_injected_token() {
-        let name = format!("refresh-injected-{}", std::process::id());
-        let store = get_or_create_store(&name);
+    async fn refresh_with_no_stored_pair_reports_no_credentials() {
+        let name = format!("refresh-nocreds-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let store = save_bound_to_local_authority(&name, &resource_url, None).await;
 
-        let mut creds = make_test_token("test-access", Some("test-refresh"), Some(3600));
-        creds.client_id = "injected".to_string();
-        store.save(creds).await.unwrap();
+        let result = refresh_access_token(&name, &resource_url, None).await;
 
-        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::TransientError(_)));
-
-        // Clean up
+        assert!(matches!(result, RefreshResult::NoCredentials), "{result:?}");
+        authority_task.abort();
         store.clear().await.unwrap();
     }
 
-    /// An unreachable authority cannot cause a no-refresh credential to be
-    /// loaded before issuer binding.
     #[tokio::test]
-    async fn test_refresh_no_refresh_token() {
-        let name = format!("refresh-norefresh-{}", std::process::id());
-        let store = get_or_create_store(&name);
+    async fn refresh_of_an_injected_token_is_left_alone() {
+        let name = format!("refresh-injected-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let mut credentials = make_test_token("test-access", Some("test-refresh"), Some(3600));
+        credentials.client_id = "injected".to_string();
+        let store = save_bound_to_local_authority(&name, &resource_url, Some(credentials)).await;
 
-        // Token without a refresh_token
-        let creds = make_test_token("test-access", None, Some(3600));
-        store.save(creds).await.unwrap();
+        let result = refresh_access_token(&name, &resource_url, None).await;
 
-        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::TransientError(_)));
-
-        // Clean up
+        assert!(matches!(result, RefreshResult::InjectedToken), "{result:?}");
+        authority_task.abort();
         store.clear().await.unwrap();
     }
 
-    /// Valid credentials but unreachable server → TransientError (metadata
-    /// discovery fails).
     #[tokio::test]
-    async fn test_refresh_transient_error_unreachable_server() {
-        let name = format!("refresh-transient-{}", std::process::id());
+    async fn refresh_without_a_refresh_token_says_so() {
+        let name = format!("refresh-norefresh-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let store = save_bound_to_local_authority(
+            &name,
+            &resource_url,
+            Some(make_test_token("test-access", None, Some(3600))),
+        )
+        .await;
+
+        let result = refresh_access_token(&name, &resource_url, None).await;
+
+        assert!(
+            matches!(result, RefreshResult::NoRefreshToken),
+            "{result:?}"
+        );
+        authority_task.abort();
+        store.clear().await.unwrap();
+    }
+
+    /// Discovery comes before any stored credential is read, so an authority
+    /// that cannot be reached is a transient failure even with a token saved.
+    #[tokio::test]
+    async fn refresh_against_an_unreachable_authority_is_transient() {
+        let name = format!("refresh-unreachable-{}", uuid::Uuid::new_v4());
         let store = get_or_create_store(&name);
+        store
+            .save(make_test_token(
+                "test-access",
+                Some("test-refresh"),
+                Some(3600),
+            ))
+            .await
+            .unwrap();
 
-        let creds = make_test_token("test-access", Some("test-refresh"), Some(3600));
-        store.save(creds).await.unwrap();
+        let result = refresh_access_token(&name, "http://127.0.0.1:1/mcp", None).await;
 
-        // Point at a non-existent server — metadata discovery will fail.
-        let result = refresh_access_token(&name, "http://127.0.0.1:1", None).await;
         assert!(
             matches!(result, RefreshResult::TransientError(_)),
-            "expected TransientError, got {result:?}"
+            "{result:?}"
         );
-
-        // Clean up
         store.clear().await.unwrap();
     }
 
     #[tokio::test]
+
     async fn test_load_prefers_in_memory_cache_before_backing_stores() {
         let name = format!("oauth-cache-first-{}", std::process::id());
         let store = get_or_create_store(&name);
