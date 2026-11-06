@@ -8,7 +8,7 @@ use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -1149,13 +1149,7 @@ pub(crate) fn next_upstream_generation() -> u64 {
         .expect("upstream connection generation exhausted")
 }
 
-/// Manages the lifecycle of upstream MCP servers.
-///
-/// Uses `ArcSwap` for wait-free reads — critical for HTTP concurrency where
-/// multiple requests resolve tools simultaneously. Writes (server start/stop)
-/// are infrequent and use compare-and-swap.
-/// Runtime per-upstream call metrics (atomics, recorded on the call path).
-/// Observability only — nothing routes on these.
+/// Per-upstream call metrics for status output. Nothing decides on them.
 #[derive(Debug, Default)]
 pub(crate) struct UpstreamMetrics {
     call_count: AtomicU64,
@@ -1163,15 +1157,13 @@ pub(crate) struct UpstreamMetrics {
     last_latency_ms: AtomicU64,
     /// Unix epoch seconds since which calls have been failing; 0 = healthy.
     degraded_since_epoch: AtomicU64,
-    /// How many times the supervisor has restarted this upstream since start.
+    /// Recovery episodes and supervised restarts since this server started.
     restart_count: AtomicU64,
-    /// Unix epoch seconds of the most recent supervised restart; 0 = never.
+    /// Unix epoch seconds of the most recent of them; 0 = never.
     last_restart_epoch: AtomicU64,
 }
 
 impl UpstreamMetrics {
-    /// Record a supervised restart: bump the count and stamp the time. Read back
-    /// through `snapshot()` into `plug status --output json`.
     fn record_restart(&self) {
         self.restart_count.fetch_add(1, Ordering::Relaxed);
         let now = SystemTime::now()
@@ -1248,6 +1240,11 @@ fn circuit_state_label(state: crate::circuit::CircuitState) -> &'static str {
     }
 }
 
+/// Owns the connected upstream servers and the per-server state every call
+/// path reads: health, call guards, metrics and the last-known-good catalog.
+///
+/// The server map is an `ArcSwap`, so the many concurrent readers on the
+/// call path never wait; the rare writers serialize on a lock.
 pub struct ServerManager {
     servers: ArcSwap<HashMap<String, Arc<UpstreamServer>>>,
     /// Serializes every writer to `servers` (RCU: lock, load, clone, mutate,
@@ -1270,9 +1267,6 @@ pub struct ServerManager {
     /// Cleared when it starts; shown in status while it is unhealthy.
     last_errors: DashMap<String, String>,
     pub(crate) semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
-    /// Per-server reconnection flag to prevent stampede (multiple concurrent callers
-    /// all trying to reconnect the same server simultaneously).
-    reconnecting: DashMap<String, Arc<AtomicBool>>,
     tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
     /// Grace-period retirement tasks spawned by `replace_server` for
     /// old-generation upstreams still held by in-flight requests. Tracked so
@@ -1358,7 +1352,6 @@ impl ServerManager {
             availability: DashMap::new(),
             last_errors: DashMap::new(),
             semaphores: DashMap::new(),
-            reconnecting: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             shutdown_signal,
@@ -1400,7 +1393,7 @@ impl ServerManager {
             .record(ok, latency_ms);
     }
 
-    /// Record a supervised restart of `server_id` in its metrics (item 2b).
+    /// Count a restart of `server_id` for status output.
     pub(crate) fn record_restart(&self, server_id: &str) {
         self.metrics
             .entry(server_id.to_string())
@@ -1408,15 +1401,21 @@ impl ServerManager {
             .record_restart();
     }
 
-    /// Unix epoch seconds of the most recent supervised restart, or `None` if the
-    /// upstream has never been restarted. Drives the supervisor's backoff clock.
-    pub(crate) fn last_restart_epoch(&self, server_id: &str) -> Option<u64> {
-        let epoch = self
-            .metrics
-            .get(server_id)?
-            .last_restart_epoch
-            .load(Ordering::Relaxed);
-        (epoch != 0).then_some(epoch)
+    pub(crate) fn health(&self, server_id: &str) -> Option<ServerHealth> {
+        self.health.get(server_id).map(|entry| entry.health)
+    }
+
+    /// Count one health check of `server_id`, returning its health before and
+    /// after.
+    pub(crate) fn record_check(&self, server_id: &str, ok: bool) -> (ServerHealth, ServerHealth) {
+        let mut entry = self.health.entry(server_id.to_string()).or_default();
+        let before = entry.health;
+        if ok {
+            entry.record_success();
+        } else {
+            entry.record_failure();
+        }
+        (before, entry.health)
     }
 
     /// Whether `server_id`'s circuit breaker is currently open.
@@ -1570,11 +1569,7 @@ impl ServerManager {
     /// begin per-server background work without waiting for the slowest upstream:
     /// one server that takes a minute to spawn must not delay the health task that
     /// would otherwise be reconnecting an upstream that is already back.
-    pub async fn start_all(
-        &self,
-        config: &Config,
-        on_settled: impl Fn(&str),
-    ) -> Result<(), anyhow::Error> {
+    pub async fn start_all(&self, config: &Config, on_settled: impl Fn(&str)) {
         self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
@@ -1585,7 +1580,7 @@ impl ServerManager {
 
         if enabled.is_empty() {
             tracing::info!("no servers configured");
-            return Ok(());
+            return;
         }
 
         tracing::info!(
@@ -1652,8 +1647,6 @@ impl ServerManager {
 
         let servers = self.servers.load();
         tracing::info!(started = servers.len(), "server startup complete");
-
-        Ok(())
     }
 
     /// Spawn and initialize a single upstream server.
@@ -2551,7 +2544,6 @@ impl ServerManager {
         self.availability.clear();
         self.last_errors.clear();
         self.semaphores.clear();
-        self.reconnecting.clear();
     }
 
     /// Return health/status information for all servers.
@@ -2623,8 +2615,6 @@ impl ServerManager {
         self.last_errors.get(name).map(|error| error.clone())
     }
 
-    /// Record that a configured server failed during startup so it appears in
-    /// status output and becomes eligible for proactive recovery.
     /// Whether every call slot of `name` is taken by a running call.
     pub(crate) fn busy_with_a_call(&self, name: &str) -> bool {
         self.semaphores
@@ -2642,14 +2632,9 @@ impl ServerManager {
         Arc::clone(&self.check_now)
     }
 
+    /// Mark `name` down, so status shows it and recovery takes it on.
     pub fn mark_start_failure(&self, name: &str) {
-        self.health.insert(
-            name.to_string(),
-            HealthState {
-                health: ServerHealth::Failed,
-                consecutive_failures: 6,
-            },
-        );
+        self.health.insert(name.to_string(), HealthState::failed());
     }
 
     /// Mark a server as requiring OAuth authentication.
@@ -2657,13 +2642,8 @@ impl ServerManager {
     pub fn mark_auth_required(&self, name: &str) {
         self.configured_auth
             .insert(name.to_string(), ConfiguredAuth::Oauth);
-        self.health.insert(
-            name.to_string(),
-            HealthState {
-                health: ServerHealth::AuthRequired,
-                consecutive_failures: 0,
-            },
-        );
+        self.health
+            .insert(name.to_string(), HealthState::auth_required());
     }
 
     /// Start a single server and register it in the manager.
@@ -2815,15 +2795,6 @@ impl ServerManager {
                 retire_upstream_owned(name.to_string(), old_upstream, "replace").await;
             }
         }
-    }
-
-    /// Get the reconnecting flag for a server (creates one if missing).
-    /// Used to prevent concurrent reconnection stampedes.
-    pub fn get_reconnecting_flag(&self, name: &str) -> Arc<AtomicBool> {
-        self.reconnecting
-            .entry(name.to_string())
-            .or_insert_with(|| Arc::new(AtomicBool::new(false)))
-            .clone()
     }
 }
 
@@ -3048,7 +3019,7 @@ mod tests {
         let starting = {
             let manager = Arc::clone(&manager);
             tokio::spawn(async move {
-                let _ = manager
+                manager
                     .start_all(&config, move |name| {
                         let _ = tx.send(name.to_string());
                     })
@@ -4773,24 +4744,6 @@ mod tests {
     }
 
     #[test]
-    fn get_reconnecting_flag_returns_same_instance() {
-        let mgr = ServerManager::new();
-        let flag1 = mgr.get_reconnecting_flag("test");
-        let flag2 = mgr.get_reconnecting_flag("test");
-        // Both should point to the same AtomicBool
-        assert!(Arc::ptr_eq(&flag1, &flag2));
-    }
-
-    #[test]
-    fn reconnecting_flags_are_per_server() {
-        let mgr = ServerManager::new();
-        let flag_a = mgr.get_reconnecting_flag("server-a");
-        let flag_b = mgr.get_reconnecting_flag("server-b");
-        // Different servers should have different flags
-        assert!(!Arc::ptr_eq(&flag_a, &flag_b));
-    }
-
-    #[test]
     fn server_statuses_include_failed_startups_without_upstreams() {
         let mgr = ServerManager::new();
         mgr.mark_start_failure("workspace");
@@ -6383,7 +6336,7 @@ mod tests {
             ),
         );
 
-        mgr.start_all(&config, |_| {}).await.expect("start_all");
+        mgr.start_all(&config, |_| {}).await;
 
         let statuses = mgr.server_statuses();
         assert_eq!(statuses.len(), 1);

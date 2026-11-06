@@ -39,6 +39,7 @@ pub mod secrets;
 pub mod server;
 pub mod session;
 pub mod slack_events;
+pub(crate) mod supervision;
 pub mod tasks;
 pub mod tls;
 pub mod tool_naming;

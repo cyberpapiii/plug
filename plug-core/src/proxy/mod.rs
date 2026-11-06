@@ -2283,36 +2283,27 @@ impl ToolRouter {
             .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
     }
 
+    /// Reconnect `server_id` once before the caller sends again. A failure
+    /// hands the server to its recovery episode.
     async fn reconnect_server_now(&self, server_id: &str) -> Result<(), anyhow::Error> {
         let engine = self
             .upgrade_engine()
             .ok_or_else(|| anyhow::anyhow!("engine reference unavailable"))?;
-        engine.reconnect_server(server_id).await
+        if let Err(error) = engine.reconnect_server(server_id).await {
+            engine.recover_server(server_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn reconnect_server_in_background(&self, server_id: String) {
-        let Some(engine) = self.upgrade_engine() else {
-            tracing::warn!(
+        match self.upgrade_engine() {
+            Some(engine) => engine.recover_server(&server_id),
+            None => tracing::warn!(
                 server = %server_id,
                 "no engine reference available for background reconnect"
-            );
-            return;
-        };
-
-        tokio::spawn(async move {
-            if let Err(reconnect_err) = engine.reconnect_server(&server_id).await {
-                tracing::warn!(
-                    server = %server_id,
-                    error = %reconnect_err,
-                    "background reconnect after timeout failed"
-                );
-            } else {
-                tracing::info!(
-                    server = %server_id,
-                    "background reconnect after timeout succeeded"
-                );
-            }
-        });
+            ),
+        }
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.

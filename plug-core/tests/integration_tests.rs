@@ -2346,8 +2346,8 @@ async fn run_http_upstream_crash_restart_scenario(
     );
 
     // Phase 5: deterministically exercise the engine reconnect path
-    // (`do_reconnect` success: fresh connect + `replace_server` +
-    // `refresh_tools`) against the restarted upstream — the same entry point
+    // (one fresh connect, commit and `refresh_tools`) against the restarted
+    // upstream — the same entry point
     // health-monitor proactive recovery and call-path reactive recovery use.
     engine
         .reconnect_server("httpcrash")

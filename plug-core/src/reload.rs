@@ -278,19 +278,17 @@ pub async fn apply_reload(
     for name in &diff.removed {
         tracing::info!(server = %name, "stopping removed server");
         server_manager.stop_server(name).await;
-        engine.clear_health_task_generation(name);
-        engine.clear_refresh_task_generation(name);
-        // stop_server clears the metrics (incl. the restart clock); clear the
-        // matching supervision backoff so a re-added server doesn't inherit a
-        // stale escalating counter.
-        engine.reset_supervision(name);
+        let supervision = engine.supervision();
+        supervision.health_tasks.clear(name);
+        supervision.refresh_tasks.clear(name);
+        supervision.forget(name);
     }
 
     // Stop changed servers before their replacement startup batch begins.
     for (name, _new_cfg) in &diff.changed {
         tracing::info!(server = %name, "restarting changed server");
         server_manager.stop_server(name).await;
-        engine.reset_supervision(name);
+        engine.supervision().forget(name);
     }
 
     let start_actions = reload_start_actions(&diff);

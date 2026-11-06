@@ -1,9 +1,9 @@
 //! Health-check background tasks for upstream MCP servers.
 //!
-//! Spawns one tokio task per server that periodically pings the upstream
-//! and updates the `HealthState` in `ServerManager.health` (DashMap).
-//! On state transitions, triggers `ToolRouter::refresh_tools()` so that
-//! failed servers' tools are removed from the cache.
+//! One task per server pings it on its interval and records the result with
+//! the server manager. A change of health schedules a tool-list refresh, so a
+//! failed server's tools leave the list. A server that is down gets one
+//! recovery episode, which reconnects it until it is back.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,65 +13,38 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::backoff::Backoff;
-use crate::config::Config;
-use crate::engine::Engine;
-use crate::proxy::ToolRouter;
+use crate::config::{Config, ServerConfig};
+use crate::engine::{Engine, Reconnect};
 use crate::server::ServerManager;
 use crate::types::ServerHealth;
 
-/// Spawn health-check background tasks for all enabled servers.
-///
-/// Each server gets its own tokio task with a staggered start (random jitter)
-/// to avoid thundering-herd pings. Tasks run until `cancel` is triggered.
-/// Uses `tracker.spawn()` for ordered shutdown via `TaskTracker::wait()`.
-///
-/// When a server transitions to `Failed`, spawns a proactive recovery task
-/// that reconnects it with exponential backoff until it is back.
-pub fn spawn_health_checks(
-    server_manager: Arc<ServerManager>,
-    router: Arc<ToolRouter>,
-    engine: Arc<Engine>,
-    cancel: CancellationToken,
-    config: &Config,
-    tracker: &TaskTracker,
-) {
-    for (name, sc) in &config.servers {
-        if !sc.enabled {
-            continue;
-        }
+/// Bound on one health ping.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Spawn the health task of every enabled server that has none yet.
+pub(crate) fn spawn_health_checks(engine: &Arc<Engine>, config: &Config) {
+    for (name, server_config) in &config.servers {
         // A server whose start already settled has a live task. Spawning a
         // second one would supersede it and hand the server a fresh full
         // interval to wait out, which is exactly what this call is here to
         // avoid for the servers that never settled.
-        if engine.current_health_task_generation(name).is_some() {
-            continue;
+        if server_config.enabled && engine.supervision().health_tasks.current(name).is_none() {
+            spawn_health_check(engine, name, server_config);
         }
-        spawn_health_check(
-            server_manager.clone(),
-            router.clone(),
-            engine.clone(),
-            cancel.clone(),
-            name.clone(),
-            sc.health_check_interval_secs,
-            tracker,
-        );
     }
 }
 
-pub fn spawn_health_check(
-    server_manager: Arc<ServerManager>,
-    router: Arc<ToolRouter>,
-    engine: Arc<Engine>,
-    cancel: CancellationToken,
-    name: String,
-    health_check_interval_secs: u64,
-    tracker: &TaskTracker,
-) {
-    let generation = engine.next_health_task_generation(&name);
-    let interval = Duration::from_secs(health_check_interval_secs);
-    let tracker_clone = tracker.clone();
-
+/// Spawn `name`'s health task, superseding any it had. The task ends when the
+/// server is removed, turned off, or given another interval.
+pub(crate) fn spawn_health_check(engine: &Arc<Engine>, name: &str, server_config: &ServerConfig) {
+    let generation = engine.supervision().health_tasks.next(name);
+    let interval_secs = server_config.health_check_interval_secs;
+    let engine = Arc::clone(engine);
+    let name = name.to_string();
+    let tracker = engine.tracker().clone();
     tracker.spawn(async move {
+        let server_manager = engine.server_manager().clone();
+        let cancel = engine.cancel_token().clone();
         // A server that is already missing an upstream is known-bad before the
         // loop begins -- typically a local upstream still binding its port
         // after a reboot -- so it skips both the stagger and the consumed first
@@ -79,11 +52,11 @@ pub fn spawn_health_check(
         // were just contacted and need neither an immediate ping nor a herd.
         let started_healthy = server_manager.get_upstream(&name).is_some();
         if started_healthy {
-            let jitter = Duration::from_millis(rand::random_range(0..10_000));
-            tokio::time::sleep(jitter).await;
+            let stagger = Duration::from_millis(rand::random_range(0..10_000));
+            tokio::time::sleep(stagger).await;
         }
 
-        let mut tick = tokio::time::interval(interval);
+        let mut tick = tokio::time::interval(Duration::from_secs(interval_secs));
         tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
         // `interval` yields its first tick immediately. For a server that
         // started healthy that tick would be a redundant ping, so it is
@@ -101,154 +74,98 @@ pub fn spawn_health_check(
                     tracing::debug!(server = %name, "health check task shutting down");
                     break;
                 }
-                _ = async {
-                    tokio::select! {
-                        _ = tick.tick() => {}
-                        _ = check_now.notified() => {}
-                    }
-                } => {
-                    if engine.current_health_task_generation(&name) != Some(generation) {
-                        tracing::debug!(server = %name, "health check generation superseded");
-                        break;
-                    }
-
-                    let current_config = {
-                        let cfg = engine.config();
-                        cfg.servers.get(&name).cloned()
-                    };
-                    let Some(current_config) = current_config else {
-                        engine.clear_health_task_generation(&name);
-                        break;
-                    };
-                    if !current_config.enabled || current_config.health_check_interval_secs != health_check_interval_secs {
-                        break;
-                    }
-
-                    let is_auth_required = server_manager
-                        .health
-                        .get(&name)
-                        .is_some_and(|entry| entry.health == ServerHealth::AuthRequired);
-                    if is_auth_required {
-                        tracing::debug!(server = %name, "skipping health check for AuthRequired server");
-                        continue;
-                    }
-
-                    let missing_upstream = server_manager.get_upstream(&name).is_none();
-                    let startup_failed = server_manager
-                        .health
-                        .get(&name)
-                        .is_some_and(|entry| entry.health == ServerHealth::Failed);
-
-                    if missing_upstream && startup_failed {
-                        trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
-                        continue;
-                    }
-
-                    // A connection that has ended cannot answer a ping, so
-                    // there is nothing to count toward: the server is down
-                    // now. Its tools leave the list until it is back.
-                    let connection_ended = server_manager
-                        .get_upstream(&name)
-                        .is_some_and(|upstream| upstream.client.is_transport_closed());
-                    if connection_ended {
-                        tracing::warn!(server = %name, "server connection ended; reconnecting");
-                        server_manager.mark_start_failure(&name);
-                        router.schedule_tool_list_changed_refresh();
-                        trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
-                        continue;
-                    }
-
-                    let result = health_check_server(&server_manager, &name).await;
-                    if let Some((old, new)) = result {
-                        tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
-                        router.schedule_tool_list_changed_refresh();
-
-                        if new == ServerHealth::Failed {
-                            // Always-on Failed-recovery (not gated by the
-                            // supervision flag); stamps the restart clock so a
-                            // supervised restart isn't fired again immediately.
-                            trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, false);
-                        }
-                    }
-
-                    // Active upstream supervision (item 2b / R10): restart an
-                    // upstream that stays degraded past the threshold or whose
-                    // circuit is open — covering the "connected but failing real
-                    // calls" case (e.g. the iMessage continuation leak) that the
-                    // Failed-recovery path above does not reach. Bounded by the
-                    // SupervisionConfig backoff. The escalating backoff is cleared
-                    // only once the upstream has *stably* recovered (settled), so a
-                    // flapping upstream's backoff keeps escalating rather than
-                    // resetting to the floor on every brief healthy blip.
-                    let (health_now, _) = server_manager.health_streak(&name);
-                    if health_now == ServerHealth::Healthy
-                        && !server_manager.circuit_open(&name)
-                        && engine.supervision_settled(&name)
-                    {
-                        engine.reset_supervision(&name);
-                    } else if engine.supervision_due(&name)
-                        && trigger_recovery(&engine, &name, cancel.clone(), &tracker_clone, true)
-                    {
-                        tracing::warn!(
-                            server = %name,
-                            "item 2b: supervising restart of degraded upstream"
-                        );
-                    }
-                }
+                _ = tick.tick() => {}
+                _ = check_now.notified() => {}
             }
+            if engine.supervision().health_tasks.current(&name) != Some(generation) {
+                tracing::debug!(server = %name, "health check generation superseded");
+                break;
+            }
+            let Some(current_config) = engine.config().servers.get(&name).cloned() else {
+                engine.supervision().health_tasks.clear(&name);
+                break;
+            };
+            if !current_config.enabled || current_config.health_check_interval_secs != interval_secs
+            {
+                break;
+            }
+            check_once(&engine, &server_manager, &name).await;
         }
     });
 }
 
-/// Start a recovery episode and record it. Returns `true` if a new episode was
-/// started (deduped: at most one per server). When `supervised`, the per-server
-/// escalating backoff counter grows; for every started episode the restart clock
-/// and `restart_count` metric are stamped so the backoff clock is consistent
-/// across crash/Failed and supervised recoveries.
-fn trigger_recovery(
-    engine: &Arc<Engine>,
-    server_name: &str,
-    cancel: CancellationToken,
-    tracker: &TaskTracker,
-    supervised: bool,
-) -> bool {
-    if !spawn_proactive_recovery_once(engine, server_name, cancel, tracker) {
-        return false;
+async fn check_once(engine: &Arc<Engine>, server_manager: &ServerManager, name: &str) {
+    let health = server_manager.health(name);
+    if health == Some(ServerHealth::AuthRequired) {
+        tracing::debug!(server = %name, "skipping health check for AuthRequired server");
+        return;
     }
-    if supervised {
-        engine.note_supervised_restart(server_name);
-    } else {
-        engine.note_restart(server_name);
+
+    match server_manager.get_upstream(name) {
+        None if health == Some(ServerHealth::Failed) => {
+            start_recovery(engine, name, false);
+            return;
+        }
+        // A connection that has ended cannot answer a ping, so there is
+        // nothing to count toward: the server is down now. Its tools leave
+        // the list until it is back.
+        Some(upstream) if upstream.client.is_transport_closed() => {
+            tracing::warn!(server = %name, "server connection ended; reconnecting");
+            server_manager.mark_start_failure(name);
+            engine.tool_router().schedule_tool_list_changed_refresh();
+            start_recovery(engine, name, false);
+            return;
+        }
+        _ => {}
     }
-    true
+
+    if let Some((old, new)) = health_check_server(server_manager, name).await {
+        tracing::info!(server = %name, ?old, ?new, "health state changed, refreshing tools");
+        engine.tool_router().schedule_tool_list_changed_refresh();
+        if new == ServerHealth::Failed {
+            start_recovery(engine, name, false);
+        }
+    }
+
+    // Supervision restarts a server that stays degraded past the threshold
+    // or whose circuit is open: it is connected but failing real calls (the
+    // iMessage continuation leak), which the Failed path above never sees.
+    let (health_now, consecutive_failures) = server_manager.health_streak(name);
+    let circuit_open = server_manager.circuit_open(name);
+    let policy = engine.config().supervision.clone();
+    let supervision = engine.supervision();
+    if health_now == ServerHealth::Healthy && !circuit_open && supervision.settled(&policy, name) {
+        supervision.reset(name);
+    } else if supervision.restart_due(
+        &policy,
+        name,
+        health_now,
+        consecutive_failures,
+        circuit_open,
+    ) && start_recovery(engine, name, true)
+    {
+        tracing::warn!(server = %name, "supervising restart of degraded upstream");
+    }
 }
 
-/// Spawn a backoff-bounded recovery episode for `server_name`, deduplicated so at
-/// most one is active per server. Returns `true` if this call started a new
-/// episode, `false` if one was already running (so the supervisor only counts a
-/// restart when it actually initiates one).
-fn spawn_proactive_recovery_once(
-    engine: &Arc<Engine>,
-    server_name: &str,
-    cancel: CancellationToken,
-    tracker: &TaskTracker,
-) -> bool {
-    let Some(flag) = engine.try_claim_recovery_task(server_name) else {
+/// Start `server_name`'s recovery episode unless one is running. Returns
+/// whether this call started it. Every episode stamps the restart clock;
+/// `supervised` ones also grow the supervisor's backoff.
+pub(crate) fn start_recovery(engine: &Arc<Engine>, server_name: &str, supervised: bool) -> bool {
+    let Some(claim) = engine.supervision().recovering.claim(server_name) else {
         tracing::debug!(server = %server_name, "proactive recovery task already active");
         return false;
     };
+    engine.supervision().note_restart(server_name, supervised);
+    engine.server_manager().record_restart(server_name);
 
     let engine = Arc::clone(engine);
     let server_name = server_name.to_string();
+    let cancel = engine.cancel_token().clone();
+    let tracker: TaskTracker = engine.tracker().clone();
     tracker.spawn(async move {
-        struct RecoveryGuard(Arc<std::sync::atomic::AtomicBool>);
-        impl Drop for RecoveryGuard {
-            fn drop(&mut self) {
-                self.0.store(false, std::sync::atomic::Ordering::SeqCst);
-            }
-        }
-        let _guard = RecoveryGuard(flag);
-        spawn_proactive_recovery(&engine, &server_name, cancel).await;
+        let _claim = claim;
+        recover(&engine, &server_name, cancel).await;
     });
     true
 }
@@ -266,22 +183,22 @@ fn recovery_still_needed(engine: &Engine, server_name: &str) -> bool {
         return false;
     }
     let manager = engine.server_manager();
-    let health = manager.health.get(server_name).map(|entry| entry.health);
+    let health = manager.health(server_name);
     if health == Some(ServerHealth::AuthRequired) {
         return false;
     }
     manager.get_upstream(server_name).is_none()
         || health != Some(ServerHealth::Healthy)
         || manager.circuit_open(server_name)
+        || engine.supervision().reconnect_wanted(server_name)
 }
 
-/// Reconnect a failed server until it is back, with exponential backoff from
-/// 1s to a minute. On success the server is replaced and its health and
-/// circuit breaker state are reset via `replace_server()`.
+/// One recovery episode: reconnect, one attempt at a time on
+/// [`Backoff::RECOVERY`], until the server is back or no longer needs it.
 ///
 /// Logs the first failure and the moment the backoff reaches its cap as
 /// warnings, every other failure at debug, and the recovery once.
-async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: CancellationToken) {
+async fn recover(engine: &Engine, server_name: &str, cancel: CancellationToken) {
     tracing::info!(server = %server_name, "starting proactive recovery");
     let started = tokio::time::Instant::now();
     // An episode lasts until the server is back, so the wait keeps growing
@@ -297,54 +214,53 @@ async fn spawn_proactive_recovery(engine: &Engine, server_name: &str, cancel: Ca
                 tracing::debug!(server = %server_name, "proactive recovery cancelled during shutdown");
                 return;
             }
-            result = engine.reconnect_server_once(server_name) => result,
-        };
-
-        let error = match result {
-            Ok(()) => {
-                // Ok without an upstream means the reconnect was abandoned for
-                // a reload, or another start owns the server. Either way the
-                // next health tick decides whether recovery is still needed.
-                if engine.server_manager().get_upstream(server_name).is_some() {
-                    tracing::info!(
-                        server = %server_name,
-                        attempts = failures + 1,
-                        elapsed_secs = started.elapsed().as_secs(),
-                        "server recovered"
-                    );
-                }
-                return;
-            }
-            Err(error) => error,
+            result = engine.reconnect_server(server_name) => result,
         };
 
         let delay = backoff.jittered(failures);
-        let reached_cap = backoff.first_at_max(failures);
-        failures += 1;
-        let attempts = failures;
-        if attempts == 1 {
-            tracing::warn!(
-                server = %server_name,
-                error = %error,
-                retry_in_secs = delay.as_secs(),
-                "recovery attempt failed; retrying with backoff"
-            );
-        } else if reached_cap {
-            tracing::warn!(
-                server = %server_name,
-                attempts,
-                error = %error,
-                retry_every_secs = backoff.max.as_secs(),
-                "server still down; retrying at the slowest rate"
-            );
-        } else {
-            tracing::debug!(
-                server = %server_name,
-                attempts,
-                error = %error,
-                retry_in_secs = delay.as_secs(),
-                "recovery attempt failed"
-            );
+        match result {
+            Ok(Reconnect::Reconnected) => {
+                tracing::info!(
+                    server = %server_name,
+                    attempts = failures + 1,
+                    elapsed_secs = started.elapsed().as_secs(),
+                    "server recovered"
+                );
+                return;
+            }
+            // The reload that changed the server started what it needs.
+            Ok(Reconnect::Abandoned) => return,
+            // Someone else is starting it. Look again after the wait: that
+            // start may fail too, and then this episode is still the one.
+            Ok(Reconnect::AlreadyRunning) => {}
+            Err(error) => {
+                let reached_cap = backoff.first_at_max(failures);
+                failures += 1;
+                if failures == 1 {
+                    tracing::warn!(
+                        server = %server_name,
+                        error = %error,
+                        retry_in_secs = delay.as_secs(),
+                        "recovery attempt failed; retrying with backoff"
+                    );
+                } else if reached_cap {
+                    tracing::warn!(
+                        server = %server_name,
+                        attempts = failures,
+                        error = %error,
+                        retry_every_secs = backoff.max.as_secs(),
+                        "server still down; retrying at the slowest rate"
+                    );
+                } else {
+                    tracing::debug!(
+                        server = %server_name,
+                        attempts = failures,
+                        error = %error,
+                        retry_in_secs = delay.as_secs(),
+                        "recovery attempt failed"
+                    );
+                }
+            }
         }
 
         tokio::select! {
@@ -440,7 +356,7 @@ async fn health_check_server(
 
     // Use the first list_tools page as a lightweight liveness probe rather than
     // enumerating the full merged surface on every health cycle.
-    let result = tokio::time::timeout(Duration::from_secs(10), async {
+    let result = tokio::time::timeout(PROBE_TIMEOUT, async {
         upstream
             .client
             .peer()
@@ -460,17 +376,8 @@ async fn health_check_server(
         return None;
     }
 
-    // Clone-and-drop pattern: extract state, drop guard, then use data.
-    let mut entry = mgr.health.entry(name.to_string()).or_default();
-    let old_health = entry.health;
-    let changed = if success {
-        entry.record_success()
-    } else {
-        entry.record_failure()
-    };
-    let new_health = entry.health;
-    drop(entry); // Drop DashMap guard before any .await
-
+    let (old_health, new_health) = mgr.record_check(name, success);
+    let changed = old_health != new_health;
     if changed {
         if success {
             tracing::info!(server = %name, health = ?new_health, "health improved");
@@ -631,6 +538,34 @@ mod tests {
              cap notice at most, got {}: {loud:#?}",
             loud.len()
         );
+    }
+
+    /// A recovery that finds another start of its server running waits it
+    /// out and tries again. It used to end there, and a server whose other
+    /// start then failed was left down with nothing bringing it back.
+    #[tokio::test(start_paused = true)]
+    async fn recovery_outlasts_another_start_of_the_same_server() {
+        let capture = crate::test_log::EventCapture::default();
+        let _default = tracing::subscriber::set_default(capture.clone());
+
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("dead".to_string(), unstartable_server_config(600));
+        let engine = Arc::new(Engine::new(config));
+        engine.server_manager().mark_start_failure("dead");
+
+        let other_start = engine.supervision().starting.claim("dead");
+        assert!(super::start_recovery(&engine, "dead", false));
+        tokio::time::sleep(Duration::from_secs(5)).await;
+        drop(other_start);
+        tokio::time::sleep(Duration::from_secs(30)).await;
+        engine.shutdown().await;
+
+        let spawns = events_for(&capture.events(), "dead")
+            .filter(|event| event.fields.contains("spawning server process"))
+            .count();
+        assert!(spawns >= 1, "recovery gave up while another start ran");
     }
 
     /// Recovery reports success once, with how many attempts it took.
