@@ -72,7 +72,7 @@ final class AppModel {
         ipc: PlugIPCClient? = nil,
         coordinator: (any InstallationCoordinating)? = nil,
         clientVersion: String = AppModel.defaultClientVersion,
-        tokenURL: URL = PlugIPCClient.defaultTokenURL,
+        tokenURL: URL = PlugPaths.tokenURL,
         appLinker: any AppLinking = AppLinkService(),
         foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
         backgroundPollInterval: Duration = AppModel.backgroundPollInterval,

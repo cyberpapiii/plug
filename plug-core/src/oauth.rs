@@ -112,7 +112,7 @@ pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     INIT.get_or_init(|| {
-        platform_keyring::Entry::new("plug", "oauth:store-init")
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, "oauth:store-init")
             .map(drop)
             .map_err(|error| error.to_string())
     })
@@ -206,12 +206,18 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
 }
 
 /// The `tokens` directory in Plug's config directory.
+/// The file a server's sign-in is mirrored to.
+pub(crate) fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
+    let safe = config::sanitize_server_name_for_path(server_name)?;
+    Ok(tokens_dir().join(format!("{safe}.json")))
+}
+
 pub fn tokens_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(environment) = test_credential_environment() {
         return environment.tokens_dir.clone();
     }
-    config::config_dir().join("tokens")
+    crate::paths::tokens_dir()
 }
 
 /// Normalize an `expires_in` value: apply defaults and clamping.
@@ -822,7 +828,7 @@ impl CompositeCredentialStore {
         }
 
         let user = format!("oauth:{}", self.server_name);
-        match platform_keyring::Entry::new("plug", &user) {
+        match platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, &user) {
             Ok(entry) => Some(entry),
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring entry creation failed");
@@ -909,10 +915,9 @@ impl CompositeCredentialStore {
     // -- file helpers -----------------------------------------------------
 
     fn token_file_path(&self) -> Result<PathBuf, AuthError> {
-        let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
+        token_file_path(&self.server_name).map_err(|e| {
             AuthError::InternalError(format!("invalid server name for file path: {e}"))
-        })?;
-        Ok(tokens_dir().join(format!("{safe}.json")))
+        })
     }
 
     fn registration_file_path(&self) -> Result<PathBuf, AuthError> {
@@ -2646,7 +2651,7 @@ mod tests {
 
     #[test]
     fn unit_tests_do_not_use_the_real_plug_token_directory() {
-        let production = config::config_dir().join("tokens");
+        let production = crate::paths::tokens_dir();
         let actual = tokens_dir();
 
         assert_ne!(

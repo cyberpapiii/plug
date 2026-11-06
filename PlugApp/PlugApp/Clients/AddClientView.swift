@@ -178,7 +178,7 @@ struct AddClientView: View {
     private var ways: [AddClient.Way] { AddClient.ways(for: chosen) }
     private var chosenWay: AddClient.Way { ways.contains(way) ? way : ways[0] }
     private var command: String {
-        BundledPlug.executable?.path ?? "/Applications/Plug.app/Contents/Resources/plug"
+        BundledPlug.executable?.path ?? "/Applications/Plug.app/\(PlugPaths.bundledBinary)"
     }
 
     private var chosenName: String? {

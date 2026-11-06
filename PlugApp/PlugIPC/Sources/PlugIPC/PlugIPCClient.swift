@@ -17,7 +17,7 @@ public actor PlugIPCClient {
     private let decoder: JSONDecoder
 
     public init(
-        socketURL: URL = PlugIPCClient.defaultSocketURL,
+        socketURL: URL = PlugPaths.socketURL,
         clientVersion: String,
         requestTimeout: TimeInterval = 3
     ) {
@@ -41,16 +41,6 @@ public actor PlugIPCClient {
         }
         let trimmed = version.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "development" : trimmed
-    }
-
-    public static var defaultSocketURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/plug/plug.sock")
-    }
-
-    public static var defaultTokenURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: "Library/Application Support/plug/plug.token")
     }
 
     public func connect() throws -> OperatorHandshake {

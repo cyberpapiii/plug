@@ -14,11 +14,9 @@ pub mod command;
 pub mod file;
 
 use std::borrow::Cow;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
-
-use serde::{Deserialize, Serialize};
 
 #[cfg(not(target_os = "linux"))]
 use keyring as platform_keyring;
@@ -28,82 +26,11 @@ use keyring_core as platform_keyring;
 use crate::config::ServerConfig;
 use crate::types::SecretString;
 
-/// The store a pasted key goes to unless the person chooses another.
-pub const KEYCHAIN: &str = "keychain";
-
-pub use command::OP;
-pub use file::FILE;
+pub use crate::config::{CommandStoreConfig, FILE, KEYCHAIN, OP, SecretsConfig};
 
 /// How long one read may take unless the store says otherwise. A store that
 /// asks a person for approval can wait forever; a server start cannot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The stores a person adds, under `[secrets]` in `config.toml`.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SecretsConfig {
-    /// `[secrets.stores.<id>]`: a reference `<id>:<name>` runs the command.
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub stores: BTreeMap<String, CommandStoreConfig>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct CommandStoreConfig {
-    /// The program and its arguments. `{name}` is replaced by the secret's
-    /// name; what the command prints is the value. No shell is involved.
-    pub command: Vec<String>,
-    /// Seconds the command may take, for a tool that asks for approval.
-    #[serde(default = "default_command_timeout")]
-    pub timeout_secs: u64,
-}
-
-fn default_command_timeout() -> u64 {
-    15
-}
-
-impl SecretsConfig {
-    pub fn is_empty(&self) -> bool {
-        self.stores.is_empty()
-    }
-
-    /// What is wrong with the stores as written, for config validation.
-    pub fn validate(&self) -> Vec<String> {
-        let mut errors = Vec::new();
-        for (id, store) in &self.stores {
-            let at = format!("secrets.stores.{id}");
-            let plain = !id.is_empty()
-                && id.bytes().all(|b| {
-                    b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'_' | b'-')
-                });
-            if !plain {
-                errors.push(format!(
-                    "{at}: a store's name is lowercase letters, digits, `_`, and `-`"
-                ));
-            }
-            if [KEYCHAIN, FILE, OP, "http", "https"].contains(&id.as_str()) {
-                errors.push(format!("{at}: `{id}` is taken; choose another name"));
-            }
-            if store.command.first().is_none_or(String::is_empty) {
-                errors.push(format!("{at}: `command` needs a program to run"));
-            } else if !store
-                .command
-                .iter()
-                .skip(1)
-                .any(|arg| arg.contains(command::NAME))
-            {
-                errors.push(format!(
-                    "{at}: `command` needs `{}` where the secret's name goes",
-                    command::NAME
-                ));
-            }
-            if !(1..=120).contains(&store.timeout_secs) {
-                errors.push(format!("{at}: `timeout_secs` is between 1 and 120"));
-            }
-        }
-        errors
-    }
-}
 
 /// The stores the running service follows references with. Set from the
 /// config when it loads; the built-in ones until then.
@@ -285,7 +212,7 @@ const ENV_MARK: &str = "env.";
 fn is_literal(value: &str) -> bool {
     !value.is_empty()
         && value != crate::config::REDACTED_SECRET
-        && crate::config::expand::extract_env_refs(value).is_empty()
+        && crate::config::env::env_refs(value).is_empty()
 }
 
 /// The OS credential store, under the same service name as Plug's OAuth
@@ -299,7 +226,7 @@ impl Keychain {
             reason,
         };
         crate::oauth::initialize_platform_keyring().map_err(unavailable)?;
-        platform_keyring::Entry::new("plug", &format!("secret:{name}"))
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, &format!("secret:{name}"))
             .map_err(|error| unavailable(error.to_string()))
     }
 
@@ -358,7 +285,9 @@ impl Stores {
         }
         Self::with_keychain_and_file(
             Arc::new(Keychain),
-            file::File::new(crate::dotenv::env_file_path()),
+            file::File::new(crate::config::env::env_file_path(
+                &crate::paths::default_config_path(),
+            )),
         )
     }
 
@@ -400,11 +329,6 @@ impl Stores {
             .ok()
             .and_then(|current| current.clone())
             .unwrap_or_else(Self::builtin)
-    }
-
-    /// The stores a value can be put in, for a command's help and errors.
-    pub fn ids(&self) -> Vec<&str> {
-        self.stores.iter().map(|(id, _)| id.as_str()).collect()
     }
 
     /// Whether `server` refers to any store, so the caller can prepare what
@@ -464,26 +388,14 @@ impl Stores {
         fields
     }
 
-    /// Move the credentials typed into `server` to the Keychain and leave
-    /// references in their place: the bearer token, and the `env` values whose
-    /// names say they are credentials. Returns the names stored.
+    /// Move the credentials typed into `server` to the store named `id` and
+    /// leave references in their place: the bearer token, and the `env`
+    /// values whose names say they are credentials. Returns each name stored
+    /// with what it held before, so a change that is then refused can be
+    /// undone with [`Stores::put_back`].
     ///
     /// A value the store will not take stays where it is, so a machine with no
     /// credential store keeps working the way it did.
-    pub fn keep(&self, server_name: &str, server: &mut ServerConfig) -> Vec<String> {
-        self.keep_in(KEYCHAIN, server_name, server)
-    }
-
-    /// [`Stores::keep`], into the store named `id` in place of the Keychain.
-    pub fn keep_in(&self, id: &str, server_name: &str, server: &mut ServerConfig) -> Vec<String> {
-        self.keep_staged(id, server_name, server)
-            .into_iter()
-            .map(|(name, _)| name)
-            .collect()
-    }
-
-    /// [`Stores::keep_in`], also returning what each name held before, so a
-    /// change that is then refused can be undone with [`Stores::put_back`].
     pub fn keep_staged(
         &self,
         id: &str,
@@ -560,7 +472,7 @@ impl Stores {
         failed
     }
 
-    /// Remove what [`Stores::keep`] stored for `server` and no server in
+    /// Remove what [`Stores::keep_staged`] stored for `server` and no server in
     /// `remaining`, the config as it now stands, refers to. A second account
     /// refers to the secrets of the server it was copied from, and those
     /// stay until the last of them is gone. A secret the person named
@@ -891,7 +803,11 @@ OPENAI_API_KEY = "keychain:mine"
 "#,
         );
         assert_eq!(stores.plaintext(&config), ["token", "GITHUB_TOKEN"]);
-        let mut kept = stores.keep("my-server", &mut config);
+        let mut kept: Vec<String> = stores
+            .keep_staged(KEYCHAIN, "my-server", &mut config)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
         kept.sort();
         assert_eq!(kept, ["my-server.GITHUB_TOKEN", "my-server.token"]);
         assert_eq!(
@@ -911,7 +827,11 @@ OPENAI_API_KEY = "keychain:mine"
         );
         assert!(stores.plaintext(&config).is_empty());
         // A second pass has nothing left to move.
-        assert!(stores.keep("my-server", &mut config).is_empty());
+        assert!(
+            stores
+                .keep_staged(KEYCHAIN, "my-server", &mut config)
+                .is_empty()
+        );
 
         memory.set("mine", &"shared".to_string().into()).unwrap();
         let mut edited = config.clone();
@@ -945,7 +865,7 @@ OPENAI_API_KEY = "keychain:mine"
         let memory = Arc::new(Memory::default());
         let stores = Stores::default().with(KEYCHAIN, memory.clone());
         let mut original = server("command = \"server\"\nauth_token = \"typed-token\"\n");
-        stores.keep("workspace", &mut original);
+        stores.keep_staged(KEYCHAIN, "workspace", &mut original);
         // A second account is a copy, references and all.
         let copy = original.clone();
 
@@ -1059,7 +979,7 @@ OPENAI_API_KEY = "keychain:mine"
         let mut config = server("command = \"server\"\nauth_token = \"typed-token\"\n");
         let kept = Stores::default()
             .with(KEYCHAIN, Arc::new(ReadOnly))
-            .keep("s", &mut config);
+            .keep_staged(KEYCHAIN, "s", &mut config);
         assert!(kept.is_empty());
         assert_eq!(config.auth_token.unwrap().as_str(), "typed-token");
     }

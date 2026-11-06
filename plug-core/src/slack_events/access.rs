@@ -1,4 +1,5 @@
 use super::{EventAccess, SlackEventsConfig};
+use crate::config::SLACK_SERVER;
 use crate::events::{Access, EVENT_SCOPE};
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
@@ -8,8 +9,6 @@ use std::sync::{Arc, Weak};
 // They are that server's choices, not Plug's: a rename or a new output shape
 // there is fixed here.
 
-/// The name that server must have in Plug's config.
-const SLACK_SERVER: &str = "slack";
 /// Reports the signed-in account as `is_oauth`, `is_bot_token`, and
 /// `provider_identity.{team_id,user_id}`, under `data` when structured.
 const AUTH_STATUS_TOOL: &str = "slack_auth_status";
@@ -41,14 +40,6 @@ fn result_json(result: &CallToolResult) -> Option<Value> {
     })
 }
 
-/// Whether the Slack server is configured and turned on.
-pub(crate) fn upstream_enabled(config: &crate::config::Config) -> bool {
-    config
-        .servers
-        .get(SLACK_SERVER)
-        .is_some_and(|server| server.enabled)
-}
-
 /// No credentials are copied into event storage: probes use the existing live
 /// upstream connection and the owner's durable downstream OAuth grant.
 pub struct RuntimeAccess {
@@ -76,7 +67,7 @@ impl EventAccess for RuntimeAccess {
             let config = engine.config();
             crate::events::events_possible(&config.http)
                 && config.http.slack_events.as_ref() == Some(&self.config)
-                && upstream_enabled(&config)
+                && config.slack_upstream_enabled()
         })
     }
     async fn check(&self, channel: Option<&str>) -> Access {

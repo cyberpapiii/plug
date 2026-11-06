@@ -12,8 +12,8 @@ pub(crate) fn load_editable_config(
 ) -> anyhow::Result<(std::path::PathBuf, plug_core::config::Config)> {
     let path = config_path
         .cloned()
-        .unwrap_or_else(plug_core::config::default_config_path);
-    let config = plug_core::operator::load_editable_config(&path)?;
+        .unwrap_or_else(plug_core::paths::default_config_path);
+    let config = plug_core::config::load_editable_config(&path)?;
     Ok((path, config))
 }
 
@@ -25,7 +25,7 @@ pub(crate) fn cmd_config(
 ) -> anyhow::Result<()> {
     let path = config_path
         .cloned()
-        .unwrap_or_else(plug_core::config::default_config_path);
+        .unwrap_or_else(plug_core::paths::default_config_path);
     if path_only {
         println!("{}", path.display());
         return Ok(());

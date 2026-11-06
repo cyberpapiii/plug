@@ -22,7 +22,9 @@
 /// guaranteed single-threaded here since this runs before `#[tokio::main]`.
 #[allow(unsafe_code)]
 fn apply_dotenv() {
-    for (key, value) in plug_core::dotenv::load_dotenv() {
+    for (key, value) in
+        plug_core::config::env::dotenv_to_apply(&plug_core::paths::default_config_path())
+    {
         unsafe {
             std::env::set_var(&key, &value);
         }
@@ -581,7 +583,7 @@ async fn main() -> anyhow::Result<()> {
     let daemon_mode = matches!(&cli.command, Some(Commands::Serve { daemon: true, .. }));
 
     let _log_guard = if daemon_mode {
-        Some(daemon::setup_file_logging(&daemon::log_dir())?)
+        Some(daemon::setup_file_logging(&plug_core::paths::log_dir())?)
     } else {
         init_stderr_tracing(log_level);
         None

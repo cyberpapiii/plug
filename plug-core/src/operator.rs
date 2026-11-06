@@ -2,11 +2,11 @@
 
 use std::path::{Path, PathBuf};
 
-use figment::Figment;
-use figment::providers::{Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
-use crate::config::{Config, ServerConfig, ToolBlock, TransportType, validate_config};
+use crate::config::{
+    Config, ServerConfig, ToolBlock, TransportType, load_editable_config, validate_as_written,
+};
 use crate::tool_patterns::is_disabled_tool;
 
 #[derive(Debug, Clone)]
@@ -112,7 +112,7 @@ impl OperatorServerSummary {
             name,
             enabled: server.enabled,
             transport: server.transport.clone(),
-            oauth: server.auth.as_deref() == Some("oauth"),
+            oauth: server.is_oauth(),
         }
     }
 }
@@ -132,17 +132,6 @@ impl OperatorMutationResult {
             disabled_tools: None,
         }
     }
-}
-
-#[allow(clippy::result_large_err)]
-pub fn load_editable_config(path: &Path) -> Result<Config, figment::Error> {
-    if !path.exists() {
-        return Ok(Config::default());
-    }
-    Figment::new()
-        .merge(Serialized::defaults(Config::default()))
-        .merge(Toml::file(path))
-        .extract()
 }
 
 pub fn apply_operator_mutation(
@@ -604,7 +593,7 @@ fn pin_tool_blocks(config: &mut Config, tool_behind: ToolBehind<'_>) {
 /// round-trip. `toml_edit` is not a workspace dependency; do not add a second
 /// TOML stack here just to keep comments.
 pub fn persist_config_atomic(path: &Path, config: &Config) -> anyhow::Result<()> {
-    let errors = validate_config(config);
+    let errors = validate_as_written(config, path);
     if !errors.is_empty() {
         anyhow::bail!(errors.join("; "));
     }

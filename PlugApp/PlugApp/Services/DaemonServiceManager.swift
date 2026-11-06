@@ -56,8 +56,8 @@ final class DaemonServiceManager {
 
     /// The name the daemon's LaunchAgent is registered under, which is also
     /// its launchd label with `.plist` added.
-    nonisolated static let agentPlistName = "com.plug.daemon.plist"
-    nonisolated static let daemonLabel = "com.plug.daemon"
+    nonisolated static let agentPlistName = "\(PlugPaths.daemonLabel).plist"
+    nonisolated static let daemonLabel = PlugPaths.daemonLabel
 
     var appServiceEnabled: Bool { backend.enabled }
 

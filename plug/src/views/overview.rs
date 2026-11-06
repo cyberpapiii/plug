@@ -250,7 +250,7 @@ pub(crate) async fn cmd_overview(
 ) -> anyhow::Result<()> {
     let config_path = config_path
         .cloned()
-        .unwrap_or_else(plug_core::config::default_config_path);
+        .unwrap_or_else(plug_core::paths::default_config_path);
     let config_exists = config_path.exists();
     let linked = linked_topology();
     let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();
@@ -322,10 +322,10 @@ pub(crate) async fn cmd_overview(
     let downstream_http_endpoint = config.http.mcp_url();
     let downstream_auth_summary = match config.http.auth_mode {
         plug_core::config::DownstreamAuthMode::Auto => {
-            if plug_core::config::http_bind_is_loopback(&config.http.bind_address) {
-                "auto (loopback => no auth)"
+            if config.http.requires_bearer() {
+                "auto (reachable off this Mac => bearer)"
             } else {
-                "auto (non-loopback => bearer)"
+                "auto (loopback => no auth)"
             }
         }
         plug_core::config::DownstreamAuthMode::None => "explicit none",
@@ -440,10 +440,10 @@ pub(crate) async fn cmd_status(
         let mode = c.http.auth_mode.label();
         let summary = match c.http.auth_mode {
             plug_core::config::DownstreamAuthMode::Auto => {
-                if plug_core::config::http_bind_is_loopback(&c.http.bind_address) {
-                    "loopback => no auth".to_string()
+                if c.http.requires_bearer() {
+                    "reachable off this Mac => bearer".to_string()
                 } else {
-                    "non-loopback => bearer".to_string()
+                    "loopback => no auth".to_string()
                 }
             }
             plug_core::config::DownstreamAuthMode::None => "explicit none".to_string(),
@@ -459,15 +459,7 @@ pub(crate) async fn cmd_status(
         )
     });
     let http_auth_info = config.as_ref().and_then(|c| {
-        let expects_bearer = match c.http.auth_mode {
-            plug_core::config::DownstreamAuthMode::Bearer => true,
-            plug_core::config::DownstreamAuthMode::Auto => {
-                !plug_core::config::http_bind_is_loopback(&c.http.bind_address)
-            }
-            plug_core::config::DownstreamAuthMode::None
-            | plug_core::config::DownstreamAuthMode::Oauth => false,
-        };
-        if !expects_bearer {
+        if !c.http.requires_bearer() {
             return None;
         }
 

@@ -5,7 +5,6 @@
 mod access;
 pub mod credentials;
 pub use access::RuntimeAccess;
-pub(crate) use access::upstream_enabled;
 #[cfg(test)]
 mod tests;
 
@@ -24,70 +23,15 @@ use crate::events::{
     State, Subscription, denied, hmac_sha256, invalid, iso_time, now, unavailable,
 };
 
-pub const EVENT_NAME: &str = "slack.ditto_message";
+pub use crate::config::{SLACK_EVENT_NAME as EVENT_NAME, SlackEventsConfig};
 pub const SOURCE_PATH: &str = "/events/slack";
 const OWNER_PROOF_MARKER: &str = "PLUG_EVENTS_PROOF_20261003";
-/// The furthest ahead `owner_proof_until` may be set.
-const MAX_OWNER_PROOF_SECS: u64 = 3600;
 const MAX_SEEN: usize = 10_000;
 /// How long a Slack event ID, and a thread the dot is in, are remembered.
 const REMEMBER_SECS: u64 = 7 * DAY;
 /// How far a signed Slack request's timestamp may be from now (Slack's
 /// replay guidance).
 const SIGNATURE_WINDOW_SECS: u64 = 300;
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SlackEventsConfig {
-    pub team_id: String,
-    pub app_id: String,
-    pub owner_user_id: String,
-    pub dot_user_id: String,
-    /// Existing downstream OAuth registration explicitly chosen by the owner.
-    pub subscriber_client_id: String,
-    /// Until this Unix time, an owner message that is exactly
-    /// `<@dot> PLUG_EVENTS_PROOF_20261003` counts, so the owner can prove
-    /// delivery alone. At most an hour ahead; off by default.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub owner_proof_until: Option<u64>,
-}
-
-impl SlackEventsConfig {
-    pub fn validate(&self) -> Vec<String> {
-        let valid_id = |value: &str, prefix| {
-            value.starts_with(prefix)
-                && value.len() > 1
-                && value
-                    .bytes()
-                    .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit())
-        };
-        let mut errors = Vec::new();
-        for (name, value, prefix) in [
-            ("team_id", &self.team_id, 'T'),
-            ("app_id", &self.app_id, 'A'),
-            ("owner_user_id", &self.owner_user_id, 'U'),
-            ("dot_user_id", &self.dot_user_id, 'U'),
-        ] {
-            if !valid_id(value, prefix) {
-                errors.push(format!("http.slack_events.{name} is invalid"));
-            }
-        }
-        if self.owner_user_id == self.dot_user_id || self.subscriber_client_id.is_empty() {
-            errors.push(
-                "http.slack_events requires distinct owner/dot users and an explicit OAuth client"
-                    .into(),
-            );
-        }
-        if self
-            .owner_proof_until
-            .is_some_and(|until| until > now().saturating_add(MAX_OWNER_PROOF_SECS))
-        {
-            errors
-                .push("http.slack_events.owner_proof_until cannot exceed one hour from now".into());
-        }
-        errors
-    }
-}
 
 #[allow(
     clippy::double_must_use,
