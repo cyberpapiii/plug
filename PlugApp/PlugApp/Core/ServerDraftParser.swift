@@ -121,11 +121,20 @@ enum ServerDraftParser {
     }
 
     private static func looksLikeServerBody(_ body: [String: Any]) -> Bool {
-        body["command"] != nil || body["url"] != nil || body["type"] != nil || body["transport"] != nil
+        // A value that is an object is an entry named like a field.
+        (["command", "type", "transport"] + urlKeys).contains { body[$0] != nil && !(body[$0] is [String: Any]) }
     }
 
+    /// Where the clients `plug import` reads keep an entry's address, in the
+    /// order `read_entry` in `plug-core/src/clients/layout.rs` tries them.
+    /// `testdata/server_entries.json` holds both readers to the same entries.
+    private static let urlKeys = ["url", "httpUrl", "sseUrl", "uri", "http_url"]
+
     private static func draft(named name: String, from body: [String: Any]) -> ServerDraft? {
-        if let url = (body["url"] as? String)?.trimmingCharacters(in: .whitespaces), !url.isEmpty {
+        let url = urlKeys.lazy
+            .compactMap { (body[$0] as? String)?.trimmingCharacters(in: .whitespaces) }
+            .first { !$0.isEmpty }
+        if let url {
             var config = ServerConfig.remote(url)
             if let declared = declaredTransport(in: body), declared == "sse" {
                 config.transport = "sse"
@@ -136,13 +145,15 @@ enum ServerDraftParser {
             return ServerDraft(name: name, config: config, facts: facts(for: config))
         }
 
-        guard let command = (body["command"] as? String)?.trimmingCharacters(in: .whitespaces),
-              !command.isEmpty
-        else { return nil }
+        // OpenCode keeps the command and its arguments in one list.
+        var words = (body["command"] as? [Any])?.compactMap { $0 as? String }
+            ?? [(body["command"] as? String) ?? ""]
+        let command = words.removeFirst().trimmingCharacters(in: .whitespaces)
+        guard !command.isEmpty else { return nil }
 
-        let args = (body["args"] as? [Any])?.compactMap { $0 as? String } ?? []
+        let args = words + ((body["args"] as? [Any])?.compactMap { $0 as? String } ?? [])
         var config = ServerConfig.command(command, args: args)
-        if let env = body["env"] as? [String: Any] {
+        if let env = (body["env"] ?? body["environment"]) as? [String: Any] {
             config.env = env.compactMapValues { $0 as? String }
         }
         if let enabled = body["enabled"] as? Bool {
