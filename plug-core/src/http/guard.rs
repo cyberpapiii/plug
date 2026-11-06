@@ -65,56 +65,29 @@ pub(super) async fn validate_bearer_auth(
     Ok(next.run(req).await)
 }
 
-/// Validate Origin header for DNS rebinding prevention.
-///
-/// - Missing Origin: allowed (non-browser MCP clients don't send it)
-/// - localhost/127.0.0.1/[::1]: allowed
-/// - "null" literal: rejected (DNS rebinding vector)
-/// - Anything else: rejected
-/// - Authenticated requests (via bearer token): origin check skipped
+/// Refuse a browser page that is not allowed to drive `/mcp`, against DNS
+/// rebinding. A caller that proved who it is skips this: the credential, not
+/// the page, is what is trusted. The modern era checks Origin for every
+/// caller in [`validate_modern_request`].
 pub(super) async fn validate_origin(
     State(state): State<Arc<HttpState>>,
     req: Request,
     next: Next,
 ) -> Result<Response, HttpError> {
-    // Skip origin check for authenticated remote clients
-    if matches!(
+    if !matches!(
         req.extensions().get::<AuthStatus>(),
         Some(AuthStatus::Authenticated(_))
     ) {
-        return Ok(next.run(req).await);
+        check_origin(req.headers(), &state)?;
     }
-
-    if let Some(origin) = req.headers().get(header::ORIGIN) {
-        let origin = origin.to_str().map_err(|_| HttpError::InvalidOrigin)?;
-
-        if state
-            .allowed_origins
-            .iter()
-            .any(|allowed| allowed.as_ref() == origin)
-        {
-            return Ok(next.run(req).await);
-        }
-
-        if origin == "null" {
-            return Err(HttpError::InvalidOrigin);
-        }
-
-        // Parse origin to extract host — prevents bypass via localhost.evil.com
-        let is_local = extract_origin_host(origin).is_some_and(crate::config::is_loopback_host);
-
-        if !is_local {
-            return Err(HttpError::InvalidOrigin);
-        }
-    }
-
     Ok(next.run(req).await)
 }
 
-pub(super) fn validate_modern_host(
+/// A modern request names a Host this listener answers to, and comes from no
+/// page or an allowed one.
+pub(super) fn validate_modern_request(
     headers: &HeaderMap,
-    allowed_origins: &[Arc<str>],
-    public_base_url: Option<&str>,
+    state: &HttpState,
 ) -> Result<(), HttpError> {
     let host = headers
         .get(header::HOST)
@@ -122,73 +95,59 @@ pub(super) fn validate_modern_host(
         .ok_or_else(|| {
             HttpError::BadRequest("modern requests require a valid Host header".into())
         })?;
-    let host_name = if host.starts_with('[') {
-        host.split(']').next().map(|value| format!("{value}]"))
-    } else {
-        host.split(':').next().map(str::to_string)
-    }
-    .ok_or_else(|| HttpError::BadRequest("modern request Host is malformed".into()))?;
-    let local = crate::config::is_loopback_host(&host_name);
-    let explicitly_allowed = allowed_origins.iter().any(|origin| {
-        extract_origin_host(origin)
-            .is_some_and(|allowed_host| allowed_host.eq_ignore_ascii_case(&host_name))
-    }) || public_base_url.is_some_and(|base_url| {
-        extract_origin_host(base_url)
-            .is_some_and(|public_host| public_host.eq_ignore_ascii_case(&host_name))
-    });
-    if !local && !explicitly_allowed {
+    let host = host_of_authority(host)
+        .ok_or_else(|| HttpError::BadRequest("modern request Host is malformed".into()))?;
+    let answers_to = crate::config::is_loopback_host(&host)
+        || state.public_host.as_deref() == Some(host.as_str())
+        || state
+            .allowed_origins
+            .iter()
+            .any(|origin| host_of_url(origin).as_deref() == Some(host.as_str()));
+    if !answers_to {
         return Err(HttpError::BadRequest(
             "modern request Host is not allowed".into(),
         ));
     }
-    Ok(())
+    check_origin(headers, state)
 }
 
-pub(super) fn validate_modern_origin(
-    headers: &HeaderMap,
-    allowed_origins: &[Arc<str>],
-) -> Result<(), HttpError> {
+/// No Origin is a client that is not a browser. Otherwise the page must be
+/// one the config allows or one served from this Mac. `null` is what a
+/// sandboxed or local-file page sends, so it is never allowed.
+fn check_origin(headers: &HeaderMap, state: &HttpState) -> Result<(), HttpError> {
     let Some(origin) = headers.get(header::ORIGIN) else {
         return Ok(());
     };
     let origin = origin.to_str().map_err(|_| HttpError::InvalidOrigin)?;
-    if origin == "null" {
-        return Err(HttpError::InvalidOrigin);
-    }
-    if allowed_origins
-        .iter()
-        .any(|allowed| allowed.as_ref() == origin)
-    {
-        return Ok(());
-    }
-    if extract_origin_host(origin).is_some_and(crate::config::is_loopback_host) {
+    let allowed = origin != "null"
+        && (state
+            .allowed_origins
+            .iter()
+            .any(|allowed| allowed.as_ref() == origin)
+            || host_of_url(origin).is_some_and(|host| crate::config::is_loopback_host(&host)));
+    if allowed {
         Ok(())
     } else {
         Err(HttpError::InvalidOrigin)
     }
 }
 
-/// Extract the host from an Origin header value.
-///
-/// Origin format is `scheme://host[:port]`. We parse manually to avoid
-/// pulling in the `url` crate dependency for this single use case.
-pub(super) fn extract_origin_host(origin: &str) -> Option<&str> {
-    let after_scheme = origin.split("://").nth(1)?;
-    // Handle IPv6 bracket notation: [::1]:port
-    if after_scheme.starts_with('[') {
-        let end = after_scheme.find(']')?;
-        let host = &after_scheme[..=end]; // includes brackets
-        return if host.len() > 2 { Some(host) } else { None };
+/// The host of a URL such as an Origin, lowercased, with an IPv6 address in
+/// brackets.
+pub(super) fn host_of_url(value: &str) -> Option<String> {
+    url::Url::parse(value)
+        .ok()?
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .map(str::to_string)
+}
+
+/// The host of a Host header value, `name[:port]`.
+fn host_of_authority(authority: &str) -> Option<String> {
+    if authority.is_empty() || authority.contains(['/', '?', '#', '@', '\\']) {
+        return None;
     }
-    // Strip port and path: take everything before ':' or '/'
-    let host = after_scheme
-        .split(':')
-        .next()
-        .unwrap_or(after_scheme)
-        .split('/')
-        .next()
-        .unwrap_or(after_scheme);
-    if host.is_empty() { None } else { Some(host) }
+    host_of_url(&format!("http://{authority}"))
 }
 
 #[cfg(test)]
@@ -201,76 +160,69 @@ mod tests {
 
     use tower::ServiceExt;
 
-    #[test]
-    fn shared_loopback_classifier_matches_http_parser_outputs() {
-        for origin in [
-            "http://localhost:3282",
-            "http://127.0.0.1:3282",
-            "http://[::1]:3282",
-        ] {
-            let host = extract_origin_host(origin).expect("loopback origin host");
-            assert!(
-                crate::config::is_loopback_host(host),
-                "expected {host} parsed from {origin} to be loopback"
-            );
+    fn headers(host: &str, origin: Option<&str>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        if let Some(origin) = origin {
+            headers.insert(header::ORIGIN, HeaderValue::from_str(origin).unwrap());
         }
+        headers
+    }
 
-        for origin in [
-            "http://localhost.evil.example:3282",
-            "http://192.0.2.1:3282",
-            "https://plug.example.com",
+    #[tokio::test]
+    async fn a_modern_request_must_name_a_host_this_listener_answers_to() {
+        let state = test_state();
+        for host in [
+            "localhost:3282",
+            "LOCALHOST",
+            "127.0.0.1:3282",
+            "[::1]:3282",
         ] {
-            let host = extract_origin_host(origin).expect("non-loopback origin host");
             assert!(
-                !crate::config::is_loopback_host(host),
-                "expected {host} parsed from {origin} to remain non-loopback"
-            );
-        }
-
-        for host in ["localhost:3282", "127.0.0.1:3282", "[::1]:3282"] {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
-            assert!(
-                validate_modern_host(&headers, &[], None).is_ok(),
+                validate_modern_request(&headers(host, None), &state).is_ok(),
                 "host {host}"
             );
         }
-
-        for host in ["localhost.evil.example:3282", "192.0.2.1:3282", "::1"] {
-            let mut headers = HeaderMap::new();
-            headers.insert(header::HOST, HeaderValue::from_str(host).unwrap());
+        for host in [
+            "localhost.evil.example:3282",
+            "192.0.2.1:3282",
+            "::1",
+            "localhost#.evil.example",
+            "evil.example@localhost",
+        ] {
             assert!(
-                validate_modern_host(&headers, &[], None).is_err(),
+                validate_modern_request(&headers(host, None), &state).is_err(),
                 "host {host} must not become loopback"
             );
         }
     }
 
-    #[test]
-    fn modern_host_accepts_public_tunnel_without_allowing_unrelated_browser_origin() {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            header::HOST,
-            HeaderValue::from_static("plug-tunnel.example.com"),
-        );
-        headers.insert(
-            header::ORIGIN,
-            HeaderValue::from_static("https://unrelated.example.com"),
-        );
-
-        // OAuth mode supplies the manager's downstream base URL directly.
+    #[tokio::test]
+    async fn the_public_host_is_answered_without_trusting_pages_served_from_it() {
+        let sm = Arc::new(crate::server::ServerManager::new());
+        let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
+        let state = HttpState::new(
+            router,
+            Arc::new(crate::session::SessionStore::new(1800, 100)),
+            CancellationToken::new(),
+        )
+        .with_public_base_url(Some("https://Plug-Tunnel.example.com/"));
+        let host = "plug-tunnel.example.com";
+        assert!(validate_modern_request(&headers(host, None), &state).is_ok());
+        for origin in [
+            "https://unrelated.example.com",
+            "https://plug-tunnel.example.com",
+            "null",
+        ] {
+            assert!(
+                validate_modern_request(&headers(host, Some(origin)), &state).is_err(),
+                "{origin}"
+            );
+        }
         assert!(
-            validate_modern_host(&headers, &[], Some("https://plug-tunnel.example.com/mcp"))
-                .is_ok()
+            validate_modern_request(&headers(host, Some("http://localhost:3000")), &state).is_ok()
         );
-        // Non-OAuth public_base_url configuration contributes a host-only URL
-        // marker to this list; it can satisfy Host without satisfying Origin.
-        let configured_public_host = [Arc::from(
-            "https://plug-tunnel.example.com/.plug-public-host-only",
-        )];
-        assert!(validate_modern_host(&headers, &configured_public_host, None).is_ok());
-        assert!(validate_modern_origin(&headers, &configured_public_host).is_err());
-        assert!(validate_modern_origin(&headers, &[]).is_err());
+        assert!(validate_modern_request(&headers("other.example.com", None), &state).is_err());
     }
 
     #[tokio::test]

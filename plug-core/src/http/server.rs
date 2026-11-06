@@ -30,7 +30,8 @@ use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_identity::HttpCredential;
 use crate::events::EventSource;
 use crate::mcp_http_headers::{
-    inject_trace_context, validate_mirrored_headers, validate_required_mirrored_headers,
+    TRACEPARENT_HEADER, inject_trace_context, validate_mirrored_headers,
+    validate_required_mirrored_headers,
 };
 use crate::notifications::NotificationTarget;
 use crate::proxy::{DownstreamCallContext, ToolRouter};
@@ -40,7 +41,6 @@ pub(super) const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
 /// MCP protocol version header name.
 pub(super) const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
-pub(super) const TRACEPARENT_HEADER: &str = "traceparent";
 pub(super) const PLUG_TRACE_ID_HEADER: &str = "x-plug-trace-id";
 
 /// The MCP protocol version we implement.
@@ -66,7 +66,11 @@ pub struct HttpState {
     /// Where MCP Events come from. See `crate::events`.
     pub(crate) event_sources: Vec<Arc<dyn EventSource>>,
     pub(crate) sse_channel_capacity: usize,
+    /// Browser origins allowed besides this Mac's own, exactly as written.
     pub(crate) allowed_origins: Vec<Arc<str>>,
+    /// The host of `http.public_base_url`. A modern request may name it in
+    /// Host; a page served from it is not thereby allowed.
+    pub(crate) public_host: Option<String>,
     pub(crate) notification_task_started: AtomicBool,
     /// Sessions whose clients advertise `roots` capability.
     pub(crate) roots_capable_sessions: Arc<DashMap<String, ()>>,
@@ -134,6 +138,7 @@ impl HttpState {
             event_sources: Vec::new(),
             sse_channel_capacity: crate::config::DEFAULT_SSE_CHANNEL_CAPACITY,
             allowed_origins: Vec::new(),
+            public_host: None,
             notification_task_started: AtomicBool::new(false),
             roots_capable_sessions: Arc::default(),
             pending_client_requests: Arc::default(),
@@ -194,6 +199,13 @@ impl HttpState {
     #[must_use]
     pub fn with_allowed_origins(mut self, allowed_origins: Vec<Arc<str>>) -> Self {
         self.allowed_origins = allowed_origins;
+        self
+    }
+
+    /// The public address a tunnel or proxy reaches this listener by.
+    #[must_use]
+    pub fn with_public_base_url(mut self, public_base_url: Option<&str>) -> Self {
+        self.public_host = public_base_url.and_then(super::guard::host_of_url);
         self
     }
 
@@ -318,14 +330,7 @@ pub(super) async fn post_mcp(
         if raw_message.get("id").is_some() {
             validate_modern_request_metadata(&raw_message)?;
         }
-        validate_modern_host(
-            &headers,
-            &state.allowed_origins,
-            state
-                .downstream_oauth()
-                .map(crate::downstream_oauth::DownstreamOauthManager::base_url),
-        )?;
-        validate_modern_origin(&headers, &state.allowed_origins)?;
+        validate_modern_request(&headers, &state)?;
         if headers.contains_key(SESSION_ID_HEADER) {
             return Err(HttpError::BadRequest(
                 "modern requests must not use Mcp-Session-Id".to_string(),
@@ -507,47 +512,22 @@ pub(super) fn validate_modern_request_metadata(value: &serde_json::Value) -> Res
     Ok(())
 }
 
+/// The trace a request belongs to: the W3C `traceparent` it carries, else
+/// the id a Plug client sent, else a new one.
 pub(super) fn extract_trace_id(headers: &HeaderMap) -> String {
-    if let Some(trace_id) = headers
-        .get(TRACEPARENT_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .and_then(trace_id_from_traceparent)
+    let header = |name| headers.get(name).and_then(|value| value.to_str().ok());
+    if let Some(trace_id) = header(TRACEPARENT_HEADER)
+        .filter(|value| crate::types::valid_traceparent(value))
+        .and_then(|value| value.split('-').nth(1))
     {
         return trace_id.to_string();
     }
-
-    if let Some(trace_id) = headers
-        .get(PLUG_TRACE_ID_HEADER)
-        .and_then(|value| value.to_str().ok())
-        .filter(|value| is_valid_trace_id(value))
+    if let Some(trace_id) =
+        header(PLUG_TRACE_ID_HEADER).filter(|value| crate::types::valid_trace_id(value))
     {
         return trace_id.to_ascii_lowercase();
     }
-
     crate::proxy::new_trace_id()
-}
-
-pub(super) fn trace_id_from_traceparent(value: &str) -> Option<&str> {
-    let mut parts = value.split('-');
-    let version = parts.next()?;
-    let trace_id = parts.next()?;
-    let parent_id = parts.next()?;
-    let flags = parts.next()?;
-    if parts.next().is_some()
-        || version.len() != 2
-        || parent_id.len() != 16
-        || flags.len() != 2
-        || !is_valid_trace_id(trace_id)
-    {
-        return None;
-    }
-    Some(trace_id)
-}
-
-pub(super) fn is_valid_trace_id(value: &str) -> bool {
-    value.len() == 32
-        && value != "00000000000000000000000000000000"
-        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
 /// GET /mcp — open SSE stream for server-initiated notifications.
@@ -874,6 +854,18 @@ mod tests {
         let trace_id = extract_trace_id(&headers);
         assert_eq!(trace_id.len(), 32);
         assert_ne!(trace_id, "00000000000000000000000000000000");
+
+        // The one W3C rule: version 00 and a parent id that is not all zero.
+        for traceparent in [
+            "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+        ] {
+            headers.insert(TRACEPARENT_HEADER, HeaderValue::from_static(traceparent));
+            assert_ne!(
+                extract_trace_id(&headers),
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            );
+        }
     }
 
     fn modern_task_meta(client_supports_tasks: bool) -> RequestMetaObject {

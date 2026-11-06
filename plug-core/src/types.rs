@@ -337,14 +337,19 @@ pub(crate) fn valid_traceparent(value: &str) -> bool {
     let parts = value.split('-').collect::<Vec<_>>();
     parts.len() == 4
         && parts[0] == "00"
-        && parts[1].len() == 32
-        && parts[1].bytes().all(|byte| byte.is_ascii_hexdigit())
-        && parts[1].bytes().any(|byte| byte != b'0')
+        && valid_trace_id(parts[1])
         && parts[2].len() == 16
         && parts[2].bytes().all(|byte| byte.is_ascii_hexdigit())
         && parts[2].bytes().any(|byte| byte != b'0')
         && parts[3].len() == 2
         && parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+/// A W3C trace id: 32 hex digits, not all zero.
+pub(crate) fn valid_trace_id(value: &str) -> bool {
+    value.len() == 32
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && value.bytes().any(|byte| byte != b'0')
 }
 
 fn validate_value(

@@ -607,15 +607,6 @@ struct ConfiguredHttpRuntime {
     state: Arc<plug_core::http::server::HttpState>,
 }
 
-fn public_host_allowance(public_base_url: &str) -> Option<Arc<str>> {
-    (!public_base_url.trim().is_empty()).then(|| {
-        Arc::from(format!(
-            "{}/.plug-public-host-only",
-            public_base_url.trim_end_matches('/')
-        ))
-    })
-}
-
 fn build_configured_http_runtime(
     config: &plug_core::config::Config,
     engine: &Arc<plug_core::engine::Engine>,
@@ -714,15 +705,9 @@ fn build_configured_http_runtime(
                 .iter()
                 .cloned()
                 .map(Arc::<str>::from)
-                .chain(
-                    config
-                        .http
-                        .public_base_url
-                        .as_deref()
-                        .and_then(public_host_allowance),
-                )
                 .collect(),
-        ),
+        )
+        .with_public_base_url(config.http.public_base_url.as_deref()),
     );
 
     Ok(ConfiguredHttpRuntime {
