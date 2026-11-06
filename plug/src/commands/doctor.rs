@@ -586,30 +586,27 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
         })
         .collect();
     let linked_clients = inspect_linked_clients(app.as_ref());
-    let launchd = tokio::time::timeout(
-        std::time::Duration::from_secs(4),
-        tokio::task::spawn_blocking(|| {
-            crate::install::discover_launchd_jobs_bounded(std::time::Duration::from_secs(3))
-        }),
-    )
+    let app_program = app.as_ref().map(|app| app.executable_path.clone());
+    let launchd = tokio::task::spawn_blocking(move || {
+        crate::service::discover_launchd_jobs(
+            app_program.as_deref(),
+            std::time::Duration::from_secs(3),
+        )
+    })
     .await;
     let (launchd_jobs, launchd_inspection_complete) = match launchd {
-        Ok(Ok(Ok(jobs))) => (
+        Ok(Ok(jobs)) => (
             jobs.into_iter()
-                .filter(crate::install::is_plug_launchd_candidate)
+                .filter(crate::service::is_plug_launchd_candidate)
                 .collect(),
             true,
         ),
-        Ok(Ok(Err(error))) => {
+        Ok(Err(error)) => {
             inspection_errors.push(format!("launchd inspection failed: {error}"));
             (Vec::new(), false)
         }
-        Ok(Err(error)) => {
+        Err(error) => {
             inspection_errors.push(format!("launchd inspection worker failed: {error}"));
-            (Vec::new(), false)
-        }
-        Err(_) => {
-            inspection_errors.push("launchd inspection timed out after 4000ms".to_string());
             (Vec::new(), false)
         }
     };
@@ -621,8 +618,8 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
                     && crate::install::paths_match(&job.program, &app.executable_path)
             }) =>
         {
-            match crate::install::prove_app_daemon_invocation(app) {
-                Ok(verified) => verified,
+            match crate::service::inspect() {
+                Ok(state) => state.ownership == crate::service::ServiceOwnership::AppManaged,
                 Err(error) => {
                     launchd_inspection_complete = false;
                     inspection_errors.push(format!(

@@ -16,7 +16,6 @@ pub struct LaunchdJobRecord {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
-#[allow(dead_code)] // Consumed by unified installation diagnosis in the next rollout task.
 pub enum LaunchdProgramOwnership {
     CurrentApp,
     RecognizedLegacyPlug,
@@ -40,7 +39,6 @@ pub enum ServiceOwnership {
 enum StartupAction {
     KickstartApp,
     OpenApp,
-    RepairCli,
     InstallCli,
 }
 
@@ -50,8 +48,9 @@ fn startup_action(app_installed: bool, ownership: ServiceOwnership) -> StartupAc
         (true, ServiceOwnership::CliManaged | ServiceOwnership::Unmanaged) => {
             StartupAction::OpenApp
         }
-        (false, ServiceOwnership::CliManaged) => StartupAction::RepairCli,
-        (false, ServiceOwnership::Unmanaged) => StartupAction::InstallCli,
+        (false, ServiceOwnership::CliManaged | ServiceOwnership::Unmanaged) => {
+            StartupAction::InstallCli
+        }
     }
 }
 
@@ -62,12 +61,40 @@ pub struct ServiceState {
     pub plist_path: PathBuf,
 }
 
-fn user_id() -> anyhow::Result<String> {
-    let output = Command::new("id").arg("-u").output()?;
+/// How long one `launchctl` or `id` call may take. A wedged launchd answers
+/// nothing at all, and every caller here would otherwise hang with it.
+const LAUNCHCTL_TIMEOUT: Duration = Duration::from_secs(5);
+
+fn login_user_id() -> anyhow::Result<String> {
+    let mut command = Command::new("/usr/bin/id");
+    command.arg("-u");
+    let output = crate::install::bounded_output(command, LAUNCHCTL_TIMEOUT)?;
     if !output.status.success() {
         anyhow::bail!("unable to determine login user id");
     }
     Ok(String::from_utf8(output.stdout)?.trim().to_string())
+}
+
+fn launchctl_output(args: &[&str], timeout: Duration) -> anyhow::Result<std::process::Output> {
+    let mut command = Command::new("/bin/launchctl");
+    command.args(args);
+    crate::install::bounded_output(command, timeout)
+}
+
+fn launchctl(args: &[&str]) -> anyhow::Result<()> {
+    let output = launchctl_output(args, LAUNCHCTL_TIMEOUT)?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "launchctl failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Unregister one job from the login session's launchd domain.
+pub fn bootout(label: &str) -> anyhow::Result<()> {
+    launchctl(&["bootout", &format!("gui/{}/{label}", login_user_id()?)])
 }
 
 fn cli_plist_path() -> PathBuf {
@@ -239,15 +266,26 @@ fn parse_launchd_arguments(output: &str) -> Vec<String> {
     arguments
 }
 
-/// Enumerate launchd jobs for diagnosis only. Startup remains authoritative
-/// only for the fixed `com.plug.daemon` label.
-#[allow(dead_code)] // Consumed by unified installation diagnosis in the next rollout task.
-pub fn discover_launchd_jobs() -> anyhow::Result<Vec<LaunchdJobRecord>> {
-    let uid = user_id()?;
-    let domain = format!("gui/{uid}");
-    let output = Command::new("launchctl")
-        .args(["print", &domain])
-        .output()?;
+/// Enumerate launchd jobs for diagnosis and uninstall, within one time budget
+/// for the whole walk. Startup remains authoritative only for the fixed
+/// `com.plug.daemon` label.
+pub fn discover_launchd_jobs(
+    verified_app_program: Option<&Path>,
+    budget: Duration,
+) -> anyhow::Result<Vec<LaunchdJobRecord>> {
+    let deadline = std::time::Instant::now() + budget;
+    let remaining = || {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            anyhow::bail!(
+                "launchd inspection timed out after {}ms",
+                budget.as_millis()
+            );
+        }
+        Ok(left)
+    };
+    let domain = format!("gui/{}", login_user_id()?);
+    let output = launchctl_output(&["print", &domain], remaining()?)?;
     if !output.status.success() {
         anyhow::bail!(
             "unable to inspect user launchd domain: {}",
@@ -255,26 +293,33 @@ pub fn discover_launchd_jobs() -> anyhow::Result<Vec<LaunchdJobRecord>> {
         );
     }
     let labels = parse_launchd_labels(&String::from_utf8_lossy(&output.stdout));
-    let verified_app_program = crate::install::resolve_verified_app()
-        .ok()
-        .flatten()
-        .map(|app| app.executable_path);
     let mut jobs = Vec::new();
     for label in labels {
-        let output = Command::new("launchctl")
-            .args(["print", &format!("{domain}/{label}")])
-            .output()?;
+        let output = launchctl_output(&["print", &format!("{domain}/{label}")], remaining()?)?;
         if output.status.success()
             && let Some(job) = parse_launchd_job(
                 &label,
                 &String::from_utf8_lossy(&output.stdout),
-                verified_app_program.as_deref(),
+                verified_app_program,
             )
         {
             jobs.push(job);
         }
     }
     Ok(jobs)
+}
+
+/// Whether a launchd job is one plug could own.
+///
+/// Matching a label that merely *ends* in `.plug` sweeps in jobs that only
+/// mention plug: `local.claude-rc.plug` runs `claude remote-control` with this
+/// repo as its working directory, and `plug doctor` reported it as an unknown
+/// job on every run. A job plug owns either sits in plug's own label namespace
+/// or runs a binary called `plug`; the historical labels (`com.plug.daemon`,
+/// `com.plug.serve`) are both inside that namespace.
+pub fn is_plug_launchd_candidate(job: &LaunchdJobRecord) -> bool {
+    job.label.to_ascii_lowercase().starts_with("com.plug.")
+        || job.program.file_name().and_then(|name| name.to_str()) == Some("plug")
 }
 
 pub fn classify_launchctl_output(output: &str, cli_plist_exists: bool) -> ServiceOwnership {
@@ -288,11 +333,12 @@ pub fn classify_launchctl_output(output: &str, cli_plist_exists: bool) -> Servic
 }
 
 pub fn inspect() -> anyhow::Result<ServiceState> {
-    let uid = user_id()?;
+    let uid = login_user_id()?;
     let plist_path = cli_plist_path();
-    let output = Command::new("launchctl")
-        .args(["print", &format!("gui/{uid}/{DAEMON_LABEL}")])
-        .output()?;
+    let output = launchctl_output(
+        &["print", &format!("gui/{uid}/{DAEMON_LABEL}")],
+        LAUNCHCTL_TIMEOUT,
+    )?;
     let text = String::from_utf8_lossy(&output.stdout).into_owned();
     Ok(ServiceState {
         ownership: classify_launchctl_output(&text, plist_path.exists()),
@@ -379,17 +425,6 @@ fn install_cli_plist(path: &Path, config_path: Option<&Path>) -> anyhow::Result<
     Ok(())
 }
 
-fn launchctl(args: &[String]) -> anyhow::Result<()> {
-    let output = Command::new("launchctl").args(args).output()?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "launchctl failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
 /// How long a cold start may take before it is treated as failed.
 ///
 /// Starting every configured upstream takes tens of seconds, and each one can
@@ -455,7 +490,8 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     if crate::ipc_client::daemon_starting() {
         return wait_for_daemon_socket(false, true).await;
     }
-    let uid = user_id()?;
+    let uid = login_user_id()?;
+    let job = format!("gui/{uid}/{DAEMON_LABEL}");
     let state = inspect()?;
     let verified_app = crate::install::resolve_verified_app()?;
     match startup_action(verified_app.is_some(), state.ownership) {
@@ -463,36 +499,19 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
             // No `-k`: a daemon that started a moment ago and has not taken
             // the runtime lock yet would be killed in the middle of starting.
             // Without it launchd starts the job only if it is not running.
-            launchctl(&["kickstart".into(), format!("gui/{uid}/{DAEMON_LABEL}")])?;
+            launchctl(&["kickstart", &job])?;
         }
-        StartupAction::RepairCli => {
+        StartupAction::InstallCli => {
             if state.loaded {
-                launchctl(&["bootout".into(), format!("gui/{uid}/{DAEMON_LABEL}")])?;
+                launchctl(&["bootout", &job])?;
             }
             install_cli_plist(&state.plist_path, config_path)?;
             launchctl(&[
-                "bootstrap".into(),
-                format!("gui/{uid}"),
-                state.plist_path.display().to_string(),
+                "bootstrap",
+                &format!("gui/{uid}"),
+                &state.plist_path.display().to_string(),
             ])?;
-            launchctl(&[
-                "kickstart".into(),
-                "-k".into(),
-                format!("gui/{uid}/{DAEMON_LABEL}"),
-            ])?;
-        }
-        StartupAction::InstallCli => {
-            install_cli_plist(&state.plist_path, config_path)?;
-            launchctl(&[
-                "bootstrap".into(),
-                format!("gui/{uid}"),
-                state.plist_path.display().to_string(),
-            ])?;
-            launchctl(&[
-                "kickstart".into(),
-                "-k".into(),
-                format!("gui/{uid}/{DAEMON_LABEL}"),
-            ])?;
+            launchctl(&["kickstart", "-k", &job])?;
         }
         StartupAction::OpenApp => {
             let app = verified_app.expect("app-owned startup requires a verified app");
@@ -554,7 +573,7 @@ mod tests {
         );
         assert_eq!(
             startup_action(false, ServiceOwnership::CliManaged),
-            StartupAction::RepairCli
+            StartupAction::InstallCli
         );
         assert_eq!(
             startup_action(false, ServiceOwnership::Unmanaged),
@@ -741,6 +760,38 @@ mod tests {
                 "expected unrecognized: {path}"
             );
         }
+    }
+
+    #[test]
+    fn plug_launchd_candidates_ignore_unrelated_jobs() {
+        let unrelated = LaunchdJobRecord {
+            label: "com.apple.XprotectFramework.PluginService".to_string(),
+            program: PathBuf::from("/System/Library/XProtectPluginService"),
+        };
+        // Named after the working directory it runs in, not after plug: the
+        // program is `claude`, so this job is nothing plug should report on.
+        let claude_remote_control = LaunchdJobRecord {
+            label: "local.claude-rc.plug".to_string(),
+            program: PathBuf::from("/Users/example/.local/bin/claude"),
+        };
+        let legacy_serve = LaunchdJobRecord {
+            label: "com.plug.serve".to_string(),
+            program: PathBuf::from("/Users/example/.cargo/bin/plug"),
+        };
+        let relabelled = LaunchdJobRecord {
+            label: "local.something.else".to_string(),
+            program: PathBuf::from("/Users/example/.local/bin/plug"),
+        };
+        assert!(!is_plug_launchd_candidate(&unrelated));
+        assert!(!is_plug_launchd_candidate(&claude_remote_control));
+        assert!(is_plug_launchd_candidate(&legacy_serve));
+        assert!(is_plug_launchd_candidate(&relabelled));
+    }
+
+    #[test]
+    fn launchd_discovery_out_of_budget_fails_closed() {
+        let error = discover_launchd_jobs(None, Duration::ZERO).unwrap_err();
+        assert!(error.to_string().contains("timed out"), "{error}");
     }
 
     #[test]
