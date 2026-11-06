@@ -118,11 +118,11 @@ pub(crate) async fn cmd_event_unwatch(
 /// other config was named, else from the file alone.
 async fn event_statuses(config_path: Option<&PathBuf>) -> anyhow::Result<Vec<EventStatus>> {
     if config_path.is_none()
-        && crate::runtime::daemon_running().await
-        && let Ok(auth_token) = crate::daemon::read_auth_token()
         && let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) =
-            crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot { auth_token })
-                .await
+            crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
+                auth_token: String::new(),
+            })
+            .await
     {
         return Ok(snapshot.events);
     }

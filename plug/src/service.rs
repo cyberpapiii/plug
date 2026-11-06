@@ -410,10 +410,10 @@ async fn wait_for_daemon_socket(started: bool, already_starting: bool) -> anyhow
     let mut saw_lock = already_starting;
     let mut delay = Duration::from_millis(100);
     loop {
-        if crate::daemon::connect_to_daemon().await.is_some() {
+        if crate::ipc_client::daemon_running().await {
             return Ok(started);
         }
-        if crate::daemon::runtime_lock_is_held() {
+        if crate::ipc_client::daemon_starting() {
             saw_lock = true;
         } else if saw_lock {
             // The lock was held and is now gone with no socket to show for it.
@@ -439,7 +439,7 @@ async fn wait_for_daemon_socket(started: bool, already_starting: bool) -> anyhow
 
 pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> {
     ensure_service_enabled(&plug_core::paths::marker(SERVICE_DISABLED_MARKER))?;
-    if crate::daemon::connect_to_daemon().await.is_some() {
+    if crate::ipc_client::daemon_running().await {
         return Ok(false);
     }
     #[cfg(test)]
@@ -452,7 +452,7 @@ pub async fn ensure_started(config_path: Option<&Path>) -> anyhow::Result<bool> 
     // do it once more. Plug.app stopped force-kickstarting inside its
     // verification loop for this reason; the CLI drives the same daemon and
     // needs the same restraint.
-    if crate::daemon::runtime_lock_is_held() {
+    if crate::ipc_client::daemon_starting() {
         return wait_for_daemon_socket(false, true).await;
     }
     let uid = user_id()?;
@@ -900,21 +900,21 @@ arguments = {
     /// than after the full cold-start budget.
     #[tokio::test]
     async fn wait_reports_a_daemon_that_died_during_startup() {
-        let _guard = crate::daemon::runtime_paths_test_lock().lock().await;
+        let _guard = plug_core::paths::test::lock().lock().await;
         let root = std::env::temp_dir().join(format!(
             "plug-service-startup-{}-{}",
             std::process::id(),
             uuid::Uuid::new_v4().simple()
         ));
         std::fs::create_dir_all(&root).expect("create runtime root");
-        crate::daemon::set_test_runtime_paths(root.clone(), root.clone());
+        plug_core::paths::test::set(root.clone(), root.clone());
 
         let started = std::time::Instant::now();
         let error = wait_for_daemon_socket(false, true)
             .await
             .expect_err("a vanished startup lock must not be reported as success");
 
-        crate::daemon::clear_test_runtime_paths();
+        plug_core::paths::test::clear();
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(
@@ -931,7 +931,7 @@ arguments = {
     /// cold start eventually produces.
     #[tokio::test]
     async fn wait_succeeds_once_the_socket_appears() {
-        let _guard = crate::daemon::runtime_paths_test_lock().lock().await;
+        let _guard = plug_core::paths::test::lock().lock().await;
         // Short and directly under /tmp: a Unix socket path has to fit in
         // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
         let root = std::path::PathBuf::from(format!(
@@ -939,7 +939,7 @@ arguments = {
             std::process::id(),
             uuid::Uuid::new_v4().as_fields().0
         ));
-        crate::daemon::set_test_runtime_paths(root.clone(), root.clone());
+        plug_core::paths::test::set(root.clone(), root.clone());
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
             .expect("create runtime dir");
@@ -948,7 +948,7 @@ arguments = {
         let started = wait_for_daemon_socket(true, false).await;
 
         drop(listener);
-        crate::daemon::clear_test_runtime_paths();
+        plug_core::paths::test::clear();
         let _ = std::fs::remove_dir_all(&root);
 
         assert!(started.expect("socket present means started"));
@@ -967,14 +967,14 @@ arguments = {
 
     #[tokio::test]
     async fn redirected_test_runtime_never_mutates_launchd() {
-        let _guard = crate::daemon::runtime_paths_test_lock().lock().await;
+        let _guard = plug_core::paths::test::lock().lock().await;
         let temp =
             std::env::temp_dir().join(format!("plug-service-launchd-guard-{}", std::process::id()));
-        crate::daemon::set_test_runtime_paths(temp.join("runtime"), temp.join("state"));
+        plug_core::paths::test::set(temp.join("runtime"), temp.join("state"));
 
         let result = ensure_started(None).await;
 
-        crate::daemon::clear_test_runtime_paths();
+        plug_core::paths::test::clear();
         let error = result.expect_err("test startup must fail closed");
         assert!(
             error.to_string().contains("refusing to mutate launchd"),

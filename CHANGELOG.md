@@ -46,6 +46,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Command-line commands read a daemon answer larger than 4 MB, such as `plug tools` with a very large catalog. They used to fail to parse it.
+- `plug connect` no longer fails to start when a subscribed resource changes while it is registering with the daemon.
+- Cancelling a call through `plug connect` gives up after ten seconds on a daemon that does not answer. It used to wait forever.
 - Settings changes are saved for a config whose TLS paths or address use `$NAME`, such as `tls_cert_path = "$HOME/certs/plug.pem"`. Every change made from the app or the command line used to fail on such a config, which judged the path as written rather than its value.
 - `plug doctor` and `plug status` say an `auto` auth mode needs the bearer token when `http.public_base_url` is a public address in front of a loopback listener, as Plug does. They used to report no auth.
 - A `public_base_url` on `[::1]` counts as this Mac, as `127.0.0.1` and `localhost` do.

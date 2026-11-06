@@ -45,6 +45,7 @@ mod daemon;
 // Linux keeps only the small standalone-command subset at runtime.
 #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod install;
+mod ipc_client;
 mod ipc_proxy;
 mod runtime;
 mod service;
@@ -593,7 +594,7 @@ async fn main() -> anyhow::Result<()> {
         None => views::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Start) => runtime::cmd_start(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Connect { client }) => {
-            runtime::cmd_connect(cli.config.as_ref(), client).await?
+            ipc_proxy::cmd_connect(cli.config.as_ref(), client).await?
         }
         Some(Commands::Serve { daemon }) => {
             if daemon {

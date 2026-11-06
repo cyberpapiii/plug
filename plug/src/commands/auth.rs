@@ -47,7 +47,7 @@ fn auth_status_source_text(live: bool) -> &'static str {
 /// `status_scope` repeats `status_source` for readers of older output.
 fn auth_status_source(live: bool) -> &'static str {
     if live {
-        crate::runtime::DaemonQueryAvailability::Available.status_source()
+        crate::ipc_client::DaemonQueryAvailability::Available.status_source()
     } else {
         "stored_credentials_only"
     }
@@ -123,23 +123,19 @@ async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
         return Ok(false);
     }
 
-    let auth_token = match crate::daemon::read_auth_token() {
-        Ok(token) => token,
-        Err(_) => return Ok(false),
-    };
-
     let request = plug_core::ipc::IpcRequest::RestartServer {
         server_id: server_name.to_string(),
-        auth_token,
+        auth_token: String::new(),
     };
 
-    match crate::daemon::ipc_request(&request).await {
+    match crate::ipc_client::request(request).await {
         Ok(plug_core::ipc::IpcResponse::Ok) => Ok(true),
         Ok(plug_core::ipc::IpcResponse::Error { code, message }) => {
             anyhow::bail!("{code}: {message}");
         }
         Ok(other) => anyhow::bail!("unexpected daemon response: {other:?}"),
-        Err(err) => Err(err),
+        Err(crate::ipc_client::IpcClientError::Token { .. }) => Ok(false),
+        Err(err) => Err(err.into()),
     }
 }
 
@@ -425,12 +421,11 @@ async fn cmd_downstream_oauth_clients_via_daemon(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     crate::runtime::ensure_daemon_with_feedback(None, false).await?;
-    let auth_token = crate::daemon::read_auth_token()?;
     match command {
         crate::DownstreamOauthClientCommands::List => {
             let response =
-                crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::OperatorSnapshot {
-                    auth_token,
+                crate::ipc_client::request(plug_core::ipc::IpcRequest::OperatorSnapshot {
+                    auth_token: String::new(),
                 })
                 .await?;
             let clients = match response {
@@ -457,8 +452,8 @@ async fn cmd_downstream_oauth_clients_via_daemon(
                 ui::print_info_line("Revocation cancelled");
                 return Ok(());
             }
-            match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::RevokeDownstreamClient {
-                auth_token,
+            match crate::ipc_client::request(plug_core::ipc::IpcRequest::RevokeDownstreamClient {
+                auth_token: String::new(),
                 client_id: client_id.clone(),
             })
             .await?
@@ -1181,7 +1176,7 @@ async fn cmd_auth_status(
     }
 
     let live_auth_status =
-        match crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::AuthStatus).await {
+        match crate::ipc_client::request(plug_core::ipc::IpcRequest::AuthStatus).await {
             Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) => Some(
                 servers
                     .into_iter()

@@ -43,7 +43,9 @@ impl fmt::Debug for IpcCancellationCapability {
     }
 }
 
-/// Current daemon/client IPC protocol version.
+/// The proxy protocol `plug connect` registers at, and the only one the daemon
+/// registers. A connector checks the daemon's version in the operator
+/// handshake before it registers, so both ends always come from one build.
 ///
 /// v4: a registered proxy connection tags requests with `ipc_id` and the
 /// daemon answers them concurrently, echoing the id; replies to reverse
@@ -52,13 +54,30 @@ impl fmt::Debug for IpcCancellationCapability {
 /// unaffected.
 pub const IPC_PROTOCOL_VERSION: u16 = 4;
 
-/// Oldest proxy protocol version the daemon still registers.
+/// Requests one registered connection may have dispatching at once. The
+/// daemon answers a request over it at once with [`IpcErrorCode::Busy`]
+/// rather than queueing it, so the proxy keeps to the same limit. Requests
+/// for which [`IpcRequest::runs_inline`] holds do not count.
+pub const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
+
+/// Longest a proxy waits for one reply before it gives up on the request.
 ///
-/// A v3 `plug connect` never tags its requests, so the daemon serves it one
-/// request at a time exactly as before and sends it nothing new. Keeping v3
-/// means proxies started before an upgrade keep working until their host
-/// restarts them. A v4 proxy registering with a v3 daemon falls back to v3.
-pub const IPC_PROTOCOL_VERSION_MIN: u16 = 3;
+/// The daemon bounds every upstream call by that server's
+/// `call_timeout_secs`, elicitation or sampling inside the call included, so
+/// twice the longest configured timeout plus a minute only trips on a request
+/// the daemon has lost. Never below the default call timeout. The daemon sends
+/// it at registration, from the config it is running.
+pub fn proxy_request_ceiling(config: &crate::config::Config) -> std::time::Duration {
+    let floor = crate::config::ServerConfig::default().call_timeout_secs;
+    let longest = config
+        .servers
+        .values()
+        .map(|server| server.call_timeout_secs.max(server.timeout_secs))
+        .max()
+        .unwrap_or(floor)
+        .max(floor);
+    std::time::Duration::from_secs(longest.saturating_mul(2).saturating_add(60))
+}
 
 /// Inclusive operator IPC compatibility band advertised by the daemon.
 ///
@@ -1017,6 +1036,8 @@ pub enum IpcResponse {
         /// Secret capability for auxiliary cancellation sockets.
         #[serde(default)]
         cancellation_capability: IpcCancellationCapability,
+        /// Longest the proxy waits for one reply; see [`proxy_request_ceiling`].
+        request_ceiling_ms: u64,
     },
 
     /// MCP JSON-RPC response from the daemon's shared Engine.
@@ -1105,8 +1126,6 @@ pub enum IpcClientResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "envelope")]
 pub enum DaemonToProxyMessage {
-    /// Normal response to an `IpcRequest`.
-    Response { inner: IpcResponse },
     /// Fragment of a large logical `IpcResponse`.
     ResponseChunk {
         chunk_index: u32,
@@ -1120,63 +1139,186 @@ pub enum DaemonToProxyMessage {
     },
 }
 
-/// Check whether a request requires the daemon master auth token.
-///
-/// Admin operations (RestartServer, Reload, Shutdown) require it.
-/// MCP proxy operations (Register, Deregister, McpRequest) rely on
-/// Unix socket file permissions for access control instead.
-pub fn requires_auth(request: &IpcRequest) -> bool {
-    matches!(
-        request,
-        IpcRequest::RestartServer { .. }
-            | IpcRequest::Reload { .. }
-            | IpcRequest::Shutdown { .. }
-            | IpcRequest::ActivitySnapshot { .. }
-            | IpcRequest::OperatorSnapshot { .. }
-            | IpcRequest::GetServerConfig { .. }
-            | IpcRequest::RevokeDownstreamClient { .. }
-            | IpcRequest::ValidateServer { .. }
-            | IpcRequest::DescribeApi { .. }
-            | IpcRequest::AddServer { .. }
-            | IpcRequest::UpdateServer { .. }
-            | IpcRequest::RemoveServer { .. }
-            | IpcRequest::AddAccount { .. }
-            | IpcRequest::SetServerEnabled { .. }
-            | IpcRequest::SetToolEnabled { .. }
-            | IpcRequest::RenameClient { .. }
-            | IpcRequest::MoveClientSettings { .. }
-            | IpcRequest::SetClientPlace { .. }
-            | IpcRequest::SetClientBlock { .. }
-            | IpcRequest::AddWatch { .. }
-            | IpcRequest::RemoveWatch { .. }
-    )
+/// The `auth_token` field of a request that carries one, written once for
+/// both borrows. A request carries one exactly when it needs the daemon's
+/// token; Register, McpRequest and the other proxy requests rely on the
+/// socket's file permissions instead.
+macro_rules! auth_token_field {
+    ($request:expr) => {
+        match $request {
+            IpcRequest::RestartServer { auth_token, .. }
+            | IpcRequest::Reload { auth_token, .. }
+            | IpcRequest::Shutdown { auth_token, .. }
+            | IpcRequest::ActivitySnapshot { auth_token, .. }
+            | IpcRequest::OperatorSnapshot { auth_token, .. }
+            | IpcRequest::GetServerConfig { auth_token, .. }
+            | IpcRequest::RevokeDownstreamClient { auth_token, .. }
+            | IpcRequest::ValidateServer { auth_token, .. }
+            | IpcRequest::DescribeApi { auth_token, .. }
+            | IpcRequest::AddServer { auth_token, .. }
+            | IpcRequest::UpdateServer { auth_token, .. }
+            | IpcRequest::RemoveServer { auth_token, .. }
+            | IpcRequest::AddAccount { auth_token, .. }
+            | IpcRequest::SetServerEnabled { auth_token, .. }
+            | IpcRequest::SetToolEnabled { auth_token, .. }
+            | IpcRequest::RenameClient { auth_token, .. }
+            | IpcRequest::MoveClientSettings { auth_token, .. }
+            | IpcRequest::SetClientPlace { auth_token, .. }
+            | IpcRequest::SetClientBlock { auth_token, .. }
+            | IpcRequest::AddWatch { auth_token, .. }
+            | IpcRequest::RemoveWatch { auth_token, .. } => Some(auth_token),
+            _ => None,
+        }
+    };
 }
 
-/// Extract the auth_token from a request, if present.
-pub fn extract_auth_token(request: &IpcRequest) -> Option<&str> {
-    match request {
-        IpcRequest::RestartServer { auth_token, .. }
-        | IpcRequest::Reload { auth_token, .. }
-        | IpcRequest::Shutdown { auth_token, .. } => Some(auth_token.as_str()),
-        IpcRequest::ActivitySnapshot { auth_token, .. }
-        | IpcRequest::OperatorSnapshot { auth_token, .. }
-        | IpcRequest::GetServerConfig { auth_token, .. }
-        | IpcRequest::RevokeDownstreamClient { auth_token, .. } => Some(auth_token.as_str()),
-        IpcRequest::ValidateServer { auth_token, .. }
-        | IpcRequest::DescribeApi { auth_token, .. }
-        | IpcRequest::AddServer { auth_token, .. }
-        | IpcRequest::UpdateServer { auth_token, .. }
-        | IpcRequest::RemoveServer { auth_token, .. }
-        | IpcRequest::AddAccount { auth_token, .. }
-        | IpcRequest::SetServerEnabled { auth_token, .. }
-        | IpcRequest::SetToolEnabled { auth_token, .. }
-        | IpcRequest::RenameClient { auth_token, .. }
-        | IpcRequest::MoveClientSettings { auth_token, .. }
-        | IpcRequest::SetClientPlace { auth_token, .. }
-        | IpcRequest::SetClientBlock { auth_token, .. }
-        | IpcRequest::AddWatch { auth_token, .. }
-        | IpcRequest::RemoveWatch { auth_token, .. } => Some(auth_token.as_str()),
-        _ => None,
+impl IpcRequest {
+    /// The daemon token this request presents, if it is one that needs it.
+    pub fn auth_token(&self) -> Option<&str> {
+        auth_token_field!(self).map(String::as_str)
+    }
+
+    /// Where the daemon token goes, for a client that attaches it.
+    pub fn auth_token_mut(&mut self) -> Option<&mut String> {
+        auth_token_field!(self)
+    }
+
+    /// Whether the daemon refuses this request without its token.
+    pub fn requires_auth(&self) -> bool {
+        self.auth_token().is_some()
+    }
+
+    /// Requests the daemon runs on the connection loop even when tagged:
+    /// those that change the connection's own session and so must run in
+    /// order, and cheap control requests that must answer even when every
+    /// request slot is taken by a long call (the proxy's heartbeat is a
+    /// `Ping`). They take no request slot on either end.
+    pub fn runs_inline(&self) -> bool {
+        matches!(
+            self,
+            IpcRequest::Register { .. }
+                | IpcRequest::Deregister { .. }
+                | IpcRequest::Shutdown { .. }
+                | IpcRequest::Ping { .. }
+                | IpcRequest::ModernDownstreamGate { .. }
+        )
+    }
+}
+
+impl IpcResponse {
+    /// Pushes the daemon sends a registered connection unasked. Everything
+    /// else answers a request.
+    pub fn is_push(&self) -> bool {
+        matches!(
+            self,
+            IpcResponse::LoggingNotification { .. }
+                | IpcResponse::ToolListChangedNotification
+                | IpcResponse::ResourceListChangedNotification
+                | IpcResponse::ResourceUpdatedNotification { .. }
+                | IpcResponse::PromptListChangedNotification
+                | IpcResponse::ProgressNotification { .. }
+                | IpcResponse::CancelledNotification { .. }
+                | IpcResponse::AuthStateChanged { .. }
+                | IpcResponse::ModernDownstreamGateChanged { .. }
+        )
+    }
+
+    pub fn error(code: IpcErrorCode, message: impl Into<String>) -> Self {
+        IpcResponse::Error {
+            code: code.as_str().to_string(),
+            message: message.into(),
+        }
+    }
+
+    /// The code of an `Error` reply, when it is one a client acts on.
+    pub fn error_code(&self) -> Option<IpcErrorCode> {
+        match self {
+            IpcResponse::Error { code, .. } => IpcErrorCode::parse(code),
+            _ => None,
+        }
+    }
+
+    /// An MCP answer as an IPC reply. An error rides the same `McpResponse`
+    /// as a result, told apart by its `code` field.
+    pub fn from_mcp_result(result: Result<serde_json::Value, rmcp::ErrorData>) -> Self {
+        let payload = match result {
+            Ok(payload) => payload,
+            Err(error) => match serde_json::to_value(error) {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return IpcResponse::error(IpcErrorCode::SerializeError, error.to_string());
+                }
+            },
+        };
+        IpcResponse::McpResponse { payload }
+    }
+}
+
+/// The MCP answer an `McpResponse` payload carries: the reverse of
+/// [`IpcResponse::from_mcp_result`].
+pub fn mcp_result(payload: serde_json::Value) -> Result<serde_json::Value, rmcp::ErrorData> {
+    if payload.get("code").is_some()
+        && let Ok(error) = serde_json::from_value::<rmcp::ErrorData>(payload.clone())
+    {
+        return Err(error);
+    }
+    Ok(payload)
+}
+
+/// `Error` codes a client acts on. The wire carries the string, so a code
+/// missing here still reaches a client as text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IpcErrorCode {
+    /// The frame did not parse as a request. From a daemon that predates a
+    /// request the client sends, this means the daemon needs a restart.
+    ParseError,
+    /// Register asked for a protocol version this daemon does not speak.
+    ProtocolVersionUnsupported,
+    /// The request names a session this connection did not register.
+    SessionMismatch,
+    /// A newer registration for the same client replaced this session.
+    SessionReplaced,
+    /// The connection already has [`MAX_CONCURRENT_REQUESTS_PER_CONNECTION`]
+    /// requests running.
+    Busy,
+    SerializeError,
+    /// Raised by `plug connect`, never by the daemon: the connection dropped
+    /// while a request that must not run twice was in flight, so it is not
+    /// resent and the host has to retry it.
+    RequestRetryUnsafe,
+}
+
+impl IpcErrorCode {
+    const ALL: [IpcErrorCode; 7] = [
+        IpcErrorCode::ParseError,
+        IpcErrorCode::ProtocolVersionUnsupported,
+        IpcErrorCode::SessionMismatch,
+        IpcErrorCode::SessionReplaced,
+        IpcErrorCode::Busy,
+        IpcErrorCode::SerializeError,
+        IpcErrorCode::RequestRetryUnsafe,
+    ];
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            IpcErrorCode::ParseError => "PARSE_ERROR",
+            IpcErrorCode::ProtocolVersionUnsupported => "PROTOCOL_VERSION_UNSUPPORTED",
+            IpcErrorCode::SessionMismatch => "SESSION_MISMATCH",
+            IpcErrorCode::SessionReplaced => "SESSION_REPLACED",
+            IpcErrorCode::Busy => "BUSY",
+            IpcErrorCode::SerializeError => "SERIALIZE_ERROR",
+            IpcErrorCode::RequestRetryUnsafe => "REQUEST_RETRY_UNSAFE",
+        }
+    }
+
+    pub fn parse(code: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|known| known.as_str() == code)
+    }
+}
+
+impl fmt::Display for IpcErrorCode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 
@@ -1319,6 +1461,135 @@ pub async fn send_chunked_response_with_id<W: tokio::io::AsyncWriteExt + Unpin>(
     Ok(())
 }
 
+/// Every `DaemonToProxyMessage` frame starts with its tag: serde writes an
+/// internally tagged enum's tag first, and [`send_daemon_message`] is the only
+/// writer of envelopes. Matching the prefix keeps plain `IpcResponse` frames
+/// (the hot path) to one parse, and a payload that merely contains an
+/// `"envelope"` key somewhere is never mistaken for one.
+const ENVELOPE_FRAME_PREFIX: &[u8] = b"{\"envelope\":";
+
+/// One logical message from the daemon, after chunk reassembly.
+#[derive(Debug)]
+pub enum DaemonFrame {
+    Reply {
+        ipc_id: Option<u64>,
+        response: IpcResponse,
+    },
+    Reverse {
+        id: u64,
+        request: IpcClientRequest,
+    },
+}
+
+/// A daemon frame that could not be decoded. It concerns that frame alone.
+#[derive(Debug)]
+pub struct FrameDecodeError(String);
+
+impl fmt::Display for FrameDecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for FrameDecodeError {}
+
+/// Decodes frames written by [`send_chunked_response_with_id`] and
+/// [`send_daemon_message`], reassembling chunked responses. The daemon writes
+/// all chunks of a response back to back, so only one is ever in progress.
+#[derive(Default)]
+pub struct DaemonFrameDecoder {
+    buffer: Vec<u8>,
+    expected: Option<u32>,
+}
+
+impl DaemonFrameDecoder {
+    /// `Ok(None)` means a chunk was taken and its response is not complete.
+    pub fn decode(&mut self, frame: &[u8]) -> Result<Option<DaemonFrame>, FrameDecodeError> {
+        let message = if frame.starts_with(ENVELOPE_FRAME_PREFIX) {
+            Some(
+                serde_json::from_slice::<DaemonToProxyMessage>(frame)
+                    .map_err(|e| FrameDecodeError(format!("invalid envelope message: {e}")))?,
+            )
+        } else {
+            None
+        };
+        if let Some(DaemonToProxyMessage::ResponseChunk {
+            chunk_index,
+            chunk_count,
+            payload_b64,
+        }) = message
+        {
+            return self.take_chunk(chunk_index, chunk_count, &payload_b64);
+        }
+        if self.expected.is_some() {
+            *self = Self::default();
+            return Err(FrameDecodeError(
+                "a frame interleaved with a chunked response".to_string(),
+            ));
+        }
+        match message {
+            Some(DaemonToProxyMessage::ReverseRequest { id, request }) => {
+                Ok(Some(DaemonFrame::Reverse {
+                    id,
+                    request: *request,
+                }))
+            }
+            _ => decode_reply(frame, "invalid IPC response").map(Some),
+        }
+    }
+
+    fn take_chunk(
+        &mut self,
+        chunk_index: u32,
+        chunk_count: u32,
+        payload_b64: &str,
+    ) -> Result<Option<DaemonFrame>, FrameDecodeError> {
+        match self.append(chunk_index, chunk_count, payload_b64) {
+            Ok(false) => Ok(None),
+            Ok(true) => {
+                let whole = std::mem::take(self);
+                decode_reply(&whole.buffer, "invalid chunked IPC response").map(Some)
+            }
+            Err(message) => {
+                *self = Self::default();
+                Err(FrameDecodeError(message))
+            }
+        }
+    }
+
+    /// Add one chunk; true once the response is whole.
+    fn append(
+        &mut self,
+        chunk_index: u32,
+        chunk_count: u32,
+        payload_b64: &str,
+    ) -> Result<bool, String> {
+        if chunk_count == 0 {
+            return Err("invalid response chunk count 0".to_string());
+        }
+        if chunk_index == 0 {
+            self.buffer.clear();
+            self.expected = Some(chunk_count);
+        } else if self.expected != Some(chunk_count) {
+            return Err("response chunk count changed mid-stream".to_string());
+        }
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(payload_b64)
+            .map_err(|e| format!("invalid chunk payload: {e}"))?;
+        self.buffer.extend_from_slice(&decoded);
+        Ok(chunk_index + 1 == chunk_count)
+    }
+}
+
+fn decode_reply(bytes: &[u8], context: &str) -> Result<DaemonFrame, FrameDecodeError> {
+    let response =
+        serde_json::from_slice(bytes).map_err(|e| FrameDecodeError(format!("{context}: {e}")))?;
+    Ok(DaemonFrame::Reply {
+        ipc_id: FrameIds::peek(bytes).ipc_id,
+        response,
+    })
+}
+
 // ──────────────────────── Request correlation (v4) ────────────────────────────
 //
 // A registered proxy connection carries many requests at once. A request may
@@ -1438,6 +1709,181 @@ mod tests {
             IpcClientResponse::Error { message } if message == "declined"
         ));
         assert_eq!(FrameIds::peek(b"not json"), FrameIds::default());
+    }
+
+    #[tokio::test]
+    async fn the_decoder_reassembles_what_the_encoder_chunks() {
+        let text = "x".repeat(MAX_FRAME_SIZE as usize + RESPONSE_CHUNK_BYTES);
+        let response = IpcResponse::McpResponse {
+            payload: serde_json::json!({ "text": text }),
+        };
+        let mut wire = Vec::new();
+        send_chunked_response_with_id(&mut wire, Some(9), &response)
+            .await
+            .expect("encode");
+        send_daemon_message(
+            &mut wire,
+            &DaemonToProxyMessage::ReverseRequest {
+                id: 4,
+                request: Box::new(
+                    serde_json::from_value(serde_json::json!({
+                        "type": "CreateElicitation",
+                        "params": { "message": "?", "requestedSchema": { "type": "object", "properties": {} } }
+                    }))
+                    .expect("reverse request"),
+                ),
+            },
+        )
+        .await
+        .expect("encode reverse");
+
+        let mut reader = wire.as_slice();
+        let mut decoder = DaemonFrameDecoder::default();
+        let mut decoded = Vec::new();
+        let mut frames = 0;
+        while let Some(frame) = read_frame(&mut reader).await.expect("frame") {
+            assert!(frame.len() <= MAX_FRAME_SIZE as usize);
+            frames += 1;
+            if let Some(message) = decoder.decode(&frame).expect("decode") {
+                decoded.push(message);
+            }
+        }
+        assert!(frames > 2, "the reply must have been chunked");
+        let [
+            DaemonFrame::Reply {
+                ipc_id: Some(9),
+                response: IpcResponse::McpResponse { payload },
+            },
+            DaemonFrame::Reverse { id: 4, .. },
+        ] = decoded.as_slice()
+        else {
+            panic!("unexpected frames: {decoded:?}");
+        };
+        assert_eq!(payload["text"].as_str().map(str::len), Some(text.len()));
+    }
+
+    #[test]
+    fn envelopes_start_with_their_tag_and_replies_never_do() {
+        let chunk = DaemonToProxyMessage::ResponseChunk {
+            chunk_index: 0,
+            chunk_count: 1,
+            payload_b64: String::new(),
+        };
+        assert!(
+            serde_json::to_vec(&chunk)
+                .unwrap()
+                .starts_with(ENVELOPE_FRAME_PREFIX)
+        );
+        let reply = IpcResponse::McpResponse {
+            payload: serde_json::json!({ "envelope": "ResponseChunk" }),
+        };
+        let bytes = encode_tagged(Some(1), &reply).unwrap();
+        assert!(!bytes.starts_with(ENVELOPE_FRAME_PREFIX));
+        assert!(matches!(
+            DaemonFrameDecoder::default().decode(&bytes),
+            Ok(Some(DaemonFrame::Reply {
+                ipc_id: Some(1),
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn a_bad_chunk_resets_the_decoder() {
+        let mut decoder = DaemonFrameDecoder::default();
+        let chunk = |index, count, payload: &str| {
+            serde_json::to_vec(&DaemonToProxyMessage::ResponseChunk {
+                chunk_index: index,
+                chunk_count: count,
+                payload_b64: payload.to_string(),
+            })
+            .unwrap()
+        };
+        assert!(decoder.decode(&chunk(0, 2, "e30=")).unwrap().is_none());
+        assert!(decoder.decode(&chunk(1, 3, "e30=")).is_err());
+        assert!(decoder.decode(&chunk(0, 0, "")).is_err());
+        assert!(decoder.decode(&chunk(0, 2, "e30=")).unwrap().is_none());
+        assert!(
+            decoder.decode(br#"{"type":"Pong"}"#).is_err(),
+            "chunks of one response are written back to back"
+        );
+        let ok = base64::engine::general_purpose::STANDARD.encode(b"{\"type\":\"Ok\"}");
+        assert!(matches!(
+            decoder.decode(&chunk(0, 1, &ok)),
+            Ok(Some(DaemonFrame::Reply {
+                response: IpcResponse::Ok,
+                ..
+            }))
+        ));
+    }
+
+    #[test]
+    fn error_codes_round_trip_through_the_wire_string() {
+        for code in IpcErrorCode::ALL {
+            let response = IpcResponse::error(code, "message");
+            assert_eq!(response.error_code(), Some(code));
+        }
+        let unknown = IpcResponse::Error {
+            code: "SOMETHING_ELSE".to_string(),
+            message: String::new(),
+        };
+        assert_eq!(unknown.error_code(), None);
+    }
+
+    #[test]
+    fn an_mcp_error_rides_an_mcp_response_and_comes_back_out() {
+        let IpcResponse::McpResponse { payload } =
+            IpcResponse::from_mcp_result(Ok(serde_json::json!({ "ok": true })))
+        else {
+            panic!("expected McpResponse");
+        };
+        assert_eq!(
+            mcp_result(payload).unwrap(),
+            serde_json::json!({ "ok": true })
+        );
+        let error = IpcResponse::from_mcp_result(Err(rmcp::ErrorData::invalid_params(
+            "boom".to_string(),
+            None,
+        )));
+        let IpcResponse::McpResponse { payload } = error else {
+            panic!("expected McpResponse, got {error:?}");
+        };
+        assert_eq!(payload["code"].as_i64(), Some(-32602));
+        assert_eq!(mcp_result(payload).unwrap_err().message, "boom");
+    }
+
+    #[test]
+    fn the_proxy_ceiling_follows_the_longest_call_timeout_and_never_drops_below_the_default() {
+        let mut config = crate::config::Config::default();
+        assert_eq!(proxy_request_ceiling(&config).as_secs(), 300 * 2 + 60);
+        config.servers.insert(
+            "slow".to_string(),
+            crate::config::ServerConfig {
+                call_timeout_secs: 1_000,
+                ..Default::default()
+            },
+        );
+        config.servers.insert(
+            "quick".to_string(),
+            crate::config::ServerConfig {
+                call_timeout_secs: 5,
+                ..Default::default()
+            },
+        );
+        assert_eq!(proxy_request_ceiling(&config).as_secs(), 1_000 * 2 + 60);
+    }
+
+    #[test]
+    fn every_push_is_classified_and_no_reply_is() {
+        assert!(
+            IpcResponse::ResourceUpdatedNotification {
+                params: serde_json::Value::Null
+            }
+            .is_push()
+        );
+        assert!(IpcResponse::ModernDownstreamGateChanged { enabled: true }.is_push());
+        assert!(!IpcResponse::Pong.is_push());
+        assert!(!IpcResponse::ModernDownstreamGate { enabled: true }.is_push());
     }
 
     #[test]
@@ -1731,6 +2177,7 @@ mod tests {
                 session_id: "sess-456".to_string(),
                 modern_downstream_enabled: false,
                 cancellation_capability: IpcCancellationCapability::default(),
+                request_ceiling_ms: 660_000,
             },
             IpcResponse::Capabilities {
                 capabilities: serde_json::json!({"tools": {"listChanged": true}}),
@@ -1862,42 +2309,43 @@ mod tests {
 
     #[test]
     fn requires_auth_identifies_admin_commands() {
-        assert!(!requires_auth(&IpcRequest::Status));
+        let requires_auth = |request: IpcRequest| request.requires_auth();
+        assert!(!requires_auth(IpcRequest::Status));
 
-        assert!(requires_auth(&IpcRequest::RestartServer {
+        assert!(requires_auth(IpcRequest::RestartServer {
             server_id: "s".to_string(),
             auth_token: "t".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::Reload {
+        assert!(requires_auth(IpcRequest::Reload {
             auth_token: "t".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::Shutdown {
+        assert!(requires_auth(IpcRequest::Shutdown {
             auth_token: "t".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::OperatorSnapshot {
+        assert!(requires_auth(IpcRequest::OperatorSnapshot {
             auth_token: "t".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::GetServerConfig {
+        assert!(requires_auth(IpcRequest::GetServerConfig {
             auth_token: "t".to_string(),
             name: "server".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::RevokeDownstreamClient {
+        assert!(requires_auth(IpcRequest::RevokeDownstreamClient {
             auth_token: "t".to_string(),
             client_id: "client".to_string(),
         }));
-        assert!(requires_auth(&IpcRequest::ActivitySnapshot {
+        assert!(requires_auth(IpcRequest::ActivitySnapshot {
             auth_token: "t".to_string(),
             after_sequence: 0,
             limit: 500,
             failures_only: false,
         }));
-        assert!(requires_auth(&IpcRequest::RemoveServer {
+        assert!(requires_auth(IpcRequest::RemoveServer {
             auth_token: "t".to_string(),
             name: "server".to_string(),
         }));
 
         // MCP proxy variants do NOT require auth (socket ACL suffices)
-        assert!(!requires_auth(&IpcRequest::Register {
+        assert!(!requires_auth(IpcRequest::Register {
             protocol_version: IPC_PROTOCOL_VERSION,
             client_id: "client-123".to_string(),
             client_info: None,
@@ -1905,23 +2353,23 @@ mod tests {
             host: None,
             link_target: None,
         }));
-        assert!(!requires_auth(&IpcRequest::Deregister {
+        assert!(!requires_auth(IpcRequest::Deregister {
             session_id: "s".to_string(),
         }));
-        assert!(!requires_auth(&IpcRequest::Capabilities {
+        assert!(!requires_auth(IpcRequest::Capabilities {
             session_id: "s".to_string(),
         }));
-        assert!(!requires_auth(&IpcRequest::ListLiveSessions));
-        assert!(!requires_auth(&IpcRequest::UpdateSession {
+        assert!(!requires_auth(IpcRequest::ListLiveSessions));
+        assert!(!requires_auth(IpcRequest::UpdateSession {
             session_id: "s".to_string(),
             client_info: "claude-code".to_string(),
         }));
-        assert!(!requires_auth(&IpcRequest::McpRequest {
+        assert!(!requires_auth(IpcRequest::McpRequest {
             session_id: "s".to_string(),
             method: "tools/list".to_string(),
             params: None,
         }));
-        assert!(!requires_auth(&IpcRequest::McpRequestWithContext {
+        assert!(!requires_auth(IpcRequest::McpRequestWithContext {
             session_id: "s".to_string(),
             method: "tools/list".to_string(),
             params: None,
@@ -1932,26 +2380,26 @@ mod tests {
                 client_version: Some("1".to_string()),
             },
         }));
-        assert!(!requires_auth(&IpcRequest::CancelMcpRequest {
+        assert!(!requires_auth(IpcRequest::CancelMcpRequest {
             session_id: "s".to_string(),
             client_id: "client".to_string(),
             cancellation_capability: IpcCancellationCapability::new("secret".to_string()),
             request_id: RequestId::from(rmcp::model::NumberOrString::Number(1)),
             reason: Some("stop".to_string()),
         }));
-        assert!(!requires_auth(&IpcRequest::AuthStatus));
+        assert!(!requires_auth(IpcRequest::AuthStatus));
     }
 
     #[test]
-    fn extract_auth_token_works() {
-        assert_eq!(extract_auth_token(&IpcRequest::Status), None);
-        assert_eq!(
-            extract_auth_token(&IpcRequest::RestartServer {
-                server_id: "s".to_string(),
-                auth_token: "my_token".to_string(),
-            }),
-            Some("my_token")
-        );
+    fn auth_token_reads_and_writes_the_one_field() {
+        assert_eq!(IpcRequest::Status.auth_token(), None);
+        let mut request = IpcRequest::RestartServer {
+            server_id: "s".to_string(),
+            auth_token: String::new(),
+        };
+        *request.auth_token_mut().expect("a token slot") = "my_token".to_string();
+        assert_eq!(request.auth_token(), Some("my_token"));
+        assert!(IpcRequest::Status.auth_token_mut().is_none());
     }
 
     #[test]
@@ -1964,18 +2412,6 @@ mod tests {
         let json2 = serde_json::to_string(&deserialized).unwrap();
         assert_eq!(json, json2);
         assert!(json.contains("\"type\":\"Error\""));
-    }
-
-    #[test]
-    fn daemon_to_proxy_message_response_round_trip() {
-        let msg = DaemonToProxyMessage::Response {
-            inner: IpcResponse::Ok,
-        };
-        let json = serde_json::to_string(&msg).unwrap();
-        let deserialized: DaemonToProxyMessage = serde_json::from_str(&json).unwrap();
-        let json2 = serde_json::to_string(&deserialized).unwrap();
-        assert_eq!(json, json2);
-        assert!(json.contains("\"envelope\":\"Response\""));
     }
 
     #[test]
@@ -2116,6 +2552,7 @@ mod tests {
             session_id: "sess-123".to_string(),
             modern_downstream_enabled: false,
             cancellation_capability: IpcCancellationCapability::default(),
+            request_ceiling_ms: 660_000,
         };
 
         let value = serde_json::to_value(resp).unwrap();

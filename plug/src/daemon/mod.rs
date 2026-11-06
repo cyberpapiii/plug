@@ -130,7 +130,7 @@ fn restore_token_file(
 /// How long to keep retrying a contended PID-file lock before concluding that
 /// another daemon owns it.
 ///
-/// `runtime_lock_is_held` probes the same lock by taking it and letting it go
+/// `ipc_client::daemon_starting` probes the same lock by taking it and letting it go
 /// again, and every status surface calls that probe. A real daemon holds the
 /// lock for its whole life, so retrying cannot mistake one for a probe; without
 /// the retry, a `plug status` that happened to land in the same microsecond as
@@ -209,33 +209,6 @@ pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
         file,
         pid_file_path,
     })
-}
-
-/// Return whether another process currently owns the daemon singleton lock.
-///
-/// This probe never creates or rewrites the PID file. Auto-start callers use it
-/// to distinguish a failed child from a child that correctly lost to another
-/// daemon which is still booting. `cmd_daemon` claims the lock before it binds
-/// anything, so a held lock with no socket is the signature of a healthy cold
-/// start rather than a dead one. That window is now short, because the socket
-/// no longer waits for `Engine::start`.
-pub(crate) fn runtime_lock_is_held() -> bool {
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pid_path())
-    else {
-        return false;
-    };
-
-    match fs4::FileExt::try_lock(&file) {
-        Err(fs4::TryLockError::WouldBlock) => true,
-        Ok(()) => {
-            let _ = fs4::FileExt::unlock(&file);
-            false
-        }
-        Err(fs4::TryLockError::Error(_)) => false,
-    }
 }
 
 // ───────────────────────── Grace-period auto-shutdown ─────────────────────────
@@ -679,13 +652,6 @@ impl ConnectionContext {
     }
 }
 
-/// Requests one registered connection may have dispatching at once. The
-/// proxy keeps to the same limit, so a request over it is answered at once
-/// with a retryable `BUSY` error rather than queued: the loop never waits for
-/// a slot, and so never stops reading the reverse-request replies the
-/// running requests may be waiting on.
-pub(crate) const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
-
 /// Requests tagged with `ipc_id` on a registered connection, dispatching on
 /// their own tasks. Each task returns the response for the loop to write.
 #[derive(Default)]
@@ -694,44 +660,10 @@ struct InFlight {
     ids: std::collections::HashMap<tokio::task::Id, u64>,
 }
 
-/// Reverse requests written to the proxy and awaiting its reply, oldest first.
+/// Reverse requests written to the proxy and awaiting its reply, by id. The
+/// proxy tags each reply with the id as `reverse_id`.
 type PendingReverse =
-    std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
-
-/// The reverse request `frame` answers, if it is a reverse-request reply.
-///
-/// A v4 proxy tags its reply with `reverse_id`. A v3 proxy sends a bare
-/// `IpcClientResponse` and answers reverse requests one at a time in the
-/// order it received them, so a bare reply belongs to the oldest one waiting.
-/// No `IpcRequest` variant shares a name with an `IpcClientResponse` variant,
-/// so a request never parses as a reply.
-fn reverse_reply_target(pending: &PendingReverse, frame: &[u8], ids: ipc::FrameIds) -> Option<u64> {
-    if ids.reverse_id.is_some() {
-        return ids.reverse_id;
-    }
-    if ids.ipc_id.is_some() {
-        return None;
-    }
-    let oldest = *pending.keys().next()?;
-    serde_json::from_slice::<IpcClientResponse>(frame)
-        .is_ok()
-        .then_some(oldest)
-}
-
-/// True for requests that run on the connection loop even when tagged: those
-/// that change the connection's own session and so must run in order, and
-/// cheap control requests that must answer even when every request slot is
-/// taken by a long call (the proxy's heartbeat is a `Ping`).
-fn must_run_inline(request: &IpcRequest) -> bool {
-    matches!(
-        request,
-        IpcRequest::Register { .. }
-            | IpcRequest::Deregister { .. }
-            | IpcRequest::Shutdown { .. }
-            | IpcRequest::Ping { .. }
-            | IpcRequest::ModernDownstreamGate { .. }
-    )
-}
+    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
 ///
@@ -890,7 +822,7 @@ async fn handle_ipc_loop(
     let mut deferred: std::collections::VecDeque<anyhow::Result<Option<Vec<u8>>>> =
         std::collections::VecDeque::new();
     let permits = Arc::new(tokio::sync::Semaphore::new(
-        MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+        ipc::MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
     ));
 
     loop {
@@ -985,7 +917,7 @@ async fn handle_ipc_loop(
         };
 
         let ids = ipc::FrameIds::peek(&frame);
-        if let Some(reverse_id) = reverse_reply_target(&pending_reverse, &frame, ids) {
+        if let Some(reverse_id) = ids.reverse_id {
             deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
             continue;
         }
@@ -995,9 +927,8 @@ async fn handle_ipc_loop(
             Ok(req) => req,
             Err(e) => {
                 tracing::debug!(error = %e, "IPC parse error");
-                let resp = protocol_parse_error_response(&frame).unwrap_or(IpcResponse::Error {
-                    code: "PARSE_ERROR".to_string(),
-                    message: "invalid request format".to_string(),
+                let resp = protocol_parse_error_response(&frame).unwrap_or_else(|| {
+                    IpcResponse::error(ipc::IpcErrorCode::ParseError, "invalid request format")
                 });
                 ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp)
                     .await
@@ -1007,40 +938,29 @@ async fn handle_ipc_loop(
         };
 
         // Auth check for admin commands
-        if ipc::requires_auth(&request) {
-            match ipc::extract_auth_token(&request) {
-                Some(provided) => {
-                    if !verify_auth_token(provided, &ctx.auth_token) {
-                        let resp = IpcResponse::Error {
-                            code: "AUTH_FAILED".to_string(),
-                            message: "invalid auth token".to_string(),
-                        };
-                        ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
-                        continue;
-                    }
-                }
-                None => {
-                    let resp = IpcResponse::Error {
-                        code: "AUTH_REQUIRED".to_string(),
-                        message: "auth_token required for this command".to_string(),
-                    };
-                    ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
-                    continue;
-                }
-            }
+        if let Some(provided) = request.auth_token()
+            && !verify_auth_token(provided, &ctx.auth_token)
+        {
+            let resp = IpcResponse::Error {
+                code: "AUTH_FAILED".to_string(),
+                message: "invalid auth token".to_string(),
+            };
+            ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
+            continue;
         }
 
         if let Some(ipc_id) = ids.ipc_id
             && ctx.session_id.is_some()
-            && !must_run_inline(&request)
+            && !request.runs_inline()
         {
             let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                let busy = IpcResponse::Error {
-                    code: "BUSY".to_string(),
-                    message: format!(
-                        "this connection already has {MAX_CONCURRENT_REQUESTS_PER_CONNECTION} requests running; retry"
+                let busy = IpcResponse::error(
+                    ipc::IpcErrorCode::Busy,
+                    format!(
+                        "this connection already has {} requests running; retry",
+                        ipc::MAX_CONCURRENT_REQUESTS_PER_CONNECTION
                     ),
-                };
+                );
                 ipc::send_chunked_response_with_id(writer, Some(ipc_id), &busy).await?;
                 continue;
             };
@@ -1140,11 +1060,7 @@ async fn handle_ipc_loop(
                     }
                     next = reader.next(), if read_ahead => {
                         match next {
-                            Ok(Some(frame)) => match reverse_reply_target(
-                                &pending_reverse,
-                                &frame,
-                                ipc::FrameIds::peek(&frame),
-                            ) {
+                            Ok(Some(frame)) => match ipc::FrameIds::peek(&frame).reverse_id {
                                 Some(reverse_id) => {
                                     deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
                                 }
@@ -1394,9 +1310,8 @@ async fn send_reverse_request(
         request: Box::new(request),
     };
 
-    // Entries whose caller gave up stay until the proxy answers them: a v3
-    // proxy's bare reply is matched to the oldest entry, so dropping one
-    // early would hand the next reply to the wrong waiter.
+    // A caller that gave up has no use for its reply.
+    pending.retain(|_, waiter| !waiter.is_closed());
     pending.insert(id, response_tx);
     tracing::debug!(
         reverse_request_id = id,
@@ -1973,18 +1888,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             host,
             link_target,
         } => {
-            if !(plug_core::ipc::IPC_PROTOCOL_VERSION_MIN..=plug_core::ipc::IPC_PROTOCOL_VERSION)
-                .contains(protocol_version)
-            {
-                return IpcResponse::Error {
-                    code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
-                    message: format!(
-                        "daemon supports IPC protocol v{}..=v{}, got v{}",
-                        plug_core::ipc::IPC_PROTOCOL_VERSION_MIN,
+            if *protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+                return IpcResponse::error(
+                    ipc::IpcErrorCode::ProtocolVersionUnsupported,
+                    format!(
+                        "daemon supports IPC protocol v{}, got v{}",
                         plug_core::ipc::IPC_PROTOCOL_VERSION,
                         protocol_version
                     ),
-                };
+                );
             }
             // Enforce one registration per connection — deregister previous if exists
             if let Some(ref old_session) = ctx.session_id {
@@ -2050,15 +1962,18 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             );
             ctx.reverse_request_rx = Some(reverse_rx);
 
-            // Echo the client's version: a v3 client checks for an exact match.
             IpcResponse::Registered {
-                protocol_version: *protocol_version,
+                protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
                 client_id: client_id.clone(),
                 session_id,
                 modern_downstream_enabled: ctx.engine.tool_router().modern_downstream_enabled(),
                 cancellation_capability: plug_core::ipc::IpcCancellationCapability::new(
                     registration.cancellation_capability,
                 ),
+                request_ceiling_ms: plug_core::ipc::proxy_request_ceiling(&ctx.engine.config())
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
             }
         }
 
@@ -2436,16 +2351,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 /// (`SESSION_REPLACED`).
 fn reject_unowned_session(ctx: &ConnectionContext, session_id: &str) -> Option<IpcResponse> {
     if ctx.session_id.as_deref() != Some(session_id) {
-        return Some(IpcResponse::Error {
-            code: "SESSION_MISMATCH".to_string(),
-            message: "session_id does not match this connection".to_string(),
-        });
+        return Some(IpcResponse::error(
+            ipc::IpcErrorCode::SessionMismatch,
+            "session_id does not match this connection",
+        ));
     }
     if !ctx.client_registry.session_exists(session_id) {
-        return Some(IpcResponse::Error {
-            code: "SESSION_REPLACED".to_string(),
-            message: "session is no longer active for this client".to_string(),
-        });
+        return Some(IpcResponse::error(
+            ipc::IpcErrorCode::SessionReplaced,
+            "session is no longer active for this client",
+        ));
     }
     None
 }
@@ -2457,10 +2372,10 @@ fn reject_invalid_cancellation_identity(
     cancellation_capability: &plug_core::ipc::IpcCancellationCapability,
 ) -> Option<IpcResponse> {
     if !registry.session_exists(session_id) {
-        return Some(IpcResponse::Error {
-            code: "SESSION_REPLACED".to_string(),
-            message: "session is no longer active for this client".to_string(),
-        });
+        return Some(IpcResponse::error(
+            ipc::IpcErrorCode::SessionReplaced,
+            "session is no longer active for this client",
+        ));
     }
     if registry.client_id(session_id).as_deref() != Some(client_id) {
         return Some(IpcResponse::Error {
@@ -2485,13 +2400,13 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
         Some("Register")
             if value.get("protocol_version").is_none() || value.get("client_id").is_none() =>
         {
-            Some(IpcResponse::Error {
-                code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
-                message: format!(
+            Some(IpcResponse::error(
+                ipc::IpcErrorCode::ProtocolVersionUnsupported,
+                format!(
                     "daemon requires IPC protocol v{} registration fields",
                     plug_core::ipc::IPC_PROTOCOL_VERSION
                 ),
-            })
+            ))
         }
         _ => None,
     }
@@ -2657,70 +2572,6 @@ impl std::io::Write for ReopeningLog {
     }
 }
 
-// ──────────────────────── Client helpers ──────────────────────────────────────
-
-/// Connect to a running daemon's Unix socket.
-///
-/// Returns None if no daemon is running (socket doesn't exist or connection refused).
-pub async fn connect_to_daemon() -> Option<tokio::net::UnixStream> {
-    let sock = socket_path();
-    if !sock.exists() {
-        return None;
-    }
-    tokio::net::UnixStream::connect(&sock).await.ok()
-}
-
-/// How long an operator request may wait for the daemon to answer. Generous,
-/// because a request can land while the daemon is refreshing credentials, but
-/// bounded, because an unbounded wait reports nothing at all.
-const IPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Send a request to the daemon and read the response.
-pub async fn ipc_request(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
-    ipc_request_with_timeout(request, IPC_REQUEST_TIMEOUT).await
-}
-
-/// The body of [`ipc_request`], with the wait made explicit so it can be proven
-/// to end.
-pub(crate) async fn ipc_request_with_timeout(
-    request: &IpcRequest,
-    timeout: std::time::Duration,
-) -> anyhow::Result<IpcResponse> {
-    let stream = connect_to_daemon()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no plug daemon running"))?;
-
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Send request
-    let payload = serde_json::to_vec(request)?;
-    ipc::write_frame(&mut writer, &payload).await?;
-
-    // Read response. A daemon that accepted the connection but cannot answer,
-    // because its engine is stuck on an upstream or a Keychain read, would
-    // otherwise hang the caller forever with nothing to report.
-    let frame = tokio::time::timeout(timeout, ipc::read_frame(&mut reader))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "daemon did not answer within {}s; see {}",
-                timeout.as_secs(),
-                log_dir().display()
-            )
-        })??
-        .ok_or_else(|| anyhow::anyhow!("daemon closed connection"))?;
-
-    let response: IpcResponse = serde_json::from_slice(&frame)?;
-    Ok(response)
-}
-
-/// Read the auth token from the daemon's token file.
-pub fn read_auth_token() -> anyhow::Result<String> {
-    let path = token_path();
-    std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read auth token from {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2784,50 +2635,6 @@ mod tests {
         assert!(
             serde_json::to_string(&statuses).expect("serialize").len() < 512,
             "the entry must no longer be dominated by branding"
-        );
-    }
-
-    /// A daemon whose engine is stuck still accepts connections, so an
-    /// unbounded read turns `plug status`, `plug doctor` and every app checkup
-    /// into a spinner with nothing to report. The wait has to end.
-    #[tokio::test]
-    async fn operator_request_gives_up_on_a_daemon_that_never_answers() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        // Short and directly under /tmp: a Unix socket path has to fit in
-        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
-        let root = std::path::PathBuf::from(format!(
-            "/tmp/plug-q{}{:x}",
-            std::process::id(),
-            uuid::Uuid::new_v4().as_fields().0
-        ));
-        set_test_runtime_paths(root.clone(), root.clone());
-        let socket = socket_path();
-        std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
-            .expect("create runtime dir");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
-        // Accept and hold the connection open without ever replying.
-        let silent = tokio::spawn(async move {
-            let accepted = listener.accept().await;
-            std::future::pending::<()>().await;
-            drop(accepted);
-        });
-
-        let error = ipc_request_with_timeout(
-            &IpcRequest::Shutdown {
-                auth_token: "unused".to_string(),
-            },
-            Duration::from_millis(200),
-        )
-        .await
-        .expect_err("a silent daemon must not be waited on forever");
-
-        silent.abort();
-        clear_test_runtime_paths();
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert!(
-            error.to_string().contains("did not answer"),
-            "unexpected error: {error}"
         );
     }
 
@@ -3266,7 +3073,7 @@ mod tests {
 
     #[test]
     fn pid_lock_survives_the_momentary_hold_a_status_probe_takes() {
-        // `runtime_lock_is_held` takes the lock and lets it go again, and every
+        // `ipc_client::daemon_starting` takes the lock and lets it go again, and every
         // status surface calls it. A start that collided with one used to fail
         // outright. The window is passed explicitly so the assertion is about
         // retrying at all, not about how a loaded machine schedules threads.
@@ -3969,24 +3776,11 @@ mod tests {
                 .expect("unexpected EOF before response");
             let resp: IpcResponse =
                 serde_json::from_slice(&frame).expect("decode ipc response frame");
-            if is_ipc_push_notification(&resp) {
+            if resp.is_push() {
                 continue;
             }
             return resp;
         }
-    }
-
-    fn is_ipc_push_notification(resp: &IpcResponse) -> bool {
-        matches!(
-            resp,
-            IpcResponse::LoggingNotification { .. }
-                | IpcResponse::ToolListChangedNotification
-                | IpcResponse::ResourceListChangedNotification
-                | IpcResponse::PromptListChangedNotification
-                | IpcResponse::ResourceUpdatedNotification { .. }
-                | IpcResponse::ProgressNotification { .. }
-                | IpcResponse::CancelledNotification { .. }
-        )
     }
 
     #[tokio::test]
@@ -5063,9 +4857,7 @@ mod tests {
     /// Read the next reply that carries an `ipc_id`, reassembling a chunked
     /// one. Fails if another frame lands between the chunks of a response.
     async fn read_tagged_reply(stream: &mut tokio::net::UnixStream) -> (u64, IpcResponse) {
-        use base64::Engine as _;
-        let mut chunks: Vec<u8> = Vec::new();
-        let mut in_chunked = false;
+        let mut decoder = plug_core::ipc::DaemonFrameDecoder::default();
         loop {
             let frame = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -5075,40 +4867,16 @@ mod tests {
             .expect("timed out waiting for a tagged reply")
             .expect("read frame")
             .expect("unexpected EOF before reply");
-            let body = if frame.starts_with(b"{\"envelope\":") {
-                match serde_json::from_slice(&frame).expect("decode envelope") {
-                    plug_core::ipc::DaemonToProxyMessage::ResponseChunk {
-                        chunk_index,
-                        chunk_count,
-                        payload_b64,
-                    } => {
-                        assert_eq!(chunk_index == 0, !in_chunked, "chunks out of sequence");
-                        in_chunked = true;
-                        chunks.extend(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(payload_b64)
-                                .expect("chunk payload"),
-                        );
-                        if chunk_index + 1 < chunk_count {
-                            continue;
-                        }
-                        in_chunked = false;
-                        std::mem::take(&mut chunks)
-                    }
-                    other => panic!("unexpected envelope {other:?}"),
+            match decoder.decode(&frame).expect("decode frame") {
+                None => {}
+                Some(plug_core::ipc::DaemonFrame::Reply { response, .. }) if response.is_push() => {
                 }
-            } else {
-                assert!(!in_chunked, "a frame interleaved with a chunked response");
-                frame
-            };
-            let response: IpcResponse = serde_json::from_slice(&body).expect("decode reply");
-            if is_ipc_push_notification(&response) {
-                continue;
+                Some(plug_core::ipc::DaemonFrame::Reply { ipc_id, response }) => {
+                    let ipc_id = ipc_id.expect("a tagged request gets a tagged reply");
+                    return (ipc_id, response);
+                }
+                Some(other) => panic!("unexpected frame {other:?}"),
             }
-            let ipc_id = plug_core::ipc::FrameIds::peek(&body)
-                .ipc_id
-                .expect("a tagged request gets a tagged reply");
-            return (ipc_id, response);
         }
     }
 
@@ -5293,164 +5061,10 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// Fail if a frame sent to a v3 proxy carries a field v3 never saw.
-    fn assert_v3_frame(bytes: &[u8]) {
-        let value: serde_json::Value = serde_json::from_slice(bytes).expect("frame is JSON");
-        for field in ["ipc_id", "reverse_id"] {
-            assert!(
-                value.get(field).is_none(),
-                "a v3 proxy got a frame with `{field}`"
-            );
-        }
-    }
-
-    /// Read the reply to an untagged request the way a v3 proxy does: one
-    /// frame at a time, reassembling chunks and answering each reverse request
-    /// with a bare `IpcClientResponse` before reading on. Returns the reply
-    /// and how many reverse requests were answered.
-    async fn read_v3_reply(stream: &mut tokio::net::UnixStream) -> (IpcResponse, usize) {
-        use base64::Engine as _;
-        let mut chunks: Vec<u8> = Vec::new();
-        let mut reverse_requests = 0;
-        loop {
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                plug_core::ipc::read_frame(stream),
-            )
-            .await
-            .expect("timed out waiting for a reply")
-            .expect("read frame")
-            .expect("unexpected EOF before reply");
-            assert_v3_frame(&frame);
-            let body = if frame.starts_with(b"{\"envelope\":") {
-                match serde_json::from_slice(&frame).expect("decode envelope") {
-                    plug_core::ipc::DaemonToProxyMessage::ResponseChunk {
-                        chunk_index,
-                        chunk_count,
-                        payload_b64,
-                    } => {
-                        chunks.extend(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(payload_b64)
-                                .expect("chunk payload"),
-                        );
-                        if chunk_index + 1 < chunk_count {
-                            continue;
-                        }
-                        std::mem::take(&mut chunks)
-                    }
-                    plug_core::ipc::DaemonToProxyMessage::ReverseRequest { request, .. } => {
-                        assert!(
-                            matches!(*request, IpcClientRequest::CreateElicitation { .. }),
-                            "{request:?}"
-                        );
-                        reverse_requests += 1;
-                        let reply = IpcClientResponse::CreateElicitation {
-                            result: serde_json::from_value(
-                                serde_json::json!({ "action": "accept", "content": {} }),
-                            )
-                            .expect("elicit result"),
-                        };
-                        let payload = serde_json::to_vec(&reply).expect("encode reply");
-                        plug_core::ipc::write_frame(stream, &payload)
-                            .await
-                            .expect("write reverse reply");
-                        continue;
-                    }
-                    other => panic!("unexpected envelope {other:?}"),
-                }
-            } else {
-                frame
-            };
-            assert_v3_frame(&body);
-            let response: IpcResponse = serde_json::from_slice(&body).expect("decode reply");
-            if is_ipc_push_notification(&response) {
-                continue;
-            }
-            return (response, reverse_requests);
-        }
-    }
-
-    fn reply_text(response: &IpcResponse) -> String {
-        let IpcResponse::McpResponse { payload } = response else {
-            panic!("expected an MCP response, got {response:?}");
-        };
-        payload["content"][0]["text"]
-            .as_str()
-            .expect("text content")
-            .to_string()
-    }
-
-    /// A `plug connect` started before an upgrade speaks v3. It must keep
-    /// working against the new daemon until its host restarts it.
-    #[tokio::test]
-    async fn v3_proxy_keeps_working_against_this_daemon() {
-        let mut harness = IpcTestHarness::start_registered(
-            vec![(
-                "mock",
-                ipc_harness_mock_config_with(
-                    "echo,chunked_text",
-                    &["--reverse-request", "elicitation"],
-                ),
-            )],
-            3,
-        )
-        .await;
-        let session_id = harness.session_id.clone();
-
-        let capabilities: rmcp::model::ClientCapabilities =
-            serde_json::from_value(serde_json::json!({ "elicitation": {} }))
-                .expect("client capabilities");
-        write_ipc(
-            &mut harness.stream,
-            &IpcRequest::UpdateCapabilities {
-                session_id: session_id.clone(),
-                capabilities: Box::new(capabilities),
-            },
-        )
-        .await;
-        let (reply, _) = read_v3_reply(&mut harness.stream).await;
-        assert!(matches!(reply, IpcResponse::Ok), "{reply:?}");
-
-        // A call whose upstream asks the client for input mid-call.
-        write_ipc(
-            &mut harness.stream,
-            &tool_call_request(&session_id, "Mock__echo"),
-        )
-        .await;
-        let (reply, reverse_requests) = read_v3_reply(&mut harness.stream).await;
-        assert_eq!(reverse_requests, 1);
-        assert!(
-            reply_text(&reply).contains("reverse=elicitation:Accept"),
-            "{reply:?}"
-        );
-
-        // A reply over MAX_FRAME_SIZE arrives in chunks.
-        write_ipc(
-            &mut harness.stream,
-            &tool_call_request(&session_id, "Mock__chunked_text"),
-        )
-        .await;
-        let (reply, _) = read_v3_reply(&mut harness.stream).await;
-        assert_eq!(reply_text(&reply).len(), 6 * 1024 * 1024);
-
-        write_ipc(
-            &mut harness.stream,
-            &IpcRequest::Ping {
-                session_id: session_id.clone(),
-            },
-        )
-        .await;
-        let (reply, _) = read_v3_reply(&mut harness.stream).await;
-        assert!(matches!(reply, IpcResponse::Pong), "{reply:?}");
-
-        harness.shutdown().await;
-    }
-
     #[tokio::test]
     async fn register_rejects_versions_outside_the_supported_range() {
         for version in [
-            plug_core::ipc::IPC_PROTOCOL_VERSION_MIN - 1,
+            plug_core::ipc::IPC_PROTOCOL_VERSION - 1,
             plug_core::ipc::IPC_PROTOCOL_VERSION + 1,
         ] {
             let (client_registry, _count_rx) = ClientRegistry::new();
@@ -5492,7 +5106,7 @@ mod tests {
         .await;
         let session_id = harness.session_id.clone();
 
-        let limit = MAX_CONCURRENT_REQUESTS_PER_CONNECTION as u64;
+        let limit = ipc::MAX_CONCURRENT_REQUESTS_PER_CONNECTION as u64;
         for ipc_id in 1..=limit + 1 {
             write_tagged_ipc(
                 &mut harness.stream,
