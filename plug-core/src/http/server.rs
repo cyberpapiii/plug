@@ -4,16 +4,15 @@ use super::fanout::drain_targeted_notifications;
 use super::guard::{validate_bearer_auth, validate_modern_request, validate_origin};
 use super::identity::{
     AuthStatus, HttpDownstreamContext, HttpRequestCancellationGuard, grant_task_owner,
-    legacy_http_policy_context,
 };
 use super::response::{
     LONG_CALL_AFTER, answer_or_keep_open, header_mismatch_response, json_response_for_era,
     json_response_with_session, mark_private, modern_sse_response,
 };
-use super::reverse::{HttpBridge, handle_client_response, maybe_request_http_roots};
+use super::reverse::{handle_client_response, maybe_request_http_roots};
 use super::session_binding::{
     bind_session_to_caller, extract_session_id, reopen_lost_session, session_is_the_callers,
-    validate_session_header,
+    validate_session_header, wire_session,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -41,7 +40,6 @@ use crate::mcp_http_headers::{
     TRACEPARENT_HEADER, inject_trace_context, validate_mirrored_headers,
     validate_required_mirrored_headers,
 };
-use crate::notifications::NotificationTarget;
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 use crate::session::{SessionEnd, SessionStore};
 
@@ -371,7 +369,7 @@ pub(super) async fn post_mcp(
         crate::protocol::rewrite_legacy_request(&mut raw_message);
         // `initialize` opens a session of its own.
         if raw_message.get("method").and_then(|method| method.as_str()) != Some("initialize") {
-            reopen_lost_session(&state, &headers, &auth_status).await;
+            reopen_lost_session(&state, &headers, &auth_status).await?;
         }
     }
     let method = raw_message
@@ -466,24 +464,7 @@ pub(super) async fn post_mcp(
                     }
                 }
                 ClientNotification::InitializedNotification(_) => {
-                    maybe_request_http_roots(Arc::clone(&state), session_id.clone());
-                    let caps = state
-                        .client_capabilities
-                        .get(&session_id)
-                        .map(|c| c.clone())
-                        .unwrap_or_default();
-                    let session_arc = Arc::<str>::from(session_id.as_str());
-                    let bridge = Arc::new(HttpBridge {
-                        state: Arc::clone(&state),
-                        session_id: Arc::clone(&session_arc),
-                        capabilities: caps,
-                    });
-                    state.router.register_downstream_bridge(
-                        NotificationTarget::Http {
-                            session_id: session_arc,
-                        },
-                        bridge,
-                    );
+                    wire_session(&state, &session_id);
                 }
                 ClientNotification::RootsListChangedNotification(_) => {
                     maybe_request_http_roots(Arc::clone(&state), session_id.clone());
@@ -567,7 +548,7 @@ pub(super) async fn get_mcp(
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let session_id = extract_session_id(&headers)?;
-    reopen_lost_session(&state, &headers, &auth_status).await;
+    reopen_lost_session(&state, &headers, &auth_status).await?;
     state.sessions.validate(&session_id)?;
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
@@ -695,14 +676,8 @@ pub(super) async fn handle_request(
                 selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "HTTP client connected"
             );
-            let _ = state.sessions.set_client_type(&session_id, client_type);
-            let policy_context = legacy_http_policy_context(
-                state,
-                &auth_status,
-                request_id.clone(),
-                Arc::clone(&trace_id),
-            );
-            bind_session_to_caller(state, &session_id, &auth_status, &policy_context)?;
+            state.sessions.set_client_type(&session_id, client_type)?;
+            bind_session_to_caller(state, &session_id, &auth_status)?;
             state
                 .client_capabilities
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
@@ -922,11 +897,15 @@ mod tests {
             .await
             .expect("issued token must validate");
         let state = test_state();
-        let context = legacy_http_policy_context(
-            &state,
-            &AuthStatus::Authenticated(Some(claims)),
-            RequestId::Number(91),
-            Arc::from("legacy-oauth-scope-gate"),
+        let context = crate::dispatch::DownstreamContext::downstream_call_context(
+            &HttpDownstreamContext::new(
+                &state,
+                AuthStatus::Authenticated(Some(claims)),
+                Some("legacy-oauth-scope-gate"),
+                RequestId::Number(91),
+                Arc::from("legacy-oauth-scope-gate"),
+                None,
+            ),
         );
 
         assert!(
@@ -1949,10 +1928,7 @@ mod tests {
             )
             .with_auth(crate::http::server::HttpAuth::Oauth(manager.clone()));
             let theirs = state.sessions.create_session().unwrap();
-            state
-                .sessions
-                .set_grant(&theirs, client_id.clone())
-                .unwrap();
+            bind_for_tests(&state.sessions, &theirs, Some(&client_id));
             let other = state.sessions.create_session().unwrap();
             let owner = grant_task_owner(&manager, &client_id);
             router

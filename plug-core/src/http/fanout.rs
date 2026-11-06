@@ -321,13 +321,7 @@ mod tests {
         // This test drives the SSE stream without going through initialize, so
         // it has to record the audience initialize would have resolved for an
         // unauthenticated loopback listener.
-        state
-            .sessions
-            .set_broadcast_audience(
-                &session_id,
-                crate::session::BroadcastAudience::unrestricted(),
-            )
-            .unwrap();
+        bind_for_tests(&state.sessions, &session_id, None);
         let sse_req = HttpRequest::builder()
             .method("GET")
             .uri("/mcp")

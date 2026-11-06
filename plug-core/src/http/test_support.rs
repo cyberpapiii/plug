@@ -391,3 +391,20 @@ pub(crate) fn bare_router() -> Arc<ToolRouter> {
     let sm = Arc::new(crate::server::ServerManager::new());
     Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()))
 }
+
+/// Bind `session_id` the way `initialize` would, under `grant`'s client when
+/// one is given, with every broadcast admitted.
+pub(crate) fn bind_for_tests(sessions: &SessionStore, session_id: &str, grant: Option<&str>) {
+    sessions
+        .bind(
+            session_id,
+            crate::session::SessionBinding {
+                grant: grant.map(|client_id| crate::session::GrantBinding {
+                    client_id: client_id.to_string(),
+                    still_allowed: Arc::new(|| true),
+                }),
+                broadcast_audience: crate::session::BroadcastAudience::unrestricted(),
+            },
+        )
+        .expect("bind test session");
+}

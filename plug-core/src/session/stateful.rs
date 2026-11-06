@@ -562,14 +562,14 @@ impl SessionStore {
         Ok(true)
     }
 
-    /// Make `session_id` look idle for two minutes.
+    /// Make `session_id` look idle for two minutes past its timeout.
     #[cfg(test)]
     pub(crate) fn backdate_for_tests(&self, session_id: &str) {
         self.sessions
             .get_mut(session_id)
             .expect("session")
             .last_activity = Instant::now()
-            .checked_sub(Duration::from_secs(120))
+            .checked_sub(self.timeout + Duration::from_secs(120))
             .expect("backdate instant");
     }
 
@@ -626,38 +626,23 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), SessionError> {
-        let mut entry = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionError::NotFound)?;
-        entry.grant = Some(client_id);
-        Ok(())
-    }
-
-    pub fn set_access_check(
+    /// Tie `session_id` to the caller that opened it.
+    pub fn bind(
         &self,
         session_id: &str,
-        check: crate::session::AccessCheck,
+        binding: crate::session::SessionBinding,
     ) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
             .ok_or(SessionError::NotFound)?;
-        entry.still_allowed = Some(check);
-        Ok(())
-    }
-
-    pub fn set_broadcast_audience(
-        &self,
-        session_id: &str,
-        audience: crate::session::BroadcastAudience,
-    ) -> Result<(), SessionError> {
-        let mut entry = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionError::NotFound)?;
-        entry.broadcast_audience = audience;
+        let (grant, still_allowed) = binding
+            .grant
+            .map(|grant| (grant.client_id, grant.still_allowed))
+            .unzip();
+        entry.grant = grant;
+        entry.still_allowed = still_allowed;
+        entry.broadcast_audience = binding.broadcast_audience;
         Ok(())
     }
 
@@ -804,6 +789,27 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{AccessCheck, BroadcastAudience, GrantBinding, SessionBinding};
+
+    /// Bind `id` with the full audience, under `grant` when one is given.
+    fn bind(store: &SessionStore, id: &str, grant: Option<(&str, AccessCheck)>) {
+        store
+            .bind(
+                id,
+                SessionBinding {
+                    grant: grant.map(|(client_id, still_allowed)| GrantBinding {
+                        client_id: client_id.to_string(),
+                        still_allowed,
+                    }),
+                    broadcast_audience: BroadcastAudience::unrestricted(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn always() -> AccessCheck {
+        Arc::new(|| true)
+    }
 
     fn store_reporting_to(
         timeout_secs: u64,
@@ -1111,15 +1117,13 @@ mod tests {
         let allowed = Arc::new(AtomicBool::new(true));
         for id in [&used, &idle] {
             let allowed = Arc::clone(&allowed);
-            store
-                .set_access_check(id, Arc::new(move || allowed.load(Ordering::SeqCst)))
-                .unwrap();
+            bind(
+                &store,
+                id,
+                Some(("client", Arc::new(move || allowed.load(Ordering::SeqCst)))),
+            );
         }
-        for id in [&used, &idle, &other] {
-            store
-                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
-                .unwrap();
-        }
+        bind(&store, &other, None);
         assert!(store.validate(&used).is_ok());
 
         // Nobody ended these sessions by name. Access went away underneath.
@@ -1130,12 +1134,14 @@ mod tests {
         let (stream, mut events) = mpsc::channel(4);
         store.set_sse_sender(&sent_to, stream, None).unwrap();
         let allowed_too = Arc::clone(&allowed);
-        store
-            .set_access_check(
-                &sent_to,
+        bind(
+            &store,
+            &sent_to,
+            Some((
+                "client",
                 Arc::new(move || allowed_too.load(Ordering::SeqCst)),
-            )
-            .unwrap();
+            )),
+        );
         let message = crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap();
         assert!(matches!(
             store.send_to_live_session(&sent_to, message),
@@ -1168,12 +1174,10 @@ mod tests {
         let store = SessionStore::new(60, 100);
         let theirs = store.create_session().unwrap();
         let shared = store.create_session().unwrap();
-        store.set_grant(&theirs, "client-abc".to_string()).unwrap();
+        bind(&store, &theirs, Some(("client-abc", always())));
+        bind(&store, &shared, None);
         let mut streams = Vec::new();
         for id in [&theirs, &shared] {
-            store
-                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
-                .unwrap();
             let (stream, events) = mpsc::channel(4);
             store.set_sse_sender(id, stream, None).unwrap();
             streams.push(events);
@@ -1201,8 +1205,8 @@ mod tests {
         let theirs = store.create_session().unwrap();
         let other = store.create_session().unwrap();
         let unowned = store.create_session().unwrap();
-        store.set_grant(&theirs, "client-abc".to_string()).unwrap();
-        store.set_grant(&other, "client-xyz".to_string()).unwrap();
+        bind(&store, &theirs, Some(("client-abc", always())));
+        bind(&store, &other, Some(("client-xyz", always())));
         let (stream, mut events) = mpsc::channel(4);
         store.set_sse_sender(&theirs, stream, None).unwrap();
         assert_eq!(store.grant_of(&theirs).as_deref(), Some("client-abc"));
@@ -1228,13 +1232,18 @@ mod tests {
     fn a_session_opened_with_a_grant_reports_that_grant() {
         let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
-        store.set_grant(&id, "client-abc".to_string()).unwrap();
+        bind(&store, &id, Some(("client-abc", always())));
 
         assert_eq!(store.snapshots()[0].grant.as_deref(), Some("client-abc"));
-        assert!(
-            store
-                .set_grant("missing", "client-abc".to_string())
-                .is_err()
+        assert_eq!(
+            store.bind(
+                "missing",
+                SessionBinding {
+                    grant: None,
+                    broadcast_audience: BroadcastAudience::unrestricted(),
+                },
+            ),
+            Err(SessionError::NotFound)
         );
     }
 
@@ -1269,9 +1278,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx, None).unwrap();
         // Admit the kind, so expiry is the only thing that can stop delivery.
-        store
-            .set_broadcast_audience(&id, crate::session::BroadcastAudience::unrestricted())
-            .unwrap();
+        bind(&store, &id, None);
 
         tokio::time::sleep(Duration::from_millis(10)).await;
         store.broadcast(
@@ -1298,9 +1305,7 @@ mod tests {
         store.set_sse_sender(&fast_id, fast_tx, None).unwrap();
         // Admit the kind on both, so a full sender is the only obstacle.
         for id in [&slow_id, &fast_id] {
-            store
-                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
-                .unwrap();
+            bind(&store, id, None);
         }
 
         slow_tx
@@ -1345,19 +1350,20 @@ mod tests {
             .unwrap();
 
         store
-            .set_broadcast_audience(
+            .bind(
                 &narrow_id,
-                crate::session::BroadcastAudience {
-                    tools: true,
-                    resources: false,
-                    prompts: false,
-                    logging: false,
+                SessionBinding {
+                    grant: None,
+                    broadcast_audience: BroadcastAudience {
+                        tools: true,
+                        resources: false,
+                        prompts: false,
+                        logging: false,
+                    },
                 },
             )
             .unwrap();
-        store
-            .set_broadcast_audience(&wide_id, crate::session::BroadcastAudience::unrestricted())
-            .unwrap();
+        bind(&store, &wide_id, None);
 
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "resources"}))

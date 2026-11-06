@@ -126,25 +126,6 @@ pub(super) fn grant_task_owner(
     .task_owner(None)
 }
 
-pub(super) fn legacy_http_policy_context(
-    state: &HttpState,
-    auth_status: &AuthStatus,
-    request_id: RequestId,
-    trace_id: Arc<str>,
-) -> DownstreamCallContext {
-    let context = DownstreamCallContext::http(
-        "legacy-http-policy",
-        request_id,
-        crate::types::ClientType::Unknown,
-    )
-    .with_trace_id(trace_id);
-    apply_http_auth(
-        context,
-        auth_status,
-        state.downstream_oauth().map(|manager| manager.base_url()),
-    )
-}
-
 /// Attach what the request proved about its caller to a call context.
 ///
 /// An OAuth token carries its granted scopes and principal lifecycle. The

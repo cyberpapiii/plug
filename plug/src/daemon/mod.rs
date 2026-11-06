@@ -2580,8 +2580,17 @@ allowed_servers = ["slack"]
         let session_id = ctx.http.sessions.create_session().expect("session");
         ctx.http
             .sessions
-            .set_grant(&session_id, client.client_id.clone())
-            .expect("set grant");
+            .bind(
+                &session_id,
+                plug_core::session::SessionBinding {
+                    grant: Some(plug_core::session::GrantBinding {
+                        client_id: client.client_id.clone(),
+                        still_allowed: Arc::new(|| true),
+                    }),
+                    broadcast_audience: plug_core::session::BroadcastAudience::unrestricted(),
+                },
+            )
+            .expect("bind session");
         let resource = manager.resource();
         let owner = plug_core::downstream_identity::HttpCredential::Grant {
             issuer: manager.base_url(),
