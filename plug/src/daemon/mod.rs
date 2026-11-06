@@ -2509,7 +2509,7 @@ mod tests {
 
     pub(super) fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
         let config = plug_core::config::load_config(Some(&config_path)).unwrap();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         let client_registry = ClientRegistry::new();
         test_connection_context(
             &engine,
@@ -2636,7 +2636,7 @@ mod tests {
         config
             .servers
             .insert("mock".to_string(), mock_server("echo"));
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
         let oauth_path =
             std::env::temp_dir().join(format!("plug-daemon-revoke-{}.json", uuid::Uuid::new_v4()));
@@ -2891,7 +2891,7 @@ mod tests {
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
 
         let startup = {
             let engine = engine.clone();
@@ -2958,7 +2958,7 @@ mod tests {
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
 
         let result = run_daemon(engine, config_path).await;
         assert!(result.is_err(), "losing concurrent start should fail");
@@ -2999,7 +2999,7 @@ mod tests {
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
 
         let result = run_daemon(engine, config_path).await;
         assert!(
@@ -3264,7 +3264,7 @@ mod tests {
             for (name, server) in servers {
                 config.servers.insert(name.to_string(), server);
             }
-            let engine = Arc::new(Engine::new(config));
+            let engine = Engine::new(config);
             engine.start().await.expect("engine start");
 
             // Short unique socket path in /tmp — a Unix socket path must fit in
@@ -3498,7 +3498,7 @@ mod tests {
     #[tokio::test]
     async fn idle_registered_connection_services_reverse_request_without_new_client_frame() {
         let config = plug_core::config::Config::default();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
 
         let socket_path = std::path::PathBuf::from(format!(
@@ -3654,7 +3654,7 @@ mod tests {
     /// without sending another request.
     #[tokio::test]
     async fn registered_connection_is_pushed_modern_gate_changes() {
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
 
         let socket_path = std::path::PathBuf::from(format!(
@@ -3724,7 +3724,7 @@ mod tests {
     #[tokio::test]
     async fn failed_deregister_does_not_kill_reverse_channel() {
         let config = plug_core::config::Config::default();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
 
         let socket_path = std::path::PathBuf::from(format!(
@@ -4013,7 +4013,7 @@ mod tests {
         config
             .servers
             .insert("mock".to_string(), parity_mock_config());
-        Arc::new(Engine::new(config))
+        Engine::new(config)
     }
 
     /// HTTP: drive a `tools/call` through the real axum router and return the raw
@@ -4709,7 +4709,7 @@ mod tests {
             plug_core::ipc::IPC_PROTOCOL_VERSION + 1,
         ] {
             let client_registry = ClientRegistry::new();
-            let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+            let engine = Engine::new(plug_core::config::Config::default());
             let mut ctx = test_connection_context(
                 &engine,
                 CancellationToken::new(),

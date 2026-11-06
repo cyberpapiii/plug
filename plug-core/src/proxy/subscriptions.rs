@@ -2,6 +2,7 @@ use super::*;
 
 use dashmap::Entry as DashEntry;
 use tokio::sync::watch;
+use tokio_util::task::TaskTracker;
 
 /// Per-URI resource subscription registry with atomic subscribe/unsubscribe
 /// transitions across the upstream MCP call.
@@ -28,9 +29,8 @@ use tokio::sync::watch;
 ///   is still `Pending` on its own generation — a `Draining` marker set
 ///   mid-flight belongs to the queued drain and is never overwritten.
 /// - Every upstream `subscribe`/`unsubscribe` transition runs inside a task
-///   spawned detached from the calling request (via `Engine::tracker()`,
-///   falling back to a raw `tokio::spawn` if no engine reference is
-///   available yet or it is tearing down) so that cancelling/dropping the
+///   spawned detached from the calling request (on the runtime's
+///   `TaskTracker`) so that cancelling/dropping the
 ///   caller's future can never leave the per-URI transition lock held
 ///   forever or abandon an upstream call mid-flight.
 /// - Every MCP `resources/subscribe` and `resources/unsubscribe` call in
@@ -46,10 +46,8 @@ pub(super) struct SubscriptionRegistry {
     /// protocol for no real benefit.
     transition_locks: DashMap<String, Arc<Mutex<()>>>,
     next_generation: AtomicU64,
-    /// Weak reference to Engine, used to spawn transitions on its
-    /// `TaskTracker` so they participate in ordered shutdown. Set once via
-    /// `set_engine()`, mirroring `ToolRouter::engine`.
-    engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    /// Where transitions are spawned, so shutdown waits for them.
+    tracker: TaskTracker,
     /// Resolves a server id to its current upstream handle at drain time.
     /// Set once via `set_owner_resolver()` (production: a
     /// `ServerManager::get_upstream` lookup). Drains prefer the entry's
@@ -283,23 +281,15 @@ enum DrainOrigin {
 }
 
 impl SubscriptionRegistry {
-    pub(super) fn new() -> Arc<Self> {
+    pub(super) fn new(tracker: TaskTracker) -> Arc<Self> {
         Arc::new(Self {
             entries: DashMap::new(),
             transition_locks: DashMap::new(),
             next_generation: AtomicU64::new(0),
-            engine: std::sync::RwLock::new(None),
+            tracker,
             owner_resolver: std::sync::RwLock::new(None),
             post_confirm_hook: std::sync::RwLock::new(None),
         })
-    }
-
-    pub(super) fn set_engine(&self, engine: Weak<Engine>) {
-        let mut guard = self
-            .engine
-            .write()
-            .expect("engine RwLock poisoned — prior panic");
-        *guard = Some(engine);
     }
 
     pub(super) fn set_owner_resolver(&self, resolver: OwnerResolver) {
@@ -350,13 +340,6 @@ impl SubscriptionRegistry {
             return resolver(owner_id);
         }
         fallback
-    }
-
-    fn upgrade_engine(&self) -> Option<Arc<Engine>> {
-        self.engine
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
     }
 
     /// Number of resource URIs currently tracked (any state), matching what
@@ -441,15 +424,7 @@ impl SubscriptionRegistry {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        if let Some(engine) = self.upgrade_engine() {
-            engine.tracker().spawn(fut);
-        } else {
-            // No engine reference yet (bare registry in unit tests) or the
-            // engine is already tearing down — fall back to a raw detached
-            // task so the transition still completes and any waiter on the
-            // watch channel doesn't hang forever.
-            tokio::spawn(fut);
-        }
+        self.tracker.spawn(fut);
     }
 
     async fn await_transition(mut rx: watch::Receiver<TransitionSignal>) -> Result<(), McpError> {
@@ -1787,7 +1762,7 @@ mod tests {
 
     #[tokio::test]
     async fn piggy_backer_during_failed_first_subscribe_gets_error() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
         mock.set_subscribe_result(Err(some_error()));
 
@@ -1825,7 +1800,7 @@ mod tests {
 
     #[tokio::test]
     async fn piggy_backer_during_successful_first_subscribe_gets_ok() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
 
         let entered = mock.subscribe_entered.notified();
@@ -1859,7 +1834,7 @@ mod tests {
 
     #[tokio::test]
     async fn subscribe_during_drain_waits_for_unsubscribe() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         // A subscribes successfully first (subscribe gate is open, completes
@@ -1920,7 +1895,7 @@ mod tests {
 
     #[tokio::test]
     async fn unsubscribe_last_client_calls_upstream_once() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
 
         registry
@@ -1957,7 +1932,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_during_subscribe_uses_drain_generation() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         registry
@@ -2030,7 +2005,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_member_leaving_during_pending_subscribe_drains_after_subscribe() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
 
         let entered = mock.subscribe_entered.notified();
@@ -2077,7 +2052,7 @@ mod tests {
 
     #[tokio::test]
     async fn prune_during_pending_subscribe_prevents_transient_active_piggyback() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_gates(false, false);
 
         let entered_sub = mock.subscribe_entered.notified();
@@ -2152,7 +2127,7 @@ mod tests {
 
     #[tokio::test]
     async fn first_subscriber_cancelled_transition_still_completes() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_subscribe_gate();
 
         let entered = mock.subscribe_entered.notified();
@@ -2189,7 +2164,7 @@ mod tests {
 
     #[tokio::test]
     async fn last_unsubscriber_cancelled_mid_flight_then_new_subscriber() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         registry
@@ -2235,7 +2210,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_serializes_against_downstream_transitions() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::with_closed_subscribe_gate();
 
@@ -2304,7 +2279,7 @@ mod tests {
     /// migration failed and removed the entry.
     #[tokio::test]
     async fn equivalent_concurrent_rebinds_share_authoritative_failure() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::new();
         new_mock.set_subscribe_result(Err(some_error()));
@@ -2372,7 +2347,7 @@ mod tests {
 
     #[tokio::test]
     async fn rebind_of_emptied_entry_drains_old_owner_instead_of_reviving() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::new();
 
@@ -2444,7 +2419,7 @@ mod tests {
     /// entry gone and never touch the new owner.
     #[tokio::test]
     async fn drain_prefers_recorded_owner_over_route_resolved_fallback() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let old_mock = MockUpstream::new();
         let new_mock = MockUpstream::new();
 
@@ -2520,7 +2495,7 @@ mod tests {
     /// the old owner instead of silently leaking the upstream subscription.
     #[tokio::test]
     async fn racing_subscribe_during_prune_records_owner_for_routeless_drain() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::with_closed_unsubscribe_gate();
 
         let resolver_mock = Arc::clone(&mock);
@@ -2604,7 +2579,7 @@ mod tests {
     /// first poll.
     #[tokio::test]
     async fn different_owner_supersede_releases_the_displaced_upstream() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let s1 = MockUpstream::new();
         let s2 = MockUpstream::new();
 
@@ -2671,7 +2646,7 @@ mod tests {
     /// gain. One redundant `subscribe` is the accepted cost.
     #[tokio::test]
     async fn same_owner_supersede_does_not_release_the_upstream() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
 
         let resolver_mock = Arc::clone(&mock);
@@ -2714,7 +2689,7 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_subscribe_unsubscribe_smoke() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         let uri = "file:///smoke";
 
@@ -2748,7 +2723,7 @@ mod tests {
 
     #[test]
     fn test_only_seed_helper_marks_entry_active() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         assert!(registry.is_empty());
         registry.insert_active_for_test("file:///seed", client("seed"));
         assert_eq!(registry.len(), 1);
@@ -2760,7 +2735,7 @@ mod tests {
     /// confirmed as `owner` (via a real subscribe transition against a
     /// mock upstream).
     async fn registry_with_confirmed_owner(uri: &str, owner: &str) -> Arc<SubscriptionRegistry> {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         registry
             .subscribe(
@@ -2782,7 +2757,7 @@ mod tests {
         uri: &str,
         owner: &str,
     ) -> (Arc<SubscriptionRegistry>, Arc<MockUpstream>) {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         let resolver_mock = Arc::clone(&mock);
         let owner_id = owner.to_string();
@@ -2871,7 +2846,7 @@ mod tests {
     /// returns success for a subscription that no upstream is holding.
     #[tokio::test]
     async fn subscribe_after_reconnect_does_not_short_circuit_on_active() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         registry
             .subscribe(
@@ -2908,7 +2883,7 @@ mod tests {
     /// piggybacking subscribe into a redundant upstream round trip.
     #[tokio::test]
     async fn subscribe_on_a_live_connection_still_short_circuits() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         let mock = MockUpstream::new();
         registry
             .subscribe(
@@ -2969,7 +2944,7 @@ mod tests {
     /// rebinds for in-flight subscribes.
     #[test]
     fn classify_unconfirmed_owner_with_unchanged_route_produces_nothing() {
-        let registry = SubscriptionRegistry::new();
+        let registry = SubscriptionRegistry::new(TaskTracker::new());
         // Seed helper records no owner (owner_server_id: None).
         registry.insert_active_for_test("file:///x", client("a"));
 

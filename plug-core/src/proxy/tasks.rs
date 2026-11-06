@@ -1454,7 +1454,7 @@ mod tests {
         let handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            crate::server::no_events(),
         ));
         let client = handler
             .serve(client_transport)
@@ -2433,7 +2433,7 @@ mod tests {
         let handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            crate::server::no_events(),
         ));
         let client = handler
             .serve(client_transport)
@@ -2724,7 +2724,7 @@ mod tests {
         mock.args
             .extend(["--fail-mode".to_string(), "crash".to_string()]);
         config.servers.insert("mock".to_string(), mock);
-        let engine = Arc::new(crate::engine::Engine::new(config));
+        let engine = crate::engine::Engine::new(config);
         engine.start().await.expect("engine start");
         let router = Arc::clone(engine.tool_router());
 

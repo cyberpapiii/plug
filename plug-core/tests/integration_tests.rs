@@ -1310,7 +1310,7 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         "gated".to_string(),
         lifecycle_server_config("legacy-only", UpstreamProtocolMode::Modern, &gated_log),
     );
-    let gated_engine = Arc::new(Engine::new(gated_config));
+    let gated_engine = Engine::new(gated_config);
     gated_engine
         .start()
         .await
@@ -1347,7 +1347,7 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         "auto".to_string(),
         lifecycle_server_config("legacy-only", UpstreamProtocolMode::Auto, &auto_log),
     );
-    let auto_engine = Arc::new(Engine::new(auto_config));
+    let auto_engine = Engine::new(auto_config);
     auto_engine.start().await.expect("start auto fallback path");
     let auto_sequence = lifecycle_sequence(&auto_log);
     assert_eq!(
@@ -1382,7 +1382,7 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         "modern".to_string(),
         lifecycle_server_config("modern-only", UpstreamProtocolMode::Modern, &modern_log),
     );
-    let modern_engine = Arc::new(Engine::new(modern_config));
+    let modern_engine = Engine::new(modern_config);
     modern_engine
         .start()
         .await
@@ -1486,7 +1486,7 @@ async fn legacy_task_child_process_stdio_preserves_full_lifecycle_under_rmcp3() 
     let mut config = Config::default();
     config.servers.insert("legacy-task".to_string(), server);
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("start raw legacy task child");
     let router = engine.tool_router();
     let tool_name = router
@@ -1567,7 +1567,7 @@ async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
     server.call_timeout_secs = 1;
     config.servers.insert("mock".to_string(), server);
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     // Without the per-server listing timeout this hangs forever; with it the
@@ -1611,7 +1611,7 @@ async fn catalog_families_fetch_concurrently() {
     server.args.push("600".to_string());
     config.servers.insert("mock".to_string(), server);
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let started = std::time::Instant::now();
@@ -1657,7 +1657,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     server.call_timeout_secs = 2;
     config.servers.insert("mock".to_string(), server);
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
     let router = engine.tool_router();
     let uri = "file:///tmp/mock-resource.txt";
@@ -1934,7 +1934,7 @@ async fn test_stdio_timeout_reconnects_cleanly() {
         },
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let first = engine.tool_router().call_tool("Mock__echo", None).await;
@@ -2000,7 +2000,7 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
         },
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let call = || async {
@@ -2273,7 +2273,7 @@ async fn run_http_upstream_crash_restart_scenario(
         },
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     // Phase 1: baseline call succeeds against the live upstream.
@@ -2432,7 +2432,7 @@ async fn test_end_to_end_proxy_path() {
         .servers
         .insert("mock".to_string(), mock_server("echo,greet"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2501,7 +2501,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
         .servers
         .insert("mock".to_string(), mock_server("echo"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let state = Arc::new(HttpState::new(
@@ -2618,7 +2618,7 @@ async fn an_mcp_app_reaches_the_client_whole() {
     mock.args.push("--resources".to_string());
     config.servers.insert("mock".to_string(), mock);
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2684,7 +2684,7 @@ async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
         .insert("mock".to_string(), mock_server("echo,greet"));
     config.disabled_tools = vec!["Mock__greet".to_string()];
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2717,7 +2717,7 @@ async fn test_structured_content_passes_through_end_to_end() {
         .servers
         .insert("mock".to_string(), mock_server("structured"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2745,7 +2745,7 @@ async fn test_resource_link_passes_through_end_to_end() {
         .servers
         .insert("mock".to_string(), mock_server("resource_link"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2773,7 +2773,7 @@ async fn test_oversized_tool_result_spills_to_artifact_link() {
         .servers
         .insert("mock".to_string(), mock_server("artifact_text"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2805,7 +2805,7 @@ async fn test_artifact_manifest_is_readable() {
         .servers
         .insert("mock".to_string(), mock_server("artifact_text"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2847,7 +2847,7 @@ async fn test_artifact_chunk_is_readable() {
         .servers
         .insert("mock".to_string(), mock_server("artifact_text"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2887,7 +2887,7 @@ async fn test_attachment_like_tool_result_spills_to_artifact_link() {
         .servers
         .insert("mock".to_string(), mock_server("attachment_blob"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect(engine.tool_router().clone());
@@ -2915,7 +2915,7 @@ async fn test_http_structured_content_passes_through_end_to_end() {
         .servers
         .insert("mock".to_string(), mock_server("structured"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let state = Arc::new(HttpState::new(
@@ -2990,7 +2990,7 @@ async fn test_http_resource_link_passes_through_end_to_end() {
         .servers
         .insert("mock".to_string(), mock_server("resource_link"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let state = Arc::new(HttpState::new(
@@ -3066,7 +3066,7 @@ async fn test_http_oversized_tool_result_spills_to_artifact_link() {
         .servers
         .insert("mock".to_string(), mock_server("artifact_text"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let state = Arc::new(HttpState::new(
@@ -3141,7 +3141,7 @@ async fn test_multi_client_shared_engine_isolation() {
         .servers
         .insert("mock".to_string(), mock_server("echo"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client_a = Downstream::connect(engine.tool_router().clone());
@@ -3534,7 +3534,7 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
             },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -3686,7 +3686,7 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
             },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -3811,7 +3811,7 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
             },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -3899,7 +3899,7 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
 },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -3979,7 +3979,7 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
 },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -4074,7 +4074,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
             },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -4160,7 +4160,7 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
             },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -4234,7 +4234,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
         .servers
         .insert("mock".to_string(), mock_server("echo"));
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
@@ -4478,7 +4478,7 @@ async fn test_elicitation_reverse_request_round_trip() {
         mock_server_config_with_reverse_request("echo", "elicitation"),
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect_with_bridge(
@@ -4528,7 +4528,7 @@ async fn test_sampling_reverse_request_round_trip() {
         mock_server_config_with_reverse_request("echo", "sampling"),
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let client = Downstream::connect_with_bridge(
@@ -4575,7 +4575,7 @@ async fn test_http_elicitation_reverse_request_round_trip() {
         mock_server_config_with_reverse_request("echo", "elicitation"),
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let state = Arc::new(HttpState::new(
@@ -4749,7 +4749,7 @@ async fn test_http_sampling_reverse_request_round_trip() {
         mock_server_config_with_reverse_request("echo", "sampling"),
     );
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
 
     let state = Arc::new(HttpState::new(
@@ -5164,7 +5164,7 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
             },
         );
 
-        let started_engine = Arc::new(Engine::new(config));
+        let started_engine = Engine::new(config);
         started_engine.start().await.expect("engine start");
         engine = Some(Arc::clone(&started_engine));
 
@@ -5329,7 +5329,7 @@ async fn an_openapi_document_becomes_a_server() {
     config.servers.insert("pets".to_string(), api.clone());
     assert!(validate_config(&config).is_empty());
 
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
     let router = engine.tool_router();
 
@@ -5375,7 +5375,7 @@ async fn an_openapi_document_becomes_a_server() {
     let mut config = Config::default();
     config.servers.insert("pets".to_string(), api);
     assert!(validate_config(&config).is_empty());
-    let engine = Arc::new(Engine::new(config));
+    let engine = Engine::new(config);
     engine.start().await.expect("engine start");
     let arguments = serde_json::json!({ "id": "rex" });
     let found = engine

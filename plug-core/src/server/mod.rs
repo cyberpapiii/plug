@@ -5,8 +5,8 @@ use std::ffi::OsString;
 use std::future::Future;
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
 use arc_swap::ArcSwap;
@@ -18,10 +18,10 @@ use rmcp::handler::client::ClientHandler;
 use rmcp::model::{
     CancelledNotificationParam, ClientInfo, CreateMessageRequestParams, CreateMessageResult,
     ElicitRequestParams, ElicitResult, ElicitationCapability, FormElicitationCapability,
-    Implementation, InitializedNotification, LoggingMessageNotificationParam,
-    ProgressNotificationParam, Prompt, Resource, ResourceTemplate,
-    ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability, ServerCapabilities,
-    SetLevelRequestParams, Tool, UrlElicitationCapability,
+    Implementation, InitializedNotification, ListRootsResult, LoggingLevel,
+    LoggingMessageNotificationParam, ProgressNotificationParam, Prompt, RequestId, Resource,
+    ResourceTemplate, ResourceUpdatedNotificationParam, RootsCapabilities, SamplingCapability,
+    ServerCapabilities, SetLevelRequestParams, Tool, UrlElicitationCapability,
 };
 use rmcp::service::{NotificationContext, RequestContext};
 use rmcp::transport::streamable_http_client::{
@@ -33,7 +33,6 @@ use sse_stream::{Error as SseError, Sse};
 
 use crate::circuit::{CircuitBreaker, CircuitBreakerConfig};
 use crate::config::{Config, ServerConfig, TransportType, UpstreamProtocolMode};
-use crate::proxy::ToolRouter;
 use crate::transport::sse_client::{LegacySseClientTransport, LegacySseTransportConfig};
 use crate::types::{Availability, HealthState, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
@@ -159,8 +158,7 @@ struct InitializedNotificationCompatHttpClient {
     server_name: Arc<str>,
     /// Shared with the `UpstreamServer` this client backs.
     connection: ConnectionGeneration,
-    /// Weak so a client outliving the router cannot keep it alive.
-    tool_router: std::sync::Weak<ToolRouter>,
+    events: Weak<dyn UpstreamEvents>,
     /// The `Mcp-Session-Id` most recently seen on the wire.
     ///
     /// rmcp keeps the live session id private to its transport worker and
@@ -188,13 +186,13 @@ impl InitializedNotificationCompatHttpClient {
     fn new(
         server_name: Arc<str>,
         connection: ConnectionGeneration,
-        tool_router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
             inner: crate::upstream_http::client(reqwest::redirect::Policy::default())?,
             server_name,
             connection,
-            tool_router,
+            events,
             last_session_id: Arc::new(std::sync::Mutex::new(None)),
         })
     }
@@ -227,7 +225,7 @@ impl InitializedNotificationCompatHttpClient {
                     "upstream HTTP session replaced; treating as a new connection"
                 );
                 *last = Some(Arc::clone(session_id));
-                on_upstream_session_replaced(&self.connection, &self.tool_router);
+                on_upstream_session_replaced(&self.connection, &self.events);
             }
             None => *last = Some(Arc::clone(session_id)),
         }
@@ -739,10 +737,104 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
     }
 }
 
+/// What an upstream connection tells the downstream side, and the requests
+/// a server sends back to its client. Weak everywhere it is held: the
+/// downstream side owns the server manager.
+#[allow(
+    clippy::double_must_use,
+    reason = "async_trait generates redundant must_use on boxed futures"
+)]
+#[async_trait::async_trait]
+pub trait UpstreamEvents: Send + Sync {
+    /// The roots of every downstream client, as one list.
+    fn list_roots(&self) -> ListRootsResult;
+    async fn elicit(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: ElicitRequestParams,
+    ) -> Result<ElicitResult, McpError>;
+    async fn create_message(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: CreateMessageRequestParams,
+    ) -> Result<CreateMessageResult, McpError>;
+    fn tools_changed(self: Arc<Self>);
+    fn resources_changed(self: Arc<Self>);
+    fn prompts_changed(self: Arc<Self>);
+    fn progress(&self, server: &str, params: ProgressNotificationParam);
+    fn cancelled(&self, server: &str, params: CancelledNotificationParam);
+    fn resource_updated(&self, server: &str, params: ResourceUpdatedNotificationParam);
+    fn logging_message(&self, server: &str, params: LoggingMessageNotificationParam);
+    /// The level a newly connected server should log at.
+    fn log_level(&self) -> LoggingLevel;
+}
+
+/// An `UpstreamEvents` that is never there: events go nowhere.
+pub(crate) fn no_events() -> Weak<dyn UpstreamEvents> {
+    enum Absent {}
+    #[async_trait::async_trait]
+    impl UpstreamEvents for Absent {
+        fn list_roots(&self) -> ListRootsResult {
+            match *self {}
+        }
+        async fn elicit(
+            &self,
+            _: &str,
+            _: RequestId,
+            _: ElicitRequestParams,
+        ) -> Result<ElicitResult, McpError> {
+            match *self {}
+        }
+        async fn create_message(
+            &self,
+            _: &str,
+            _: RequestId,
+            _: CreateMessageRequestParams,
+        ) -> Result<CreateMessageResult, McpError> {
+            match *self {}
+        }
+        fn tools_changed(self: Arc<Self>) {
+            match *self {}
+        }
+        fn resources_changed(self: Arc<Self>) {
+            match *self {}
+        }
+        fn prompts_changed(self: Arc<Self>) {
+            match *self {}
+        }
+        fn progress(&self, _: &str, _: ProgressNotificationParam) {
+            match *self {}
+        }
+        fn cancelled(&self, _: &str, _: CancelledNotificationParam) {
+            match *self {}
+        }
+        fn resource_updated(&self, _: &str, _: ResourceUpdatedNotificationParam) {
+            match *self {}
+        }
+        fn logging_message(&self, _: &str, _: LoggingMessageNotificationParam) {
+            match *self {}
+        }
+        fn log_level(&self) -> LoggingLevel {
+            match *self {}
+        }
+    }
+    Weak::<Absent>::new()
+}
+
+/// Where a new connection reports: the downstream side, and the manager's
+/// check-now signal for a stdio server whose process stops.
+#[derive(Clone)]
+struct Reporting {
+    events: Weak<dyn UpstreamEvents>,
+    check_now: Arc<tokio::sync::Notify>,
+}
+
 pub(crate) struct UpstreamClientHandler {
     server_id: Arc<str>,
     tools: Arc<ArcSwap<Vec<Tool>>>,
-    router: std::sync::Weak<ToolRouter>,
+    events: Weak<dyn UpstreamEvents>,
     /// Bound on the re-list a `tools/list_changed` notification triggers: the
     /// server's `call_timeout_secs`, the same bound every other listing uses.
     list_timeout: Duration,
@@ -754,13 +846,13 @@ impl UpstreamClientHandler {
     pub(crate) fn new(
         server_id: &str,
         tools: Arc<ArcSwap<Vec<Tool>>>,
-        router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
         list_timeout: Duration,
     ) -> Self {
         Self {
             server_id: Arc::from(server_id),
             tools,
-            router,
+            events,
             list_timeout,
             protocol_version: crate::protocol::supported_protocol_version(),
         }
@@ -770,21 +862,21 @@ impl UpstreamClientHandler {
     pub(crate) fn new_for_tests(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
-        router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
     ) -> Self {
-        Self::new(&server_id, tools, router, Duration::from_secs(300))
+        Self::new(&server_id, tools, events, Duration::from_secs(300))
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_tests_with_protocol(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
-        router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
         protocol_version: rmcp::model::ProtocolVersion,
     ) -> Self {
         Self {
             protocol_version,
-            ..Self::new_for_tests(server_id, tools, router)
+            ..Self::new_for_tests(server_id, tools, events)
         }
     }
 }
@@ -828,14 +920,12 @@ impl ClientHandler for UpstreamClientHandler {
         _context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<rmcp::model::ListRootsResult, rmcp::ErrorData>> + Send + '_
     {
-        let router = self.router.clone();
-        async move {
-            if let Some(router) = router.upgrade() {
-                Ok(router.list_roots_union())
-            } else {
-                Ok(rmcp::model::ListRootsResult::default())
-            }
-        }
+        let roots = self
+            .events
+            .upgrade()
+            .map(|events| events.list_roots())
+            .unwrap_or_default();
+        std::future::ready(Ok(roots))
     }
 
     fn create_elicitation(
@@ -843,14 +933,12 @@ impl ClientHandler for UpstreamClientHandler {
         request: ElicitRequestParams,
         context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<ElicitResult, McpError>> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         let request_id = context.id.clone();
         async move {
-            if let Some(router) = router.upgrade() {
-                router
-                    .create_elicitation_from_upstream(server_id.as_ref(), request_id, request)
-                    .await
+            if let Some(events) = events.upgrade() {
+                events.elicit(server_id.as_ref(), request_id, request).await
             } else {
                 Err(McpError::internal_error(
                     "router unavailable during upstream elicitation".to_string(),
@@ -865,13 +953,13 @@ impl ClientHandler for UpstreamClientHandler {
         request: CreateMessageRequestParams,
         context: RequestContext<rmcp::RoleClient>,
     ) -> impl Future<Output = Result<CreateMessageResult, McpError>> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         let request_id = context.id.clone();
         async move {
-            if let Some(router) = router.upgrade() {
-                router
-                    .create_message_from_upstream(server_id.as_ref(), request_id, request)
+            if let Some(events) = events.upgrade() {
+                events
+                    .create_message(server_id.as_ref(), request_id, request)
                     .await
             } else {
                 Err(McpError::internal_error(
@@ -887,7 +975,7 @@ impl ClientHandler for UpstreamClientHandler {
         context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
         let tools = Arc::clone(&self.tools);
-        let router = self.router.clone();
+        let events = self.events.clone();
         let peer = context.peer.clone();
         let server_id = Arc::clone(&self.server_id);
         let list_timeout = self.list_timeout;
@@ -897,8 +985,8 @@ impl ClientHandler for UpstreamClientHandler {
                 Ok(Ok(fresh_tools)) => {
                     tools.store(Arc::new(fresh_tools));
 
-                    if let Some(router) = router.upgrade() {
-                        router.schedule_tool_list_changed_refresh();
+                    if let Some(events) = events.upgrade() {
+                        events.tools_changed();
                     }
                 }
                 Ok(Err(error)) => {
@@ -923,15 +1011,15 @@ impl ClientHandler for UpstreamClientHandler {
         &self,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         async move {
-            if let Some(router) = router.upgrade() {
+            if let Some(events) = events.upgrade() {
                 tracing::debug!(
                     server = %server_id,
                     "received resources/list_changed from upstream"
                 );
-                router.schedule_resource_list_changed_refresh();
+                events.resources_changed();
             }
         }
     }
@@ -940,15 +1028,15 @@ impl ClientHandler for UpstreamClientHandler {
         &self,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
+        let events = self.events.clone();
         let server_id = Arc::clone(&self.server_id);
         async move {
-            if let Some(router) = router.upgrade() {
+            if let Some(events) = events.upgrade() {
                 tracing::debug!(
                     server = %server_id,
                     "received prompts/list_changed from upstream"
                 );
-                router.schedule_prompt_list_changed_refresh();
+                events.prompts_changed();
             }
         }
     }
@@ -958,13 +1046,10 @@ impl ClientHandler for UpstreamClientHandler {
         params: ProgressNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.route_upstream_progress(server_id.as_ref(), params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.progress(&self.server_id, params);
         }
+        std::future::ready(())
     }
 
     fn on_cancelled(
@@ -972,28 +1057,21 @@ impl ClientHandler for UpstreamClientHandler {
         params: CancelledNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.route_upstream_cancelled(server_id.as_ref(), params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.cancelled(&self.server_id, params);
         }
+        std::future::ready(())
     }
 
     fn on_resource_updated(
         &self,
-        mut params: ResourceUpdatedNotificationParam,
+        params: ResourceUpdatedNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.name_skill_server(&server_id, &mut params.uri);
-                router.route_upstream_resource_updated(params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.resource_updated(&self.server_id, params);
         }
+        std::future::ready(())
     }
 
     fn on_logging_message(
@@ -1001,13 +1079,10 @@ impl ClientHandler for UpstreamClientHandler {
         params: LoggingMessageNotificationParam,
         _context: NotificationContext<rmcp::RoleClient>,
     ) -> impl Future<Output = ()> + Send + '_ {
-        let router = self.router.clone();
-        let server_id = Arc::clone(&self.server_id);
-        async move {
-            if let Some(router) = router.upgrade() {
-                router.route_upstream_logging_message(server_id.as_ref(), params);
-            }
+        if let Some(events) = self.events.upgrade() {
+            events.logging_message(&self.server_id, params);
         }
+        std::future::ready(())
     }
 }
 
@@ -1103,11 +1178,11 @@ impl ConnectionGeneration {
 /// flapping upstream costs one refresh, not one per flap.
 fn on_upstream_session_replaced(
     connection: &ConnectionGeneration,
-    tool_router: &std::sync::Weak<ToolRouter>,
+    events: &Weak<dyn UpstreamEvents>,
 ) {
     connection.advance();
-    if let Some(router) = tool_router.upgrade() {
-        router.schedule_resource_list_changed_refresh();
+    if let Some(events) = events.upgrade() {
+        events.resources_changed();
     }
 }
 
@@ -1234,7 +1309,7 @@ pub struct ServerManager {
     /// Cleared when it starts; shown in status while it is unhealthy.
     last_errors: DashMap<String, String>,
     semaphores: DashMap<String, Arc<tokio::sync::Semaphore>>,
-    tool_router: std::sync::RwLock<Option<std::sync::Weak<ToolRouter>>>,
+    events: Weak<dyn UpstreamEvents>,
     /// Grace-period retirement tasks spawned by `replace_server` for
     /// old-generation upstreams still held by in-flight requests. Tracked so
     /// `shutdown_all` can force them to retire immediately instead of leaving
@@ -1302,7 +1377,14 @@ impl ServerManager {
         }
     }
 
+    /// A manager whose servers report to no one, for running upstreams
+    /// without a router.
     pub fn new() -> Self {
+        Self::reporting_to(no_events())
+    }
+
+    /// A manager whose servers report to `events`.
+    pub fn reporting_to(events: Weak<dyn UpstreamEvents>) -> Self {
         let (shutdown_signal, _shutdown_signal_rx) = tokio::sync::watch::channel(false);
         Self {
             servers: ArcSwap::from_pointee(HashMap::new()),
@@ -1318,7 +1400,7 @@ impl ServerManager {
             availability: DashMap::new(),
             last_errors: DashMap::new(),
             semaphores: DashMap::new(),
-            tool_router: std::sync::RwLock::new(None),
+            events,
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
             replacement_grace: REPLACEMENT_GRACE,
             shutdown_signal,
@@ -1482,18 +1564,18 @@ impl ServerManager {
         }
     }
 
-    pub fn set_tool_router(&self, router: std::sync::Weak<ToolRouter>) {
-        if let Ok(mut guard) = self.tool_router.write() {
-            *guard = Some(router);
+    fn reporting(&self) -> Reporting {
+        Reporting {
+            events: self.events.clone(),
+            check_now: Arc::clone(&self.check_now),
         }
     }
 
-    fn tool_router(&self) -> std::sync::Weak<ToolRouter> {
-        self.tool_router
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().cloned())
-            .unwrap_or_default()
+    /// Tell the downstream side the merged tool list may have changed.
+    pub(crate) fn tools_changed(&self) {
+        if let Some(events) = self.events.upgrade() {
+            events.tools_changed();
+        }
     }
 
     fn insert_upstream(
@@ -1564,17 +1646,12 @@ impl ServerManager {
             let permits = Arc::clone(&permits);
             let name_clone = name.clone();
             let sc = server_config.clone();
-            let tool_router = self.tool_router();
+            let reporting = self.reporting();
             let modern_upstream_gate_state = self.modern_upstream_gate_state();
             join_set.spawn(async move {
                 let _permit = permits.acquire_owned().await;
-                let result = Self::start_server_with_router(
-                    &name_clone,
-                    &sc,
-                    tool_router,
-                    modern_upstream_gate_state,
-                )
-                .await;
+                let result =
+                    Self::connect(&name_clone, &sc, reporting, modern_upstream_gate_state).await;
                 (name_clone, result)
             });
         }
@@ -1627,13 +1704,8 @@ impl ServerManager {
         config: &ServerConfig,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        let result = Self::start_server_with_router(
-            name,
-            config,
-            self.tool_router(),
-            modern_upstream_gate_state,
-        )
-        .await;
+        let result =
+            Self::connect(name, config, self.reporting(), modern_upstream_gate_state).await;
         if let Err(error) = &result {
             self.record_error(name, config, error);
         }
@@ -1653,10 +1725,10 @@ impl ServerManager {
     /// the transport and nowhere else: the server keeps the config as the
     /// person wrote it, and an error that quotes the value is redacted here,
     /// while the value is still known.
-    async fn start_server_with_router(
+    async fn connect(
         name: &str,
         config: &ServerConfig,
-        tool_router: std::sync::Weak<ToolRouter>,
+        reporting: Reporting,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let stores = crate::secrets::Stores::current();
@@ -1667,7 +1739,7 @@ impl ServerManager {
         }
         let resolved = stores.resolve_server(config).await?;
         let result =
-            Self::start_resolved(name, &resolved, tool_router, modern_upstream_gate_state).await;
+            Self::start_resolved(name, &resolved, reporting, modern_upstream_gate_state).await;
         if matches!(resolved, std::borrow::Cow::Borrowed(_)) {
             return result;
         }
@@ -1696,9 +1768,10 @@ impl ServerManager {
     async fn start_resolved(
         name: &str,
         config: &ServerConfig,
-        tool_router: std::sync::Weak<ToolRouter>,
+        reporting: Reporting,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
+        let Reporting { events, check_now } = reporting;
         if name == "plug" {
             anyhow::bail!("recursion shield: ignoring upstream server named 'plug'");
         }
@@ -1749,9 +1822,7 @@ impl ServerManager {
                             name,
                             stderr,
                             failure::config_secrets(config),
-                            tool_router
-                                .upgrade()
-                                .map(|router| router.server_manager().check_now_signal()),
+                            check_now,
                         )
                     });
                     if let Some(tail) = &stderr_tail {
@@ -1762,7 +1833,7 @@ impl ServerManager {
                     let handler = Arc::new(UpstreamClientHandler::new(
                         name,
                         Arc::clone(&tools),
-                        tool_router.clone(),
+                        events.clone(),
                         Duration::from_secs(config.call_timeout_secs),
                     ));
 
@@ -1820,7 +1891,7 @@ impl ServerManager {
                         InitializedNotificationCompatHttpClient::new(
                             Arc::from(name),
                             connection.clone(),
-                            tool_router.clone(),
+                            events.clone(),
                         )?,
                         transport_config,
                     );
@@ -1829,7 +1900,7 @@ impl ServerManager {
                     let handler = Arc::new(UpstreamClientHandler::new(
                         name,
                         Arc::clone(&tools),
-                        tool_router.clone(),
+                        events.clone(),
                         Duration::from_secs(config.call_timeout_secs),
                     ));
 
@@ -1871,7 +1942,7 @@ impl ServerManager {
                                 Self::connect_sse_upstream(
                                     name,
                                     config,
-                                    tool_router,
+                                    events,
                                     modern_upstream_gate_state,
                                 )
                                 .await
@@ -1888,13 +1959,8 @@ impl ServerManager {
                             effective_protocol_mode
                         );
                     }
-                    Self::connect_sse_upstream(
-                        name,
-                        config,
-                        tool_router,
-                        modern_upstream_gate_state,
-                    )
-                    .await
+                    Self::connect_sse_upstream(name, config, events, modern_upstream_gate_state)
+                        .await
                 }
                 TransportType::OpenApi => {
                     let document = crate::openapi::load(name, config).await?;
@@ -1913,7 +1979,7 @@ impl ServerManager {
                     let handler = Arc::new(UpstreamClientHandler::new(
                         name,
                         Arc::clone(&tools),
-                        tool_router.clone(),
+                        events.clone(),
                         Duration::from_secs(config.call_timeout_secs),
                     ));
                     let client: McpClient = handler
@@ -1967,7 +2033,7 @@ impl ServerManager {
     async fn connect_sse_upstream(
         name: &str,
         config: &ServerConfig,
-        tool_router: std::sync::Weak<ToolRouter>,
+        events: Weak<dyn UpstreamEvents>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let url = config
@@ -1995,8 +2061,8 @@ impl ServerManager {
         let connection = ConnectionGeneration::new();
         let transport_config = transport_config.session_observer({
             let connection = connection.clone();
-            let tool_router = tool_router.clone();
-            Arc::new(move || on_upstream_session_replaced(&connection, &tool_router))
+            let events = events.clone();
+            Arc::new(move || on_upstream_session_replaced(&connection, &events))
         });
 
         let transport = LegacySseClientTransport::from_config(transport_config)?;
@@ -2005,7 +2071,7 @@ impl ServerManager {
         let handler = Arc::new(UpstreamClientHandler::new(
             name,
             Arc::clone(&tools),
-            tool_router,
+            events,
             Duration::from_secs(config.call_timeout_secs),
         ));
 
@@ -2569,10 +2635,10 @@ impl ServerManager {
         if upstream.capabilities.logging.is_none() {
             return;
         }
-        let Some(router) = self.tool_router().upgrade() else {
+        let Some(events) = self.events.upgrade() else {
             return;
         };
-        let params = SetLevelRequestParams::new(router.log_level());
+        let params = SetLevelRequestParams::new(events.log_level());
         let peer = upstream.client.peer().clone();
         let name = name.to_string();
         tokio::spawn(async move {
@@ -3078,7 +3144,7 @@ mod tests {
             // Dangling: these tests exercise the generation half of the
             // reaction, and a router that cannot be upgraded simply skips the
             // refresh kick.
-            std::sync::Weak::new(),
+            no_events(),
         )
         .expect("build the HTTP client");
         (client, connection)
@@ -3872,7 +3938,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3933,7 +3999,7 @@ mod tests {
         let handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("eof-ignorer"),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client: McpClient = rmcp::service::serve_directly(handler, transport, None);
         let upstream = UpstreamServer {
@@ -3977,7 +4043,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            Arc::downgrade(router),
+            Arc::downgrade(router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4253,7 +4319,7 @@ mod tests {
         let upstream_handler_a = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("replace-test"),
             Arc::clone(&tools_a),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client_a: McpClient = upstream_handler_a
             .serve(client_transport_a)
@@ -4311,7 +4377,7 @@ mod tests {
         let upstream_handler_b = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("replace-test"),
             Arc::clone(&tools_b),
-            std::sync::Weak::new(),
+            no_events(),
         ));
         let client_b: McpClient = upstream_handler_b
             .serve(client_transport_b)
@@ -4572,12 +4638,8 @@ mod tests {
 
     #[tokio::test]
     async fn upstream_tool_list_changed_refreshes_router_and_notifies_downstream() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer = Arc::clone(&upstream_server.peer);
@@ -4599,7 +4661,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4664,12 +4726,8 @@ mod tests {
 
     #[tokio::test]
     async fn rapid_upstream_tool_list_changed_notifications_coalesce_before_downstream_delivery() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer = Arc::clone(&upstream_server.peer);
@@ -4691,7 +4749,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -4745,12 +4803,8 @@ mod tests {
 
     #[tokio::test]
     async fn task_native_upstream_pass_through_proxies_task_lifecycle() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream, task_result_request_count) = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4884,12 +4938,8 @@ mod tests {
         // collect. This proves the forwarded `CancelTaskRequest` lands by
         // querying the upstream mock directly (bypassing the router, whose
         // record is gone after cleanup).
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream, _task_result_request_count) = tokio::time::timeout(
             Duration::from_secs(5),
@@ -4976,14 +5026,10 @@ mod tests {
 
     #[tokio::test]
     async fn bridge_lazy_mode_exposes_search_and_loaded_direct_tool_calls() {
-        let server_manager = Arc::new(ServerManager::new());
         let mut config = RouterConfig::default();
         config.lazy_tools.mode = crate::types::LazyToolSetting::Bridge;
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            config,
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(config);
+        let server_manager = Arc::clone(router.server_manager());
 
         let (upstream_server, tools_rx) =
             MutableToolServer::new(vec![make_tool_with_description("echo", "Echo input")]);
@@ -5006,7 +5052,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -5089,12 +5135,8 @@ mod tests {
 
     #[tokio::test]
     async fn downstream_cancellation_reaches_the_upstream() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let upstream_server = ProgressCancelServer::new();
         let cancelled_request = Arc::clone(&upstream_server.cancelled_request);
@@ -5111,7 +5153,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("upstream"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -5191,12 +5233,8 @@ mod tests {
 
     #[tokio::test]
     async fn router_refreshes_resources_and_prompts_and_routes_reads() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         tokio::spawn(async move {
@@ -5211,7 +5249,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("catalog"),
             Arc::clone(&tools),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -5526,12 +5564,8 @@ mod tests {
 
     #[tokio::test]
     async fn explicit_sse_upstream_connects_and_routes_tool_calls() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (legacy_server, url) =
             LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token"), false).await;
@@ -5576,12 +5610,8 @@ mod tests {
 
     #[tokio::test]
     async fn http_upstream_falls_back_to_legacy_sse() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         // reject_post_on_stream_path=true → the mock returns 405 on POST to /mcp,
         // which signals to the HTTP transport that this is a legacy SSE server.
@@ -5616,12 +5646,8 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_sse_tool_list_changed_reaches_downstream() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
 
         let (legacy_server, url) =
             LegacySseTestServer::spawn(vec![make_tool("echo")], None, false).await;
@@ -5722,12 +5748,8 @@ mod tests {
     /// came back after a failure logged at its own default forever.
     #[tokio::test]
     async fn replace_server_applies_the_effective_log_level() {
-        let server_manager = Arc::new(ServerManager::new());
-        let router = Arc::new(crate::proxy::ToolRouter::new(
-            server_manager.clone(),
-            RouterConfig::default(),
-        ));
-        server_manager.set_tool_router(Arc::downgrade(&router));
+        let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
+        let server_manager = Arc::clone(router.server_manager());
         router.set_client_log_level("client", rmcp::model::LoggingLevel::Debug);
 
         let seen = Arc::new(Mutex::new(None));
@@ -5747,7 +5769,7 @@ mod tests {
         let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("logging"),
             Arc::new(ArcSwap::from_pointee(Vec::new())),
-            Arc::downgrade(&router),
+            Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
         ))
         .serve(client_transport)
         .await
@@ -5838,7 +5860,7 @@ mod tests {
         let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("silent"),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ))
         .serve(client_transport)
         .await
@@ -5898,7 +5920,7 @@ mod tests {
         let client: McpClient = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from("silent"),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            no_events(),
         ))
         .serve(client_transport)
         .await

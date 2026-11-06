@@ -2771,7 +2771,7 @@ async fn connect_subscribable_upstream(
     let handler = Arc::new(UpstreamClientHandler::new_for_tests(
         Arc::from(name.to_string()),
         Arc::clone(&tools),
-        std::sync::Weak::new(),
+        crate::server::no_events(),
     ));
     let client = handler
         .serve(client_transport)
@@ -2817,7 +2817,7 @@ async fn connect_modern_tool_upstream(
     let handler = Arc::new(UpstreamClientHandler::new_for_tests_with_protocol(
         Arc::from(name.to_string()),
         Arc::clone(&tools),
-        std::sync::Weak::new(),
+        crate::server::no_events(),
         rmcp::model::ProtocolVersion::V_2026_07_28,
     ));
     let client = handler

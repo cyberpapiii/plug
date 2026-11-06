@@ -178,7 +178,7 @@ mod tests {
             let config_path = dir.path().join("config.toml");
             write_config(&config_path, &Config::default());
 
-            let engine = Arc::new(Engine::new(Config::default()));
+            let engine = Engine::new(Config::default());
             engine.start().await.expect("engine start");
             let seen_reloads = engine.reloads_applied();
 

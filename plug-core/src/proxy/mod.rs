@@ -21,8 +21,8 @@ use crate::artifacts::ArtifactStore;
 use crate::circuit::CircuitBreakerError;
 use crate::config::{Config, LazyToolsConfig};
 use crate::downstream_identity::DownstreamTransport;
-use crate::engine::Engine;
 use crate::error::ProtocolError;
+use crate::health::Recovery;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
@@ -419,9 +419,9 @@ pub struct ToolRouter {
     pending_tool_list_changed: AtomicBool,
     pending_resource_list_changed: AtomicBool,
     pending_prompt_list_changed: AtomicBool,
-    /// Weak reference to Engine for session recovery (reconnect on error).
-    /// Set after Engine construction via `set_engine()`.
-    engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    /// Reconnects a server whose session failed under a call. Weak: the
+    /// runtime behind it owns this router.
+    recovery: Weak<dyn Recovery>,
     artifact_store: ArtifactStore,
     /// Resource subscription registry: upstream URI → set of downstream subscribers.
     /// Owns the atomic subscribe/unsubscribe state machine — see
@@ -891,7 +891,26 @@ pub trait DownstreamBridge: Send + Sync {
 }
 
 impl ToolRouter {
-    pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
+    /// A router over `server_manager` that spawns its background work on
+    /// `tracker` and reconnects failed sessions through `recovery`.
+    pub(crate) fn with_runtime(
+        server_manager: Arc<ServerManager>,
+        config: RouterConfig,
+        tracker: tokio_util::task::TaskTracker,
+        recovery: Weak<dyn Recovery>,
+    ) -> Self {
+        Self::build(
+            server_manager,
+            config,
+            crate::protocol::AdmissionQuotas::new(Default::default()),
+            tracker,
+            recovery,
+        )
+    }
+
+    /// A router with no runtime behind it: nothing reconnects its servers.
+    #[cfg(test)]
+    pub(crate) fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         Self::new_with_quotas(
             server_manager,
             config,
@@ -911,10 +930,27 @@ impl ToolRouter {
         CATALOG_REVISION.load(Ordering::Relaxed)
     }
 
+    #[cfg(test)]
     pub(crate) fn new_with_quotas(
         server_manager: Arc<ServerManager>,
         config: RouterConfig,
         admission_quotas: crate::protocol::AdmissionQuotas,
+    ) -> Self {
+        Self::build(
+            server_manager,
+            config,
+            admission_quotas,
+            tokio_util::task::TaskTracker::new(),
+            crate::health::no_recovery(),
+        )
+    }
+
+    fn build(
+        server_manager: Arc<ServerManager>,
+        config: RouterConfig,
+        admission_quotas: crate::protocol::AdmissionQuotas,
+        tracker: tokio_util::task::TaskTracker,
+        recovery: Weak<dyn Recovery>,
     ) -> Self {
         // A reload builds a new router around new configuration, which can
         // change the catalog a reader sees before any upstream refresh runs.
@@ -938,7 +974,7 @@ impl ToolRouter {
             tool_definition_fingerprints: HashMap::new(),
             tool_risk_inventory: HashMap::new(),
         }));
-        let resource_subscriptions = subscriptions::SubscriptionRegistry::new();
+        let resource_subscriptions = subscriptions::SubscriptionRegistry::new(tracker);
         // Drains resolve an entry's recorded owning server to a live handle
         // at drain time — never trusting a handle resolved earlier from the
         // route cache, which can point at the wrong server on either side
@@ -1033,7 +1069,7 @@ impl ToolRouter {
             pending_tool_list_changed: AtomicBool::new(false),
             pending_resource_list_changed: AtomicBool::new(false),
             pending_prompt_list_changed: AtomicBool::new(false),
-            engine: std::sync::RwLock::new(None),
+            recovery,
             artifact_store: ArtifactStore::new(),
             resource_subscriptions,
             subscriber_client_keys: DashMap::new(),
@@ -2213,43 +2249,22 @@ impl ToolRouter {
         });
     }
 
-    /// Set the Engine reference for session recovery.
-    pub fn set_engine(&self, engine: Weak<Engine>) {
-        self.resource_subscriptions.set_engine(engine.clone());
-        let mut guard = self
-            .engine
-            .write()
-            .expect("engine RwLock poisoned — prior panic");
-        *guard = Some(engine);
-    }
-
-    fn upgrade_engine(&self) -> Option<Arc<Engine>> {
-        self.engine
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
-    }
-
     /// Reconnect `server_id` once before the caller sends again. A failure
     /// hands the server to its recovery episode.
     async fn reconnect_server_now(&self, server_id: &str) -> Result<(), anyhow::Error> {
-        let engine = self
-            .upgrade_engine()
-            .ok_or_else(|| anyhow::anyhow!("engine reference unavailable"))?;
-        if let Err(error) = engine.reconnect_server(server_id).await {
-            engine.recover_server(server_id);
+        let recovery = self.recovery.upgrade().ok_or_else(|| {
+            anyhow::anyhow!("nothing can reconnect `{server_id}`: Plug is stopping")
+        })?;
+        if let Err(error) = recovery.reconnect_server(server_id).await {
+            recovery.recover_server(server_id);
             return Err(error);
         }
         Ok(())
     }
 
     fn reconnect_server_in_background(&self, server_id: String) {
-        match self.upgrade_engine() {
-            Some(engine) => engine.recover_server(&server_id),
-            None => tracing::warn!(
-                server = %server_id,
-                "no engine reference available for background reconnect"
-            ),
+        if let Some(recovery) = self.recovery.upgrade() {
+            recovery.recover_server(&server_id);
         }
     }
 
@@ -4334,6 +4349,76 @@ impl ToolRouter {
     /// Get a reference to the underlying ServerManager.
     pub fn server_manager(&self) -> &Arc<ServerManager> {
         &self.server_manager
+    }
+
+    /// A router over a new server manager whose servers report to it, with
+    /// no runtime behind it.
+    #[cfg(test)]
+    pub(crate) fn linked(config: RouterConfig) -> Arc<Self> {
+        Arc::new_cyclic(|router: &Weak<Self>| {
+            let events: Weak<dyn crate::server::UpstreamEvents> = router.clone();
+            Self::new(Arc::new(ServerManager::reporting_to(events)), config)
+        })
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::server::UpstreamEvents for ToolRouter {
+    fn list_roots(&self) -> ListRootsResult {
+        self.list_roots_union()
+    }
+
+    async fn elicit(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: ElicitRequestParams,
+    ) -> Result<ElicitResult, McpError> {
+        self.create_elicitation_from_upstream(server, request_id, request)
+            .await
+    }
+
+    async fn create_message(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: CreateMessageRequestParams,
+    ) -> Result<CreateMessageResult, McpError> {
+        self.create_message_from_upstream(server, request_id, request)
+            .await
+    }
+
+    fn tools_changed(self: Arc<Self>) {
+        self.schedule_tool_list_changed_refresh();
+    }
+
+    fn resources_changed(self: Arc<Self>) {
+        self.schedule_resource_list_changed_refresh();
+    }
+
+    fn prompts_changed(self: Arc<Self>) {
+        self.schedule_prompt_list_changed_refresh();
+    }
+
+    fn progress(&self, server: &str, params: ProgressNotificationParam) {
+        self.route_upstream_progress(server, params);
+    }
+
+    fn cancelled(&self, server: &str, params: CancelledNotificationParam) {
+        self.route_upstream_cancelled(server, params);
+    }
+
+    fn resource_updated(&self, server: &str, mut params: ResourceUpdatedNotificationParam) {
+        self.name_skill_server(server, &mut params.uri);
+        self.route_upstream_resource_updated(params);
+    }
+
+    fn logging_message(&self, server: &str, params: LoggingMessageNotificationParam) {
+        self.route_upstream_logging_message(server, params);
+    }
+
+    fn log_level(&self) -> LoggingLevel {
+        ToolRouter::log_level(self)
     }
 }
 

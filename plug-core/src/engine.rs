@@ -3,9 +3,9 @@
 //! The Engine owns all shared state (servers, routing, config, health) and
 //! exposes it through a query API. The daemon and CLI are thin frontends.
 
-use std::sync::Arc;
 #[cfg(test)]
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -16,10 +16,10 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, ServerConfig};
-use crate::health::{spawn_health_check, spawn_health_checks};
+use crate::health::{Monitor, Reconnect, Recovery};
 use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::{ReloadReport, server_config_changed};
-use crate::server::{ServerManager, UpstreamServer, retire_upstream_owned};
+use crate::server::{ServerManager, UpstreamEvents, UpstreamServer, retire_upstream_owned};
 use crate::supervision::Supervision;
 use crate::types::{ServerHealth, ServerStatus};
 
@@ -33,21 +33,6 @@ pub struct EngineSnapshot {
     pub uptime: Duration,
 }
 
-/// What [`Engine::reconnect_server`] did. It makes one attempt and never
-/// retries: a server that stays down is the recovery episode's to bring back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Reconnect {
-    /// A fresh connection replaced the old one.
-    Reconnected,
-    /// Another start of this server was already running, so this one did
-    /// nothing.
-    AlreadyRunning,
-    /// The server was removed or reconfigured while it connected. The reload
-    /// that did it already put the new config in place, so the connection
-    /// was dropped.
-    Abandoned,
-}
-
 /// The core runtime that owns all shared state.
 ///
 /// Created by `Engine::new()`, started with `Engine::start()`, stopped with
@@ -59,7 +44,8 @@ pub struct Engine {
     cancel: CancellationToken,
     tracker: TaskTracker,
     started_at: Instant,
-    supervision: Supervision,
+    supervision: Arc<Supervision>,
+    health: Monitor,
     reload_lock: Mutex<()>,
     /// The watch engine, once the daemon has opened it. See `crate::events`.
     watch_events: std::sync::OnceLock<Arc<crate::events::WatchEvents>>,
@@ -79,29 +65,52 @@ impl Engine {
     /// Create a new Engine from configuration.
     ///
     /// Does NOT start any servers — call `start()` to begin.
-    pub fn new(config: Config) -> Self {
+    pub fn new(config: Config) -> Arc<Self> {
         crate::secrets::Stores::configure(&config.secrets);
-        let server_manager = Arc::new(ServerManager::new());
-        let router_config = RouterConfig::from(&config);
-        let tool_router = Arc::new(ToolRouter::new(server_manager.clone(), router_config));
-        tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
-        tool_router.set_client_access(&config.clients);
-        server_manager.set_tool_router(Arc::downgrade(&tool_router));
+        Arc::new_cyclic(|engine: &Weak<Engine>| {
+            let recovery: Weak<dyn Recovery> = engine.clone();
+            let cancel = CancellationToken::new();
+            let tracker = TaskTracker::new();
+            let router_config = RouterConfig::from(&config);
+            let tool_router = Arc::new_cyclic(|router: &Weak<ToolRouter>| {
+                let events: Weak<dyn UpstreamEvents> = router.clone();
+                ToolRouter::with_runtime(
+                    Arc::new(ServerManager::reporting_to(events)),
+                    router_config,
+                    tracker.clone(),
+                    recovery.clone(),
+                )
+            });
+            tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
+            tool_router.set_client_access(&config.clients);
+            let server_manager = Arc::clone(tool_router.server_manager());
+            let config = Arc::new(ArcSwap::from_pointee(config));
+            let supervision = Arc::new(Supervision::default());
+            let health = Monitor::new(
+                Arc::clone(&server_manager),
+                Arc::clone(&supervision),
+                Arc::clone(&config),
+                cancel.clone(),
+                tracker.clone(),
+                recovery,
+            );
 
-        Self {
-            server_manager,
-            tool_router,
-            config: Arc::new(ArcSwap::from_pointee(config)),
-            cancel: CancellationToken::new(),
-            tracker: TaskTracker::new(),
-            started_at: Instant::now(),
-            supervision: Supervision::default(),
-            reload_lock: Mutex::new(()),
-            watch_events: std::sync::OnceLock::new(),
-            ready: watch::channel(false).0,
-            #[cfg(test)]
-            reloads_applied: std::sync::atomic::AtomicU64::new(0),
-        }
+            Self {
+                server_manager,
+                tool_router,
+                config,
+                cancel,
+                tracker,
+                started_at: Instant::now(),
+                supervision,
+                health,
+                reload_lock: Mutex::new(()),
+                watch_events: std::sync::OnceLock::new(),
+                ready: watch::channel(false).0,
+                #[cfg(test)]
+                reloads_applied: std::sync::atomic::AtomicU64::new(0),
+            }
+        })
     }
 
     #[cfg(test)]
@@ -131,13 +140,9 @@ impl Engine {
 
     /// Start every enabled server and the background work that keeps them up.
     ///
-    /// Takes `Arc<Self>` because the router and the background tasks hold
-    /// the engine for recovery. Every task goes on `self.tracker`, so
-    /// shutdown can wait for them.
+    /// Every task goes on `self.tracker`, so shutdown can wait for them.
     pub async fn start(self: &Arc<Self>) -> Result<(), anyhow::Error> {
         let config = self.config.load();
-
-        self.tool_router.set_engine(Arc::downgrade(self));
 
         // Each server's health task starts as soon as that server's own start
         // attempt settles, rather than after every server has settled. A single
@@ -147,7 +152,7 @@ impl Engine {
         self.server_manager
             .start_all(&config, |name| {
                 if let Some(server_config) = config.servers.get(name) {
-                    spawn_health_check(self, name, server_config);
+                    self.health.spawn_check(name, server_config);
                 }
             })
             .await;
@@ -173,13 +178,8 @@ impl Engine {
         // The health task of a server whose start never reported. Servers that
         // already have one keep it; a second would supersede it and reset its
         // interval.
-        spawn_health_checks(self, &config);
-
-        crate::health::spawn_wake_watch(
-            self.server_manager.clone(),
-            self.cancel.clone(),
-            &self.tracker,
-        );
+        self.health.spawn_missing_checks(&config);
+        self.health.spawn_wake_watch();
 
         for (name, server_config) in &config.servers {
             if server_config.enabled && server_config.is_oauth() {
@@ -248,8 +248,14 @@ impl Engine {
         &self.tracker
     }
 
+    #[cfg(test)]
     pub(crate) fn supervision(&self) -> &Supervision {
         &self.supervision
+    }
+
+    #[cfg(test)]
+    pub(crate) fn health(&self) -> &Monitor {
+        &self.health
     }
 
     pub(crate) fn spawn_background_tasks_for_server(
@@ -257,7 +263,7 @@ impl Engine {
         server_name: &str,
         server_config: &ServerConfig,
     ) {
-        crate::health::spawn_health_check(self, server_name, server_config);
+        self.health.spawn_check(server_name, server_config);
         self.sync_refresh_loop_for_server(server_name, server_config);
     }
 
@@ -423,9 +429,8 @@ impl Engine {
     /// Ask for `server_id` to be reconnected until it works: the one recovery
     /// episode for the server, started now if none is running. For a caller
     /// that saw the connection go bad in a way health checks do not.
-    pub(crate) fn recover_server(self: &Arc<Self>, server_id: &str) {
-        self.supervision.want_reconnect(server_id);
-        crate::health::start_recovery(self, server_id, false);
+    pub fn recover_server(&self, server_id: &str) {
+        self.health.recover(server_id);
     }
 
     /// Enable or disable a server. Clones the current config, toggles the
@@ -822,7 +827,7 @@ impl Engine {
                 old.health_check_interval_secs != server_config.health_check_interval_secs
             });
             if interval_changed {
-                crate::health::spawn_health_check(self, name, server_config);
+                self.health.spawn_check(name, server_config);
             }
         }
 
@@ -837,6 +842,100 @@ impl Engine {
             tracing::warn!("{warning}");
         }
         report
+    }
+}
+
+#[async_trait::async_trait]
+impl Recovery for Engine {
+    async fn reconnect_server(&self, server: &str) -> anyhow::Result<Reconnect> {
+        Engine::reconnect_server(self, server).await
+    }
+
+    fn recover_server(&self, server: &str) {
+        Engine::recover_server(self, server);
+    }
+}
+
+/// What a watch reads: the live config, grants, and servers. Nothing is
+/// copied into event storage: every check goes to the running daemon.
+pub struct RuntimeWatchAccess {
+    engine: Weak<Engine>,
+    oauth: crate::downstream_oauth::DownstreamOauthManager,
+}
+
+impl RuntimeWatchAccess {
+    pub fn new(
+        engine: &Arc<Engine>,
+        oauth: crate::downstream_oauth::DownstreamOauthManager,
+    ) -> Self {
+        Self {
+            engine: Arc::downgrade(engine),
+            oauth,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::events::WatchAccess for RuntimeWatchAccess {
+    fn watches(&self) -> Vec<crate::events::WatchConfig> {
+        let Some(engine) = self.engine.upgrade() else {
+            return Vec::new();
+        };
+        let config = engine.config();
+        if !crate::events::events_possible(&config.http) {
+            return Vec::new();
+        }
+        config
+            .events
+            .watch
+            .iter()
+            .filter(|watch| {
+                config
+                    .servers
+                    .get(&watch.server)
+                    .is_some_and(|server| server.enabled)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn may_use(&self, client_id: &str, watch: &crate::events::WatchConfig) -> bool {
+        self.engine.upgrade().is_some_and(|engine| {
+            engine.tool_router().client_may_watch(
+                Some(&crate::downstream_identity::grant_client_key(client_id)),
+                &watch.server,
+                &watch.tool,
+            )
+        })
+    }
+
+    async fn permits(&self, client_id: &str, watch: &crate::events::WatchConfig) -> bool {
+        self.may_use(client_id, watch)
+            && crate::events::delivery_permitted(&self.oauth, client_id).await
+    }
+
+    fn tool(&self, watch: &crate::events::WatchConfig) -> Option<(String, bool)> {
+        self.engine
+            .upgrade()?
+            .tool_router()
+            .watched_tool(&watch.server, &watch.tool)
+    }
+
+    async fn call(
+        &self,
+        tool_name: &str,
+        arguments: serde_json::Map<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, String> {
+        let engine = self.engine.upgrade().ok_or("Plug is stopping")?;
+        let result = engine
+            .tool_router()
+            .call_tool(tool_name, Some(arguments))
+            .await
+            .map_err(|error| format!("the call failed with code {}", error.code.0))?;
+        if result.is_error == Some(true) {
+            return Err("the tool returned an error".into());
+        }
+        serde_json::to_value(&result).map_err(|_| "the result is not JSON".into())
     }
 }
 
@@ -1058,7 +1157,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reload_starts_only_the_servers_that_are_on() {
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         let mut config = Config::default();
         config
             .servers
@@ -1080,7 +1179,7 @@ mod tests {
     #[tokio::test]
     async fn settings_that_need_no_restart_apply_to_the_running_server() {
         let config = mock_stdio_config("foo", "echo");
-        let engine = Arc::new(Engine::new(config.clone()));
+        let engine = Engine::new(config.clone());
         engine.start().await.expect("engine start");
         let before = engine
             .server_manager()
@@ -1122,7 +1221,7 @@ mod tests {
 
     #[tokio::test]
     async fn reload_updates_modern_downstream_gate_without_rebuilding_engine() {
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         assert!(!engine.tool_router().modern_downstream_enabled());
 
         let mut enabled = Config::default();
@@ -1142,7 +1241,7 @@ mod tests {
     /// No reload in between: the commit installs.
     #[tokio::test]
     async fn commit_installs_when_config_unchanged() {
-        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let engine = Engine::new(mock_stdio_config("foo", "echo"));
         let snapshot = engine
             .config()
             .servers
@@ -1174,7 +1273,7 @@ mod tests {
             .get_mut("foo")
             .expect("foo configured")
             .protocol_mode = crate::config::UpstreamProtocolMode::Auto;
-        let engine = Arc::new(Engine::new(initial.clone()));
+        let engine = Engine::new(initial.clone());
         let snapshot = initial.servers["foo"].clone();
 
         // Park the old reconnect immediately before commit. Gate-off forces
@@ -1215,7 +1314,7 @@ mod tests {
     /// it back.
     #[tokio::test]
     async fn commit_discards_when_server_removed() {
-        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let engine = Engine::new(mock_stdio_config("foo", "echo"));
         let snapshot = engine
             .config()
             .servers
@@ -1245,7 +1344,7 @@ mod tests {
     /// and leaves the reload's instance alone.
     #[tokio::test]
     async fn commit_discards_on_material_change() {
-        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let engine = Engine::new(mock_stdio_config("foo", "echo"));
         let snapshot = engine
             .config()
             .servers
@@ -1296,7 +1395,7 @@ mod tests {
     /// throw away a working reconnection and leave the server down.
     #[tokio::test]
     async fn commit_installs_on_non_material_change() {
-        let engine = Arc::new(Engine::new(mock_stdio_config("foo", "echo")));
+        let engine = Engine::new(mock_stdio_config("foo", "echo"));
         let snapshot = engine
             .config()
             .servers
@@ -1363,7 +1462,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
 
         let result = engine.reconnect_server("foo").await;
         assert!(result.is_err(), "{result:?}");
@@ -1383,7 +1482,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_rate_limit() {
-        let engine = Arc::new(Engine::new(test_config()));
+        let engine = Engine::new(test_config());
         let _ = engine.restart_server("test-server").await;
 
         let result = engine.restart_server("test-server").await;
@@ -1393,7 +1492,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_unknown_server() {
-        let engine = Arc::new(Engine::new(test_config()));
+        let engine = Engine::new(test_config());
         let result = engine.restart_server("nonexistent").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();
@@ -1402,7 +1501,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_respawns_refresh_loop_for_oauth_server() {
-        let engine = Arc::new(Engine::new(oauth_mock_stdio_config()));
+        let engine = Engine::new(oauth_mock_stdio_config());
         engine.start().await.expect("engine start");
         let refresh_tasks = &engine.supervision().refresh_tasks;
         let before = refresh_tasks.current("oauth-mock");
@@ -1421,7 +1520,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_set_server_enabled_unknown() {
-        let engine = Arc::new(Engine::new(test_config()));
+        let engine = Engine::new(test_config());
         let result = engine.set_server_enabled("nonexistent", true).await;
         assert!(result.is_err());
     }
@@ -1439,7 +1538,7 @@ mod tests {
             },
         );
 
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         // Already enabled — should be a no-op
         let result = engine.set_server_enabled("test", true).await;
         assert!(result.is_ok());
@@ -1458,7 +1557,7 @@ mod tests {
             },
         );
 
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         let reloads_before = engine.reloads_applied();
 
         // Disable the server — triggers a config reload
@@ -1477,7 +1576,7 @@ mod tests {
 
     #[tokio::test]
     async fn operator_mutation_persists_and_reloads_under_engine_lock() {
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         crate::operator::persist_config_atomic(&path, &Config::default()).unwrap();
@@ -1517,7 +1616,7 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "command": "echo", "enabled": false }))
                 .unwrap(),
         );
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         let error = engine.restart_server("resting").await.unwrap_err();
         assert_eq!(error.to_string(), "resting is off; turn it on to start it");
         assert!(engine.server_manager.get_upstream("resting").is_none());
@@ -1526,7 +1625,7 @@ mod tests {
     #[tokio::test]
     async fn a_key_typed_into_a_server_is_written_as_a_reference() {
         use crate::secrets::SecretStore;
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         crate::operator::persist_config_atomic(&path, &Config::default()).unwrap();
@@ -1593,7 +1692,7 @@ FROM_ENV = "$HOME"
         )
         .unwrap();
         let config = crate::config::load_config(Some(&path)).unwrap();
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         // What a client is given to edit: every value hidden.
         let mut edited = engine.config().servers["older"].redacted();
         edited.args = vec!["hello".into()];
@@ -1630,7 +1729,7 @@ FROM_ENV = "$HOME"
 
     #[tokio::test]
     async fn a_key_is_kept_in_the_store_that_was_chosen() {
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
         crate::operator::persist_config_atomic(&path, &Config::default()).unwrap();
@@ -1764,7 +1863,7 @@ HOME_DIR = "$HOME"
         .unwrap();
         let config = crate::config::load_config(Some(&path)).unwrap();
         assert_ne!(config.servers["fixture"].env["HOME_DIR"], "$HOME");
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
 
         let (_, report) = engine
             .apply_operator_mutation(
@@ -1790,7 +1889,7 @@ HOME_DIR = "$HOME"
     async fn reload_preserves_failed_server_visibility_for_added_server() {
         use crate::config::ServerConfig;
 
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         engine.start().await.expect("engine start");
 
         let mut new_config = Config::default();
@@ -1849,7 +1948,7 @@ HOME_DIR = "$HOME"
         // Config B: empty (removes "alpha")
         let config_b = Config::default();
 
-        let engine = Arc::new(Engine::new(config_a));
+        let engine = Engine::new(config_a);
         let done = Arc::new(AtomicBool::new(false));
 
         // Spawn reader tasks that continuously call snapshot/server_statuses/tool list
@@ -1902,7 +2001,7 @@ HOME_DIR = "$HOME"
     /// hang every MCP request instead of answering late.
     #[tokio::test]
     async fn readiness_flips_once_start_finishes() {
-        let engine = Arc::new(Engine::new(Config::default()));
+        let engine = Engine::new(Config::default());
         assert!(!engine.is_ready());
 
         let waiting = {

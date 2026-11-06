@@ -1798,7 +1798,7 @@ mod tests {
         config: Config,
         config_path: std::path::PathBuf,
     ) -> (Arc<Engine>, JoinHandle<anyhow::Result<()>>) {
-        let engine = Arc::new(Engine::new(config));
+        let engine = Engine::new(config);
         engine.start().await.expect("engine start");
         let engine_for_task = Arc::clone(&engine);
         let handle = tokio::spawn(async move { run_daemon(engine_for_task, config_path).await });
