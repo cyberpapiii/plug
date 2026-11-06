@@ -1,8 +1,8 @@
 use super::error::HttpError;
 use super::server::HttpState;
 use crate::notifications::NotificationTarget;
-use crate::proxy::DownstreamBridge;
-use crate::session::{SessionSendOutcome, SseMessage, SseReplayKey};
+use crate::proxy::{DownstreamBridge, ReverseRequest};
+use crate::session::{SseMessage, SseReplayKey};
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
 use std::future::Future;
@@ -25,13 +25,8 @@ impl DownstreamBridge for HttpBridge {
         &self,
         request: ElicitRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
-        if self.capabilities.elicitation.is_none() {
-            return Box::pin(async {
-                Err(McpError::internal_error(
-                    "client does not support elicitation".to_string(),
-                    None,
-                ))
-            });
+        if let Err(error) = ReverseRequest::Elicitation.check_declared(Some(&self.capabilities)) {
+            return Box::pin(async { Err(error) });
         }
         let state = Arc::clone(&self.state);
         let session_id = Arc::clone(&self.session_id);
@@ -57,13 +52,8 @@ impl DownstreamBridge for HttpBridge {
         &self,
         request: CreateMessageRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
-        if self.capabilities.sampling.is_none() {
-            return Box::pin(async {
-                Err(McpError::internal_error(
-                    "client does not support sampling".to_string(),
-                    None,
-                ))
-            });
+        if let Err(error) = ReverseRequest::Sampling.check_declared(Some(&self.capabilities)) {
+            return Box::pin(async { Err(error) });
         }
         let state = Arc::clone(&self.state);
         let session_id = Arc::clone(&self.session_id);
@@ -105,16 +95,11 @@ pub(super) async fn send_http_client_request(
                 .map_err(|e| McpError::internal_error(e.to_string(), None))
         })?;
 
-    let has_live_sse_sender = state
+    if !state
         .sessions
         .has_live_sse_sender(session_id)
-        .map_err(|_| {
-            McpError::internal_error(
-                "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
-                None,
-            )
-        })?;
-    if !has_live_sse_sender {
+        .unwrap_or(false)
+    {
         return Err(McpError::internal_error(
             "HTTP client SSE stream disappeared before reverse request delivery".to_string(),
             None,
@@ -133,14 +118,11 @@ pub(super) async fn send_http_client_request(
         session_id,
         id,
     };
-    match state.sessions.send_to_live_session(session_id, message) {
-        SessionSendOutcome::Delivered | SessionSendOutcome::Queued => {}
-        SessionSendOutcome::SessionNotFound => {
-            return Err(McpError::internal_error(
-                "HTTP client SSE stream could not accept reverse request delivery".to_string(),
-                None,
-            ));
-        }
+    if !state.sessions.send_to_live_session(session_id, message) {
+        return Err(McpError::internal_error(
+            "HTTP client SSE stream could not accept reverse request delivery".to_string(),
+            None,
+        ));
     }
     match tokio::time::timeout(timeout, rx).await {
         Ok(Ok(result)) => Ok(result),

@@ -6,9 +6,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    DownstreamSessionSnapshot, SessionError, SessionSendOutcome, SseEvent, SseMessage, SseReplayKey,
-};
+use super::{DownstreamSessionSnapshot, SessionError, SseEvent, SseMessage, SseReplayKey};
 
 /// The in-memory store of downstream HTTP sessions.
 pub struct SessionStore {
@@ -301,82 +299,53 @@ impl SessionStore {
         Ok(f(&mut entry))
     }
 
-    fn try_send_to_session(
-        &self,
-        session_id: &str,
-        message: SseMessage,
-        queue_if_unavailable: bool,
-    ) -> SessionSendOutcome {
-        let mut remove_session = false;
-        let mut clear_sender = false;
+    /// Deliver `message` to the session's stream, or queue it for the next
+    /// stream. Returns whether the session was there to take it.
+    pub fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> bool {
         let mut failed_sender: Option<mpsc::Sender<SseEvent>> = None;
-        let mut queue_event: Option<SseEvent> = None;
-        let mut delivered = false;
-
-        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+        let event;
+        {
+            let Some(mut entry) = self.sessions.get_mut(session_id) else {
+                return false;
+            };
             if entry.last_activity.elapsed() > self.timeout {
-                remove_session = true;
-            } else if entry.access_ended() {
+                drop(entry);
+                self.remove_if_expired(session_id);
+                return false;
+            }
+            if entry.access_ended() {
                 drop(entry);
                 self.end(session_id, SessionEnd::Lapsed);
-                return SessionSendOutcome::SessionNotFound;
-            } else if let Some(sender) = entry.sse_sender.clone() {
-                let event = Self::next_event(&mut entry, message);
-                match sender.try_send(event.clone()) {
+                return false;
+            }
+            let next = Self::next_event(&mut entry, message);
+            if let Some(sender) = entry.sse_sender.clone() {
+                match sender.try_send(next.clone()) {
                     Ok(()) => {
                         entry.last_activity = Instant::now();
-                        delivered = true;
+                        return true;
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        clear_sender = true;
-                        failed_sender = Some(sender);
-                        if queue_if_unavailable {
-                            queue_event = Some(event);
-                        }
-                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         tracing::warn!(
                             session_id = %session_id,
                             "dropping slow SSE client from targeted notification delivery"
                         );
-                        clear_sender = true;
-                        failed_sender = Some(sender);
-                        if queue_if_unavailable {
-                            queue_event = Some(event);
-                        }
                     }
                 }
-            } else if queue_if_unavailable {
-                queue_event = Some(Self::next_event(&mut entry, message));
+                failed_sender = Some(sender);
             }
+            event = next;
+        }
+        if failed_sender.is_some() {
+            self.clear_sender_if_matching(session_id, failed_sender.as_ref(), Some(event));
         } else {
-            return SessionSendOutcome::SessionNotFound;
+            self.enqueue_or_deliver_racy(session_id, event);
         }
-
-        if remove_session {
-            self.remove_if_expired(session_id);
-            return SessionSendOutcome::SessionNotFound;
-        }
-
-        let queued = queue_event.is_some();
-        if clear_sender {
-            self.clear_sender_if_matching(session_id, failed_sender.as_ref(), queue_event);
-        } else if let Some(event) = queue_event
-            && self.enqueue_or_deliver_racy(session_id, event)
-        {
-            delivered = true;
-        }
-
-        if delivered {
-            SessionSendOutcome::Delivered
-        } else if queued {
-            SessionSendOutcome::Queued
-        } else {
-            SessionSendOutcome::SessionNotFound
-        }
+        true
     }
 
-    /// Second phase of `try_send_to_session`'s no-live-sender-at-first-check
+    /// Second phase of `send_to_live_session`'s no-live-sender-at-first-check
     /// path. A reconnecting client may install a fresh sender in the window
     /// between the initial `None` check (phase 1, where no sender was found)
     /// and re-acquiring this entry's guard here (phase 2); blindly enqueuing
@@ -410,10 +379,10 @@ impl SessionStore {
         }
     }
 
-    /// Second phase of `try_send_to_session`'s clear path. Only nulls the entry's
+    /// Second phase of `send_to_live_session`'s clear path. Only nulls the entry's
     /// `sse_sender` if it is still the same channel that failed delivery; a
     /// reconnecting client may have installed a fresh, live sender in the window
-    /// between `try_send_to_session` releasing and re-acquiring this entry's guard,
+    /// between `send_to_live_session` releasing and re-acquiring this entry's guard,
     /// and wiping that out would silently break the new connection.
     fn clear_sender_if_matching(
         &self,
@@ -716,14 +685,6 @@ impl SessionStore {
         for session_id in ended {
             self.end(&session_id, SessionEnd::Lapsed);
         }
-    }
-
-    pub fn send_to_live_session(
-        &self,
-        session_id: &str,
-        message: SseMessage,
-    ) -> SessionSendOutcome {
-        self.try_send_to_session(session_id, message, true)
     }
 
     pub fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
@@ -1143,10 +1104,7 @@ mod tests {
             )),
         );
         let message = crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap();
-        assert!(matches!(
-            store.send_to_live_session(&sent_to, message),
-            SessionSendOutcome::SessionNotFound
-        ));
+        assert!(!store.send_to_live_session(&sent_to, message));
         assert!(matches!(
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -1462,7 +1420,7 @@ mod tests {
     #[tokio::test]
     async fn racing_reconnect_sender_is_not_clobbered_by_stale_clear() {
         // Reproduces the fix directly: `clear_sender_if_matching` is the exact
-        // second-phase decision `try_send_to_session` makes after releasing and
+        // second-phase decision `send_to_live_session` makes after releasing and
         // re-acquiring the session guard. Here we drive it with a failed sender
         // (A) while the entry's live sender has already moved on to a
         // reconnected sender (B) -- simulating a client reconnect racing into
@@ -1630,7 +1588,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_recheck_flushes_to_new_sender() {
         // Reproduces the fix directly: `enqueue_or_deliver_racy` is the exact
-        // second-phase decision `try_send_to_session` makes after releasing
+        // second-phase decision `send_to_live_session` makes after releasing
         // and re-acquiring the session guard when phase 1 found no sender.
         // Here a live sender is installed AFTER the point where phase 1 would
         // have observed `None`, simulating a client reconnect racing into the
@@ -1640,7 +1598,7 @@ mod tests {
         let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
-        // No sender yet -- this is what phase 1 of `try_send_to_session`
+        // No sender yet -- this is what phase 1 of `send_to_live_session`
         // would have seen.
         assert!(!store.has_live_sse_sender(&id).unwrap());
 

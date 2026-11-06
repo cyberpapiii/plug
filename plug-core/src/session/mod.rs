@@ -69,13 +69,6 @@ impl SseMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionSendOutcome {
-    Delivered,
-    Queued,
-    SessionNotFound,
-}
-
 /// Which class of broadcast a notification belongs to.
 ///
 /// Targeted notifications (progress, cancellation, resource updates) are not

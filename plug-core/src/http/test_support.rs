@@ -23,9 +23,7 @@ pub(super) use crate::mcp_http_headers::{
 pub(super) use crate::notifications::{NotificationTarget, ProtocolNotification};
 pub(super) use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 pub(super) use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
-pub(super) use crate::session::{
-    SessionEnd, SessionSendOutcome, SessionStore, SseMessage, SseReplayKey,
-};
+pub(super) use crate::session::{SessionEnd, SessionStore, SseMessage, SseReplayKey};
 pub(super) use axum::Json;
 pub(super) use axum::body::Bytes;
 pub(super) use axum::extract::State;
