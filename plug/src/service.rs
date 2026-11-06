@@ -24,7 +24,6 @@ pub enum LaunchdProgramOwnership {
 
 /// CLI leftover-launchd sentence. The app leftover path still uses the generic
 /// "Background running is off" / Turn On verdict, not this string.
-#[cfg(any(target_os = "macos", test))]
 pub const LEFTOVER_LAUNCHD_ADOPT_SENTENCE: &str =
     "Open Plug.app and tap Turn On to adopt the leftover launchd daemon.";
 
