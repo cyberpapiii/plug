@@ -1,6 +1,53 @@
-use super::{Access, EVENT_SCOPE, EventAccess, SlackEventsConfig};
+use super::{EventAccess, SlackEventsConfig};
+use crate::events::{Access, EVENT_SCOPE};
+use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
+
+// Facts about the third-party Slack MCP server this source reads through.
+// They are that server's choices, not Plug's: a rename or a new output shape
+// there is fixed here.
+
+/// The name that server must have in Plug's config.
+const SLACK_SERVER: &str = "slack";
+/// Reports the signed-in account as `is_oauth`, `is_bot_token`, and
+/// `provider_identity.{team_id,user_id}`, under `data` when structured.
+const AUTH_STATUS_TOOL: &str = "slack_auth_status";
+/// Reads a channel. Failing with `error.code` says why.
+const HISTORY_TOOL: &str = "conversations_history";
+
+/// Only stable, structured permission failures discard a channel's queued
+/// data. Generic tool errors and network/rate-limit failures remain bounded
+/// retries.
+fn channel_error_access(code: Option<&str>) -> Access {
+    match code {
+        Some(
+            "channel_not_found" | "not_in_channel" | "no_permission" | "missing_scope"
+            | "restricted_action",
+        ) => Access::Denied,
+        _ => Access::Unavailable,
+    }
+}
+
+/// The JSON a tool returned: its structured content, or else the first text
+/// item that parses.
+fn result_json(result: &CallToolResult) -> Option<Value> {
+    result.structured_content.clone().or_else(|| {
+        result
+            .content
+            .iter()
+            .filter_map(|item| item.as_text())
+            .find_map(|text| serde_json::from_str::<Value>(&text.text).ok())
+    })
+}
+
+/// Whether the Slack server is configured and turned on.
+pub(crate) fn upstream_enabled(config: &crate::config::Config) -> bool {
+    config
+        .servers
+        .get(SLACK_SERVER)
+        .is_some_and(|server| server.enabled)
+}
 
 /// No credentials are copied into event storage: probes use the existing live
 /// upstream connection and the owner's durable downstream OAuth grant.
@@ -27,18 +74,9 @@ impl EventAccess for RuntimeAccess {
     fn enabled(&self) -> bool {
         self.engine.upgrade().is_some_and(|engine| {
             let config = engine.config();
-            config.http.modern_downstream_enabled
-                && config.http.auth_mode == crate::config::DownstreamAuthMode::Oauth
+            crate::events::events_possible(&config.http)
                 && config.http.slack_events.as_ref() == Some(&self.config)
-                && config
-                    .http
-                    .oauth_scopes
-                    .as_ref()
-                    .is_some_and(|s| s.iter().any(|s| s == EVENT_SCOPE))
-                && config
-                    .servers
-                    .get("slack")
-                    .is_some_and(|server| server.enabled)
+                && upstream_enabled(&config)
         })
     }
     async fn check(&self, channel: Option<&str>) -> Access {
@@ -55,8 +93,8 @@ impl EventAccess for RuntimeAccess {
         };
         let router = engine.tool_router();
         let (Some(auth), Some(history)) = (
-            router.event_probe_tool("slack_auth_status"),
-            router.event_probe_tool("conversations_history"),
+            router.listed_name(SLACK_SERVER, AUTH_STATUS_TOOL),
+            router.listed_name(SLACK_SERVER, HISTORY_TOOL),
         ) else {
             return Access::Unavailable;
         };
@@ -70,13 +108,9 @@ impl EventAccess for RuntimeAccess {
             .structured_content
             .as_ref()
             .and_then(|v| v.get("data"))
-            .or(result.structured_content.as_ref());
-        let fallback = result
-            .content
-            .iter()
-            .filter_map(|item| item.as_text())
-            .find_map(|text| serde_json::from_str::<Value>(&text.text).ok());
-        let Some(data) = data.or(fallback.as_ref()) else {
+            .cloned()
+            .or_else(|| result_json(&result));
+        let Some(data) = data else {
             return Access::Unavailable;
         };
         if data["is_oauth"] != true
@@ -95,29 +129,13 @@ impl EventAccess for RuntimeAccess {
             .cloned();
         match router.call_tool(&history, arguments).await {
             Ok(result) if result.is_error != Some(true) && self.enabled() => Access::Allowed,
-            Ok(result) => {
-                let fallback = result
-                    .content
-                    .iter()
-                    .filter_map(|item| item.as_text())
-                    .find_map(|text| serde_json::from_str::<Value>(&text.text).ok());
-                let value = result.structured_content.as_ref().or(fallback.as_ref());
-                channel_error_access(value.and_then(|v| v["error"]["code"].as_str()))
-            }
+            Ok(result) => channel_error_access(
+                result_json(&result)
+                    .as_ref()
+                    .and_then(|v| v["error"]["code"].as_str()),
+            ),
             Err(_) => Access::Unavailable,
         }
-    }
-}
-
-// Only stable, structured permission failures discard a channel's queued data.
-// Generic tool errors and network/rate-limit failures remain bounded retries.
-fn channel_error_access(code: Option<&str>) -> Access {
-    match code {
-        Some(
-            "channel_not_found" | "not_in_channel" | "no_permission" | "missing_scope"
-            | "restricted_action",
-        ) => Access::Denied,
-        _ => Access::Unavailable,
     }
 }
 #[cfg(test)]

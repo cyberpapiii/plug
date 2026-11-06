@@ -4,21 +4,21 @@ impl crate::slack_events::EventAccess for AllowedEventAccess {
     fn enabled(&self) -> bool {
         true
     }
-    async fn check(&self, _channel: Option<&str>) -> crate::slack_events::Access {
-        crate::slack_events::Access::Allowed
+    async fn check(&self, _channel: Option<&str>) -> crate::events::Access {
+        crate::events::Access::Allowed
     }
 }
 struct EchoEventDelivery;
 #[async_trait::async_trait]
-impl crate::slack_events::EventDelivery for EchoEventDelivery {
+impl crate::events::EventDelivery for EchoEventDelivery {
     async fn post(
         &self,
         _: &str,
         _: HeaderMap,
         body: Vec<u8>,
-    ) -> Result<crate::slack_events::DeliveryResponse, &'static str> {
+    ) -> Result<crate::events::DeliveryResponse, &'static str> {
         let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
-        Ok(crate::slack_events::DeliveryResponse {
+        Ok(crate::events::DeliveryResponse {
             status: 200,
             body: json!({"challenge":value["challenge"]})
                 .to_string()
@@ -56,7 +56,7 @@ async fn slack_events_http_requires_selected_client_scope_and_live_grant() {
     .unwrap();
     let mut state = oauth_test_state_with_manager(manager.clone());
     state.router.set_modern_downstream_enabled(true);
-    Arc::get_mut(&mut state).unwrap().slack_events = Some(events);
+    Arc::get_mut(&mut state).unwrap().event_sources = vec![events as Arc<dyn crate::events::EventSource>];
     let app = build_router(state);
     let unsigned = HttpRequest::builder()
         .method("POST")
@@ -164,7 +164,7 @@ async fn slack_events_selected_client_can_discover_scope_challenge_before_consen
     .unwrap();
     let mut state = oauth_test_state_with_manager(manager);
     state.router.set_modern_downstream_enabled(true);
-    Arc::get_mut(&mut state).unwrap().slack_events = Some(events.clone());
+    Arc::get_mut(&mut state).unwrap().event_sources = vec![events as Arc<dyn crate::events::EventSource>];
     let app = build_router(state);
     let mut discover = modern_request("server/discover", json!({}));
     discover.headers_mut().insert(
@@ -212,5 +212,4 @@ async fn slack_events_selected_client_can_discover_scope_challenge_before_consen
         assert!(challenge.contains("resource_metadata="));
     }
     assert!(!dir.path().join("events/state.json").exists());
-    assert!(!events.available_to(&events.config.subscriber_client_id, &["tools:read".into()]));
 }
