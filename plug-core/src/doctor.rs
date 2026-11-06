@@ -1253,21 +1253,16 @@ mod tests {
     /// Plug's folder in a fresh temporary folder, so a check reads no real
     /// token, PID file or daemon.
     struct TempPlug {
-        _paths: crate::paths::test::Set,
+        _paths: crate::paths::test::Isolated,
         _dir: tempfile::TempDir,
-        _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
     impl TempPlug {
         async fn new() -> Self {
-            let lock = crate::paths::test::lock().lock().await;
             let dir = tempfile::tempdir().unwrap();
-            let paths =
-                crate::paths::test::set(dir.path().join("runtime"), dir.path().join("state"));
             Self {
-                _paths: paths,
+                _paths: crate::paths::test::isolate(dir.path()).await,
                 _dir: dir,
-                _lock: lock,
             }
         }
     }

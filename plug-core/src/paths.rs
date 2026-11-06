@@ -187,6 +187,24 @@ pub mod test {
         }
     }
 
+    /// Plug's folders under `root`, for one test at a time, until this drops.
+    /// It takes `lock` and sets the paths in the one call, and lets go in
+    /// the right order, so a test cannot get either wrong.
+    pub struct Isolated {
+        _paths: Set,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    /// Wait for any other test that set the paths, then put Plug's folder
+    /// under `root`.
+    pub async fn isolate(root: &std::path::Path) -> Isolated {
+        let lock = lock().lock().await;
+        Isolated {
+            _paths: set(root.join("runtime"), root.join("state")),
+            _lock: lock,
+        }
+    }
+
     /// Held by every test that sets the paths, for as long as they are set,
     /// so tests running in parallel do not see each other's. Take it with
     /// `.lock().await` in a tokio test and `.blocking_lock()` in a plain one.
