@@ -12,7 +12,7 @@ use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
-use rmcp::service::{Peer, PeerRequestOptions};
+use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
@@ -795,6 +795,32 @@ struct ActiveCallRecord {
     downstream_progress_token: Option<ProgressToken>,
     upstream_progress_token: Option<ProgressToken>,
     pending_cancel_reason: Option<Option<String>>,
+}
+
+/// Who waits for a tool call's answer.
+#[derive(Clone, Debug)]
+enum CallKind {
+    /// The downstream request that named the tool.
+    Direct,
+    /// `plug__invoke_tool`'s target, which a lazy session may call before
+    /// loading it.
+    Invoked,
+    /// The task with this id. Its record holds the upstream request, so a
+    /// cancel or a teardown reaches the call.
+    Task(String),
+}
+
+impl CallKind {
+    fn is_task(&self) -> bool {
+        matches!(self, Self::Task(_))
+    }
+
+    fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Task(task_id) => Some(task_id),
+            Self::Direct | Self::Invoked => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -3100,7 +3126,7 @@ impl ToolRouter {
                 },
                 progress_token,
                 downstream,
-                true,
+                CallKind::Direct,
                 false,
             )
             .await?
@@ -3149,7 +3175,7 @@ impl ToolRouter {
                     },
                     progress_token,
                     downstream,
-                    true,
+                    CallKind::Direct,
                     false,
                 )
                 .await;
@@ -3247,7 +3273,7 @@ impl ToolRouter {
                 },
                 progress_token,
                 downstream,
-                true,
+                CallKind::Direct,
                 false,
             )
             .await?;
@@ -3331,22 +3357,26 @@ impl ToolRouter {
         Ok(CallToolResponse::InputRequired(input_required))
     }
 
-    /// Inner tool call implementation with retry support.
-    /// `is_retry` prevents infinite recursion — max 1 reconnect per call.
-    /// Uses `Box::pin` for the recursive call to avoid infinitely-sized future.
+    /// Route one tool call to its server and wait for the answer. Every
+    /// tool call, a task's included, runs through here, so the health gate,
+    /// circuit breaker, call slots, timeout, metrics, result sanitizing and
+    /// the resend rule apply to each the same way. `is_retry` marks the one
+    /// resend after a reconnect.
     fn call_tool_inner<'a>(
         &'a self,
         tool_name: &'a str,
         round: ToolRoundInput,
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
-        enforce_lazy_visibility: bool,
+        kind: CallKind,
         is_retry: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let _in_flight = self.track_call();
+            // A task's answer stays in this process's task store, so a daemon
+            // swap gains nothing by waiting for it.
+            let _in_flight = (!kind.is_task()).then(|| self.track_call());
             // Every way to call a tool ends here, the invoke wrapper included,
             // so this is where a per-client block cannot be stepped around.
             self.ensure_client_may_use_tool(downstream.as_ref(), tool_name)?;
@@ -3373,12 +3403,7 @@ impl ToolRouter {
                     }
                     "plug__invoke_tool" => {
                         return self
-                            .handle_invoke_tool(
-                                round.arguments.clone(),
-                                progress_token,
-                                downstream,
-                                is_retry,
-                            )
+                            .handle_invoke_tool(round.arguments.clone(), progress_token, downstream)
                             .await
                             .map(Into::into);
                     }
@@ -3395,19 +3420,17 @@ impl ToolRouter {
 
             let server_id = server_id.clone();
             let original_name = original_name.to_string();
-            // A call that reached the server and lost its answer is sent
-            // again only when the tool says a second run does no harm.
-            let safe_to_repeat = cache
-                .tool_by_name(tool_name)
-                .and_then(|tool| tool.annotations.as_ref())
-                .is_some_and(|hints| {
-                    hints.read_only_hint == Some(true) || hints.idempotent_hint == Some(true)
-                });
+            let safe_to_repeat = cache.safe_to_repeat(tool_name);
             drop(cache);
 
-            if enforce_lazy_visibility {
+            if matches!(kind, CallKind::Direct) {
                 self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;
             }
+
+            let era = downstream
+                .as_ref()
+                .map(|context| context.protocol_era)
+                .unwrap_or(crate::protocol::ProtocolEra::Legacy);
 
             // Health gate — auth failure is actionable and must not be
             // flattened into a generic availability failure. The existing
@@ -3415,14 +3438,9 @@ impl ToolRouter {
             // re-authorized, without returning any credential material.
             let health = self.server_manager.health(&server_id);
             if let Some(outcome) = health.and_then(health_gate_outcome) {
-                let era = downstream
-                    .as_ref()
-                    .map(|context| context.protocol_era)
-                    .unwrap_or(crate::protocol::ProtocolEra::Legacy);
                 return Err(outcome.into_error(era));
             }
 
-            // Circuit breaker gate
             if let Some(cb) = self.server_manager.circuit_breaker(&server_id) {
                 cb.call_allowed().map_err(|_: CircuitBreakerError| {
                     McpError::from(ProtocolError::ServerUnavailable {
@@ -3431,11 +3449,18 @@ impl ToolRouter {
                 })?;
             }
 
-            let semaphore_timeout = self
-                .server_manager
-                .get_upstream(&server_id)
-                .map(|upstream| Duration::from_secs(upstream.config.call_timeout_secs))
-                .unwrap_or(Duration::from_secs(30));
+            let unavailable = || {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            };
+            let slot_wait = Duration::from_secs(
+                self.server_manager
+                    .get_upstream(&server_id)
+                    .ok_or_else(unavailable)?
+                    .config
+                    .call_timeout_secs,
+            );
 
             let call_id = next_call_id();
             let trace_id = downstream
@@ -3488,8 +3513,10 @@ impl ToolRouter {
                     }
                 }
             }
+            // A task's downstream request was answered when the task was
+            // created, so nothing downstream waits on this call's id.
             let mut active_call_guard = None;
-            if let Some(call_context) = downstream.clone() {
+            if let Some(call_context) = downstream.clone().filter(|_| !kind.is_task()) {
                 self.register_active_call(
                     call_id,
                     ActiveCallRecord {
@@ -3537,24 +3564,18 @@ impl ToolRouter {
             // the first is queued or executing, rather than waiting for the
             // semaphore and becoming a second side effect after the first
             // call unregisters.
-            let semaphore = self.server_manager.call_slots(&server_id);
-            let permit = if let Some(sem) = semaphore {
-                Some(
-                    tokio::time::timeout(semaphore_timeout, sem.acquire_owned())
+            let permit = match self.server_manager.call_slots(&server_id) {
+                Some(sem) => Some(
+                    tokio::time::timeout(slot_wait, sem.acquire_owned())
                         .await
                         .map_err(|_| {
                             McpError::from(ProtocolError::ServerBusy {
                                 server_id: server_id.clone(),
                             })
                         })?
-                        .map_err(|_| {
-                            McpError::from(ProtocolError::ServerUnavailable {
-                                server_id: server_id.clone(),
-                            })
-                        })?,
-                )
-            } else {
-                None
+                        .map_err(|_| unavailable())?,
+                ),
+                None => None,
             };
 
             // Resolve the live peer only after the queue wait. A reconnect may
@@ -3565,22 +3586,13 @@ impl ToolRouter {
             let upstream = self
                 .server_manager
                 .get_upstream(&server_id)
-                .ok_or_else(|| {
-                    McpError::from(ProtocolError::ServerUnavailable {
-                        server_id: server_id.clone(),
-                    })
-                })?;
+                .ok_or_else(unavailable)?;
 
             if let Some(expected) = &round.expected_route {
                 let (actual, _) = self.tool_route_identity(tool_name)?;
                 if actual != *expected {
                     return Err(
-                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(
-                            downstream
-                                .as_ref()
-                                .map(|context| context.protocol_era)
-                                .unwrap_or(crate::protocol::ProtocolEra::Legacy),
-                        ),
+                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(era)
                     );
                 }
             }
@@ -3593,8 +3605,11 @@ impl ToolRouter {
             // when nothing else holds it, which cut this call off.
             let _held_through_the_call = upstream;
 
+            // No `options.timeout`: rmcp's timeout path cancels through an
+            // unbounded `send_notification`, so a wedged sink would hang the
+            // call forever. The bound is the `tokio::time::timeout` below,
+            // paired with a cancel bounded on its own.
             let mut options = PeerRequestOptions::default();
-            options.timeout = Some(timeout_duration);
             options.meta = extension_meta.clone().map(RequestMetaObject);
             if let Some(token) = upstream_progress_token.clone() {
                 options
@@ -3602,7 +3617,13 @@ impl ToolRouter {
                     .get_or_insert_with(RequestMetaObject::new)
                     .set_progress_token(token);
             }
-            let request_handle = peer
+            let RequestHandle {
+                mut rx,
+                id: upstream_request_id,
+                peer: request_peer,
+                progress_token: request_progress_token,
+                ..
+            } = peer
                 .send_cancellable_request(request, options)
                 .await
                 .map_err(|error| {
@@ -3610,28 +3631,39 @@ impl ToolRouter {
                         guard.disarm();
                     }
                     self.remove_active_call(call_id);
-                    match error {
-                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
-                    }
+                    map_service_error(error)
                 })?;
 
-            let actual_progress_token = downstream_progress_token
-                .as_ref()
-                .map(|_| request_handle.progress_token.clone());
-            self.attach_upstream_request_id(
-                call_id,
-                &server_id,
-                request_handle.id.clone(),
-                actual_progress_token,
-            );
+            match &kind {
+                CallKind::Task(task_id) => {
+                    self.record_task_request(
+                        task_id,
+                        &server_id,
+                        &request_peer,
+                        &upstream_request_id,
+                        timeout_duration,
+                    )
+                    .await?;
+                }
+                CallKind::Direct | CallKind::Invoked => {
+                    self.attach_upstream_request_id(
+                        call_id,
+                        &server_id,
+                        upstream_request_id.clone(),
+                        downstream_progress_token
+                            .as_ref()
+                            .map(|_| request_progress_token),
+                    );
+                }
+            }
             tracing::info!(
                 call_id,
                 trace_id = %trace_id,
+                task_id = ?kind.task_id(),
                 downstream_transport = ?downstream.as_ref().map(|context| context.transport),
                 downstream_client = ?downstream.as_ref().map(|context| context.client_id.as_ref()),
                 downstream_request_id = ?downstream.as_ref().map(|context| &context.request_id),
-                upstream_request_id = ?request_handle.id,
+                upstream_request_id = ?upstream_request_id,
                 server = %server_id,
                 tool = %original_name,
                 retry = is_retry,
@@ -3640,10 +3672,25 @@ impl ToolRouter {
 
             let call_start = std::time::Instant::now();
 
-            // Execute with timeout via rmcp RequestHandle so we retain upstream request ID.
-            let result = request_handle.await_response().await;
+            // The oneshot maps as rmcp's `await_response` maps it: a dropped
+            // responder means the transport went away.
+            let result = match tokio::time::timeout(timeout_duration, &mut rx).await {
+                Ok(Ok(inner)) => inner,
+                Ok(Err(_recv_error)) => Err(rmcp::service::ServiceError::TransportClosed),
+                Err(_elapsed) => {
+                    cancel_upstream_request(
+                        &request_peer,
+                        upstream_request_id.clone(),
+                        RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON,
+                        timeout_duration,
+                    )
+                    .await;
+                    Err(rmcp::service::ServiceError::Timeout {
+                        timeout: timeout_duration,
+                    })
+                }
+            };
 
-            // Drop semaphore permit
             drop(permit);
 
             // Metrics RAII: any early exit / panic after await still records a
@@ -3678,7 +3725,6 @@ impl ToolRouter {
             };
             let duration_ms = call_start.elapsed().as_millis() as u64;
 
-            // Record circuit breaker outcome
             let cb = self.server_manager.circuit_breaker(&server_id);
 
             // Close out this attempt's ledgers: record the circuit breaker
@@ -3701,6 +3747,7 @@ impl ToolRouter {
                 self.remove_active_call(call_id);
             };
 
+            let lost = result.as_ref().err().and_then(LostSession::of);
             match result {
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
@@ -3716,8 +3763,16 @@ impl ToolRouter {
                         duration_ms,
                         "proxy tool call completed"
                     );
+                    if kind.is_task() {
+                        // A task's result is spilled when it is fetched.
+                        return Ok(response.into());
+                    }
                     self.artifact_store
-                        .maybe_spill_result_of(&server_id, &original_name, tool_name, response)
+                        .maybe_spill_result_of(
+                            Some((&server_id, &original_name)),
+                            tool_name,
+                            response,
+                        )
                         .await
                         .map(Into::into)
                 }
@@ -3736,7 +3791,7 @@ impl ToolRouter {
                     );
                     Ok(CallToolResponse::InputRequired(response))
                 }
-                Err(e) if is_session_error(&e) && !(never_reached_server(&e) || safe_to_repeat) => {
+                Err(e) if lost == Some(LostSession::MayHaveArrived) && !safe_to_repeat => {
                     // The connection dropped after the call was sent. The
                     // tool may have run, so Plug does not send it again: a
                     // second message or a second record is worse than an
@@ -3759,13 +3814,12 @@ impl ToolRouter {
                     ))
                 }
                 Err(e)
-                    if is_session_error(&e)
+                    if lost.is_some()
                         && !is_retry
                         && round.input_responses.is_none()
                         && round.request_state.is_none()
                         && round.expected_route.is_none() =>
                 {
-                    // Session/transport error on first attempt — try to reconnect and retry
                     tracing::warn!(
                         server = %server_id,
                         tool = %original_name,
@@ -3805,15 +3859,8 @@ impl ToolRouter {
                         }
                     }
 
-                    self.call_tool_inner(
-                        tool_name,
-                        round,
-                        progress_token,
-                        downstream,
-                        enforce_lazy_visibility,
-                        true,
-                    )
-                    .await
+                    self.call_tool_inner(tool_name, round, progress_token, downstream, kind, true)
+                        .await
                 }
                 Err(rmcp::service::ServiceError::Timeout { timeout }) => {
                     tracing::error!(
@@ -3842,10 +3889,7 @@ impl ToolRouter {
                         "upstream tool call failed"
                     );
                     finish(Some(false), Some(false));
-                    match e {
-                        rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
-                        other => Err(McpError::internal_error(other.to_string(), None)),
-                    }
+                    Err(map_service_error(e))
                 }
                 Ok(other) => {
                     // An unexpected upstream response is a terminal failure —
@@ -4132,7 +4176,6 @@ impl ToolRouter {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
-        is_retry: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
     > {
@@ -4194,8 +4237,8 @@ impl ToolRouter {
                 },
                 progress_token,
                 downstream,
+                CallKind::Invoked,
                 false,
-                is_retry,
             )
             .await
             .and_then(|response| match response {
@@ -4282,54 +4325,68 @@ impl ToolRouter {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Session error classification
-// ---------------------------------------------------------------------------
+/// A call that failed because the connection to its server was lost, which
+/// a reconnect may fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LostSession {
+    /// The server refused the connection or no longer knew the session, so
+    /// the call never reached it.
+    NeverArrived,
+    /// The connection closed, reset or broke. The call may have arrived first.
+    MayHaveArrived,
+}
 
-/// Classify whether a ServiceError indicates a session/transport failure
-/// that should trigger automatic reconnection.
-///
-/// rmcp v1.0.0 error mapping:
-/// - HTTP 404 "Session not found" → `ServiceError::TransportSend(DynamicTransportError)`
-///   with formatted string containing "404" and "session not found"
-/// - Connection refused/reset → `ServiceError::TransportSend` or `TransportClosed`
-/// - JSON-RPC application errors → `ServiceError::McpError` (do NOT reconnect)
-/// - Timeouts → `ServiceError::Timeout` (do NOT reconnect)
-fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
-    use rmcp::service::ServiceError;
-    match e {
-        // Transport send failures (HTTP 404, connection refused, etc.)
-        ServiceError::TransportSend(dyn_err) => {
-            let msg = dyn_err.to_string().to_lowercase();
-            msg.contains("404")
-                || msg.contains("session not found")
-                || msg.contains("connection refused")
-                || msg.contains("connection reset")
-                || msg.contains("broken pipe")
+impl LostSession {
+    /// rmcp reports transport failures only as text: an HTTP 404 "Session
+    /// not found" and refused or reset connections arrive as
+    /// `TransportSend` with the cause in its message. Tool errors
+    /// (`McpError`), timeouts and cancels are not lost sessions.
+    fn of(error: &rmcp::service::ServiceError) -> Option<Self> {
+        match error {
+            rmcp::service::ServiceError::TransportSend(error) => {
+                let msg = error.to_string().to_lowercase();
+                let has = |needles: &[&str]| needles.iter().any(|needle| msg.contains(needle));
+                if has(&["404", "session not found", "connection refused"]) {
+                    Some(Self::NeverArrived)
+                } else if has(&["connection reset", "broken pipe"]) {
+                    Some(Self::MayHaveArrived)
+                } else {
+                    None
+                }
+            }
+            rmcp::service::ServiceError::TransportClosed => Some(Self::MayHaveArrived),
+            _ => None,
         }
-        // Transport closed = connection dropped (server crashed/restarted)
-        ServiceError::TransportClosed => true,
-        // All other variants: do NOT reconnect
-        // McpError = application-level error (tool errors, invalid params)
-        // Timeout = slow tool, not a server failure
-        // Cancelled = task cancelled
-        // UnexpectedResponse = wrong response type
-        _ => false,
     }
 }
 
-/// Whether a session error proves the server never took the call: it refused
-/// the connection or no longer knew the session. A closed, reset, or broken
-/// connection proves nothing, since the call may have arrived first.
-fn never_reached_server(e: &rmcp::service::ServiceError) -> bool {
-    match e {
-        rmcp::service::ServiceError::TransportSend(error) => {
-            let msg = error.to_string().to_lowercase();
-            msg.contains("404")
-                || msg.contains("session not found")
-                || msg.contains("connection refused")
-        }
-        _ => false,
+fn map_service_error(error: rmcp::service::ServiceError) -> McpError {
+    match error {
+        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+        other => McpError::internal_error(other.to_string(), None),
+    }
+}
+
+/// Ask `peer` to stop `request_id`, waiting at most `bound`: rmcp's
+/// notification send waits on a full transport sink forever.
+async fn cancel_upstream_request(
+    peer: &Peer<RoleClient>,
+    request_id: RequestId,
+    reason: &str,
+    bound: Duration,
+) {
+    let send = peer.notify_cancelled(CancelledNotificationParam::new(
+        Some(request_id),
+        Some(reason.to_string()),
+    ));
+    match tokio::time::timeout(bound, send).await {
+        Err(_) => tracing::warn!(
+            reason,
+            timeout_secs = bound.as_secs(),
+            "upstream cancellation notify timed out"
+        ),
+        Ok(Err(error)) => tracing::debug!(reason, %error, "upstream cancellation notify failed"),
+        Ok(Ok(())) => {}
     }
 }
 
