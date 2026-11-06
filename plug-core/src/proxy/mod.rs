@@ -30,9 +30,7 @@ use crate::types::{
     ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
     ResolvedLazyToolPolicy, ServerHealth,
 };
-use continuations::{
-    MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES, MRTR_MAX_ROUNDS,
-};
+use continuations::{MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ROUNDS};
 
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Backstop timeout for a single `refresh_tools` pass inside the notification
@@ -1206,8 +1204,8 @@ impl ToolRouter {
         )
     }
 
-    /// The server and the server's own name behind `listed`, a name Plug
-    /// lists a tool under. Plug's own tools have neither.
+    /// The server and the server's own name behind `listed`, a name a call
+    /// to the tool may use. Plug's own tools have neither.
     pub fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
         self.cache
             .load()
@@ -3318,11 +3316,6 @@ impl ToolRouter {
         })?;
         let input_requests = input_required.input_requests.clone().unwrap_or_default();
         if input_requests.is_empty()
-            || input_requests.len() > MRTR_MAX_ITEMS
-            || input_required
-                .request_state
-                .as_ref()
-                .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
             || input_requests.values().any(|request| {
                 !matches!(
                     request,
@@ -3333,10 +3326,11 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                 .into_error(context.protocol_era));
         }
-        let payload_bytes = serde_json::to_vec(&input_required)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .len();
-        if payload_bytes > MRTR_MAX_BYTES {
+        if continuations::exceeds_continuation_limits(
+            input_required.request_state.as_deref(),
+            input_requests.len(),
+            &input_required,
+        ) {
             return Err(McpError::invalid_request(
                 "upstream multi-round response exceeds Plug's bounded continuation limits",
                 None,

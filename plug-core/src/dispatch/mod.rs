@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::protocol::{MethodFamily, ProtocolEra};
-use crate::proxy::continuations::{MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES};
+use crate::proxy::continuations::exceeds_continuation_limits;
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 use crate::tasks::{OwnerLivenessProbe, TaskOwner};
 use crate::types::ClientType;
@@ -496,21 +496,14 @@ async fn tools_call_inner(
     downstream.authorize(MethodFamily::ToolsCall)?;
 
     let has_continuation = params.input_responses.is_some() || params.request_state.is_some();
-    if params
-        .request_state
-        .as_ref()
-        .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
-        || params
+    if exceeds_continuation_limits(
+        params.request_state.as_deref(),
+        params
             .input_responses
             .as_ref()
-            .is_some_and(|responses| responses.len() > MRTR_MAX_ITEMS)
-        || params.input_responses.as_ref().is_some_and(|responses| {
-            match serde_json::to_vec(responses) {
-                Ok(encoded) => encoded.len() > MRTR_MAX_BYTES,
-                Err(_) => true,
-            }
-        })
-    {
+            .map_or(0, |responses| responses.len()),
+        &params.input_responses,
+    ) {
         return Err(McpError::invalid_params(
             "multi-round tool input exceeds Plug's bounded continuation limits".to_string(),
             None,
@@ -545,21 +538,6 @@ async fn tools_call_inner(
     {
         rmcp::model::CallToolResponse::Complete(result) => Ok(ToolCallOutcome::Called(result)),
         rmcp::model::CallToolResponse::InputRequired(result) => {
-            if result
-                .request_state
-                .as_ref()
-                .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
-                || result
-                    .input_requests
-                    .as_ref()
-                    .is_some_and(|requests| requests.len() > MRTR_MAX_ITEMS)
-                || serde_json::to_vec(&result).is_ok_and(|encoded| encoded.len() > MRTR_MAX_BYTES)
-            {
-                return Err(McpError::invalid_request(
-                    "upstream multi-round response exceeds Plug's bounded continuation limits",
-                    None,
-                ));
-            }
             Ok(ToolCallOutcome::InputRequired(result))
         }
         rmcp::model::CallToolResponse::Task(_) => Err(McpError::internal_error(
