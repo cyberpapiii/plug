@@ -45,6 +45,7 @@ pub mod tls;
 pub mod tool_naming;
 pub mod transport;
 pub mod types;
+pub(crate) mod upstream_http;
 pub mod watcher;
 
 #[cfg(test)]

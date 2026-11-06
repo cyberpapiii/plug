@@ -977,7 +977,7 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
 
         match engine.reconnect_server(server_name).await {
             Ok(_) => {}
-            Err(e) if crate::oauth::is_auth_error_chain(&e) => {
+            Err(e) if crate::oauth::is_auth_rejection(&e) => {
                 tracing::warn!(
                     server = %server_name,
                     "reconnect with fresh token failed (auth error), marking AuthRequired"

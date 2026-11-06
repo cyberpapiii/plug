@@ -40,16 +40,6 @@ pub enum LegacySseError {
     Join(#[from] tokio::task::JoinError),
 }
 
-impl LegacySseError {
-    pub fn is_legacy_fallback_hint(&self) -> bool {
-        matches!(
-            self,
-            Self::UnexpectedStatus { status, .. }
-                if matches!(*status, StatusCode::BAD_REQUEST | StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED)
-        )
-    }
-}
-
 #[derive(Clone)]
 pub struct LegacySseTransportConfig {
     pub uri: Arc<str>,
@@ -109,13 +99,12 @@ impl LegacySseTransportConfig {
 pub struct LegacySseClientTransport(WorkerTransport<LegacySseWorker>);
 
 impl LegacySseClientTransport {
-    pub fn from_config(config: LegacySseTransportConfig) -> Self {
-        let client = reqwest::Client::builder()
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(crate::server::UPSTREAM_CONNECT_TIMEOUT)
-            .build()
-            .expect("build reqwest client");
-        Self(WorkerTransport::spawn(LegacySseWorker { client, config }))
+    pub fn from_config(config: LegacySseTransportConfig) -> anyhow::Result<Self> {
+        let client = crate::upstream_http::client(reqwest::redirect::Policy::none())?;
+        Ok(Self(WorkerTransport::spawn(LegacySseWorker {
+            client,
+            config,
+        })))
     }
 }
 
@@ -536,13 +525,9 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
             .map_err(|_| LegacySseError::InvalidEndpoint(trimmed.into()))?,
     };
 
-    // Enforce same-origin: the resolved endpoint must share the scheme, host, and port
-    // of the base URL. This prevents a malicious server from redirecting traffic
-    // to arbitrary destinations via the SSE `endpoint` event.
-    if joined.scheme() != base.scheme()
-        || joined.host_str() != base.host_str()
-        || joined.port() != base.port()
-    {
+    // A server must not send Plug's requests, and their credential, anywhere
+    // else with its `endpoint` event.
+    if !crate::upstream_http::same_origin(&joined, &base) {
         return Err(LegacySseError::InvalidEndpoint(format!(
             "endpoint '{}' does not match origin of '{}'",
             joined, base_url
@@ -550,19 +535,6 @@ fn resolve_endpoint(base_url: &str, endpoint: &str) -> Result<Arc<str>, LegacySs
     }
 
     Ok(Arc::from(joined.to_string()))
-}
-
-/// Check if an HTTP connection error suggests the remote server uses legacy SSE
-/// rather than Streamable HTTP. Used by the HTTP→SSE fallback path.
-pub fn should_fallback_http_error(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| {
-        cause
-            .downcast_ref::<LegacySseError>()
-            .is_some_and(LegacySseError::is_legacy_fallback_hint)
-            || cause
-                .to_string()
-                .contains("unexpected server response: HTTP 405 Method Not Allowed")
-    })
 }
 
 #[cfg(test)]
@@ -600,12 +572,6 @@ mod tests {
         let (_tx, mut rx) = tokio::sync::watch::channel::<Option<Arc<str>>>(None);
         let result = wait_for_endpoint(&mut rx, Duration::from_millis(10)).await;
         assert!(matches!(result, Err(LegacySseError::MissingEndpoint)));
-    }
-
-    #[test]
-    fn generic_http_status_strings_do_not_trigger_fallback() {
-        let error = anyhow::anyhow!("failed to connect to HTTP upstream: HTTP 404 Not Found");
-        assert!(!should_fallback_http_error(&error));
     }
 
     #[test]
@@ -654,33 +620,6 @@ mod tests {
     fn resolve_endpoint_empty_returns_error() {
         let result = resolve_endpoint("http://localhost:8080/mcp", "  ");
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn fallback_hint_detects_status_codes() {
-        assert!(
-            LegacySseError::UnexpectedStatus {
-                status: StatusCode::METHOD_NOT_ALLOWED,
-                body: String::new(),
-            }
-            .is_legacy_fallback_hint()
-        );
-
-        assert!(
-            LegacySseError::UnexpectedStatus {
-                status: StatusCode::NOT_FOUND,
-                body: String::new(),
-            }
-            .is_legacy_fallback_hint()
-        );
-
-        assert!(
-            !LegacySseError::UnexpectedStatus {
-                status: StatusCode::INTERNAL_SERVER_ERROR,
-                body: String::new(),
-            }
-            .is_legacy_fallback_hint()
-        );
     }
 
     #[test]
@@ -743,7 +682,8 @@ mod tests {
         let transport = LegacySseClientTransport::from_config(
             LegacySseTransportConfig::with_uri(server_url)
                 .endpoint_wait_timeout(Duration::from_secs(1)),
-        );
+        )
+        .expect("build the transport");
 
         let _client = handler
             .serve(transport)
@@ -771,7 +711,8 @@ mod tests {
         let transport = LegacySseClientTransport::from_config(
             LegacySseTransportConfig::with_uri(server_url)
                 .endpoint_wait_timeout(Duration::from_secs(1)),
-        );
+        )
+        .expect("build the transport");
         let client = handler
             .serve(transport)
             .await

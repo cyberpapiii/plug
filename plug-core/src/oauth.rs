@@ -1641,7 +1641,23 @@ fn has_token(haystack: &str, needle: &str) -> bool {
         })
 }
 
-pub(crate) fn is_auth_error(message: &str) -> bool {
+/// An upstream refused Plug's credentials: its owner has to sign in again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct AuthRejected(pub(crate) String);
+
+/// Whether `error` means the server needs its owner to sign in again.
+///
+/// Plug's own refusals are [`AuthRejected`]. rmcp 3.1.0 reports its OAuth
+/// failures (`AuthError`, a refused token refresh) and some transport
+/// failures only as text, so for those the words in each cause are read.
+pub(crate) fn is_auth_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<AuthRejected>().is_some() || is_auth_error(&cause.to_string())
+    })
+}
+
+fn is_auth_error(message: &str) -> bool {
     let normalized = message.to_lowercase();
 
     normalized.contains("authorization required")
@@ -1651,10 +1667,6 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
         || normalized.contains("resource_metadata=")
         || has_token(&normalized, "unauthorized")
         || has_token(&normalized, "401")
-}
-
-pub(crate) fn is_auth_error_chain(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| is_auth_error(&cause.to_string()))
 }
 
 pub fn injected_client_identity(
@@ -1812,8 +1824,7 @@ pub async fn refresh_access_token(
             RefreshResult::Refreshed
         }
         Err(e) => {
-            let err = anyhow::anyhow!("{e:#}");
-            if is_auth_error_chain(&err) {
+            if is_auth_rejection(&anyhow::anyhow!("{e:#}")) {
                 RefreshResult::AuthError(format!("{e}"))
             } else {
                 RefreshResult::TransientError(format!("{e}"))
@@ -1963,8 +1974,11 @@ mod tests {
         )
         .context("failed to connect to HTTP upstream");
 
-        assert!(is_auth_error_chain(&err));
+        assert!(is_auth_rejection(&err));
         assert!(!is_auth_error(&err.to_string()));
+        assert!(is_auth_rejection(
+            &anyhow::Error::new(AuthRejected("signed out".into())).context("start failed")
+        ));
     }
 
     #[test]

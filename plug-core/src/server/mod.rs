@@ -89,9 +89,42 @@ fn client_lifecycle_mode(mode: UpstreamProtocolMode) -> ClientLifecycleMode {
     }
 }
 
-fn should_fallback_to_legacy_sse(mode: UpstreamProtocolMode, error: &anyhow::Error) -> bool {
-    mode == UpstreamProtocolMode::Legacy
-        && crate::transport::sse_client::should_fallback_http_error(error)
+/// The HTTP status an upstream refused a streamable-HTTP request with.
+///
+/// rmcp 3.1.0 turns a 401 or 403 that carries `WWW-Authenticate` into
+/// `AuthRequired` / `InsufficientScope`, and any other refusal into
+/// `UnexpectedServerResponse("HTTP {status}: {body}")` (its reqwest client's
+/// `post_message`), where the status exists only as text. This is the one
+/// place that reads that text.
+fn refused_with(error: &StreamableHttpError<reqwest::Error>) -> Option<u16> {
+    match error {
+        StreamableHttpError::AuthRequired(_) => Some(401),
+        StreamableHttpError::InsufficientScope(_) => Some(403),
+        StreamableHttpError::UnexpectedServerResponse(message) => {
+            message.strip_prefix("HTTP ")?.get(..3)?.parse().ok()
+        }
+        _ => None,
+    }
+}
+
+/// [`refused_with`] for a failed `initialize` over streamable HTTP.
+fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Option<u16> {
+    let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
+        return None;
+    };
+    error
+        .error
+        .downcast_ref::<StreamableHttpError<reqwest::Error>>()
+        .and_then(refused_with)
+}
+
+/// Whether a legacy-mode HTTP upstream that refused `initialize` is an old
+/// SSE server: those answer the streamable-HTTP POST with 405.
+fn should_fallback_to_legacy_sse(
+    mode: UpstreamProtocolMode,
+    error: &rmcp::service::ClientInitializeError,
+) -> bool {
+    mode == UpstreamProtocolMode::Legacy && initialize_refused_with(error) == Some(405)
 }
 
 /// RMCP 3.x intentionally dropped SEP-1686's top-level `capabilities.tasks`,
@@ -144,17 +177,6 @@ struct InitializedNotificationCompatHttpClient {
     last_session_id: Arc<std::sync::Mutex<Option<Arc<str>>>>,
 }
 
-/// How long an upstream HTTP connect may take before it is abandoned.
-///
-/// DNS, TCP and TLS to a reachable host settle well inside a second even
-/// across an ocean, so a connect still running after this is not slow, it is
-/// not happening. Without a bound it runs until the per-server start timeout
-/// expires — thirty seconds by default — and startup readiness waits on it,
-/// which is how one unreachable remote server delays every other one. The
-/// downstream OAuth metadata client has always bounded its connects; this is
-/// the same bound on the path that carries every upstream call.
-pub(crate) const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-
 /// Bound on the legacy `tasks/list` capability probe. A legacy server that
 /// implements the old task surface answers a read-only list at once; one that
 /// ignores the method would otherwise hold the start open for its whole
@@ -166,30 +188,19 @@ const LEGACY_TASKS_PROBE_TIMEOUT: Duration = Duration::from_secs(3);
 /// answers `logging/setLevel` keeps the request open.
 const INITIAL_LOG_LEVEL_TIMEOUT: Duration = Duration::from_secs(5);
 
-fn upstream_http_client() -> reqwest::Client {
-    // Building a TLS-capable client panics without a crypto provider, and the
-    // callers that used to guarantee one are elsewhere in the start path.
-    // Claiming it here makes this function correct on its own.
-    crate::tls::ensure_rustls_provider_installed();
-    reqwest::Client::builder()
-        .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
-        .build()
-        .unwrap_or_else(|_| reqwest::Client::new())
-}
-
 impl InitializedNotificationCompatHttpClient {
     fn new(
         server_name: Arc<str>,
         connection: ConnectionGeneration,
         tool_router: std::sync::Weak<ToolRouter>,
-    ) -> Self {
-        Self {
-            inner: upstream_http_client(),
+    ) -> anyhow::Result<Self> {
+        Ok(Self {
+            inner: crate::upstream_http::client(reqwest::redirect::Policy::default())?,
             server_name,
             connection,
             tool_router,
             last_session_id: Arc::new(std::sync::Mutex::new(None)),
-        }
+        })
     }
 
     /// Record the session id carried by an outbound call and advance the
@@ -232,21 +243,6 @@ fn is_initialized_notification_message(message: &rmcp::model::ClientJsonRpcMessa
         message,
         rmcp::model::ClientJsonRpcMessage::Notification(notification)
             if matches!(notification.notification, rmcp::model::ClientNotification::InitializedNotification(InitializedNotification { .. }))
-    )
-}
-
-fn is_initialized_notification_auth_failure(error: &StreamableHttpError<reqwest::Error>) -> bool {
-    let message = error.to_string().to_lowercase();
-    crate::oauth::is_auth_error(&message)
-        || message.contains("403")
-        || message.contains("forbidden")
-}
-
-fn is_initialized_notification_compat_failure(error: &StreamableHttpError<reqwest::Error>) -> bool {
-    matches!(
-        error,
-        StreamableHttpError::UnexpectedServerResponse(message)
-            if message.starts_with("HTTP 400")
     )
 }
 
@@ -694,25 +690,13 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
             && result
                 .as_ref()
                 .err()
-                .is_some_and(is_initialized_notification_compat_failure)
+                .is_some_and(|error| refused_with(error) == Some(400))
         {
             tracing::warn!(
                 server = %self.server_name,
                 "ignoring notifications/initialized failure for HTTP upstream; continuing with compatibility fallback"
             );
             return Ok(StreamableHttpPostResponse::Accepted);
-        }
-
-        if is_initialized
-            && result
-                .as_ref()
-                .err()
-                .is_some_and(is_initialized_notification_auth_failure)
-        {
-            tracing::debug!(
-                server = %self.server_name,
-                "notifications/initialized failure classified as auth rejection"
-            );
         }
 
         result
@@ -1330,10 +1314,7 @@ impl ServerManager {
     ) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
-        if config.auth.as_deref() == Some("oauth")
-            && (crate::oauth::is_auth_error_chain(error)
-                || crate::oauth::is_auth_error(&format!("{error:#}")))
-        {
+        if config.auth.as_deref() == Some("oauth") && crate::oauth::is_auth_rejection(error) {
             self.mark_auth_required(name);
         } else {
             self.mark_start_failure(name);
@@ -1722,7 +1703,12 @@ impl ServerManager {
                 let secrets = failure::config_secrets(&resolved);
                 let text = format!("{error:#}");
                 if secrets.iter().any(|secret| text.contains(secret.as_str())) {
-                    Err(anyhow::anyhow!(failure::redact(&text, &secrets)))
+                    let redacted = failure::redact(&text, &secrets);
+                    Err(if crate::oauth::is_auth_rejection(&error) {
+                        anyhow::Error::new(crate::oauth::AuthRejected(redacted))
+                    } else {
+                        anyhow::anyhow!(redacted)
+                    })
                 } else {
                     Err(error)
                 }
@@ -1832,8 +1818,6 @@ impl ServerManager {
                     })
                 }
                 TransportType::Http => {
-                    crate::tls::ensure_rustls_provider_installed();
-
                     let url = config
                         .url
                         .as_deref()
@@ -1863,7 +1847,7 @@ impl ServerManager {
                             Arc::from(name),
                             connection.clone(),
                             tool_router.clone(),
-                        ),
+                        )?,
                         transport_config,
                     );
 
@@ -1898,9 +1882,15 @@ impl ServerManager {
                             .await
                         }
                         Err(e) => {
-                            let error =
-                                anyhow::Error::new(e).context("failed to connect to HTTP upstream");
-                            if should_fallback_to_legacy_sse(effective_protocol_mode, &error) {
+                            let fall_back =
+                                should_fallback_to_legacy_sse(effective_protocol_mode, &e);
+                            let error = if initialize_refused_with(&e) == Some(401) {
+                                anyhow::Error::new(crate::oauth::AuthRejected(e.to_string()))
+                            } else {
+                                anyhow::Error::new(e)
+                            }
+                            .context("failed to connect to HTTP upstream");
+                            if fall_back {
                                 tracing::info!(
                                     server = %name,
                                     error = %error,
@@ -1940,7 +1930,7 @@ impl ServerManager {
                     // The adapter is a real MCP server on the far end of an
                     // in-process pipe. It stops when the client side drops.
                     let (server_io, client_io) = tokio::io::duplex(64 * 1024);
-                    let adapter = crate::openapi::OpenApiServer::new(document, config);
+                    let adapter = crate::openapi::OpenApiServer::new(document, config)?;
                     tokio::spawn(async move {
                         if let Ok(service) = adapter.serve(server_io).await {
                             let _ = service.waiting().await;
@@ -2010,8 +2000,6 @@ impl ServerManager {
         tool_router: std::sync::Weak<ToolRouter>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        crate::tls::ensure_rustls_provider_installed();
-
         let url = config
             .url
             .as_deref()
@@ -2041,7 +2029,7 @@ impl ServerManager {
             Arc::new(move || on_upstream_session_replaced(&connection, &tool_router))
         });
 
-        let transport = LegacySseClientTransport::from_config(transport_config);
+        let transport = LegacySseClientTransport::from_config(transport_config)?;
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
         let handler = Arc::new(UpstreamClientHandler {
@@ -2945,17 +2933,9 @@ impl Default for ServerManager {
     }
 }
 
-/// Check if a hostname or IP address is a cloud metadata endpoint.
-///
-/// Only blocks cloud metadata endpoints (169.254.169.254, metadata.google.internal).
-/// Loopback and private IPs are allowed because all servers in config.toml are
-/// explicitly user-configured — blocking them prevents legitimate local servers.
 /// Check a remote upstream URL against the SSRF block list and resolve the
 /// bearer token to send: the verified OAuth token for `auth = "oauth"`, the
 /// static `auth_token` otherwise. Shared by the HTTP and legacy SSE paths.
-///
-/// DNS-based bypasses (a hostname resolving to a private IP) are not covered;
-/// that would need async resolution at connect time.
 async fn resolve_upstream_auth(
     name: &str,
     url: &str,
@@ -2965,9 +2945,9 @@ async fn resolve_upstream_auth(
         .parse::<http::Uri>()
         .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
     if let Some(host) = parsed.host()
-        && is_blocked_host(host)
+        && crate::upstream_http::is_blocked_host(host)
     {
-        anyhow::bail!("URL host '{host}' is blocked — private, loopback, or metadata endpoint");
+        anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint");
     }
 
     if config.auth.as_deref() != Some("oauth") {
@@ -2989,36 +2969,10 @@ async fn resolve_upstream_auth(
                 server = %name,
                 "OAuth server has no available token, marking AuthRequired"
             );
-            Err(anyhow::anyhow!(
+            Err(anyhow::Error::new(crate::oauth::AuthRejected(format!(
                 "OAuth authorization required for server '{name}'. Run `plug auth login --server {name}` to authenticate."
-            ))
+            ))))
         }
-    }
-}
-
-pub(crate) fn is_blocked_host(host: &str) -> bool {
-    // Known metadata hostnames
-    if host == "metadata.google.internal" {
-        return true;
-    }
-
-    // Try parsing as IP address — only block cloud metadata IP
-    let host_trimmed = host.trim_start_matches('[').trim_end_matches(']');
-    if let Ok(ip) = host_trimmed.parse::<std::net::IpAddr>() {
-        return is_metadata_ip(&ip);
-    }
-
-    false
-}
-
-/// Returns true only for cloud metadata IPs (169.254.169.254).
-fn is_metadata_ip(ip: &std::net::IpAddr) -> bool {
-    match ip {
-        std::net::IpAddr::V4(v4) => {
-            // AWS/GCP/Azure metadata endpoint
-            *v4 == std::net::Ipv4Addr::new(169, 254, 169, 254)
-        }
-        std::net::IpAddr::V6(_) => false,
     }
 }
 
@@ -3304,7 +3258,8 @@ mod tests {
             // reaction, and a router that cannot be upgraded simply skips the
             // refresh kick.
             std::sync::Weak::new(),
-        );
+        )
+        .expect("build the HTTP client");
         (client, connection)
     }
 
@@ -3554,34 +3509,42 @@ mod tests {
     }
 
     #[test]
-    fn modern_modes_never_enter_the_legacy_sse_error_fallback() {
-        let method_not_allowed =
-            anyhow::anyhow!("unexpected server response: HTTP 405 Method Not Allowed");
+    fn only_a_405_to_a_legacy_mode_initialize_falls_back_to_sse() {
+        let refused =
+            |message: &'static str| rmcp::service::ClientInitializeError::TransportError {
+                error: rmcp::transport::DynamicTransportError::from_parts(
+                    "test",
+                    std::any::TypeId::of::<()>(),
+                    Box::new(
+                        StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+                            message.into(),
+                        ),
+                    ),
+                ),
+                context: "send initialize request".into(),
+            };
+        let method_not_allowed = refused("HTTP 405 Method Not Allowed: ");
         assert!(should_fallback_to_legacy_sse(
             UpstreamProtocolMode::Legacy,
             &method_not_allowed
         ));
-        assert!(!should_fallback_to_legacy_sse(
-            UpstreamProtocolMode::Auto,
-            &method_not_allowed
-        ));
-        assert!(!should_fallback_to_legacy_sse(
-            UpstreamProtocolMode::Modern,
-            &method_not_allowed
-        ));
-
+        for mode in [UpstreamProtocolMode::Auto, UpstreamProtocolMode::Modern] {
+            assert!(!should_fallback_to_legacy_sse(mode, &method_not_allowed));
+        }
         for message in [
-            "HTTP 401 Unauthorized",
-            "TLS certificate validation failed",
-            "request timed out",
-            "HTTP 429 Too Many Requests",
-            "HTTP 500 Internal Server Error",
+            "HTTP 401 Unauthorized: ",
+            "HTTP 404 Not Found: ",
+            "HTTP 500 Internal Server Error: ",
         ] {
             assert!(!should_fallback_to_legacy_sse(
                 UpstreamProtocolMode::Legacy,
-                &anyhow::anyhow!(message)
+                &refused(message)
             ));
         }
+        assert_eq!(
+            initialize_refused_with(&refused("HTTP 401 Unauthorized: ")),
+            Some(401)
+        );
     }
 
     #[tokio::test]
@@ -4339,38 +4302,6 @@ mod tests {
             )])
             .into()))
         }
-    }
-
-    #[test]
-    fn ssrf_allows_loopback() {
-        // Loopback is allowed — user-configured local servers are legitimate
-        assert!(!is_blocked_host("127.0.0.1"));
-        assert!(!is_blocked_host("127.0.0.2"));
-        assert!(!is_blocked_host("[::1]"));
-    }
-
-    #[test]
-    fn ssrf_allows_private_ranges() {
-        // Private IPs are allowed — user-configured local servers are legitimate
-        assert!(!is_blocked_host("10.0.0.1"));
-        assert!(!is_blocked_host("172.16.0.1"));
-        assert!(!is_blocked_host("192.168.1.1"));
-    }
-
-    #[test]
-    fn ssrf_blocks_cloud_metadata() {
-        assert!(is_blocked_host("169.254.169.254"));
-        assert!(is_blocked_host("metadata.google.internal"));
-        // Other link-local IPs are NOT blocked (only the specific metadata IP)
-        assert!(!is_blocked_host("169.254.0.1"));
-    }
-
-    #[test]
-    fn ssrf_allows_public_ips() {
-        assert!(!is_blocked_host("8.8.8.8"));
-        assert!(!is_blocked_host("1.1.1.1"));
-        assert!(!is_blocked_host("example.com"));
-        assert!(!is_blocked_host("localhost"));
     }
 
     #[test]
@@ -6061,26 +5992,6 @@ mod tests {
 
         assert_eq!(notifications.load(Ordering::SeqCst), 1);
         assert_eq!(router.tool_count(), 2);
-    }
-
-    /// An upstream that never answers a connect must not hold startup for the
-    /// whole per-server start timeout, which defaults to thirty seconds and
-    /// which every other server's readiness waits behind.
-    #[tokio::test]
-    async fn upstream_http_connect_is_bounded_well_under_the_start_timeout() {
-        // RFC 5737 TEST-NET-1: reserved for documentation, routed nowhere.
-        let started = std::time::Instant::now();
-        let result = upstream_http_client()
-            .get("http://192.0.2.1:80/mcp")
-            .send()
-            .await;
-
-        assert!(result.is_err(), "a reserved address should never answer");
-        assert!(
-            started.elapsed() < UPSTREAM_CONNECT_TIMEOUT + Duration::from_secs(5),
-            "connect took {:?}, which is not bounded by the connect timeout",
-            started.elapsed()
-        );
     }
 
     /// A server that failed at boot has no semaphore and no breaker. When it
