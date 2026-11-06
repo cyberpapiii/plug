@@ -1,4 +1,4 @@
-use super::server::*;
+use super::server::HttpState;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::session::SseMessage;
 use std::sync::Arc;
@@ -100,7 +100,8 @@ impl HttpState {
             }
         });
 
-        // Separate logging fan-out task (isolated from control notifications)
+        // Log lines have their own channel, so a burst of them cannot crowd
+        // out list changes.
         let log_state = Arc::clone(self);
         let mut log_rx = log_state.router.subscribe_logging();
         tokio::spawn(async move {
@@ -125,10 +126,9 @@ impl HttpState {
                                     );
                                 }
                             }
-                            Ok(_) => {} // non-logging notifications on wrong channel
+                            Ok(_) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP logging fan-out lagged");
-                                // Emit synthetic warning to all connected clients
                                 let synthetic = ProtocolNotification::LoggingMessage {
                                     params: rmcp::model::LoggingMessageNotificationParam::new(
                                         rmcp::model::LoggingLevel::Warning,

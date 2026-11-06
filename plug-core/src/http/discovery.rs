@@ -1,4 +1,4 @@
-use super::server::*;
+use super::server::{HttpAuth, HttpState};
 use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 use axum::Json;
 use axum::Router;
@@ -10,7 +10,6 @@ use axum::routing::get;
 use serde_json::json;
 use std::sync::Arc;
 
-/// GET /.well-known/mcp-server-card and legacy /.well-known/mcp.json.
 /// The server card, at its current address and the one older clients read.
 /// Any page may read it, so it sits outside the Origin check.
 pub(super) fn discovery_router(state: Arc<HttpState>) -> Router {

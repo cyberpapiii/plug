@@ -1,8 +1,8 @@
 use super::error::HttpError;
-use super::identity::*;
+use super::identity::AuthStatus;
 use super::oauth::protected_resource_metadata_url;
-use super::response::*;
-use super::server::*;
+use super::response::json_response_for_era;
+use super::server::HttpState;
 use crate::downstream_oauth::AccessTokenClaims;
 use crate::events::{EVENT_SCOPE, EventSource};
 use axum::body::Bytes;
@@ -16,7 +16,6 @@ use rmcp::model::*;
 use serde_json::json;
 use std::sync::Arc;
 
-/// The asking client and the event sources it can see, when there are any.
 /// Sources that take events pushed from outside sign those requests
 /// themselves, so these routes sit outside the MCP auth layers.
 pub(super) fn ingest_router(sources: &[Arc<dyn EventSource>]) -> Router {
@@ -46,6 +45,7 @@ pub(super) fn ingest_router(sources: &[Arc<dyn EventSource>]) -> Router {
     router
 }
 
+/// The asking client and the event sources it can see, when there are any.
 pub(super) fn event_sources_for<'a>(
     state: &'a HttpState,
     auth: &'a AuthStatus,

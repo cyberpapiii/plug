@@ -1,3 +1,19 @@
+use super::discovery::discovery_router;
+use super::events::{event_request, events_discoverable, ingest_router};
+use super::fanout::drain_targeted_notifications;
+use super::guard::{validate_bearer_auth, validate_modern_request, validate_origin};
+use super::identity::{
+    AuthStatus, HttpDownstreamContext, HttpRequestCancellationGuard, legacy_http_policy_context,
+};
+use super::response::{
+    LONG_CALL_AFTER, answer_or_keep_open, header_mismatch_response, json_response_for_era,
+    json_response_with_session, mark_private, modern_sse_response,
+};
+use super::reverse::{HttpBridge, handle_client_response, maybe_request_http_roots};
+use super::session_binding::{
+    bind_session_to_caller, extract_session_id, reopen_lost_session, session_is_the_callers,
+    validate_session_header,
+};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
@@ -17,15 +33,7 @@ use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 
-use super::discovery::*;
 use super::error::HttpError;
-use super::events::*;
-use super::fanout::*;
-use super::guard::*;
-use super::identity::*;
-use super::response::*;
-use super::reverse::*;
-use super::session_binding::*;
 use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_identity::HttpCredential;
 use crate::events::EventSource;
@@ -39,11 +47,9 @@ use crate::session::{SessionEnd, SessionStore};
 
 pub(super) const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
 
-/// MCP protocol version header name.
 pub(super) const PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 pub(super) const PLUG_TRACE_ID_HEADER: &str = "x-plug-trace-id";
 
-/// The MCP protocol version we implement.
 use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
 /// How callers of `/mcp` prove who they are.
@@ -57,7 +63,6 @@ pub enum HttpAuth {
     Oauth(crate::downstream_oauth::DownstreamOauthManager),
 }
 
-/// Shared state for all HTTP handlers.
 pub struct HttpState {
     pub router: Arc<ToolRouter>,
     pub sessions: Arc<SessionStore>,
@@ -72,9 +77,8 @@ pub struct HttpState {
     /// Host; a page served from it is not thereby allowed.
     pub(crate) public_host: Option<String>,
     pub(crate) notification_task_started: AtomicBool,
-    /// Pending reverse requests sent to HTTP clients (keyed by session_id + request_id).
+    /// Reverse requests waiting for the client's answer, by session and id.
     pub(crate) pending_client_requests: Arc<PendingClientRequests>,
-    /// Counter for generating unique reverse-request IDs.
     pub(crate) reverse_request_counter: AtomicU64,
     /// What each session's client declared at `initialize`.
     pub(crate) client_capabilities: Arc<DashMap<String, ClientCapabilities>>,
@@ -150,7 +154,8 @@ pub enum ClientRevocation {
 }
 
 impl HttpState {
-    /// State with [`HttpAuth::Open`], no events, no extra allowed origins, and the default SSE channel capacity.
+    /// State with [`HttpAuth::Open`], no events, no extra allowed origins,
+    /// and the default SSE channel capacity.
     ///
     /// From here on `sessions` drops expired sessions on its own, and what
     /// Plug holds for any session that lapses is released. Must be called on
@@ -286,13 +291,11 @@ impl HttpState {
     }
 }
 
-/// Build the axum Router with all middleware and handlers.
 pub fn build_router(state: Arc<HttpState>) -> Router {
     state.spawn_notification_fanout();
 
-    // MCP protocol routes — protected by auth + origin validation middleware
-    // Layer order (innermost first): origin validation → bearer auth → body limit
-    // Bearer auth runs first; if authenticated, origin validation is skipped.
+    // The last layer added runs first: the body limit, then auth, then the
+    // Origin check, which an authenticated caller skips.
     let mcp = Router::new()
         .route("/mcp", post(post_mcp).get(get_mcp).delete(delete_mcp))
         .layer(middleware::from_fn_with_state(
@@ -304,7 +307,7 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
             validate_bearer_auth,
         ))
         .layer(DefaultBodyLimit::disable())
-        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
+        .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024))
         .with_state(state.clone());
 
     let mut router =
@@ -326,7 +329,6 @@ pub(super) async fn post_mcp(
     headers: HeaderMap,
     body: Bytes,
 ) -> Result<Response, HttpError> {
-    // 1. Validate Content-Type
     let content_type = headers
         .get(header::CONTENT_TYPE)
         .and_then(|v| v.to_str().ok())
@@ -336,7 +338,6 @@ pub(super) async fn post_mcp(
     }
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
-    // 2. Parse JSON-RPC message
     let mut raw_message: serde_json::Value = serde_json::from_slice(&body).map_err(|e| {
         tracing::debug!(error = %e, "invalid JSON-RPC message from client");
         HttpError::MalformedJsonRpc {
@@ -397,7 +398,6 @@ pub(super) async fn post_mcp(
     }
     let trace_id = Arc::<str>::from(extract_trace_id(&headers));
 
-    // 3. Route based on message type
     match message {
         JsonRpcMessage::Request(req) => {
             let method = method.unwrap_or_default();
@@ -566,13 +566,11 @@ pub(super) async fn get_mcp(
     axum::Extension(auth_status): axum::Extension<AuthStatus>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
-    // 1. Validate session
     let session_id = extract_session_id(&headers)?;
     reopen_lost_session(&state, &headers, &auth_status);
     state.sessions.validate(&session_id)?;
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
-    // 2. Validate Accept header
     let accept = headers
         .get(header::ACCEPT)
         .and_then(|v| v.to_str().ok())
@@ -581,7 +579,6 @@ pub(super) async fn get_mcp(
         return Err(HttpError::InvalidAcceptHeader);
     }
 
-    // 3. Create channel and register SSE sender
     let (tx, rx) = mpsc::channel(state.sse_channel_capacity);
     let last_event_id = headers
         .get("last-event-id")
@@ -621,7 +618,6 @@ pub(super) async fn delete_mcp(
     }
 }
 
-/// Route a typed JSON-RPC request to the appropriate handler.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn handle_request(
     req: JsonRpcRequest<ClientRequest>,

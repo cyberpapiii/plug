@@ -1,8 +1,8 @@
 use super::error::HttpError;
-use super::fanout::*;
-use super::identity::*;
-use super::reverse::*;
-use super::server::*;
+use super::fanout::notification_to_sse_message;
+use super::identity::{AuthStatus, legacy_http_policy_context};
+use super::reverse::{HttpBridge, maybe_request_http_roots};
+use super::server::{HttpState, SESSION_ID_HEADER, extract_trace_id};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::proxy::DownstreamCallContext;
 use crate::session::SessionStore;
@@ -36,7 +36,6 @@ pub(super) fn broadcast_audience_for(
     }
 }
 
-/// Extract session ID from request headers.
 pub(super) fn extract_session_id(headers: &HeaderMap) -> Result<String, HttpError> {
     headers
         .get(SESSION_ID_HEADER)
@@ -100,8 +99,7 @@ pub(super) fn bind_session_to_caller(
 /// the session timeout, goes on sending the session it was given. Many never
 /// start a new one when told theirs is gone, and fail every call from then
 /// on. The caller has already proved who it is, so its session is opened
-/// again under the same id, as its own. What it said about itself at
-/// `initialize` is not known again until it next initializes.
+/// again under the same id, as its own.
 pub(super) fn reopen_lost_session(
     state: &Arc<HttpState>,
     headers: &HeaderMap,
@@ -162,7 +160,6 @@ pub(super) fn reopen_lost_session(
     );
 }
 
-/// Validate that the session exists and is not expired.
 pub(super) fn validate_session_header(
     headers: &HeaderMap,
     sessions: &SessionStore,

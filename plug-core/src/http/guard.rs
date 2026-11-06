@@ -1,7 +1,7 @@
 use super::error::HttpError;
-use super::identity::*;
+use super::identity::AuthStatus;
 use super::oauth::protected_resource_metadata_url;
-use super::server::*;
+use super::server::{HttpAuth, HttpState};
 use crate::downstream_oauth::{AccessTokenValidation, resource_scopes};
 use axum::extract::Request;
 use axum::extract::State;
@@ -10,7 +10,6 @@ use axum::middleware::Next;
 use axum::response::Response;
 use std::sync::Arc;
 
-/// Check if a request's bearer token is valid against the expected token.
 pub(super) fn check_bearer_token(headers: &HeaderMap, expected: &str) -> bool {
     headers
         .get(header::AUTHORIZATION)

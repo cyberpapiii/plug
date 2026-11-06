@@ -1,5 +1,5 @@
 use super::error::HttpError;
-use super::server::*;
+use super::server::{PROTOCOL_VERSION_HEADER, SESSION_ID_HEADER};
 use crate::mcp_http_headers::{HEADER_MISMATCH_CODE, HeaderMismatch};
 use crate::notifications::ProtocolNotification;
 use crate::protocol::SUPPORTED_PROTOCOL_VERSION;

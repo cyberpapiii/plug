@@ -1,5 +1,5 @@
 use super::error::HttpError;
-use super::server::*;
+use super::server::HttpState;
 use crate::notifications::NotificationTarget;
 use crate::proxy::DownstreamBridge;
 use crate::session::{SessionSendOutcome, SseMessage, SseReplayKey};
@@ -40,7 +40,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::ElicitRequest(ElicitRequest::new(request)),
-                Duration::from_secs(600), // 10-minute upper bound prevents resource leaks
+                Duration::from_secs(600),
             )
             .await?;
             match result {
@@ -72,7 +72,7 @@ impl DownstreamBridge for HttpBridge {
                 &state,
                 &session_id,
                 ServerRequest::CreateMessageRequest(CreateMessageRequest::new(request)),
-                Duration::from_secs(60), // sampling has bounded timeout
+                Duration::from_secs(60),
             )
             .await?;
             match result {

@@ -1,4 +1,4 @@
-use super::server::*;
+use super::server::HttpState;
 use crate::downstream_identity::HttpCredential;
 use crate::downstream_oauth::AccessTokenClaims;
 use crate::proxy::{DownstreamCallContext, ToolRouter};
@@ -222,11 +222,11 @@ impl Drop for HttpRequestCancellationGuard {
     }
 }
 
-/// Whether the request has been authenticated via bearer token.
+/// What the auth middleware settled about the caller.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum AuthStatus {
-    /// Request authenticated with valid bearer token.
+    /// It presented the shared bearer (`None`) or an OAuth access token.
     Authenticated(Option<AccessTokenClaims>),
-    /// No auth required (loopback-only server).
+    /// The listener asks for no credential.
     NoAuthRequired,
 }
