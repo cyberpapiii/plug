@@ -39,7 +39,7 @@ use crate::mcp_http_headers::{
     TRACEPARENT_HEADER, inject_trace_context, validate_mirrored_headers,
     validate_required_mirrored_headers,
 };
-use crate::proxy::{DownstreamCallContext, ToolRouter};
+use crate::proxy::ToolRouter;
 use crate::session::{SessionEnd, SessionStore};
 
 pub(super) const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -69,6 +69,7 @@ pub struct HttpState {
     pub(crate) event_sources: Vec<Arc<dyn EventSource>>,
     pub(crate) sse_channel_capacity: usize,
     /// Browser origins allowed besides this Mac's own, exactly as written.
+    /// Their hosts are also hosts a modern request may name in Host.
     pub(crate) allowed_origins: Vec<Arc<str>>,
     /// The host of `http.public_base_url`. A modern request may name it in
     /// Host; a page served from it is not thereby allowed.
@@ -319,7 +320,6 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
-/// POST /mcp — handle JSON-RPC requests, notifications, and client responses.
 pub(super) async fn post_mcp(
     State(state): State<Arc<HttpState>>,
     axum::Extension(auth_status): axum::Extension<AuthStatus>,
@@ -384,10 +384,10 @@ pub(super) async fn post_mcp(
         }
     })?;
 
-    validate_protocol_version_for_post(&headers, era)?;
     let mirrored = if era == crate::protocol::ProtocolEra::Modern {
         validate_required_mirrored_headers(&headers, &message)
     } else {
+        validate_legacy_protocol_version(&headers)?;
         validate_mirrored_headers(&headers, &message)
     };
     if let Err(err) = mirrored {
@@ -451,15 +451,21 @@ pub(super) async fn post_mcp(
             match notification.notification {
                 ClientNotification::CancelledNotification(cancelled) => {
                     if let Some(request_id) = cancelled.params.request_id.clone() {
-                        state.router.forward_cancel_from_downstream(
-                            &DownstreamCallContext::http(
-                                Arc::<str>::from(session_id.as_str()),
+                        // Built as the call it cancels was, so both name the
+                        // same downstream call.
+                        let context = crate::dispatch::DownstreamContext::downstream_call_context(
+                            &HttpDownstreamContext::new(
+                                &state,
+                                auth_status,
+                                Some(&session_id),
                                 request_id,
-                                crate::types::ClientType::Unknown,
-                            )
-                            .with_trace_id(Arc::clone(&trace_id)),
-                            cancelled.params.reason,
+                                trace_id,
+                                None,
+                            ),
                         );
+                        state
+                            .router
+                            .cancel_downstream_request(&context, cancelled.params.reason);
                     }
                 }
                 ClientNotification::InitializedNotification(_) => {
@@ -481,13 +487,7 @@ pub(super) async fn post_mcp(
     }
 }
 
-pub(super) fn validate_protocol_version_for_post(
-    headers: &HeaderMap,
-    era: crate::protocol::ProtocolEra,
-) -> Result<(), HttpError> {
-    if era == crate::protocol::ProtocolEra::Modern {
-        return Ok(());
-    }
+fn validate_legacy_protocol_version(headers: &HeaderMap) -> Result<(), HttpError> {
     match headers.get(PROTOCOL_VERSION_HEADER) {
         Some(value) => {
             let version = value
@@ -540,7 +540,6 @@ pub(super) fn extract_trace_id(headers: &HeaderMap) -> String {
     crate::proxy::new_trace_id()
 }
 
-/// GET /mcp — open SSE stream for server-initiated notifications.
 pub(super) async fn get_mcp(
     State(state): State<Arc<HttpState>>,
     axum::Extension(auth_status): axum::Extension<AuthStatus>,
@@ -578,7 +577,6 @@ pub(super) async fn get_mcp(
     Ok(response)
 }
 
-/// DELETE /mcp — terminate a session.
 pub(super) async fn delete_mcp(
     State(state): State<Arc<HttpState>>,
     axum::Extension(auth_status): axum::Extension<AuthStatus>,

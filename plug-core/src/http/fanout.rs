@@ -24,11 +24,8 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                // Unlike the daemon (one fan-out task per client, comparing
-                                // target to "self"), this task is shared by every HTTP session,
-                                // so a targeted resolution names which session to route to
-                                // rather than answering "is this me?". See
-                                // plug-core/src/notifications.rs::fanout.
+                                // One task serves every HTTP session, so a targeted
+                                // notification is routed by the session it names.
                                 use crate::notifications::fanout::{
                                     NotificationClass, ResolvedDelivery, classify, resolve,
                                 };
