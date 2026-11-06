@@ -72,31 +72,61 @@ pub struct HttpState {
     /// Host; a page served from it is not thereby allowed.
     pub(crate) public_host: Option<String>,
     pub(crate) notification_task_started: AtomicBool,
-    /// Sessions whose clients advertise `roots` capability.
-    pub(crate) roots_capable_sessions: Arc<DashMap<String, ()>>,
     /// Pending reverse requests sent to HTTP clients (keyed by session_id + request_id).
     pub(crate) pending_client_requests: Arc<PendingClientRequests>,
     /// Counter for generating unique reverse-request IDs.
     pub(crate) reverse_request_counter: AtomicU64,
-    /// Per-session client capabilities for reverse-request gating.
+    /// What each session's client declared at `initialize`.
     pub(crate) client_capabilities: Arc<DashMap<String, ClientCapabilities>>,
+    pub(crate) lapsed_capabilities: Arc<LapsedCapabilities>,
 }
 
 pub(super) type PendingClientRequests = DashMap<(String, i64), oneshot::Sender<ClientResult>>;
 
+/// The capabilities of sessions that timed out, newest last, for clients
+/// that go on using their session. A client that never returns is forgotten
+/// once this many others have lapsed after it.
+#[derive(Default)]
+pub(crate) struct LapsedCapabilities(
+    std::sync::Mutex<std::collections::VecDeque<(String, ClientCapabilities)>>,
+);
+
+impl LapsedCapabilities {
+    const KEPT: usize = 256;
+
+    fn keep(&self, session_id: &str, capabilities: ClientCapabilities) {
+        let mut kept = self.0.lock().expect("lapsed capabilities mutex poisoned");
+        if kept.len() == Self::KEPT {
+            kept.pop_front();
+        }
+        kept.push_back((session_id.to_string(), capabilities));
+    }
+
+    pub(super) fn take(&self, session_id: &str) -> Option<ClientCapabilities> {
+        let mut kept = self.0.lock().expect("lapsed capabilities mutex poisoned");
+        let index = kept.iter().position(|(id, _)| id == session_id)?;
+        kept.remove(index).map(|(_, capabilities)| capabilities)
+    }
+}
+
 /// What HTTP holds for its sessions outside the session store.
 pub(super) struct HeldForSessions {
     router: Arc<ToolRouter>,
-    roots_capable_sessions: Arc<DashMap<String, ()>>,
     pending_client_requests: Arc<PendingClientRequests>,
     client_capabilities: Arc<DashMap<String, ClientCapabilities>>,
+    lapsed_capabilities: Arc<LapsedCapabilities>,
 }
 
 impl HeldForSessions {
-    /// Release what is held for a session that has left the store.
-    async fn release(&self, session_id: &str) {
-        self.roots_capable_sessions.remove(session_id);
-        self.client_capabilities.remove(session_id);
+    /// Release what is held for a session that has left the store. What the
+    /// client of a session that timed out said at `initialize` is kept, so
+    /// the session works as before if the client comes back to it.
+    async fn release(&self, session_id: &str, lapsed: bool) {
+        if let Some((_, capabilities)) = self.client_capabilities.remove(session_id)
+            && lapsed
+        {
+            self.lapsed_capabilities.keep(session_id, capabilities);
+        }
         // Dropping pending reverse-request senders wakes their receivers with
         // RecvError instead of leaving them to time out.
         self.pending_client_requests
@@ -140,10 +170,10 @@ impl HttpState {
             allowed_origins: Vec::new(),
             public_host: None,
             notification_task_started: AtomicBool::new(false),
-            roots_capable_sessions: Arc::default(),
             pending_client_requests: Arc::default(),
             reverse_request_counter: AtomicU64::new(1),
             client_capabilities: Arc::default(),
+            lapsed_capabilities: Arc::default(),
         };
         let (lapsed_tx, mut lapsed_rx) = mpsc::unbounded_channel::<String>();
         state
@@ -154,7 +184,7 @@ impl HttpState {
         let held = state.held_for_sessions();
         tokio::spawn(async move {
             while let Some(session_id) = lapsed_rx.recv().await {
-                held.release(&session_id).await;
+                held.release(&session_id, true).await;
             }
         });
         state
@@ -163,9 +193,9 @@ impl HttpState {
     fn held_for_sessions(&self) -> HeldForSessions {
         HeldForSessions {
             router: Arc::clone(&self.router),
-            roots_capable_sessions: Arc::clone(&self.roots_capable_sessions),
             pending_client_requests: Arc::clone(&self.pending_client_requests),
             client_capabilities: Arc::clone(&self.client_capabilities),
+            lapsed_capabilities: Arc::clone(&self.lapsed_capabilities),
         }
     }
 
@@ -215,7 +245,7 @@ impl HttpState {
         if !self.sessions.end(session_id, why) {
             return false;
         }
-        self.held_for_sessions().release(session_id).await;
+        self.held_for_sessions().release(session_id, false).await;
         true
     }
 
@@ -677,9 +707,6 @@ pub(super) async fn handle_request(
                 Arc::clone(&trace_id),
             );
             bind_session_to_caller(state, &session_id, &auth_status, &policy_context)?;
-            if init_req.params.capabilities.roots.is_some() {
-                state.roots_capable_sessions.insert(session_id.clone(), ());
-            }
             state
                 .client_capabilities
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
@@ -1883,11 +1910,6 @@ mod tests {
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         assert_eq!(state.router.task_count_for_owner(&owner).await, 0);
-    }
-
-    fn bare_router() -> Arc<ToolRouter> {
-        let sm = Arc::new(crate::server::ServerManager::new());
-        Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()))
     }
 
     #[tokio::test]

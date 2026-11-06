@@ -203,7 +203,11 @@ pub(super) async fn handle_client_response(
 /// If the session supports roots, spawn a task to request roots via SSE
 /// and cache the result.
 pub(super) fn maybe_request_http_roots(state: Arc<HttpState>, session_id: String) {
-    if !state.roots_capable_sessions.contains_key(&session_id) {
+    if !state
+        .client_capabilities
+        .get(&session_id)
+        .is_some_and(|capabilities| capabilities.roots.is_some())
+    {
         return;
     }
     tokio::spawn(async move {

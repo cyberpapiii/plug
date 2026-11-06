@@ -52,6 +52,7 @@ pub(super) use std::future::Future;
 pub(super) use std::pin::Pin;
 pub(super) use std::sync::Arc;
 pub(super) use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+pub(super) use std::time::Duration;
 pub(super) use tokio::sync::mpsc;
 pub(super) use tokio::sync::oneshot;
 pub(super) use tokio_util::sync::CancellationToken;
@@ -66,7 +67,6 @@ use crate::test_helpers::collect_sse_events;
 use axum::body::Body;
 use http::Request as HttpRequest;
 use std::collections::HashMap;
-use std::time::Duration;
 use tower::ServiceExt;
 
 pub(crate) fn isolated_oauth_manager(
@@ -394,4 +394,9 @@ pub(crate) fn test_state_with_auth(token: &str) -> Arc<HttpState> {
         )
         .with_auth(crate::http::server::HttpAuth::Bearer(Arc::from(token))),
     )
+}
+
+pub(crate) fn bare_router() -> Arc<ToolRouter> {
+    let sm = Arc::new(crate::server::ServerManager::new());
+    Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()))
 }

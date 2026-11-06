@@ -48,6 +48,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A remote client that goes on using a session Plug timed out can still be asked to fill in a form, to sample, and for its roots. The reopened session used to forget what the client said it supports at `initialize`, so those requests stopped until the client connected again. After Plug restarts this is still not known until the client initializes again.
 - A tool whose name is not plain ASCII can be called on a server that speaks the 2026-07-28 protocol. Plug left out the `Mcp-Name` header such a server requires, so the server refused the call; it now sends the name Base64-wrapped, as the protocol says, and reads that form when a client sends it.
 - A request whose `Mcp-Method` or `Mcp-Name` header disagrees with its body is refused with the protocol's header-mismatch code, -32020. Plug used -32001, its code for a caller that has not signed in.
 - The sign-in page calls a callback on `[::1]` a local app callback, as it does one on `127.0.0.1` or `localhost`.

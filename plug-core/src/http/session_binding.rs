@@ -125,7 +125,16 @@ pub(super) fn reopen_lost_session(
     }
     // The client will not say `initialized` again, so the session is wired for
     // notifications here, and told its lists may have changed while it was
-    // gone: what it holds was read from a Plug that no longer exists.
+    // gone: what it holds was read from a Plug that no longer exists. What it
+    // declared at `initialize` is still known when the session only timed
+    // out; after Plug restarts it is not, until the client initializes again.
+    let capabilities = state
+        .lapsed_capabilities
+        .take(&session_id)
+        .unwrap_or_default();
+    state
+        .client_capabilities
+        .insert(session_id.clone(), capabilities.clone());
     let session_arc = Arc::<str>::from(session_id.as_str());
     state.router.register_downstream_bridge(
         NotificationTarget::Http {
@@ -134,9 +143,10 @@ pub(super) fn reopen_lost_session(
         Arc::new(HttpBridge {
             state: Arc::clone(state),
             session_id: session_arc,
-            capabilities: Default::default(),
+            capabilities,
         }),
     );
+    maybe_request_http_roots(Arc::clone(state), session_id.clone());
     for notification in [
         ProtocolNotification::ToolListChanged,
         ProtocolNotification::ResourceListChanged,
@@ -402,5 +412,61 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn a_session_that_timed_out_keeps_what_its_client_declared() {
+        let state = Arc::new(HttpState::new(
+            bare_router(),
+            Arc::new(crate::session::SessionStore::new(0, 100)),
+            CancellationToken::new(),
+        ));
+        let initialize = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
+                        "capabilities": {"roots": {}, "elicitation": {}},
+                        "clientInfo": {"name": "returning-client", "version": "1"}
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = build_router(Arc::clone(&state))
+            .oneshot(initialize)
+            .await
+            .unwrap();
+        let session_id = response.headers()[SESSION_ID_HEADER]
+            .to_str()
+            .unwrap()
+            .to_string();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.client_capabilities.contains_key(&session_id) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the session lapses");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SESSION_ID_HEADER,
+            HeaderValue::from_str(&session_id).unwrap(),
+        );
+        reopen_lost_session(&state, &headers, &AuthStatus::NoAuthRequired);
+        let capabilities = state
+            .client_capabilities
+            .get(&session_id)
+            .map(|entry| entry.clone())
+            .expect("the reopened session has its capabilities");
+        assert!(capabilities.roots.is_some());
+        assert!(capabilities.elicitation.is_some());
     }
 }
