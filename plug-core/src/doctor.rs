@@ -1046,8 +1046,7 @@ async fn check_oauth_metadata_reachable(base_url: &str) -> Result<(), String> {
         "{}/.well-known/oauth-authorization-server",
         base_url.trim_end_matches('/')
     );
-    crate::tls::ensure_rustls_provider_installed();
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .timeout(std::time::Duration::from_secs(5))
         .build()
         .map_err(|error| error.to_string())?;

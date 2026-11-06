@@ -15,9 +15,7 @@ pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A client for upstream traffic, following redirects by `redirect`.
 pub(crate) fn client(redirect: reqwest::redirect::Policy) -> anyhow::Result<reqwest::Client> {
-    // Building a TLS-capable client panics without a crypto provider.
-    crate::tls::ensure_rustls_provider_installed();
-    reqwest::Client::builder()
+    crate::tls::http_client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(redirect)
         .build()

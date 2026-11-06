@@ -355,9 +355,7 @@ pub async fn bind_discovered_authority(
     resource_url: &str,
     budget: Duration,
 ) -> Result<(), AuthError> {
-    use rmcp::transport::auth::AuthorizationManager;
-
-    let manager = AuthorizationManager::new(resource_url).await?;
+    let manager = crate::tls::authorization_manager(resource_url).await?;
     let resolution = bounded_discovery(resource_url, budget, manager.resolve_metadata()).await?;
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     store.bind_verified_authority(&authority)
@@ -1682,15 +1680,10 @@ pub async fn refresh_access_token(
     server_url: &str,
     oauth_client_id: Option<&str>,
 ) -> RefreshResult {
-    use rmcp::transport::auth::AuthorizationManager;
-
-    // Ensure the TLS provider is available (reqwest needs it even for HTTP).
-    crate::tls::ensure_rustls_provider_installed();
-
     // 1. Perform token-silent discovery and bind authority before any stored
     // credential is loaded, refreshed, or eligible for attachment.
     let store = get_or_create_store(server_name);
-    let mut auth_manager = match AuthorizationManager::new(server_url).await {
+    let mut auth_manager = match crate::tls::authorization_manager(server_url).await {
         Ok(manager) => manager,
         Err(error) => {
             return RefreshResult::TransientError(format!("failed to init auth manager: {error}"));
@@ -2247,7 +2240,6 @@ mod tests {
     }
 
     async fn spawn_empty_oauth_authority() -> (String, tokio::task::JoinHandle<()>) {
-        crate::tls::ensure_rustls_provider_installed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind OAuth authority");
@@ -2318,11 +2310,11 @@ mod tests {
 
     #[tokio::test]
     async fn verified_runtime_lookup_returns_matching_bound_credential_pair() {
-        use rmcp::transport::auth::AuthorizationManager;
-
         let name = format!("bound-runtime-{}", uuid::Uuid::new_v4());
         let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
-        let manager = AuthorizationManager::new(&resource_url).await.unwrap();
+        let manager = crate::tls::authorization_manager(&resource_url)
+            .await
+            .unwrap();
         let resolution = manager.resolve_metadata().await.unwrap();
         let authority =
             VerifiedOAuthAuthority::verify(&resource_url, &resolution.metadata).unwrap();
@@ -2525,7 +2517,6 @@ mod tests {
     /// discovery fails).
     #[tokio::test]
     async fn test_refresh_transient_error_unreachable_server() {
-        crate::tls::ensure_rustls_provider_installed();
         let name = format!("refresh-transient-{}", std::process::id());
         let store = get_or_create_store(&name);
 

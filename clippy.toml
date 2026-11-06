@@ -1,0 +1,7 @@
+# Building a TLS-capable reqwest client panics unless the process-wide rustls
+# crypto provider is installed first. The wrappers in plug_core::tls install it.
+disallowed-methods = [
+    { path = "reqwest::Client::builder", reason = "use plug_core::tls::http_client_builder" },
+    { path = "reqwest::Client::new", reason = "use plug_core::tls::http_client_builder().build()" },
+    { path = "rmcp::transport::auth::AuthorizationManager::new", reason = "use plug_core::tls::authorization_manager" },
+]

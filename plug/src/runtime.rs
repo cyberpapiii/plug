@@ -1743,7 +1743,7 @@ mod tests {
                 .await
                 .expect("serve operator router");
         });
-        let client = reqwest::Client::builder()
+        let client = plug_core::tls::http_client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()
@@ -1888,7 +1888,10 @@ mod tests {
             Arc::from(authority.as_str()),
         );
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder().no_proxy().build().unwrap();
+        let client = plug_core::tls::http_client_builder()
+            .no_proxy()
+            .build()
+            .unwrap();
         let mut endpoint =
             reqwest::Url::parse(&format!("http://{addr}{OPERATOR_OAUTH_CLIENTS_PATH}")).unwrap();
         endpoint.path_segments_mut().unwrap().push(cimd_client_id);

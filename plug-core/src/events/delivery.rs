@@ -105,7 +105,7 @@ impl EventDelivery for HttpsDelivery {
             // A new non-pooled client pins this connection's resolution. Keep the
             // URL hostname for SNI/certificate validation. Never use system proxies
             // (which could perform an unvalidated second DNS lookup) or redirects.
-            let client = reqwest::Client::builder()
+            let client = crate::tls::http_client_builder()
                 .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .resolve_to_addrs(host, &addresses)

@@ -2099,7 +2099,7 @@ async fn fetch_client_metadata_document(
         return Err(DownstreamOauthError::MetadataFetch);
     }
     let pinned = resolved[0];
-    let client = reqwest::Client::builder()
+    let client = crate::tls::http_client_builder()
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(Duration::from_secs(3))
         .timeout(Duration::from_secs(5))
@@ -2668,7 +2668,13 @@ mod tests {
     async fn metadata_body_cap_applies_to_chunked_responses() {
         crate::tls::ensure_rustls_provider_installed();
         let url = endless_chunked_server().await;
-        let response = reqwest::Client::new().get(url).send().await.expect("send");
+        let response = crate::tls::http_client_builder()
+            .build()
+            .expect("HTTP client")
+            .get(url)
+            .send()
+            .await
+            .expect("send");
         assert!(response.content_length().is_none(), "body must be chunked");
         let result = tokio::time::timeout(
             Duration::from_secs(5),

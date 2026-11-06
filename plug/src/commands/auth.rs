@@ -286,7 +286,7 @@ fn local_operator_client(
         crate::runtime::local_operator_connection_authority(&cfg.http.bind_address, cfg.http.port);
     let endpoint =
         reqwest::Url::parse(&format!("{scheme}://{connection_authority}{endpoint_path}"))?;
-    let client = reqwest::Client::builder()
+    let client = plug_core::tls::http_client_builder()
         .timeout(Duration::from_secs(5))
         // Never let proxy configuration or redirects carry operator headers
         // outside the loopback request boundary.
@@ -726,9 +726,7 @@ async fn cmd_auth_login(
         "Starting OAuth login for server '{server_name}'..."
     ));
 
-    use rmcp::transport::auth::AuthorizationManager;
-
-    let mut auth_manager = AuthorizationManager::new(url)
+    let mut auth_manager = plug_core::tls::authorization_manager(url)
         .await
         .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
 
@@ -944,9 +942,7 @@ async fn cmd_auth_complete(
         .as_deref()
         .ok_or_else(|| anyhow::anyhow!("server '{server_name}' has no URL configured"))?;
 
-    use rmcp::transport::auth::AuthorizationManager;
-
-    let mut auth_manager = AuthorizationManager::new(url)
+    let mut auth_manager = plug_core::tls::authorization_manager(url)
         .await
         .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
 
@@ -1810,7 +1806,7 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        let client = reqwest::Client::builder()
+        let client = plug_core::tls::http_client_builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .build()

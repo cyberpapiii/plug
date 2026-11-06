@@ -3399,9 +3399,9 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
     store.clear().await.expect("clear OAuth store before test");
     plug_core::tls::ensure_rustls_provider_installed();
     let result = AssertUnwindSafe(async {
-        use rmcp::transport::auth::{AuthorizationManager, OAuthClientConfig};
+        use rmcp::transport::auth::OAuthClientConfig;
 
-        let mut auth_manager = AuthorizationManager::new(provider.mcp_url().as_str())
+        let mut auth_manager = plug_core::tls::authorization_manager(provider.mcp_url().as_str())
             .await
             .expect("create auth manager");
         auth_manager.set_credential_store(plug_core::oauth::CompositeCredentialStore::new(
@@ -3426,7 +3426,7 @@ async fn test_oauth_auth_code_exchange_persists_credentials() {
             .get_authorization_url(&["read"])
             .await
             .expect("authorization url");
-        let client = reqwest::Client::builder()
+        let client = plug_core::tls::http_client_builder()
             .redirect(reqwest::redirect::Policy::none())
             .build()
             .expect("reqwest client");
