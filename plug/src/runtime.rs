@@ -421,7 +421,7 @@ async fn operator_remove_owner_credential(
     let path = original_uri.path();
     let allow_empty = exact_header(&headers, OPERATOR_ALLOW_EMPTY_HEADER) == Some("true");
     if let Err(status) =
-        operator_proof_authorized(&state, &headers, "DELETE", &path, allow_empty).await
+        operator_proof_authorized(&state, &headers, "DELETE", path, allow_empty).await
     {
         return status;
     }
@@ -464,7 +464,7 @@ async fn operator_revoke_oauth_client(
     headers: HeaderMap,
 ) -> StatusCode {
     let path = original_uri.path();
-    if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", &path, false).await {
+    if let Err(status) = operator_proof_authorized(&state, &headers, "DELETE", path, false).await {
         return status;
     }
     match state.http_state.revoke_downstream_client(&client_id).await {
@@ -939,7 +939,7 @@ pub(crate) fn restart_advice() -> &'static str {
 
 fn restart_advice_for(app_installed: bool) -> &'static str {
     if app_installed {
-        "Restart Plug from Plug.app (Settings → Service → Restart)"
+        "Restart Plug from Plug.app (Settings → Plug → Restart)"
     } else {
         "Run `plug stop`, then `plug start`"
     }
