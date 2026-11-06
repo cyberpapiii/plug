@@ -51,6 +51,14 @@ pub enum TaskUpstreamRef {
     },
 }
 
+impl TaskUpstreamRef {
+    pub fn server_id(&self) -> &str {
+        match self {
+            Self::Request { server_id, .. } | Self::Task { server_id, .. } => server_id,
+        }
+    }
+}
+
 /// The tool a task is running: the name it was called by, and the server
 /// and the server's own name for it when Plug knew them. A large result is
 /// kept with these, so who may read it back follows the tool.

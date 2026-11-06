@@ -23,6 +23,124 @@ async fn ask_task_upstream(
     .await
 }
 
+/// The connection to cancel `upstream` on, and how long to wait: its
+/// server's call timeout. `None` when the server is gone, which leaves
+/// nothing to cancel.
+fn cancel_route(
+    server_manager: &ServerManager,
+    upstream: &TaskUpstreamRef,
+) -> Option<(Peer<RoleClient>, Duration)> {
+    let server = server_manager.get_upstream(upstream.server_id())?;
+    Some((server.client.peer().clone(), upstream_call_timeout(&server)))
+}
+
+/// Stop a task's upstream half: the task its server runs itself, by id, or
+/// the request still running for it. Waits at most `bound`, since rmcp
+/// waits for an answer forever. A failure is logged.
+async fn cancel_upstream(
+    peer: &Peer<RoleClient>,
+    upstream: &TaskUpstreamRef,
+    reason: &str,
+    bound: Duration,
+) {
+    match upstream {
+        TaskUpstreamRef::Task { server_id, task_id } => {
+            let params =
+                serde_json::to_value(crate::legacy_tasks::CancelTaskParams::new(task_id.clone()))
+                    .expect("legacy task cancel params serialize");
+            let send =
+                peer.send_request(crate::legacy_tasks::request("tasks/cancel", Some(params)));
+            match tokio::time::timeout(bound, send).await {
+                Err(_) => tracing::warn!(
+                    server = %server_id,
+                    upstream_task_id = %task_id,
+                    reason,
+                    timeout_secs = bound.as_secs(),
+                    "upstream tasks/cancel timed out"
+                ),
+                Ok(Err(error)) => tracing::debug!(
+                    server = %server_id,
+                    upstream_task_id = %task_id,
+                    reason,
+                    %error,
+                    "upstream tasks/cancel failed"
+                ),
+                Ok(Ok(_)) => {}
+            }
+        }
+        TaskUpstreamRef::Request { request_id, .. } => {
+            cancel_upstream_request(peer, request_id.clone(), reason, bound).await;
+        }
+    }
+}
+
+/// Wait for cancels spawned by `spawn_upstream_cancel`.
+async fn finish_cancels(cancels: Vec<tokio::task::JoinHandle<()>>) {
+    for cancel in cancels {
+        if let Err(error) = cancel.await {
+            tracing::warn!(%error, "upstream cancel did not finish");
+        }
+    }
+}
+
+/// After a task create timed out, wait one more `window` for its answer and
+/// cancel the task if one still arrives. If none does, the upstream task may
+/// be orphaned.
+///
+/// rmcp 3.1.0 (`service.rs`): once the request-level cancel passes through
+/// the peer loop, rmcp resolves the pending responder with
+/// `ServiceError::Cancelled` and drops any later response for that id, so a
+/// late `CreateTaskResult` reaches this only when it beat the cancel. An
+/// upstream that honors the request-level cancel creates nothing.
+pub(super) fn spawn_late_task_reaper(
+    rx: tokio::sync::oneshot::Receiver<Result<ServerResult, ServiceError>>,
+    server_manager: Arc<ServerManager>,
+    window: Duration,
+    server_id: String,
+    trace_id: Arc<str>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match tokio::time::timeout(window, rx).await {
+            Ok(Ok(Ok(response))) => {
+                // A late answer without a task created nothing to cancel.
+                let Ok(result) = crate::legacy_tasks::parse_create_result(response) else {
+                    return;
+                };
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    server = %server_id,
+                    task_id = %result.task.task_id,
+                    "native task created after its create timed out; cancelling upstream task"
+                );
+                let upstream = TaskUpstreamRef::Task {
+                    server_id,
+                    task_id: result.task.task_id,
+                };
+                if let Some((peer, bound)) = cancel_route(&server_manager, &upstream) {
+                    cancel_upstream(
+                        &peer,
+                        &upstream,
+                        "task created after its create timed out",
+                        bound,
+                    )
+                    .await;
+                }
+            }
+            // `ServiceError::Cancelled` once the request-level cancel went
+            // through, or a dropped responder once the connection is gone.
+            Ok(_) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    server = %server_id,
+                    window_secs = window.as_secs(),
+                    "native create reaper window expired; upstream task may be orphaned"
+                );
+            }
+        }
+    })
+}
+
 /// RAII cover for the send-to-record gap in `record_task_request`:
 /// constructed the moment the upstream request is in flight and defused
 /// once the request id is safely recorded on the task record — or once an
@@ -315,8 +433,9 @@ impl super::ToolRouter {
                         // NOT handed to the reaper — it dies with this task
                         // (the reaper only cancels; it never creates
                         // records).
-                        router.spawn_native_create_reaper(
+                        spawn_late_task_reaper(
                             rx,
+                            Arc::clone(&router.server_manager),
                             call_timeout,
                             server_id.clone(),
                             Arc::clone(&trace_id),
@@ -402,13 +521,15 @@ impl super::ToolRouter {
                                 task_id = %result.task.task_id,
                                 "owner torn down during native task creation; cancelling upstream task"
                             );
-                            if let Some(cancellation) =
-                                router.spawn_bounded_upstream_cancellation(TaskUpstreamRef::Task {
-                                    server_id,
-                                    task_id: result.task.task_id.clone(),
-                                })
+                            let upstream = TaskUpstreamRef::Task {
+                                server_id,
+                                task_id: result.task.task_id.clone(),
+                            };
+                            if let Some((peer, bound)) =
+                                cancel_route(&router.server_manager, &upstream)
                             {
-                                let _ = cancellation.await;
+                                cancel_upstream(&peer, &upstream, "task owner disconnected", bound)
+                                    .await;
                             }
                             Err(error)
                         }
@@ -686,15 +807,13 @@ impl super::ToolRouter {
     /// upstream also stops instead of completing the call for a result
     /// nobody will ever collect.
     ///
-    /// Mirrors the cancellation-forwarding branches in `cancel_task_for_owner`,
-    /// minus the store sync-back — the records are already gone by the time
-    /// cancellation is forwarded, so there is nothing left to update. Errors
-    /// notifying any one upstream are ignored and never skip the rest.
+    /// Each upstream is cancelled as `cancel_task_for_owner` cancels one
+    /// (`cancel_upstream`). A failure with one upstream is logged and never
+    /// skips the rest.
     ///
     /// Returns in bounded time regardless of upstream behavior: local aborts
     /// happen first and synchronously, and every upstream cancellation is
-    /// forwarded concurrently under a per-upstream timeout (see
-    /// `spawn_bounded_upstream_cancellation`). Callers include the daemon's
+    /// forwarded concurrently under a per-upstream timeout. Callers include the daemon's
     /// idle-session expiry loop, which is a single serialized loop — an
     /// unbounded hang here would permanently stop idle cleanup daemon-wide.
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
@@ -723,146 +842,36 @@ impl super::ToolRouter {
         // max(per-server bound), not the sum — and a cancellation outlives
         // even a caller that gets aborted mid-await (e.g. an HTTP DELETE
         // request task).
-        let cancellations: Vec<_> = upstreams
+        let cancellations = upstreams
             .into_iter()
-            .filter_map(|upstream| self.spawn_bounded_upstream_cancellation(upstream))
+            .filter_map(|upstream| self.spawn_upstream_cancel(upstream, "task owner disconnected"))
             .collect();
-        for cancellation in cancellations {
-            let _ = cancellation.await;
-        }
+        finish_cancels(cancellations).await;
     }
 
     async fn finish_expired_task_cleanup(&self, cleanup: Vec<crate::tasks::ExpiredTaskCleanup>) {
         let cancellations = cleanup
             .iter()
             .filter_map(|item| item.upstream.clone())
-            .filter_map(|upstream| self.spawn_bounded_upstream_cancellation(upstream))
-            .collect::<Vec<_>>();
-        for cancellation in cancellations {
-            let _ = cancellation.await;
-        }
+            .filter_map(|upstream| self.spawn_upstream_cancel(upstream, "task expired"))
+            .collect();
+        finish_cancels(cancellations).await;
         // Dropping only after every bounded cancellation attempt releases
         // the quota leases retained by stale live records.
         drop(cleanup);
     }
 
-    /// Spawns a best-effort cancellation of `upstream` (task cancel request
-    /// or request-cancel notification), bounded by the owning server's
-    /// `call_timeout_secs`. rmcp's plain `send_request` sets no timeout of
-    /// its own and awaits the response oneshot forever, so without this
-    /// bound a single unresponsive upstream would wedge the caller.
-    /// Returns `None` when the server is no longer registered (nothing left
-    /// to cancel). Timeouts and errors are logged, never propagated.
-    fn spawn_bounded_upstream_cancellation(
+    /// Cancel `upstream` on a task of its own, so the cancel finishes even
+    /// when the caller is dropped. `None` when its server is gone.
+    fn spawn_upstream_cancel(
         &self,
         upstream: TaskUpstreamRef,
+        reason: &'static str,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let server_id = match &upstream {
-            TaskUpstreamRef::Task { server_id, .. }
-            | TaskUpstreamRef::Request { server_id, .. } => server_id,
-        };
-        let server = self.server_manager.get_upstream(server_id)?;
-        let bound = Duration::from_secs(server.config.call_timeout_secs);
-        let peer = server.client.peer().clone();
-        drop(server);
-
+        let (peer, bound) = cancel_route(&self.server_manager, &upstream)?;
         Some(tokio::spawn(async move {
-            match upstream {
-                TaskUpstreamRef::Task {
-                    server_id,
-                    task_id: upstream_task_id,
-                } => {
-                    let params = serde_json::to_value(crate::legacy_tasks::CancelTaskParams::new(
-                        upstream_task_id.clone(),
-                    ))
-                    .expect("legacy task cancel params serialize");
-                    let send = peer
-                        .send_request(crate::legacy_tasks::request("tasks/cancel", Some(params)));
-                    match tokio::time::timeout(bound, send).await {
-                        Err(_) => tracing::warn!(
-                            server = %server_id,
-                            upstream_task_id = %upstream_task_id,
-                            timeout_secs = bound.as_secs(),
-                            "upstream tasks/cancel timed out during task teardown"
-                        ),
-                        Ok(Err(error)) => tracing::debug!(
-                            server = %server_id,
-                            upstream_task_id = %upstream_task_id,
-                            %error,
-                            "upstream tasks/cancel failed during task teardown"
-                        ),
-                        Ok(Ok(_)) => {}
-                    }
-                }
-                TaskUpstreamRef::Request { request_id, .. } => {
-                    cancel_upstream_request(&peer, request_id, "task owner disconnected", bound)
-                        .await;
-                }
-            }
+            cancel_upstream(&peer, &upstream, reason, bound).await;
         }))
-    }
-
-    /// Spawns the detached reaper backing a timed-out native create: keeps
-    /// awaiting the request's response oneshot for up to one more `window`
-    /// and, if a `CreateTaskResult` still lands late, sends a bounded
-    /// task-id cancellation so the just-created upstream task is stopped
-    /// instead of orphaned. If the window also expires, it logs and gives
-    /// up (residual: the upstream task may be orphaned).
-    ///
-    /// rmcp caveat (rmcp 3.1.0 `service.rs`): once our
-    /// request-level cancel passes through the peer loop, rmcp resolves the
-    /// pending responder with `ServiceError::Cancelled` and DROPS any later
-    /// response for that id — so a late `CreateTaskResult` is only
-    /// observable here when it beats that clobber. A spec-compliant
-    /// upstream honors the request-level cancel anyway; the reaper is
-    /// defense-in-depth for the race where the response was already in
-    /// flight.
-    fn spawn_native_create_reaper(
-        self: &Arc<Self>,
-        rx: tokio::sync::oneshot::Receiver<Result<ServerResult, ServiceError>>,
-        window: Duration,
-        server_id: String,
-        trace_id: Arc<str>,
-    ) -> tokio::task::JoinHandle<()> {
-        let router = Arc::clone(self);
-        tokio::spawn(async move {
-            match tokio::time::timeout(window, rx).await {
-                Ok(Ok(Ok(response))) => {
-                    // A late non-task response created nothing to cancel.
-                    let Ok(result) = crate::legacy_tasks::parse_create_result(response) else {
-                        return;
-                    };
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        task_id = %result.task.task_id,
-                        "native task created after enqueue timed out; cancelling upstream task"
-                    );
-                    if let Some(cancellation) =
-                        router.spawn_bounded_upstream_cancellation(TaskUpstreamRef::Task {
-                            server_id,
-                            task_id: result.task.task_id.clone(),
-                        })
-                    {
-                        let _ = cancellation.await;
-                    }
-                }
-                // Includes `ServiceError::Cancelled`: rmcp resolved the
-                // responder once our request-level cancel went through — the
-                // cancel reached the upstream, nothing further to do here.
-                Ok(Ok(Err(_error))) => {}
-                // Responder dropped: transport/service went away entirely.
-                Ok(Err(_recv_error)) => {}
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        window_secs = window.as_secs(),
-                        "native create reaper window expired; upstream task may be orphaned"
-                    );
-                }
-            }
-        })
     }
 
     /// How many task records `owner` has.
@@ -909,59 +918,10 @@ impl super::ToolRouter {
         };
         self.finish_expired_task_cleanup(cleanup).await;
         let (task, upstream, handle) = cancelled?;
-        if let Some(upstream) = upstream {
-            match upstream {
-                TaskUpstreamRef::Task {
-                    server_id,
-                    task_id: upstream_task_id,
-                } => {
-                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        // Bounded like the teardown path: rmcp's plain
-                        // `send_request` awaits its response forever, and an
-                        // unresponsive upstream must not wedge the caller. On
-                        // timeout we fall through to returning the locally
-                        // cancelled task, exactly like any other non-
-                        // CancelTaskResult response.
-                        let bound = Duration::from_secs(server.config.call_timeout_secs);
-                        let response = tokio::time::timeout(
-                            bound,
-                            server.client.peer().send_request({
-                                let params = serde_json::to_value(
-                                    crate::legacy_tasks::CancelTaskParams::new(upstream_task_id),
-                                )
-                                .expect("legacy task cancel params serialize");
-                                crate::legacy_tasks::request("tasks/cancel", Some(params))
-                            }),
-                        )
-                        .await;
-                        match response {
-                            Ok(Ok(_)) => {}
-                            Err(_) => tracing::debug!(
-                                server = %server_id,
-                                task_id = %task_id,
-                                timeout_secs = bound.as_secs(),
-                                "upstream tasks/cancel timed out; returning locally cancelled task"
-                            ),
-                            Ok(_) => {}
-                        }
-                    }
-                }
-                TaskUpstreamRef::Request {
-                    server_id,
-                    request_id,
-                } => {
-                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        let bound = Duration::from_secs(server.config.call_timeout_secs);
-                        cancel_upstream_request(
-                            server.client.peer(),
-                            request_id,
-                            "task cancelled",
-                            bound,
-                        )
-                        .await;
-                    }
-                }
-            }
+        if let Some(upstream) = upstream
+            && let Some((peer, bound)) = cancel_route(&self.server_manager, &upstream)
+        {
+            cancel_upstream(&peer, &upstream, "task cancelled", bound).await;
         }
         if let Some(handle) = handle {
             handle.abort();
@@ -2274,7 +2234,6 @@ mod tests {
     async fn native_create_reaper_cancels_late_created_upstream_task() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2282,8 +2241,9 @@ mod tests {
         .await;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let reaper = router.spawn_native_create_reaper(
+        let reaper = spawn_late_task_reaper(
             rx,
+            Arc::clone(&sm),
             Duration::from_secs(5),
             "mock".to_string(),
             Arc::from("trace-reaper-test"),
