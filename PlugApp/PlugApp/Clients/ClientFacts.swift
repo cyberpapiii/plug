@@ -55,6 +55,12 @@ struct AppRoster: Equatable {
 }
 
 extension LiveSession {
+    /// The key server choices for this session are stored under: the one its
+    /// requests carry, when that key is the client's own. A remote session
+    /// with no grant shares its key with every other such session, so it has
+    /// no choices of its own.
+    var ownAccessKey: String? { accessKey == clientKey ? clientKey : nil }
+
     /// The product name of a client Plug knows, nil for any other.
     var knownName: String? {
         for value in [clientType, clientInfo].compactMap({ $0 }) {
@@ -98,7 +104,6 @@ extension LiveSession {
 /// A name belongs to a client, not a session, so it is looked up through the
 /// key the daemon stores it under.
 struct ClientNames: Equatable {
-    private let keys: [String: String]
     private let names: [String: String]
     /// The name each remote client registered its grant under.
     private let grantNames: [String: String]
@@ -106,16 +111,11 @@ struct ClientNames: Equatable {
     private let places: [String: String]
 
     init(
-        visibility: [ClientVisibility],
         names: [ClientName],
         grants: [DownstreamClient] = [],
         places: [ClientPlace] = []
     ) {
         self.places = Dictionary(places.map { ($0.key, $0.place) }, uniquingKeysWith: { first, _ in first })
-        keys = Dictionary(
-            visibility.compactMap { entry in entry.clientKey.map { (entry.sessionId, $0) } },
-            uniquingKeysWith: { first, _ in first }
-        )
         self.names = Dictionary(names.map { ($0.key, $0.name) }, uniquingKeysWith: { first, _ in first })
         grantNames = Dictionary(
             grants.filter { !$0.clientName.isEmpty }.map { ($0.clientKey, $0.clientName) },
@@ -125,16 +125,11 @@ struct ClientNames: Equatable {
 
     init(snapshot: OperatorSnapshot) {
         self.init(
-            visibility: snapshot.clientVisibility,
             names: snapshot.clientNames ?? [],
             grants: snapshot.downstreamClients,
             places: snapshot.clientPlaces ?? []
         )
     }
-
-    /// Nil for a session the daemon cannot tell apart from other clients.
-    /// There is nothing to store a name under, so it cannot be renamed.
-    func key(of session: LiveSession) -> String? { keys[session.sessionId] }
 
     func name(forKey key: String?) -> String? { key.flatMap { names[$0] } }
 
@@ -150,12 +145,12 @@ struct ClientNames: Equatable {
     /// Plug does not know takes the name on its grant, which the owner
     /// approved, ahead of whatever the session says about itself.
     func displayName(_ session: LiveSession) -> String {
-        name(forKey: key(of: session)) ?? originalName(session)
+        name(forKey: session.clientKey) ?? originalName(session)
     }
 
     /// What a session is called before the owner names it.
     func originalName(_ session: LiveSession) -> String {
-        let key = key(of: session)
+        let key = session.clientKey
         return session.knownName
             // A link says which client it was written for; that outranks
             // the program that happened to start the connector.
@@ -185,14 +180,13 @@ struct ClientNames: Equatable {
     /// client it reports, else the client its link was written for, else
     /// the client its sign-in names. A call is pictured the same way.
     func target(of session: LiveSession) -> String {
-        if let named = knownTarget(named: name(forKey: key(of: session))) { return named }
-        if let key = key(of: session), key.hasPrefix(AddClient.customPrefix) { return key }
+        let key = session.clientKey
+        if let named = knownTarget(named: name(forKey: key)) { return named }
+        if let key, key.hasPrefix(AddClient.customPrefix) { return key }
         let reported = AppIcons.target(forClientType: session.clientType)
         if AppIcons.displayName(forTarget: reported) != nil { return reported }
-        if let key = key(of: session), AppIcons.displayName(forTarget: key) != nil {
-            return key
-        }
-        if let grant = key(of: session).flatMap({ grantNames[$0] }) {
+        if let key, AppIcons.displayName(forTarget: key) != nil { return key }
+        if let grant = key.flatMap({ grantNames[$0] }) {
             return AppIcons.target(forClientType: grant)
         }
         return reported
@@ -207,7 +201,7 @@ struct ClientNames: Equatable {
             let known = AppIcons.displayName(forTarget: target) != nil
             // A client Plug knows is one client however it is keyed. Any
             // other is told apart by its key.
-            let identity = known ? target : (key(of: session) ?? target)
+            let identity = known ? target : (session.clientKey ?? target)
             guard seen.insert(identity).inserted else { return nil }
             return ConnectedClient(
                 target: target,

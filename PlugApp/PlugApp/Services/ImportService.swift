@@ -90,7 +90,7 @@ extension ImportScan {
         var unreadable: [String] = []
         for scan in root["scanned"] as? [[String: Any]] ?? [] {
             guard let error = scan["error"] as? String, !error.isEmpty else { continue }
-            unreadable.append(Self.appName(fromSource: scan["source"] as? String ?? ""))
+            unreadable.append(scan["source_name"] as? String ?? "Another client")
         }
 
         let found = root["new_servers"] as? [[String: Any]] ?? []
@@ -104,7 +104,6 @@ extension ImportScan {
               let body = raw["config"] as? [String: Any]
         else { return nil }
 
-        let source = raw["source"] as? String ?? ""
         let env = body["env"] as? [String: String] ?? [:]
 
         var config: ServerConfig
@@ -123,49 +122,11 @@ extension ImportScan {
 
         return DiscoveredServer(
             name: name,
-            source: target(forSource: source),
-            sourceName: appName(fromSource: source),
+            source: raw["source_target"] as? String ?? "",
+            sourceName: raw["source_name"] as? String ?? "Another client",
             config: config,
             detail: detail
         )
-    }
-
-    /// `ClaudeDesktop` in the report is `claude-desktop` everywhere else in the
-    /// app, which is what picks the icon. Spelled out rather than derived,
-    /// because the two names disagree in both directions (`VSCodeCopilot` is
-    /// `vscode`, `OpenCode` is `opencode`).
-    static func target(forSource source: String) -> String {
-        switch source {
-        case "ClaudeDesktop": "claude-desktop"
-        case "ClaudeCode": "claude-code"
-        case "VSCodeCopilot": "vscode"
-        case "GeminiCli": "gemini-cli"
-        case "CodexCli": "codex-cli"
-        case "ClineCli": "cline-cli"
-        case "OpenCode": "opencode"
-        case "RooCode": "roocode"
-        case "GrokBuild": "grok-build"
-        case "CopilotCli": "copilot-cli"
-        default: source.lowercased()
-        }
-    }
-
-    /// The app's name as its own makers write it.
-    static func appName(fromSource source: String) -> String {
-        switch source {
-        case "ClaudeDesktop": "Claude Desktop"
-        case "ClaudeCode": "Claude Code"
-        case "VSCodeCopilot": "VS Code"
-        case "GeminiCli": "Gemini CLI"
-        case "CodexCli": "Codex CLI"
-        case "ClineCli": "Cline CLI"
-        case "OpenCode": "OpenCode"
-        case "RooCode": "Roo Code"
-        case "GrokBuild": "Grok Build"
-        case "CopilotCli": "GitHub Copilot CLI"
-        case "": "Another client"
-        default: source
-        }
     }
 }
 
