@@ -329,7 +329,17 @@ impl super::ToolRouter {
                     }
                 };
 
-                if let Ok(result) = crate::legacy_tasks::parse_create_result(response) {
+                let parsed = crate::legacy_tasks::parse_create_result(response);
+                if let Err(error) = &parsed {
+                    tracing::warn!(
+                        trace_id = %trace_id,
+                        server = %server_id,
+                        tool = %original_name,
+                        %error,
+                        "upstream answered a task-wrapped call without a legacy task"
+                    );
+                }
+                if let Ok(result) = parsed {
                     tracing::info!(
                         trace_id = %trace_id,
                         server = %server_id,
@@ -406,12 +416,9 @@ impl super::ToolRouter {
         // Create + spawn + attach in ONE task_store lock scope: `tokio::spawn`
         // is synchronous, and the spawned future's own store accesses simply
         // queue on this same lock, so no teardown can interleave between the
-        // record insert and the abort-handle attach. (Previously these were
-        // three separate lock scopes; a `cleanup_owner` interleaving drained a
-        // record whose handle was still `None`, `attach_abort_handle` then
-        // silently no-opped on the missing record and dropped the JoinHandle —
-        // detaching the future, which kept running and kept holding its
-        // server's `max_concurrent` semaphore permit.) No await is held
+        // record insert and the abort-handle attach. A record drained before
+        // its handle was attached would detach the future, which would keep
+        // running and holding its server's call slot. No await is held
         // across this scope other than acquiring the lock itself.
         // The way the call itself routes, so a tool called by its server's
         // own name is recorded too.
@@ -814,7 +821,7 @@ impl super::ToolRouter {
     /// instead of orphaned. If the window also expires, it logs and gives
     /// up (residual: the upstream task may be orphaned).
     ///
-    /// rmcp caveat (verified against rmcp 1.7.0 `service.rs`): once our
+    /// rmcp caveat (rmcp 3.1.0 `service.rs`): once our
     /// request-level cancel passes through the peer loop, rmcp resolves the
     /// pending responder with `ServiceError::Cancelled` and DROPS any later
     /// response for that id — so a late `CreateTaskResult` is only
@@ -832,11 +839,11 @@ impl super::ToolRouter {
         let router = Arc::clone(self);
         tokio::spawn(async move {
             match tokio::time::timeout(window, rx).await {
-                Ok(Ok(Ok(response)))
-                    if crate::legacy_tasks::parse_create_result(response.clone()).is_ok() =>
-                {
-                    let result = crate::legacy_tasks::parse_create_result(response)
-                        .expect("guard proved legacy create response");
+                Ok(Ok(Ok(response))) => {
+                    // A late non-task response created nothing to cancel.
+                    let Ok(result) = crate::legacy_tasks::parse_create_result(response) else {
+                        return;
+                    };
                     tracing::warn!(
                         trace_id = %trace_id,
                         server = %server_id,
@@ -852,8 +859,6 @@ impl super::ToolRouter {
                         let _ = cancellation.await;
                     }
                 }
-                // A late non-task response created nothing to cancel.
-                Ok(Ok(Ok(_other))) => {}
                 // Includes `ServiceError::Cancelled`: rmcp resolved the
                 // responder once our request-level cancel went through — the
                 // cancel reached the upstream, nothing further to do here.
