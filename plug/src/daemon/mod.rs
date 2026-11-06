@@ -956,11 +956,10 @@ async fn handle_ipc_loop(
                     Err(TryRecvError::Lagged(skipped)) => {
                         tracing::warn!(skipped, "IPC logging notification lagged");
                         let synthetic = IpcResponse::LoggingNotification {
-                            params: serde_json::json!({
-                                "level": "warning",
-                                "logger": "plug",
-                                "data": format!("skipped {skipped} log messages")
-                            }),
+                            params: serde_json::to_value(
+                                plug_core::notifications::ProtocolNotification::lagged_logging_params(skipped),
+                            )
+                            .unwrap_or_default(),
                         };
                         ipc::send_response(writer, &synthetic).await.ok();
                     }
@@ -1117,11 +1116,8 @@ async fn send_ipc_logging_notification(
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC logging notification lagged");
             let synthetic = IpcResponse::LoggingNotification {
-                params: serde_json::json!({
-                    "level": "warning",
-                    "logger": "plug",
-                    "data": format!("skipped {skipped} log messages")
-                }),
+                params: serde_json::to_value(ProtocolNotification::lagged_logging_params(skipped))
+                    .unwrap_or_default(),
             };
             ipc::send_response(writer, &synthetic).await.ok();
         }

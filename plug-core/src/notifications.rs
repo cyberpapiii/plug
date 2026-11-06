@@ -50,6 +50,16 @@ pub enum NotificationTarget {
 }
 
 impl ProtocolNotification {
+    /// The log line a client gets in place of `skipped` log messages its
+    /// connection fell too far behind to receive.
+    pub fn lagged_logging_params(skipped: u64) -> LoggingMessageNotificationParam {
+        LoggingMessageNotificationParam::new(
+            rmcp::model::LoggingLevel::Warning,
+            serde_json::json!(format!("skipped {skipped} log messages")),
+        )
+        .with_logger("plug")
+    }
+
     pub fn control_lagged_logging_params(
         skipped: u64,
         transport: &'static str,

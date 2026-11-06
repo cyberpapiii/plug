@@ -130,13 +130,7 @@ impl HttpState {
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                                 tracing::warn!(skipped, "HTTP logging fan-out lagged");
                                 let synthetic = ProtocolNotification::LoggingMessage {
-                                    params: rmcp::model::LoggingMessageNotificationParam::new(
-                                        rmcp::model::LoggingLevel::Warning,
-                                        serde_json::json!(format!(
-                                            "skipped {skipped} log messages"
-                                        )),
-                                    )
-                                    .with_logger("plug"),
+                                    params: ProtocolNotification::lagged_logging_params(skipped),
                                 };
                                 if let Some(message) = notification_to_sse_message(&synthetic) {
                                     log_state.sessions.broadcast(
