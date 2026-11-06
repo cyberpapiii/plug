@@ -454,7 +454,7 @@ impl super::ToolRouter {
             .cache
             .load()
             .resolve_route(tool_name)
-            .filter(|(server, _)| server != "__plug_internal__")
+            .filter(|(server, _)| server != crate::tool_naming::INTERNAL_SERVER_ID)
             .cloned();
         let created = {
             let mut store = self.task_store.lock().await;

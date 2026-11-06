@@ -842,7 +842,7 @@ impl Default for IpcTrustInfo {
 
 impl IpcTrustInfo {
     pub fn for_server(server_id: &str, config: Option<&crate::config::ServerConfig>) -> Self {
-        if server_id == "__plug_internal__" {
+        if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
             return Self {
                 tier: "plug_internal".to_string(),
                 source: "plug_builtin".to_string(),
@@ -1241,27 +1241,6 @@ pub enum DaemonToProxyMessage {
 /// Admin operations (RestartServer, Reload, Shutdown) require it.
 /// MCP proxy operations (Register, Deregister, McpRequest) rely on
 /// Unix socket file permissions for access control instead.
-/// True when `disabled_tools` hides `tool_name` from downstream clients.
-pub fn tool_is_disabled(patterns: &[String], tool_name: &str) -> bool {
-    crate::proxy::is_disabled_tool(patterns, tool_name)
-}
-
-/// The wildcard `disabled_tools` entry hiding `tool_name`, if the tool is not
-/// listed by its exact name. Operator surfaces use this to explain why a
-/// single tool cannot be switched back on by itself.
-pub fn disabling_wildcard(patterns: &[String], tool_name: &str) -> Option<String> {
-    if patterns
-        .iter()
-        .any(|pattern| pattern.eq_ignore_ascii_case(tool_name))
-    {
-        return None;
-    }
-    patterns
-        .iter()
-        .find(|pattern| crate::proxy::is_disabled_tool(std::slice::from_ref(*pattern), tool_name))
-        .cloned()
-}
-
 pub fn requires_auth(request: &IpcRequest) -> bool {
     matches!(
         request,

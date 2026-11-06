@@ -1,3 +1,7 @@
+/// The server id Plug's own tools (`plug__search_tools` and the other meta
+/// tools) are routed under. No configured server can have it.
+pub const INTERNAL_SERVER_ID: &str = "__plug_internal__";
+
 /// Sanitize a tool name into snake_case for LLM API compatibility.
 ///
 /// Handles hyphens, dots, camelCase, PascalCase, and acronyms.

@@ -6,7 +6,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use crate::proxy::DownstreamTransport;
 use crate::types::PrincipalId;
 
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "2025-11-25";
@@ -200,7 +199,6 @@ impl MethodFamily {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityPolicyInput<'a> {
     pub era: ProtocolEra,
-    pub transport: DownstreamTransport,
     pub principal: Option<&'a PrincipalId>,
     pub scopes: &'a BTreeSet<String>,
     pub local_trust: bool,
@@ -688,7 +686,6 @@ mod tests {
         let scopes = BTreeSet::from(["tools:read".to_string()]);
         let input = CapabilityPolicyInput {
             era: ProtocolEra::Legacy,
-            transport: DownstreamTransport::Http,
             principal: Some(&principal),
             scopes: &scopes,
             local_trust: false,
@@ -714,7 +711,6 @@ mod tests {
         let scopes = BTreeSet::new();
         let input = CapabilityPolicyInput {
             era: ProtocolEra::Legacy,
-            transport: DownstreamTransport::Http,
             principal: None,
             scopes: &scopes,
             local_trust: true,

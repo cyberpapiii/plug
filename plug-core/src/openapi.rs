@@ -477,8 +477,8 @@ fn parse_unlimited(
 fn is_selected(selected: &[String], name: &str, operation_id: Option<&str>) -> bool {
     selected.is_empty()
         || selected.iter().any(|pattern| {
-            crate::proxy::wildcard_match(pattern, name)
-                || operation_id.is_some_and(|id| crate::proxy::wildcard_match(pattern, id))
+            crate::tool_patterns::wildcard_match(pattern, name)
+                || operation_id.is_some_and(|id| crate::tool_patterns::wildcard_match(pattern, id))
         })
 }
 

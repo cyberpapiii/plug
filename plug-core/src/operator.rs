@@ -7,7 +7,7 @@ use figment::providers::{Format, Serialized, Toml};
 use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, ServerConfig, ToolBlock, TransportType, validate_config};
-use crate::proxy::is_disabled_tool;
+use crate::tool_patterns::is_disabled_tool;
 
 #[derive(Debug, Clone)]
 pub enum OperatorMutation {

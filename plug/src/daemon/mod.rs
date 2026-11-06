@@ -2157,12 +2157,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                             &server_id,
                             config.servers.get(&server_id),
                         ),
-                        risk,
-                        disabled: plug_core::ipc::tool_is_disabled(
+                        risk: plug_core::ipc::IpcToolRiskInfo::from_annotations(
+                            risk.upstream_declared.as_ref(),
+                            risk.plug_inferred.as_ref(),
+                            risk.effective.as_ref(),
+                        ),
+                        disabled: plug_core::tool_patterns::is_disabled_tool(
                             &config.disabled_tools,
                             tool.name.as_ref(),
                         ),
-                        disabled_by_pattern: plug_core::ipc::disabling_wildcard(
+                        disabled_by_pattern: plug_core::tool_patterns::disabling_wildcard(
                             &config.disabled_tools,
                             tool.name.as_ref(),
                         ),

@@ -147,7 +147,7 @@ pub(crate) async fn cmd_server_list(
                         let mut failed = 0usize;
                         let mut auth_required = 0usize;
                         for server in &servers {
-                            if server.server_id == "__plug_internal__" {
+                            if server.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
                                 continue;
                             }
                             match server.health {
@@ -164,7 +164,8 @@ pub(crate) async fn cmd_server_list(
                                 "{} on",
                                 servers
                                     .iter()
-                                    .filter(|server| server.server_id != "__plug_internal__")
+                                    .filter(|server| server.server_id
+                                        != plug_core::tool_naming::INTERNAL_SERVER_ID)
                                     .count()
                             ),
                         );
@@ -176,7 +177,7 @@ pub(crate) async fn cmd_server_list(
                         println!();
                         print_heading("Servers");
                         for s in &servers {
-                            if s.server_id == "__plug_internal__" {
+                            if s.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
                                 continue;
                             }
                             let server_cfg = config
@@ -202,7 +203,7 @@ pub(crate) async fn cmd_server_list(
                         }
                         let auth_required_servers = servers
                             .iter()
-                            .filter(|s| s.server_id != "__plug_internal__")
+                            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
                             .filter(|s| {
                                 matches!(s.health, plug_core::types::ServerHealth::AuthRequired)
                             })
@@ -210,13 +211,13 @@ pub(crate) async fn cmd_server_list(
                             .collect::<Vec<_>>();
                         let failed_servers = servers
                             .iter()
-                            .filter(|s| s.server_id != "__plug_internal__")
+                            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
                             .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
                             .map(|s| s.server_id.clone())
                             .collect::<Vec<_>>();
                         let degraded_servers = servers
                             .iter()
-                            .filter(|s| s.server_id != "__plug_internal__")
+                            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
                             .filter(|s| {
                                 matches!(s.health, plug_core::types::ServerHealth::Degraded)
                             })

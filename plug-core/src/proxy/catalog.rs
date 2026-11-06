@@ -178,63 +178,6 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
     }
 }
 
-pub(crate) fn is_disabled_tool(patterns: &[String], tool_name: &str) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
-    // Prefer pre-lowercased patterns (`RouterConfig::from`); still tolerate mixed case.
-    let tool_name = tool_name.to_ascii_lowercase();
-    patterns.iter().any(|pattern| {
-        if pattern.bytes().all(|b| !b.is_ascii_uppercase()) {
-            wildcard_match(pattern, &tool_name)
-        } else {
-            wildcard_match(&pattern.to_ascii_lowercase(), &tool_name)
-        }
-    })
-}
-
-pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == text;
-    }
-
-    let mut remainder = text;
-    let mut first = true;
-
-    for (index, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-
-        if first && !pattern.starts_with('*') {
-            if !remainder.starts_with(part) {
-                return false;
-            }
-            remainder = &remainder[part.len()..];
-            first = false;
-            continue;
-        }
-
-        if index == parts.len() - 1 && !pattern.ends_with('*') {
-            return remainder.ends_with(part);
-        }
-
-        if let Some(found) = remainder.find(part) {
-            remainder = &remainder[found + part.len()..];
-            first = false;
-        } else {
-            return false;
-        }
-    }
-
-    true
-}
-
 pub(crate) fn paginated_result<T: Clone, R>(
     items: &[T],
     request: Option<PaginatedRequestParams>,
@@ -378,7 +321,7 @@ impl ToolSearchIndex {
             .iter()
             .filter_map(|tool| {
                 let (server_id, _) = snapshot.routes.get(tool.name.as_ref())?;
-                if server_id == "__plug_internal__" {
+                if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
                     return None;
                 }
                 Some(ToolSearchEntry {
@@ -626,7 +569,7 @@ impl super::ToolRouter {
     }
 
     /// List all tools with their source server IDs and operator risk metadata.
-    pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, crate::ipc::IpcToolRiskInfo)> {
+    pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, ToolRisk)> {
         let snapshot = self.cache.load();
         let mut result = Vec::new();
         for tool in snapshot.tools_all.iter() {
@@ -639,12 +582,10 @@ impl super::ToolRouter {
                 .tool_risk_inventory
                 .get(tool.name.as_ref())
                 .cloned()
-                .unwrap_or_else(|| {
-                    crate::ipc::IpcToolRiskInfo::from_annotations(
-                        None,
-                        tool.annotations.as_ref(),
-                        tool.annotations.as_ref(),
-                    )
+                .unwrap_or_else(|| ToolRisk {
+                    upstream_declared: None,
+                    plug_inferred: tool.annotations.clone(),
+                    effective: tool.annotations.clone(),
                 });
 
             result.push((server_id, tool.clone(), risk));

@@ -112,7 +112,7 @@ pub(crate) async fn cmd_tool_disable(
         {
             tools
                 .into_iter()
-                .filter(|tool| tool.server_id != "__plug_internal__")
+                .filter(|tool| tool.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
                 .map(|tool| tool.name)
                 .collect()
         } else {

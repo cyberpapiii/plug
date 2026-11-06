@@ -193,11 +193,11 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
         let mut snapshot = (**router.cache.load()).clone();
         snapshot.tool_risk_inventory.insert(
             "git__commit".to_string(),
-            crate::ipc::IpcToolRiskInfo::from_annotations(
-                declared.map(hint).as_ref(),
-                None,
-                effective.map(hint).as_ref(),
-            ),
+            ToolRisk {
+                upstream_declared: declared.map(hint),
+                plug_inferred: None,
+                effective: effective.map(hint),
+            },
         );
         router.cache.store(Arc::new(snapshot));
         router
@@ -382,26 +382,6 @@ fn priority_sort_orders_correctly() {
         Arc::new(serde_json::Map::new()),
     );
     assert_eq!(priority_sort(&d, &a, &priority), std::cmp::Ordering::Less);
-}
-
-#[test]
-fn disabled_tool_patterns_support_exact_and_wildcard_matches() {
-    assert!(is_disabled_tool(
-        &["slack__search_messages".into()],
-        "Slack__search_messages"
-    ));
-    assert!(is_disabled_tool(
-        &["slack__*".into()],
-        "Slack__search_messages"
-    ));
-    assert!(is_disabled_tool(
-        &["*search*".into()],
-        "Slack__search_messages"
-    ));
-    assert!(!is_disabled_tool(
-        &["gmail__*".into()],
-        "Slack__search_messages"
-    ));
 }
 
 #[test]

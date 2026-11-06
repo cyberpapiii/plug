@@ -141,7 +141,9 @@ pub(crate) async fn cmd_tool_list(
                 plug_core::ipc::IpcResponse::Status { servers, .. } => Some(
                     servers
                         .into_iter()
-                        .filter(|server| server.server_id != "__plug_internal__")
+                        .filter(|server| {
+                            server.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID
+                        })
                         .collect::<Vec<_>>(),
                 ),
                 _ => None,
@@ -163,7 +165,7 @@ pub(crate) async fn cmd_tool_list(
                 plug_core::ipc::IpcResponse::Tools { tools } => Some(
                     tools
                         .into_iter()
-                        .filter(|tool| tool.server_id != "__plug_internal__")
+                        .filter(|tool| tool.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
                         .collect::<Vec<_>>(),
                 ),
                 _ => None,

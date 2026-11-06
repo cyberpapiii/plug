@@ -41,6 +41,7 @@ pub mod slack_events;
 pub mod tasks;
 pub mod tls;
 pub mod tool_naming;
+pub mod tool_patterns;
 pub mod transport;
 pub mod types;
 pub mod watcher;

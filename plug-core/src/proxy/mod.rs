@@ -24,11 +24,12 @@ use crate::branding;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
-use crate::engine::{Engine, next_call_id};
+use crate::engine::Engine;
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
+use crate::tool_patterns::is_disabled_tool;
 use crate::types::{
     ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
     ResolvedLazyToolPolicy, ServerHealth,
@@ -86,8 +87,17 @@ pub(crate) struct RouterSnapshot {
     pub prompt_routes: HashMap<String, (String, String)>,
     /// Fingerprints for routed tool definitions to detect material drift.
     pub tool_definition_fingerprints: HashMap<String, u64>,
-    /// Tool name -> operator-only risk metadata preserving upstream-vs-Plug annotation provenance.
-    pub tool_risk_inventory: HashMap<String, crate::ipc::IpcToolRiskInfo>,
+    /// Tool name -> where its risk annotations came from.
+    pub tool_risk_inventory: HashMap<String, ToolRisk>,
+}
+
+/// A tool's annotations as its server declared them, as Plug inferred them
+/// from the tool, and as Plug lists them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolRisk {
+    pub upstream_declared: Option<ToolAnnotations>,
+    pub plug_inferred: Option<ToolAnnotations>,
+    pub effective: Option<ToolAnnotations>,
 }
 
 impl RouterSnapshot {
@@ -98,7 +108,7 @@ impl RouterSnapshot {
     fn safe_to_repeat(&self, name: &str) -> bool {
         self.tool_risk_inventory
             .get(name)
-            .and_then(|risk| risk.upstream_declared.read_only)
+            .and_then(|risk| risk.upstream_declared.as_ref()?.read_only_hint)
             .unwrap_or(false)
     }
 
@@ -750,7 +760,6 @@ impl DownstreamCallContext {
         crate::protocol::decide_method(
             &crate::protocol::CapabilityPolicyInput {
                 era: self.protocol_era,
-                transport: self.transport,
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
@@ -774,7 +783,6 @@ impl DownstreamCallContext {
         match crate::protocol::decide_method(
             &crate::protocol::CapabilityPolicyInput {
                 era: self.protocol_era,
-                transport: self.transport,
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
@@ -827,6 +835,13 @@ fn stable_instance_uuid(namespace: &str, value: &str) -> Uuid {
     namespace.hash(&mut second);
     0x706c_7567_u32.hash(&mut second);
     Uuid::from_u128(((first.finish() as u128) << 64) | second.finish() as u128)
+}
+
+/// Correlates a call's ToolCallStarted and ToolCallCompleted events.
+static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_call_id() -> u64 {
+    NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -1220,7 +1235,7 @@ impl ToolRouter {
         };
         // Plug's own tools are how a client finds the rest. What they hand
         // back is filtered for the client, so no list keeps them from it.
-        if server_id == "__plug_internal__" {
+        if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
             return true;
         }
         !access.keeps_from(
@@ -1239,7 +1254,7 @@ impl ToolRouter {
             .routes
             .get(listed)
             .or_else(|| cache.routes_lower.get(&listed.to_ascii_lowercase()))
-            .filter(|(server, _)| server != "__plug_internal__")
+            .filter(|(server, _)| server != crate::tool_naming::INTERNAL_SERVER_ID)
             .cloned()
     }
 
@@ -2692,11 +2707,11 @@ impl ToolRouter {
 
             tool_risk_inventory.insert(
                 prefixed_name.clone(),
-                crate::ipc::IpcToolRiskInfo::from_annotations(
-                    upstream_annotations.as_ref(),
-                    inferred_annotations.as_ref(),
-                    prefixed_tool.annotations.as_ref(),
-                ),
+                ToolRisk {
+                    upstream_declared: upstream_annotations.clone(),
+                    plug_inferred: inferred_annotations.clone(),
+                    effective: prefixed_tool.annotations.clone(),
+                },
             );
             tools.push(prefixed_tool);
         }
@@ -2711,15 +2726,18 @@ impl ToolRouter {
             let meta_tool = build_search_tools_meta_tool();
             routes.insert(
                 meta_tool.name.to_string(),
-                ("__plug_internal__".to_string(), meta_tool.name.to_string()),
+                (
+                    crate::tool_naming::INTERNAL_SERVER_ID.to_string(),
+                    meta_tool.name.to_string(),
+                ),
             );
             tool_risk_inventory.insert(
                 meta_tool.name.to_string(),
-                crate::ipc::IpcToolRiskInfo::from_annotations(
-                    None,
-                    meta_tool.annotations.as_ref(),
-                    meta_tool.annotations.as_ref(),
-                ),
+                ToolRisk {
+                    upstream_declared: None,
+                    plug_inferred: meta_tool.annotations.clone(),
+                    effective: meta_tool.annotations.clone(),
+                },
             );
             // Insert at position 0 so it's always visible
             tools.insert(0, meta_tool);
@@ -3991,7 +4009,9 @@ impl ToolRouter {
         let snapshot = self.cache.load();
         let mut tool_counts: HashMap<&str, usize> = HashMap::new();
         for (tool_name, (server_id, _)) in snapshot.routes.iter() {
-            if server_id != "__plug_internal__" && self.client_may_use_tool(client_key, tool_name) {
+            if server_id != crate::tool_naming::INTERNAL_SERVER_ID
+                && self.client_may_use_tool(client_key, tool_name)
+            {
                 *tool_counts.entry(server_id.as_str()).or_insert(0) += 1;
             }
         }
@@ -4048,7 +4068,7 @@ impl ToolRouter {
             let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
                 continue;
             };
-            if server_id == "__plug_internal__" {
+            if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
                 continue;
             }
             if !self.client_may_use_tool(client_key, tool.name.as_ref()) {

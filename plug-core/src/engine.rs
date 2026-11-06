@@ -7,7 +7,7 @@
 //! return value types, never through direct field access.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arc_swap::ArcSwap;
@@ -29,14 +29,6 @@ const RECONNECT_RETRY_MAX_ATTEMPTS: u32 = 5;
 const RECONNECT_RETRY_MIN_DELAY: Duration = Duration::from_millis(100);
 const RECONNECT_RETRY_MAX_DELAY: Duration = Duration::from_secs(2);
 const ARTIFACT_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
-
-/// Monotonic counter for correlating ToolCallStarted/ToolCallCompleted events.
-static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Generate a unique call ID for tool call correlation.
-pub fn next_call_id() -> u64 {
-    NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
-}
 
 /// Holds the per-server start slot claimed by restart or reconnect.
 struct UpstreamStartGuard(Arc<AtomicBool>);
@@ -105,7 +97,7 @@ pub struct Engine {
     ready: watch::Sender<bool>,
     /// Completed config reloads, so tests can wait for one without a bus.
     #[cfg(test)]
-    reloads_applied: AtomicU64,
+    reloads_applied: std::sync::atomic::AtomicU64,
 }
 
 impl Engine {
@@ -137,7 +129,7 @@ impl Engine {
             watch_events: std::sync::OnceLock::new(),
             ready: watch::channel(false).0,
             #[cfg(test)]
-            reloads_applied: AtomicU64::new(0),
+            reloads_applied: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -1804,15 +1796,6 @@ mod tests {
         let snapshot = engine.snapshot();
         assert!(snapshot.servers.is_empty());
         assert_eq!(snapshot.tool_count, 0);
-    }
-
-    #[test]
-    fn call_id_monotonic() {
-        let a = next_call_id();
-        let b = next_call_id();
-        let c = next_call_id();
-        assert!(b > a);
-        assert!(c > b);
     }
 
     #[tokio::test]

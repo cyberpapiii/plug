@@ -165,25 +165,13 @@ impl ProtocolNotification {
     }
 }
 
-/// Transport-independent notification fan-out decision logic.
+/// Which connected clients a notification is for.
 ///
-/// By the time a `ProtocolNotification` reaches a downstream transport's
-/// fan-out loop (via [`crate::proxy::ToolRouter::subscribe_notifications`] /
-/// `subscribe_logging`), target resolution against the progress-token and
-/// subscription registries has ALREADY happened at publish time (see
-/// `ToolRouter::publish_protocol_notification` and its callers). What
-/// remains — and what was previously re-implemented three times, once per
-/// transport (stdio in `plug-core/src/proxy/handler.rs`, HTTP in
-/// `plug-core/src/http/server.rs`, daemon IPC in `plug/src/daemon.rs`) — is
-/// strictly simpler: decide whether a given notification is meant for
-/// *every* connected client on a transport, or only for the single client
-/// identified by an embedded [`NotificationTarget`].
-///
-/// This module intentionally stays free of any transport type (no axum, no
-/// SSE, no IPC frames, no stdio `Peer`) so both `plug-core` (stdio, HTTP) and
-/// `plug` (daemon IPC) can share it. Each transport keeps its own delivery
-/// code (which wire method to call, how to serialize the payload) — see the
-/// "Maintenance notes" in `plans/015-notification-fanout-dedup-claude-fable.md`.
+/// Targets are resolved when a notification is published, so a transport's
+/// fan-out loop only has to tell a notification meant for every client on it
+/// from one meant for the single client an embedded [`NotificationTarget`]
+/// names. The module holds no transport type, so `plug-core` and `plug` share
+/// it; each transport keeps its own delivery code.
 pub mod fanout {
     use super::{NotificationTarget, ProtocolNotification};
 

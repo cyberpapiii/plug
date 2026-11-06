@@ -854,7 +854,7 @@ fn runtime_health_checks(
     let mut degraded_servers = Vec::new();
     for server in servers
         .iter()
-        .filter(|s| s.server_id != "__plug_internal__")
+        .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
     {
         match server.health {
             plug_core::types::ServerHealth::Healthy => counts.healthy += 1,
