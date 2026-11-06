@@ -18,6 +18,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A `[lazy_tools.clients]` entry may name a client by any of its aliases. An entry naming no known client is ignored; it used to stop the config from loading.
 - `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
 - `plug link` and `plug unlink` answer `--output json` with the clients they changed.
+- `plug repair --output json` says `repair_needed`: whether a link still does not run Plug.app's command. The app reads that instead of judging each link itself.
 - The import sheet in the app names each client the way `plug import` does, such as "VS Code Copilot" and "RooCode".
 - `daemon_grace_period_secs` is gone: Plug.app keeps the daemon running, so it never shuts itself down when idle. A config that still sets it loads and the key is ignored.
 - `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.

@@ -41,6 +41,23 @@ pub struct ClientRepairItem {
 pub struct ClientRepairReport {
     pub canonical_command: PathBuf,
     pub items: Vec<ClientRepairItem>,
+    /// A link still needs repair: one that does not run the canonical
+    /// command and was not changed. The app reads this rather than judging
+    /// the dispositions itself.
+    pub repair_needed: bool,
+}
+
+impl ClientRepairReport {
+    pub fn new(canonical_command: PathBuf, items: Vec<ClientRepairItem>) -> Self {
+        let repair_needed = items
+            .iter()
+            .any(|item| !item.changed && item.disposition.needs_repair());
+        Self {
+            canonical_command,
+            items,
+            repair_needed,
+        }
+    }
 }
 
 /// Everything doctor learned about who owns the install. The app reads it
@@ -294,7 +311,7 @@ pub(crate) async fn cmd_doctor(
     Ok(report.exit_code)
 }
 
-fn doctor_json_value(
+pub(crate) fn doctor_json_value(
     report: &plug_core::doctor::DoctorReport,
     snapshot: &UnifiedInstallSnapshot,
 ) -> serde_json::Value {
@@ -1431,16 +1448,16 @@ mod tests {
             serde_json::json!({"preserved": true})
         );
 
-        let repair = ClientRepairReport {
-            canonical_command: app.executable_path.clone(),
-            items: vec![ClientRepairItem {
+        let repair = ClientRepairReport::new(
+            app.executable_path.clone(),
+            vec![ClientRepairItem {
                 target: "cursor".to_string(),
                 path: std::path::PathBuf::from("/tmp/unknown.json"),
                 disposition,
                 changed: false,
                 message: "Unknown command was left untouched.".to_string(),
             }],
-        };
+        );
         assert_eq!(
             serde_json::to_value(&repair).unwrap(),
             serde_json::json!({
@@ -1451,7 +1468,8 @@ mod tests {
                     "disposition": "unknown_command",
                     "changed": false,
                     "message": "Unknown command was left untouched."
-                }]
+                }],
+                "repair_needed": true
             })
         );
 

@@ -9,36 +9,12 @@ final class CheckupTests: XCTestCase {
         try JSONDecoder().decode(Checkup.self, from: Data(json.utf8))
     }
 
-    func testReadsTheCheckupTheRuntimePrints() throws {
-        let result = try checkup(
-            """
-            {"checks":[
-              {"name":"config_exists","status":"Pass","message":"Config file valid","fix_suggestion":null},
-              {"name":"client_limits","status":"Warn","message":"Too many tools","fix_suggestion":"Filter some"}
-            ],"exit_code":2}
-            """
-        )
-        XCTAssertEqual(result.checks.count, 2)
-        XCTAssertEqual(result.checks[0].result, .pass)
-        XCTAssertEqual(result.checks[1].result, .warn)
-        XCTAssertEqual(result.checks[1].fix, "Filter some")
-    }
-
     func testAnUnknownStatusCountsAsAProblemRatherThanAPass() throws {
-        let result = try checkup(#"{"checks":[{"name":"port_available","status":"Fail","message":"Port busy"}]}"#)
+        let result = try checkup(
+            #"{"checks":[{"name":"port_available","title":"Network port","status":"Skipped","message":"Port busy","fix_suggestion":null}]}"#
+        )
         XCTAssertEqual(result.checks[0].result, .fail)
         XCTAssertNil(result.checks[0].fix)
-    }
-
-    func testARowShowsTheTitleTheRuntimeSends() throws {
-        let result = try checkup(#"""
-        {"checks":[
-          {"name":"config_permissions","title":"Settings file is private","status":"pass","message":""},
-          {"name":"brand_new_check","status":"pass","message":""}
-        ]}
-        """#)
-        XCTAssertEqual(result.checks[0].title, "Settings file is private")
-        XCTAssertEqual(result.checks[1].title, "brand new check")
     }
 
     func testACleanCheckupSaysHowMuchWasChecked() {

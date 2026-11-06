@@ -8,7 +8,7 @@ final class ClientRepairServiceTests: XCTestCase {
     )
 
     func testInspectReportsDriftFromReadOnlyRepairContract() async throws {
-        let runner = StubProcessRunner(result: .report(dispositions: ["recognized_legacy"]))
+        let runner = StubProcessRunner(result: try .golden("repair_needed.json"))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
@@ -20,7 +20,7 @@ final class ClientRepairServiceTests: XCTestCase {
     }
 
     func testInspectReportsNoDriftFromRepairContract() async throws {
-        let runner = StubProcessRunner(result: .report(dispositions: ["canonical", "http", "missing"]))
+        let runner = StubProcessRunner(result: try .golden("repair_clean.json"))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
@@ -30,8 +30,8 @@ final class ClientRepairServiceTests: XCTestCase {
         XCTAssertEqual(calls.map(\.arguments), [["repair", "--all", "--dry-run", "--output", "json"]])
     }
 
-    func testInspectRejectsNonzeroRepairStatus() async {
-        let runner = StubProcessRunner(result: .report(dispositions: ["canonical"], status: 1))
+    func testInspectRejectsNonzeroRepairStatus() async throws {
+        let runner = StubProcessRunner(result: try .golden("repair_clean.json", status: 1))
         let service = ClientRepairService(runner: runner)
 
         do {
@@ -45,7 +45,7 @@ final class ClientRepairServiceTests: XCTestCase {
     }
 
     func testRepairAllInvokesVerifiedCanonicalExecutableAndDecodesStableReport() async throws {
-        let runner = StubProcessRunner(result: .report(changed: [true, false, false]))
+        let runner = StubProcessRunner(result: try .golden("repair_clean.json"))
         let service = ClientRepairService(runner: runner)
 
         try await service.repairAll(canonicalExecutable: canonicalExecutable)
@@ -76,6 +76,8 @@ final class ClientRepairServiceTests: XCTestCase {
             Data("not-json".utf8),
             Data(#"{"items":[{"changed":false}]}"#.utf8),
             Data(#"{"canonical_command":"/tmp/plug"}"#.utf8),
+            // A report without the CLI's verdict cannot say no repair is needed.
+            Data(#"{"canonical_command":"/tmp/plug","items":[]}"#.utf8),
         ]
 
         for fixture in fixtures {
@@ -91,33 +93,5 @@ final class ClientRepairServiceTests: XCTestCase {
                 XCTFail("Unexpected error: \(error)")
             }
         }
-    }
-
-    func testInspectFailsClosedForUnknownUnreadableAndFutureDispositions() async throws {
-        for disposition in ["unknown_command", "unreadable", "unrelated", "future_value"] {
-            let runner = StubProcessRunner(result: .report(dispositions: [disposition]))
-            let service = ClientRepairService(runner: runner)
-
-            let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
-            XCTAssertTrue(needsRepair)
-        }
-    }
-}
-
-private extension ProcessResult {
-    static func report(changed: [Bool]) -> ProcessResult {
-        let items = changed.enumerated().map { index, changed in
-            "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(changed ? "recognized_legacy" : "canonical")\",\"changed\":\(changed),\"message\":\"ok\"}"
-        }.joined(separator: ",")
-        let json = "{\"canonical_command\":\"/Applications/Plug.app/Contents/Resources/plug\",\"items\":[\(items)]}"
-        return ProcessResult(status: 0, stdout: Data(json.utf8), stderr: Data())
-    }
-
-    static func report(dispositions: [String], status: Int32 = 0) -> ProcessResult {
-        let items = dispositions.enumerated().map { index, disposition in
-            "{\"target\":\"client-\(index)\",\"path\":\"/tmp/client-\(index).json\",\"disposition\":\"\(disposition)\",\"changed\":false,\"message\":\"ok\"}"
-        }.joined(separator: ",")
-        let json = "{\"canonical_command\":\"/Applications/Plug.app/Contents/Resources/plug\",\"items\":[\(items)]}"
-        return ProcessResult(status: status, stdout: Data(json.utf8), stderr: Data())
     }
 }

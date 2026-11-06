@@ -66,7 +66,7 @@ fn configured_client_lazy_tool_text(client: &crate::commands::clients::ClientVie
     )
 }
 
-fn client_list_json(
+pub(crate) fn client_list_json(
     clients: &[crate::commands::clients::ClientView],
     live_sessions: &[crate::commands::clients::LiveSessionView],
     inventory: &crate::runtime::LiveInventoryMetadata,

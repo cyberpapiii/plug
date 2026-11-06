@@ -136,8 +136,9 @@ final class ToolCatalogTests: XCTestCase {
     }
 }
 
-/// The app list comes from `plug clients --output json`. These pin the shape
-/// that command actually prints, including the fields it omits.
+/// The app list comes from `plug clients --output json`; `CLIReportTests`
+/// reads what that command prints. These cover the fields a listing may
+/// leave out.
 final class LinkableAppTests: XCTestCase {
     private func decode(_ json: String) throws -> [LinkableApp] {
         struct Listing: Decodable { let clients: [LinkableApp] }
@@ -232,23 +233,6 @@ final class LinkableAppTests: XCTestCase {
             from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a","signedIn":false,"createdAt":1,"expiresAt":2}"#.utf8)
         )
         XCTAssertTrue(lapsed.needsSignIn)
-    }
-
-    func testDecodesTheListingTheCommandPrints() throws {
-        let apps = try decode(
-            """
-            {"clients":[{"target":"claude-desktop","name":"Claude Desktop","linked":true,
-            "detected":true,"live":true,"live_sessions":2,"linked_transport":"stdio"}]}
-            """
-        )
-        XCTAssertEqual(apps.count, 1)
-        XCTAssertEqual(apps[0].id, "claude-desktop")
-        XCTAssertEqual(apps[0].name, "Claude Desktop")
-        XCTAssertTrue(apps[0].linked)
-        XCTAssertTrue(apps[0].detected)
-        XCTAssertTrue(apps[0].live)
-        XCTAssertEqual(apps[0].sessions, 2)
-        XCTAssertEqual(apps[0].transport, "stdio")
     }
 
     func testAnAppWithOnlyATargetStillDecodes() throws {

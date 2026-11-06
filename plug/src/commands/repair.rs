@@ -110,10 +110,7 @@ pub(crate) fn cmd_repair(
             item
         })
         .collect();
-    let report = ClientRepairReport {
-        canonical_command,
-        items,
-    };
+    let report = ClientRepairReport::new(canonical_command, items);
 
     match output {
         OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
@@ -154,18 +151,16 @@ mod tests {
 
     #[test]
     fn repair_text_reports_attention_without_a_success_summary() {
-        let report = ClientRepairReport {
-            canonical_command: std::path::PathBuf::from(
-                "/Applications/Plug.app/Contents/Resources/plug",
-            ),
-            items: vec![ClientRepairItem {
+        let report = ClientRepairReport::new(
+            std::path::PathBuf::from("/Applications/Plug.app/Contents/Resources/plug"),
+            vec![ClientRepairItem {
                 target: "cursor".to_string(),
                 path: std::path::PathBuf::from("/tmp/cursor.json"),
                 disposition: PlugLinkDisposition::UnknownCommand,
                 changed: false,
                 message: "Plug command is not recognized; left unchanged.".to_string(),
             }],
-        };
+        );
         assert_eq!(
             repair_attention_messages(&report),
             vec!["cursor: Plug command is not recognized; left unchanged.".to_string()]

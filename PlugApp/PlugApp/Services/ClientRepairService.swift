@@ -36,8 +36,7 @@ struct ClientRepairService: ClientRepairing {
         }
 
         do {
-            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
-                .repairNeeded
+            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout).repairNeeded
         } catch {
             throw ClientRepairError.malformedOutput
         }
@@ -70,16 +69,12 @@ struct ClientRepairService: ClientRepairing {
     }
 }
 
+/// The CLI's own verdict on its report, so the rule for which links need
+/// repair lives only in `PlugLinkDisposition::needs_repair`.
 private struct ParsedRepairReport: Decodable {
-    struct Item: Decodable {
-        let disposition: String
-    }
+    let repairNeeded: Bool
 
-    let items: [Item]
-
-    var repairNeeded: Bool {
-        items.contains { item in
-            !["canonical", "http", "missing"].contains(item.disposition)
-        }
+    private enum CodingKeys: String, CodingKey {
+        case repairNeeded = "repair_needed"
     }
 }
