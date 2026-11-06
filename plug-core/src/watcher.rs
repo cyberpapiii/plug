@@ -63,12 +63,17 @@ async fn run_watcher(
     let mut debouncer = new_debouncer(
         Duration::from_millis(DEBOUNCE_MS),
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
-            if let Ok(events) = result {
-                for event in events {
-                    if event.kind == DebouncedEventKind::Any {
-                        // Non-blocking send — if channel is full, skip
-                        let _ = tx.try_send(event.path);
-                    }
+            let events = match result {
+                Ok(events) => events,
+                Err(error) => {
+                    tracing::warn!(%error, "config file watcher error; a change may be missed");
+                    return;
+                }
+            };
+            for event in events {
+                // A full channel already holds a change to reload for.
+                if event.kind == DebouncedEventKind::Any {
+                    let _ = tx.try_send(event.path);
                 }
             }
         },
