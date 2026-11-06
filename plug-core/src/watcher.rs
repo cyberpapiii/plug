@@ -14,7 +14,6 @@ use tokio_util::sync::CancellationToken;
 use crate::config;
 use crate::engine::Engine;
 
-/// Debounce interval for config file changes.
 const DEBOUNCE_MS: u64 = 500;
 
 /// Spawn a background task that watches `config.toml` for changes.

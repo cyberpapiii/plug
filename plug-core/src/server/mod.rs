@@ -784,10 +784,10 @@ pub struct UpstreamServer {
     /// Protocol era and version selected by this live connection.
     pub protocol_era: crate::protocol::ProtocolEra,
     pub selected_protocol_version: String,
-    /// Exact global protocol-gate generation/value used when this connection
-    /// began. Commit validation uses it to reject a connection made stale by
-    /// a concurrent live gate flip.
-    pub(crate) protocol_gate_state: u64,
+    /// The modern-upstream gate when this connection began. Commit
+    /// validation uses it to reject a connection made stale by a concurrent
+    /// gate flip.
+    pub(crate) protocol_gate: ProtocolGate,
     /// Monotonic identity of this concrete connection. Unlike an `Arc`
     /// address, this cannot be recycled after a reconnect and is stable for
     /// every clone of the published connection. Read it with
@@ -800,6 +800,56 @@ pub struct UpstreamServer {
     pub(crate) child_pid: Option<u32>,
     /// What a stdio server has written to stderr recently.
     pub(crate) stderr_tail: Option<Arc<StderrTail>>,
+}
+
+/// The modern-upstream gate as one connection saw it: whether it was on, and
+/// which flip of it this is. Two readings are equal only if the gate did not
+/// flip between them, so a connection can tell it was made under a gate that
+/// has since changed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ProtocolGate(u64);
+
+impl ProtocolGate {
+    /// Bit 0 is the gate; the bits above count its flips.
+    pub(crate) fn enabled(self) -> bool {
+        self.0 & 1 == 1
+    }
+
+    fn flipped(self) -> Self {
+        Self(self.0.wrapping_add(2) ^ 1)
+    }
+}
+
+#[cfg(test)]
+impl UpstreamServer {
+    /// A connected upstream with the test defaults: a placeholder stdio
+    /// config, no capabilities, the legacy protocol and a fresh connection.
+    /// Tests set other fields with struct update syntax.
+    pub(crate) fn for_tests(
+        name: String,
+        client: McpClient,
+        tools: Arc<ArcSwap<Vec<rmcp::model::Tool>>>,
+    ) -> Self {
+        Self {
+            name,
+            config: ServerConfig {
+                command: Some("fake".to_string()),
+                call_timeout_secs: 30,
+                circuit_breaker_enabled: false,
+                ..Default::default()
+            },
+            client,
+            tools,
+            capabilities: ServerCapabilities::default(),
+            upstream: None,
+            protocol_era: crate::protocol::ProtocolEra::Legacy,
+            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
+            protocol_gate: ProtocolGate::default(),
+            connection: ConnectionGeneration::new(),
+            child_pid: None,
+            stderr_tail: None,
+        }
+    }
 }
 
 impl UpstreamServer {
@@ -1009,7 +1059,8 @@ pub struct ServerManager {
     /// unaffected.
     shutdown_signal: tokio::sync::watch::Sender<bool>,
     /// Live, reloadable safety gate for modern upstream negotiation.
-    modern_upstream_gate_state: AtomicU64,
+    /// A [`ProtocolGate`], stored as its bits.
+    modern_upstream_gate: AtomicU64,
     /// Wakes every health task and every waiting recovery at once. Signalled
     /// when a server's process stops and when the Mac wakes or its network
     /// changes, the moments a wait until the next tick is wasted time.
@@ -1091,32 +1142,30 @@ impl ServerManager {
             replacement_grace: REPLACEMENT_GRACE,
             shutdown_signal,
             check_now: Arc::new(tokio::sync::Notify::new()),
-            modern_upstream_gate_state: AtomicU64::new(0),
+            modern_upstream_gate: AtomicU64::new(ProtocolGate::default().0),
         }
     }
 
     pub fn set_modern_upstream_enabled(&self, enabled: bool) {
-        let enabled_bit = u64::from(enabled);
-        let mut current = self.modern_upstream_gate_state.load(Ordering::Acquire);
+        let mut current = self.protocol_gate();
         loop {
-            if current & 1 == enabled_bit {
+            if current.enabled() == enabled {
                 return;
             }
-            let next = current.wrapping_add(2) ^ 1;
-            match self.modern_upstream_gate_state.compare_exchange_weak(
-                current,
-                next,
+            match self.modern_upstream_gate.compare_exchange_weak(
+                current.0,
+                current.flipped().0,
                 Ordering::AcqRel,
                 Ordering::Acquire,
             ) {
                 Ok(_) => return,
-                Err(observed) => current = observed,
+                Err(observed) => current = ProtocolGate(observed),
             }
         }
     }
 
-    pub(crate) fn modern_upstream_gate_state(&self) -> u64 {
-        self.modern_upstream_gate_state.load(Ordering::Acquire)
+    pub(crate) fn protocol_gate(&self) -> ProtocolGate {
+        ProtocolGate(self.modern_upstream_gate.load(Ordering::Acquire))
     }
 
     /// Record the outcome and latency of a tool call to an upstream. Read-side
@@ -1333,11 +1382,10 @@ impl ServerManager {
             let name_clone = name.clone();
             let sc = server_config.clone();
             let reporting = self.reporting();
-            let modern_upstream_gate_state = self.modern_upstream_gate_state();
+            let protocol_gate = self.protocol_gate();
             join_set.spawn(async move {
                 let _permit = permits.acquire_owned().await;
-                let result =
-                    Self::connect(&name_clone, &sc, reporting, modern_upstream_gate_state).await;
+                let result = Self::connect(&name_clone, &sc, reporting, protocol_gate).await;
                 (name_clone, result)
             });
         }
@@ -1374,24 +1422,12 @@ impl ServerManager {
         tracing::info!(started = servers.len(), "server startup complete");
     }
 
-    /// Spawn and initialize a single upstream server.
     pub async fn start_server(
         &self,
         name: &str,
         config: &ServerConfig,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        self.start_server_with_protocol_gate_state(name, config, self.modern_upstream_gate_state())
-            .await
-    }
-
-    pub(crate) async fn start_server_with_protocol_gate_state(
-        &self,
-        name: &str,
-        config: &ServerConfig,
-        modern_upstream_gate_state: u64,
-    ) -> Result<UpstreamServer, anyhow::Error> {
-        let result =
-            Self::connect(name, config, self.reporting(), modern_upstream_gate_state).await;
+        let result = Self::connect(name, config, self.reporting(), self.protocol_gate()).await;
         if let Err(error) = &result {
             self.record_error(name, config, error);
         }
@@ -1415,7 +1451,7 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
         reporting: Reporting,
-        modern_upstream_gate_state: u64,
+        protocol_gate: ProtocolGate,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let stores = crate::secrets::Stores::current();
         // A store that is a command finds its tool on the PATH a terminal
@@ -1426,8 +1462,7 @@ impl ServerManager {
             None
         };
         let resolved = stores.resolve_server(config, path).await?;
-        let result =
-            Self::start_resolved(name, &resolved, reporting, modern_upstream_gate_state).await;
+        let result = Self::start_resolved(name, &resolved, reporting, protocol_gate).await;
         if matches!(resolved, std::borrow::Cow::Borrowed(_)) {
             return result;
         }
@@ -1457,7 +1492,7 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
         reporting: Reporting,
-        modern_upstream_gate_state: u64,
+        protocol_gate: ProtocolGate,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let Reporting { events, check_now } = reporting;
         if name == "plug" {
@@ -1465,10 +1500,8 @@ impl ServerManager {
         }
 
         let timeout_duration = Duration::from_secs(config.timeout_secs);
-        let effective_protocol_mode = effective_upstream_protocol_mode(
-            config.protocol_mode,
-            modern_upstream_gate_state & 1 == 1,
-        );
+        let effective_protocol_mode =
+            effective_upstream_protocol_mode(config.protocol_mode, protocol_gate.enabled());
 
         // Set once a stdio server is spawned, so a start that fails or times
         // out afterwards can say what the server wrote to stderr.
@@ -1540,7 +1573,7 @@ impl ServerManager {
                         tools,
                         "stdio upstream",
                         effective_protocol_mode,
-                        modern_upstream_gate_state,
+                        protocol_gate,
                         ConnectionGeneration::new(),
                     )
                     .await
@@ -1607,7 +1640,7 @@ impl ServerManager {
                                 tools,
                                 "HTTP upstream",
                                 effective_protocol_mode,
-                                modern_upstream_gate_state,
+                                protocol_gate,
                                 connection,
                             )
                             .await
@@ -1631,7 +1664,7 @@ impl ServerManager {
                                     name,
                                     config,
                                     events,
-                                    modern_upstream_gate_state,
+                                    protocol_gate,
                                 )
                                 .await
                             } else {
@@ -1647,7 +1680,7 @@ impl ServerManager {
                             effective_protocol_mode
                         );
                     }
-                    Self::connect_sse_upstream(name, config, events, modern_upstream_gate_state)
+                    Self::connect_sse_upstream(name, config, events, protocol_gate)
                         .await
                 }
                 TransportType::OpenApi => {
@@ -1687,7 +1720,7 @@ impl ServerManager {
                         tools,
                         "OpenAPI upstream",
                         UpstreamProtocolMode::Legacy,
-                        modern_upstream_gate_state,
+                        protocol_gate,
                         ConnectionGeneration::new(),
                     )
                     .await
@@ -1722,12 +1755,11 @@ impl ServerManager {
         }
     }
 
-    /// Connect to a legacy SSE upstream server.
     async fn connect_sse_upstream(
         name: &str,
         config: &ServerConfig,
         events: Weak<dyn UpstreamEvents>,
-        modern_upstream_gate_state: u64,
+        protocol_gate: ProtocolGate,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let url = config
             .url
@@ -1781,7 +1813,7 @@ impl ServerManager {
             tools,
             "legacy SSE upstream",
             UpstreamProtocolMode::Legacy,
-            modern_upstream_gate_state,
+            protocol_gate,
             connection,
         )
         .await
@@ -1796,7 +1828,7 @@ impl ServerManager {
         tools: Arc<ArcSwap<Vec<Tool>>>,
         transport_label: &str,
         effective_protocol_mode: UpstreamProtocolMode,
-        modern_upstream_gate_state: u64,
+        protocol_gate: ProtocolGate,
         connection: ConnectionGeneration,
     ) -> Result<UpstreamServer, anyhow::Error> {
         let server_info = client.peer().peer_info();
@@ -1862,7 +1894,7 @@ impl ServerManager {
             upstream,
             protocol_era,
             selected_protocol_version,
-            protocol_gate_state: modern_upstream_gate_state,
+            protocol_gate,
             connection,
             child_pid: None,
             stderr_tail: None,
@@ -2015,7 +2047,6 @@ impl ServerManager {
             .collect()
     }
 
-    /// Get a reference to a specific upstream server by name.
     /// Returns an Arc clone for wait-free access — no lock held.
     pub fn get_upstream(&self, server_name: &str) -> Option<Arc<UpstreamServer>> {
         let servers = self.servers.load();
@@ -2029,13 +2060,9 @@ impl ServerManager {
             .and_then(|upstream| upstream.upstream.clone())
     }
 
-    /// Gracefully shutdown all upstream servers.
-    ///
-    /// Swaps in an empty map (serialized with `server_map_write_lock`, like every
-    /// other writer to `self.servers`), then attempts to take ownership of each
-    /// server via `Arc::try_unwrap` and cancel it cleanly. Falls back to retiring
-    /// via a shared handle if other references to the map still exist — retirement
-    /// and state clearing always run, so shutdown can never silently no-op.
+    /// Swaps in an empty map (serialized with `server_map_write_lock`, like
+    /// every other writer to `self.servers`), then retires every server that
+    /// was in it and clears its state.
     pub async fn shutdown_all(&self) {
         // Tell every pending grace-period retirement task (from replace_server)
         // to skip its sleep and retire now, then wait for them so no
@@ -2072,17 +2099,10 @@ impl ServerManager {
             self.servers.swap(Arc::new(HashMap::new()))
         };
 
-        let entries: Vec<(String, Arc<UpstreamServer>)> = match Arc::try_unwrap(old) {
-            Ok(map) => map.into_iter().collect(),
-            Err(arc) => {
-                tracing::warn!(
-                    "other references to server map exist; retiring entries via shared handles"
-                );
-                arc.iter()
-                    .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
-                    .collect()
-            }
-        };
+        // Owning the entries lets each retirement take its server whole; a map
+        // someone else still holds keeps its own references.
+        let entries: Vec<(String, Arc<UpstreamServer>)> =
+            Arc::unwrap_or_clone(old).into_iter().collect();
 
         if !entries.is_empty() {
             tracing::info!(count = entries.len(), "shutting down upstream servers");
@@ -2630,8 +2650,6 @@ mod tests {
         InitializedNotificationCompatHttpClient,
         ConnectionGeneration,
     ) {
-        // The wrapper builds a `reqwest::Client`, which panics without one.
-        crate::tls::ensure_rustls_provider_installed();
         let connection = ConnectionGeneration::new();
         let client = InitializedNotificationCompatHttpClient::new(
             Arc::from("watched"),
@@ -3414,7 +3432,20 @@ mod tests {
     }
 
     async fn make_connected_test_upstream(name: &str) -> UpstreamServer {
-        let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
+        connect_mutable_tool_upstream(name, vec![make_tool("echo")], no_events())
+            .await
+            .0
+    }
+
+    /// An upstream named `name` connected over a duplex pipe to a
+    /// [`MutableToolServer`] serving `tools`, reporting to `events`. The
+    /// server is returned so a test can change its tools.
+    async fn connect_mutable_tool_upstream(
+        name: &str,
+        tools: Vec<Tool>,
+        events: Weak<dyn UpstreamEvents>,
+    ) -> (UpstreamServer, MutableToolServer) {
+        let (upstream_server, tools_rx) = MutableToolServer::new(tools);
         let upstream_peer = Arc::clone(&upstream_server.peer);
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         tokio::spawn(async move {
@@ -3433,7 +3464,7 @@ mod tests {
         let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            no_events(),
+            events,
         ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
@@ -3442,20 +3473,10 @@ mod tests {
         let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
         tools.store(Arc::new(initial_tools));
 
-        UpstreamServer {
-            name: name.to_string(),
-            config: test_server_config(),
-            client,
-            tools,
-            capabilities: ServerCapabilities::default(),
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: ConnectionGeneration::new(),
-            child_pid: None,
-            stderr_tail: None,
-        }
+        (
+            UpstreamServer::for_tests(name.to_string(), client, tools),
+            upstream_server,
+        )
     }
 
     /// A stdio server that ignores stdin EOF (Figma keeps a WebSocket server
@@ -3497,18 +3518,8 @@ mod tests {
         ));
         let client: McpClient = rmcp::service::serve_directly(handler, transport, None);
         let upstream = UpstreamServer {
-            name: "eof-ignorer".to_string(),
-            config: test_server_config(),
-            client,
-            tools,
-            capabilities: ServerCapabilities::default(),
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: ConnectionGeneration::new(),
             child_pid,
-            stderr_tail: None,
+            ..UpstreamServer::for_tests("eof-ignorer".to_string(), client, tools)
         };
 
         let started = std::time::Instant::now();
@@ -3556,18 +3567,8 @@ mod tests {
 
         (
             UpstreamServer {
-                name: name.to_string(),
-                config: test_server_config(),
-                client,
-                tools,
                 capabilities,
-                upstream: None,
-                protocol_era: crate::protocol::ProtocolEra::Legacy,
-                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-                protocol_gate_state: 0,
-                connection: ConnectionGeneration::new(),
-                child_pid: None,
-                stderr_tail: None,
+                ..UpstreamServer::for_tests(name.to_string(), client, tools)
             },
             result_request_count,
         )
@@ -3717,8 +3718,7 @@ mod tests {
         mgr.insert_upstream("shared-shutdown".to_string(), Arc::new(upstream));
         mgr.record_call("shared-shutdown", true, 5);
 
-        // Hold a reference to the map Arc so `Arc::try_unwrap` inside
-        // `shutdown_all` fails, exercising the shared-handle fallback path.
+        // Something else still holds the old map while shutdown runs.
         let held_map = mgr.servers.load_full();
 
         mgr.shutdown_all().await;
@@ -3739,15 +3739,15 @@ mod tests {
 
         assert!(
             mgr.health.is_empty(),
-            "health must be cleared even on the shared-Arc fallback path"
+            "health must be cleared while the old map is held"
         );
         assert!(
             mgr.metrics.is_empty(),
-            "metrics must be cleared even on the shared-Arc fallback path"
+            "metrics must be cleared while the old map is held"
         );
         assert!(
             mgr.circuit_breakers.is_empty(),
-            "circuit breakers must be cleared even on the shared-Arc fallback path"
+            "circuit breakers must be cleared while the old map is held"
         );
     }
 
@@ -3792,56 +3792,11 @@ mod tests {
             ..ServerManager::new()
         };
 
-        let (upstream_server_a, tools_rx_a) = MutableToolServer::new(vec![make_tool("echo")]);
-        let upstream_peer_a = Arc::clone(&upstream_server_a.peer);
-        let (server_transport_a, client_transport_a) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let handler = MutableToolServerHandler {
-                tools_rx: tools_rx_a,
-                peer: upstream_peer_a,
-            };
-            let server = handler
-                .serve(server_transport_a)
-                .await
-                .expect("start upstream test server a");
-            let _ = server.waiting().await;
-        });
+        let (upstream_a, _upstream_server_a) =
+            connect_mutable_tool_upstream("replace-test", vec![make_tool("echo")], no_events())
+                .await;
 
-        let tools_a = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler_a = Arc::new(UpstreamClientHandler::new_for_tests(
-            Arc::from("replace-test"),
-            Arc::clone(&tools_a),
-            no_events(),
-        ));
-        let client_a: McpClient = upstream_handler_a
-            .serve(client_transport_a)
-            .await
-            .expect("connect upstream test client a");
-        let initial_tools_a = client_a
-            .peer()
-            .list_all_tools()
-            .await
-            .expect("initial tools a");
-        tools_a.store(Arc::new(initial_tools_a));
-
-        mgr.replace_server(
-            "replace-test",
-            UpstreamServer {
-                name: "replace-test".to_string(),
-                config: test_server_config(),
-                client: client_a,
-                tools: tools_a,
-                capabilities: ServerCapabilities::default(),
-                upstream: None,
-                protocol_era: crate::protocol::ProtocolEra::Legacy,
-                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-                protocol_gate_state: 0,
-                connection: ConnectionGeneration::new(),
-                child_pid: None,
-                stderr_tail: None,
-            },
-        )
-        .await;
+        mgr.replace_server("replace-test", upstream_a).await;
 
         let old_upstream = mgr.get_upstream("replace-test").expect("old upstream");
         assert!(
@@ -3849,56 +3804,11 @@ mod tests {
             "old upstream should start open"
         );
 
-        let (upstream_server_b, tools_rx_b) = MutableToolServer::new(vec![make_tool("echo")]);
-        let upstream_peer_b = Arc::clone(&upstream_server_b.peer);
-        let (server_transport_b, client_transport_b) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let handler = MutableToolServerHandler {
-                tools_rx: tools_rx_b,
-                peer: upstream_peer_b,
-            };
-            let server = handler
-                .serve(server_transport_b)
-                .await
-                .expect("start upstream test server b");
-            let _ = server.waiting().await;
-        });
+        let (upstream_b, _upstream_server_b) =
+            connect_mutable_tool_upstream("replace-test", vec![make_tool("echo")], no_events())
+                .await;
 
-        let tools_b = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler_b = Arc::new(UpstreamClientHandler::new_for_tests(
-            Arc::from("replace-test"),
-            Arc::clone(&tools_b),
-            no_events(),
-        ));
-        let client_b: McpClient = upstream_handler_b
-            .serve(client_transport_b)
-            .await
-            .expect("connect upstream test client b");
-        let initial_tools_b = client_b
-            .peer()
-            .list_all_tools()
-            .await
-            .expect("initial tools b");
-        tools_b.store(Arc::new(initial_tools_b));
-
-        mgr.replace_server(
-            "replace-test",
-            UpstreamServer {
-                name: "replace-test".to_string(),
-                config: test_server_config(),
-                client: client_b,
-                tools: tools_b,
-                capabilities: ServerCapabilities::default(),
-                upstream: None,
-                protocol_era: crate::protocol::ProtocolEra::Legacy,
-                selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-                protocol_gate_state: 0,
-                connection: ConnectionGeneration::new(),
-                child_pid: None,
-                stderr_tail: None,
-            },
-        )
-        .await;
+        mgr.replace_server("replace-test", upstream_b).await;
 
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -4131,55 +4041,14 @@ mod tests {
         let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
         let server_manager = Arc::clone(router.server_manager());
 
-        let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
-        let upstream_peer = Arc::clone(&upstream_server.peer);
-
-        let (server_transport, client_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let handler = MutableToolServerHandler {
-                tools_rx,
-                peer: upstream_peer,
-            };
-            let server = handler
-                .serve(server_transport)
-                .await
-                .expect("start upstream test server");
-            let _ = server.waiting().await;
-        });
-
-        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
-            Arc::from("upstream"),
-            Arc::clone(&tools),
+        let (upstream, upstream_server) = connect_mutable_tool_upstream(
+            "upstream",
+            vec![make_tool("echo")],
             Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
-        ));
-        let client: McpClient = upstream_handler
-            .serve(client_transport)
-            .await
-            .expect("connect upstream test client");
-        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
-        tools.store(Arc::new(initial_tools));
+        )
+        .await;
 
-        server_manager
-            .replace_server(
-                "upstream",
-                UpstreamServer {
-                    name: "upstream".to_string(),
-                    config: test_server_config(),
-                    client,
-                    tools,
-                    capabilities: ServerCapabilities::default(),
-                    upstream: None,
-                    protocol_era: crate::protocol::ProtocolEra::Legacy,
-                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
-                        .to_string(),
-                    protocol_gate_state: 0,
-                    connection: ConnectionGeneration::new(),
-                    child_pid: None,
-                    stderr_tail: None,
-                },
-            )
-            .await;
+        server_manager.replace_server("upstream", upstream).await;
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
@@ -4218,55 +4087,14 @@ mod tests {
         let router = crate::proxy::ToolRouter::linked(RouterConfig::default());
         let server_manager = Arc::clone(router.server_manager());
 
-        let (upstream_server, tools_rx) = MutableToolServer::new(vec![make_tool("echo")]);
-        let upstream_peer = Arc::clone(&upstream_server.peer);
-
-        let (server_transport, client_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let handler = MutableToolServerHandler {
-                tools_rx,
-                peer: upstream_peer,
-            };
-            let server = handler
-                .serve(server_transport)
-                .await
-                .expect("start upstream test server");
-            let _ = server.waiting().await;
-        });
-
-        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
-            Arc::from("upstream"),
-            Arc::clone(&tools),
+        let (upstream, upstream_server) = connect_mutable_tool_upstream(
+            "upstream",
+            vec![make_tool("echo")],
             Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
-        ));
-        let client: McpClient = upstream_handler
-            .serve(client_transport)
-            .await
-            .expect("connect upstream test client");
-        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
-        tools.store(Arc::new(initial_tools));
+        )
+        .await;
 
-        server_manager
-            .replace_server(
-                "upstream",
-                UpstreamServer {
-                    name: "upstream".to_string(),
-                    config: test_server_config(),
-                    client,
-                    tools,
-                    capabilities: ServerCapabilities::default(),
-                    upstream: None,
-                    protocol_era: crate::protocol::ProtocolEra::Legacy,
-                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
-                        .to_string(),
-                    protocol_gate_state: 0,
-                    connection: ConnectionGeneration::new(),
-                    child_pid: None,
-                    stderr_tail: None,
-                },
-            )
-            .await;
+        server_manager.replace_server("upstream", upstream).await;
         router.refresh_tools().await;
         assert_eq!(router.tool_count(), 1);
 
@@ -4519,56 +4347,14 @@ mod tests {
         let router = crate::proxy::ToolRouter::linked(config);
         let server_manager = Arc::clone(router.server_manager());
 
-        let (upstream_server, tools_rx) =
-            MutableToolServer::new(vec![make_tool_with_description("echo", "Echo input")]);
-        let upstream_peer = Arc::clone(&upstream_server.peer);
-
-        let (server_transport, client_transport) = tokio::io::duplex(4096);
-        tokio::spawn(async move {
-            let handler = MutableToolServerHandler {
-                tools_rx,
-                peer: upstream_peer,
-            };
-            let server = handler
-                .serve(server_transport)
-                .await
-                .expect("start upstream test server");
-            let _ = server.waiting().await;
-        });
-
-        let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
-            Arc::from("upstream"),
-            Arc::clone(&tools),
+        let (upstream, _upstream_server) = connect_mutable_tool_upstream(
+            "upstream",
+            vec![make_tool_with_description("echo", "Echo input")],
             Arc::downgrade(&router) as Weak<dyn UpstreamEvents>,
-        ));
-        let client: McpClient = upstream_handler
-            .serve(client_transport)
-            .await
-            .expect("connect upstream test client");
-        let initial_tools = client.peer().list_all_tools().await.expect("initial tools");
-        tools.store(Arc::new(initial_tools));
+        )
+        .await;
 
-        server_manager
-            .replace_server(
-                "upstream",
-                UpstreamServer {
-                    name: "upstream".to_string(),
-                    config: test_server_config(),
-                    client,
-                    tools,
-                    capabilities: ServerCapabilities::default(),
-                    upstream: None,
-                    protocol_era: crate::protocol::ProtocolEra::Legacy,
-                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
-                        .to_string(),
-                    protocol_gate_state: 0,
-                    connection: ConnectionGeneration::new(),
-                    child_pid: None,
-                    stderr_tail: None,
-                },
-            )
-            .await;
+        server_manager.replace_server("upstream", upstream).await;
         router.refresh_tools().await;
 
         let visible_tools = dispatch_tools_list(&router).await;
@@ -4652,21 +4438,7 @@ mod tests {
         server_manager
             .replace_server(
                 "upstream",
-                UpstreamServer {
-                    name: "upstream".to_string(),
-                    config: test_server_config(),
-                    client,
-                    tools,
-                    capabilities: ServerCapabilities::default(),
-                    upstream: None,
-                    protocol_era: crate::protocol::ProtocolEra::Legacy,
-                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
-                        .to_string(),
-                    protocol_gate_state: 0,
-                    connection: ConnectionGeneration::new(),
-                    child_pid: None,
-                    stderr_tail: None,
-                },
+                UpstreamServer::for_tests("upstream".to_string(), client, tools),
             )
             .await;
         router.refresh_tools().await;
@@ -4753,19 +4525,8 @@ mod tests {
             .replace_server(
                 "catalog",
                 UpstreamServer {
-                    name: "catalog".to_string(),
-                    config: test_server_config(),
-                    client,
-                    tools,
                     capabilities,
-                    upstream: None,
-                    protocol_era: crate::protocol::ProtocolEra::Legacy,
-                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
-                        .to_string(),
-                    protocol_gate_state: 0,
-                    connection: ConnectionGeneration::new(),
-                    child_pid: None,
-                    stderr_tail: None,
+                    ..UpstreamServer::for_tests("catalog".to_string(), client, tools)
                 },
             )
             .await;
@@ -4831,8 +4592,6 @@ mod tests {
             .expect("get prompt");
         assert_eq!(prompt.messages.len(), 1);
     }
-
-    // ── Legacy SSE test mock server ──────────────────────────────────────
 
     /// A legacy SSE upstream with a tool list, recording the `Mcp-*` headers
     /// of the last message it received.
@@ -4922,8 +4681,6 @@ mod tests {
             self.last_message_headers.lock().unwrap().clone()
         }
     }
-
-    // ── Legacy SSE integration tests ─────────────────────────────────────
 
     #[tokio::test]
     async fn explicit_sse_upstream_connects_and_routes_tool_calls() {
@@ -5145,19 +4902,12 @@ mod tests {
             .replace_server(
                 "logging",
                 UpstreamServer {
-                    name: "logging".to_string(),
-                    config: test_server_config(),
-                    client,
-                    tools: Arc::new(ArcSwap::from_pointee(Vec::new())),
                     capabilities,
-                    upstream: None,
-                    protocol_era: crate::protocol::ProtocolEra::Legacy,
-                    selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION
-                        .to_string(),
-                    protocol_gate_state: 0,
-                    connection: ConnectionGeneration::new(),
-                    child_pid: None,
-                    stderr_tail: None,
+                    ..UpstreamServer::for_tests(
+                        "logging".to_string(),
+                        client,
+                        Arc::new(ArcSwap::from_pointee(Vec::new())),
+                    )
                 },
             )
             .await;
@@ -5223,20 +4973,11 @@ mod tests {
         .serve(client_transport)
         .await
         .expect("connect upstream test client");
-        let upstream = Arc::new(UpstreamServer {
-            name: "silent".to_string(),
-            config: test_server_config(),
+        let upstream = Arc::new(UpstreamServer::for_tests(
+            "silent".to_string(),
             client,
             tools,
-            capabilities: ServerCapabilities::default(),
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: ConnectionGeneration::new(),
-            child_pid: None,
-            stderr_tail: None,
-        });
+        ));
 
         // The server never answers ping, so this request holds the upstream
         // until retirement cancels the connection.
@@ -5293,7 +5034,7 @@ mod tests {
             tools,
             "test upstream",
             UpstreamProtocolMode::Legacy,
-            0,
+            ProtocolGate::default(),
             ConnectionGeneration::new(),
         )
         .await

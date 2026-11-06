@@ -2806,18 +2806,8 @@ async fn connect_subscribable_upstream(
     capabilities.resources = Some(resources);
 
     UpstreamServer {
-        name: name.to_string(),
-        config: subscribable_test_server_config(),
-        client,
-        tools,
         capabilities,
-        upstream: None,
-        protocol_era: crate::protocol::ProtocolEra::Legacy,
-        selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-        protocol_gate_state: 0,
-        connection: crate::server::ConnectionGeneration::new(),
-        child_pid: None,
-        stderr_tail: None,
+        ..UpstreamServer::for_tests(name.to_string(), client, tools)
     }
 }
 
@@ -2845,27 +2835,9 @@ async fn connect_modern_tool_upstream(
         .await
         .expect("connect modern tool upstream test client");
     UpstreamServer {
-        name: name.to_string(),
-        config: subscribable_test_server_config(),
-        client,
-        tools,
-        capabilities: ServerCapabilities::default(),
-        upstream: None,
         protocol_era: crate::protocol::ProtocolEra::Modern,
         selected_protocol_version: crate::protocol::MODERN_PROTOCOL_VERSION.to_string(),
-        protocol_gate_state: 0,
-        connection: crate::server::ConnectionGeneration::new(),
-        child_pid: None,
-        stderr_tail: None,
-    }
-}
-
-fn subscribable_test_server_config() -> crate::config::ServerConfig {
-    crate::config::ServerConfig {
-        command: Some("fake".to_string()),
-        call_timeout_secs: 30,
-        circuit_breaker_enabled: false,
-        ..Default::default()
+        ..UpstreamServer::for_tests(name.to_string(), client, tools)
     }
 }
 

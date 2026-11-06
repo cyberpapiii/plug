@@ -279,7 +279,7 @@ impl Engine {
         let current = self.config.load();
         let gate_is_current = connected_with.protocol_mode
             == crate::config::UpstreamProtocolMode::Legacy
-            || upstream.protocol_gate_state == self.server_manager.modern_upstream_gate_state();
+            || upstream.protocol_gate == self.server_manager.protocol_gate();
         match current.servers.get(server_id) {
             Some(cfg)
                 if server_change(connected_with, cfg) != ServerChange::Restart
@@ -318,11 +318,7 @@ impl Engine {
         };
         let upstream = self
             .server_manager
-            .start_server_with_protocol_gate_state(
-                server_id,
-                server_config,
-                self.server_manager.modern_upstream_gate_state(),
-            )
+            .start_server(server_id, server_config)
             .await?;
         let outcome = self
             .commit_replacement(server_id, server_config, upstream)
@@ -1056,9 +1052,6 @@ fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {
 }
 
 /// Mark a server as `AuthRequired` and notify clients of the state change.
-///
-/// Used by `run_refresh_loop` when the token cannot be refreshed (revoked,
-/// missing refresh_token, etc.).
 async fn mark_auth_required(engine: &Engine, server_name: &str) {
     engine.server_manager().mark_auth_required(server_name);
     engine.tool_router().refresh_tools().await;
@@ -1076,10 +1069,6 @@ mod tests {
     use crate::config::{Config, TransportType};
     use std::sync::atomic::Ordering;
 
-    fn test_config() -> Config {
-        Config::default()
-    }
-
     fn oauth_mock_stdio_config() -> Config {
         let mut config = Config::default();
         config.servers.insert(
@@ -1094,8 +1083,8 @@ mod tests {
         config
     }
 
-    /// `tools` feeds `args`, which `server_change` compares;
-    /// `max_concurrent` is a field it omits.
+    /// `tools` feeds `args`, which needs a restart when it changes;
+    /// `max_concurrent` applies live.
     fn mock_stdio_server_config(tools: &str, max_concurrent: usize) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
             max_concurrent,
@@ -1431,7 +1420,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_rate_limit() {
-        let engine = Engine::new(test_config());
+        let engine = Engine::new(Config::default());
         let _ = engine.restart_server("test-server").await;
 
         let result = engine.restart_server("test-server").await;
@@ -1441,7 +1430,7 @@ mod tests {
 
     #[tokio::test]
     async fn engine_restart_unknown_server() {
-        let engine = Engine::new(test_config());
+        let engine = Engine::new(Config::default());
         let result = engine.restart_server("nonexistent").await;
         assert!(result.is_err());
         let err = result.unwrap_err().to_string();

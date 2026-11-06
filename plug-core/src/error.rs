@@ -23,11 +23,11 @@ impl ProtocolError {
     /// Returns the JSON-RPC error code for this error.
     pub fn code(&self) -> i64 {
         match self {
-            ProtocolError::ToolNotFound { .. } => -32601, // Method not found
-            ProtocolError::ServerUnavailable { .. } => -32603, // Internal error
-            ProtocolError::ServerBusy { .. } => -32603,   // Internal error
-            ProtocolError::Timeout { .. } => -32603,      // Internal error
-            ProtocolError::InvalidRequest { .. } => -32600, // Invalid request
+            ProtocolError::ToolNotFound { .. } => -32601,
+            ProtocolError::ServerUnavailable { .. } => -32603,
+            ProtocolError::ServerBusy { .. } => -32603,
+            ProtocolError::Timeout { .. } => -32603,
+            ProtocolError::InvalidRequest { .. } => -32600,
         }
     }
 }
