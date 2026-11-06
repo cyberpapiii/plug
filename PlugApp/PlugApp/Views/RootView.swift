@@ -242,7 +242,7 @@ struct RootView: View {
         let verdict = model.verdict
         return VStack(alignment: .leading, spacing: Metric.tight) {
             HStack(spacing: Metric.tight) {
-                PlugCharacter(mood: verdict.mood, mark: verdict.tone == .blocked ? StatusColor.stopped : StatusColor.needsYou)
+                PlugCharacter(mood: verdict.mood, mark: verdict.markColor)
                     .foregroundStyle(.tint)
                     .frame(width: 30, height: 30)
                 Text("Plug")

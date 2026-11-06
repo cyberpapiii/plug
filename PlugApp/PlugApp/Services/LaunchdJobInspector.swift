@@ -14,9 +14,14 @@ enum LaunchdJobInspectionError: Error, Equatable {
     case printFailed(label: String, status: Int32, detail: String)
 }
 
+/// Reads launchd the way `plug doctor` does (`plug/src/service.rs`): the
+/// labels from `launchctl print gui/<uid>`, then each job's own print. Both
+/// parsers are held to the samples in `testdata/launchd`.
 struct LaunchdJobInspector: LaunchdJobInspecting {
-    private static let daemonLabel = DaemonServiceManager.daemonLabel
+    private static let daemonLabel = PlugPaths.daemonLabel
     private static let appProgramIdentifier = PlugPaths.bundledBinary
+    /// What `managed_by` says of a job SMAppService registered for an app.
+    static let serviceManagement = "com.apple.xpc.ServiceManagement"
     private static let appArguments = [appProgramIdentifier] + PlugPaths.daemonArguments
 
     private let records: @Sendable () async throws -> [LaunchdJobRecord]
@@ -71,7 +76,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let launchctl = URL(fileURLWithPath: "/bin/launchctl")
         let listed = try await runner.run(
             executable: launchctl,
-            arguments: ["list"],
+            arguments: ["print", "gui/\(userID)"],
             timeout: .seconds(10)
         )
         guard listed.status == 0 else {
@@ -125,12 +130,26 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
     /// used named its job `com.plug.*`. Excluding that namespace leaves a few
     /// dozen labels to inspect instead of several hundred.
     static func parseLabels(_ output: String) -> [String] {
-        output.split(separator: "\n").compactMap { line in
+        domainLabels(output).filter { !$0.hasPrefix("com.apple.") }
+    }
+
+    /// Every label in the `services` block of a launchd domain's print: a
+    /// line of PID, last exit status and label.
+    static func domainLabels(_ output: String) -> [String] {
+        var inServices = false
+        var labels: [String] = []
+        for line in output.split(separator: "\n", omittingEmptySubsequences: false) {
+            guard inServices else {
+                inServices = line.trimmingCharacters(in: .whitespaces) == "services = {"
+                continue
+            }
+            if line == "\t}" || line == "}" { break }
             let fields = line.split(whereSeparator: \.isWhitespace)
-            guard fields.count >= 3, fields.last != "Label" else { return nil }
-            guard let label = fields.last.map(String.init) else { return nil }
-            return label.hasPrefix("com.apple.") ? nil : label
+            if fields.count >= 3, UInt32(fields[0]) != nil, let label = fields.last {
+                labels.append(String(label))
+            }
         }
+        return labels
     }
 
     static func parseRecord(label: String, output: String) -> LaunchdJobRecord {
@@ -138,6 +157,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         var programIdentifier: String?
         var parentIdentifier: String?
         var parentVersion: String?
+        var managedBy: String?
         var arguments: [String] = []
         var parsingArguments = false
         for line in output.split(separator: "\n") {
@@ -146,14 +166,16 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 if text == "}" {
                     parsingArguments = false
                 } else if !text.isEmpty {
-                    arguments.append(text)
+                    arguments.append(unquoted(text))
                 }
             } else if text == "arguments = {" {
                 parsingArguments = true
             } else if let value = value(after: "program identifier =", in: text) {
                 programIdentifier = value.components(separatedBy: " (mode:").first
             } else if let value = value(after: "program =", in: text) {
-                program = URL(fileURLWithPath: value).standardizedFileURL
+                program = URL(fileURLWithPath: unquoted(value)).standardizedFileURL
+            } else if let value = value(after: "managed_by =", in: text) {
+                managedBy = value
             } else if let value = value(after: "parent bundle identifier =", in: text) {
                 parentIdentifier = value
             } else if let value = value(after: "parent bundle version =", in: text) {
@@ -169,15 +191,20 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             parentBundleIdentifier: parentIdentifier,
             parentBundleVersion: parentVersion,
             programIdentifier: programIdentifier,
-            arguments: arguments
+            arguments: arguments,
+            managedBy: managedBy
         )
     }
 
+    /// The four facts `app_managed_launchd_evidence` in `plug/src/service.rs`
+    /// requires together: SMAppService registered it, for Plug.app, to run
+    /// the bundled binary as the daemon.
     private static func resolveAppManagedProgram(
         in record: LaunchdJobRecord,
         canonical: VerifiedAppInstallation
     ) -> LaunchdJobRecord {
         guard record.programURL == nil,
+              record.managedBy == serviceManagement,
               record.programIdentifier == appProgramIdentifier,
               record.arguments == appArguments,
               record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
@@ -198,8 +225,13 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             parentBundleIdentifier: record.parentBundleIdentifier,
             parentBundleVersion: record.parentBundleVersion,
             programIdentifier: record.programIdentifier,
-            arguments: record.arguments
+            arguments: record.arguments,
+            managedBy: record.managedBy
         )
+    }
+
+    private static func unquoted(_ text: String) -> String {
+        text.trimmingCharacters(in: CharacterSet(charactersIn: "\""))
     }
 
     private static func value(after prefix: String, in line: String) -> String? {

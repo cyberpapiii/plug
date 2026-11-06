@@ -14,18 +14,9 @@ struct ClientsView: View {
     @Environment(\.splitPane) private var pane
     @Environment(\.windowSeen) private var windowSeen
 
-    /// Keep rarely used legacy integrations out of the default inventory. If
-    /// one is still linked or live, it remains visible so status is never
-    /// hidden from the person who needs to act on it.
-    private static let secondaryTargets: Set<String> = ["roocode", "goose"]
-
     private var sessions: [LiveSession] { model.snapshot.liveSessions }
     private var allApps: [LinkableApp] {
-        model.actions.connectableApps.filter { app in
-            guard app.detected || app.linked || app.live else { return false }
-            let isSecondary = Self.secondaryTargets.contains(app.target.lowercased())
-            return !isSecondary || app.linked || app.live
-        }
+        model.actions.connectableApps.filter { $0.detected || $0.linked || $0.live }
     }
     /// Every app is placed against all sessions, then search narrows what
     /// shows, so a session never leaves its app's row because the app was
@@ -269,7 +260,9 @@ struct ClientsView: View {
             }
             .map { sessionEntry(id: $0.id, sessions: $0.sessions) }
         let represented = Set(allApps.filter { app in
-            ClientStatus.hasNetworkRepresentation(app, grantNames: model.snapshot.downstreamClients.map(\.clientName))
+            ClientStatus.hasNetworkRepresentation(
+                app, grantTargets: model.snapshot.downstreamClients.map(names.target(ofGrant:))
+            )
         }.map(\.target))
         let apps = roster.connected
             .filter { matches($0.app.name) || matches($0.app.target) }
@@ -280,12 +273,12 @@ struct ClientsView: View {
             .filter { !represented.contains($0.target) }
             .map { appEntry($0, sessions: []) }
         let granted = grants.map { grant in
-            let target = AppIcons.target(forClientType: grant.clientName)
+            let target = names.target(ofGrant: grant)
             var own = sessions.filter { $0.clientKey == grant.clientKey }
             // A uniquely identified grant can show its still-open local
             // sessions too. Multiple grants remain separate identities.
             if represented.contains(target), model.snapshot.downstreamClients.filter({
-                AppIcons.target(forClientType: $0.clientName) == target
+                names.target(ofGrant: $0) == target
             }).count == 1 {
                 own += sessions.filter { !Self.isRemote($0) && AppRoster.targets(of: $0).contains(target) }
             }
@@ -411,7 +404,7 @@ struct ClientsView: View {
             ),
             isLive: false,
             dimmed: false,
-            glyph: .app(target: call.callerTarget, name: call.callerIconName, appPath: nil),
+            glyph: .app(target: call.callerTarget, name: call.caller, appPath: nil),
             isBusy: false,
             switchLabel: "",
             isOn: nil,
@@ -435,12 +428,12 @@ struct ClientsView: View {
         let since = SignInFacts.day(grant.createdAt)
         // A client with a connection open is plainly signed in.
         let needsSignIn = grant.needsSignIn && sessions.isEmpty
-        let target = AppIcons.target(forClientType: names.picturedName(forGrant: grant))
+        let target = names.target(ofGrant: grant)
         let earlier = SignInFacts.earlier(
             than: grant, among: model.snapshot.downstreamClients, ownerNamed: owned != nil, answered: answered
         )
         return ClientEntry(
-            id: "grant:\(grant.clientId)",
+            id: ClientEntry.id(grant: grant.clientId),
             group: .network,
             place: ClientPlaces.place(owners: names.place(forKey: grant.clientKey), group: .network),
             name: name,
@@ -450,7 +443,7 @@ struct ClientsView: View {
             ),
             isLive: !sessions.isEmpty,
             dimmed: false,
-            glyph: .grant(name: names.picturedName(forGrant: grant)),
+            glyph: .grant(target: target, name: ClientIdentity.displayName(forTarget: target) ?? grant.clientName),
             isBusy: false,
             switchLabel: "Access",
             isOn: true,
@@ -494,7 +487,7 @@ struct ClientsView: View {
         let until = Date(timeIntervalSince1970: TimeInterval(grant.expiresAt))
             .formatted(date: .omitted, time: .shortened)
         return ClientEntry(
-            id: "grant:\(grant.clientId)",
+            id: ClientEntry.id(grant: grant.clientId),
             group: .unfinished,
             place: ClientEntry.Group.unfinished.rawValue,
             name: name,
@@ -502,7 +495,7 @@ struct ClientsView: View {
             status: ClientStatus(state: "Sign-in never finished", limit: nil),
             isLive: false,
             dimmed: true,
-            glyph: .grant(name: name),
+            glyph: .grant(target: names.target(ofGrant: grant), name: name),
             isBusy: false,
             switchLabel: "Access",
             isOn: nil,
@@ -531,7 +524,5 @@ struct ClientsView: View {
 
     private func displayName(_ session: LiveSession) -> String { names.displayName(session) }
 
-    /// The target whose icon a session shows: the client it reports, else the
-    /// client its link was written for.
     private func sessionTarget(_ session: LiveSession) -> String { names.target(of: session) }
 }

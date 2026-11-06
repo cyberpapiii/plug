@@ -27,20 +27,20 @@ struct ServicePowerToggle: View {
     }
 }
 
-/// Plug's top row, the same in the menu bar panel, the window and Settings:
-/// the character with how Plug is on its face, one line that says it, and
-/// the switch.
+/// Plug's top row in Settings: the character with how Plug is on its face,
+/// one line that says it, and the switch. The menu bar panel and the
+/// window's sidebar lay out their own, from the same parts.
 struct PlugHeadline: View {
     let model: AppModel
     let run: (PlugIntent) -> Void
-    var characterSize: CGFloat = 40
+    static let characterSize: CGFloat = 40
 
     var body: some View {
         let verdict = model.verdict
         HStack(spacing: Metric.panelGap) {
-            PlugCharacter(mood: verdict.mood, mark: verdict.tone == .blocked ? StatusColor.stopped : StatusColor.needsYou)
+            PlugCharacter(mood: verdict.mood, mark: verdict.markColor)
                 .foregroundStyle(.tint)
-                .frame(width: characterSize, height: characterSize)
+                .frame(width: Self.characterSize, height: Self.characterSize)
             Text(verdict.title)
                 .font(PanelType.title)
                 .lineLimit(2)
@@ -112,6 +112,12 @@ enum StatusColor {
     static let stopped = Color.red
     /// How strong the wash is behind a card that reports trouble.
     static let wash = 0.11
+}
+
+extension Verdict {
+    /// The colour of the mark beside Plug's character. The character itself
+    /// stays Plug blue.
+    var markColor: Color { tone == .blocked ? StatusColor.stopped : StatusColor.needsYou }
 }
 
 extension Verdict.Tone {

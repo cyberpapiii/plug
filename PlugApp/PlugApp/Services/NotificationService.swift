@@ -40,8 +40,11 @@ final class NotificationService {
         }
     }
 
-    init(sink: @escaping NotificationSink = NotificationService.enqueue) {
+    private let defaults: UserDefaults
+
+    init(sink: @escaping NotificationSink = NotificationService.enqueue, defaults: UserDefaults = .standard) {
         self.sink = sink
+        self.defaults = defaults
     }
 
     /// Registers the Sign In action and takes clicks. Runs at launch, so a
@@ -133,7 +136,7 @@ final class NotificationService {
     /// Notifications interrupt, so they remain off until the person explicitly
     /// asks for them in Settings.
     private var isEnabled: Bool {
-        UserDefaults.standard.object(forKey: NotificationService.preferenceKey) as? Bool ?? false
+        defaults.object(forKey: NotificationService.preferenceKey) as? Bool ?? false
     }
 
     static let preferenceKey = "notificationsEnabled"

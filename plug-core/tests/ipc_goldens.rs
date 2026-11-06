@@ -487,6 +487,8 @@ fn snapshot() -> OperatorSnapshot {
             }])
             .collect(),
         client_address: Some("https://plug.example.com/mcp".to_string()),
+        // Not the default, so the app is seen reading it.
+        prefix_delimiter: ".".to_string(),
     }
 }
 
@@ -737,6 +739,12 @@ fn the_goldens_are_what_the_daemon_writes() {
     check("requests.json", pretty(&requests()));
     check("responses.json", pretty(&responses()));
     check("chunked_response.json", pretty(&chunked_response()));
+    // What the daemon fills in for a field a server leaves out, which is how
+    // the app sends a setting the person did not set.
+    check(
+        "server_config_default.json",
+        pretty(&ServerConfig::default()),
+    );
 
     let mut files: Vec<String> = std::fs::read_dir(dir())
         .expect("testdata/ipc")
@@ -745,7 +753,12 @@ fn the_goldens_are_what_the_daemon_writes() {
     files.sort();
     assert_eq!(
         files,
-        ["chunked_response.json", "requests.json", "responses.json"],
+        [
+            "chunked_response.json",
+            "requests.json",
+            "responses.json",
+            "server_config_default.json"
+        ],
         "testdata/ipc holds a file nothing checks"
     );
 }

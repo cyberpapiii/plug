@@ -48,11 +48,12 @@ final class FrameCodecTests: XCTestCase {
         if accepted >= 0 { Darwin.close(accepted) }
     }
 
+    /// The server holds the connection open until the test ends, so only the
+    /// client's own timeout can end the call.
     func testHandshakeTimesOutWhenSocketAcceptsButNeverReplies() async throws {
         let server = try AcceptWithoutReplyServer()
         defer { server.stop() }
         let client = PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.7.0", requestTimeout: 0.15)
-        let started = ContinuousClock.now
 
         do {
             _ = try await client.connect()
@@ -62,10 +63,10 @@ final class FrameCodecTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
-
-        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
     }
 
+    /// The server never reads until the test ends, so the write can only end
+    /// by the client's own timeout.
     func testLargeRequestTimesOutWhenAcceptedSocketNeverReads() async throws {
         let server = try AcceptedNeverReadServer()
         defer { server.stop() }
@@ -77,7 +78,6 @@ final class FrameCodecTests: XCTestCase {
         let frame = try FrameCodec.encode(request, encoder: PlugIPCClient.makeEncoder())
         XCTAssertGreaterThan(frame.count, 3_000_000)
 
-        let started = ContinuousClock.now
         do {
             _ = try await client.request(request)
             XCTFail("Expected bounded IPC write timeout")
@@ -86,8 +86,6 @@ final class FrameCodecTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
-
-        XCTAssertLessThan(started.duration(to: .now), .milliseconds(500))
     }
 
     private func chunkFrames(_ payload: Data, pieceSize: Int) -> [Data] {
@@ -144,7 +142,7 @@ private final class AcceptWithoutReplyServer: @unchecked Sendable {
 
     func stop() {
         release.signal()
-        _ = finished.wait(timeout: .now() + 1)
+        _ = finished.wait(timeout: .now() + 10)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
     }
@@ -176,12 +174,12 @@ private final class AcceptedNeverReadServer: @unchecked Sendable {
 
             let requestSocket = Darwin.accept(listenerFD, nil, nil)
             if requestSocket >= 0 {
-                _ = release.wait(timeout: .now() + .milliseconds(750))
+                release.wait()
                 Darwin.close(requestSocket)
             }
             finished.signal()
         }
-        guard accepted.wait(timeout: .now() + 1) == .success else {
+        guard accepted.wait(timeout: .now() + 10) == .success else {
             Darwin.close(readinessClient)
             Darwin.close(listener)
             _ = finished.wait(timeout: .now() + 1)
@@ -192,7 +190,7 @@ private final class AcceptedNeverReadServer: @unchecked Sendable {
 
     func stop() {
         release.signal()
-        _ = finished.wait(timeout: .now() + 1)
+        _ = finished.wait(timeout: .now() + 10)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
     }

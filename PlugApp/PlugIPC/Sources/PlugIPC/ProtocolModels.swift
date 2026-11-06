@@ -116,8 +116,6 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     /// The client Plug takes this one for, by its link target: the one its
     /// link names, else the one its reported name is.
     public let target: String?
-    public var connectedSecs: UInt64
-    public var lastActivitySecs: UInt64?
 }
 
 public struct ClientHost: Codable, Equatable, Sendable {
@@ -348,11 +346,15 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public var events: [EventStatus]?
     /// The address a client Plug has no switch for is given to reach it.
     public var clientAddress: String?
+    /// What joins a server's prefix to a tool's name in the names clients
+    /// call: `Server__tool` by default, as the config sets it.
+    public var prefixDelimiter: String
 
+    /// Before the first read nothing is known, so no name is split.
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, toolCatalogRevision: 0, ownership: .unmanaged,
         configuredServers: [], servers: [], liveSessions: [],
-        upstreamAuth: [], downstreamClients: []
+        upstreamAuth: [], downstreamClients: [], prefixDelimiter: ""
     )
 }
 
@@ -361,14 +363,13 @@ public extension OperatorSnapshot {
     /// apart are equal unless something happened. Every count of seconds in
     /// it ticks on its own, and a reader that redraws on any difference
     /// would redraw on every read.
-    func steadied() -> OperatorSnapshot {
+    ///
+    /// A reader asks one thing of the daemon's first `startup` seconds:
+    /// whether they are over. So the uptime reads 0 until then and more
+    /// than `startup` after, rounded to the minute.
+    func steadied(startup: UInt64) -> OperatorSnapshot {
         var steady = self
-        // A reader asks one thing of the first minute: whether it is over.
-        steady.uptimeSecs = uptimeSecs > 60 ? max(61, uptimeSecs / 60 * 60) : 0
-        for index in steady.liveSessions.indices {
-            steady.liveSessions[index].connectedSecs = liveSessions[index].connectedSecs / 60 * 60
-            steady.liveSessions[index].lastActivitySecs = liveSessions[index].lastActivitySecs.map { $0 / 60 * 60 }
-        }
+        steady.uptimeSecs = uptimeSecs > startup ? max(startup + 1, uptimeSecs / 60 * 60) : 0
         for index in steady.upstreamAuth.indices {
             steady.upstreamAuth[index].tokenExpiresInSecs = upstreamAuth[index].tokenExpiresInSecs.map {
                 $0 >= 3_600 ? $0 / 3_600 * 3_600 : $0 / 60 * 60
@@ -492,24 +493,28 @@ public struct ToolInfo: Codable, Identifiable, Equatable, Sendable {
     }
 }
 
+/// A server as the config holds it. A setting the app has no field for is
+/// nil until the daemon sends it, and a nil one is left out of what the app
+/// sends, so the daemon's own default applies (`ServerConfig::default` in
+/// `plug-core/src/config`).
 public struct ServerConfig: Codable, Equatable, Sendable {
     public var command: String?
     public var args: [String] = []
     public var env: [String: String] = [:]
     public var enabled = true
     public var transport: String
-    public var protocolMode = "legacy"
+    public var protocolMode: String?
     public var url: String?
     public var authToken: String?
     public var auth: String?
     public var oauthClientID: String?
     public var oauthScopes: [String]?
-    public var timeoutSecs = 30
-    public var callTimeoutSecs = 300
-    public var maxConcurrent = 1
-    public var healthCheckIntervalSecs = 60
-    public var circuitBreakerEnabled = true
-    public var enrichment = false
+    public var timeoutSecs: Int?
+    public var callTimeoutSecs: Int?
+    public var maxConcurrent: Int?
+    public var healthCheckIntervalSecs: Int?
+    public var circuitBreakerEnabled: Bool?
+    public var enrichment: Bool?
     public var toolRenames: [String: String] = [:]
     public var toolGroups: [ToolGroupRule] = []
     public var sandbox: StdioSandboxConfig?
@@ -529,6 +534,7 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     }
 
     /// An HTTP API, named by the URL or file path of its OpenAPI document.
+    /// Four calls at once, as `plug servers add` gives an API server.
     public static func api(_ spec: String) -> Self {
         Self(transport: "openapi", maxConcurrent: 4, spec: spec)
     }
@@ -551,18 +557,18 @@ extension ServerConfig {
         env = try c.decodeIfPresent([String: String].self, forKey: .env) ?? [:]
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         transport = try c.decodeIfPresent(String.self, forKey: .transport) ?? "stdio"
-        protocolMode = try c.decodeIfPresent(String.self, forKey: .protocolMode) ?? "legacy"
+        protocolMode = try c.decodeIfPresent(String.self, forKey: .protocolMode)
         url = try c.decodeIfPresent(String.self, forKey: .url)
         authToken = try c.decodeIfPresent(String.self, forKey: .authToken)
         auth = try c.decodeIfPresent(String.self, forKey: .auth)
         oauthClientID = try c.decodeIfPresent(String.self, forKey: .oauthClientID)
         oauthScopes = try c.decodeIfPresent([String].self, forKey: .oauthScopes)
-        timeoutSecs = try c.decodeIfPresent(Int.self, forKey: .timeoutSecs) ?? 30
-        callTimeoutSecs = try c.decodeIfPresent(Int.self, forKey: .callTimeoutSecs) ?? 300
-        maxConcurrent = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) ?? 1
-        healthCheckIntervalSecs = try c.decodeIfPresent(Int.self, forKey: .healthCheckIntervalSecs) ?? 60
-        circuitBreakerEnabled = try c.decodeIfPresent(Bool.self, forKey: .circuitBreakerEnabled) ?? true
-        enrichment = try c.decodeIfPresent(Bool.self, forKey: .enrichment) ?? false
+        timeoutSecs = try c.decodeIfPresent(Int.self, forKey: .timeoutSecs)
+        callTimeoutSecs = try c.decodeIfPresent(Int.self, forKey: .callTimeoutSecs)
+        maxConcurrent = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent)
+        healthCheckIntervalSecs = try c.decodeIfPresent(Int.self, forKey: .healthCheckIntervalSecs)
+        circuitBreakerEnabled = try c.decodeIfPresent(Bool.self, forKey: .circuitBreakerEnabled)
+        enrichment = try c.decodeIfPresent(Bool.self, forKey: .enrichment)
         toolRenames = try c.decodeIfPresent([String: String].self, forKey: .toolRenames) ?? [:]
         toolGroups = try c.decodeIfPresent([ToolGroupRule].self, forKey: .toolGroups) ?? []
         sandbox = try c.decodeIfPresent(StdioSandboxConfig.self, forKey: .sandbox)
@@ -571,7 +577,7 @@ extension ServerConfig {
         tokenIn = try c.decodeIfPresent(String.self, forKey: .tokenIn)
     }
 
-    /// As the daemon writes a server, which leaves out an empty `operations`.
+    /// Leaves out what is nil and an empty `operations`.
     public func encode(to encoder: Encoder) throws {
         var c = encoder.container(keyedBy: CodingKeys.self)
         try c.encodeIfPresent(command, forKey: .command)
@@ -579,18 +585,18 @@ extension ServerConfig {
         try c.encode(env, forKey: .env)
         try c.encode(enabled, forKey: .enabled)
         try c.encode(transport, forKey: .transport)
-        try c.encode(protocolMode, forKey: .protocolMode)
+        try c.encodeIfPresent(protocolMode, forKey: .protocolMode)
         try c.encodeIfPresent(url, forKey: .url)
         try c.encodeIfPresent(authToken, forKey: .authToken)
         try c.encodeIfPresent(auth, forKey: .auth)
         try c.encodeIfPresent(oauthClientID, forKey: .oauthClientID)
         try c.encodeIfPresent(oauthScopes, forKey: .oauthScopes)
-        try c.encode(timeoutSecs, forKey: .timeoutSecs)
-        try c.encode(callTimeoutSecs, forKey: .callTimeoutSecs)
-        try c.encode(maxConcurrent, forKey: .maxConcurrent)
-        try c.encode(healthCheckIntervalSecs, forKey: .healthCheckIntervalSecs)
-        try c.encode(circuitBreakerEnabled, forKey: .circuitBreakerEnabled)
-        try c.encode(enrichment, forKey: .enrichment)
+        try c.encodeIfPresent(timeoutSecs, forKey: .timeoutSecs)
+        try c.encodeIfPresent(callTimeoutSecs, forKey: .callTimeoutSecs)
+        try c.encodeIfPresent(maxConcurrent, forKey: .maxConcurrent)
+        try c.encodeIfPresent(healthCheckIntervalSecs, forKey: .healthCheckIntervalSecs)
+        try c.encodeIfPresent(circuitBreakerEnabled, forKey: .circuitBreakerEnabled)
+        try c.encodeIfPresent(enrichment, forKey: .enrichment)
         try c.encode(toolRenames, forKey: .toolRenames)
         try c.encode(toolGroups, forKey: .toolGroups)
         try c.encodeIfPresent(sandbox, forKey: .sandbox)

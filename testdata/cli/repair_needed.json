@@ -1,0 +1,34 @@
+{
+  "canonical_command": "/Applications/Plug.app/Contents/Resources/plug",
+  "items": [
+    {
+      "changed": false,
+      "disposition": "canonical",
+      "message": "Inspected.",
+      "path": "/Users/example/.claude-code.json",
+      "target": "claude-code"
+    },
+    {
+      "changed": false,
+      "disposition": "http",
+      "message": "Inspected.",
+      "path": "/Users/example/.cursor.json",
+      "target": "cursor"
+    },
+    {
+      "changed": false,
+      "disposition": "missing",
+      "message": "Inspected.",
+      "path": "/Users/example/.zed.json",
+      "target": "zed"
+    },
+    {
+      "changed": false,
+      "disposition": "recognized_legacy",
+      "message": "Inspected.",
+      "path": "/Users/example/.codex-cli.json",
+      "target": "codex-cli"
+    }
+  ],
+  "repair_needed": true
+}

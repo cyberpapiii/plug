@@ -1,5 +1,6 @@
 import XCTest
 @testable import Plug
+import PlugIPC
 
 /// The verdict is the only thing the menu bar icon, the popover headline, and
 /// the window banner say, so its priority order is the product. These pin it.
@@ -356,6 +357,17 @@ final class PlugVerdictTests: XCTestCase {
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 5), .starting)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 61), .notLoaded)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: false, daemonUptimeSecs: 600), .off)
+
+        // The model reads the uptime steadied, and the silence still ends
+        // exactly when the startup allowance does.
+        func health(atUptime uptime: UInt64) -> ServerHealth {
+            var snapshot = OperatorSnapshot.empty
+            snapshot.uptimeSecs = uptime
+            let steady = snapshot.steadied(startup: ServerHealth.notLoadedAfterSecs)
+            return ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: steady.uptimeSecs)
+        }
+        XCTAssertEqual(health(atUptime: ServerHealth.notLoadedAfterSecs), .starting)
+        XCTAssertEqual(health(atUptime: ServerHealth.notLoadedAfterSecs + 1), .notLoaded)
 
         let missing = server("Linear", health: .notLoaded)
         XCTAssertEqual(missing.fix, .init("Reload", .reloadConfiguration))

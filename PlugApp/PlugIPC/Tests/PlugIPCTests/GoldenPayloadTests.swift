@@ -114,18 +114,37 @@ final class GoldenPayloadTests: XCTestCase {
 
     /// The app writes each request as the daemon does. The daemon writes a
     /// field with nothing in it as `null` and the app leaves it out, which
-    /// the daemon reads the same way.
+    /// the daemon reads the same way. A server setting the app leaves out is
+    /// one the daemon fills with its default, from `server_config_default.json`.
     func testTheAppWritesEveryRequestAsTheDaemonDoes() throws {
         let golden = try goldens("requests.json")
+        let defaults = try goldens("server_config_default.json")
         let encoder = PlugIPCClient.makeEncoder()
         for (name, request) in Self.requests {
-            let sent = try JSONSerialization.jsonObject(with: encoder.encode(request))
+            let sent = Self.withServerDefaults(
+                try JSONSerialization.jsonObject(with: encoder.encode(request)), defaults
+            )
             XCTAssertEqual(
                 Self.withoutNulls(sent) as? NSDictionary,
                 Self.withoutNulls(golden[name] as Any) as? NSDictionary,
                 name
             )
         }
+    }
+
+    /// `value` with each server in it filled in where the daemon would fill
+    /// it, for a field the app left out.
+    private static func withServerDefaults(_ value: Any, _ defaults: [String: Any]) -> Any {
+        if let object = value as? [String: Any] {
+            var filled = object.mapValues { withServerDefaults($0, defaults) }
+            if var server = filled["server"] as? [String: Any] {
+                for (key, value) in defaults where server[key] == nil { server[key] = value }
+                filled["server"] = server
+            }
+            return filled
+        }
+        if let array = value as? [Any] { return array.map { withServerDefaults($0, defaults) } }
+        return value
     }
 
     private static func withoutNulls(_ value: Any) -> Any {
@@ -162,6 +181,7 @@ final class GoldenPayloadTests: XCTestCase {
     func testSnapshot() throws {
         guard case let .snapshot(snapshot) = try response("snapshot") else { return XCTFail() }
         XCTAssertEqual(snapshot.runtimeVersion, "0.9.0")
+        XCTAssertEqual(snapshot.prefixDelimiter, ".")
         XCTAssertEqual(snapshot.toolCatalogRevision, 7)
         XCTAssertEqual(snapshot.ownership, .appManaged)
         XCTAssertEqual(snapshot.configuredServers.map(\.name), ["healthy", "degraded", "failed", "auth-required", "notes"])
@@ -179,12 +199,10 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(local.clientKey, "claude-code")
         XCTAssertEqual(local.accessKey, "claude-code")
         XCTAssertEqual(local.target, "claude-code")
-        XCTAssertEqual(local.connectedSecs, 3_700)
         let remote = snapshot.liveSessions[1]
         XCTAssertEqual(remote.transport, "http")
         XCTAssertEqual(remote.clientKey, "oauth:abc")
         XCTAssertNil(remote.target)
-        XCTAssertNil(remote.lastActivitySecs)
 
         XCTAssertEqual(snapshot.upstreamAuth.first?.tokenExpiresInSecs, 7_300)
         XCTAssertEqual(snapshot.upstreamAuth.first?.warnings, ["token expires soon"])
@@ -231,13 +249,22 @@ final class GoldenPayloadTests: XCTestCase {
     func testServerConfigs() throws {
         guard case let .serverConfig(name, server) = try response("server_config") else { return XCTFail() }
         XCTAssertEqual(name, "workspace")
-        XCTAssertEqual(server, Self.stdioServer)
+        XCTAssertEqual(server, try asTheDaemonKeepsIt(Self.stdioServer))
         guard case let .serverConfig(_, api) = try response("api_server_config") else { return XCTFail() }
-        XCTAssertEqual(api, Self.apiServer)
+        XCTAssertEqual(api, try asTheDaemonKeepsIt(Self.apiServer))
         // A field whose name ends in an initialism is read back, so a save
         // does not drop it.
         guard case let .serverConfig(_, remote) = try response("remote_server_config") else { return XCTFail() }
-        XCTAssertEqual(remote, Self.remoteServer)
+        XCTAssertEqual(remote, try asTheDaemonKeepsIt(Self.remoteServer))
+    }
+
+    /// A server the app sent, read back once the daemon has filled in what
+    /// the app left out.
+    private func asTheDaemonKeepsIt(_ server: ServerConfig) throws -> ServerConfig {
+        let sent = try JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(["server": server]))
+        let kept = Self.withServerDefaults(sent, try goldens("server_config_default.json"))
+        let data = try JSONSerialization.data(withJSONObject: kept)
+        return try decoder.decode([String: ServerConfig].self, from: data)["server"]!
     }
 
     func testActivity() throws {

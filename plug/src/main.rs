@@ -26,6 +26,8 @@ pub(crate) fn install_test_credential_environment() {
     );
 }
 
+#[cfg(test)]
+mod cli_goldens;
 mod client_host;
 mod commands;
 mod daemon;

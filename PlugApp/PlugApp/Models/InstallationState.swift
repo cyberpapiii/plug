@@ -50,13 +50,13 @@ struct InstallationFailure: Equatable, Sendable {
     let logURL: URL?
 }
 
-/// This app's bundle, signed by Plug's team, and the daemon binary inside it.
+/// This app's bundle, signed by Plug's team, and the daemon binary inside it,
+/// which the inspector found to be the app's own version.
 struct VerifiedAppInstallation: Equatable, Sendable {
     let bundleURL: URL
     let executableURL: URL
     let appVersion: String
     let buildVersion: String
-    let embeddedVersion: String
 }
 
 // MARK: - Whether the daemon is this app's own
@@ -76,7 +76,7 @@ extension VerifiedAppInstallation {
 
     /// A daemon that answers as this build: this version, from this binary.
     func answers(version: String?, executable: URL?) -> Bool {
-        embeddedVersion == appVersion && version == appVersion && executable.map(isExecutable) == true
+        version == appVersion && executable.map(isExecutable) == true
     }
 
     /// The one test of "the daemon is this app's own current build": launchd
@@ -145,6 +145,9 @@ struct LaunchdJobRecord: Equatable, Sendable {
     let parentBundleVersion: String?
     let programIdentifier: String?
     let arguments: [String]
+    /// Who registered the job. `com.apple.xpc.ServiceManagement` for one
+    /// SMAppService registered on an app's behalf.
+    let managedBy: String?
 
     init(
         label: String,
@@ -152,7 +155,8 @@ struct LaunchdJobRecord: Equatable, Sendable {
         parentBundleIdentifier: String?,
         parentBundleVersion: String?,
         programIdentifier: String? = nil,
-        arguments: [String] = []
+        arguments: [String] = [],
+        managedBy: String? = nil
     ) {
         self.label = label
         self.programURL = programURL
@@ -160,6 +164,7 @@ struct LaunchdJobRecord: Equatable, Sendable {
         self.parentBundleVersion = parentBundleVersion
         self.programIdentifier = programIdentifier
         self.arguments = arguments
+        self.managedBy = managedBy
     }
 }
 

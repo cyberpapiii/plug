@@ -1,0 +1,13 @@
+gui/501/homebrew.mxcl.plug = {
+	active count = 0
+	path = /Users/example/Library/LaunchAgents/homebrew.mxcl.plug.plist
+	type = LaunchAgent
+	state = not running
+
+	program = /opt/homebrew/opt/plug/bin/plug
+	arguments = {
+		"/opt/homebrew/opt/plug/bin/plug"
+		serve
+		--daemon
+	}
+}

@@ -305,6 +305,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             retryLimit: 1
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: fixture.inspector,
             legacyMigrator: migrator,
             clientRepairer: ClientRepairService(runner: runner),
@@ -479,8 +480,7 @@ private struct SignedReconciliationFixture {
             bundleURL: bundleURL,
             executableURL: executableURL,
             appVersion: appVersion,
-            buildVersion: appBuild,
-            embeddedVersion: appVersion
+            buildVersion: appBuild
         )
         formulaURL = rootURL.appending(path: "homebrew/opt/plug/bin/plug")
         brewURL = rootURL.appending(path: "homebrew/bin/brew")
@@ -519,54 +519,17 @@ private struct SignedReconciliationFixture {
         if mode == .legacy { try createLegacyFixtures() }
     }
 
+    /// The app's own readers, on the fixture bundle. Only the version run
+    /// differs: PLUG_DEV keeps the copied binary from handing `--version` to
+    /// an installed Plug.app.
     var inspector: AppInstallationInspector {
         let bundleURL = self.bundleURL
-        let executableURL = canonical.executableURL
-        let expectedVersion = version
         return AppInstallationInspector(
             bundleURL: { bundleURL },
-            signatureReader: { url in
-                try fixtureSignatureEvidence(at: url)
-            },
-            infoReader: { url in
-                let infoURL = url.appending(path: "Contents/Info.plist")
-                guard let data = try? Data(contentsOf: infoURL),
-                      let object = try? PropertyListSerialization.propertyList(
-                          from: data,
-                          options: [],
-                          format: nil
-                      ) as? [String: Any],
-                      let appVersion = object["CFBundleShortVersionString"] as? String,
-                      let buildVersion = object["CFBundleVersion"] as? String
-                else { throw AppInstallationError.missingMetadata }
-                return [
-                    "CFBundleShortVersionString": appVersion,
-                    "CFBundleVersion": buildVersion,
-                ]
-            },
-            embeddedVersionReader: { url in
-                guard url.standardizedFileURL == executableURL,
-                      FileManager.default.isExecutableFile(atPath: url.path)
-                else { throw AppInstallationError.missingEmbeddedExecutable(url) }
-                // PLUG_DEV keeps the copied binary from delegating to any
-                // live installation while still exercising its real --version
-                // path and proving the embedded version.
-                let result = try await ProcessRunner().run(
-                    executable: URL(fileURLWithPath: "/usr/bin/env"),
-                    arguments: ["PLUG_DEV=1", url.path, "--version"],
-                    timeout: .seconds(3)
-                )
-                let output = String(decoding: result.stdout, as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard result.status == 0,
-                      let version = output.split(whereSeparator: \.isWhitespace).last,
-                      String(version) == expectedVersion
-                else {
-                    throw AppInstallationError.embeddedVersionFailure(
-                        String(decoding: result.stderr, as: UTF8.self)
-                    )
-                }
-                return String(version)
+            signatureReader: AppInstallationInspector.readSignature,
+            infoReader: AppInstallationInspector.readBundleInfo,
+            embeddedVersionReader: {
+                try await AppInstallationInspector.readEmbeddedVersion(at: $0, runner: DevModeRunner())
             }
         )
     }
@@ -643,32 +606,15 @@ private struct SignedReconciliationFixture {
     }
 }
 
-private func fixtureSignatureEvidence(at bundleURL: URL) throws -> AppSignatureEvidence {
-    var staticCode: SecStaticCode?
-    guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode) == errSecSuccess,
-          let staticCode
-    else { throw AppInstallationError.invalidSignature }
-
-    let requirementText = "anchor apple generic and identifier \"\(AppInstallationInspector.bundleIdentifier)\" and certificate leaf[subject.OU] = \"\(AppInstallationInspector.teamID)\""
-    var requirement: SecRequirement?
-    guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
-          let requirement
-    else { throw AppInstallationError.invalidSignature }
-
-    var signingInformation: CFDictionary?
-    guard SecCodeCopySigningInformation(
-        staticCode,
-        SecCSFlags(rawValue: kSecCSSigningInformation),
-        &signingInformation
-    ) == errSecSuccess,
-    let information = signingInformation as? [String: Any]
-    else { throw AppInstallationError.invalidSignature }
-
-    return AppSignatureEvidence(
-        valid: SecStaticCodeCheckValidity(staticCode, [], requirement) == errSecSuccess,
-        bundleIdentifier: information[kSecCodeInfoIdentifier as String] as? String ?? "",
-        teamID: information[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
-    )
+/// Runs a command with `PLUG_DEV=1` in its environment.
+private struct DevModeRunner: ProcessRunning {
+    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        try await ProcessRunner().run(
+            executable: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: ["PLUG_DEV=1", executable.path] + arguments,
+            timeout: timeout
+        )
+    }
 }
 
 private actor FixtureProcessRunner: ProcessRunning {
@@ -724,21 +670,14 @@ private actor FixtureProcessRunner: ProcessRunning {
 
         if executable == canonicalExecutable {
             if arguments == ["repair", "--all", "--dry-run", "--output", "json"] {
-                let disposition = clientNeedsRepair ? "recognized_legacy" : "canonical"
-                let json = "{\"items\":[{\"changed\":false,\"disposition\":\"\(disposition)\"}]}"
-                return ProcessResult(
-                    status: 0,
-                    stdout: Data(json.utf8),
-                    stderr: Data()
-                )
+                return try .golden(clientNeedsRepair ? "repair_needed.json" : "repair_clean.json")
             }
             if arguments == ["repair", "--all", "--output", "json"] {
                 if clientNeedsRepair {
                     try Data(canonicalClientContents.utf8).write(to: clientURL, options: .atomic)
                     clientNeedsRepair = false
                 }
-                let json = "{\"items\":[{\"changed\":true,\"disposition\":\"canonical\"},{\"changed\":false,\"disposition\":\"canonical\"}]}"
-                return ProcessResult(status: 0, stdout: Data(json.utf8), stderr: Data())
+                return try .golden("repair_clean.json")
             }
         }
 

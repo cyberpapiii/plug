@@ -26,22 +26,43 @@ public enum PlugPaths {
     /// What launchd runs the bundled binary with.
     public static let daemonArguments = ["serve", "--daemon"]
 
-    public static var directoryURL: URL {
-        FileManager.default.homeDirectoryForCurrentUser
-            .appending(path: directory, directoryHint: .isDirectory)
-    }
+    public static var directoryURL: URL { PlugHome.standard.directory }
 
     public static var logs: URL {
         FileManager.default.homeDirectoryForCurrentUser
             .appending(path: logDirectory, directoryHint: .isDirectory)
     }
 
-    public static var socketURL: URL { directoryURL.appending(path: socketFile) }
+    public static var socketURL: URL { PlugHome.standard.socketURL }
 
-    public static var tokenURL: URL { directoryURL.appending(path: tokenFile) }
+    public static var tokenURL: URL { PlugHome.standard.tokenURL }
 
     /// A marker file, which sits beside the socket.
-    public static func marker(_ name: String) -> URL {
+    public static func marker(_ name: String) -> URL { PlugHome.standard.marker(name) }
+}
+
+/// One folder holding a daemon's socket, token and markers: the owner's real
+/// one, or a test's own, so a test never reads or writes the owner's files.
+public struct PlugHome: Sendable, Equatable {
+    public let directory: URL
+
+    public init(directory: URL) {
+        self.directory = directory
+    }
+
+    public static var standard: PlugHome {
+        PlugHome(
+            directory: FileManager.default.homeDirectoryForCurrentUser
+                .appending(path: PlugPaths.directory, directoryHint: .isDirectory)
+        )
+    }
+
+    public var socketURL: URL { directory.appending(path: PlugPaths.socketFile) }
+
+    public var tokenURL: URL { directory.appending(path: PlugPaths.tokenFile) }
+
+    /// A marker file, which sits beside the socket.
+    public func marker(_ name: String) -> URL {
         socketURL.deletingLastPathComponent().appending(path: name)
     }
 }

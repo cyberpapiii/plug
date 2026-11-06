@@ -24,6 +24,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - A `[lazy_tools.clients]` entry may name a client by any of its aliases. An entry naming no known client is ignored; it used to stop the config from loading.
 - `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
 - `plug link` and `plug unlink` answer `--output json` with the clients they changed.
+- `plug repair --output json` says `repair_needed`: whether a link still does not run Plug.app's command. The app reads that instead of judging each link itself.
 - The import sheet in the app names each client the way `plug import` does, such as "VS Code Copilot" and "RooCode".
 - `daemon_grace_period_secs` is gone: Plug.app keeps the daemon running, so it never shuts itself down when idle. A config that still sets it loads and the key is ignored.
 - `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.
@@ -73,6 +74,9 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Setting `owner_proof_until` for Slack events keeps the existing subscription. A client that subscribed again during the window used to get a second subscription next to the first.
 - When Plug cannot tell whether a client may still have an event, it tries that event again after the usual wait. It used to ask again on every delivery tick and log a warning each time.
 - Event delivery that stopped because its state could not be saved stays quiet until Plug restarts. It used to keep checking access and log a warning on every delivery tick.
+- The app names and pictures a client by the client the daemon took it for, on sessions, calls and remote sign-ins alike, and knows every client `plug clients` can link: Zed, Cline, Junie, Factory, Kilo Code and the rest now show their own names where they showed a capitalized client type. A sign-in named "Gemini" is Gemini CLI, as the daemon calls it. Goose is listed like every other client when it is on this Mac, and two of the owner's own scripts no longer show a Python icon.
+- Pasting a server block copied from Gemini CLI, Qwen Code or OpenCode settings into Add Server reads it the way `plug import` reads those files: `httpUrl`, `sseUrl`, `uri` and `http_url` addresses, a command given as a list, and `environment`. The app used to say the block had no command or address.
+- With a `prefix_delimiter` other than `__`, the app shows tools by their short names, a server's tool groups and a call's server again. It used to split names on `__` whatever the config said.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.
 - Asking a server that runs tasks itself for a task's status or result gives up after the server's `call_timeout_secs`. A server that never answered used to hold the client's request open for good.

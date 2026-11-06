@@ -551,7 +551,8 @@
           "subscribers": 1
         }
       ],
-      "client_address": "https://plug.example.com/mcp"
+      "client_address": "https://plug.example.com/mcp",
+      "prefix_delimiter": "."
     }
   },
   "status": {

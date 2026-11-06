@@ -11,7 +11,7 @@ import AppKit
 /// icon at all — a symbol stands in, chosen so the row still says what kind of
 /// thing it is.
 enum AppIcons {
-    /// Bundle identifiers for the apps Plug can be wired into. Best effort:
+    /// Bundle identifiers of the apps behind client targets, by slug. Best effort:
     /// a wrong or missing entry costs a symbol instead of an icon, never an
     /// error, and the name lookup below catches most of the rest.
     private static let bundleIdentifiers: [String: String] = [
@@ -20,7 +20,6 @@ enum AppIcons {
         "claude-code": "com.anthropic.claudefordesktop",
         // Codex CLI and the Codex desktop client share OpenAI's installed app
         // identity on macOS (currently shipped as ChatGPT.app).
-        "codex": "com.openai.codex",
         "codex-cli": "com.openai.codex",
         "cursor": "com.todesktop.230313mzl4w4u92",
         "vscode": "com.microsoft.VSCode",
@@ -39,7 +38,6 @@ enum AppIcons {
         "hermes": "com.nousresearch.hermes",
         // Remote clients whose Mac app supplies the icon. Perplexity's
         // identifier is unchecked; a miss costs a symbol.
-        "gemini": "com.google.GeminiMacOS",
         "perplexity": "ai.perplexity.mac",
         "chatgpt": "com.openai.chat",
     ]
@@ -61,13 +59,12 @@ enum AppIcons {
 
     /// Clients that live on someone else's servers and reach Plug over the
     /// public address. They have no link target, only a name and a picture.
-    private static let remoteTargets: Set<String> = ["gemini", "perplexity", "le-chat", "muse"]
+    private static let remoteTargets: Set<String> = ["perplexity", "le-chat", "muse"]
 
     /// Agents a person talks to by text message.
     private static let textAgentTargets: Set<String> = ["poke"]
 
     /// The symbol that stands in for an app with no icon on this Mac.
-    ///
     static func symbol(target: String, name: String = "") -> String {
         let key = target.lowercased()
         let text = "\(key) \(name.lowercased())"
@@ -79,7 +76,7 @@ enum AppIcons {
         // Codex has one visual identity across its CLI and desktop clients.
         // The installed Codex app supplies the official artwork; this is the
         // stable system fallback when that app is absent.
-        if key == "codex" || key == "codex-cli" || text.contains("codex") {
+        if key == "codex-cli" || text.contains("codex") {
             return "app"
         }
         // Goose is optional and often CLI-only. A bird is clearer than a
@@ -124,7 +121,6 @@ enum AppIcons {
 
     /// The app a command lives inside, when it lives inside one: a server
     /// started from `/Applications/Foo.app/Contents/MacOS/foo-mcp` is Foo.
-    ///
     static func appBundle(containing command: String) -> String? {
         guard let end = command.range(of: ".app/") else { return nil }
         return String(command[..<end.lowerBound]) + ".app"
@@ -144,7 +140,6 @@ enum AppIcons {
     /// The lookup key of the app a server stands for. Google's servers go
     /// by many names, one per product, and a Mac has an app for only a few
     /// of them, so the rest share Google Drive's icon.
-    ///
     static func appName(forServer name: String, installed: (String) -> Bool = { _ in false }) -> String {
         let key = lookupKey(name)
         if let alias = serverAliases[key] { return alias }
@@ -154,7 +149,6 @@ enum AppIcons {
 
     /// A name with everything but its letters and digits removed, so
     /// "agent-admin" finds AgentAdmin.app.
-    ///
     static func lookupKey(_ name: String) -> String {
         String(name.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
@@ -193,76 +187,5 @@ enum AppIcons {
         let key = lookupKey(name)
         guard !key.isEmpty, let path = installedApps[key] else { return nil }
         return fileIcon(path)
-    }
-
-    /// Match a live session's reported client type to a known target, so a
-    /// session row can show the same icon the app row shows.
-    ///
-    static func target(forClientType clientType: String) -> String {
-        let value = clientType
-            .lowercased()
-            .split(whereSeparator: { !$0.isLetter && !$0.isNumber })
-            .joined(separator: "-")
-        let compact = value.replacingOccurrences(of: "-", with: "")
-        if compact == "dittohistory" || compact == "dittoemailmanager" { return "python" }
-        if compact.contains("claudecode") { return "claude-code" }
-        if compact.contains("claude") { return "claude-desktop" }
-        if compact.contains("codex") {
-            return "codex-cli"
-        }
-        if compact.contains("openai") || compact.contains("chatgpt") { return "chatgpt" }
-        if compact.contains("devin") || compact.contains("cascade") ||
-            compact.contains("windsurf") || compact.contains("codeium") {
-            return "devin"
-        }
-        // Copilot runs in VS Code and in a terminal.
-        if compact.contains("copilot") {
-            return compact.contains("cli") ? "copilot-cli" : "vscode"
-        }
-        // The two xAI clients share a first word.
-        if compact.contains("grok") {
-            return compact.contains("bot") ? "grok-bot" : "grok-build"
-        }
-        // Gemini is a terminal client and a remote one.
-        if compact.contains("gemini") {
-            return compact.contains("cli") ? "gemini-cli" : "gemini"
-        }
-        if compact.contains("mistral") || compact.contains("lechat") { return "le-chat" }
-        if compact.contains("poke") { return "poke" }
-        // Meta has two: Muse, its agent, and Muse Code, in a terminal.
-        if compact.contains("muse") {
-            return compact.contains("code") ? "muse-code" : "muse"
-        }
-        for target in bundleIdentifiers.keys where value.contains(target) { return target }
-        for target in commandLineTargets where value.contains(target) { return target }
-        return value
-    }
-
-    /// Canonical product name for live client sessions. Unknown clients stay
-    /// unknown; Plug must not turn an opaque client identifier into a guess.
-    static func displayName(forTarget target: String) -> String? {
-        switch target.lowercased() {
-        case "claude-desktop": return "Claude Desktop"
-        case "claude-code": return "Claude Code"
-        case "codex", "codex-cli": return "Codex CLI"
-        case "chatgpt": return "ChatGPT"
-        case "cursor": return "Cursor"
-        case "devin": return "Devin"
-        case "copilot-cli": return "GitHub Copilot CLI"
-        case "grok-build": return "Grok Build"
-        case "grok-bot": return "Grok Bot"
-        case "opencode": return "OpenCode"
-        case "goose": return "Goose"
-        case "warp": return "Warp"
-        case "kiro": return "Kiro"
-        case "hermes": return "Hermes Agent"
-        case "gemini": return "Gemini"
-        case "perplexity": return "Perplexity"
-        case "le-chat": return "Le Chat"
-        case "muse": return "Muse"
-        case "muse-code": return "Muse Code"
-        case "poke": return "Poke"
-        default: return nil
-        }
     }
 }

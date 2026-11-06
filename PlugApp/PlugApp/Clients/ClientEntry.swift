@@ -5,9 +5,8 @@ import SwiftUI
 struct ClientStatus: Equatable, Sendable {
     let text: String
 
-    static func hasNetworkRepresentation(_ app: LinkableApp, grantNames: [String]) -> Bool {
-        app.linked && app.transport?.lowercased() == "http"
-            && grantNames.contains { AppIcons.target(forClientType: $0) == app.target }
+    static func hasNetworkRepresentation(_ app: LinkableApp, grantTargets: [String]) -> Bool {
+        app.linked && app.transport?.lowercased() == "http" && grantTargets.contains(app.target)
     }
 
     /// A state, followed by what is off for the client when something is.
@@ -51,6 +50,10 @@ struct ClientStatus: Equatable, Sendable {
 
 /// One client as the list and the detail show it.
 struct ClientEntry: Identifiable {
+    /// The row id of a client allowed in over the network. A notification
+    /// selects that row by it.
+    static func id(grant clientID: String) -> String { "grant:\(clientID)" }
+
     /// Where a client is. The title is also what a connection row says.
     enum Group: String {
         case onThisMac = "On This Mac"
@@ -61,14 +64,14 @@ struct ClientEntry: Identifiable {
 
     enum Glyph: Equatable, Sendable {
         case app(target: String, name: String, appPath: String?)
-        /// A client allowed in over the network, by the name it gave.
-        case grant(name: String)
+        /// A client allowed in over the network, pictured as `target`.
+        case grant(target: String, name: String)
 
         /// The name a chosen icon for this client is kept under.
         var iconKey: String {
             switch self {
             case let .app(target, _, _): IconStore.key(client: target)
-            case let .grant(name): IconStore.key(client: AppIcons.target(forClientType: name))
+            case let .grant(target, _): IconStore.key(client: target)
             }
         }
     }

@@ -68,28 +68,32 @@ final class AppModel {
     /// When a working connection first failed, while it is `reconnecting`.
     private var connectionLostAt: ContinuousClock.Instant?
 
+    /// `home` is the folder of the daemon this model reads: its socket, its
+    /// token and the off marker. Tests pass their own.
     init(
+        home: PlugHome,
         ipc: PlugIPCClient? = nil,
         coordinator: (any InstallationCoordinating)? = nil,
         clientVersion: String = AppModel.defaultClientVersion,
-        tokenURL: URL = PlugPaths.tokenURL,
         appLinker: any AppLinking = AppLinkService(),
         foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
         backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
         reconnectGrace: Duration = AppModel.reconnectGrace,
-        authFlow: AuthFlowService = AuthFlowService(),
-        serviceDisabled: ServiceDisabledMarker = .standard
+        authFlow: AuthFlowService = AuthFlowService()
     ) {
+        let serviceDisabled = ServiceDisabledMarker(home: home)
         let daemon = DaemonClient(
-            ipc: ipc ?? PlugIPCClient(clientVersion: clientVersion),
+            ipc: ipc ?? PlugIPCClient(socketURL: home.socketURL, clientVersion: clientVersion),
             clientVersion: clientVersion,
-            tokenURL: tokenURL
+            tokenURL: home.tokenURL
         )
         self.daemon = daemon
         // Built here and not as the default argument: Swift 6.1 crashes
         // compiling that call in a default argument.
         gate = ReconciliationGate(
-            coordinator: coordinator ?? InstallationCoordinator(laterRetryDelay: .seconds(300)),
+            coordinator: coordinator ?? InstallationCoordinator(
+                serviceDisabled: serviceDisabled, laterRetryDelay: .seconds(300)
+            ),
             marker: serviceDisabled
         )
         self.foregroundPollInterval = foregroundPollInterval
@@ -208,7 +212,9 @@ final class AppModel {
         let place = event.clientKey.flatMap { key in
             snapshot.clientPlaces?.first { $0.key == key }?.place
         }
-        return CallFacts(event, ownerName: name, grantName: grant, place: place)
+        return CallFacts(
+            event, delimiter: snapshot.prefixDelimiter, ownerName: name, grantName: grant, place: place
+        )
     }
 
     /// The names and places the owner gave clients. The Clients page asks
@@ -512,7 +518,7 @@ final class AppModel {
         // A read that says nothing new is not published: every view that
         // shows a server, a client or Plug's status would be drawn again,
         // every poll, for a clock that ticked.
-        let steady = value.steadied()
+        let steady = value.steadied(startup: ServerHealth.notLoadedAfterSecs)
         if steady != snapshot {
             snapshotRevision += 1
             snapshot = steady
@@ -528,7 +534,8 @@ final class AppModel {
         // it would answer differently, so it is asked for only then.
         let revision = value.toolCatalogRevision
         if forceCatalog || !toolCatalog.isCurrent(at: revision), let tools = try await daemon.tools() {
-            toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)), revision: revision)
+            let delimiter = value.prefixDelimiter
+            toolCatalog = ToolCatalog(tools.map { ToolFacts($0, delimiter: delimiter) }, revision: revision)
         }
         if connectionState != .ready { connectionState = .ready }
         if connectionError != nil { connectionError = nil }

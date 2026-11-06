@@ -5,7 +5,8 @@ import PlugIPC
 ///
 /// Tools arrive from the daemon under their merged name (`figma__get_file`),
 /// which is what a client actually calls. People read them per server, so the
-/// server prefix is stripped for display and kept for every action.
+/// server prefix is stripped for display and kept for every action. The
+/// delimiter between the two is the daemon's (`OperatorSnapshot.prefixDelimiter`).
 struct ToolFacts: Identifiable, Equatable, Sendable {
     var id: String { name }
     let name: String
@@ -25,6 +26,7 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
     let shortName: String
 
     init(
+        delimiter: String,
         name: String,
         server: String,
         summary: String? = nil,
@@ -40,8 +42,8 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
         self.lockedByPattern = lockedByPattern
         self.ownName = ownName
         self.isReadOnly = isReadOnly
-        let prefix = "\(server)__"
-        if name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased()) {
+        let prefix = "\(server)\(delimiter)"
+        if !delimiter.isEmpty, name.count > prefix.count, name.lowercased().hasPrefix(prefix.lowercased()) {
             shortName = String(name.dropFirst(prefix.count))
         } else {
             shortName = name
@@ -50,8 +52,9 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
 }
 
 extension ToolFacts {
-    init(_ info: ToolInfo) {
+    init(_ info: ToolInfo, delimiter: String) {
         self.init(
+            delimiter: delimiter,
             name: info.name,
             server: info.serverId,
             summary: info.description ?? info.title,
@@ -61,15 +64,6 @@ extension ToolFacts {
             isReadOnly: info.readOnly
         )
     }
-}
-
-/// Tools of one server, kept together because that is how people look for them.
-struct ToolGroup: Identifiable, Equatable, Sendable {
-    var id: String { server }
-    let server: String
-    let tools: [ToolFacts]
-
-    var onCount: Int { tools.filter(\.isOn).count }
 }
 
 /// The full tool list, grouped and searchable.
@@ -96,27 +90,12 @@ struct ToolCatalog: Equatable, Sendable {
 
     /// The names a server's tools are filed under for clients, in order.
     /// More than one means Plug splits the server into groups.
-    static func groups(ofNames names: [String]) -> [String] {
-        Set(names.compactMap { name in
-            name.range(of: "__").map { String(name[..<$0.lowerBound]) }
+    static func groups(ofNames names: [String], delimiter: String) -> [String] {
+        guard !delimiter.isEmpty else { return [] }
+        return Set(names.compactMap { name in
+            name.range(of: delimiter).map { String(name[..<$0.lowerBound]) }
         })
         .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-    }
-
-    var onCount: Int { tools.filter(\.isOn).count }
-    var offCount: Int { tools.count - onCount }
-
-    /// Groups matching a query, servers alphabetical, tools alphabetical.
-    ///
-    /// A query matches a tool's name or its description, and also matches every
-    /// tool of a server whose name matches — searching "figma" should show what
-    /// Figma can do, not nothing.
-    func groups(matching query: String = "") -> [ToolGroup] {
-        let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        let matched = needle.isEmpty ? tools : tools.filter { $0.matches(needle) }
-        return Dictionary(grouping: matched, by: \.server)
-            .map { server, tools in ToolGroup(server: server, tools: tools.sorted(by: ToolFacts.inNameOrder)) }
-            .sorted { $0.server.localizedStandardCompare($1.server) == .orderedAscending }
     }
 
     /// Every tool a wildcard holds off. A pattern is the only way a tool can be
@@ -128,8 +107,10 @@ struct ToolCatalog: Equatable, Sendable {
 
     func tools(for server: String) -> [ToolFacts] { byServer[server] ?? [] }
 
-    /// One server's tools that match a query, by the same rule as `groups`:
-    /// a query naming the server keeps all of its tools.
+    /// One server's tools that match a query, alphabetical. A query matches a
+    /// tool's name or its description, and a query naming the server keeps
+    /// all of its tools: searching "figma" should show what Figma can do, not
+    /// nothing.
     func tools(for server: String, matching query: String) -> [ToolFacts] {
         let needle = query.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         let own = tools(for: server)

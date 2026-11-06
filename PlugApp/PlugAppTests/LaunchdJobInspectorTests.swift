@@ -1,6 +1,7 @@
 import Foundation
 import XCTest
 @testable import Plug
+import PlugIPC
 
 final class LaunchdJobInspectorTests: XCTestCase {
     private let canonical = makeTestInstallation()
@@ -170,23 +171,65 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentVersion: nil
         )
         XCTAssertEqual(state, .recognizedLegacy([legacy]))
-        let printed = await runner.arguments.filter { $0 != ["list"] }
+        let printed = await runner.arguments.filter { $0 != ["print", "gui/501"] }
         XCTAssertEqual(printed, [["print", "gui/501/unexpected.owner"]])
     }
 
     func testAppleNamespaceLabelsAreNotInspected() {
-        let listing = """
-        PID\tStatus\tLabel
-        -\t0\tcom.apple.unrelated
-        1\t0\tcom.apple.plug.lookalike
-        2\t0\tcom.plug.daemon
-        3\t0\tunexpected.owner
-        """
+        let listing = domain("0\t0\tcom.apple.unrelated\n1\t0\tcom.apple.plug.lookalike\n2\t0\tcom.plug.daemon\n3\t0\tunexpected.owner\n")
 
         XCTAssertEqual(
             LaunchdJobInspector.parseLabels(listing),
             ["com.plug.daemon", "unexpected.owner"]
         )
+    }
+
+    // MARK: The samples `plug/src/service.rs` reads too
+
+    private func sample(_ name: String) throws -> String {
+        let root = URL(fileURLWithPath: "\(#filePath)")
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        return try String(contentsOf: root.appending(path: "testdata/launchd/\(name)"), encoding: .utf8)
+    }
+
+    func testTheDomainSampleListsTheSameLabelsAsTheCLI() throws {
+        XCTAssertEqual(
+            LaunchdJobInspector.domainLabels(try sample("gui_domain.txt")),
+            ["local.claude-rc.plug", "com.plug.daemon", "com.apple.Finder", "homebrew.mxcl.plug"]
+        )
+    }
+
+    func testTheServiceManagedSampleIsThisAppsDaemon() async throws {
+        let output = try sample("app_service_job.txt")
+        let installation = makeTestInstallation(build: "12")
+        let state = try await LaunchdJobInspector(records: {
+            [LaunchdJobInspector.parseRecord(label: PlugPaths.daemonLabel, output: output)]
+        }).daemonJobs(canonical: installation, recognizedLegacyPaths: [])
+        guard case let .appManagedCurrent(record) = state else {
+            return XCTFail("expected the app's own daemon, got \(state)")
+        }
+        XCTAssertEqual(record.programURL, installation.executableURL)
+        XCTAssertEqual(record.managedBy, LaunchdJobInspector.serviceManagement)
+    }
+
+    /// Without `managed_by`, nothing says SMAppService registered the job,
+    /// so it is not taken for the app's, as `plug doctor` does not.
+    func testAJobSMAppServiceDidNotRegisterIsNotTheAppsDaemon() async throws {
+        let output = try sample("app_job_not_service_managed.txt")
+        let installation = makeTestInstallation(build: "12")
+        let state = try await LaunchdJobInspector(records: {
+            [LaunchdJobInspector.parseRecord(label: PlugPaths.daemonLabel, output: output)]
+        }).daemonJobs(canonical: installation, recognizedLegacyPaths: [])
+        assertUnknown(state, programIdentifier: PlugPaths.bundledBinary)
+    }
+
+    func testTheLegacySampleIsALeftoverPlug() async throws {
+        let record = LaunchdJobInspector.parseRecord(label: "homebrew.mxcl.plug", output: try sample("legacy_job.txt"))
+        XCTAssertEqual(record.programURL?.path, "/opt/homebrew/opt/plug/bin/plug")
+        XCTAssertEqual(record.arguments, ["/opt/homebrew/opt/plug/bin/plug", "serve", "--daemon"])
+        let state = try await LaunchdJobInspector(records: { [record] })
+            .daemonJobs(canonical: canonical, recognizedLegacyPaths: [])
+        XCTAssertEqual(state, .recognizedLegacy([record]))
     }
 
     func testLiveSMAppServiceShapeResolvesBundleRelativeDaemon() async throws {
@@ -205,7 +248,8 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentID: AppInstallationInspector.bundleIdentifier,
             parentVersion: canonical.buildVersion,
             programIdentifier: "Contents/Resources/plug",
-            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"],
+            managedBy: LaunchdJobInspector.serviceManagement
         )
         XCTAssertEqual(state, .appManagedCurrent(expected))
     }
@@ -226,7 +270,8 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentID: AppInstallationInspector.bundleIdentifier,
             parentVersion: "19",
             programIdentifier: "Contents/Resources/plug",
-            arguments: ["Contents/Resources/plug", "serve", "--daemon"]
+            arguments: ["Contents/Resources/plug", "serve", "--daemon"],
+            managedBy: LaunchdJobInspector.serviceManagement
         )
         XCTAssertEqual(state, .appManagedStale(expected))
     }
@@ -359,7 +404,8 @@ final class LaunchdJobInspectorTests: XCTestCase {
         parentID: String? = "com.cyberpapiii.plug",
         parentVersion: String? = "20",
         programIdentifier: String? = nil,
-        arguments: [String] = []
+        arguments: [String] = [],
+        managedBy: String? = nil
     ) -> LaunchdJobRecord {
         LaunchdJobRecord(
             label: label,
@@ -367,7 +413,8 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentBundleIdentifier: parentID,
             parentBundleVersion: parentVersion,
             programIdentifier: programIdentifier,
-            arguments: arguments
+            arguments: arguments,
+            managedBy: managedBy
         )
     }
 
@@ -407,14 +454,21 @@ private struct LegacyPlugProgramFixture: Decodable {
     }
 }
 
-/// `launchctl list` names `labels`; each `print` gets `print`'s answer for
-/// the label it asks about.
+/// A `launchctl print gui/501` whose services are `lines` of PID, status
+/// and label.
+private func domain(_ lines: String) -> String {
+    let services = lines.split(separator: "\n").map { "\t\t\($0)\n" }.joined()
+    return "gui/501 = {\n\ttype = gui\n\tservices = {\n\(services)\t}\n}\n"
+}
+
+/// The domain print names `labels`; each job's `print` gets `print`'s
+/// answer for the label it asks about.
 private func launchctl(
     listing labels: String,
     print: @escaping @Sendable (_ label: String) throws -> ProcessResult
 ) -> StubProcessRunner {
     StubProcessRunner { _, arguments in
-        if arguments == ["list"] { return .exited(stdout: "PID\tStatus\tLabel\n" + labels) }
+        if arguments == ["print", "gui/501"] { return .exited(stdout: domain(labels)) }
         return try print(arguments.last?.split(separator: "/").last.map(String.init) ?? "")
     }
 }
@@ -432,10 +486,10 @@ private func launchctlTimingOut(on slowLabel: String) -> StubProcessRunner {
 
 private func launchctlFailing(list: Bool) -> StubProcessRunner {
     StubProcessRunner { _, arguments in
-        if arguments == ["list"] {
+        if arguments == ["print", "gui/501"] {
             return list
                 ? .exited(113, stderr: "list unavailable")
-                : .exited(stdout: "PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n")
+                : .exited(stdout: domain("123\t0\tcom.plug.daemon\n"))
         }
         return .exited(113, stderr: "print unavailable")
     }
@@ -455,6 +509,7 @@ private func launchctlWithAppServiceJob(
     let argumentLines = arguments.map { "    \($0)" }.joined(separator: "\n")
     return launchctl(listing: "123\t0\tcom.plug.daemon\n") { _ in
         .exited(stdout: """
+        managed_by = com.apple.xpc.ServiceManagement
         program identifier = Contents/Resources/plug (mode: 2)
         parent bundle identifier = \(parentBundleIdentifier)
         parent bundle version = \(parentBundleVersion)
@@ -469,7 +524,7 @@ private func launchctlWithAppServiceJob(
 /// An unrelated label whose program is a recognized Plug, beside one in
 /// Apple's namespace.
 private func launchctlPrintingOneOwner() -> StubProcessRunner {
-    launchctl(listing: "-\t0\tcom.apple.unrelated\n123\t0\tunexpected.owner\n") { label in
+    launchctl(listing: "0\t0\tcom.apple.unrelated\n123\t0\tunexpected.owner\n") { label in
         guard label == "unexpected.owner" else { return .exited(stdout: "state = running\n") }
         return .exited(stdout: "program = /Users/me/.local/bin/plug\nstate = running\n")
     }

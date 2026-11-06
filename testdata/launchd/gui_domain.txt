@@ -1,0 +1,18 @@
+gui/501 = {
+	type = gui
+	handle = 501
+	active count = 4
+
+	services = {
+		     321      - 	local.claude-rc.plug
+		       0      0 	com.plug.daemon
+		     999      - 	com.apple.Finder
+		       0     78 	homebrew.mxcl.plug
+	}
+
+	unmanaged processes = {
+		com.apple.xpc.launchd.unmanaged.loginwindow.123 = {
+			active count = 1
+		}
+	}
+}

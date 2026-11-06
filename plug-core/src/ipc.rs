@@ -236,6 +236,10 @@ pub struct OperatorSnapshot {
     /// reach Plug: the public one when there is one, else this Mac's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_address: Option<String>,
+    /// What joins a server's prefix to a tool's name in the names clients
+    /// call (`prefix_delimiter` in the config).
+    #[serde(default)]
+    pub prefix_delimiter: String,
 }
 
 /// Requests sent to the daemon over its Unix socket.

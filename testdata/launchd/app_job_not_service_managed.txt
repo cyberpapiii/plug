@@ -1,0 +1,15 @@
+gui/501/com.plug.daemon = {
+	active count = 1
+	path = (submitted by smd.338)
+	type = Submitted
+	state = running
+
+	program identifier = Contents/Resources/plug (mode: 2)
+	parent bundle identifier = com.cyberpapiii.plug
+	parent bundle version = 12
+	arguments = {
+		Contents/Resources/plug
+		serve
+		--daemon
+	}
+}

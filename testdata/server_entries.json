@@ -1,0 +1,57 @@
+[
+  {
+    "name": "plain-command",
+    "entry": { "command": "npx", "args": ["-y", "linear-mcp"], "env": { "LINEAR_API_KEY": "lin_1" } },
+    "server": { "transport": "stdio", "command": "npx", "args": ["-y", "linear-mcp"], "url": null, "env": { "LINEAR_API_KEY": "lin_1" }, "enabled": true }
+  },
+  {
+    "name": "plain-url",
+    "entry": { "url": "https://mcp.example.com/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "https://mcp.example.com/mcp", "env": {}, "enabled": true }
+  },
+  {
+    "name": "sse-url",
+    "entry": { "type": "sse", "url": "https://events.example.com/sse" },
+    "server": { "transport": "sse", "command": null, "args": [], "url": "https://events.example.com/sse", "env": {}, "enabled": true }
+  },
+  {
+    "name": "gemini-http-url",
+    "entry": { "httpUrl": "https://gemini.example.com/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "https://gemini.example.com/mcp", "env": {}, "enabled": true }
+  },
+  {
+    "name": "qwen-sse-url",
+    "entry": { "sseUrl": "https://qwen.example.com/sse" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "https://qwen.example.com/sse", "env": {}, "enabled": true }
+  },
+  {
+    "name": "uri",
+    "entry": { "uri": "https://uri.example.com/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "https://uri.example.com/mcp", "env": {}, "enabled": true }
+  },
+  {
+    "name": "snake-http-url",
+    "entry": { "http_url": "https://snake.example.com/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "https://snake.example.com/mcp", "env": {}, "enabled": true }
+  },
+  {
+    "name": "opencode-command-list",
+    "entry": { "type": "local", "command": ["bunx", "notes-mcp", "--quiet"], "environment": { "NOTES_DIR": "/tmp/notes" } },
+    "server": { "transport": "stdio", "command": "bunx", "args": ["notes-mcp", "--quiet"], "url": null, "env": { "NOTES_DIR": "/tmp/notes" }, "enabled": true }
+  },
+  {
+    "name": "command-list-and-args",
+    "entry": { "command": ["uvx", "srv"], "args": ["--port", "1"] },
+    "server": { "transport": "stdio", "command": "uvx", "args": ["srv", "--port", "1"], "url": null, "env": {}, "enabled": true }
+  },
+  {
+    "name": "turned-off",
+    "entry": { "command": "srv", "enabled": false },
+    "server": { "transport": "stdio", "command": "srv", "args": [], "url": null, "env": {}, "enabled": false }
+  },
+  {
+    "name": "nothing-to-run",
+    "entry": { "args": ["--port", "1"] },
+    "server": null
+  }
+]

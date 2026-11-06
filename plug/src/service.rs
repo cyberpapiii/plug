@@ -867,6 +867,44 @@ mod tests {
         );
     }
 
+    /// The samples in `testdata/launchd`, which the app's
+    /// `LaunchdJobInspectorTests` read too, so the CLI and the app take the
+    /// same job for the same owner.
+    #[test]
+    fn launchd_samples_read_the_way_the_app_reads_them() {
+        let domain = include_str!("../../testdata/launchd/gui_domain.txt");
+        assert_eq!(
+            parse_launchd_labels(domain),
+            [
+                "local.claude-rc.plug",
+                "com.plug.daemon",
+                "com.apple.Finder",
+                "homebrew.mxcl.plug"
+            ]
+        );
+
+        let app_program = Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let app_job = include_str!("../../testdata/launchd/app_service_job.txt");
+        assert!(app_managed_launchd_evidence(app_job));
+        assert_eq!(
+            parse_launchd_job(DAEMON_LABEL, app_job, Some(app_program)).map(|job| job.program),
+            Some(app_program.to_path_buf())
+        );
+
+        let unmanaged = include_str!("../../testdata/launchd/app_job_not_service_managed.txt");
+        assert!(!app_managed_launchd_evidence(unmanaged));
+        assert_eq!(
+            parse_launchd_job(DAEMON_LABEL, unmanaged, Some(app_program)),
+            None
+        );
+
+        let legacy = include_str!("../../testdata/launchd/legacy_job.txt");
+        let job = parse_launchd_job("homebrew.mxcl.plug", legacy, None).expect("legacy job");
+        // Resolved through links when the path is on this Mac, so only its
+        // kind is checked.
+        assert!(is_recognized_legacy_program(&job.program));
+    }
+
     #[test]
     fn launchd_job_parser_rejects_unproven_relative_program() {
         let output = r#"managed_by = com.apple.xpc.ServiceManagement

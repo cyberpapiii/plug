@@ -513,32 +513,54 @@ struct WindowSeenReader: NSViewRepresentable {
 }
 
 final class WindowSeenProbe: NSView {
-    var onSeen: ((Bool) -> Void)?
+    private lazy var watch = WindowSightWatch(view: self)
+    var onSeen: ((Bool) -> Void)? {
+        get { watch.onSeen }
+        set { watch.onSeen = newValue }
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override var acceptsFirstResponder: Bool { false }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        let centre = NotificationCenter.default
-        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
-        if let newWindow {
-            centre.addObserver(
-                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
-            )
-        }
+        watch.watch(newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        look()
+        watch.look()
+    }
+}
+
+/// Tells `onSeen` whether a view's window is on screen, each time that may
+/// have changed. The view calls `watch` as it moves to a window and `look`
+/// once it is there.
+@MainActor
+final class WindowSightWatch: NSObject {
+    var onSeen: ((Bool) -> Void)?
+    private weak var view: NSView?
+
+    init(view: NSView) {
+        self.view = view
     }
 
-    /// Said a moment later, never in the middle of an update.
-    @objc private func look() {
+    func watch(_ window: NSWindow?) {
+        let centre = NotificationCenter.default
+        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        if let window {
+            centre.addObserver(
+                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: window
+            )
+        }
+    }
+
+    /// Closed, covered, minimized or on another desktop, the window is not
+    /// on screen. Said a moment later, never in the middle of an update.
+    @objc func look() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.onSeen?(self.window?.occlusionState.contains(.visible) ?? false)
+            self.onSeen?(self.view?.window?.occlusionState.contains(.visible) ?? false)
         }
     }
 }

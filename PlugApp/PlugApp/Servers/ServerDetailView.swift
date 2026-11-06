@@ -199,7 +199,10 @@ struct ServerDetailView: View {
 
     /// The groups this server's tools are split into, when there are several.
     private var toolGroups: [String] {
-        ToolCatalog.groups(ofNames: model.toolCatalog.tools(for: server.name).map(\.name))
+        ToolCatalog.groups(
+            ofNames: model.toolCatalog.tools(for: server.name).map(\.name),
+            delimiter: model.snapshot.prefixDelimiter
+        )
     }
 }
 
