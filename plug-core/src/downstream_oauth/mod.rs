@@ -6,6 +6,8 @@
 
 pub mod owner;
 pub mod paths;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_owner;
 
 pub use owner::OwnerCredentialSummary;
 use owner::{
@@ -1511,66 +1513,6 @@ impl DownstreamOauthManager {
         })
     }
 
-    /// Approve or deny a consent without the owner passkey ceremony.
-    ///
-    /// Test-only: production approval goes through
-    /// [`Self::finish_owner_approval`] and denial through
-    /// [`Self::deny_consent`]. Tests in other crates reach this through the
-    /// `test-helpers` feature, which only dev-dependencies enable.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn decide_consent(
-        &self,
-        consent_id: &str,
-        approved: bool,
-    ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
-        self.ensure_durable()?;
-        let mut guard = self.state.lock().await;
-        let now = epoch_secs();
-        guard
-            .completed_consents
-            .retain(|_, completed| completed.expires_at > now);
-        if let Some(completed) = guard.completed_consents.get(consent_id) {
-            return Ok(completed.redirect.clone());
-        }
-        let consent = guard
-            .pending_consents
-            .get(consent_id)
-            .cloned()
-            .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
-        if consent.expires_at <= now {
-            let mut next = guard.clone();
-            let expired = expire_consent(&mut next, consent_id, &consent);
-            self.commit_state(&mut guard, next)?;
-            return Err(expired);
-        }
-        if !approved {
-            let redirect = AuthorizationRedirect {
-                location: redirect_with_params(
-                    &consent.redirect_uri,
-                    &[("error", "access_denied"), ("state", &consent.state)],
-                ),
-            };
-            let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
-            next.completed_consents.insert(
-                consent_id.to_string(),
-                CompletedConsent {
-                    client_id: consent.client_id,
-                    redirect: redirect.clone(),
-                    expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                    approval_ceremony_ids: Vec::new(),
-                },
-            );
-            self.commit_state(&mut guard, next)?;
-            return Ok(redirect);
-        }
-
-        let mut next = guard.clone();
-        let redirect = issue_code_for_consent(&mut next, consent_id, consent, Vec::new(), now);
-        self.commit_state(&mut guard, next)?;
-        Ok(redirect)
-    }
-
     pub async fn exchange_authorization_code(
         &self,
         client_id: &str,
@@ -2505,7 +2447,7 @@ fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> Downstr
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+    use crate::downstream_oauth::test_owner::{self, BrowserAuthenticator};
     use serde_json::json;
 
     fn temp_state_path() -> PathBuf {
@@ -3773,14 +3715,12 @@ mod tests {
             .await
             .expect("start owner approval");
         let denial_consent = begin_test_authorization(&manager, "expired-consent-denial").await;
-        let legacy_consent = begin_test_authorization(&manager, "expired-consent-legacy").await;
         {
             let mut state = manager.state.lock().await;
             for consent_id in [
                 &challenge_consent.consent_id,
                 &assertion_consent.consent_id,
                 &denial_consent.consent_id,
-                &legacy_consent.consent_id,
             ] {
                 state
                     .pending_consents
@@ -3813,13 +3753,6 @@ mod tests {
                 .await
                 .unwrap_err(),
             "expired-consent-denial",
-        );
-        assert_expired_callback(
-            manager
-                .decide_consent(&legacy_consent.consent_id, false)
-                .await
-                .unwrap_err(),
-            "expired-consent-legacy",
         );
     }
 
@@ -4680,8 +4613,7 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(&manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let code = url::Url::parse(&redirect.location)
@@ -4798,8 +4730,7 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let parsed = url::Url::parse(&redirect.location).expect("redirect URL");
@@ -4840,7 +4771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_grant_issuance_covers_all_six_scope_families() {
+    async fn default_grant_issuance_covers_every_scope_family() {
         let manager = DownstreamOauthManager::new_with_state_path(
             DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
@@ -4875,8 +4806,7 @@ mod tests {
             consent.scopes, expected,
             "scopeless authorization must request the sorted default grant"
         );
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(&manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let code = url::Url::parse(&redirect.location)
@@ -4946,16 +4876,30 @@ mod tests {
             .await
             .expect("begin authorization");
 
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .expect("start approval");
+        let mut assert = || {
+            authenticator.authentication_response(
+                &challenge.public_key.challenge,
+                &manager.owner_security.rp_id,
+                "https://plug.example.com",
+                true,
+            )
+        };
         let first = manager
-            .decide_consent(&consent.consent_id, true)
+            .finish_owner_approval(&challenge.ceremony_id, assert())
             .await
             .expect("approve consent");
         let repeated = manager
-            .decide_consent(&consent.consent_id, true)
+            .finish_owner_approval(&challenge.ceremony_id, assert())
             .await
             .expect("repeat approval");
         let later_denial = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("later denial");
 
@@ -4983,11 +4927,11 @@ mod tests {
             .expect("begin authorization");
 
         let first = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("deny consent");
         let repeated = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("repeat denial");
 
@@ -5019,7 +4963,7 @@ mod tests {
                 .await
                 .expect("begin authorization within cap");
             manager
-                .decide_consent(&consent.consent_id, false)
+                .deny_consent(&consent.consent_id, &consent.csrf_token)
                 .await
                 .expect("deny consent");
         }
@@ -5088,7 +5032,7 @@ mod tests {
             .await
             .expect("begin authorization");
         manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("deny consent");
 
@@ -5121,7 +5065,7 @@ mod tests {
             .await
             .expect("begin second authorization");
         manager
-            .decide_consent(&second.consent_id, false)
+            .deny_consent(&second.consent_id, &second.csrf_token)
             .await
             .expect("deny second consent");
         assert!(manager.revoke_client(&client.client_id).await.unwrap());

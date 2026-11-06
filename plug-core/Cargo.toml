@@ -61,6 +61,8 @@ serde_norway.workspace = true
 
 # Only for the `test-helpers` feature.
 plug-test-harness = { path = "../plug-test-harness", optional = true }
+ciborium = { workspace = true, optional = true }
+ed25519-dalek = { workspace = true, optional = true }
 
 # OAuth token storage
 fs4.workspace = true
@@ -77,7 +79,7 @@ linux-keyutils-keyring-store.workspace = true
 [features]
 # Test-only entry points for tests outside this crate's unit tests. Only
 # dev-dependencies enable it; a shipped build never does.
-test-helpers = ["dep:plug-test-harness"]
+test-helpers = ["dep:plug-test-harness", "dep:ciborium", "dep:ed25519-dalek"]
 
 [dev-dependencies]
 plug-core = { path = ".", features = ["test-helpers"] }

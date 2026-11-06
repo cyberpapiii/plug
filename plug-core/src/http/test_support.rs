@@ -47,7 +47,7 @@ pub(super) use tokio::sync::oneshot;
 pub(super) use tokio_util::sync::CancellationToken;
 pub(super) use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+use crate::downstream_oauth::test_owner::BrowserAuthenticator;
 use crate::downstream_oauth::{
     AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
 };
@@ -296,10 +296,10 @@ pub(crate) async fn issue_test_oauth_grant(
         })
         .await
         .expect("begin authorization");
-    let redirect = manager
-        .decide_consent(&consent.consent_id, true)
-        .await
-        .expect("approve consent");
+    let redirect =
+        crate::downstream_oauth::test_owner::approve_consent(manager, &consent.consent_id)
+            .await
+            .expect("approve consent");
     let code = url::Url::parse(&redirect.location)
         .expect("redirect URL")
         .query_pairs()
