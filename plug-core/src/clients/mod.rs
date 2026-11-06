@@ -10,16 +10,13 @@ mod lazy;
 
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
-
 pub use layout::{EntryShape, FileFormat, Layout, PlugLink, ServerEntry};
 pub use lazy::lazy_tool_policy;
 
 use crate::types::ClientType;
 
-/// A client Plug knows how to link. Serialized as its variant name, which the
-/// app reads in `plug import --output json`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+/// A client Plug knows how to link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ClientTarget {
     ClaudeDesktop,
     ClaudeCode,

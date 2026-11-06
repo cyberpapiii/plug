@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- `plug import --output json` no longer has a `source` field holding the client's internal variant name. `source_target` and `source_name` name the client, as before.
 - A server's `enrichment` setting is ignored, and changing it no longer says Plug must restart. It had stopped doing anything: Plug reads every tool's safety hints from its name and gives every tool its own title.
 - `plug doctor` and the app no longer list a "Tool names" check. It always passed and only said whether tool prefixing was on.
 - A client's servers and tools in the app show what the daemon enforces for it, as the daemon reports it, where the app used to work it out again from the client's lists. A client's summary now counts every tool it is kept from: a rule such as `git__*` counts each tool it covers, and an allow list counts each tool of a partly listed server that is not on it.
@@ -51,6 +52,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Importing a server whose name is taken, and whose `<name>-<client>` is taken too, adds it as `<name>-<client>-2` and so on. It used to replace the server already under that name.
 - A second account of a Google Workspace server gets the Workspace tool groups whatever the server is called. Only a server named `workspace` used to get them, so a second account of one named otherwise listed its tools under the same names as the first.
 - `plug doctor` fails on an unset `$NAME` only when Plug's own settings use it, and warns when a server does. A server whose name began with `plug`, such as `plugin-x`, used to fail the check.
 - Only the client named in `subscriber_client_id` may subscribe to Slack events. Another remote client with the events scope used to be let in.
