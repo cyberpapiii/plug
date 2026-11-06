@@ -58,9 +58,8 @@ final class ClientRepairServiceTests: XCTestCase {
         )
         let service = ClientRepairService(runner: runner)
 
-        let result = try await service.repairAll(canonicalExecutable: canonicalExecutable)
+        try await service.repairAll(canonicalExecutable: canonicalExecutable)
 
-        XCTAssertEqual(result, ClientRepairResult(examined: 3, repaired: 1, unchanged: 2))
         let calls = await runner.calls
         XCTAssertEqual(calls.map(\.arguments), [
             ["repair", "--all", "--output", "json"],
@@ -81,7 +80,7 @@ final class ClientRepairServiceTests: XCTestCase {
         let service = ClientRepairService(runner: runner)
 
         do {
-            _ = try await service.repairAll(canonicalExecutable: canonicalExecutable)
+            try await service.repairAll(canonicalExecutable: canonicalExecutable)
             XCTFail("Expected command failure")
         } catch let error as ClientRepairError {
             XCTAssertEqual(error, .commandFailed(status: 23, stderr: "permission denied"))

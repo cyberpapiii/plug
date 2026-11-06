@@ -9,7 +9,7 @@ import XCTest
 final class DaemonServiceManagerTests: XCTestCase {
     func testStopUnregistersOwnedServiceWithoutStartingOrSuspendingClients() async throws {
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
-        let backend = FakeDaemonBackend(enabled: true, handshakes: [handshake("0.7.0")])
+        let backend = FakeDaemonBackend(enabled: true, handshakes: [makeTestHandshake(version: "0.7.0")])
         let manager = makeManager(inspector: SequenceLaunchdInspector([
             .appManagedCurrent(current), .appManagedCurrent(current),
         ]), backend: backend)
@@ -31,14 +31,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         XCTAssertTrue(backend.events.isEmpty)
     }
 
-    private let canonical = VerifiedAppInstallation(
-        bundleURL: URL(fileURLWithPath: "/Applications/Plug.app"),
-        executableURL: URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
-        appVersion: "0.7.0",
-        buildVersion: "20",
-        embeddedVersion: "0.7.0",
-        teamID: "HJF7LN64XX"
-    )
+    private let canonical = makeTestInstallation()
 
     func testAdoptRecognizedLegacyReinspectsWithInspectTimeProgramURLs() async throws {
         let cellar = record(
@@ -52,7 +45,7 @@ final class DaemonServiceManagerTests: XCTestCase {
             .recognizedLegacy([cellar]),
             .appManagedCurrent(current),
         ])
-        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.3"), handshake("0.7.0")])
+        let backend = FakeDaemonBackend(handshakes: [makeTestHandshake(version: "0.6.3"), makeTestHandshake(version: "0.7.0")])
         let manager = makeManager(inspector: inspector, backend: backend)
         let snapshot = try await manager.inspect(canonical: canonical, legacyPaths: [])
 
@@ -78,7 +71,7 @@ final class DaemonServiceManagerTests: XCTestCase {
             .unmanaged,
             .appManagedCurrent(current),
         ])
-        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.3"), handshake("0.7.0")])
+        let backend = FakeDaemonBackend(handshakes: [makeTestHandshake(version: "0.6.3"), makeTestHandshake(version: "0.7.0")])
         let manager = makeManager(inspector: inspector, backend: backend)
         let snapshot = try await manager.inspect(canonical: canonical, legacyPaths: [])
 
@@ -100,7 +93,7 @@ final class DaemonServiceManagerTests: XCTestCase {
             .recognizedLegacy([legacy]),
             .appManagedCurrent(current),
         ])
-        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.4"), handshake("0.6.4"), handshake("0.7.0")])
+        let backend = FakeDaemonBackend(handshakes: [makeTestHandshake(version: "0.6.4"), makeTestHandshake(version: "0.6.4"), makeTestHandshake(version: "0.7.0")])
         let manager = makeManager(inspector: inspector, backend: backend)
         let snapshot = try await manager.inspect(canonical: canonical, legacyPaths: [legacy.programURL!])
 
@@ -135,7 +128,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         ])
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: [handshake("0.6.4"), handshake("0.7.0")]
+            handshakes: [makeTestHandshake(version: "0.6.4"), makeTestHandshake(version: "0.7.0")]
         )
         let manager = makeManager(inspector: inspector, backend: backend)
 
@@ -158,7 +151,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
         let inspector = SequenceLaunchdInspector([.appManagedStale(stale), .appManagedCurrent(current)])
-        let backend = FakeDaemonBackend(enabled: true, handshakes: [handshake("0.6.4"), handshake("0.7.0")])
+        let backend = FakeDaemonBackend(enabled: true, handshakes: [makeTestHandshake(version: "0.6.4"), makeTestHandshake(version: "0.7.0")])
         backend.registerFailuresLeft = 1
         let manager = makeManager(inspector: inspector, backend: backend)
 
@@ -174,7 +167,7 @@ final class DaemonServiceManagerTests: XCTestCase {
     func testConnectorsResumeWhenReplacementFails() async throws {
         let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
         let inspector = SequenceLaunchdInspector([.appManagedStale(stale)])
-        let backend = FakeDaemonBackend(enabled: true, handshakes: [handshake("0.6.4")])
+        let backend = FakeDaemonBackend(enabled: true, handshakes: [makeTestHandshake(version: "0.6.4")])
         backend.registerError = TestFailure.register
         let manager = makeManager(inspector: inspector, backend: backend)
 
@@ -199,7 +192,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: Array(repeating: handshake("0.6.4"), count: 4)
+            handshakes: Array(repeating: makeTestHandshake(version: "0.6.4"), count: 4)
         )
         let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 3)
 
@@ -219,7 +212,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 3))
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: Array(repeating: handshake("0.7.0", executable: nil), count: 2)
+            handshakes: Array(repeating: makeTestHandshake(version: "0.7.0", executable: nil), count: 2)
         )
         let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 1)
 
@@ -238,7 +231,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector([.appManagedCurrent(current)])
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: [handshake("0.7.0", executable: canonical.executableURL)]
+            handshakes: [makeTestHandshake(version: "0.7.0", executable: canonical.executableURL)]
         )
         let manager = makeManager(inspector: inspector, backend: backend)
 
@@ -259,7 +252,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 3))
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: Array(repeating: handshake("0.7.0", executable: otherAppExecutable), count: 3)
+            handshakes: Array(repeating: makeTestHandshake(version: "0.7.0", executable: otherAppExecutable), count: 3)
         )
         let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 1)
 
@@ -282,7 +275,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 3))
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: Array(repeating: handshake("0.7.0", executable: otherAppExecutable), count: 2)
+            handshakes: Array(repeating: makeTestHandshake(version: "0.7.0", executable: otherAppExecutable), count: 2)
         )
         let manager = makeManager(inspector: inspector, backend: backend, retryLimit: 1)
 
@@ -300,7 +293,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector([.appManagedCurrent(current)])
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: [handshake("0.7.0", executable: handshakeExecutable)]
+            handshakes: [makeTestHandshake(version: "0.7.0", executable: handshakeExecutable)]
         )
         let manager = makeManager(inspector: inspector, backend: backend)
 
@@ -314,7 +307,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector([.appManagedCurrent(current), .appManagedCurrent(current)])
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: [handshake("0.7.0"), handshake("0.7.0")]
+            handshakes: [makeTestHandshake(version: "0.7.0"), makeTestHandshake(version: "0.7.0")]
         )
         let manager = makeManager(inspector: inspector, backend: backend)
 
@@ -364,7 +357,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let stale = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "19")
         let changed = record(label: "com.plug.daemon", path: "/tmp/replaced-by-someone-else", build: nil)
         let inspector = SequenceLaunchdInspector([.appManagedStale(stale), .unknown([changed])])
-        let backend = FakeDaemonBackend(handshakes: [handshake("0.6.4")])
+        let backend = FakeDaemonBackend(handshakes: [makeTestHandshake(version: "0.6.4")])
         let manager = makeManager(inspector: inspector, backend: backend)
 
         do {
@@ -381,7 +374,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let current = record(label: "com.plug.daemon", path: canonical.executableURL.path, build: "20")
         let changed = record(label: "com.plug.daemon", path: "/tmp/replaced-by-someone-else", build: nil)
         let inspector = SequenceLaunchdInspector([.appManagedCurrent(current), .unknown([changed])])
-        let backend = FakeDaemonBackend(handshakes: [handshake("0.7.0")])
+        let backend = FakeDaemonBackend(handshakes: [makeTestHandshake(version: "0.7.0")])
         let manager = makeManager(inspector: inspector, backend: backend)
 
         do {
@@ -426,7 +419,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let inspector = SequenceLaunchdInspector(Array(repeating: .appManagedCurrent(current), count: 5))
         let backend = FakeDaemonBackend(
             enabled: true,
-            handshakes: [handshake("0.7.0")],
+            handshakes: [makeTestHandshake(version: "0.7.0")],
             handshakeFailures: [
                 PlugIPCError.systemCall("connect", ECONNREFUSED),
                 PlugIPCError.systemCall("connect", ECONNREFUSED),
@@ -462,8 +455,7 @@ final class DaemonServiceManagerTests: XCTestCase {
             label: label,
             programURL: URL(fileURLWithPath: path),
             parentBundleIdentifier: build == nil ? nil : "com.cyberpapiii.plug",
-            parentBundleVersion: build,
-            loaded: true
+            parentBundleVersion: build
         )
     }
 
@@ -589,12 +581,4 @@ private final class FakeDaemonBackend: DaemonServiceBackend {
     }
 
     func openLoginItemSettings() {}
-}
-
-private func handshake(_ version: String, executable: URL? = URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug")) -> OperatorHandshake {
-    let executableJSON = executable.map { "\"daemonExecutable\":\"\($0.path)\", " } ?? ""
-    let json = """
-    {"daemonVersion":"\(version)",\(executableJSON)"ipcMin":3,"ipcMax":4,"ownership":"app","capabilities":[]}
-    """
-    return try! JSONDecoder().decode(OperatorHandshake.self, from: Data(json.utf8))
 }

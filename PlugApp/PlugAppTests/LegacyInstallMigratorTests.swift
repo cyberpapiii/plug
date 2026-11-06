@@ -163,8 +163,6 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
     func testCargoBinaryIsRetainedUntilExactProofThenDeleted() async throws {
         let identity = LegacyBinaryIdentity(
-            identifier: "plug",
-            teamID: AppInstallationInspector.teamID,
             sha256: "legacy-digest"
         )
         let fixture = try Fixture(
@@ -179,50 +177,28 @@ final class LegacyInstallMigratorTests: XCTestCase {
         XCTAssertEqual(snapshot.cargoBinary, fixture.cargo)
         XCTAssertEqual(snapshot.cargoBinaryIdentity, identity)
 
-        try await fixture.migrator.removeVerifiedCargoBinary(
-            snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.6.4",
-                shellTarget: fixture.canonical.executableURL,
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargo.path))
+        // A daemon of another version, or a shell command that runs something
+        // else, proves nothing, so there is no proof to remove the copy with.
+        XCTAssertNil(OwnDaemonProof(
+            app: fixture.canonical,
+            handshake: makeTestHandshake(version: "0.6.4", executable: fixture.canonical.executableURL),
+            shellLink: .canonical(fixture.canonical.executableURL)
+        ))
+        XCTAssertNil(OwnDaemonProof(
+            app: fixture.canonical,
+            handshake: makeTestHandshake(version: "0.7.0", executable: fixture.canonical.executableURL),
+            shellLink: .canonical(URL(fileURLWithPath: "/tmp/plug"))
+        ))
 
         try await fixture.migrator.removeVerifiedCargoBinary(
             snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.7.0",
-                shellTarget: URL(fileURLWithPath: "/tmp/plug"),
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: fixture.cargo.path))
-
-        try await fixture.migrator.removeVerifiedCargoBinary(
-            snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.7.0",
-                shellTarget: fixture.canonical.executableURL,
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
+            proof: fixture.proof
         )
         XCTAssertFalse(FileManager.default.fileExists(atPath: fixture.cargo.path))
     }
 
     func testCargoReplacementAfterInspectionIsNeverDeleted() async throws {
         let identity = LegacyBinaryIdentity(
-            identifier: "plug",
-            teamID: AppInstallationInspector.teamID,
             sha256: "legacy-digest"
         )
         let fixture = try Fixture(
@@ -238,14 +214,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
         try await fixture.migrator.removeVerifiedCargoBinary(
             snapshot,
-            proof: ReconciliationProof(
-                appVersion: "0.7.0",
-                embeddedVersion: "0.7.0",
-                daemonVersion: "0.7.0",
-                shellTarget: fixture.canonical.executableURL,
-                daemonExecutable: fixture.canonical.executableURL,
-                appManaged: true
-            )
+            proof: fixture.proof
         )
 
         XCTAssertEqual(try String(contentsOf: fixture.cargo, encoding: .utf8), "unknown replacement")
@@ -253,8 +222,6 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
     func testCargoDirectoryReplacementAfterIdentityCheckIsPreserved() async throws {
         let identity = LegacyBinaryIdentity(
-            identifier: "plug",
-            teamID: AppInstallationInspector.teamID,
             sha256: "legacy-digest"
         )
         let fixture = try Fixture(
@@ -280,14 +247,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
         do {
             try await fixture.migrator.removeVerifiedCargoBinary(
                 snapshot,
-                proof: ReconciliationProof(
-                    appVersion: "0.7.0",
-                    embeddedVersion: "0.7.0",
-                    daemonVersion: "0.7.0",
-                    shellTarget: fixture.canonical.executableURL,
-                    daemonExecutable: fixture.canonical.executableURL,
-                    appManaged: true
-                )
+                proof: fixture.proof
             )
             XCTFail("Expected replacement directory to fail closed")
         } catch let error as LegacyInstallError {
@@ -333,6 +293,14 @@ private final class Fixture {
     let brew: URL
     let canonical: VerifiedAppInstallation
     let migrator: LegacyInstallMigrator
+    /// The app's own daemon answering, with the shell command linked to it.
+    var proof: OwnDaemonProof {
+        OwnDaemonProof(
+            app: canonical,
+            handshake: makeTestHandshake(version: canonical.appVersion, executable: canonical.executableURL),
+            shellLink: .canonical(canonical.executableURL)
+        )!
+    }
 
     init(
         runner: any ProcessRunning = RecordingProcessRunner { _, _ in
@@ -348,14 +316,7 @@ private final class Fixture {
         brew = root.appending(path: "trusted/brew")
         let app = root.appending(path: "Applications/Plug.app")
         let executable = app.appending(path: "Contents/Resources/plug")
-        canonical = VerifiedAppInstallation(
-            bundleURL: app,
-            executableURL: executable,
-            appVersion: "0.7.0",
-            buildVersion: "20",
-            embeddedVersion: "0.7.0",
-            teamID: "HJF7LN64XX"
-        )
+        canonical = makeTestInstallation(bundle: app)
         try FileManager.default.createDirectory(at: shellLink.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: cargo.deletingLastPathComponent(), withIntermediateDirectories: true)
         try FileManager.default.createDirectory(at: executable.deletingLastPathComponent(), withIntermediateDirectories: true)

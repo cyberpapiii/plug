@@ -33,7 +33,7 @@ struct PlugPopover: View {
                 call: latest.map(model.call),
                 callID: latest?.sequence
             ),
-            error: model.actionError,
+            error: model.actions.actionError,
             power: ServicePowerToggle(model: model, run: run).labelsHidden(),
             send: send,
             quit: { run(.quit) }
@@ -51,16 +51,6 @@ struct PlugPopover: View {
             latest = index
         }
         return latest.map { activities[$0] }
-    }
-
-    /// The newest tool calls. Listing, pings, and other protocol traffic are
-    /// not what anyone opens the panel to see.
-    static func recentCalls(_ activities: [ActivityEvent], limit: Int) -> [ActivityEvent] {
-        activities
-            .filter { $0.tool?.isEmpty == false }
-            .sorted { $0.sequence > $1.sequence }
-            .prefix(limit)
-            .map { $0 }
     }
 
     /// Window-opening actions close the menu panel first. Otherwise its

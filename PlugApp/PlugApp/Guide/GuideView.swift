@@ -36,7 +36,7 @@ struct GuideView: View {
             }
             .padding(.horizontal, Metric.roomy)
         }
-        .task { await model.loadConnectableApps() }
+        .task { await model.actions.loadConnectableApps() }
     }
 
     private var doneSteps: Int { FirstRunGuide.Step.allCases.filter(guide.isDone).count }

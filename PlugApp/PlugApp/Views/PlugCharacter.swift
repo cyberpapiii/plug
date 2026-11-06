@@ -53,7 +53,7 @@ enum PlugMark {
 }
 
 /// Plug's mark, with a face for each thing Plug can be: awake, working,
-/// worried, asleep and the rest of `Mood`. Going from one face to the next it
+/// worried, asleep and the rest of `PlugMood`. Going from one face to the next it
 /// changes shape on springs; nothing is swapped. The prongs move like ears,
 /// and the two prongs and the body can pull apart into three dots, an
 /// exclamation mark, or one dot. A small mark beside it, a dot, a "?" or a
@@ -65,69 +65,7 @@ enum PlugMark {
 /// mark beside it takes that colour and the "z"s go grey, so the character
 /// itself can stay Plug blue while the mark says how bad things are.
 struct PlugCharacter: View {
-    enum Mood: Equatable, Sendable, CaseIterable {
-        /// Everything is working.
-        case awake
-        /// Something just came right.
-        case happy
-        /// A first: a server, a client, a tool call, a step done.
-        case cheering
-        /// It was clicked.
-        case wink
-        /// Waiting for a first something, on a page with nothing on it yet.
-        case curious
-        case surprised
-        /// Starting or busy.
-        case working
-        /// Something is taking a while.
-        case thinking
-        /// A page is loading: the three parts are three dots.
-        case loading
-        /// Sign in, or allow something.
-        case needsYou
-        /// Some of it works and some does not.
-        case unsure
-        /// Several things are wrong at once: its eyes are swirls.
-        case dizzy
-        /// Something stopped.
-        case worried
-        /// Plug cannot go on: the three parts are an exclamation mark.
-        case alert
-        /// Plug itself is stopped: its eyes are crosses.
-        case out
-        /// Plug is off.
-        case asleep
-        /// Out of the way: the three parts are one dot.
-        case tucked
-
-        /// The face for a tone when nothing says more.
-        init(_ tone: Verdict.Tone) {
-            switch tone {
-            case .good: self = .awake
-            case .quiet: self = .asleep
-            case .busy: self = .working
-            case .attention: self = .needsYou
-            case .blocked: self = .alert
-            }
-        }
-
-        /// Coming out of one of these into all-is-well is a relief.
-        fileprivate var isTrouble: Bool {
-            switch self {
-            case .working, .thinking, .needsYou, .unsure, .dizzy, .worried, .alert, .out: true
-            default: false
-            }
-        }
-
-        fileprivate var blinks: Bool {
-            switch self {
-            case .awake, .happy, .curious, .thinking, .needsYou: true
-            default: false
-            }
-        }
-    }
-
-    let mood: Mood
+    let mood: PlugMood
     /// Each time this goes up, the character cheers: it hops and sparks fly
     /// off its prongs, as when a step is done.
     var cheers = 0
@@ -156,7 +94,7 @@ struct PlugCharacter: View {
         var nudges: Int
     }
 
-    init(mood: Mood, cheers: Int = 0, mark: Color? = nil) {
+    init(mood: PlugMood, cheers: Int = 0, mark: Color? = nil) {
         self.mood = mood
         self.cheers = cheers
         self.mark = mark
@@ -403,7 +341,7 @@ struct PlugPose: Equatable, Sendable {
 
     /// The face for `mood`, `time` seconds after it began. `moving` is false
     /// for the one pose a face holds when nothing may move.
-    static func pose(for mood: PlugCharacter.Mood, at time: TimeInterval, moving: Bool) -> PlugPose {
+    static func pose(for mood: PlugMood, at time: TimeInterval, moving: Bool) -> PlugPose {
         let t = moving ? CGFloat(time) : 0
         /// True for `lasts` seconds out of every `every`.
         func pulse(_ shift: CGFloat, every: CGFloat, lasts: CGFloat) -> Bool {
@@ -483,7 +421,7 @@ struct PlugPose: Equatable, Sendable {
     /// When the face for `mood` next changes by itself, in seconds after it
     /// began, looking from `time`. Never, for a face that holds still. Keep
     /// it in step with `pose` above.
-    static func nextChange(for mood: PlugCharacter.Mood, after time: TimeInterval) -> TimeInterval {
+    static func nextChange(for mood: PlugMood, after time: TimeInterval) -> TimeInterval {
         /// The next start or end of a pulse.
         func edge(_ shift: TimeInterval, every: TimeInterval, lasts: TimeInterval) -> TimeInterval {
             let phase = (time + shift).truncatingRemainder(dividingBy: every)
@@ -518,10 +456,10 @@ final class PlugPuppet {
     /// How far ahead `isResting` looks for the next movement, in seconds.
     static let lookAhead: TimeInterval = 0.25
 
-    private var mood: PlugCharacter.Mood
+    private var mood: PlugMood
     private var since: TimeInterval
     /// A face put on for a moment, over the one for the state.
-    private var act: (mood: PlugCharacter.Mood, since: TimeInterval, until: TimeInterval)?
+    private var act: (mood: PlugMood, since: TimeInterval, until: TimeInterval)?
     private var pose: PlugPose
     private var speed = PlugPose.still
     private var last: TimeInterval?
@@ -530,7 +468,7 @@ final class PlugPuppet {
     private var nextBlink: TimeInterval
     private var tappedAt = -TimeInterval.infinity
 
-    init(_ mood: PlugCharacter.Mood) {
+    init(_ mood: PlugMood) {
         let now = Self.now
         self.mood = mood
         since = now
@@ -542,13 +480,13 @@ final class PlugPuppet {
     private static let sparkTime: TimeInterval = 0.6
     private static let blinkTime: TimeInterval = 0.22
 
-    private var showing: PlugCharacter.Mood { act?.mood ?? mood }
+    private var showing: PlugMood { act?.mood ?? mood }
 
     private func goal(at time: TimeInterval, moving: Bool = true) -> PlugPose {
         PlugPose.pose(for: showing, at: time - (act?.since ?? since), moving: moving)
     }
 
-    func show(_ new: PlugCharacter.Mood, moving: Bool) {
+    func show(_ new: PlugMood, moving: Bool) {
         guard new != mood else { return }
         let relieved = new == .awake && mood.isTrouble
         mood = new
@@ -567,7 +505,7 @@ final class PlugPuppet {
     /// A click is a wink. Keep clicking and it goes through every face.
     func tap() {
         let now = Self.now
-        let faces = PlugCharacter.Mood.allCases
+        let faces = PlugMood.allCases
         if now - tappedAt < 3, let act, let index = faces.firstIndex(of: act.mood) {
             perform(faces[(index + 1) % faces.count], for: 3)
         } else {
@@ -576,14 +514,14 @@ final class PlugPuppet {
         tappedAt = now
     }
 
-    private func perform(_ mood: PlugCharacter.Mood, for seconds: TimeInterval) {
+    private func perform(_ mood: PlugMood, for seconds: TimeInterval) {
         let now = Self.now
         act = (mood, now, now + seconds)
         enter(mood)
     }
 
     /// How a face arrives, beyond changing shape.
-    private func enter(_ mood: PlugCharacter.Mood) {
+    private func enter(_ mood: PlugMood) {
         switch mood {
         case .cheering:
             hop(1.3)
@@ -883,13 +821,30 @@ enum PlugDrawing {
 /// the words.
 struct PlugCharacterLabel: View {
     let title: String
-    let mood: PlugCharacter.Mood
+    let mood: PlugMood
 
     var body: some View {
         Label {
             Text(title)
         } icon: {
             PlugCharacter(mood: mood).frame(width: 52, height: 52)
+        }
+    }
+}
+
+extension PlugMood {
+    /// Coming out of one of these into all-is-well is a relief.
+    fileprivate var isTrouble: Bool {
+        switch self {
+        case .working, .thinking, .needsYou, .unsure, .dizzy, .worried, .alert, .out: true
+        default: false
+        }
+    }
+
+    fileprivate var blinks: Bool {
+        switch self {
+        case .awake, .happy, .curious, .thinking, .needsYou: true
+        default: false
         }
     }
 }

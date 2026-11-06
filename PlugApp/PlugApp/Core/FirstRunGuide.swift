@@ -105,14 +105,3 @@ struct FirstMoments: Equatable, Sendable {
         return FirstRunGuide.Step.allCases.last { done.contains($0) && !marked.contains($0) }
     }
 }
-
-extension AppModel {
-    /// Where this Mac is in the three steps.
-    var firstRunGuide: FirstRunGuide {
-        FirstRunGuide(
-            serverCount: snapshot.configuredServers.count,
-            clientCount: connectableApps.filter { $0.linked || $0.live }.count + snapshot.downstreamClients.count,
-            hasActivity: !activities.isEmpty
-        )
-    }
-}

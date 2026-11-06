@@ -201,15 +201,13 @@ struct ImportServersView: View {
         refused = [:]
         let wanted = scan.servers.filter { chosen.contains($0.id) }
         Task {
-            var failed: [String: String] = [:]
-            for server in wanted {
-                do {
-                    try await model.performOperation {
-                        .addServer(authToken: $0, name: server.name, server: server.config)
-                    }
-                } catch {
-                    failed[server.id] = error.localizedDescription
-                }
+            let failed: [String: String]
+            do {
+                failed = try await model.actions.importServers(wanted)
+            } catch {
+                importing = false
+                failure = error.localizedDescription
+                return
             }
             importing = false
             guard !failed.isEmpty else {

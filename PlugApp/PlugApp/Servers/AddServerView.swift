@@ -199,7 +199,7 @@ struct AddServerView: View {
         choiceFailure = nil
         guard let spec = apiSpec else { return }
         do {
-            let api = try await model.describeAPI(spec)
+            let api = try await model.actions.describeAPI(spec)
             guard !Task.isCancelled else { return }
             let read = APIOperationChoice(api: api)
             choice = read
@@ -285,12 +285,7 @@ struct AddServerView: View {
         let store = form.keyStore.sent
         Task {
             do {
-                try await model.performOperation {
-                    .validateServer(authToken: $0, name: finalName, server: saved)
-                }
-                try await model.performOperation {
-                    .addServer(authToken: $0, name: finalName, server: saved, secretStore: store)
-                }
+                try await model.actions.addServer(finalName, saved, secretStore: store)
                 saving = false
                 router.reveal(server: finalName)
                 dismiss()

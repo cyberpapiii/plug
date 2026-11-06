@@ -35,23 +35,6 @@ public actor PlugIPCClient {
         if descriptor >= 0 { Darwin.close(descriptor) }
     }
 
-    // Keep package-level callers source-compatible while app callers pass the
-    // installed bundle version explicitly.
-    public init(
-        socketURL: URL = PlugIPCClient.defaultSocketURL,
-        requestTimeout: TimeInterval = 3
-    ) {
-        self.init(
-            socketURL: socketURL,
-            clientVersion: Self.bundleClientVersion,
-            requestTimeout: requestTimeout
-        )
-    }
-
-    private static var bundleClientVersion: String {
-        clientVersion(from: Bundle.main.infoDictionary ?? [:])
-    }
-
     public static func clientVersion(from infoDictionary: [String: Any]) -> String {
         guard let version = infoDictionary["CFBundleShortVersionString"] as? String else {
             return "development"

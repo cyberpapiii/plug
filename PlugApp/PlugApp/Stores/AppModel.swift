@@ -2,20 +2,9 @@ import Foundation
 import Observation
 import PlugIPC
 
-@MainActor
-protocol InstallationCoordinating: AnyObject {
-    var state: InstallationState { get }
-    func reconcile(trigger: ReconciliationTrigger) async
-    func adopt() async
-    func retry() async
-    func restartService() async throws
-    func stopService() async throws
-    func openLog()
-}
-
-@MainActor
-extension InstallationCoordinator: InstallationCoordinating {}
-
+/// What Plug looks like right now, read from the daemon on a poll, and the
+/// one place the interface reads it from. Changes go through `actions`;
+/// installation work and the on/off switch go through `gate`.
 @MainActor @Observable
 final class AppModel {
     /// `reconnecting` is a working connection that just dropped. A daemon swap
@@ -34,7 +23,7 @@ final class AppModel {
         var id: String { configured.name }
         var health: ServerHealth {
             ServerHealth(
-                daemonValue: configured.enabled ? runtime?.health : "Disabled",
+                daemonValue: runtime?.health,
                 enabled: configured.enabled,
                 daemonUptimeSecs: daemonUptimeSecs
             )
@@ -42,85 +31,28 @@ final class AppModel {
         var toolCount: Int { runtime?.toolCount ?? 0 }
     }
 
-    private let ipc: PlugIPCClient
-    private let coordinator: any InstallationCoordinating
-    private let appLinker: any AppLinking
-    private let tokenURL: URL
-    private let clientVersion: String
-    private let serviceDisabledURL: URL
-    private(set) var serviceEnabled: Bool
-    private(set) var isChangingService = false
-    static var defaultServiceDisabledURL: URL {
-        PlugIPCClient.defaultSocketURL.deletingLastPathComponent().appending(path: "service-disabled")
-    }
+    let gate: ReconciliationGate
+    let actions: PlugActions
+    private let daemon: DaemonClient
     private var monitoringTask: Task<Void, Never>?
     private var refreshTask: Task<Void, Never>?
     private var refreshRequestedAgain = false
     private var refreshAgainForcesCatalog = false
-    private var reconciliationTask: Task<Void, Never>?
     private var hasStarted = false
-    private var reconciliationInFlight = false
     private var attemptedSkewRecovery = false
     /// Not `.disconnected`: before the first handshake nobody has asked, and
     /// "Plug is not running" is an answer, not a question.
     private(set) var connectionState: ConnectionState = .connecting
     private(set) var snapshot: OperatorSnapshot = .empty
     private(set) var hasLoadedSnapshot = false
-    /// Called with each snapshot read. The app uses it to find icons; a
-    /// model under test leaves it unset and asks the daemon nothing extra.
-    @ObservationIgnored var snapshotDidLoad: ((OperatorSnapshot) -> Void)?
-    private(set) var activities: [ActivityEvent] = []
-    /// How far back the history goes. The daemon keeps a bounded ring, so this
-    /// is the whole of what can be asked for, not a page of a longer list.
-    static let activityLimit = 200
-    /// True only after Plug has actually discarded older rows. Reaching exactly
-    /// 200 events is not proof that a 201st event exists.
-    private(set) var activityWasTruncated = false
-    var activityIsCapped: Bool { activityWasTruncated }
-    /// The one line Activity shows about its list: how many calls, how many
-    /// of them failed, and whether older ones were dropped. Nil with no calls.
-    var activitySummary: String? {
-        guard hasLoadedSnapshot, !activities.isEmpty else { return nil }
-        let count = activities.count
-        let failed = activities.filter { CallFacts($0).failed }.count
-        var summary = activityIsCapped
-            ? "Latest \(Self.activityLimit) calls"
-            : "\(count) recent \(count == 1 ? "call" : "calls")"
-        if failed > 0 { summary += ", \(failed) failed" }
-        return dataIsStale ? "Last known · \(summary)" : summary
-    }
+    /// Called with each snapshot read, for what the app keeps beside the
+    /// model: notifications and icons. A model under test leaves it unset.
+    @ObservationIgnored var snapshotDidLoad: (@MainActor (OperatorSnapshot) -> Void)?
+    private(set) var activity = ActivityLog()
     /// Why the last read of the daemon failed. Polling owns this: the next
     /// good read clears it, and the verdict already says Plug is unreachable.
     private(set) var connectionError: String?
-    /// A button press that failed. Kept apart from `connectionError` because a
-    /// poll that succeeds says nothing about the press, and clearing one with
-    /// the other used to wipe the message before anyone could read it.
-    private(set) var actionError: ActionError?
-    private(set) var signingInServers: Set<String> = []
-    /// The running `plug auth login` per server, so Cancel and Try Again can
-    /// stop it instead of leaving it waiting on the browser.
-    private var signInTasks: [String: Task<Void, Never>] = [:]
     private(set) var toolCatalog = ToolCatalog()
-    private(set) var connectableApps: [LinkableApp] = []
-    private(set) var hasLoadedConnectableApps = false
-    private(set) var isLoadingConnectableApps = false
-    private(set) var connectableAppsError: String?
-    private(set) var busyApps: Set<String> = []
-    private(set) var busyTools: Set<String> = []
-    private(set) var isRestartingService = false
-    private var capabilities: Set<String> = []
-    private var toolCatalogRevision: UInt64?
-
-    /// The daemon accepts per-tool switches. Older daemons do not, and the
-    /// interface hides the switches rather than offering a button that fails.
-    var canManageTools: Bool { capabilities.contains("tool_mutation") }
-    /// The daemon can return one complete server definition. Older daemons
-    /// cannot, and Edit Server must not send GetServerConfig until they can.
-    var canReadServerConfig: Bool { capabilities.contains("server_config_read") }
-    /// Same restart/update sentence Edit Server shows when that capability is
-    /// missing, so a Save that never fires is not mistaken for a parse error.
-    nonisolated static let serverConfigReadRequiredCopy =
-        "Restart Plug to finish updating, then edit this server."
     /// Someone is looking at Plug right now, so refresh briskly. Nothing is
     /// visible otherwise, and a background poll every few seconds is rude to
     /// a laptop battery for information no one is reading.
@@ -133,9 +65,53 @@ final class AppModel {
     private let foregroundPollInterval: Duration
     private let backgroundPollInterval: Duration
     private let reconnectGrace: Duration
-    private let authFlow: AuthFlowService
     /// When a working connection first failed, while it is `reconnecting`.
     private var connectionLostAt: ContinuousClock.Instant?
+
+    init(
+        ipc: PlugIPCClient? = nil,
+        coordinator: (any InstallationCoordinating)? = nil,
+        clientVersion: String = AppModel.defaultClientVersion,
+        tokenURL: URL = PlugIPCClient.defaultTokenURL,
+        appLinker: any AppLinking = AppLinkService(),
+        foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
+        backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
+        reconnectGrace: Duration = AppModel.reconnectGrace,
+        authFlow: AuthFlowService = AuthFlowService(),
+        serviceDisabled: ServiceDisabledMarker = .standard
+    ) {
+        let daemon = DaemonClient(
+            ipc: ipc ?? PlugIPCClient(clientVersion: clientVersion),
+            clientVersion: clientVersion,
+            tokenURL: tokenURL
+        )
+        self.daemon = daemon
+        // Built here and not as the default argument: Swift 6.1 crashes
+        // compiling that call in a default argument.
+        gate = ReconciliationGate(
+            coordinator: coordinator ?? InstallationCoordinator(laterRetryDelay: .seconds(300)),
+            marker: serviceDisabled
+        )
+        self.foregroundPollInterval = foregroundPollInterval
+        self.backgroundPollInterval = backgroundPollInterval
+        self.reconnectGrace = reconnectGrace
+        var canMutate: @MainActor () -> Bool = { false }
+        var refresh: @MainActor () async -> Void = {}
+        actions = PlugActions(
+            daemon: daemon,
+            appLinker: appLinker,
+            authFlow: authFlow,
+            canMutate: { canMutate() },
+            refresh: { await refresh() }
+        )
+        if !gate.serviceEnabled { connectionState = .disconnected }
+        canMutate = { [weak self] in self?.canMutate ?? false }
+        refresh = { [weak self] in await self?.refresh() }
+    }
+
+    var serviceEnabled: Bool { gate.serviceEnabled }
+    var activities: [ActivityEvent] { activity.events }
+    var activitySummary: String? { hasLoadedSnapshot ? activity.summary(stale: dataIsStale) : nil }
 
     private var pollInterval: Duration {
         let interval = watcherCount > 0 ? foregroundPollInterval : backgroundPollInterval
@@ -153,49 +129,6 @@ final class AppModel {
         if !wasWatched, monitoringTask != nil { startMonitoring() }
         Task { await refresh() }
     }
-
-    init(
-        ipc: PlugIPCClient? = nil,
-        coordinator: (any InstallationCoordinating)? = nil,
-        clientVersion: String = AppModel.defaultClientVersion,
-        tokenURL: URL = PlugIPCClient.defaultTokenURL,
-        appLinker: any AppLinking = AppLinkService(),
-        foregroundPollInterval: Duration = AppModel.foregroundPollInterval,
-        backgroundPollInterval: Duration = AppModel.backgroundPollInterval,
-        reconnectGrace: Duration = AppModel.reconnectGrace,
-        authFlow: AuthFlowService = AuthFlowService(),
-        serviceDisabledURL: URL = AppModel.defaultServiceDisabledURL
-    ) {
-        self.clientVersion = clientVersion
-        self.ipc = ipc ?? PlugIPCClient(clientVersion: clientVersion)
-        // Built here and not as the default argument: Swift 6.1 crashes
-        // compiling that call in a default argument.
-        self.coordinator = coordinator ?? InstallationCoordinator(laterRetryDelay: .seconds(300))
-        self.tokenURL = tokenURL
-        self.appLinker = appLinker
-        self.foregroundPollInterval = foregroundPollInterval
-        self.backgroundPollInterval = backgroundPollInterval
-        self.reconnectGrace = reconnectGrace
-        self.authFlow = authFlow
-        self.serviceDisabledURL = serviceDisabledURL
-        self.serviceEnabled = !FileManager.default.fileExists(atPath: serviceDisabledURL.path)
-        if !serviceEnabled { connectionState = .disconnected }
-    }
-
-    /// Read live rather than mirrored. A copy refreshed only when a
-    /// reconciliation ends reports the state the app was in before the work
-    /// started, which is how a repair in progress came to describe itself with
-    /// the pre-repair situation.
-    private var installationState: InstallationState { coordinator.state }
-
-    /// The installation is being looked at, not changed, so reading the
-    /// daemon alongside is safe.
-    private var isOnlyInspecting: Bool {
-        if case .reconcilingUpdate(.inspecting) = installationState { return true }
-        return false
-    }
-
-    private var readsAllowed: Bool { serviceEnabled && !isChangingService && (!reconciliationInFlight || isOnlyInspecting) }
 
     var visibleServers: [ServerPresentation] {
         let runtimeByName = Dictionary(snapshot.servers.map { ($0.serverId, $0) }, uniquingKeysWith: { first, _ in first })
@@ -220,15 +153,15 @@ final class AppModel {
     }
 
     /// Everything the interface needs to describe Plug, as one plain value.
-    ///
-    /// Built once per change. A page reads it a dozen times each time it is
-    /// drawn, and building it walks every server and every session.
+    /// A page reads it a dozen times each time it is drawn, and building it
+    /// walks every server and every session, so it is kept until one of its
+    /// inputs changes.
     var situation: PlugSituation {
         let key = SituationKey(
             revision: snapshotRevision,
-            setup: setupState,
-            runtime: runtimeState,
-            signingIn: signingInServers
+            setup: gate.setup,
+            runtime: runtime,
+            signingIn: actions.signingInServers
         )
         // Read so a view that only ever sees the kept value still follows
         // the snapshot.
@@ -252,13 +185,12 @@ final class AppModel {
     @ObservationIgnored private var keptSituation: (key: SituationKey, value: PlugSituation)?
 
     private func buildSituation() -> PlugSituation {
-        let connectedClients = connectedClients
+        let connectedClients = clientNames.connectedClients(snapshot.liveSessions)
         return PlugSituation(
-            setup: setupState,
-            runtime: runtimeState,
+            setup: gate.setup,
+            runtime: runtime,
             servers: serverFacts,
             connectedApps: connectedClients.count,
-            connectedAppTargets: connectedClients.map(\.target),
             connectedClients: connectedClients,
             version: snapshot.runtimeVersion
         )
@@ -279,14 +211,8 @@ final class AppModel {
         return CallFacts(event, ownerName: name, grantName: grant, place: place)
     }
 
-    /// Distinct connected apps, first seen first, so the panel's icon row is
-    /// stable while sessions come and go.
-    private var connectedClients: [ConnectedClient] {
-        clientNames.connectedClients(snapshot.liveSessions)
-    }
-
-    /// The names and places the owner gave clients. Built once per snapshot:
-    /// the Clients page asks for it for every session of every row.
+    /// The names and places the owner gave clients. The Clients page asks
+    /// for it for every session of every row, so it is built once a snapshot.
     var clientNames: ClientNames {
         // Read first, so a view that only ever sees the kept value still
         // follows the snapshot.
@@ -317,32 +243,16 @@ final class AppModel {
                 health: server.health,
                 toolCount: server.toolCount,
                 error: server.runtime?.error,
-                isSigningIn: signingInServers.contains(server.configured.name),
+                isSigningIn: actions.signingInServers.contains(server.configured.name),
                 tokenExpiresInSecs: account?.tokenExpiresInSecs,
                 authWarnings: account?.warnings ?? []
             )
         }
     }
 
-    private var setupState: PlugSituation.Setup {
-        if !serviceEnabled { return .ready }
-        switch installationState {
-        case .healthy: return .ready
-        case .adoptionRequired: return .needsPermission
-        // The first pass only reads the installation, and every launch runs it.
-        // Nothing is being set up there, so setup keeps quiet and the runtime
-        // verdict says the true thing: Plug is starting. The later phases do
-        // change the installation, and those are worth a word.
-        case .reconcilingUpdate(.inspecting), .reconcilingUpdate(.waitingToRetry): return .ready
-        case .reconcilingUpdate: return .settingUp
-        case let .repairableDrift(drift): return .needsRepair(detail: drift.detail)
-        case let .blocked(failure): return .blocked(detail: failure.detail, hasLog: failure.logURL != nil)
-        }
-    }
-
-    private var runtimeState: PlugSituation.Runtime {
-        if !serviceEnabled { return .off }
-        if isRestartingService { return .restarting }
+    private var runtime: PlugSituation.Runtime {
+        if !gate.serviceEnabled { return .off }
+        if gate.isRestartingService { return .restarting }
         switch connectionState {
         case .ready: return .running
         case .connecting: return .starting
@@ -357,7 +267,7 @@ final class AppModel {
     /// The version About shows: the daemon's once it has answered, the app's
     /// own before that. The two match except in the middle of an update.
     var displayVersion: String {
-        snapshot.runtimeVersion.isEmpty ? clientVersion : snapshot.runtimeVersion
+        snapshot.runtimeVersion.isEmpty ? daemon.clientVersion : snapshot.runtimeVersion
     }
 
     var isLoadingInitialData: Bool {
@@ -372,7 +282,17 @@ final class AppModel {
         hasLoadedSnapshot && connectionState != .ready
     }
 
-    var canMutate: Bool { serviceEnabled && !isChangingService && connectionState == .ready }
+    var canMutate: Bool { gate.serviceEnabled && !gate.isChangingService && connectionState == .ready }
+
+    /// Where this Mac is in the three first-run steps.
+    var firstRunGuide: FirstRunGuide {
+        FirstRunGuide(
+            serverCount: snapshot.configuredServers.count,
+            clientCount: actions.connectableApps.filter { $0.linked || $0.live }.count
+                + snapshot.downstreamClients.count,
+            hasActivity: !activities.isEmpty
+        )
+    }
 
     /// Recent calls that touched one server, newest first.
     func recentActivity(for server: String, limit: Int = 12) -> [ActivityEvent] {
@@ -383,19 +303,32 @@ final class AppModel {
             .map { $0 }
     }
 
+    // MARK: Reading the daemon
+
+    /// One complete server definition, for editing.
+    func serverConfig(name: String) async throws -> ServerConfig {
+        try await daemon.serverConfig(name: name)
+    }
+
+    /// What the daemon knows about where servers come from. See
+    /// `DaemonClient.origins(configsFor:)`.
+    func origins(configsFor names: [String]) async -> [String: ServerOrigin] {
+        await daemon.origins(configsFor: names)
+    }
+
     func start() async {
         guard !hasStarted else { return }
         hasStarted = true
-        guard serviceEnabled else { return }
+        guard gate.serviceEnabled else { return }
         // Every launch opens with a pass that only reads the installation,
         // and the daemon is nearly always already running. Waiting for the
         // pass before asking the daemon anything kept a healthy Plug on
         // "Starting…" for seconds.
-        let readsDuringLaunch = isOnlyInspecting
+        let readsDuringLaunch = gate.isOnlyInspecting
         // A task of the model's own: the surface that asked may go away before
         // launch is over, and Plug must still end up watching the daemon.
         await Task {
-            let launch = Task { await reconcile(trigger: .applicationLaunch) }
+            let launch = Task { await gate.reconcile(trigger: .applicationLaunch) }
             if readsDuringLaunch { await refresh() }
             await launch.value
             await refresh()
@@ -417,28 +350,23 @@ final class AppModel {
         }
     }
 
+    // MARK: Installation and the service
+
     func reconcile(trigger: ReconciliationTrigger) async {
-        guard serviceEnabled, !isChangingService else { return }
-        await runReconciliation { [coordinator] in
-            await coordinator.reconcile(trigger: trigger)
-        }
+        await gate.reconcile(trigger: trigger)
     }
 
     func adopt() async {
-        await runReconciliation { [coordinator] in
-            await coordinator.adopt()
-        }
+        await gate.reconcile(trigger: .explicitAdoption)
     }
 
     func retry() async {
-        await ipc.disconnect()
-        await runReconciliation { [coordinator] in
-            await coordinator.retry()
-        }
+        await daemon.disconnect()
+        await gate.reconcile(trigger: .retry)
     }
 
     func retryConnection() async {
-        if !serviceEnabled { await setServiceEnabled(true); return }
+        if !gate.serviceEnabled { await setServiceEnabled(true); return }
         attemptedSkewRecovery = false
         // Someone pressed Start. Polls no longer flip a stopped Plug to
         // "Starting…", so the press is the one place that says it is trying.
@@ -447,76 +375,49 @@ final class AppModel {
         await refresh()
     }
 
-    /// Restarts the background service inside the reconciliation gate, so
-    /// polling stands aside while the daemon is swapped and a Start Plug
-    /// pressed meanwhile waits for this swap instead of starting a second one.
+    /// Restarts the background service inside the gate, so polling stands
+    /// aside while the daemon is swapped and a Start Plug pressed meanwhile
+    /// waits for this swap instead of starting a second one.
     func restartService() async {
-        guard serviceEnabled, !isChangingService else { return }
-        guard !isRestartingService else { return }
-        isRestartingService = true
-        // A reconciliation already running would swallow this one; let it
-        // finish first so the restart that was asked for still happens.
-        if let reconciliationTask { await reconciliationTask.value }
-        await runReconciliation { [weak self, coordinator] in
-            do {
-                try await coordinator.restartService()
-            } catch {
-                self?.reportActionError("restart Plug", error)
-                await coordinator.retry()
-            }
-        }
-        isRestartingService = false
+        guard gate.serviceEnabled, !gate.isChangingService, !gate.isRestartingService else { return }
+        await gate.restart { [weak self] in self?.actions.report("restart Plug", $0) }
         // The daemon behind the open descriptor is gone.
-        await ipc.disconnect()
+        await daemon.disconnect()
         await refresh()
     }
 
     func openLog() {
-        coordinator.openLog()
+        gate.openLog()
     }
 
     func setServiceEnabled(_ enabled: Bool) async {
-        guard enabled != serviceEnabled, !isChangingService else { return }
-        isChangingService = true
-        if let reconciliationTask { await reconciliationTask.value }
-        if let refreshTask { await refreshTask.value }
+        guard enabled != gate.serviceEnabled, !gate.isChangingService else { return }
         do {
-            if enabled {
-                do { try FileManager.default.removeItem(at: serviceDisabledURL) }
-                catch CocoaError.fileNoSuchFile {}
-                serviceEnabled = true
-                connectionState = .connecting
-                // Turning on is explicit consent to register our own agent.
-                await coordinator.adopt()
-            } else {
-                try FileManager.default.createDirectory(
-                    at: serviceDisabledURL.deletingLastPathComponent(), withIntermediateDirectories: true
-                )
-                try Data().write(to: serviceDisabledURL, options: .atomic)
-                do { try await coordinator.stopService() }
-                catch {
-                    try FileManager.default.removeItem(at: serviceDisabledURL)
-                    throw error
-                }
-                serviceEnabled = false
-                monitoringTask?.cancel()
-                await ipc.disconnect()
-                connectionState = .disconnected
-                connectionLostAt = nil
+            try await gate.setServiceEnabled(enabled) { [self] in
+                if let refreshTask { await refreshTask.value }
+                if enabled { connectionState = .connecting }
             }
-        } catch { reportActionError("turn Plug \(enabled ? "on" : "off")", error) }
-        isChangingService = false
-        if serviceEnabled {
+        } catch {
+            actions.report("turn Plug \(enabled ? "on" : "off")", error)
+        }
+        if gate.serviceEnabled {
             await refresh()
             startMonitoring()
+        } else {
+            monitoringTask?.cancel()
+            await daemon.disconnect()
+            connectionState = .disconnected
+            connectionLostAt = nil
         }
     }
+
+    // MARK: Polling
 
     /// Reads the daemon's state. A call that arrives while a read is already
     /// running waits for one more read that starts after it, because the caller
     /// usually just changed something and the read in flight may predate it.
     func refresh(forceCatalog: Bool = false) async {
-        guard readsAllowed else { return }
+        guard gate.readsAllowed else { return }
         if let refreshTask {
             refreshRequestedAgain = true
             refreshAgainForcesCatalog = refreshAgainForcesCatalog || forceCatalog
@@ -531,7 +432,7 @@ final class AppModel {
                 await readDaemonState(forceCatalog: force)
                 force = refreshAgainForcesCatalog
                 refreshAgainForcesCatalog = false
-            } while refreshRequestedAgain && readsAllowed
+            } while refreshRequestedAgain && gate.readsAllowed
             refreshRequestedAgain = false
             // Cleared here rather than by the caller, in the same turn that
             // ends the loop, so no request can land between the last read and
@@ -588,35 +489,26 @@ final class AppModel {
         if monitoringTask != nil { startMonitoring() }
     }
 
+    /// Nothing is read from a daemon of another version: the app and its
+    /// daemon are one build, so a different version is an update half done.
     private func readDaemonStateOnce(forceCatalog: Bool) async throws {
-        let handshake = try await ipc.connect()
-        let offered = Set(handshake.capabilities)
-        if offered != capabilities { capabilities = offered }
-        guard handshake.sharesSupportedIPCVersion else {
-            if connectionState != .incompatible { connectionState = .incompatible }
-            if connectionError != nil { connectionError = nil }
-            return
-        }
-        guard handshake.daemonVersion == clientVersion else {
+        let handshake = try await daemon.handshake()
+        guard handshake.daemonVersion == daemon.clientVersion else {
             if connectionState != .incompatible { connectionState = .incompatible }
             if connectionError != nil { connectionError = nil }
             // During a launch pass the pass itself settles the version, and
             // a retry asked for now would be swallowed by it.
-            if !attemptedSkewRecovery, !reconciliationInFlight {
+            if !attemptedSkewRecovery, !gate.isInFlight {
                 attemptedSkewRecovery = true
                 await retry()
             }
             return
         }
         attemptedSkewRecovery = false
-        let token = try String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard case let .snapshot(value) = try await ipc.request(.snapshot(authToken: token)) else {
-            throw PlugIPCError.unexpectedResponse("OperatorSnapshot")
-        }
+        let value = try await daemon.snapshot()
         let daemonRestarted = lastUptimeSecs > 0 && value.uptimeSecs < lastUptimeSecs
         lastUptimeSecs = value.uptimeSecs
-        let activityCursor = daemonRestarted ? 0 : (activities.last?.sequence ?? 0)
+        let cursor = activity.cursor(daemonRestarted: daemonRestarted)
         // A read that says nothing new is not published: every view that
         // shows a server, a client or Plug's status would be drawn again,
         // every poll, for a clock that ticked.
@@ -627,268 +519,18 @@ final class AppModel {
         }
         if !hasLoadedSnapshot { hasLoadedSnapshot = true }
         snapshotDidLoad?(value)
-        NotificationService.shared.observe(value)
-        if case let .activity(events) = try await ipc.request(
-            .activity(
-                authToken: token,
-                afterSequence: activityCursor,
-                limit: Self.activityLimit + 1,
-                failuresOnly: false
-            )
-        ) {
-            if activityCursor == 0 {
-                // With no calls yet this branch runs every poll, so it only
-                // writes what changed.
-                let truncated = events.count > Self.activityLimit
-                if activityWasTruncated != truncated { activityWasTruncated = truncated }
-                let latest = Array(events.suffix(Self.activityLimit))
-                if latest != activities { activities = latest }
-            } else if !events.isEmpty {
-                let merged = activities + events
-                activityWasTruncated = activityWasTruncated
-                    || merged.count > Self.activityLimit
-                activities = Array(merged.suffix(Self.activityLimit))
-            }
+        if let page = try await daemon.activity(after: cursor, limit: ActivityLog.limit + 1) {
+            var next = activity
+            next.take(page, after: cursor)
+            if next != activity { activity = next }
         }
-        // The tool list is nearly a megabyte and the snapshot above
-        // already reports when it would answer differently, so ask for
-        // it only then. This used to refetch on a timer as well,
-        // because the fingerprint was assembled here from server
-        // fields and could not see a tool disabled from the CLI. The
-        // daemon reports that now.
+        // The tool list is nearly a megabyte, and the snapshot reports when
+        // it would answer differently, so it is asked for only then.
         let revision = value.toolCatalogRevision
-        if forceCatalog || toolCatalog.isEmpty || revision != toolCatalogRevision,
-           case let .tools(tools) = try await ipc.request(.listTools)
-        {
-            toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)))
-            toolCatalogRevision = revision
+        if forceCatalog || !toolCatalog.isCurrent(at: revision), let tools = try await daemon.tools() {
+            toolCatalog = ToolCatalog(tools.map(ToolFacts.init(_:)), revision: revision)
         }
         if connectionState != .ready { connectionState = .ready }
         if connectionError != nil { connectionError = nil }
-    }
-
-    func performOperation(_ request: (String) -> IPCRequest) async throws {
-        guard canMutate else { throw RuntimeUnavailableError() }
-        let token = try String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        _ = try await ipc.request(request(token))
-        // No forced tool list. Every change an operation can make to it, a
-        // switched tool or a rebuilt catalog, moves the snapshot's
-        // `tool_catalog_revision`, and the refresh refetches on that alone.
-        await refresh()
-    }
-
-    /// The operations of the OpenAPI document at `spec`. The daemon may have
-    /// to fetch the document, which outlasts the poll's short timeout, so
-    /// this asks over a connection of its own.
-    func describeAPI(_ spec: String) async throws -> APISummary {
-        guard canMutate else { throw RuntimeUnavailableError() }
-        let token = try String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        let patient = PlugIPCClient(clientVersion: clientVersion, requestTimeout: 15)
-        guard case let .apiDescribed(api) = try await patient.request(
-            .describeAPI(authToken: token, spec: spec)
-        ) else {
-            throw PlugIPCError.unexpectedResponse("ApiDescribed")
-        }
-        return api
-    }
-
-    /// Runs one change the person asked for. `doing` finishes the sentence
-    /// "Could not …", so a failure names what was being attempted.
-    func perform(_ doing: String, _ request: (String) -> IPCRequest) async {
-        do {
-            try await performOperation(request)
-        } catch { reportActionError(doing, error) }
-    }
-
-    /// The settings move first: if that fails, the old sign-in keeps both its
-    /// settings and its access.
-    func replaceClient(oldID: String, newID: String) async {
-        do {
-            try await performOperation {
-                .moveClientSettings(authToken: $0, from: "oauth:\(oldID)", to: "oauth:\(newID)")
-            }
-            try await performOperation { .revokeClient(authToken: $0, clientID: oldID) }
-        } catch { reportActionError("replace the old sign-in", error) }
-    }
-
-    /// Shows a failed press until it is dismissed. A newer failure replaces
-    /// it. It does not leave by itself: a message that vanishes while it is
-    /// being read is no message.
-    private func reportActionError(_ doing: String, _ error: any Error) {
-        actionError = ActionError(
-            title: "Could not \(doing).",
-            message: error.localizedDescription,
-            advice: Explain.advice(for: error)
-        )
-    }
-
-    func dismissActionError() {
-        actionError = nil
-    }
-
-    /// Tools of one server, for its detail view.
-    func tools(for server: String) -> [ToolFacts] { toolCatalog.tools(for: server) }
-
-    func setToolEnabled(_ tool: String, _ enabled: Bool) async {
-        guard busyTools.insert(tool).inserted else { return }
-        defer { busyTools.remove(tool) }
-        await perform("turn \(tool) \(enabled ? "on" : "off")") {
-            .setToolEnabled(authToken: $0, tool: tool, enabled: enabled)
-        }
-    }
-
-    /// Every server with what it said about itself. The snapshot leaves the
-    /// icons out, so they are asked for apart from it, and rarely.
-    func serverDescriptions() async throws -> [ServerStatus] {
-        guard case let .status(servers) = try await ipc.request(.status) else {
-            throw PlugIPCError.unexpectedResponse("Status")
-        }
-        return servers
-    }
-
-    func serverConfig(name: String) async throws -> ServerConfig {
-        guard canReadServerConfig else {
-            throw ServerConfigReadRequiredError()
-        }
-        let token = try String(contentsOf: tokenURL, encoding: .utf8)
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        guard case let .serverConfig(returnedName, config) = try await ipc.request(
-            .serverConfig(authToken: token, name: name)
-        ), returnedName == name else {
-            throw PlugIPCError.unexpectedResponse("ServerConfig")
-        }
-        return config
-    }
-
-    /// Which AI apps are wired into Plug. Read from the client configuration
-    /// files on disk rather than the daemon, which does not own them.
-    func loadConnectableApps() async {
-        guard !isLoadingConnectableApps else { return }
-        isLoadingConnectableApps = true
-        defer {
-            isLoadingConnectableApps = false
-            if !hasLoadedConnectableApps { hasLoadedConnectableApps = true }
-        }
-        do {
-            // Assigned only when it differs: the list is read every few
-            // seconds while shown, and an equal value should redraw nothing.
-            let apps = try await appLinker.apps()
-            if apps != connectableApps { connectableApps = apps }
-            if connectableAppsError != nil { connectableAppsError = nil }
-        } catch {
-            let message = error.localizedDescription
-            if connectableAppsError != message { connectableAppsError = message }
-        }
-    }
-
-    func setAppLinked(_ target: String, _ linked: Bool, overNetwork: Bool = false) async {
-        guard busyApps.insert(target).inserted else { return }
-        defer { busyApps.remove(target) }
-        do {
-            if linked {
-                try await appLinker.link(target: target, overNetwork: overNetwork)
-            } else {
-                try await appLinker.unlink(target: target)
-            }
-            await loadConnectableApps()
-            await refresh()
-        } catch {
-            let name = AppIcons.displayName(forTarget: target) ?? target
-            reportActionError(linked ? "add Plug to \(name)" : "remove Plug from \(name)", error)
-        }
-    }
-
-    /// Forgets a server's stored account. The button that starts this is behind
-    /// a confirmation, so by the time it runs the choice has been made.
-    func signOut(server: String) async {
-        do {
-            try await authFlow.signOut(server: server)
-            await refresh()
-        } catch { reportActionError("sign out of \(server)", error) }
-    }
-
-    /// Starts a sign-in. Pressed again while one is open, it is Try Again:
-    /// the open attempt holds the browser callback, so it is stopped and
-    /// waited for before the new one starts.
-    func signIn(server: String) async {
-        if let running = signInTasks[server] {
-            running.cancel()
-            await running.value
-            // A second press that waited on the same attempt has already
-            // started the replacement; one browser tab is enough.
-            if let current = signInTasks[server], current != running { return }
-        }
-        let task = Task { [weak self] in _ = await self?.runSignIn(server: server) }
-        signInTasks[server] = task
-        await task.value
-        if signInTasks[server] == task { signInTasks[server] = nil }
-    }
-
-    /// Stops an open sign-in. The browser tab stays, but nothing is waiting
-    /// on it any more, and the server goes back to offering Sign In.
-    func cancelSignIn(server: String) {
-        signInTasks[server]?.cancel()
-    }
-
-    /// Runs a client's sign-in command. The client opens the browser, where
-    /// Plug asks the owner to approve it.
-    func signInClient(name: String, command: String) async {
-        do {
-            try await authFlow.signInClient(command: command)
-            await refresh()
-        } catch {
-            reportActionError("sign in \(name)", error)
-        }
-    }
-
-    private func runSignIn(server: String) async {
-        signingInServers.insert(server)
-        defer { signingInServers.remove(server) }
-        do {
-            try await authFlow.signIn(server: server)
-            await refresh()
-        } catch let error where Task.isCancelled || error is CancellationError {
-            // Cancelled on purpose. Nothing failed.
-        } catch {
-            reportActionError("sign in to \(server)", error)
-        }
-    }
-
-    private func runReconciliation(_ operation: @escaping @MainActor () async -> Void) async {
-        if let reconciliationTask {
-            await reconciliationTask.value
-            return
-        }
-
-        reconciliationInFlight = true
-        let task = Task { @MainActor [weak self] in
-            guard let self else { return }
-            await operation()
-            self.reconciliationInFlight = false
-            self.reconciliationTask = nil
-        }
-        reconciliationTask = task
-        await task.value
-    }
-}
-
-/// A press that failed: what was being done, why it failed in the error's
-/// own words, and what to do next.
-struct ActionError: Identifiable, Equatable {
-    let id = UUID()
-    let title: String
-    let message: String
-    let advice: String
-}
-
-private struct ServerConfigReadRequiredError: LocalizedError {
-    var errorDescription: String? { AppModel.serverConfigReadRequiredCopy }
-}
-
-private struct RuntimeUnavailableError: LocalizedError {
-    var errorDescription: String? {
-        "Plug is starting. Try again in a moment."
     }
 }

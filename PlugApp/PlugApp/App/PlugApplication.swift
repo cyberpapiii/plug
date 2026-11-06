@@ -57,10 +57,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct PlugApplication: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
-    @State private var model = AppModel()
+    @State private var model: AppModel
     @State private var router = Router()
     @Environment(\.openWindow) private var openWindow
     @Environment(\.openSettings) private var openSettings
+
+    init() {
+        let model = AppModel()
+        model.snapshotDidLoad = { [weak model] snapshot in
+            NotificationService.shared.observe(snapshot)
+            guard let model else { return }
+            IconStore.shared.observe(snapshot) { await model.origins(configsFor: $0) }
+        }
+        _model = State(initialValue: model)
+    }
 
     var body: some Scene {
         // The menu bar panel is the app. It answers "is Plug working?" and
@@ -78,7 +88,6 @@ struct PlugApplication: App {
                 .task {
                     appDelegate.showWindow = { runner.run(.openCurrentWindow) }
                     NotificationService.shared.perform = { runner.run($0) }
-                    IconStore.shared.attach(to: model)
                     await model.start()
                 }
         }
@@ -90,7 +99,6 @@ struct PlugApplication: App {
             RootView(model: model, router: router, run: runner.run)
                 .frame(minWidth: 860, minHeight: 520)
                 .task {
-                    IconStore.shared.attach(to: model)
                     await model.start()
                 }
         }
@@ -133,7 +141,7 @@ struct PlugApplication: App {
                 // Plug refreshes itself, so a refresh button would be visual
                 // weight for something the app already does. The shortcut
                 // people reach for out of habit still works.
-                Button("Refresh") { Task { await model.refresh(forceCatalog: true) } }
+                Button("Refresh") { runner.run(.refresh) }
                     .keyboardShortcut("r", modifiers: .command)
             }
             CommandGroup(replacing: .help) {

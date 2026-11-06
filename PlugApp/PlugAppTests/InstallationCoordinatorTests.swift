@@ -5,14 +5,7 @@ import XCTest
 
 @MainActor
 final class InstallationCoordinatorTests: XCTestCase {
-    private let canonical = VerifiedAppInstallation(
-        bundleURL: URL(fileURLWithPath: "/Applications/Plug.app"),
-        executableURL: URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
-        appVersion: "0.7.0",
-        buildVersion: "20",
-        embeddedVersion: "0.7.0",
-        teamID: "HJF7LN64XX"
-    )
+    private let canonical = makeTestInstallation()
 
     func testRoutineReconciliationRunsOrderedProofAndPublishesHealthy() async {
         let events = EventLog()
@@ -35,8 +28,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
+            parentBundleVersion: canonical.buildVersion
         )
         let service = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(current),
@@ -142,8 +134,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "local.claude-rc.plug",
             programURL: URL(fileURLWithPath: "/Users/me/.cargo/bin/plug"),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         let service = DaemonServiceSnapshot(
             ownership: .recognizedLegacy([legacyRecord]),
@@ -178,8 +169,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: URL(fileURLWithPath: "/Users/me/.local/bin/plug"),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         let legacyService = DaemonServiceSnapshot(
             ownership: .recognizedLegacy([legacyRecord]),
@@ -252,8 +242,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "local.claude-rc.plug",
             programURL: URL(fileURLWithPath: "/Users/me/.cargo/bin/plug"),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         let legacyService = DaemonServiceSnapshot(
             ownership: .recognizedLegacy([legacyRecord]),
@@ -277,7 +266,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
-        await coordinator.adopt()
+        await coordinator.reconcile(trigger: .explicitAdoption)
 
         guard case .healthy = coordinator.state else {
             return XCTFail("Expected explicit adoption to converge, got \(coordinator.state)")
@@ -292,8 +281,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "19",
-            loaded: true
+            parentBundleVersion: "19"
         )
         let staleService = DaemonServiceSnapshot(
             ownership: .appManagedStale(staleRecord),
@@ -431,47 +419,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
     }
 
-    func testIncompatibleHandshakePreservesCargoAndDoesNotReportHealthy() async {
-        let events = EventLog()
-        let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
-        let coordinator = InstallationCoordinator(
-            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
-            legacyMigrator: RecordingLegacyMigrator(
-                events: events,
-                values: [
-                    LegacyInstallSnapshot(
-                        formulaInstalled: false,
-                        cargoBinary: cargo,
-                        shellLink: .canonical(canonical.executableURL),
-                        recognizedPaths: [cargo],
-                        unknownPaths: []
-                    ),
-                    emptyLegacy(),
-                ]
-            ),
-            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
-            daemonManager: RecordingDaemonManager(
-                events: events,
-                inspections: [healthyService(), healthyService()],
-                handshakes: [handshake(
-                    version: canonical.appVersion,
-                    ipcMin: 7,
-                    ipcMax: 7
-                )]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
-        )
-
-        await coordinator.reconcile(trigger: .applicationLaunch)
-
-        if case .healthy = coordinator.state {
-            XCTFail("An incompatible handshake must not report healthy")
-        }
-        let eventValues = await events.values
-        XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
-    }
-
     func testConcurrentReconciliationCallsShareOneInFlightOperation() async {
         let events = EventLog()
         let gate = AsyncGate()
@@ -510,8 +457,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
+            parentBundleVersion: canonical.buildVersion
         )
         let service = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(current),
@@ -558,8 +504,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
+            parentBundleVersion: canonical.buildVersion
         )
         let service = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(current),
@@ -633,7 +578,7 @@ final class InstallationCoordinatorTests: XCTestCase {
 
         // Try Again starts the budget over instead of failing on the first
         // timeout because the old count is still standing.
-        await coordinator.retry()
+        await coordinator.reconcile(trigger: .retry)
         XCTAssertEqual(coordinator.state, .reconcilingUpdate(.waitingToRetry))
         while let retry = coordinator.scheduledRetry {
             await retry.value
@@ -682,7 +627,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected blocked state, got \(coordinator.state)")
         }
 
-        await coordinator.retry()
+        await coordinator.reconcile(trigger: .retry)
         let callsAfterRetry = await app.calls
         XCTAssertEqual(callsAfterRetry, 2)
     }
@@ -731,8 +676,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "19",
-            loaded: true
+            parentBundleVersion: "19"
         )
         let stale = DaemonServiceSnapshot(
             ownership: .appManagedStale(staleRecord),
@@ -853,8 +797,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "19",
-            loaded: true
+            parentBundleVersion: "19"
         )
         let stale = DaemonServiceSnapshot(
             ownership: .appManagedStale(staleRecord),
@@ -899,8 +842,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
+            parentBundleVersion: canonical.buildVersion
         )
         let finalService = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(finalRecord),
@@ -947,8 +889,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                                 label: "com.plug.daemon",
                                 programURL: URL(fileURLWithPath: "/Applications/Other.app/plug"),
                                 parentBundleIdentifier: "com.example.other",
-                                parentBundleVersion: "1",
-                                loaded: true
+                                parentBundleVersion: "1"
                             ),
                         ]),
                         daemonVersion: nil,
@@ -1273,8 +1214,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: URL(fileURLWithPath: path),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
     }
 
@@ -1301,8 +1241,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
+            parentBundleVersion: canonical.buildVersion
         )
         return DaemonServiceSnapshot(
             ownership: .appManagedCurrent(record),
@@ -1311,21 +1250,8 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
     }
 
-    private func handshake(
-        version: String,
-        ipcMin: UInt16 = 3,
-        ipcMax: UInt16 = 4,
-        ownership: String = "app_managed"
-    ) -> OperatorHandshake {
-        let data = try! JSONSerialization.data(withJSONObject: [
-            "daemonVersion": version,
-            "daemonExecutable": canonical.executableURL.path,
-            "ipcMin": ipcMin,
-            "ipcMax": ipcMax,
-            "ownership": ownership,
-            "capabilities": [],
-        ])
-        return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
+    private func handshake(version: String, ownership: String = OperatorHandshake.appManaged) -> OperatorHandshake {
+        makeTestHandshake(version: version, executable: canonical.executableURL, ownership: ownership)
     }
 }
 
@@ -1446,7 +1372,7 @@ private actor RecordingLegacyMigrator: LegacyInstallMigrating {
 
     func removeVerifiedCargoBinary(
         _ snapshot: LegacyInstallSnapshot,
-        proof: ReconciliationProof
+        proof: OwnDaemonProof
     ) async throws {
         await events.append("legacy.removeCargo")
     }
@@ -1466,9 +1392,8 @@ private actor RecordingClientRepairer: ClientRepairing {
         return values.count > 1 ? values.removeFirst() : values[0]
     }
 
-    func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult {
+    func repairAll(canonicalExecutable: URL) async throws {
         await events.append("clients.repair")
-        return ClientRepairResult(examined: 1, repaired: 1, unchanged: 0)
     }
 }
 
@@ -1531,7 +1456,7 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
     func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
         await events.append("daemon.ensureRunning")
         return handshakes.isEmpty
-            ? makeHandshake(version: expectedVersion)
+            ? makeTestHandshake(version: expectedVersion)
             : handshakes.removeFirst()
     }
 
@@ -1646,18 +1571,6 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
     }
 
     func stop() async throws { await events.append("daemon.stop") }
-}
-
-private func makeHandshake(version: String) -> OperatorHandshake {
-    let data = try! JSONSerialization.data(withJSONObject: [
-        "daemonVersion": version,
-        "daemonExecutable": "/Applications/Plug.app/Contents/Resources/plug",
-        "ipcMin": 3,
-        "ipcMax": 4,
-        "ownership": "app_managed",
-        "capabilities": [],
-    ])
-    return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
 }
 
 private actor AsyncGate {

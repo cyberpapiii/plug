@@ -176,14 +176,13 @@ struct ServerDetailView: View {
 
     private func findSettingsPlace() async {
         settingsPlace = Self.knownSettingsPlaces[server.name]
-        guard let config = try? await model.serverConfig(name: server.name) else {
+        let origin = await model.origins(configsFor: [server.name])[server.name]
+        guard let config = origin?.config else {
             settingsPlace = nil
             return
         }
-        let described = (try? await model.serverDescriptions()) ?? []
-        let website = described.first { $0.serverId == server.name }?.upstream?.websiteUrl
         guard !Task.isCancelled else { return }
-        let found = ServerSettingsPlace.find(config: config, website: website)
+        let found = ServerSettingsPlace.find(config: config, website: origin?.upstream?.websiteUrl)
         Self.knownSettingsPlaces[server.name] = found
         if settingsPlace != found { settingsPlace = found }
     }
@@ -263,7 +262,7 @@ private struct ServerTools: View, Equatable {
         let all = model.toolCatalog.tools(for: server)
         let matched = model.toolCatalog.tools(for: server, matching: query)
         let shown = showsOffOnly ? matched.filter { !$0.isOn } : matched
-        let canManage = model.canManageTools && model.canMutate
+        let canManage = model.canMutate
         // Read once here, so opening a tool's details redraws two rows and
         // not every row.
         let selected = router.selectedTool
@@ -284,7 +283,7 @@ private struct ServerTools: View, Equatable {
                         ServerToolRow(
                             tool: tool,
                             canManage: canManage,
-                            isBusy: model.busyTools.contains(tool.name),
+                            isBusy: model.actions.busyTools.contains(tool.name),
                             showsDetails: selected == tool.name,
                             model: model,
                             router: router,

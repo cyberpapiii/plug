@@ -172,7 +172,7 @@ struct AddClientView: View {
     @State private var name = ""
     @State private var failure: String?
 
-    private var apps: [LinkableApp] { model.connectableApps }
+    private var apps: [LinkableApp] { model.actions.connectableApps }
     private var address: String? { model.snapshot.clientAddress }
     private var chosen: AddClient.Choice { choice ?? AddClient.firstChoice(apps) }
     private var ways: [AddClient.Way] { AddClient.ways(for: chosen) }
@@ -245,7 +245,7 @@ struct AddClientView: View {
             .formStyle(.grouped)
             .fixedSize(horizontal: false, vertical: true)
         }
-        .task { await model.loadConnectableApps() }
+        .task { await model.actions.loadConnectableApps() }
     }
 
     @ViewBuilder private var step: some View {
@@ -256,11 +256,11 @@ struct AddClientView: View {
                 AppGlyph(target: target, name: name, size: 22)
                 caption("Plug adds itself to \(name)'s settings.")
                 Spacer(minLength: 0)
-                if model.busyApps.contains(target) {
+                if model.actions.busyApps.contains(target) {
                     WaitingDots()
                 } else {
                     Button("Add to \(name)") {
-                        Task { await model.setAppLinked(target, true, overNetwork: chosenWay == .network) }
+                        Task { await model.actions.setAppLinked(target, true, overNetwork: chosenWay == .network) }
                     }
                     .buttonStyle(.borderedProminent)
                 }
@@ -321,7 +321,7 @@ struct AddClientView: View {
         failure = nil
         Task {
             do {
-                try await model.performOperation { .renameClient(authToken: $0, key: customTarget, name: name) }
+                try await model.actions.nameClient(key: customTarget, name: name)
             } catch {
                 failure = "Plug could not keep the name: \(error.localizedDescription)"
             }

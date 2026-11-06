@@ -1,17 +1,7 @@
 import AppKit
 import SwiftUI
 
-/// What the window is for. Signing in to a server used to be its own section,
-/// and so did tools; both now live on the server they belong to, because a
-/// server's account and its tools are found and fixed where the server is.
-enum AppSection: String, CaseIterable, Identifiable, Sendable {
-    case servers = "Servers"
-    case clients = "Clients"
-    case events = "Events"
-    case activity = "Activity"
-
-    var id: Self { self }
-
+extension AppSection {
     var icon: PlugIcon.Kind {
         switch self {
         case .servers: .servers
@@ -125,7 +115,7 @@ struct RootView: View {
             .overlay(alignment: .bottom) {
                 // Any verdict: a press that failed while Plug is unwell still
                 // deserves its own sentence, and the verdict never says it.
-                if let error = model.actionError {
+                if let error = model.actions.actionError {
                     ErrorToast(error: error) { run(.dismissActionError) }
                         .id(error.id)
                         .transition(reduceMotion ? .opacity : .move(edge: .bottom).combined(with: .opacity))
@@ -138,7 +128,7 @@ struct RootView: View {
             .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: firstMoment)
             .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: router.sheet)
             .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: showsBanner)
-            .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actionError?.id)
+            .animation(reduceMotion ? nil : .snappy(duration: 0.2), value: model.actions.actionError?.id)
         }
         .plainWindowBar()
         .onChange(of: router.section) {
@@ -176,7 +166,7 @@ struct RootView: View {
             if guideOpensByItself, router.sheet == nil { router.sheet = .guide }
         }
         .onChange(of: firstsToLookAt, initial: true) { lookForFirsts() }
-        .task { await model.loadConnectableApps() }
+        .task { await model.actions.loadConnectableApps() }
         .background(WindowSeenReader(seen: $windowSeen))
         .environment(\.windowSeen, windowSeen)
         .onChange(of: windowSeen) { watch(windowSeen) }
@@ -322,7 +312,7 @@ struct RootView: View {
     /// Where the setup is, once both halves of it have been read. Before
     /// that an empty list does not mean nothing is there.
     private var firstsToLookAt: FirstRunGuide? {
-        model.hasLoadedSnapshot && model.hasLoadedConnectableApps ? model.firstRunGuide : nil
+        model.hasLoadedSnapshot && model.actions.hasLoadedConnectableApps ? model.firstRunGuide : nil
     }
 
     private func lookForFirsts() {
