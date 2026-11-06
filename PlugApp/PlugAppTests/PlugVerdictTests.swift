@@ -210,7 +210,7 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     private func trouble(_ situation: PlugSituation) -> PanelTrouble? {
-        PanelTrouble.trouble(for: situation, verdict: PlugVerdict.verdict(for: situation))
+        PanelTrouble.trouble(for: situation)
     }
 
     func testPanelHasNoCardWhenNothingNeedsYou() {
