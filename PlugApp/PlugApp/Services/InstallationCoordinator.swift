@@ -22,7 +22,7 @@ protocol DaemonServiceManaging: AnyObject {
         legacyPaths: Set<URL>
     ) async throws -> DaemonServiceSnapshot
     func bootOutRecognizedLegacy(_ snapshot: DaemonServiceSnapshot) async throws
-    func adoptRecognizedLegacy(
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake
@@ -30,12 +30,10 @@ protocol DaemonServiceManaging: AnyObject {
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake
-    func adopt() async throws
     func restart() async throws
     func stop() async throws
 }
@@ -364,17 +362,12 @@ final class InstallationCoordinator {
             )
         }
         switch snapshot.ownership {
-        case .recognizedLegacy:
+        case .recognizedLegacy, .unmanaged:
             publish(.replacingDaemon)
-            return try await daemonManager.adoptRecognizedLegacy(
+            return try await daemonManager.adopt(
                 snapshot: snapshot,
                 expectedVersion: canonical.appVersion
             )
-
-        case .unmanaged:
-            publish(.replacingDaemon)
-            try await daemonManager.adopt()
-            return try await daemonManager.ensureRunning(expectedVersion: canonical.appVersion)
 
         case .appManagedStale:
             publish(.replacingDaemon)
