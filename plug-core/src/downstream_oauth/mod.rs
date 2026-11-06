@@ -1401,25 +1401,24 @@ impl DownstreamOauthManager {
         })
     }
 
+    /// Revoke `client_id`'s grant. `Ok(false)` when there is no such client.
+    /// Any error still leaves the grant refused by this process: only saving
+    /// the revocation failed.
     pub async fn revoke_client(&self, client_id: &str) -> Result<bool, DownstreamOauthError> {
-        self.ensure_durable()?;
         let mut guard = self.state.lock().await;
-        let existed = guard.clients.contains_key(client_id);
-        if !existed {
+        if !guard.clients.contains_key(client_id) {
             return Ok(false);
         }
-        // Invalidate validation-time leases before removing credentials or
-        // starting task cleanup. If persistence fails, this process remains
-        // fail-closed; the operator did not receive a successful revocation.
         if let Some(lifecycle) = self.principal_lifecycles.get(client_id) {
             lifecycle.deactivate();
         }
+        self.ensure_durable()?;
         let mut next = guard.clone();
         next.remove_client_material(client_id);
         next.revoked_client_ids.insert(client_id.to_string());
         self.commit_state(&mut guard, next)?;
         self.principal_lifecycles.remove(client_id);
-        Ok(existed)
+        Ok(true)
     }
 
     pub async fn begin_authorization(

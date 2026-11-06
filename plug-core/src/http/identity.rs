@@ -112,6 +112,20 @@ pub(super) fn http_credential<'a>(
     }
 }
 
+/// Who owns the tasks `client_id`'s grant creates.
+pub(super) fn grant_task_owner(
+    manager: &crate::downstream_oauth::DownstreamOauthManager,
+    client_id: &str,
+) -> crate::tasks::TaskOwner {
+    let resource = manager.resource();
+    HttpCredential::Grant {
+        issuer: manager.base_url(),
+        client_id,
+        resource: &resource,
+    }
+    .task_owner(None)
+}
+
 pub(super) fn legacy_http_policy_context(
     state: &HttpState,
     auth_status: &AuthStatus,

@@ -3,7 +3,8 @@ use super::events::{event_request, events_discoverable, ingest_router};
 use super::fanout::drain_targeted_notifications;
 use super::guard::{validate_bearer_auth, validate_modern_request, validate_origin};
 use super::identity::{
-    AuthStatus, HttpDownstreamContext, HttpRequestCancellationGuard, legacy_http_policy_context,
+    AuthStatus, HttpDownstreamContext, HttpRequestCancellationGuard, grant_task_owner,
+    legacy_http_policy_context,
 };
 use super::response::{
     LONG_CALL_AFTER, answer_or_keep_open, header_mismatch_response, json_response_for_era,
@@ -35,7 +36,6 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
-use crate::downstream_identity::HttpCredential;
 use crate::events::EventSource;
 use crate::mcp_http_headers::{
     TRACEPARENT_HEADER, inject_trace_context, validate_mirrored_headers,
@@ -151,8 +151,8 @@ pub enum ClientRevocation {
     Revoked,
     UnknownClient,
     OauthDisabled,
-    /// The grant stopped working before the save was tried, so its sessions
-    /// ended even though saving the revocation failed.
+    /// Saving the revocation failed. The grant stopped working before the
+    /// save was tried, so its sessions and tasks went all the same.
     SaveFailed(crate::downstream_oauth::DownstreamOauthError),
 }
 
@@ -271,33 +271,22 @@ impl HttpState {
         let Some(manager) = self.downstream_oauth() else {
             return ClientRevocation::OauthDisabled;
         };
-        match manager.revoke_client(client_id).await {
-            Ok(true) => {
-                self.end_sessions_of(client_id).await;
-                // The manager already refuses the grant's tokens, and the
-                // task store's create guard keeps a create that is under way
-                // from outliving this cleanup.
-                let resource = manager.resource();
-                let owner = HttpCredential::Grant {
-                    issuer: manager.base_url(),
-                    client_id,
-                    resource: &resource,
-                }
-                .task_owner(None);
-                self.router.cleanup_tasks_for_owner(&owner).await;
-                ClientRevocation::Revoked
-            }
-            Ok(false) => ClientRevocation::UnknownClient,
-            Err(error) => {
-                self.end_sessions_of(client_id).await;
-                ClientRevocation::SaveFailed(error)
-            }
+        let revoked = manager.revoke_client(client_id).await;
+        if matches!(revoked, Ok(false)) {
+            return ClientRevocation::UnknownClient;
         }
-    }
-
-    async fn end_sessions_of(&self, client_id: &str) {
+        // Saved or not, the manager already refuses the grant's tokens, and
+        // the task store's create guard keeps a create that is under way
+        // from outliving this cleanup.
         for session_id in self.sessions.sessions_of(client_id) {
             self.end_session(&session_id, SessionEnd::Revoked).await;
+        }
+        self.router
+            .cleanup_tasks_for_owner(&grant_task_owner(manager, client_id))
+            .await;
+        match revoked {
+            Ok(_) => ClientRevocation::Revoked,
+            Err(error) => ClientRevocation::SaveFailed(error),
         }
     }
 }
@@ -1948,45 +1937,48 @@ mod tests {
 
     #[tokio::test]
     async fn revoking_a_client_ends_its_sessions_and_the_tasks_it_owns() {
-        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
-        let (client_id, _tokens) = issue_test_oauth_grant(&manager, "tools:read").await;
-        let router = bare_router();
-        enable_test_task_surface(&router);
-        let state = HttpState::new(
-            Arc::clone(&router),
-            Arc::new(crate::session::SessionStore::new(1800, 100)),
-            CancellationToken::new(),
-        )
-        .with_auth(crate::http::server::HttpAuth::Oauth(manager.clone()));
-        let theirs = state.sessions.create_session().unwrap();
-        state
-            .sessions
-            .set_grant(&theirs, client_id.clone())
-            .unwrap();
-        let other = state.sessions.create_session().unwrap();
-        let resource = manager.resource();
-        let owner = HttpCredential::Grant {
-            issuer: manager.base_url(),
-            client_id: &client_id,
-            resource: &resource,
-        }
-        .task_owner(None);
-        router
-            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
-            .await
-            .expect("enqueue a task for the client");
+        for save_fails in [false, true] {
+            let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+            let (client_id, _tokens) = issue_test_oauth_grant(&manager, "tools:read").await;
+            let router = bare_router();
+            enable_test_task_surface(&router);
+            let state = HttpState::new(
+                Arc::clone(&router),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth(crate::http::server::HttpAuth::Oauth(manager.clone()));
+            let theirs = state.sessions.create_session().unwrap();
+            state
+                .sessions
+                .set_grant(&theirs, client_id.clone())
+                .unwrap();
+            let other = state.sessions.create_session().unwrap();
+            let owner = grant_task_owner(&manager, &client_id);
+            router
+                .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+                .await
+                .expect("enqueue a task for the client");
 
-        assert!(matches!(
-            state.revoke_downstream_client(&client_id).await,
-            ClientRevocation::Revoked
-        ));
-        assert!(state.sessions.validate(&theirs).is_err());
-        assert!(state.sessions.validate(&other).is_ok());
-        assert_eq!(router.task_count_for_owner(&owner).await, 0);
-        assert!(matches!(
-            state.revoke_downstream_client(&client_id).await,
-            ClientRevocation::UnknownClient
-        ));
+            if save_fails {
+                crate::fs_perm::faults::fail_next_rename();
+            }
+            let revocation = state.revoke_downstream_client(&client_id).await;
+            assert_eq!(
+                matches!(revocation, ClientRevocation::SaveFailed(_)),
+                save_fails,
+                "{revocation:?}"
+            );
+            assert!(state.sessions.validate(&theirs).is_err());
+            assert!(state.sessions.validate(&other).is_ok());
+            assert_eq!(router.task_count_for_owner(&owner).await, 0);
+            if !save_fails {
+                assert!(matches!(
+                    state.revoke_downstream_client(&client_id).await,
+                    ClientRevocation::UnknownClient
+                ));
+            }
+        }
     }
 
     /// Drop guard that flips a flag when the future holding it stops
