@@ -3144,16 +3144,6 @@ impl ToolRouter {
         }
     }
 
-    /// Resolve an internal read-only probe through the published tool catalog.
-    pub(crate) fn event_probe_tool(&self, original: &str) -> Option<String> {
-        self.cache
-            .load()
-            .routes
-            .iter()
-            .find(|(_, (server, tool))| server == "slack" && tool == original)
-            .map(|(name, _)| name.clone())
-    }
-
     /// A listed tool's name on its own server, and whether that server marks
     /// it read-only.
     pub fn own_tool(&self, merged_name: &str) -> Option<(String, bool)> {

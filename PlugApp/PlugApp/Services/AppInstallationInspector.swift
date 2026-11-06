@@ -25,6 +25,12 @@ struct AppInstallationInspector: AppInstallationInspecting {
     static let bundleIdentifier = "com.cyberpapiii.plug"
     static let teamID = "HJF7LN64XX"
 
+    /// The code-signing requirement a Plug binary meets: Apple-anchored, with
+    /// this identifier, signed by Plug's team.
+    static func signingRequirement(identifier: String) -> String {
+        "anchor apple generic and identifier \"\(identifier)\" and certificate leaf[subject.OU] = \"\(teamID)\""
+    }
+
     private let bundleURL: @Sendable () -> URL
     private let signatureReader: @Sendable (URL) throws -> AppSignatureEvidence
     private let infoReader: @Sendable (URL) throws -> [String: String]
@@ -80,8 +86,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
             executableURL: executableURL,
             appVersion: appVersion,
             buildVersion: buildVersion,
-            embeddedVersion: embeddedVersion,
-            teamID: signature.teamID
+            embeddedVersion: embeddedVersion
         )
     }
 
@@ -93,7 +98,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
             throw AppInstallationError.invalidSignature
         }
 
-        let requirementText = "anchor apple generic and identifier \"\(bundleIdentifier)\" and certificate leaf[subject.OU] = \"\(teamID)\""
+        let requirementText = signingRequirement(identifier: bundleIdentifier)
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
               let requirement

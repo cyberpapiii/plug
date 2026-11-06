@@ -5,12 +5,17 @@ import XCTest
 /// Adding a server means pasting whatever the server's instructions printed.
 /// These pin the shapes that arrive in practice.
 final class ServerDraftParserTests: XCTestCase {
-    private func draft(_ text: String) throws -> ServerDraft {
-        guard case let .draft(draft) = ServerDraftParser.parse(text) else {
-            throw XCTSkip("expected a draft for: \(text)")
+    /// A paste that does not parse fails the test that made it.
+    private func draft(_ text: String, file: StaticString = #filePath, line: UInt = #line) throws -> ServerDraft {
+        let parsed = ServerDraftParser.parse(text)
+        guard case let .draft(draft) = parsed else {
+            XCTFail("expected a draft, got \(parsed)", file: file, line: line)
+            throw ParseFailed()
         }
         return draft
     }
+
+    private struct ParseFailed: Error {}
 
     func testEmptyPasteIsNotAnError() {
         XCTAssertEqual(ServerDraftParser.parse("   \n "), .empty)

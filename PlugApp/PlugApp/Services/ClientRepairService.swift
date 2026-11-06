@@ -1,11 +1,5 @@
 import Foundation
 
-struct ClientRepairResult: Codable, Equatable, Sendable {
-    let examined: Int
-    let repaired: Int
-    let unchanged: Int
-}
-
 enum ClientRepairError: Error, Equatable {
     case commandFailed(status: Int32, stderr: String)
     case malformedOutput
@@ -13,7 +7,7 @@ enum ClientRepairError: Error, Equatable {
 
 protocol ClientRepairing: Sendable {
     func inspect(canonicalExecutable: URL) async throws -> Bool
-    func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult
+    func repairAll(canonicalExecutable: URL) async throws
 }
 
 struct ClientRepairService: ClientRepairing {
@@ -49,11 +43,9 @@ struct ClientRepairService: ClientRepairing {
         }
     }
 
-    func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult {
-        try await executeRepair(canonicalExecutable: canonicalExecutable).result
-    }
-
-    private func executeRepair(canonicalExecutable: URL) async throws -> ParsedRepairReport {
+    /// A report that does not parse means the repair cannot be trusted to
+    /// have run, so it fails like the command did.
+    func repairAll(canonicalExecutable: URL) async throws {
         let process = try await runner.run(
             executable: canonicalExecutable,
             arguments: Self.repairArguments,
@@ -64,7 +56,7 @@ struct ClientRepairService: ClientRepairing {
         }
 
         do {
-            return try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
+            _ = try JSONDecoder().decode(ParsedRepairReport.self, from: process.stdout)
         } catch {
             throw ClientRepairError.malformedOutput
         }
@@ -85,15 +77,6 @@ private struct ParsedRepairReport: Decodable {
         items.contains { item in
             !["canonical", "http", "missing"].contains(item.disposition)
         }
-    }
-
-    var result: ClientRepairResult {
-        let repaired = items.count(where: \.changed)
-        return ClientRepairResult(
-            examined: items.count,
-            repaired: repaired,
-            unchanged: items.count - repaired
-        )
     }
 
     private enum CodingKeys: String, CodingKey {

@@ -30,7 +30,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             fixture.canonicalClientContents
         )
 
-        await harness.coordinator.adopt()
+        await harness.coordinator.reconcile(trigger: .explicitAdoption)
 
         guard let adopted = healthySnapshot(harness.coordinator.state) else { return }
         assertExactHealthy(adopted, fixture: fixture)
@@ -73,7 +73,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertEqual(harness.connector.sessions, ["stdio-fixture-1", "stdio-fixture-2"])
         XCTAssertTrue(harness.connector.observedReconnect)
 
-        await harness.coordinator.retry()
+        await harness.coordinator.reconcile(trigger: .retry)
 
         guard let retried = healthySnapshot(harness.coordinator.state) else { return }
         assertExactHealthy(retried, fixture: fixture)
@@ -105,7 +105,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         }
         let firstRetryConnector = harness.connector.snapshot
 
-        await harness.coordinator.retry()
+        await harness.coordinator.reconcile(trigger: .retry)
 
         guard let retriedAgain = healthySnapshot(harness.coordinator.state) else { return }
         XCTAssertEqual(retriedAgain, firstRetryState)
@@ -156,7 +156,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             return XCTFail("Legacy fixture must pause at explicit adoption, got \(harness.coordinator.state)")
         }
 
-        await harness.coordinator.adopt()
+        await harness.coordinator.reconcile(trigger: .explicitAdoption)
 
         guard case .blocked = harness.coordinator.state else {
             return XCTFail("Interrupted cleanup must remain retryable")
@@ -168,7 +168,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertEqual(harness.connector.replayCount, 1)
         assertProtectedFilesUnchanged(fixture)
 
-        await harness.coordinator.retry()
+        await harness.coordinator.reconcile(trigger: .retry)
 
         guard let snapshot = healthySnapshot(harness.coordinator.state) else { return }
         assertExactHealthy(snapshot, fixture: fixture)
@@ -268,8 +268,6 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
                           (try? String(contentsOf: url, encoding: .utf8)) == "legacy plug \(fixture.legacyVersion)\n"
                     else { return nil }
                     return LegacyBinaryIdentity(
-                        identifier: "plug",
-                        teamID: AppInstallationInspector.teamID,
                         sha256: "fixture-cargo"
                     )
                 }
@@ -482,8 +480,7 @@ private struct SignedReconciliationFixture {
             executableURL: executableURL,
             appVersion: appVersion,
             buildVersion: appBuild,
-            embeddedVersion: appVersion,
-            teamID: AppInstallationInspector.teamID
+            embeddedVersion: appVersion
         )
         formulaURL = rootURL.appending(path: "homebrew/opt/plug/bin/plug")
         brewURL = rootURL.appending(path: "homebrew/bin/brew")
@@ -502,22 +499,19 @@ private struct SignedReconciliationFixture {
             label: "local.fixture.plug",
             programURL: cargoURL,
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         currentJob = LaunchdJobRecord(
             label: "com.plug.daemon",
             programURL: executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: appBuild,
-            loaded: true
+            parentBundleVersion: appBuild
         )
         launchdDecoyJob = LaunchdJobRecord(
             label: "com.example.unrelated",
             programURL: rootURL.appending(path: "decoys/other-daemon"),
             parentBundleIdentifier: "com.example.other",
-            parentBundleVersion: "1",
-            loaded: true
+            parentBundleVersion: "1"
         )
 
         try createBundle(from: signedHost)
@@ -801,7 +795,7 @@ private struct FixtureLegacyMigrator: LegacyInstallMigrating {
 
     func removeVerifiedCargoBinary(
         _ snapshot: LegacyInstallSnapshot,
-        proof: ReconciliationProof
+        proof: OwnDaemonProof
     ) async throws {
         if await interruptions.consumeCargoRemovalFailure() {
             throw LegacyInstallError.fileOperation("interrupted fixture cleanup")
@@ -1557,7 +1551,7 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     func handshake() async throws -> OperatorHandshake {
         let version = enabled ? currentVersion : legacyVersion
         events.append(.handshake(version))
-        return fixtureHandshake(
+        return makeTestHandshake(
             version: version,
             executable: enabled ? currentExecutable : legacyExecutable
         )
@@ -1566,16 +1560,4 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     func waitBeforeRetry() async {}
 
     func openLoginItemSettings() {}
-}
-
-private func fixtureHandshake(version: String, executable: URL) -> OperatorHandshake {
-    let data = try! JSONSerialization.data(withJSONObject: [
-        "daemonVersion": version,
-        "daemonExecutable": executable.path,
-        "ipcMin": 3,
-        "ipcMax": 4,
-        "ownership": "app_managed",
-        "capabilities": ["stdio-replay"],
-    ])
-    return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
 }

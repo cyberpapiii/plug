@@ -19,7 +19,6 @@ final class AppInstallationInspectorTests: XCTestCase {
             XCTAssertEqual(installation.appVersion, "0.7.0")
             XCTAssertEqual(installation.buildVersion, "20")
             XCTAssertEqual(installation.embeddedVersion, "0.7.0")
-            XCTAssertEqual(installation.teamID, "HJF7LN64XX")
         }
     }
 

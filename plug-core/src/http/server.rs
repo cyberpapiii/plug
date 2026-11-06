@@ -32,6 +32,7 @@ use super::oauth::{
 };
 use super::sse::sse_stream_with_heartbeat;
 use crate::downstream_oauth::{AccessTokenClaims, AccessTokenValidation, resource_scopes};
+use crate::events::{EVENT_SCOPE, EventSource};
 use crate::mcp_http_headers::{
     HEADER_MISMATCH_CODE, HeaderMismatch, inject_trace_context, validate_mirrored_headers,
     validate_required_mirrored_headers,
@@ -59,9 +60,8 @@ pub struct HttpState {
     pub(crate) cancel: CancellationToken,
     pub(crate) auth_mode: crate::config::DownstreamAuthMode,
     pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
-    pub(crate) slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
-    /// Events made by watching a tool. See `crate::events`.
-    pub(crate) watch_events: Option<Arc<crate::events::WatchEvents>>,
+    /// Where MCP Events come from. See `crate::events`.
+    pub(crate) event_sources: Vec<Arc<dyn EventSource>>,
     pub(crate) sse_channel_capacity: usize,
     pub(crate) allowed_origins: Vec<Arc<str>>,
     pub(crate) notification_task_started: AtomicBool,
@@ -487,8 +487,7 @@ impl HttpState {
             cancel,
             auth_mode: crate::config::DownstreamAuthMode::default(),
             downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
+            event_sources: Vec::new(),
             sse_channel_capacity: crate::config::DEFAULT_SSE_CHANNEL_CAPACITY,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
@@ -521,21 +520,10 @@ impl HttpState {
         self
     }
 
+    /// Event sources, in the order `events/list` shows their events.
     #[must_use]
-    pub fn with_slack_events(
-        mut self,
-        slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
-    ) -> Self {
-        self.slack_events = slack_events;
-        self
-    }
-
-    #[must_use]
-    pub fn with_watch_events(
-        mut self,
-        watch_events: Option<Arc<crate::events::WatchEvents>>,
-    ) -> Self {
-        self.watch_events = watch_events;
+    pub fn with_event_sources(mut self, event_sources: Vec<Arc<dyn EventSource>>) -> Self {
+        self.event_sources = event_sources;
         self
     }
 
@@ -803,78 +791,52 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
         .with_state(state.clone());
 
-    if state.slack_events.is_some() {
-        let source = Router::new()
-            .route(crate::slack_events::SOURCE_PATH, post(slack_event_source))
-            .layer(DefaultBodyLimit::max(256 * 1024))
-            .with_state(state);
-        source.merge(discovery).merge(mcp)
-    } else {
-        discovery.merge(mcp)
+    // Sources that take events pushed from outside sign those requests
+    // themselves, so these routes sit outside the MCP auth layers.
+    let mut router = discovery.merge(mcp);
+    for source in &state.event_sources {
+        let Some(path) = source.ingest_path() else {
+            continue;
+        };
+        let source = Arc::clone(source);
+        let ingest = Router::new()
+            .route(
+                path,
+                post(move |headers: HeaderMap, body: Bytes| async move {
+                    match source.ingest(&headers, &body).await {
+                        Ok(value) => Json(value).into_response(),
+                        Err(error) => (error.http_status(), Json(json!({"error":error.message})))
+                            .into_response(),
+                    }
+                }),
+            )
+            .layer(DefaultBodyLimit::max(crate::events::MAX_BODY));
+        router = ingest.merge(router);
     }
+    router
 }
 
-async fn slack_event_source(
-    State(state): State<Arc<HttpState>>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Response {
-    let Some(events) = &state.slack_events else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    match events.ingest(&headers, &body).await {
-        Ok(value) => Json(value).into_response(),
-        Err(error) => {
-            let status = match error.code {
-                -32001 => StatusCode::UNAUTHORIZED,
-                -32602 => StatusCode::BAD_REQUEST,
-                _ => StatusCode::SERVICE_UNAVAILABLE,
-            };
-            (status, Json(json!({"error":error.message}))).into_response()
-        }
-    }
-}
-
-fn discoverable_events<'a>(
-    state: &'a HttpState,
-    auth: &AuthStatus,
-) -> Option<&'a Arc<crate::slack_events::SlackEvents>> {
-    let AuthStatus::Authenticated(Some(claims)) = auth else {
-        return None;
-    };
-    state.slack_events.as_ref().filter(|events| {
-        claims.principal_lifecycle.is_active() && events.discoverable_to(&claims.client_id)
-    })
-}
-
-fn permitted_events<'a>(
-    state: &'a HttpState,
-    auth: &AuthStatus,
-) -> Option<&'a Arc<crate::slack_events::SlackEvents>> {
-    let AuthStatus::Authenticated(Some(claims)) = auth else {
-        return None;
-    };
-    state.slack_events.as_ref().filter(|events| {
-        claims.principal_lifecycle.is_active()
-            && events.available_to(&claims.client_id, &claims.scopes)
-    })
-}
-
-/// The watch events and the client asking, when that client can see any.
-fn watch_events_for<'a>(
+/// The asking client and the event sources it can see, when there are any.
+fn event_sources_for<'a>(
     state: &'a HttpState,
     auth: &'a AuthStatus,
-) -> Option<(&'a Arc<crate::events::WatchEvents>, &'a str)> {
+) -> Option<(&'a AccessTokenClaims, Vec<&'a Arc<dyn EventSource>>)> {
     let AuthStatus::Authenticated(Some(claims)) = auth else {
         return None;
     };
-    let events = state.watch_events.as_ref()?;
-    (claims.principal_lifecycle.is_active() && events.discoverable_to(&claims.client_id))
-        .then_some((events, claims.client_id.as_str()))
+    if !claims.principal_lifecycle.is_active() {
+        return None;
+    }
+    let sources: Vec<_> = state
+        .event_sources
+        .iter()
+        .filter(|source| source.discoverable_to(&claims.client_id))
+        .collect();
+    (!sources.is_empty()).then_some((claims, sources))
 }
 
 fn events_discoverable(state: &HttpState, auth: &AuthStatus) -> bool {
-    discoverable_events(state, auth).is_some() || watch_events_for(state, auth).is_some()
+    event_sources_for(state, auth).is_some()
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,98 +1954,64 @@ async fn handle_request(
                     "MCP Events subscription request"
                 );
             }
-            // Advertise a scope challenge only to the configured active client.
-            // This is incremental consent, never a grant or an event subscription.
-            if custom.method != "events/list"
-                && let AuthStatus::Authenticated(Some(claims)) = &auth_status
-                && claims.principal_lifecycle.is_active()
-                && events_discoverable(state, &auth_status)
-                && !claims
-                    .scopes
-                    .iter()
-                    .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
+            let sources = event_sources_for(state, &auth_status);
+            let has_scope = sources
+                .as_ref()
+                .is_some_and(|(claims, _)| claims.scopes.iter().any(|s| s == EVENT_SCOPE));
+            // Advertise a scope challenge only to an active client that can see
+            // events. This is incremental consent, never a grant or an event
+            // subscription.
+            if let Some(method) = subscription_method
+                && sources.is_some()
+                && !has_scope
                 && let Some(manager) = &state.downstream_oauth
             {
-                if let Some(method) = subscription_method {
-                    tracing::info!(
-                        method,
-                        status = 403,
-                        missing_scope = crate::slack_events::EVENT_SCOPE,
-                        "MCP Events subscription outcome"
-                    );
-                }
+                tracing::info!(
+                    method,
+                    status = 403,
+                    missing_scope = EVENT_SCOPE,
+                    "MCP Events subscription outcome"
+                );
                 return Err(HttpError::InsufficientScopeWithMetadata {
                     metadata_url: protected_resource_metadata_url(manager.base_url()),
-                    scope: crate::slack_events::EVENT_SCOPE.to_string(),
+                    scope: EVENT_SCOPE.to_string(),
                 });
             }
-            // Static catalog discovery must precede incremental subscription consent.
-            let eligible = if custom.method == "events/list" {
-                discoverable_events(state, &auth_status)
-            } else {
-                permitted_events(state, &auth_status)
-            };
             let params = custom.params.unwrap_or_else(|| json!({}));
-            // A watch event goes to the watch source; everything else is Slack's.
-            let watch = watch_events_for(state, &auth_status).filter(|(events, _)| {
-                custom.method == "events/list"
-                    || params["name"]
-                        .as_str()
-                        .is_some_and(|name| events.owns(name))
-            });
-            if eligible.is_none() && watch.is_none() {
-                if let Some(method) = subscription_method {
-                    tracing::info!(
-                        method,
-                        status = "jsonrpc_error",
-                        "MCP Events subscription outcome"
-                    );
-                }
-                return json_response_for_era(
-                    &ServerJsonRpcMessage::error(
-                        McpError::new(ErrorCode(-32001), "event access denied", None),
-                        Some(request_id),
-                    ),
-                    era,
-                );
-            }
-            let result = match custom.method.as_str() {
-                "events/list" => {
-                    if params
-                        .as_object()
-                        .is_none_or(|p| p.keys().any(|k| k != "_meta" && k != "cursor"))
-                        || params.get("cursor").is_some_and(|v| !v.is_null())
-                    {
-                        Err(crate::slack_events::EventError {
-                            code: -32602,
-                            message: "invalid event list parameters",
-                            reason: None,
-                        })
-                    } else {
-                        tracing::info!(
-                            method = "events/list",
-                            status = 200,
-                            "MCP Events discovery outcome"
-                        );
-                        let mut list = eligible
-                            .map_or_else(|| json!({"events": []}), |events| events.catalog());
-                        if let (Some((events, client_id)), Some(all)) =
-                            (watch, list["events"].as_array_mut())
+            // Static catalog discovery must precede incremental subscription consent.
+            let result = match sources.filter(|_| subscription_method.is_none() || has_scope) {
+                None => Err(crate::events::denied()),
+                Some((claims, sources)) => match custom.method.as_str() {
+                    "events/list" => {
+                        if params
+                            .as_object()
+                            .is_none_or(|p| p.keys().any(|k| k != "_meta" && k != "cursor"))
+                            || params.get("cursor").is_some_and(|v| !v.is_null())
                         {
-                            all.extend(events.catalog(client_id));
+                            Err(crate::events::invalid("invalid event list parameters"))
+                        } else {
+                            tracing::info!(
+                                method = "events/list",
+                                status = 200,
+                                "MCP Events discovery outcome"
+                            );
+                            let events: Vec<_> = sources
+                                .iter()
+                                .flat_map(|source| source.catalog(&claims.client_id))
+                                .collect();
+                            Ok(json!({ "events": events }))
                         }
-                        Ok(list)
                     }
-                }
-                "events/subscribe" => match (watch, eligible) {
-                    (Some((events, client_id)), _) => events.subscribe(client_id, &params).await,
-                    (None, Some(events)) => events.subscribe(&params).await,
-                    (None, None) => Err(crate::slack_events::denied()),
-                },
-                _ => match (watch, eligible) {
-                    (Some((events, client_id)), _) => events.unsubscribe(client_id, &params).await,
-                    (None, Some(events)) => events.unsubscribe(&params).await,
-                    (None, None) => Err(crate::slack_events::denied()),
+                    method => match params["name"]
+                        .as_str()
+                        .and_then(|name| sources.iter().find(|source| source.owns(name)))
+                    {
+                        None => Err(crate::events::invalid("unsupported event")),
+                        Some(source) if method == "events/subscribe" => {
+                            source.subscribe(&claims.client_id, &params).await
+                        }
+                        Some(source) => source.unsubscribe(&claims.client_id, &params).await,
+                    },
                 },
             };
             if let Some(method) = subscription_method {

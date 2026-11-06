@@ -15,7 +15,7 @@ struct ServicePowerToggle: View {
             }
         ))
         .toggleStyle(.switch)
-        .disabled(model.isChangingService || model.isRestartingService)
+        .disabled(model.gate.isChangingService || model.gate.isRestartingService)
         .accessibilityLabel("Plug")
         .help(model.serviceEnabled ? "Turn Plug off" : "Turn Plug on")
         .confirmationDialog("Turn off Plug?", isPresented: $confirmingOff, titleVisibility: .visible) {
@@ -70,7 +70,6 @@ enum Metric {
     /// The picture at the start of a detail header.
     static let glyphSlot: CGFloat = 32
     static let popoverWidth: CGFloat = 340
-    static let popoverRowHeight: CGFloat = 34
     /// The space between one group and the next in the menu bar panel.
     static let panelGap: CGFloat = 12
     /// A server's tile in the menu bar panel, and the gap between two.

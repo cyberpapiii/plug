@@ -2,8 +2,7 @@ use std::sync::{Arc, Weak};
 
 use serde_json::{Map, Value};
 
-use super::{WatchAccess, WatchConfig};
-use crate::slack_events::EVENT_SCOPE;
+use super::{EVENT_SCOPE, WatchAccess, WatchConfig};
 
 /// Reads the live config, grants, and servers. Nothing is copied into event
 /// storage: every check goes to the running daemon.
@@ -31,14 +30,7 @@ impl WatchAccess for RuntimeWatchAccess {
             return Vec::new();
         };
         let config = engine.config();
-        if !config.http.modern_downstream_enabled
-            || config.http.auth_mode != crate::config::DownstreamAuthMode::Oauth
-            || !config
-                .http
-                .oauth_scopes
-                .as_ref()
-                .is_some_and(|scopes| scopes.iter().any(|scope| scope == EVENT_SCOPE))
-        {
+        if !super::events_possible(&config.http) {
             return Vec::new();
         }
         config
@@ -80,16 +72,16 @@ impl WatchAccess for RuntimeWatchAccess {
             .watched_tool(&watch.server, &watch.tool)
     }
 
-    async fn call(&self, tool_name: &str, arguments: Map<String, Value>) -> Option<Value> {
-        let engine = self.engine.upgrade()?;
+    async fn call(&self, tool_name: &str, arguments: Map<String, Value>) -> Result<Value, String> {
+        let engine = self.engine.upgrade().ok_or("Plug is stopping")?;
         let result = engine
             .tool_router()
             .call_tool(tool_name, Some(arguments))
             .await
-            .ok()?;
+            .map_err(|error| format!("the call failed with code {}", error.code.0))?;
         if result.is_error == Some(true) {
-            return None;
+            return Err("the tool returned an error".into());
         }
-        serde_json::to_value(&result).ok()
+        serde_json::to_value(&result).map_err(|_| "the result is not JSON".into())
     }
 }

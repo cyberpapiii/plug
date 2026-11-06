@@ -762,51 +762,34 @@ pub fn sanitize_server_name_for_path(name: &str) -> Result<&str, String> {
 pub fn validate_config(config: &Config) -> Vec<String> {
     let mut errors = Vec::new();
     errors.extend(config.secrets.validate());
+    let events_missing = crate::events::events_missing(&config.http);
     if let Some(events) = &config.http.slack_events {
         errors.extend(events.validate());
-        if !config.http.modern_downstream_enabled
-            || config.http.auth_mode != DownstreamAuthMode::Oauth
-        {
-            errors.push("http.slack_events requires modern downstream MCP and OAuth".into());
-        }
-        if !config.http.oauth_scopes.as_ref().is_some_and(|scopes| {
-            scopes
+        errors.extend(
+            events_missing
                 .iter()
-                .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
-        }) {
-            errors.push("http.slack_events requires explicit events:subscribe OAuth scope".into());
-        }
-        if !config
-            .servers
-            .get("slack")
-            .is_some_and(|server| server.enabled)
-        {
+                .map(|missing| format!("http.slack_events needs {missing}")),
+        );
+        if !crate::slack_events::upstream_enabled(config) {
             errors.push("http.slack_events requires the enabled slack upstream".into());
         }
     }
     errors.extend(config.events.validate());
     if !config.events.watch.is_empty() {
-        if !config.http.modern_downstream_enabled
-            || config.http.auth_mode != DownstreamAuthMode::Oauth
-        {
-            errors.push(
-                "events.watch needs remote clients that sign in: set http.modern_downstream_enabled = true and http.auth_mode = \"oauth\""
-                    .into(),
-            );
-        }
-        if !config.http.oauth_scopes.as_ref().is_some_and(|scopes| {
-            scopes
+        errors.extend(
+            events_missing
                 .iter()
-                .any(|scope| scope == crate::slack_events::EVENT_SCOPE)
-        }) {
-            errors.push("events.watch needs \"events:subscribe\" in http.oauth_scopes".into());
-        }
+                .map(|missing| format!("events.watch needs {missing}")),
+        );
         for watch in &config.events.watch {
+            let event = watch.event_name();
             if !config.servers.contains_key(&watch.server) {
                 errors.push(format!(
-                    "events.watch '{}' names a server that is not configured",
-                    watch.event_name()
+                    "events.watch '{event}' names a server that is not configured"
                 ));
+            }
+            if event == crate::slack_events::EVENT_NAME {
+                errors.push(format!("events.watch '{event}' is already an event"));
             }
         }
     }

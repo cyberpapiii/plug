@@ -1,7 +1,6 @@
 import Foundation
 
-/// The daemon IPC protocol versions this app speaks. The handshake offers
-/// them, and the app accepts a daemon only when the two ranges overlap.
+/// The daemon IPC protocol versions this app speaks, offered in the handshake.
 public let supportedIPCVersions: ClosedRange<UInt16> = 3...6
 
 public struct OperatorHandshake: Codable, Equatable, Sendable {
@@ -30,14 +29,6 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
         ipcMax = try container.decode(UInt16.self, forKey: .ipcMax)
         ownership = try container.decode(String.self, forKey: .ownership)
         capabilities = try container.decode([String].self, forKey: .capabilities)
-    }
-
-    /// Whether the daemon's IPC range is well formed and shares at least one
-    /// version with `supportedIPCVersions`.
-    public var sharesSupportedIPCVersion: Bool {
-        ipcMin <= ipcMax
-            && ipcMin <= supportedIPCVersions.upperBound
-            && ipcMax >= supportedIPCVersions.lowerBound
     }
 }
 
@@ -637,7 +628,6 @@ public enum IPCRequest: Encodable, Equatable, Sendable {
     case setClientAllowList(authToken: String, key: String, on: Bool)
     /// Start watching a tool. The daemon checks the tool before it saves.
     case addWatch(authToken: String, watch: WatchConfig)
-    /// Stop watching, by event name.
     case removeWatch(authToken: String, event: String)
     case shutdown(authToken: String)
 
@@ -790,7 +780,7 @@ public enum IPCResponse: Decodable, Sendable {
     case apiDescribed(APISummary)
     case mutation
     case revoked(String)
-    /// What a reload changed, so the app can say something specific about it.
+    /// What a reload changed. The app does not show it yet.
     case reloaded(ReloadSummary)
     case ok
     case error(code: String, message: String)

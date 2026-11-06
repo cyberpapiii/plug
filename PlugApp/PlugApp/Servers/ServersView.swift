@@ -15,26 +15,25 @@ struct ServersView: View {
     @State private var removingName = ""
 
     var body: some View {
-        Group {
-            if model.isLoadingInitialData {
-                LoadingPage(message: "Loading servers")
-            } else if model.initialDataUnavailable {
-                UnavailablePage(verdict: model.verdict, run: run)
-            } else if model.situation.servers.isEmpty {
-                EmptyPage(
-                    title: "No Servers",
-                    message: "Add one and every client connected to Plug can use it right away.",
-                    actionTitle: "Add Server…",
-                    actionIntent: .addServer,
-                    secondaryTitle: "Import Servers…",
-                    secondaryIntent: .importServers,
-                    run: run
-                )
-            } else if visibleNames.isEmpty {
-                NoSearchResults(text: search)
-            } else {
-                list
-            }
+        SectionPage(
+            model: model,
+            loading: "Loading servers",
+            isEmpty: model.situation.servers.isEmpty,
+            hasNoMatches: visibleNames.isEmpty,
+            search: search,
+            run: run
+        ) {
+            EmptyPage(
+                title: "No Servers",
+                message: "Add one and every client connected to Plug can use it right away.",
+                actionTitle: "Add Server…",
+                actionIntent: .addServer,
+                secondaryTitle: "Import Servers…",
+                secondaryIntent: .importServers,
+                run: run
+            )
+        } content: {
+            list
         }
         .pageSubtitle(serverSummary)
         .toolbar {

@@ -47,8 +47,6 @@ struct ToolFacts: Identifiable, Equatable, Sendable {
             shortName = name
         }
     }
-
-    var canToggle: Bool { lockedByPattern == nil }
 }
 
 extension ToolFacts {
@@ -72,25 +70,29 @@ struct ToolGroup: Identifiable, Equatable, Sendable {
     let tools: [ToolFacts]
 
     var onCount: Int { tools.filter(\.isOn).count }
-    var isFullyOff: Bool { !tools.isEmpty && onCount == 0 }
 }
 
-/// The full tool list, grouped and searchable. Pure value, so the rules for
-/// what a search matches and how groups are ordered can be tested directly.
+/// The full tool list, grouped and searchable.
 struct ToolCatalog: Equatable, Sendable {
     let tools: [ToolFacts]
+    /// The snapshot's `tool_catalog_revision` when this list was read.
+    let revision: UInt64?
     /// Each server's tools in the order they are shown. Every row of a server
     /// asks for these, so they are sorted once, when the list arrives.
     private let byServer: [String: [ToolFacts]]
 
-    init(_ tools: [ToolFacts] = []) {
+    init(_ tools: [ToolFacts] = [], revision: UInt64? = nil) {
         self.tools = tools
+        self.revision = revision
         byServer = Dictionary(grouping: tools, by: \.server).mapValues { $0.sorted(by: ToolFacts.inNameOrder) }
     }
 
     static func == (lhs: ToolCatalog, rhs: ToolCatalog) -> Bool { lhs.tools == rhs.tools }
 
     var isEmpty: Bool { tools.isEmpty }
+
+    /// Whether a daemon reporting `revision` would answer with this list.
+    func isCurrent(at revision: UInt64?) -> Bool { !isEmpty && self.revision == revision }
 
     /// The names a server's tools are filed under for clients, in order.
     /// More than one means Plug splits the server into groups.

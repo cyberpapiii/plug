@@ -3,14 +3,7 @@ import XCTest
 @testable import Plug
 
 final class LaunchdJobInspectorTests: XCTestCase {
-    private let canonical = VerifiedAppInstallation(
-        bundleURL: URL(fileURLWithPath: "/Applications/Plug.app"),
-        executableURL: URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
-        appVersion: "0.7.0",
-        buildVersion: "20",
-        embeddedVersion: "0.7.0",
-        teamID: "HJF7LN64XX"
-    )
+    private let canonical = makeTestInstallation()
 
     func testClassifiesCurrentAndStaleAppManagedJobs() async throws {
         let current = record(label: "com.plug.daemon", program: canonical.executableURL, parentVersion: "20")
@@ -373,7 +366,6 @@ final class LaunchdJobInspectorTests: XCTestCase {
             programURL: program,
             parentBundleIdentifier: parentID,
             parentBundleVersion: parentVersion,
-            loaded: true,
             programIdentifier: programIdentifier,
             arguments: arguments
         )

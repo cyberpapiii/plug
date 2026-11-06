@@ -113,29 +113,18 @@ final class FrameCodecTests: XCTestCase {
         XCTAssertEqual(unknown.ownership, "unknown")
     }
 
-    /// The handshake offer and both acceptance checks read one range, so the
-    /// app cannot offer versions it would then refuse.
-    func testHandshakeAcceptsOnlyAnOverlappingWellFormedIPCRange() throws {
-        func handshake(_ min: UInt16, _ max: UInt16) throws -> OperatorHandshake {
-            try JSONDecoder().decode(
-                OperatorHandshake.self,
-                from: Data(#"{"daemonVersion":"0.7.0","ipcMin":\#(min),"ipcMax":\#(max),"ownership":"app","capabilities":[]}"#.utf8)
-            )
-        }
-        let low = supportedIPCVersions.lowerBound
-        let high = supportedIPCVersions.upperBound
-
-        XCTAssertTrue(try handshake(low, high).sharesSupportedIPCVersion)
-        XCTAssertTrue(try handshake(high, high + 3).sharesSupportedIPCVersion)
-        XCTAssertTrue(try handshake(low - 1, low).sharesSupportedIPCVersion)
-        XCTAssertFalse(try handshake(high + 1, high + 1).sharesSupportedIPCVersion)
-        XCTAssertFalse(try handshake(low - 2, low - 1).sharesSupportedIPCVersion)
-        XCTAssertFalse(try handshake(high, low).sharesSupportedIPCVersion, "an inverted range is malformed")
-
-        let offer = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(IPCRequest.handshake(clientVersion: "0.7.0", ipcMin: low, ipcMax: high))
-        ) as? [String: Any]
-        XCTAssertEqual(offer?["ipc_min"] as? Int ?? offer?["ipcMin"] as? Int, Int(low))
+    /// The handshake offers exactly the range the app speaks, under the
+    /// daemon's field names.
+    func testHandshakeOffersTheSupportedIPCRange() throws {
+        let encoder = JSONEncoder()
+        encoder.keyEncodingStrategy = .convertToSnakeCase
+        let offer = try JSONSerialization.jsonObject(with: encoder.encode(IPCRequest.handshake(
+            clientVersion: "0.7.0",
+            ipcMin: supportedIPCVersions.lowerBound,
+            ipcMax: supportedIPCVersions.upperBound
+        ))) as? [String: Any]
+        XCTAssertEqual(offer?["ipc_min"] as? Int, Int(supportedIPCVersions.lowerBound))
+        XCTAssertEqual(offer?["ipc_max"] as? Int, Int(supportedIPCVersions.upperBound))
     }
 
     func testKeepingAClientFromAServerIsSentAsTheDaemonReadsIt() throws {
@@ -318,7 +307,7 @@ final class FrameCodecTests: XCTestCase {
     func testHandshakeTimesOutWhenSocketAcceptsButNeverReplies() async throws {
         let server = try AcceptWithoutReplyServer()
         defer { server.stop() }
-        let client = PlugIPCClient(socketURL: server.socketURL, requestTimeout: 0.15)
+        let client = PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.7.0", requestTimeout: 0.15)
         let started = ContinuousClock.now
 
         do {
@@ -336,7 +325,7 @@ final class FrameCodecTests: XCTestCase {
     func testLargeRequestTimesOutWhenAcceptedSocketNeverReads() async throws {
         let server = try AcceptedNeverReadServer()
         defer { server.stop() }
-        let client = PlugIPCClient(socketURL: server.socketURL, requestTimeout: 0.15)
+        let client = PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.7.0", requestTimeout: 0.15)
         let request = IPCRequest.addServer(
             authToken: "token",
             name: "large",

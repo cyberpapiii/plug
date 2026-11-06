@@ -776,7 +776,7 @@ fn build_configured_http_runtime(
                     oauth,
                     event_config.clone(),
                 )),
-                Arc::new(plug_core::slack_events::HttpsDelivery),
+                Arc::new(plug_core::events::HttpsDelivery),
             )
         };
         let events = open()
@@ -792,7 +792,7 @@ fn build_configured_http_runtime(
         plug_core::events::WatchEvents::open(
             &plug_core::config::config_dir().join("events").join("watch"),
             Arc::new(plug_core::events::RuntimeWatchAccess::new(engine, oauth)),
-            Arc::new(plug_core::slack_events::HttpsDelivery),
+            Arc::new(plug_core::events::HttpsDelivery),
         )
         .inspect_err(|error| tracing::warn!(%error, "watch events unavailable"))
         .ok()
@@ -801,6 +801,11 @@ fn build_configured_http_runtime(
         engine.set_watch_events(Arc::clone(events));
         events.spawn(engine.cancel_token().clone());
     }
+    let event_sources: Vec<Arc<dyn plug_core::events::EventSource>> = slack_events
+        .into_iter()
+        .map(|events| events as Arc<dyn plug_core::events::EventSource>)
+        .chain(watch_events.map(|events| events as Arc<dyn plug_core::events::EventSource>))
+        .collect();
 
     let http_state = Arc::new(
         plug_core::http::server::HttpState::new(
@@ -811,8 +816,7 @@ fn build_configured_http_runtime(
         .with_auth_mode(config.http.auth_mode.clone())
         .with_auth_token(auth_token)
         .with_downstream_oauth(downstream_oauth.clone())
-        .with_slack_events(slack_events)
-        .with_watch_events(watch_events)
+        .with_event_sources(event_sources)
         .with_sse_channel_capacity(config.http.sse_channel_capacity)
         .with_allowed_origins(
             config
