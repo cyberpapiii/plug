@@ -47,9 +47,6 @@
   ],
   "config_error": null,
   "daemon_error": null,
-  "http_sessions_included": true,
-  "inventory_partial": false,
-  "inventory_unavailable_sources": [],
   "lazy_tool_live_policy_note": "clients[].lazy_tool_* fields reflect config/default resolution; live sessions keep their daemon-start policy until restart after lazy_tools edits",
   "lazy_tool_policy_scope": "configured",
   "live_client_support": "supported",
@@ -57,8 +54,7 @@
   "live_session_count": 2,
   "live_session_transports": {
     "daemon_proxy": 2,
-    "http": 0,
-    "sse": 0
+    "http": 0
   },
   "live_sessions": [
     {

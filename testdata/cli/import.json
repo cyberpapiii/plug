@@ -30,7 +30,6 @@
         "url": null
       },
       "name": "github",
-      "source": "Cursor",
       "source_name": "Cursor",
       "source_target": "cursor"
     },
@@ -58,7 +57,6 @@
         "url": "https://notes.example.com/sse"
       },
       "name": "notes",
-      "source": "VSCodeCopilot",
       "source_name": "VS Code Copilot",
       "source_target": "vscode"
     }
@@ -96,12 +94,10 @@
             "url": null
           },
           "name": "github",
-          "source": "Cursor",
           "source_name": "Cursor",
           "source_target": "cursor"
         }
       ],
-      "source": "Cursor",
       "source_name": "Cursor",
       "source_target": "cursor"
     },
@@ -132,19 +128,16 @@
             "url": "https://notes.example.com/sse"
           },
           "name": "notes",
-          "source": "VSCodeCopilot",
           "source_name": "VS Code Copilot",
           "source_target": "vscode"
         }
       ],
-      "source": "VSCodeCopilot",
       "source_name": "VS Code Copilot",
       "source_target": "vscode"
     },
     {
       "error": "settings.json: expected value at line 1 column 1",
       "servers": [],
-      "source": "Zed",
       "source_name": "Zed",
       "source_target": "zed"
     }

@@ -18,9 +18,7 @@ use crate::commands::doctor::{
     ClientRepairItem, ClientRepairReport, PlugLinkDisposition, UnifiedInstallSnapshot,
     doctor_json_value,
 };
-use crate::runtime::{
-    LiveClientSupport, LiveInventoryAvailability, LiveInventoryMetadata, LiveSessionTransportCounts,
-};
+use crate::views::live::{LiveClientSupport, LiveInventory, LiveSessionTransportCounts};
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdata/cli")
@@ -89,19 +87,13 @@ fn clients() -> serde_json::Value {
         connected_secs: 30,
         last_activity_secs: Some(2),
     }];
-    let inventory = LiveInventoryMetadata {
+    let inventory = LiveInventory {
         session_count: 2,
         session_transports: LiveSessionTransportCounts {
             daemon_proxy: 2,
             http: 0,
-            sse: 0,
         },
         scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        availability: LiveInventoryAvailability {
-            partial: false,
-            unavailable_sources: Vec::new(),
-        },
-        http_sessions_included: true,
     };
     crate::views::clients::client_list_json(
         &clients,
