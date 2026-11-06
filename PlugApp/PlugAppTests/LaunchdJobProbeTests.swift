@@ -7,8 +7,7 @@ final class LaunchdJobProbeTests: XCTestCase {
         label: "local.plug.legacy",
         programURL: URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug"),
         parentBundleIdentifier: nil,
-        parentBundleVersion: nil,
-        loaded: true
+        parentBundleVersion: nil
     )
 
     func testReportsUnchangedWhenTheLabelStillNamesTheSameProgram() async throws {
@@ -75,8 +74,7 @@ final class LaunchdJobProbeTests: XCTestCase {
             label: "local.plug.legacy",
             programURL: nil,
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
 
         do {

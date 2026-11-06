@@ -14,7 +14,7 @@ enum LaunchdJobInspectionError: Error, Equatable {
 }
 
 struct LaunchdJobInspector: LaunchdJobInspecting {
-    private static let daemonLabel = "com.plug.daemon"
+    private static let daemonLabel = DaemonServiceManager.daemonLabel
     private static let appProgramIdentifier = "Contents/Resources/plug"
     private static let appArguments = [appProgramIdentifier, "serve", "--daemon"]
 
@@ -37,8 +37,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let allRecords = try await records().map {
             Self.resolveAppManagedProgram(in: $0, canonical: canonical)
         }
-        let canonicalPath = Self.resolvedPath(canonical.executableURL)
-        let legacyPaths = Set(recognizedLegacyPaths.map(Self.resolvedPath))
+        let legacyPaths = Set(recognizedLegacyPaths.map(\.resolvedStandardized))
         let relevant = allRecords.filter { record in
             record.label == Self.daemonLabel
                 || record.programURL?.lastPathComponent == "plug"
@@ -47,19 +46,13 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         }
         guard !relevant.isEmpty else { return .unmanaged }
 
-        let appOwned = relevant.filter {
-            $0.programURL.map(Self.resolvedPath) == canonicalPath
-                && $0.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
-        }
-        if appOwned.count == 1, relevant.count == 1, let record = appOwned.first {
-            return record.parentBundleVersion == canonical.buildVersion
-                ? .appManagedCurrent(record)
-                : .appManagedStale(record)
+        if relevant.count == 1, let record = relevant.first, canonical.registered(record) {
+            return canonical.registeredCurrent(record) ? .appManagedCurrent(record) : .appManagedStale(record)
         }
 
         let recognized = relevant.filter { record in
             guard let programURL = record.programURL else { return false }
-            let program = Self.resolvedPath(programURL)
+            let program = programURL.resolvedStandardized
             return legacyPaths.contains(program)
                 || LegacyPlugProgram.isRecognized(programURL)
                 || LegacyPlugProgram.isRecognized(program)
@@ -83,7 +76,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         guard listed.status == 0 else {
             throw LaunchdJobInspectionError.listFailed(
                 status: listed.status,
-                detail: errorDetail(listed)
+                detail: listed.stderrText
             )
         }
         let labels = parseLabels(String(decoding: listed.stdout, as: UTF8.self))
@@ -114,7 +107,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 throw LaunchdJobInspectionError.printFailed(
                     label: label,
                     status: detail.status,
-                    detail: errorDetail(detail)
+                    detail: detail.stderrText
                 )
             }
             records.append(parseRecord(label: label, output: String(decoding: detail.stdout, as: UTF8.self)))
@@ -146,7 +139,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         var parentVersion: String?
         var arguments: [String] = []
         var parsingArguments = false
-        var loaded = false
         for line in output.split(separator: "\n") {
             let text = line.trimmingCharacters(in: .whitespaces)
             if parsingArguments {
@@ -165,8 +157,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
                 parentIdentifier = value
             } else if let value = value(after: "parent bundle version =", in: text) {
                 parentVersion = value
-            } else if text == "state = running" {
-                loaded = true
             }
         }
         if parsingArguments {
@@ -177,7 +167,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             programURL: program,
             parentBundleIdentifier: parentIdentifier,
             parentBundleVersion: parentVersion,
-            loaded: loaded,
             programIdentifier: programIdentifier,
             arguments: arguments
         )
@@ -198,7 +187,7 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         let candidate = canonical.bundleURL
             .appending(path: appProgramIdentifier)
             .standardizedFileURL
-        guard resolvedPath(candidate) == resolvedPath(canonical.executableURL) else {
+        guard canonical.isExecutable(candidate) else {
             return record
         }
 
@@ -207,7 +196,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
             programURL: candidate,
             parentBundleIdentifier: record.parentBundleIdentifier,
             parentBundleVersion: record.parentBundleVersion,
-            loaded: record.loaded,
             programIdentifier: record.programIdentifier,
             arguments: record.arguments
         )
@@ -218,13 +206,6 @@ struct LaunchdJobInspector: LaunchdJobInspecting {
         return String(line.dropFirst(prefix.count)).trimmingCharacters(in: .whitespaces)
     }
 
-    static func resolvedPath(_ url: URL) -> URL {
-        url.resolvedStandardized
-    }
-
-    private static func errorDetail(_ result: ProcessResult) -> String {
-        result.stderrText
-    }
 }
 
 /// Re-reads one launchd job in the moment before it is torn down.
@@ -271,8 +252,7 @@ struct LaunchdJobProbe: Sendable {
         // Only recognized-legacy jobs are ever booted out, and those always
         // carry a concrete `program`.
         guard let program = current.programURL else { return .replaced(nil) }
-        let same = LaunchdJobInspector.resolvedPath(program)
-            == LaunchdJobInspector.resolvedPath(expected)
+        let same = program.resolvedStandardized == expected.resolvedStandardized
         return same ? .unchanged : .replaced(program)
     }
 }

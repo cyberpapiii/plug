@@ -2,7 +2,6 @@ import Darwin
 import Foundation
 import PlugIPC
 import ServiceManagement
-import UserNotifications
 
 enum DaemonServiceError: Error, Equatable {
     case adoptionRequired
@@ -28,7 +27,6 @@ protocol DaemonServiceBackend: AnyObject {
     func handshake() async throws -> OperatorHandshake
     func waitBeforeRetry() async
     func openLoginItemSettings()
-    var backgroundItemAllowance: SystemAllowance { get }
 }
 
 @MainActor
@@ -56,14 +54,12 @@ final class DaemonServiceManager {
         self.retryLimit = max(1, retryLimit)
     }
 
-    var appServiceEnabled: Bool { backend.enabled }
-    var mainAppAtLoginEnabled: Bool { SMAppService.mainApp.status == .enabled }
+    /// The name the daemon's LaunchAgent is registered under, which is also
+    /// its launchd label with `.plist` added.
+    nonisolated static let agentPlistName = "com.plug.daemon.plist"
+    nonisolated static let daemonLabel = "com.plug.daemon"
 
-    /// What macOS says about Plug running in the background and opening at
-    /// login. Both are switched off by the person in System Settings > Login
-    /// Items, and neither says so on its own.
-    var backgroundItemAllowance: SystemAllowance { backend.backgroundItemAllowance }
-    var loginItemAllowance: SystemAllowance { SystemAllowance(SMAppService.mainApp.status) }
+    var appServiceEnabled: Bool { backend.enabled }
 
     func inspect(
         canonical: VerifiedAppInstallation,
@@ -169,12 +165,7 @@ final class DaemonServiceManager {
         }
         if case let .appManagedCurrent(record) = inspected.ownership,
            let handshake = try? await backend.handshake(),
-           exactProof(
-               record: record,
-               handshake: handshake,
-               canonical: canonical,
-               expectedVersion: expectedVersion
-           )
+           canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
         {
             return handshake
         }
@@ -192,12 +183,7 @@ final class DaemonServiceManager {
         switch inspection.snapshot.ownership {
         case let .appManagedCurrent(record):
             if let handshake = inspection.handshake,
-               exactProof(
-                   record: record,
-                   handshake: handshake,
-                   canonical: canonical,
-                   expectedVersion: expectedVersion
-               )
+               canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
             {
                 return handshake
             }
@@ -234,8 +220,7 @@ final class DaemonServiceManager {
         }
     }
 
-    // Compatibility entry point for the existing first-run button. It remains
-    // an explicit operator action and delegates to the evidence-backed methods.
+    /// Takes over whatever daemon is running, with the owner's consent.
     func adopt() async throws {
         let canonical = try await appInspector.inspectCurrentApp()
         let snapshot = try await inspect(canonical: canonical, legacyPaths: legacyPaths)
@@ -261,8 +246,8 @@ final class DaemonServiceManager {
         }
     }
 
-    // Compatibility entry point for the existing restart button. Replacement
-    // still requires a newly verified app-owned record before any bootout.
+    /// Replaces this app's own daemon with a fresh one. Only a job read again
+    /// now and proved to be the app's own is booted out.
     func restart() async throws {
         let canonical = try await appInspector.inspectCurrentApp()
         let snapshot = try await inspect(canonical: canonical, legacyPaths: legacyPaths)
@@ -434,12 +419,7 @@ final class DaemonServiceManager {
             actualVersion = inspection.snapshot.daemonVersion
             if case let .appManagedCurrent(record) = inspection.snapshot.ownership,
                let handshake = inspection.handshake,
-               exactProof(
-                   record: record,
-                   handshake: handshake,
-                   canonical: canonical,
-                   expectedVersion: expectedVersion
-               )
+               canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
             {
                 return (handshake, actualVersion)
             }
@@ -468,20 +448,6 @@ final class DaemonServiceManager {
         )
     }
 
-    private func exactProof(
-        record: LaunchdJobRecord,
-        handshake: OperatorHandshake,
-        canonical: VerifiedAppInstallation,
-        expectedVersion: String
-    ) -> Bool {
-        guard let program = record.programURL else { return false }
-        return resolved(program) == resolved(canonical.executableURL)
-            && record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
-            && record.parentBundleVersion == canonical.buildVersion
-            && handshake.daemonExecutable.map { resolved($0) == resolved(canonical.executableURL) } == true
-            && handshake.daemonVersion == expectedVersion
-    }
-
     private func inspectionPaths(including snapshot: DaemonServiceSnapshot) -> Set<URL> {
         legacyPaths.union(snapshot.ownership.programURLs)
     }
@@ -499,26 +465,16 @@ final class DaemonServiceManager {
         return canonical
     }
 
-    private func resolved(_ url: URL) -> URL {
-        url.resolvedStandardized
-    }
-
-    /// Existence probes for leftover files still on disk. Not the classify table.
-    /// Cellar and brew-bin shapes are classified by `LegacyPlugProgram` even after uninstall.
+    /// A launchd job that runs one of these, after symlinks, is a leftover
+    /// install. A link that resolves into the app's own binary still counts.
     private static var defaultLegacyPaths: Set<URL> {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return [
-            home.appending(path: ".local/bin/plug"),
-            home.appending(path: ".cargo/bin/plug"),
-            URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug"),
-            URL(fileURLWithPath: "/usr/local/opt/plug/bin/plug"),
-        ]
+        LegacyPlugProgram.installPaths(home: FileManager.default.homeDirectoryForCurrentUser)
     }
 }
 
 @MainActor
 private final class SystemDaemonServiceBackend: DaemonServiceBackend {
-    private let agent = SMAppService.agent(plistName: "com.plug.daemon.plist")
+    private let agent = SMAppService.agent(plistName: DaemonServiceManager.agentPlistName)
     private let runner: any ProcessRunning
     private let probe: LaunchdJobProbe
 
@@ -528,7 +484,6 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool { agent.status == .enabled }
-    var backgroundItemAllowance: SystemAllowance { SystemAllowance(agent.status) }
 
     func pauseConnectors() async -> [Int32] {
         DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()).compactMap { pid in
@@ -591,13 +546,13 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
         // and killing that fresh instance runs into launchd's ten-second
         // respawn throttle, leaving no daemon for about eleven seconds. A plain
         // kickstart starts the job only when it is not already running.
-        try await launchctl(["kickstart", "gui/\(getuid())/com.plug.daemon"])
+        try await launchctl(["kickstart", "gui/\(getuid())/\(DaemonServiceManager.daemonLabel)"])
     }
 
     func handshake() async throws -> OperatorHandshake {
         // Called several times a reconcile and up to `retryLimit` times while
         // a replacement proves itself, so each probe closes its own socket.
-        try await PlugIPCClient().handshakeAndDisconnect()
+        try await PlugIPCClient(clientVersion: AppModel.defaultClientVersion).handshakeAndDisconnect()
     }
 
     func waitBeforeRetry() async {
@@ -636,73 +591,4 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
 
 extension DaemonServiceBackend {
     func resumeStrandedConnectors() async {}
-    var backgroundItemAllowance: SystemAllowance { enabled ? .allowed : .notAsked }
-}
-
-/// Where one thing Plug needs from macOS stands.
-enum SystemAllowance: Equatable, Sendable {
-    case allowed
-    /// The person turned it off in System Settings; only they can turn it on.
-    case turnedOff
-    /// Nothing has asked macOS for it yet.
-    case notAsked
-
-    init(_ status: SMAppService.Status) {
-        switch status {
-        case .enabled: self = .allowed
-        case .requiresApproval: self = .turnedOff
-        case .notRegistered, .notFound: self = .notAsked
-        @unknown default: self = .notAsked
-        }
-    }
-
-    init(_ status: UNAuthorizationStatus) {
-        switch status {
-        case .authorized, .provisional, .ephemeral: self = .allowed
-        case .denied: self = .turnedOff
-        case .notDetermined: self = .notAsked
-        @unknown default: self = .notAsked
-        }
-    }
-}
-
-/// Whether Plug's menu bar icon comes back after something else closed the
-/// app. The daemon does the reopening and reads one file to know whether it
-/// may: `menu-bar-hidden` beside its socket means the owner wants the app
-/// left closed.
-struct MenuBarPresence {
-    static let preferenceKey = "keepInMenuBar"
-    static var standard: MenuBarPresence {
-        MenuBarPresence(
-            marker: URL.homeDirectory.appending(path: "Library/Application Support/plug/menu-bar-hidden"),
-            defaults: .standard
-        )
-    }
-
-    let marker: URL
-    let defaults: UserDefaults
-
-    /// On unless the person turned it off.
-    var keeps: Bool {
-        get { defaults.object(forKey: Self.preferenceKey) as? Bool ?? true }
-        nonmutating set {
-            defaults.set(newValue, forKey: Self.preferenceKey)
-            appDidOpen()
-        }
-    }
-
-    /// The app is open, so an earlier quit no longer hides it.
-    func appDidOpen() {
-        if keeps { try? FileManager.default.removeItem(at: marker) } else { hide() }
-    }
-
-    /// The owner quit the app themselves; it stays closed until they open it.
-    func ownerDidQuit() { hide() }
-
-    private func hide() {
-        try? FileManager.default.createDirectory(
-            at: marker.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try? Data().write(to: marker, options: .atomic)
-    }
 }

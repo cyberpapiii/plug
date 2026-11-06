@@ -9,9 +9,7 @@ struct LinkableApp: Identifiable, Equatable, Sendable {
     let name: String
     /// Plug is written into this app's MCP configuration.
     let linked: Bool
-    /// The app is installed on this Mac.
     let detected: Bool
-    /// The app is talking to Plug right now.
     let live: Bool
     let sessions: Int
     /// How a linked app reaches Plug: on this Mac, or over the network.

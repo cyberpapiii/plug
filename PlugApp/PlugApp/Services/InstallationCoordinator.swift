@@ -45,9 +45,6 @@ extension DaemonServiceManager: DaemonServiceManaging {}
 
 @MainActor @Observable
 final class InstallationCoordinator {
-    private static let appManagedOwnership = "app_managed"
-    private static let unknownOwnership = "unknown"
-
     private(set) var state: InstallationState
 
     private let appInspector: any AppInstallationInspecting
@@ -61,16 +58,15 @@ final class InstallationCoordinator {
     private let laterRetryDelay: Duration?
     private let sleep: @Sendable (Duration) async -> Void
     private let logWriter: (URL, String) -> Void
+    private let serviceDisabled: ServiceDisabledMarker
     private var inFlight: Task<Void, Never>?
     private var transientFailures = 0
     private var retryGeneration = 0
 
-    /// The follow-up scheduled after a timeout. Tests await it; nothing else
-    /// needs to.
+    /// The follow-up scheduled after a timeout or a failure.
     private(set) var scheduledRetry: Task<Void, Never>?
 
-    static let defaultLogURL = FileManager.default.homeDirectoryForCurrentUser
-        .appending(path: "Library/Logs/Plug/installation-reconciliation.log")
+    static let defaultLogURL = PlugPaths.logs.appending(path: "installation-reconciliation.log")
 
     init(
         appInspector: any AppInstallationInspecting = AppInstallationInspector(),
@@ -84,8 +80,10 @@ final class InstallationCoordinator {
         transientRetryLimit: Int = 6,
         laterRetryDelay: Duration? = nil,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
-        logWriter: @escaping (URL, String) -> Void = ReconciliationLog.append
+        logWriter: @escaping (URL, String) -> Void = ReconciliationLog.append,
+        serviceDisabled: ServiceDisabledMarker = .standard
     ) {
+        self.serviceDisabled = serviceDisabled
         self.appInspector = appInspector
         self.legacyMigrator = legacyMigrator
         self.clientRepairer = clientRepairer
@@ -101,7 +99,7 @@ final class InstallationCoordinator {
     }
 
     func reconcile(trigger: ReconciliationTrigger) async {
-        guard !FileManager.default.fileExists(atPath: AppModel.defaultServiceDisabledURL.path) else { return }
+        guard !serviceDisabled.isSet else { return }
         guard shouldStart(trigger: trigger) else { return }
         if trigger == .retry || trigger == .explicitAdoption {
             // A person asked. Start the timeout budget over and drop any
@@ -128,14 +126,6 @@ final class InstallationCoordinator {
         }
         inFlight = task
         await task.value
-    }
-
-    func adopt() async {
-        await reconcile(trigger: .explicitAdoption)
-    }
-
-    func retry() async {
-        await reconcile(trigger: .retry)
     }
 
     /// Swaps this app's own daemon for a fresh one. The daemon manager refuses
@@ -236,7 +226,7 @@ final class InstallationCoordinator {
             if clientsNeedRepair {
                 publish(.repairingClients)
                 changedInstallation = true
-                _ = try await clientRepairer.repairAll(
+                try await clientRepairer.repairAll(
                     canonicalExecutable: canonical.executableURL
                 )
                 clientsNeedRepair = false
@@ -252,7 +242,7 @@ final class InstallationCoordinator {
             )
             // Anything but this app's own current daemon gets replaced or
             // adopted below.
-            if !isExactService(daemonSnapshot, canonical: canonical) {
+            if !canonical.isOwnCurrentDaemon(daemonSnapshot) {
                 changedInstallation = true
             }
             let handshake = try await reconcileDaemon(
@@ -263,20 +253,7 @@ final class InstallationCoordinator {
                 trigger: trigger
             )
 
-            let proof = ReconciliationProof(
-                appVersion: canonical.appVersion,
-                embeddedVersion: canonical.embeddedVersion,
-                daemonVersion: handshake.daemonVersion,
-                shellTarget: canonical.executableURL.standardizedFileURL,
-                daemonExecutable: handshake.daemonExecutable?.standardizedFileURL,
-                appManaged: handshake.ownership == Self.appManagedOwnership
-            )
-            try requireExactProof(
-                proof,
-                handshake: handshake,
-                canonical: canonical,
-                shellLink: shellLink
-            )
+            let proof = try requireProof(handshake: handshake, canonical: canonical, shellLink: shellLink)
 
             if legacy.cargoBinary != nil {
                 changedInstallation = true
@@ -407,7 +384,7 @@ final class InstallationCoordinator {
             )
 
         case .appManagedCurrent:
-            if !isExactService(snapshot, canonical: canonical) {
+            if !canonical.isOwnCurrentDaemon(snapshot) {
                 publish(.replacingDaemon)
             }
             return try await daemonManager.ensureRunning(canonical: canonical, inspected: snapshot)
@@ -479,7 +456,7 @@ final class InstallationCoordinator {
         if snapshot.clientRepairNeeded {
             failures.append("A linked client still needs repair.")
         }
-        if !isCanonical(snapshot.shellLink, executable: canonical.executableURL) {
+        if !isCanonical(snapshot.shellLink, canonical: canonical) {
             failures.append("The shell command does not point at \(canonical.executableURL.path).")
         }
         if snapshot.service.daemonVersion != canonical.appVersion {
@@ -487,16 +464,16 @@ final class InstallationCoordinator {
                 "The login service reports version \(snapshot.service.daemonVersion ?? "unknown"), expected \(canonical.appVersion)."
             )
         }
-        if snapshot.service.daemonExecutable.map({ samePath($0, canonical.executableURL) }) != true {
+        if snapshot.service.daemonExecutable.map(canonical.isExecutable) != true {
             failures.append(
                 "The daemon runs from \(snapshot.service.daemonExecutable?.path ?? "an unknown path"), expected \(canonical.executableURL.path)."
             )
         }
-        if !isAppManagedCurrent(snapshot.service.ownership, canonical: canonical) {
+        if !isRegisteredCurrent(snapshot.service.ownership, canonical: canonical) {
             failures.append("The daemon is not owned by this app build.")
         }
         if !snapshot.shadowInstalls.isEmpty {
-            let paths = snapshot.shadowInstalls.map(\.url.path).joined(separator: ", ")
+            let paths = snapshot.shadowInstalls.map(\.path).joined(separator: ", ")
             failures.append("Other Plug installs remain: \(paths).")
         }
         return failures
@@ -517,7 +494,7 @@ final class InstallationCoordinator {
             shadowInstalls: shadowInstalls(
                 legacy: legacy,
                 service: service,
-                canonicalExecutable: app.executableURL
+                app: app
             )
         )
     }
@@ -525,41 +502,32 @@ final class InstallationCoordinator {
     private func shadowInstalls(
         legacy: LegacyInstallSnapshot,
         service: DaemonServiceSnapshot,
-        canonicalExecutable: URL
-    ) -> [ShadowInstall] {
-        var shadows: [ShadowInstall] = []
+        app: VerifiedAppInstallation
+    ) -> [URL] {
+        var shadows: [URL] = []
         var knownPaths = Set<URL>()
         if let cargo = legacy.cargoBinary?.standardizedFileURL {
-            shadows.append(ShadowInstall(url: cargo))
+            shadows.append(cargo)
             knownPaths.insert(cargo)
         }
         // The shell link stays in `recognizedPaths` so legacy launchd jobs
         // that recorded it can be adopted. Once it points at the bundled
         // executable it is the canonical command, not a competing install.
-        let canonicalShellLink: Bool
-        if case let .canonical(target) = legacy.shellLink {
-            canonicalShellLink = samePath(target, canonicalExecutable)
-        } else {
-            canonicalShellLink = false
-        }
+        let canonicalShellLink = isCanonical(legacy.shellLink, canonical: app)
         for path in legacy.recognizedPaths.map(\.standardizedFileURL) {
             guard knownPaths.insert(path).inserted else { continue }
-            if canonicalShellLink, path.path.hasSuffix("/.local/bin/plug") { continue }
-            shadows.append(ShadowInstall(url: path))
+            if canonicalShellLink, path.path.hasSuffix("/" + LegacyPlugProgram.shellLink) { continue }
+            shadows.append(path)
         }
         if legacy.formulaInstalled,
-           !shadows.contains(where: { $0.url.path.contains("/opt/plug/bin/plug") })
+           !shadows.contains(where: { LegacyPlugProgram.formulaLinks.contains($0.path) })
         {
-            shadows.append(ShadowInstall(url: URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")))
+            shadows.append(URL(fileURLWithPath: LegacyPlugProgram.formulaLinks[0]))
         }
         if case let .recognizedLegacy(records) = service.ownership {
-            for record in records {
-                if let program = record.programURL {
-                    shadows.append(ShadowInstall(url: program.standardizedFileURL))
-                }
-            }
+            shadows += records.compactMap { $0.programURL?.standardizedFileURL }
         }
-        return shadows.sorted { $0.url.path < $1.url.path }
+        return shadows.sorted { $0.path < $1.path }
     }
 
     private func adoptionSnapshot(
@@ -614,66 +582,33 @@ final class InstallationCoordinator {
         }
     }
 
-    private func requireExactProof(
-        _ proof: ReconciliationProof,
+    private func requireProof(
         handshake: OperatorHandshake,
         canonical: VerifiedAppInstallation,
         shellLink: ShellLinkState
-    ) throws {
+    ) throws -> OwnDaemonProof {
         // `unknown` is an absence of evidence, not a disagreement: the daemon
         // could not read its own launchd registration. Repairable drift retries
         // the whole adoption path on every trigger, so folding absence into
         // drift would keep replacing a daemon nobody has proved is ours. Fail
         // closed and wait to be asked.
-        if handshake.ownership == Self.unknownOwnership {
+        if handshake.ownership == OperatorHandshake.unknownOwnership {
             throw CoordinatorError.unknownOwnership
         }
-        guard proof.appManaged,
-              handshake.ownership == Self.appManagedOwnership,
-              isCompatible(handshake),
-              handshake.daemonExecutable.map({ samePath($0, canonical.executableURL) }) == true,
-              proof.appVersion == canonical.appVersion,
-              proof.embeddedVersion == canonical.embeddedVersion,
-              proof.daemonVersion == canonical.appVersion,
-              isCanonical(shellLink, executable: canonical.executableURL)
-        else {
+        guard let proof = OwnDaemonProof(app: canonical, handshake: handshake, shellLink: shellLink) else {
             throw CoordinatorError.proofDisagreement
         }
+        return proof
     }
 
-    private func isCompatible(_ handshake: OperatorHandshake) -> Bool {
-        handshake.sharesSupportedIPCVersion
+    private func isRegisteredCurrent(_ ownership: DaemonOwnershipState, canonical: VerifiedAppInstallation) -> Bool {
+        guard case let .appManagedCurrent(record) = ownership else { return false }
+        return canonical.registeredCurrent(record)
     }
 
-    private func isExactService(
-        _ snapshot: DaemonServiceSnapshot,
-        canonical: VerifiedAppInstallation
-    ) -> Bool {
-        snapshot.daemonVersion == canonical.appVersion
-            && snapshot.daemonExecutable.map { samePath($0, canonical.executableURL) } == true
-            && isAppManagedCurrent(snapshot.ownership, canonical: canonical)
-    }
-
-    private func isAppManagedCurrent(
-        _ ownership: DaemonOwnershipState,
-        canonical: VerifiedAppInstallation
-    ) -> Bool {
-        guard case let .appManagedCurrent(record) = ownership,
-              let executable = record.programURL
-        else { return false }
-        return samePath(executable, canonical.executableURL)
-            && record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
-            && record.parentBundleVersion == canonical.buildVersion
-    }
-
-    private func isCanonical(_ shellLink: ShellLinkState, executable: URL) -> Bool {
+    private func isCanonical(_ shellLink: ShellLinkState, canonical: VerifiedAppInstallation) -> Bool {
         guard case let .canonical(target) = shellLink else { return false }
-        return samePath(target, executable)
-    }
-
-    private func samePath(_ lhs: URL, _ rhs: URL) -> Bool {
-        lhs.resolvedStandardized
-            == rhs.resolvedStandardized
+        return canonical.isExecutable(target)
     }
 
     private func publish(_ phase: ReconciliationPhase) {

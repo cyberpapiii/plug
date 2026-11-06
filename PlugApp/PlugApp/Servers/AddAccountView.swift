@@ -74,7 +74,7 @@ struct AddAccountView: View {
         failure = nil
         Task {
             do {
-                try await model.performOperation { .addAccount(authToken: $0, server: server, account: label) }
+                try await model.actions.addAccount(server: server, label: label)
                 saving = false
                 router.reveal(server: AccountDraft.serverName(server: server, label: label))
                 dismiss()

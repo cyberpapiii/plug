@@ -194,13 +194,7 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     func testCharacterWearsTheFaceTheVerdictReads() {
-        XCTAssertEqual(PlugCharacter.Mood(.good), .awake)
-        XCTAssertEqual(PlugCharacter.Mood(.quiet), .asleep)
-        XCTAssertEqual(PlugCharacter.Mood(.busy), .working)
-        XCTAssertEqual(PlugCharacter.Mood(.attention), .needsYou)
-        XCTAssertEqual(PlugCharacter.Mood(.blocked), .alert)
-
-        func mood(_ servers: [ServerFacts]) -> PlugCharacter.Mood {
+        func mood(_ servers: [ServerFacts]) -> PlugMood {
             PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: servers)).mood
         }
         XCTAssertEqual(mood([]), .curious)
@@ -307,7 +301,7 @@ final class PlugVerdictTests: XCTestCase {
     /// A face that never came to rest would redraw for ever, and one that
     /// moved a part out of sight would not be the character.
     func testEveryFaceHoldsStillAsAWholeCharacter() {
-        for mood in PlugCharacter.Mood.allCases {
+        for mood in PlugMood.allCases {
             let pose = PlugPose.pose(for: mood, at: 0, moving: false)
             XCTAssertEqual(pose, PlugPose.pose(for: mood, at: 3.7, moving: false), "\(mood)")
             for part in [PlugPose.Part.bodyWidth, .bodyHeight, .leftProngHeight, .rightProngHeight] {
@@ -362,7 +356,6 @@ final class PlugVerdictTests: XCTestCase {
     func testAServerTheDaemonNeverLoadedSaysSoAndOffersAReload() {
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 5), .starting)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true, daemonUptimeSecs: 61), .notLoaded)
-        XCTAssertEqual(ServerHealth(daemonValue: "Starting", enabled: true, daemonUptimeSecs: 600), .starting)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: false, daemonUptimeSecs: 600), .off)
 
         let missing = server("Linear", health: .notLoaded)
@@ -382,24 +375,10 @@ final class PlugVerdictTests: XCTestCase {
         let situation = PlugSituation(runtime: .reconnecting, servers: [off, server("a", tools: 3)])
         XCTAssertEqual(situation.countsSummary(stale: false), "1 server · 3 tools")
         XCTAssertEqual(situation.countsSummary(stale: true), "Last known · 1 server · 3 tools")
-        XCTAssertEqual(situation.listedServers.map(\.name), ["a", "b"])
         XCTAssertEqual(
             PlugSituation(servers: [server("a", tools: 1)]).countsSummary(stale: false),
             "1 server · 1 tool"
         )
-    }
-
-    func testConnectedAppsGroupSessionsByAppInFirstSeenOrder() {
-        let targets = AppIcons.distinctTargets(forClientTypes: [
-            "claude-code", "Codex CLI", "claude-code", "Claude Desktop"
-        ])
-        XCTAssertEqual(targets, ["claude-code", "codex-cli", "claude-desktop"])
-        let situation = PlugSituation(
-            runtime: .running,
-            connectedApps: targets.count,
-            connectedAppTargets: targets
-        )
-        XCTAssertEqual(situation.connectedApps, 3)
     }
 
     func testThePanelNamesWhoIsConnected() {

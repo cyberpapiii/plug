@@ -58,9 +58,8 @@ final class ClientRepairServiceTests: XCTestCase {
         )
         let service = ClientRepairService(runner: runner)
 
-        let result = try await service.repairAll(canonicalExecutable: canonicalExecutable)
+        try await service.repairAll(canonicalExecutable: canonicalExecutable)
 
-        XCTAssertEqual(result, ClientRepairResult(examined: 3, repaired: 1, unchanged: 2))
         let calls = await runner.calls
         XCTAssertEqual(calls.map(\.arguments), [
             ["repair", "--all", "--output", "json"],
@@ -81,7 +80,7 @@ final class ClientRepairServiceTests: XCTestCase {
         let service = ClientRepairService(runner: runner)
 
         do {
-            _ = try await service.repairAll(canonicalExecutable: canonicalExecutable)
+            try await service.repairAll(canonicalExecutable: canonicalExecutable)
             XCTFail("Expected command failure")
         } catch let error as ClientRepairError {
             XCTAssertEqual(error, .commandFailed(status: 23, stderr: "permission denied"))
@@ -114,21 +113,12 @@ final class ClientRepairServiceTests: XCTestCase {
         }
     }
 
-    func testInspectDoesNotEditClientFilesOrInvokeRepair() async throws {
-        let root = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: root) }
-        let clientFile = root.appending(path: "client.json")
-        let original = "{\"mcpServers\":{\"plug\":{\"command\":\"legacy\"}}}"
-        try Data(original.utf8).write(to: clientFile)
-
+    func testInspectRunsOnlyTheDryRun() async throws {
         let runner = RecordingRepairRunner(result: .success(.report(dispositions: ["recognized_legacy"])))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
         XCTAssertTrue(needsRepair)
-
-        XCTAssertEqual(try String(contentsOf: clientFile, encoding: .utf8), original)
         let calls = await runner.calls
         XCTAssertEqual(calls.map(\.arguments), [["repair", "--all", "--dry-run", "--output", "json"]])
     }

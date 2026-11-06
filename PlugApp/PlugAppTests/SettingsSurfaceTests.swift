@@ -208,8 +208,9 @@ final class ServerPlaceTests: XCTestCase {
 
     func testLocalAndRemoteReadDifferently() {
         XCTAssertEqual(server(transport: "stdio").transportLabel, "On this Mac")
-        XCTAssertEqual(server(transport: "streamable_http").transportLabel, "Over the network")
+        XCTAssertEqual(server(transport: "http").transportLabel, "Over the network")
         XCTAssertEqual(server(transport: "sse").transportLabel, "Over the network")
+        XCTAssertEqual(server(transport: "openapi").transportLabel, "Web API")
     }
 }
 
