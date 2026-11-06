@@ -1912,7 +1912,7 @@ async fn test_stdio_timeout_reconnects_cleanly() {
 
     std::fs::write(
         &script,
-        "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  touch \"$1\"\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --delay-ms 1500\nelse\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --delay-ms 0\nfi\n",
+        "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  touch \"$1\"\n  exec \"$2\" --tools echo --delay-ms 1500\nelse\n  exec \"$2\" --tools echo --delay-ms 0\nfi\n",
     )
     .expect("write wrapper");
     #[cfg(unix)]
@@ -1928,7 +1928,10 @@ async fn test_stdio_timeout_reconnects_cleanly() {
         "mock".to_string(),
         ServerConfig {
             command: Some(script.display().to_string()),
-            args: vec![marker.display().to_string()],
+            args: vec![
+                marker.display().to_string(),
+                plug_test_harness::mock_server_bin().display().to_string(),
+            ],
             timeout_secs: 10,
             call_timeout_secs: 1,
             ..Default::default()
@@ -1978,7 +1981,7 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
 
     std::fs::write(
         &script,
-        "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  touch \"$1\"\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --fail-mode crash\nelse\n  exec cargo run --quiet -p plug-test-harness --bin mock-mcp-server -- --tools echo --delay-ms 0\nfi\n",
+        "#!/bin/sh\nif [ ! -f \"$1\" ]; then\n  touch \"$1\"\n  exec \"$2\" --tools echo --fail-mode crash\nelse\n  exec \"$2\" --tools echo --delay-ms 0\nfi\n",
     )
     .expect("write wrapper");
     #[cfg(unix)]
@@ -1994,7 +1997,10 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
         "mock".to_string(),
         ServerConfig {
             command: Some(script.display().to_string()),
-            args: vec![marker.display().to_string()],
+            args: vec![
+                marker.display().to_string(),
+                plug_test_harness::mock_server_bin().display().to_string(),
+            ],
             timeout_secs: 10,
             call_timeout_secs: 5,
             ..Default::default()
