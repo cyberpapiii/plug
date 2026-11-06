@@ -8,8 +8,11 @@ use std::sync::{Arc, Mutex};
 
 use crate::types::PrincipalId;
 
+/// The legacy revision: every upstream and every legacy downstream speaks it.
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "2025-11-25";
-pub const ANNOUNCED_FUTURE_PROTOCOL_VERSION: &str = "2026-07-28";
+/// The stateless 2026-07-28 revision, served downstream only while
+/// `http.modern_downstream_enabled` is on.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// SEP-2322 discriminator for a fully materialized result. A proxied upstream
 /// result carries no pagination or task state, so this is the value a modern
 /// client would infer from an absent field on an earlier-revision server.
@@ -49,12 +52,12 @@ pub fn classify_http_request_era(
     let modern = method == Some("server/discover")
         || declared
             .first()
-            .is_some_and(|version| *version == ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+            .is_some_and(|version| *version == MODERN_PROTOCOL_VERSION);
     if modern {
-        if header_version != Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION) {
+        if header_version != Some(MODERN_PROTOCOL_VERSION) {
             return Err("modern requests require MCP-Protocol-Version: 2026-07-28".to_string());
         }
-        if value.get("id").is_some() && meta_version != Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION) {
+        if value.get("id").is_some() && meta_version != Some(MODERN_PROTOCOL_VERSION) {
             return Err(
                 "modern requests require matching protocolVersion in params._meta".to_string(),
             );
@@ -85,12 +88,30 @@ pub fn suppress_unimplemented_modern_capabilities(
 }
 
 impl ProtocolEra {
-    pub fn from_version(version: &ProtocolVersion) -> Self {
-        if version.as_str() == ANNOUNCED_FUTURE_PROTOCOL_VERSION {
+    /// The era a negotiated or declared version belongs to. Anything but the
+    /// modern revision is served as legacy.
+    pub fn of(version: &str) -> Self {
+        if version == MODERN_PROTOCOL_VERSION {
             Self::Modern
         } else {
             Self::Legacy
         }
+    }
+
+    pub fn from_version(version: &ProtocolVersion) -> Self {
+        Self::of(version.as_str())
+    }
+
+    pub fn version_str(self) -> &'static str {
+        match self {
+            Self::Legacy => SUPPORTED_PROTOCOL_VERSION,
+            Self::Modern => MODERN_PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn version(self) -> ProtocolVersion {
+        serde_json::from_value(serde_json::Value::String(self.version_str().to_string()))
+            .expect("Plug's protocol versions must parse")
     }
 }
 
@@ -447,13 +468,8 @@ impl Drop for QuotaLease {
     }
 }
 
-/// Parse the single protocol revision Plug is currently prepared to serve.
-/// Keeping construction here prevents individual transports from drifting.
 pub fn supported_protocol_version() -> ProtocolVersion {
-    serde_json::from_value(serde_json::Value::String(
-        SUPPORTED_PROTOCOL_VERSION.to_string(),
-    ))
-    .expect("Plug's supported protocol version must parse")
+    ProtocolEra::Legacy.version()
 }
 
 /// Every downstream protocol revision Plug will speak, oldest first.
@@ -466,7 +482,7 @@ pub fn supported_protocol_version() -> ProtocolVersion {
 pub fn supported_downstream_protocol_versions(modern_enabled: bool) -> Vec<ProtocolVersion> {
     let mut versions = vec![supported_protocol_version()];
     if modern_enabled {
-        versions.push(ProtocolVersion::V_2026_07_28);
+        versions.push(ProtocolEra::Modern.version());
     }
     versions
 }
@@ -641,6 +657,17 @@ mod tests {
     use super::*;
     use crate::types::PrincipalId;
     use uuid::Uuid;
+
+    #[test]
+    fn era_versions_are_the_revisions_rmcp_names() {
+        assert_eq!(ProtocolEra::Legacy.version(), ProtocolVersion::V_2025_11_25);
+        assert_eq!(ProtocolEra::Modern.version(), ProtocolVersion::V_2026_07_28);
+        assert_eq!(
+            ProtocolEra::from_version(&ProtocolVersion::V_2026_07_28),
+            ProtocolEra::Modern
+        );
+        assert_eq!(ProtocolEra::of("2025-06-18"), ProtocolEra::Legacy);
+    }
 
     #[test]
     fn parsed_supported_version_matches_policy_literal() {
@@ -872,7 +899,7 @@ mod tests {
             "params": { "requestId": 7 }
         });
         assert_eq!(
-            classify_http_request_era(&notification, Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION)),
+            classify_http_request_era(&notification, Some(MODERN_PROTOCOL_VERSION)),
             Ok(ProtocolEra::Modern)
         );
     }

@@ -143,7 +143,7 @@ fn modern_http_call_context(
     .with_trace_id(trace_id)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(state.router.modern_downstream_enabled());
     if let Some(info) = client_info {
@@ -294,9 +294,7 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             self.protocol_era,
             match self.protocol_era {
                 crate::protocol::ProtocolEra::Legacy => crate::protocol::SUPPORTED_PROTOCOL_VERSION,
-                crate::protocol::ProtocolEra::Modern => {
-                    crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
-                }
+                crate::protocol::ProtocolEra::Modern => crate::protocol::MODERN_PROTOCOL_VERSION,
             },
         )
         .with_modern_direction_enabled(self.modern_direction_enabled)
@@ -978,7 +976,7 @@ async fn post_mcp(
     if era == crate::protocol::ProtocolEra::Modern {
         if !state.router.modern_downstream_enabled() {
             return Err(HttpError::UnsupportedProtocolVersion(
-                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
+                crate::protocol::MODERN_PROTOCOL_VERSION.to_string(),
             ));
         }
         if raw_message.get("id").is_some() {
@@ -1192,7 +1190,7 @@ fn header_mismatch_response(
     if era == crate::protocol::ProtocolEra::Modern {
         response.headers_mut().insert(
             PROTOCOL_VERSION_HEADER,
-            HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+            HeaderValue::from_static(crate::protocol::MODERN_PROTOCOL_VERSION),
         );
     }
     response
@@ -1229,7 +1227,7 @@ fn validate_modern_request_metadata(value: &serde_json::Value) -> Result<(), Htt
         .ok_or_else(|| HttpError::BadRequest("modern request metadata is required".into()))?;
     let meta: RequestMetaObject = serde_json::from_value(meta)
         .map_err(|_| HttpError::BadRequest("modern request metadata is malformed".into()))?;
-    let missing = meta.missing_required_keys(&ProtocolVersion::V_2026_07_28);
+    let missing = meta.missing_required_keys(&crate::protocol::ProtocolEra::Modern.version());
     if !missing.is_empty() {
         return Err(HttpError::BadRequest(format!(
             "modern request metadata is missing: {}",
@@ -2765,7 +2763,7 @@ fn json_response_for_era(
     if era == crate::protocol::ProtocolEra::Modern {
         response.headers_mut().insert(
             PROTOCOL_VERSION_HEADER,
-            HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+            HeaderValue::from_static(crate::protocol::MODERN_PROTOCOL_VERSION),
         );
     }
 
@@ -2913,7 +2911,7 @@ fn modern_sse_response(
     );
     response.headers_mut().insert(
         PROTOCOL_VERSION_HEADER,
-        HeaderValue::from_static(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION),
+        HeaderValue::from_static(crate::protocol::MODERN_PROTOCOL_VERSION),
     );
     Ok(response)
 }
@@ -3321,7 +3319,7 @@ mod tests {
         )
         .with_protocol(
             crate::protocol::ProtocolEra::Modern,
-            crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+            crate::protocol::MODERN_PROTOCOL_VERSION,
         )
         .with_modern_direction_enabled(gate_enabled)
         .with_authorization(
@@ -4405,7 +4403,7 @@ mod tests {
         )
         .with_protocol(
             crate::protocol::ProtocolEra::Modern,
-            crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+            crate::protocol::MODERN_PROTOCOL_VERSION,
         )
         .with_modern_direction_enabled(true)
         .with_authorization(
@@ -4797,7 +4795,7 @@ mod tests {
                 .headers()
                 .get(PROTOCOL_VERSION_HEADER)
                 .and_then(|value| value.to_str().ok()),
-            Some(crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
+            Some(crate::protocol::MODERN_PROTOCOL_VERSION)
         );
         let body = axum::body::to_bytes(response.into_body(), 1024 * 1024)
             .await

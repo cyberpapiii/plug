@@ -103,7 +103,7 @@ fn ipc_ok_with_context<T: serde::Serialize>(
             // rather than a JSON-RPC envelope. Keep modern RMCP 3.x result
             // discriminators from leaking onto that legacy surface.
             if !context.is_some_and(|context| {
-                context.protocol_version == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                context.protocol_version == plug_core::protocol::MODERN_PROTOCOL_VERSION
             }) {
                 plug_core::protocol::rewrite_legacy_result(&mut payload, false);
             }
@@ -331,7 +331,7 @@ pub(super) async fn dispatch_mcp_request(
         // matching the downstream HTTP adapter.
         "ping" => {
             if request_context.is_some_and(|context| {
-                context.protocol_version == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                context.protocol_version == plug_core::protocol::MODERN_PROTOCOL_VERSION
             }) {
                 return IpcResponse::Error {
                     code: "UNSUPPORTED_METHOD".to_string(),
@@ -346,8 +346,7 @@ pub(super) async fn dispatch_mcp_request(
             let call_params = match params.map(|params| {
                 let mut params = params.clone();
                 if !request_context.is_some_and(|context| {
-                    context.protocol_version
-                        == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                    context.protocol_version == plug_core::protocol::MODERN_PROTOCOL_VERSION
                 }) {
                     plug_core::protocol::rewrite_legacy_call_params(&mut params);
                 }
@@ -425,8 +424,7 @@ pub(super) async fn dispatch_mcp_request(
                 request_context: request_context.cloned(),
                 modern_direction_enabled: tool_router.modern_downstream_enabled()
                     && request_context.is_some_and(|context| {
-                        context.protocol_version
-                            == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+                        context.protocol_version == plug_core::protocol::MODERN_PROTOCOL_VERSION
                     }),
             };
 
@@ -621,7 +619,7 @@ fn reject_invalid_request_context(
     context: Option<&IpcMcpRequestContext>,
 ) -> Option<IpcResponse> {
     if context.is_some_and(|context| {
-        context.protocol_version == plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+        context.protocol_version == plug_core::protocol::MODERN_PROTOCOL_VERSION
     }) && !modern_downstream_enabled
     {
         return Some(IpcResponse::Error {
@@ -681,7 +679,7 @@ mod tests {
     fn forged_modern_context_is_rejected_when_daemon_gate_is_off() {
         let context = IpcMcpRequestContext {
             request_id: RequestId::from(rmcp::model::NumberOrString::Number(7_i64)),
-            protocol_version: plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
+            protocol_version: plug_core::protocol::MODERN_PROTOCOL_VERSION.to_string(),
             client_name: Some("forged-client".to_string()),
             client_version: Some("1.0".to_string()),
         };
@@ -710,8 +708,7 @@ mod tests {
             owner_liveness: None,
             request_context: Some(IpcMcpRequestContext {
                 request_id: request_id.clone(),
-                protocol_version: plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
-                    .to_string(),
+                protocol_version: plug_core::protocol::MODERN_PROTOCOL_VERSION.to_string(),
                 client_name: Some("modern-client".to_string()),
                 client_version: Some("2.0".to_string()),
             }),

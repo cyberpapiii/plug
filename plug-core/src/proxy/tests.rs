@@ -3159,7 +3159,7 @@ async fn connect_modern_tool_upstream(
         capabilities: ServerCapabilities::default(),
         upstream: None,
         protocol_era: crate::protocol::ProtocolEra::Modern,
-        selected_protocol_version: crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION.to_string(),
+        selected_protocol_version: crate::protocol::MODERN_PROTOCOL_VERSION.to_string(),
         protocol_gate_state: 0,
         connection: crate::server::ConnectionGeneration::new(),
         health: ServerHealth::Healthy,
@@ -3451,7 +3451,7 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let error = router
@@ -3529,7 +3529,7 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let error = router
@@ -3576,7 +3576,7 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let error = router
@@ -3616,7 +3616,7 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
     )
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
 
@@ -3659,7 +3659,7 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     .with_local_principal(principal.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let first = router
@@ -3728,7 +3728,7 @@ async fn continuation_keeps_max_byte_reservation_across_larger_second_input_requ
     .with_local_principal(principal)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
 
@@ -3815,7 +3815,7 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
     .with_principal_lifecycle(lifecycle.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let request_router = Arc::clone(&router);
@@ -3879,7 +3879,7 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
     .with_local_principal(principal.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let request_router = Arc::clone(&router);
@@ -3947,7 +3947,7 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
     .with_local_principal(principal.clone())
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let request_router = Arc::clone(&router);
@@ -4070,7 +4070,7 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
     ))
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
-        crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        crate::protocol::MODERN_PROTOCOL_VERSION,
     )
     .with_modern_direction_enabled(true);
     let arguments = serde_json::Map::from_iter([

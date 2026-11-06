@@ -1337,7 +1337,7 @@ fn is_modern_stdio_message(value: &serde_json::Value) -> bool {
         || value
             .pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion")
             .and_then(serde_json::Value::as_str)
-            == Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION)
+            == Some(plug_core::protocol::MODERN_PROTOCOL_VERSION)
 }
 
 #[derive(Default)]
@@ -1367,7 +1367,7 @@ impl StdioProtocolState {
             && value
                 .pointer("/params/protocolVersion")
                 .and_then(serde_json::Value::as_str)
-                != Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+                != Some(plug_core::protocol::MODERN_PROTOCOL_VERSION);
         if explicit_legacy_initialize {
             self.modern_confirmed = false;
             self.pending_discovery_ids.clear();
@@ -1399,7 +1399,7 @@ impl StdioProtocolState {
                 && value
                     .pointer("/result/protocolVersion")
                     .and_then(serde_json::Value::as_str)
-                    == Some(plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+                    == Some(plug_core::protocol::MODERN_PROTOCOL_VERSION);
             if discovered || negotiated_modern {
                 self.modern_confirmed = true;
             }

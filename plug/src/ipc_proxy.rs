@@ -1334,11 +1334,12 @@ impl ServerHandler for IpcProxyHandler {
             // modern-aware local client can connect. The HTTP adapter, which
             // does classify eras, still answers `initialize` with
             // METHOD_NOT_FOUND in the modern era.
-            if request.protocol_version == ProtocolVersion::V_2026_07_28
+            if plug_core::protocol::ProtocolEra::from_version(&request.protocol_version)
+                == plug_core::protocol::ProtocolEra::Modern
                 && !self.refresh_modern_gate().await?
             {
                 return Err(McpError::unsupported_protocol_version(
-                    ProtocolVersion::V_2026_07_28,
+                    plug_core::protocol::ProtocolEra::Modern.version(),
                     &self.supported_protocol_versions(),
                 ));
             }
@@ -1445,7 +1446,7 @@ impl ServerHandler for IpcProxyHandler {
         async move {
             if !self.refresh_modern_gate().await? {
                 return Err(McpError::unsupported_protocol_version(
-                    ProtocolVersion::V_2026_07_28,
+                    plug_core::protocol::ProtocolEra::Modern.version(),
                     &self.supported_protocol_versions(),
                 ));
             }
@@ -1456,7 +1457,7 @@ impl ServerHandler for IpcProxyHandler {
                 McpError::invalid_params("discover requires client capability metadata", None)
             })?;
             let initialize = InitializeRequestParams::new(capabilities, client_info)
-                .with_protocol_version(ProtocolVersion::V_2026_07_28);
+                .with_protocol_version(plug_core::protocol::ProtocolEra::Modern.version());
             let mut info = self.initialize(initialize, context).await?;
             plug_core::protocol::suppress_unimplemented_modern_capabilities(&mut info.capabilities);
             Ok(DiscoverResult::from_server_info(
@@ -1948,7 +1949,7 @@ mod tests {
         );
         assert_eq!(
             selected_protocol_for_log(&ProtocolVersion::V_2026_07_28, &with_modern).as_str(),
-            plug_core::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+            plug_core::protocol::MODERN_PROTOCOL_VERSION
         );
     }
 

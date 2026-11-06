@@ -1052,7 +1052,7 @@ mod modern_context_tests {
     fn selected_protocol_log_uses_negotiated_request_version() {
         assert_eq!(
             selected_protocol_for_log(&ProtocolVersion::V_2026_07_28),
-            crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION
+            crate::protocol::MODERN_PROTOCOL_VERSION
         );
         assert_eq!(
             selected_protocol_for_log(&ProtocolVersion::V_2025_11_25),
