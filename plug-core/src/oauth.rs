@@ -27,10 +27,6 @@ use keyring_core as platform_keyring;
 
 use crate::config;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 /// Default token lifetime when `expires_in` is missing or invalid.
 pub const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 
@@ -123,10 +119,6 @@ pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Global store registry
-// ---------------------------------------------------------------------------
-
 static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
     LazyLock::new(DashMap::new);
 
@@ -213,11 +205,7 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
         .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Token helpers
-// ---------------------------------------------------------------------------
-
-/// Return the `~/.config/plug/tokens/` directory path.
+/// The `tokens` directory in Plug's config directory.
 pub fn tokens_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-helpers"))]
     if let Some(environment) = test_credential_environment() {
@@ -368,10 +356,6 @@ pub async fn bind_discovered_authority(
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     store.bind_verified_authority(&authority)
 }
-
-// ---------------------------------------------------------------------------
-// CachedCredentials
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct CachedCredentials {
@@ -543,12 +527,8 @@ impl std::fmt::Debug for CachedCredentials {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CompositeCredentialStore
-// ---------------------------------------------------------------------------
-
 /// Credential store that mirrors credentials to a JSON file at
-/// `~/.config/plug/tokens/{server_name}.json` and can also use the OS keyring.
+/// `tokens/{server_name}.json` in Plug's config directory and can also use the OS keyring.
 ///
 /// Reads prefer the local 0600 token file once credentials have been mirrored
 /// there, which avoids repeated macOS keychain prompts across short-lived CLI
@@ -1490,12 +1470,8 @@ impl CredentialStore for CompositeCredentialStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CompositeStateStore
-// ---------------------------------------------------------------------------
-
 /// File-based PKCE state store. Each state entry is stored at
-/// `~/.config/plug/tokens/{server_name}_state_{csrf}.json`.
+/// `tokens/{server_name}_state_{csrf}.json` in Plug's config directory.
 pub struct CompositeStateStore {
     server_name: String,
 }
@@ -1595,10 +1571,6 @@ impl StateStore for CompositeStateStore {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Token refresh
-// ---------------------------------------------------------------------------
 
 /// Outcome of an OAuth token refresh attempt.
 #[derive(Debug)]
@@ -1832,10 +1804,6 @@ pub async fn refresh_access_token(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {

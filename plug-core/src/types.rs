@@ -831,6 +831,31 @@ mod tests {
     }
 
     #[test]
+    fn three_failed_checks_degrade_six_fail_and_successes_climb_back() {
+        use super::{HealthState, ServerHealth};
+        let mut state = HealthState::new();
+        let after: Vec<ServerHealth> = (0..6)
+            .map(|_| {
+                state.record_failure();
+                state.health
+            })
+            .collect();
+        use ServerHealth::{Degraded, Failed, Healthy};
+        assert_eq!(
+            after,
+            [Healthy, Healthy, Degraded, Degraded, Degraded, Failed]
+        );
+        assert_eq!(
+            state.consecutive_failures,
+            HealthState::failed().consecutive_failures
+        );
+        state.record_success();
+        assert_eq!(state.health, Degraded);
+        state.record_success();
+        assert_eq!(state.health, Healthy);
+    }
+
+    #[test]
     fn auth_required_is_sticky_on_success() {
         use super::{HealthState, ServerHealth};
         let mut state = HealthState {

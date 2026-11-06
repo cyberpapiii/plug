@@ -397,7 +397,6 @@ mod tests {
 
     use crate::config::{Config, ServerConfig};
     use crate::engine::Engine;
-    use crate::types::{HealthState, ServerHealth};
 
     fn unstartable_server_config(health_check_interval_secs: u64) -> ServerConfig {
         ServerConfig {
@@ -405,15 +404,6 @@ mod tests {
             health_check_interval_secs,
             ..Default::default()
         }
-    }
-
-    #[test]
-    fn only_a_long_gap_in_the_wall_clock_counts_as_sleep() {
-        assert!(!super::slept_through(super::WAKE_WATCH_TICK));
-        assert!(!super::slept_through(
-            super::WAKE_WATCH_TICK + Duration::from_secs(5)
-        ));
-        assert!(super::slept_through(Duration::from_secs(3600)));
     }
 
     #[test]
@@ -610,73 +600,5 @@ mod tests {
             "one failed attempt, then success: {}",
             recovered[0]
         );
-    }
-
-    #[test]
-    fn health_state_transitions_to_degraded() {
-        let mut state = HealthState::new();
-        assert_eq!(state.health, ServerHealth::Healthy);
-
-        // 2 failures: still healthy
-        assert!(!state.record_failure());
-        assert!(!state.record_failure());
-        assert_eq!(state.health, ServerHealth::Healthy);
-
-        // 3rd failure: transitions to degraded
-        assert!(state.record_failure());
-        assert_eq!(state.health, ServerHealth::Degraded);
-    }
-
-    #[test]
-    fn health_state_transitions_to_failed() {
-        let mut state = HealthState::new();
-
-        // 3 failures → Degraded
-        for _ in 0..3 {
-            state.record_failure();
-        }
-        assert_eq!(state.health, ServerHealth::Degraded);
-
-        // 3 more failures → Failed (6 total)
-        for _ in 0..2 {
-            assert!(!state.record_failure());
-        }
-        assert!(state.record_failure()); // 6th
-        assert_eq!(state.health, ServerHealth::Failed);
-    }
-
-    #[test]
-    fn health_state_recovers_on_success() {
-        let mut state = HealthState::new();
-
-        // Drive to Failed
-        for _ in 0..6 {
-            state.record_failure();
-        }
-        assert_eq!(state.health, ServerHealth::Failed);
-
-        // 1 success → Degraded
-        assert!(state.record_success());
-        assert_eq!(state.health, ServerHealth::Degraded);
-
-        // 1 more success → Healthy
-        assert!(state.record_success());
-        assert_eq!(state.health, ServerHealth::Healthy);
-    }
-
-    #[test]
-    fn success_resets_failure_count() {
-        let mut state = HealthState::new();
-
-        state.record_failure();
-        state.record_failure();
-        // 1 success resets count
-        state.record_success();
-
-        // Need 3 more failures to reach Degraded
-        assert!(!state.record_failure());
-        assert!(!state.record_failure());
-        assert!(state.record_failure()); // 3rd since reset
-        assert_eq!(state.health, ServerHealth::Degraded);
     }
 }

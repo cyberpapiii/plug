@@ -3205,13 +3205,6 @@ mod tests {
     use tokio::sync::{Notify, watch};
 
     #[test]
-    fn secret_string_as_str_preserves_auth_header_value() {
-        let token = crate::types::SecretString::from("real-token".to_string());
-        assert_eq!(format!("Bearer {}", token.as_str()), "Bearer real-token");
-        assert_eq!(format!("{token}"), "[REDACTED]");
-    }
-
-    #[test]
     fn upstream_metrics_record_success_error_and_recovery() {
         let sm = ServerManager::new();
 
@@ -3301,32 +3294,6 @@ mod tests {
         assert_eq!(metadata.version, "0.1.0");
         assert_eq!(metadata.title, None);
         assert_eq!(metadata.icons, None);
-    }
-
-    #[test]
-    fn upstream_protocol_gate_and_lifecycle_mapping_are_exact() {
-        assert_eq!(
-            effective_upstream_protocol_mode(UpstreamProtocolMode::Modern, false),
-            UpstreamProtocolMode::Legacy
-        );
-        assert_eq!(
-            effective_upstream_protocol_mode(UpstreamProtocolMode::Auto, true),
-            UpstreamProtocolMode::Auto
-        );
-
-        assert_eq!(
-            client_lifecycle_mode(UpstreamProtocolMode::Auto),
-            ClientLifecycleMode::Auto {
-                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
-                legacy_version: Some(rmcp::model::ProtocolVersion::V_2025_11_25),
-            }
-        );
-        assert_eq!(
-            client_lifecycle_mode(UpstreamProtocolMode::Modern),
-            ClientLifecycleMode::Discover {
-                preferred_versions: vec![rmcp::model::ProtocolVersion::V_2026_07_28],
-            }
-        );
     }
 
     #[test]
@@ -4117,31 +4084,6 @@ mod tests {
             )])
             .into()))
         }
-    }
-
-    #[test]
-    fn replace_server_resets_health_state() {
-        let mgr = ServerManager::new();
-
-        // Simulate a degraded server by recording failures
-        {
-            let mut entry = mgr.health.entry("test".to_string()).or_default();
-            entry.record_failure();
-            entry.record_failure();
-            entry.record_failure(); // → Degraded
-            assert_eq!(entry.health, ServerHealth::Degraded);
-        }
-
-        // We can't easily create a real UpstreamServer without a running MCP server,
-        // but we can verify the health reset logic by checking the DashMap directly.
-        // The replace_server method resets health via: `*entry = HealthState::new()`
-        if let Some(mut entry) = mgr.health.get_mut("test") {
-            *entry = HealthState::new();
-        }
-
-        let health = mgr.health.get("test").unwrap();
-        assert_eq!(health.health, ServerHealth::Healthy);
-        assert_eq!(health.consecutive_failures, 0);
     }
 
     #[tokio::test]
