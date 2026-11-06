@@ -184,12 +184,6 @@ fn script_name(script: &str) -> Option<String> {
     (!name.is_empty()).then(|| name.to_string())
 }
 
-/// The host of `pid` in a `ps -axo pid=,ppid=,comm=` listing.
-#[cfg(test)]
-fn host_of(pid: u32, table: &str) -> Option<ClientHost> {
-    find_host(pid, table).map(|(_, executable)| describe(executable))
-}
-
 /// The pid and executable of the program that started `pid`.
 fn find_host(pid: u32, table: &str) -> Option<(u32, &str)> {
     let processes: std::collections::HashMap<u32, (u32, &str)> =
@@ -251,6 +245,11 @@ fn describe(executable: &str) -> ClientHost {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host of `pid` in a `ps -axo pid=,ppid=,comm=` listing.
+    fn host_of(pid: u32, table: &str) -> Option<ClientHost> {
+        find_host(pid, table).map(|(_, executable)| describe(executable))
+    }
 
     #[test]
     fn a_connector_started_by_an_app_is_hosted_by_that_app() {

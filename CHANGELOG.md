@@ -12,6 +12,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - `plug clients --output json` gives each live session its client's `target` slug, and `plug import --output json` gives each server and scanned file a `source_target` slug and a `source_name`, next to the fields it had.
 - `plug link` and `plug unlink` answer `--output json` with the clients they changed.
 - `plug import`, `plug link` and `plug repair` accept the same client names, aliases included. `plug import --clients` refuses a name it does not know where it used to skip it.
+- `plug` on its own suggests the same next steps in text as it lists in `--output json`.
 - `plug repair` writes `connect --client <name>` into Codex and Goose settings too, as it already did for JSON settings, and keeps the comments in a Goose file when it links Plug.
 - Plug rests when its window is covered, minimized or on another desktop, the way it does when the window is closed. It used to keep checking every two seconds, and the Clients page every five, for a window no one could see. It catches up the moment the window is back on screen.
 - The menu bar icon is a little larger and sits a point to the right, so it reads as centred and the same size as the icons beside it.

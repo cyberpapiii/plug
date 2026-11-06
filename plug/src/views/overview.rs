@@ -132,29 +132,53 @@ fn owner_approval_json(
     }
 }
 
+/// What to run next, each with why. Text and JSON both show this list.
 fn overview_next_actions(
     config_exists: bool,
     linked_clients_empty: bool,
     daemon_running: bool,
     owner_approval: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
-) -> Vec<&'static str> {
+) -> Vec<(&'static str, &'static str)> {
+    use plug_core::downstream_oauth::OwnerEnrollmentStatus;
+    const DOCTOR: (&str, &str) = ("plug doctor", "Diagnose configuration issues");
     if !config_exists {
-        vec!["plug setup"]
-    } else {
-        match owner_approval {
-            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled) => {
-                vec!["plug auth owner enroll", "plug doctor"]
-            }
-            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable) => {
-                vec!["plug doctor", "plug auth owner list"]
-            }
-            Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions) => {
-                vec!["plug doctor"]
-            }
-            _ if linked_clients_empty => vec!["plug link", "plug status"],
-            _ if daemon_running => vec!["plug status", "plug doctor"],
-            _ => vec!["plug status", "plug doctor", "plug repair"],
+        return vec![("plug setup", "Create config and link clients")];
+    }
+    match owner_approval {
+        Some(OwnerEnrollmentStatus::NotEnrolled) => vec![
+            (
+                "plug auth owner enroll",
+                "Finish owner setup before connecting",
+            ),
+            ("plug doctor", "Verify connection prerequisites"),
+        ],
+        Some(OwnerEnrollmentStatus::StateUnavailable) => vec![
+            ("plug doctor", "Inspect owner state safely"),
+            (
+                "plug auth owner list",
+                "Confirm whether owner passkeys can be read",
+            ),
+        ],
+        Some(OwnerEnrollmentStatus::UnsafePermissions) => {
+            vec![("plug doctor", "Inspect owner state safely")]
         }
+        _ if linked_clients_empty => vec![
+            ("plug link", "Link plug to your AI clients"),
+            ("plug status", "Check runtime health"),
+        ],
+        _ if daemon_running => vec![("plug status", "Inspect runtime health"), DOCTOR],
+        _ => vec![
+            ("plug status", "Start and inspect the service"),
+            DOCTOR,
+            ("plug repair", "Refresh linked client configs"),
+        ],
+    }
+}
+
+fn print_next_actions(actions: &[(&str, &str)]) {
+    print_heading("Next");
+    for (index, (command, why)) in actions.iter().enumerate() {
+        print_next_action(index + 1, command, why);
     }
 }
 
@@ -167,7 +191,7 @@ fn overview_json(
     inventory: &crate::runtime::LiveInventoryMetadata,
     live_client_support: LiveClientSupport,
     owner_approval: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
-    next_actions: &[&str],
+    next_actions: &[(&str, &str)],
 ) -> serde_json::Value {
     serde_json::json!({
         "command": "overview",
@@ -186,7 +210,7 @@ fn overview_json(
         "inventory_unavailable_sources": inventory.availability.unavailable_sources,
         "http_sessions_included": inventory.http_sessions_included,
         "owner_approval": owner_approval_json(owner_approval),
-        "next_actions": next_actions,
+        "next_actions": next_actions.iter().map(|(command, _)| command).collect::<Vec<_>>(),
     })
 }
 
@@ -274,9 +298,7 @@ pub(crate) async fn cmd_overview(
         print_label_value("Config", style("not found").yellow().bold());
         print_label_value("Path", style(config_path.display()).dim());
         println!();
-        print_heading("Next");
-        print_next_action(1, "plug setup", "Create config and link clients");
-        print_next_action(2, "plug status", "Check runtime health once configured");
+        print_next_actions(&overview_next_actions(false, true, false, None));
         return Ok(());
     }
 
@@ -394,40 +416,12 @@ pub(crate) async fn cmd_overview(
     }
 
     println!();
-    print_heading("Next");
-    if matches!(
+    print_next_actions(&overview_next_actions(
+        true,
+        linked_clients.is_empty(),
+        daemon_running,
         owner_approval,
-        Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled)
-    ) {
-        print_next_action(
-            1,
-            "plug auth owner enroll",
-            "Finish owner setup before connecting",
-        );
-        print_next_action(2, "plug doctor", "Verify connection prerequisites");
-    } else if matches!(
-        owner_approval,
-        Some(
-            plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable
-                | plug_core::downstream_oauth::OwnerEnrollmentStatus::UnsafePermissions
-        )
-    ) {
-        print_next_action(1, "plug doctor", "Inspect owner state safely");
-        print_next_action(
-            2,
-            "plug auth owner list",
-            "Confirm whether owner passkeys can be read",
-        );
-    } else if linked_clients.is_empty() {
-        print_next_action(1, "plug link", "Link plug to your AI clients");
-        print_next_action(2, "plug status", "Check runtime health");
-    } else if daemon_running {
-        print_next_action(1, "plug status", "Inspect runtime health");
-        print_next_action(2, "plug doctor", "Diagnose configuration issues");
-    } else {
-        print_next_action(1, "plug status", "Start and inspect the service");
-        print_next_action(2, "plug repair", "Refresh linked client configs");
-    }
+    ));
 
     Ok(())
 }
@@ -694,7 +688,7 @@ pub(crate) async fn cmd_status(
                 &servers,
                 live_client_support,
                 true,
-                "live_daemon",
+                crate::runtime::DaemonQueryAvailability::Available.status_source(),
                 daemon_running,
                 resource_subscriptions,
             );
@@ -793,7 +787,7 @@ pub(crate) async fn cmd_status(
                     "auth_status": serde_json::Value::Null,
                     "configured": true,
                     "enabled": server.enabled,
-                    "status_source": "config_only",
+                    "status_source": super::status_source(status_availability),
                 })
             })
             .collect::<Vec<_>>();
@@ -803,7 +797,7 @@ pub(crate) async fn cmd_status(
                 "uptime": 0,
                 "clients": 0,
                 "runtime_available": false,
-                "status_source": if status_availability.daemon_reachable() { "ipc_unavailable" } else { "config_only" },
+                "status_source": super::status_source(status_availability),
                 "servers": servers,
                 "daemon_running": status_availability.daemon_reachable()
             }))?
@@ -853,7 +847,7 @@ mod tests {
                     credential_count: 2,
                 },
             ),
-            &["plug status"],
+            &[("plug status", "Inspect runtime health")],
         );
 
         assert_eq!(json["live_client_count"], 2);
@@ -893,7 +887,10 @@ mod tests {
                 false,
                 true,
                 Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::NotEnrolled),
-            ),
+            )
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>(),
             vec!["plug auth owner enroll", "plug doctor"]
         );
         assert_eq!(
@@ -902,7 +899,10 @@ mod tests {
                 false,
                 true,
                 Some(plug_core::downstream_oauth::OwnerEnrollmentStatus::StateUnavailable),
-            ),
+            )
+            .iter()
+            .map(|(command, _)| *command)
+            .collect::<Vec<_>>(),
             vec!["plug doctor", "plug auth owner list"]
         );
     }

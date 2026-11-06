@@ -130,7 +130,7 @@ pub(crate) async fn cmd_server_list(
                         "{}",
                         serde_json::to_string_pretty(&serde_json::json!({
                             "runtime_available": true,
-                            "status_source": "live_daemon",
+                            "status_source": super::status_source(availability),
                             "servers": servers,
                         }))?
                     );
@@ -325,11 +325,7 @@ pub(crate) async fn cmd_server_list(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
                         "runtime_available": false,
-                        "status_source": if availability.daemon_reachable() {
-                            "ipc_unavailable"
-                        } else {
-                            "config_only"
-                        },
+                        "status_source": super::status_source(availability),
                         "daemon_running": availability.daemon_reachable(),
                         "servers": config.servers,
                         "server_inventory": server_inventory,
