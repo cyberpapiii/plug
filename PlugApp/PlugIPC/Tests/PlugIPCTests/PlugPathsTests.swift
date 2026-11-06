@@ -46,6 +46,27 @@ final class PlugPathsTests: XCTestCase {
         XCTAssertEqual(fixture.daemonArgs, PlugPaths.daemonArguments)
     }
 
+    /// The plist the app registers names the job and runs the binary the way
+    /// the daemon and both inspectors expect, or every app-managed job reads
+    /// as someone else's.
+    func testTheAppsLaunchAgentRunsTheDaemonAsNamed() throws {
+        let repoRoot = URL(fileURLWithPath: "\(#filePath)")
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .deletingLastPathComponent().deletingLastPathComponent()
+        let data = try Data(
+            contentsOf: repoRoot.appending(path: "PlugApp/PlugApp/Resources/\(PlugPaths.daemonLabel).plist")
+        )
+        let plist = try XCTUnwrap(
+            PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Any]
+        )
+        XCTAssertEqual(plist["Label"] as? String, PlugPaths.daemonLabel)
+        XCTAssertEqual(plist["BundleProgram"] as? String, PlugPaths.bundledBinary)
+        XCTAssertEqual(
+            plist["ProgramArguments"] as? [String],
+            [PlugPaths.bundledBinary] + PlugPaths.daemonArguments
+        )
+    }
+
     func testMarkersSitBesideTheSocket() {
         XCTAssertEqual(
             PlugPaths.marker(PlugPaths.menuBarHiddenMarker).deletingLastPathComponent(),

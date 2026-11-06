@@ -50,6 +50,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Fixed
 
 - The app names and pictures a client by the client the daemon took it for, on sessions, calls and remote sign-ins alike, and knows every client `plug clients` can link: Zed, Cline, Junie, Factory, Kilo Code and the rest now show their own names where they showed a capitalized client type. A sign-in named "Gemini" is Gemini CLI, as the daemon calls it. Goose is listed like every other client when it is on this Mac, and two of the owner's own scripts no longer show a Python icon.
+- With a `prefix_delimiter` other than `__`, the app shows tools by their short names, a server's tool groups and a call's server again. It used to split names on `__` whatever the config said.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.
 - Asking a server that runs tasks itself for a task's status or result gives up after the server's `call_timeout_secs`. A server that never answered used to hold the client's request open for good.

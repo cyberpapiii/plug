@@ -145,6 +145,9 @@ struct LaunchdJobRecord: Equatable, Sendable {
     let parentBundleVersion: String?
     let programIdentifier: String?
     let arguments: [String]
+    /// Who registered the job. `com.apple.xpc.ServiceManagement` for one
+    /// SMAppService registered on an app's behalf.
+    let managedBy: String?
 
     init(
         label: String,
@@ -152,7 +155,8 @@ struct LaunchdJobRecord: Equatable, Sendable {
         parentBundleIdentifier: String?,
         parentBundleVersion: String?,
         programIdentifier: String? = nil,
-        arguments: [String] = []
+        arguments: [String] = [],
+        managedBy: String? = nil
     ) {
         self.label = label
         self.programURL = programURL
@@ -160,6 +164,7 @@ struct LaunchdJobRecord: Equatable, Sendable {
         self.parentBundleVersion = parentBundleVersion
         self.programIdentifier = programIdentifier
         self.arguments = arguments
+        self.managedBy = managedBy
     }
 }
 
