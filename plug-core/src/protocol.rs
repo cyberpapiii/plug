@@ -140,9 +140,6 @@ pub enum MethodFamily {
     /// `decide_method` path as everything else.
     LoggingRead,
     Continuations,
-    Extensions,
-    Administration,
-    Unknown,
 }
 
 /// Default downstream OAuth grant: the method families a normal MCP client
@@ -187,42 +184,19 @@ pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 9] = {
 };
 
 impl MethodFamily {
-    pub fn from_method(method: &str) -> Self {
-        match method {
-            "tools/list" => Self::ToolsList,
-            "tools/call" => Self::ToolsCall,
-            "resources/list" | "resources/templates/list" => Self::ResourcesList,
-            "resources/read" => Self::ResourcesRead,
-            "resources/subscribe" | "resources/unsubscribe" => Self::ResourcesSubscribe,
-            "prompts/list" => Self::PromptsList,
-            "prompts/get" => Self::PromptsGet,
-            "completion/complete" => Self::Completion,
-            m if m.starts_with("tasks/") || m.starts_with("plug/legacy/tasks/") => Self::Tasks,
-            "subscriptions/listen" => Self::Listeners,
-            "logging/setLevel" => Self::Logging,
-            "tools/complete" => Self::Continuations,
-            m if m.starts_with("extensions/") => Self::Extensions,
-            m if m.starts_with("plug/admin/") => Self::Administration,
-            _ => Self::Unknown,
-        }
-    }
-
-    fn required_scope(self) -> Option<&'static str> {
+    fn required_scope(self) -> &'static str {
         match self {
-            Self::ToolsList | Self::ToolsCall => Some("tools:read"),
+            Self::ToolsList | Self::ToolsCall => "tools:read",
             Self::ResourcesList | Self::ResourcesRead | Self::ResourcesSubscribe => {
-                Some("resources:read")
+                "resources:read"
             }
-            Self::PromptsList | Self::PromptsGet => Some("prompts:read"),
-            Self::Completion => Some("completion:use"),
-            Self::Tasks => Some("tasks:use"),
-            Self::Listeners => Some("subscriptions:listen"),
-            Self::Logging => Some("logging:configure"),
-            Self::LoggingRead => Some("logging:read"),
-            Self::Continuations => Some("continuations:complete"),
-            Self::Extensions => Some("extensions:use"),
-            Self::Administration => Some("plug:admin"),
-            Self::Unknown => None,
+            Self::PromptsList | Self::PromptsGet => "prompts:read",
+            Self::Completion => "completion:use",
+            Self::Tasks => "tasks:use",
+            Self::Listeners => "subscriptions:listen",
+            Self::Logging => "logging:configure",
+            Self::LoggingRead => "logging:read",
+            Self::Continuations => "continuations:complete",
         }
     }
 
@@ -255,29 +229,22 @@ impl PolicyDecision {
 
 /// The single projection/admission policy. Unknown combinations fail closed.
 pub fn decide_method(input: &CapabilityPolicyInput<'_>, family: MethodFamily) -> PolicyDecision {
-    if family == MethodFamily::Unknown {
-        return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
-    }
     if input.era == ProtocolEra::Modern && !input.modern_direction_enabled {
         return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
     }
     if family.durable() && input.principal.is_none() {
         return PolicyDecision::Deny(ProtocolOutcome::AuthorizationRequired);
     }
-    if matches!(
-        family,
-        MethodFamily::Continuations | MethodFamily::Extensions
-    ) && !input.bridge_implemented
-    {
+    if family == MethodFamily::Continuations && !input.bridge_implemented {
         return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
     }
     if input.local_trust {
         return PolicyDecision::Allow;
     }
-    match family.required_scope() {
-        Some(scope) if input.scopes.contains(scope) => PolicyDecision::Allow,
-        Some(_) => PolicyDecision::Deny(ProtocolOutcome::PermissionDenied),
-        None => PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge),
+    if input.scopes.contains(family.required_scope()) {
+        PolicyDecision::Allow
+    } else {
+        PolicyDecision::Deny(ProtocolOutcome::PermissionDenied)
     }
 }
 
@@ -711,11 +678,7 @@ mod tests {
             MethodFamily::LoggingRead,
             MethodFamily::Continuations,
         ]
-        .map(|family| {
-            family
-                .required_scope()
-                .expect("default-grant families all require a scope")
-        });
+        .map(MethodFamily::required_scope);
         assert_eq!(
             DEFAULT_DOWNSTREAM_OAUTH_SCOPES, expected,
             "default grant must track MethodFamily::required_scope"
@@ -747,10 +710,6 @@ mod tests {
         assert_eq!(
             decide_method(&input, MethodFamily::PromptsGet),
             PolicyDecision::Deny(ProtocolOutcome::PermissionDenied)
-        );
-        assert_eq!(
-            decide_method(&input, MethodFamily::Unknown),
-            PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge)
         );
     }
 

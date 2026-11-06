@@ -8,9 +8,7 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
-use crate::legacy_tasks::{
-    CancelTaskResult, GetTaskPayloadResult, GetTaskResult, Task, TaskStatus,
-};
+use crate::legacy_tasks::{GetTaskPayloadResult, GetTaskResult, Task, TaskStatus};
 use crate::protocol::QuotaLease;
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
@@ -737,20 +735,6 @@ impl TaskStore {
                 None,
             )),
         }
-    }
-
-    pub fn cancel_result_for_owner(
-        &mut self,
-        owner: &TaskOwner,
-        task_id: &str,
-    ) -> Result<CancelTaskResult, McpError> {
-        self.prune_expired();
-        let record = self
-            .tasks
-            .get(task_id)
-            .ok_or_else(|| task_not_found(task_id))?;
-        ensure_owner(owner, record)?;
-        Ok(CancelTaskResult::new(record.task.clone()))
     }
 
     /// Drain stale in-flight cleanup after the synchronous store operation

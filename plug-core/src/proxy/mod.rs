@@ -15,7 +15,6 @@ use rmcp::model::*;
 use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
 
 use crate::artifacts::ArtifactStore;
 use crate::circuit::CircuitBreakerError;
@@ -524,9 +523,6 @@ pub struct DownstreamCallContext {
     scopes: Arc<BTreeSet<String>>,
     local_trust: bool,
     pub client_metadata: Option<crate::protocol::ClientMetadata>,
-    pub deadline: Option<std::time::Instant>,
-    pub cancellation: CancellationToken,
-    pub durable_owner: Option<TaskOwner>,
     /// OAuth client generation captured during bearer validation. Durable
     /// admission rechecks it after registering the TaskStore create guard.
     principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
@@ -557,9 +553,6 @@ impl DownstreamCallContext {
             scopes: Arc::new(BTreeSet::new()),
             local_trust,
             client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
             principal_lifecycle: None,
             extension_envelope: None,
         }
@@ -678,18 +671,6 @@ impl DownstreamCallContext {
 
     pub fn with_modern_direction_enabled(mut self, enabled: bool) -> Self {
         self.modern_direction_enabled = enabled;
-        self
-    }
-
-    pub fn with_lifecycle(
-        mut self,
-        deadline: Option<std::time::Instant>,
-        cancellation: CancellationToken,
-        durable_owner: Option<TaskOwner>,
-    ) -> Self {
-        self.deadline = deadline;
-        self.cancellation = cancellation;
-        self.durable_owner = durable_owner;
         self
     }
 
@@ -3314,7 +3295,6 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
                 .into_error(context.protocol_era));
         }
-        let context = context;
         let binding = binding.ok_or_else(|| {
             crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
         })?;
