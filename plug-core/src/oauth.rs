@@ -415,6 +415,35 @@ enum PersistedCredentialEnvelope {
     Legacy(StoredCredentials),
 }
 
+/// How one save is persisted. A bound write always carries the generation its
+/// file and Keychain entry share, so a bound record without one cannot be built.
+enum WriteShape {
+    /// The bare record, for a store no authority is bound to yet.
+    Legacy,
+    Bound {
+        binding: CredentialBinding,
+        generation: String,
+    },
+}
+
+impl WriteShape {
+    fn encode(&self, credentials: &StoredCredentials) -> Result<serde_json::Value, AuthError> {
+        match self {
+            Self::Legacy => serde_json::to_value(credentials),
+            Self::Bound {
+                binding,
+                generation,
+            } => serde_json::to_value(BoundCredentialEnvelope {
+                version: CREDENTIAL_ENVELOPE_VERSION,
+                generation: generation.clone(),
+                binding: binding.clone(),
+                credentials: credentials.clone(),
+            }),
+        }
+        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
+    }
+}
+
 enum BoundPairProbe {
     NotBound,
     Valid(Box<StoredCredentials>),
@@ -719,35 +748,16 @@ impl CompositeCredentialStore {
             .and_then(|credentials| stored_access_token(&credentials))
     }
 
-    /// The persisted shape of `credentials`: a bound envelope when an
-    /// authority is bound, the bare legacy record otherwise.
-    fn credential_envelope(
-        &self,
-        credentials: &StoredCredentials,
-        generation: Option<&str>,
-    ) -> Result<serde_json::Value, AuthError> {
+    /// The shape of the next write, read once so the file and the Keychain
+    /// entry of one save agree. A bound write gets a fresh generation here.
+    fn write_shape(&self) -> WriteShape {
         match self.binding.load().as_ref().as_ref() {
-            Some(binding) => serde_json::to_value(BoundCredentialEnvelope {
-                version: CREDENTIAL_ENVELOPE_VERSION,
-                generation: generation
-                    .expect("bound credential writes require a transaction generation")
-                    .to_string(),
+            Some(binding) => WriteShape::Bound {
                 binding: binding.clone(),
-                credentials: credentials.clone(),
-            }),
-            None => serde_json::to_value(credentials),
+                generation: uuid::Uuid::new_v4().to_string(),
+            },
+            None => WriteShape::Legacy,
         }
-        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
-    }
-
-    fn encode_credentials(
-        &self,
-        credentials: &StoredCredentials,
-        generation: Option<&str>,
-    ) -> Result<String, AuthError> {
-        Ok(self
-            .credential_envelope(credentials, generation)?
-            .to_string())
     }
 
     fn credential_write_lock_path(&self) -> Result<PathBuf, AuthError> {
@@ -791,13 +801,37 @@ impl CompositeCredentialStore {
         }
     }
 
-    fn save_credential_pair(&self, credentials: &StoredCredentials) -> Result<(), AuthError> {
-        self.with_credential_write_lock(|| {
-            let generation = uuid::Uuid::new_v4().to_string();
-            self.file_save_generation(credentials, Some(&generation))?;
-            self.keyring_save_generation(credentials, Some(&generation))?;
-            Ok(())
-        })
+    /// Write the file mirror, then the Keychain entry. A bound pair is one
+    /// transaction under the credential lock: a partial write returns Err, and
+    /// the generation mismatch makes the split pair unreadable on the next load.
+    fn persist(&self, credentials: &StoredCredentials) -> Result<(), AuthError> {
+        let shape = self.write_shape();
+        let write_both = || {
+            self.file_write(credentials, &shape)?;
+            self.keyring_write(credentials, &shape)
+        };
+        match shape {
+            WriteShape::Legacy => write_both(),
+            WriteShape::Bound { .. } => self.with_credential_write_lock(write_both),
+        }
+    }
+
+    /// Copy credentials read from the Keychain back to a missing or stale file
+    /// mirror. Only an unbound mirror can be repaired by itself: a bound file
+    /// must carry its Keychain entry's generation, which only [`Self::persist`]
+    /// writes.
+    fn repair_legacy_file_mirror(&self, credentials: &StoredCredentials) {
+        let shape = self.write_shape();
+        if matches!(shape, WriteShape::Bound { .. }) {
+            return;
+        }
+        if let Err(error) = self.file_write(credentials, &shape) {
+            warn!(
+                server = %self.server_name,
+                %error,
+                "token file mirror repair failed after keyring-backed load"
+            );
+        }
     }
 
     fn migrate_loaded_legacy_credentials(
@@ -807,7 +841,7 @@ impl CompositeCredentialStore {
         if !self.unbound_legacy_loaded.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        self.save_credential_pair(credentials)?;
+        self.persist(credentials)?;
         self.update_cache(credentials);
         Ok(())
     }
@@ -835,14 +869,10 @@ impl CompositeCredentialStore {
         self.decode_credentials(&json, "keyring")
     }
 
-    fn keyring_save(&self, creds: &StoredCredentials) -> bool {
-        self.keyring_save_generation(creds, None).is_ok()
-    }
-
-    fn keyring_save_generation(
+    fn keyring_write(
         &self,
         creds: &StoredCredentials,
-        generation: Option<&str>,
+        shape: &WriteShape,
     ) -> Result<(), AuthError> {
         #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
@@ -856,7 +886,7 @@ impl CompositeCredentialStore {
                     "injected test keyring write failure".to_string(),
                 ));
             }
-            let json = self.encode_credentials(creds, generation)?;
+            let json = shape.encode(creds)?.to_string();
             environment
                 .keyring
                 .lock()
@@ -868,7 +898,7 @@ impl CompositeCredentialStore {
         let entry = self
             .keyring_entry()
             .ok_or_else(|| AuthError::InternalError("keyring entry is unavailable".to_string()))?;
-        let json = self.encode_credentials(creds, generation)?;
+        let json = shape.encode(creds)?.to_string();
         match entry.set_password(&json) {
             Ok(()) => {
                 debug!(server = %self.server_name, "keyring: credentials saved");
@@ -1000,18 +1030,9 @@ impl CompositeCredentialStore {
         self.decode_credentials(&json, "token file")
     }
 
-    fn file_save(&self, creds: &StoredCredentials) -> Result<(), AuthError> {
-        self.file_save_generation(creds, None)
-    }
-
-    fn file_save_generation(
-        &self,
-        creds: &StoredCredentials,
-        generation: Option<&str>,
-    ) -> Result<(), AuthError> {
+    fn file_write(&self, creds: &StoredCredentials, shape: &WriteShape) -> Result<(), AuthError> {
         let path = self.token_file_path()?;
-        let value = self.credential_envelope(creds, generation)?;
-        self.save_json_file(path, &value, "token file")
+        self.save_json_file(path, &shape.encode(creds)?, "token file")
     }
 
     fn file_clear(&self) {
@@ -1289,15 +1310,9 @@ impl CompositeCredentialStore {
                 if matches!(source, CredentialSource::Keyring)
                     && persisted_file
                         .as_ref()
-                        .map(|file| !Self::persisted_credentials_match(file, creds))
-                        .unwrap_or(true)
-                    && let Err(error) = self.file_save(creds)
+                        .is_none_or(|file| !Self::persisted_credentials_match(file, creds))
                 {
-                    warn!(
-                        server = %self.server_name,
-                        error = %error,
-                        "token file mirror repair failed after keyring-backed load"
-                    );
+                    self.repair_legacy_file_mirror(creds);
                 }
                 self.update_cache(creds);
                 CredentialSnapshot {
@@ -1370,36 +1385,17 @@ impl CredentialStore for CompositeCredentialStore {
         {
             if self.binding.load().as_ref().is_some() {
                 self.migrate_loaded_legacy_credentials(credentials)?;
-            } else if let Err(error) = self.file_save(credentials) {
-                warn!(
-                    server = %self.server_name,
-                    %error,
-                    "token file mirror repair failed after keyring-backed load"
-                );
+            } else {
+                self.repair_legacy_file_mirror(credentials);
             }
         }
         Ok(snapshot.credentials)
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        if self.binding.load().as_ref().is_some() {
-            // Bound credentials are one logical mirror transaction. A partial
-            // platform write returns Err and the generation mismatch makes the
-            // split pair unreadable on the next load.
-            self.save_credential_pair(&credentials)?;
-        } else {
-            // Legacy unbound records retain their compatibility write shape.
-            self.file_save(&credentials)?;
-            if !self.keyring_save(&credentials) {
-                return Err(AuthError::InternalError(
-                    "keyring credential save failed".to_string(),
-                ));
-            }
-        }
-
+        self.persist(&credentials)?;
         // Publish to the in-memory cache only after durable mirror success.
         self.update_cache(&credentials);
-
         Ok(())
     }
 
@@ -1915,7 +1911,7 @@ mod tests {
             Some(1234567890),
         );
 
-        let save_result = store.file_save(&creds);
+        let save_result = write_file_only(&store, &creds);
         assert!(save_result.is_ok(), "file_save failed: {save_result:?}");
 
         let loaded = store.file_load();
@@ -2066,6 +2062,20 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(now))
+    }
+
+    fn write_file_only(
+        store: &CompositeCredentialStore,
+        credentials: &StoredCredentials,
+    ) -> Result<(), AuthError> {
+        store.file_write(credentials, &store.write_shape())
+    }
+
+    fn write_keyring_only(
+        store: &CompositeCredentialStore,
+        credentials: &StoredCredentials,
+    ) -> Result<(), AuthError> {
+        store.keyring_write(credentials, &store.write_shape())
     }
 
     fn cached_access_token(server_name: &str) -> Option<String> {
@@ -2490,11 +2500,11 @@ mod tests {
         let mut fresher_keyring =
             make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
         fresher_keyring.token_received_at = Some(200);
-        assert!(store.keyring_save(&fresher_keyring));
+        write_keyring_only(&store, &fresher_keyring).unwrap();
 
         let mut mirrored_file = make_test_token("file-access", Some("file-refresh"), Some(3600));
         mirrored_file.token_received_at = Some(100);
-        store.file_save(&mirrored_file).unwrap();
+        write_file_only(&store, &mirrored_file).unwrap();
         store.clear_cache();
 
         let debug_snapshot = store.fallback_auth_debug_snapshot();
@@ -2598,7 +2608,7 @@ mod tests {
         store.clear().await.unwrap();
 
         let creds = make_test_token("file-only-access", Some("file-only-refresh"), Some(3600));
-        store.file_save(&creds).unwrap();
+        write_file_only(&store, &creds).unwrap();
         store.keyring_clear();
 
         let warnings = store.credential_snapshot().warnings;
@@ -2660,7 +2670,7 @@ mod tests {
             Some("legacy-keyring-refresh"),
             Some(3600),
         );
-        assert!(store.keyring_save(&credentials));
+        write_keyring_only(&store, &credentials).unwrap();
         store.file_clear();
         store.clear_cache();
         store.binding.store(Arc::new(Some(CredentialBinding {
@@ -2694,6 +2704,73 @@ mod tests {
         assert_eq!(file.generation, keyring.generation);
         assert_eq!(file.binding, keyring.binding);
 
+        store.clear().await.unwrap();
+    }
+
+    /// `plug auth login` and `plug auth inject` read a snapshot of a store
+    /// whose Keychain entry is bound but whose file mirror is gone. Decoding
+    /// that entry binds the store, so the snapshot must not try to write the
+    /// file by itself: a bound file needs the generation it shares with the
+    /// Keychain entry.
+    #[tokio::test]
+    async fn snapshot_of_a_bound_keychain_entry_without_its_file_does_not_panic() {
+        let name = format!("oauth-bound-keyring-snapshot-{}", uuid::Uuid::new_v4());
+        let writer = CompositeCredentialStore::new(name.clone());
+        writer.bind_verified_authority(&test_authority()).unwrap();
+        CredentialStore::save(
+            &writer,
+            make_test_token("bound-access", Some("refresh"), Some(3600)),
+        )
+        .await
+        .unwrap();
+        writer.file_clear();
+        let keyring_before = writer.raw_keyring_json();
+
+        let reader = CompositeCredentialStore::new(name);
+        let snapshot = reader.credential_snapshot();
+
+        assert_eq!(snapshot.source, Some("keyring"));
+        assert_eq!(
+            snapshot
+                .credentials
+                .as_ref()
+                .and_then(stored_access_token)
+                .as_deref(),
+            Some("bound-access")
+        );
+        assert!(reader.raw_file_json().is_none());
+        assert_eq!(reader.raw_keyring_json(), keyring_before);
+        reader.clear().await.unwrap();
+    }
+
+    /// The same read after `bind_discovered_authority`, with a stale legacy
+    /// file and newer legacy Keychain credentials.
+    #[tokio::test]
+    async fn snapshot_of_a_store_bound_by_discovery_does_not_panic() {
+        let name = format!("oauth-discovery-bound-snapshot-{}", uuid::Uuid::new_v4());
+        let store = CompositeCredentialStore::new(name);
+        let mut stale = make_test_token("stale-file", Some("refresh"), Some(3600));
+        stale.token_received_at = Some(100);
+        write_file_only(&store, &stale).unwrap();
+        write_keyring_only(
+            &store,
+            &make_test_token("newer-keyring", Some("refresh"), Some(3600)),
+        )
+        .unwrap();
+        store.bind_verified_authority(&test_authority()).unwrap();
+
+        let snapshot = store.credential_snapshot();
+
+        assert_eq!(snapshot.source, Some("keyring"));
+        assert_eq!(
+            store
+                .file_load()
+                .as_ref()
+                .and_then(stored_access_token)
+                .as_deref(),
+            Some("stale-file"),
+            "a bound store's file is rewritten only by a full pair save"
+        );
         store.clear().await.unwrap();
     }
 
@@ -2747,7 +2824,7 @@ mod tests {
             Some("keyring-only-refresh"),
             Some(3600),
         );
-        assert!(store.keyring_save(&credentials));
+        write_keyring_only(&store, &credentials).unwrap();
         store.file_clear();
         store.clear_cache();
 

@@ -49,6 +49,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug auth login` and `plug auth inject` no longer crash on a server whose Keychain entry is bound to its sign-in server but whose token file is missing. Reading the entry tried to rewrite the file by itself, without the shared mark a bound pair needs; Plug now leaves a bound file to a full save.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.
 - Asking a server that runs tasks itself for a task's status or result gives up after the server's `call_timeout_secs`. A server that never answered used to hold the client's request open for good.
