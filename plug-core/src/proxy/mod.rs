@@ -2714,11 +2714,12 @@ impl ToolRouter {
         // reader of these two fields, and it always returns `tools_all` early
         // when filtering is disabled, so these views are provably never read
         // in that case.
+        let capped = |client: ClientType| {
+            let limit = client.tool_limit().unwrap_or(usize::MAX);
+            Arc::new(tools.iter().take(limit).cloned().collect())
+        };
         let (tools_devin, tools_copilot) = if self.config.tool_filter_enabled {
-            (
-                Arc::new(tools.iter().take(100).cloned().collect()),
-                Arc::new(tools.iter().take(128).cloned().collect()),
-            )
+            (capped(ClientType::Devin), capped(ClientType::VSCodeCopilot))
         } else {
             (Arc::new(Vec::new()), Arc::new(Vec::new()))
         };

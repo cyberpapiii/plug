@@ -50,6 +50,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A second account of a Google Workspace server gets the Workspace tool groups whatever the server is called. Only a server named `workspace` used to get them, so a second account of one named otherwise listed its tools under the same names as the first.
 - `plug doctor` fails on an unset `$NAME` only when Plug's own settings use it, and warns when a server does. A server whose name began with `plug`, such as `plugin-x`, used to fail the check.
 - Only the client named in `subscriber_client_id` may subscribe to Slack events. Another remote client with the events scope used to be let in.
 - Setting `owner_proof_until` for Slack events keeps the existing subscription. A client that subscribed again during the window used to get a second subscription next to the first.
