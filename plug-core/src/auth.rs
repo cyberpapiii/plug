@@ -22,88 +22,56 @@ pub fn verify_auth_token(provided: &str, expected: &str) -> bool {
     a.ct_eq(b).into()
 }
 
-/// Load an existing auth token from a file, or generate and persist a new one.
+/// Load the auth token kept at `path`, or generate one and keep it there.
 ///
-/// If the file exists with correct permissions (0600 on Unix), its contents are reused.
-/// Otherwise a fresh token is generated, written with 0600 permissions, and returned.
+/// A token already there is reused, and its file made owner-only if it was
+/// not. A new one replaces the file only when there was none or it held
+/// something that is not a token. Any other failure to read it is returned:
+/// replacing the token would disconnect every client that holds it.
 pub fn load_or_generate_token(path: &Path) -> anyhow::Result<String> {
-    if let Ok(token) = try_load_token(path) {
+    if let Some(token) = load_token(path)? {
         return Ok(token);
     }
-
     let token = generate_auth_token();
     write_token_file(path, &token)?;
     Ok(token)
 }
 
-/// Try to load and validate a token from an existing file.
-/// Opens the file once and checks permissions on the fd to avoid TOCTOU races.
-fn try_load_token(path: &Path) -> anyhow::Result<String> {
-    use std::io::Read;
-    let mut file = std::fs::File::open(path)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let meta = file.metadata()?;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode != 0o600 {
-            tracing::warn!(
-                path = %path.display(),
-                mode = format!("{mode:o}"),
-                "auth token file has incorrect permissions, fixing to 0600"
-            );
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        }
+fn load_token(path: &Path) -> anyhow::Result<Option<String>> {
+    use std::io::Read as _;
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let mode = file.metadata()?.permissions().mode() & 0o777;
+    if mode != 0o600 {
+        tracing::warn!(
+            path = %path.display(),
+            mode = format!("{mode:o}"),
+            "auth token file has incorrect permissions, fixing to 0600"
+        );
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
     }
-
     let mut contents = String::new();
-    file.read_to_string(&mut contents)?;
-    let token = contents.trim().to_string();
+    match file.read_to_string(&mut contents) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {}
+        Err(error) => return Err(error.into()),
+    }
+    let token = contents.trim();
     if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
-        Ok(token)
+        Ok(Some(token.to_string()))
     } else {
         tracing::warn!(path = %path.display(), "auth token file has invalid content, regenerating");
-        anyhow::bail!("invalid token content")
+        Ok(None)
     }
 }
 
-/// Write a token to a file with secure permissions.
-/// Uses create_new to prevent symlink attacks on initial creation,
-/// falling back to truncate if the file already exists.
+/// Keep `token` at `path`, readable by its owner only.
 pub fn write_token_file(path: &Path, token: &str) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
-        // Try exclusive create first (prevents symlink attacks)
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(path);
-        let mut file = match file {
-            Ok(f) => f,
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // File exists — truncate and overwrite
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .truncate(true)
-                    .mode(0o600)
-                    .open(path)?
-            }
-            Err(e) => return Err(e.into()),
-        };
-        file.write_all(token.as_bytes())?;
-    }
-
-    #[cfg(not(unix))]
-    std::fs::write(path, token)?;
-
+    crate::fs_perm::write_private_atomic(path, token.as_bytes())?;
     Ok(())
 }
 
@@ -144,6 +112,28 @@ mod tests {
     #[test]
     fn verify_different_lengths() {
         assert!(!verify_auth_token("short", "longer_token"));
+    }
+
+    #[test]
+    fn a_token_that_cannot_be_read_is_not_replaced() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir =
+            std::env::temp_dir().join(format!("plug-auth-unreadable-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("token");
+        let token = generate_auth_token();
+        write_token_file(&path, &token).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let loaded = load_or_generate_token(&path);
+
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            loaded.is_err(),
+            "an unreadable token is an error, not a reason to replace it"
+        );
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
