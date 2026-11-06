@@ -1,8 +1,13 @@
 pub(crate) mod auth;
 pub(crate) mod clients;
 pub(crate) mod config;
+pub(crate) mod doctor;
 pub(crate) mod events;
-pub(crate) mod misc;
+pub(crate) mod import;
+pub(crate) mod reload;
+pub(crate) mod repair;
 pub(crate) mod secrets;
 pub(crate) mod servers;
+pub(crate) mod setup;
 pub(crate) mod tools;
+pub(crate) mod uninstall;

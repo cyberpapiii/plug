@@ -324,7 +324,7 @@ pub(crate) fn summarize_server_auth(
     }
 }
 
-fn truncate_tail(value: &str, max_width: usize) -> String {
+pub(crate) fn truncate_tail(value: &str, max_width: usize) -> String {
     let char_count = value.chars().count();
     if max_width == 0 || char_count <= max_width {
         return value.to_string();

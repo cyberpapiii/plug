@@ -1,9 +1,7 @@
 use dialoguer::console::style;
 
 use crate::OutputFormat;
-use crate::commands::clients::{
-    configured_http_export_url, linked_client_targets, linked_client_transport,
-};
+use crate::commands::clients::{link_transport, linked_clients};
 use crate::runtime::{
     LiveClientSupport, daemon_query, daemon_running, fetch_live_sessions, live_inventory_metadata,
 };
@@ -37,6 +35,19 @@ fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) 
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => "transport-complete",
         plug_core::ipc::LiveSessionInventoryScope::Unavailable => "unavailable",
     }
+}
+
+/// Each linked client's slug and the transport its link uses.
+fn linked_topology() -> Vec<(String, String)> {
+    linked_clients()
+        .into_iter()
+        .map(|(target, entry)| {
+            (
+                target.slug().to_string(),
+                link_transport(&entry).as_str().to_string(),
+            )
+        })
+        .collect()
 }
 
 fn linked_client_transport_summary(linked_clients: &[(String, String)]) -> String {
@@ -217,7 +228,8 @@ pub(crate) async fn cmd_overview(
         .cloned()
         .unwrap_or_else(plug_core::config::default_config_path);
     let config_exists = config_path.exists();
-    let linked_clients = linked_client_targets();
+    let linked = linked_topology();
+    let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();
     let (live_clients, live_inventory_scope, live_client_support) =
         fetch_live_sessions(Some(&config_path)).await;
     let live_client_count = live_clients.len();
@@ -285,8 +297,7 @@ pub(crate) async fn cmd_overview(
             });
     let downstream_auth_mode = config.http.auth_mode.label();
     let owner_approval = owner_approval_state(&config);
-    let downstream_http_endpoint = configured_http_export_url(Some(&config_path))
-        .unwrap_or_else(|| format!("http://localhost:{}/mcp", config.http.port));
+    let downstream_http_endpoint = config.http.mcp_url();
     let downstream_auth_summary = match config.http.auth_mode {
         plug_core::config::DownstreamAuthMode::Auto => {
             if plug_core::config::http_bind_is_loopback(&config.http.bind_address) {
@@ -363,35 +374,12 @@ pub(crate) async fn cmd_overview(
         print_label_value("Owner approval", value);
     }
 
-    if !linked_clients.is_empty() {
-        let linked_transport_summary = linked_clients
+    if !linked.is_empty() {
+        let linked_descriptions = linked
             .iter()
-            .map(|target| {
-                let transport = linked_client_transport(target, false)
-                    .map(|transport| match transport {
-                        plug_core::export::ExportTransport::Stdio => "stdio",
-                        plug_core::export::ExportTransport::Http => "http",
-                    })
-                    .unwrap_or("unknown");
-                (target.clone(), transport.to_string())
-            })
+            .map(|(target, transport)| format!("{target} ({transport})"))
             .collect::<Vec<_>>();
-        let linked_descriptions = linked_clients
-            .iter()
-            .map(|target| {
-                let transport = linked_client_transport(target, false)
-                    .map(|transport| match transport {
-                        plug_core::export::ExportTransport::Stdio => "stdio",
-                        plug_core::export::ExportTransport::Http => "http",
-                    })
-                    .unwrap_or("unknown");
-                format!("{target} ({transport})")
-            })
-            .collect::<Vec<_>>();
-        print_label_value(
-            "Linked Topology",
-            linked_client_transport_summary(&linked_transport_summary),
-        );
+        print_label_value("Linked Topology", linked_client_transport_summary(&linked));
         print_label_value("Linked Clients", linked_descriptions.join(", "));
     }
 
@@ -453,18 +441,7 @@ pub(crate) async fn cmd_status(
     let daemon_running = daemon_running().await;
 
     let config = plug_core::config::load_config(config_path).ok();
-    let linked_clients = linked_client_targets()
-        .into_iter()
-        .map(|target| {
-            let transport = linked_client_transport(&target, false)
-                .map(|transport| match transport {
-                    plug_core::export::ExportTransport::Stdio => "stdio",
-                    plug_core::export::ExportTransport::Http => "http",
-                })
-                .unwrap_or("unknown");
-            (target, transport.to_string())
-        })
-        .collect::<Vec<_>>();
+    let linked_clients = linked_topology();
     let downstream_auth_info = config.as_ref().map(|c| {
         let mode = c.http.auth_mode.label();
         let summary = match c.http.auth_mode {
@@ -479,8 +456,7 @@ pub(crate) async fn cmd_status(
             plug_core::config::DownstreamAuthMode::Bearer => "explicit bearer".to_string(),
             plug_core::config::DownstreamAuthMode::Oauth => "authorization-code + PKCE".to_string(),
         };
-        let endpoint = configured_http_export_url(config_path)
-            .unwrap_or_else(|| format!("http://localhost:{}/mcp", c.http.port));
+        let endpoint = c.http.mcp_url();
         (
             mode.to_string(),
             summary,

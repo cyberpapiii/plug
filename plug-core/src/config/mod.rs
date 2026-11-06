@@ -315,26 +315,10 @@ pub fn default_lazy_tool_mode_for_client(client_type: crate::types::ClientType) 
 }
 
 pub fn default_lazy_tool_mode_for_target(target: &str) -> LazyToolMode {
-    lazy_tool_client_type_for_target(target)
+    crate::clients::ClientTarget::from_slug(target)
+        .and_then(|target| target.info().live)
         .map(default_lazy_tool_mode_for_client)
         .unwrap_or(LazyToolMode::Standard)
-}
-
-pub fn lazy_tool_client_type_for_target(target: &str) -> Option<crate::types::ClientType> {
-    match target {
-        "claude-code" => Some(crate::types::ClientType::ClaudeCode),
-        "claude-desktop" => Some(crate::types::ClientType::ClaudeDesktop),
-        "cursor" => Some(crate::types::ClientType::Cursor),
-        "devin" => Some(crate::types::ClientType::Devin),
-        "vscode" => Some(crate::types::ClientType::VSCodeCopilot),
-        "copilot-cli" => Some(crate::types::ClientType::CopilotCli),
-        "gemini-cli" => Some(crate::types::ClientType::GeminiCli),
-        "codex-cli" => Some(crate::types::ClientType::CodexCli),
-        "grok-build" => Some(crate::types::ClientType::GrokBuild),
-        "opencode" => Some(crate::types::ClientType::OpenCode),
-        "zed" => Some(crate::types::ClientType::Zed),
-        _ => None,
-    }
 }
 
 pub fn lazy_tool_policy_reason(mode: LazyToolMode, origin: LazyToolModeOrigin) -> &'static str {
@@ -491,11 +475,24 @@ impl DownstreamAuthMode {
     }
 }
 
-pub fn downstream_mcp_url(http: &HttpConfig) -> String {
-    if let Some(public_base_url) = &http.public_base_url {
-        format!("{}/mcp", public_base_url.trim_end_matches('/'))
-    } else {
-        format!("http://localhost:{}/mcp", http.port)
+impl HttpConfig {
+    pub fn tls_enabled(&self) -> bool {
+        self.tls_cert_path.is_some() && self.tls_key_path.is_some()
+    }
+
+    /// The address a client is given to reach Plug over HTTP: the public one
+    /// when there is one, else this Mac's own.
+    pub fn mcp_url(&self) -> String {
+        let base = self.public_base_url.clone().unwrap_or_else(|| {
+            let scheme = if self.tls_enabled() { "https" } else { "http" };
+            let host = match self.bind_address.as_str() {
+                "0.0.0.0" | "::" | "[::]" => "localhost",
+                bind if http_bind_is_loopback(bind) => "localhost",
+                bind => bind,
+            };
+            format!("{scheme}://{host}:{}", self.port)
+        });
+        format!("{}/mcp", base.trim_end_matches('/'))
     }
 }
 
@@ -949,7 +946,7 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     }
 
     for target in config.lazy_tools.clients.keys() {
-        match canonical_lazy_tool_client_target(target) {
+        match crate::clients::ClientTarget::from_slug(target).map(crate::clients::ClientTarget::slug) {
             Some(canonical) if canonical == target => {}
             Some(canonical) => errors.push(format!(
                 "lazy_tools.clients target '{target}' is an alias; use canonical target '{canonical}'"
@@ -1064,18 +1061,6 @@ pub fn validate_config(config: &Config) -> Vec<String> {
     }
 
     errors
-}
-
-/// The one spelling of a client target, for any name `plug link` accepts.
-pub fn canonical_client_target(target: &str) -> Option<&'static str> {
-    canonical_lazy_tool_client_target(target)
-}
-
-fn canonical_lazy_tool_client_target(target: &str) -> Option<&'static str> {
-    target
-        .parse::<crate::export::ExportTarget>()
-        .ok()
-        .map(|target| target.target_name())
 }
 
 fn resolved_env_source(config_path: &std::path::Path) -> HashMap<String, String> {
@@ -2185,20 +2170,23 @@ LOG_LEVEL = "debug"
     }
 
     #[test]
-    fn downstream_mcp_url_prefers_public_base_url() {
+    fn mcp_url_prefers_public_base_url() {
         let mut cfg = Config::default();
         cfg.http.public_base_url = Some("https://plug.example.com/base/".to_string());
-        assert_eq!(
-            downstream_mcp_url(&cfg.http),
-            "https://plug.example.com/base/mcp"
-        );
+        assert_eq!(cfg.http.mcp_url(), "https://plug.example.com/base/mcp");
     }
 
     #[test]
-    fn downstream_mcp_url_falls_back_to_localhost_port() {
+    fn mcp_url_falls_back_to_this_macs_listener() {
         let mut cfg = Config::default();
         cfg.http.port = 4411;
-        assert_eq!(downstream_mcp_url(&cfg.http), "http://localhost:4411/mcp");
+        assert_eq!(cfg.http.mcp_url(), "http://localhost:4411/mcp");
+        cfg.http.bind_address = "0.0.0.0".to_string();
+        cfg.http.tls_cert_path = Some(PathBuf::from("cert.pem"));
+        cfg.http.tls_key_path = Some(PathBuf::from("key.pem"));
+        assert_eq!(cfg.http.mcp_url(), "https://localhost:4411/mcp");
+        cfg.http.bind_address = "192.168.1.5".to_string();
+        assert_eq!(cfg.http.mcp_url(), "https://192.168.1.5:4411/mcp");
     }
 
     #[test]

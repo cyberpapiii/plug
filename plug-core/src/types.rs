@@ -948,25 +948,8 @@ pub enum ClientType {
     Unknown,
 }
 
+/// The link target and display name of each come from `crate::clients`.
 impl ClientType {
-    /// Stable config/export target slug for known clients.
-    pub fn target_slug(&self) -> Option<&'static str> {
-        match self {
-            ClientType::ClaudeCode => Some("claude-code"),
-            ClientType::ClaudeDesktop => Some("claude-desktop"),
-            ClientType::Cursor => Some("cursor"),
-            ClientType::Devin => Some("devin"),
-            ClientType::VSCodeCopilot => Some("vscode"),
-            ClientType::CopilotCli => Some("copilot-cli"),
-            ClientType::GeminiCli => Some("gemini-cli"),
-            ClientType::CodexCli => Some("codex-cli"),
-            ClientType::GrokBuild => Some("grok-build"),
-            ClientType::GrokBot | ClientType::Unknown => None,
-            ClientType::OpenCode => Some("opencode"),
-            ClientType::Zed => Some("zed"),
-        }
-    }
-
     /// Returns the maximum number of tools this client supports, if known.
     pub fn tool_limit(&self) -> Option<usize> {
         match self {
@@ -1061,27 +1044,6 @@ impl ResolvedLazyToolPolicy {
             origin,
             reason: reason.into(),
         }
-    }
-}
-
-impl std::fmt::Display for ClientType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let name = match self {
-            ClientType::ClaudeCode => "Claude Code",
-            ClientType::ClaudeDesktop => "Claude Desktop",
-            ClientType::Cursor => "Cursor",
-            ClientType::Devin => "Devin",
-            ClientType::VSCodeCopilot => "VS Code Copilot",
-            ClientType::CopilotCli => "GitHub Copilot CLI",
-            ClientType::GeminiCli => "Gemini CLI",
-            ClientType::CodexCli => "Codex CLI",
-            ClientType::GrokBuild => "Grok Build",
-            ClientType::GrokBot => "Grok Bot",
-            ClientType::OpenCode => "OpenCode",
-            ClientType::Zed => "Zed",
-            ClientType::Unknown => "Unknown",
-        };
-        write!(f, "{name}")
     }
 }
 

@@ -1,168 +1,228 @@
+//! `plug doctor`: the cold checks from plug-core, what the running daemon
+//! says, and whether Plug.app owns the install and every client link.
+
+use std::path::{Path, PathBuf};
+
 use dialoguer::console::style;
+use plug_core::clients::{ClientTarget, Scope};
+use plug_core::doctor::{CheckResult, CheckStatus};
 
 use crate::OutputFormat;
-use crate::commands::clients::{
-    ClientRepairItem, ClientRepairReport, PlugLinkDisposition, cmd_link, repair_client_content,
-};
-use crate::ui::{
-    cli_prompt_theme, print_banner, print_heading, print_info_line, print_next_step,
-    print_success_line, print_warning_line,
-};
+use crate::ui::{print_banner, print_heading, print_next_step};
 
-pub(crate) fn cmd_import(
-    config_path: Option<&std::path::PathBuf>,
-    clients: Option<Vec<String>>,
-    _all: bool,
-    dry_run: bool,
-    yes: bool,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
-    use dialoguer::MultiSelect;
-    use plug_core::import::{self, ClientSource};
-
-    let sources = match clients {
-        Some(names) => names
-            .iter()
-            .filter_map(|n| match n.as_str() {
-                "claude-desktop" => Some(ClientSource::ClaudeDesktop),
-                "claude-code" => Some(ClientSource::ClaudeCode),
-                "cursor" => Some(ClientSource::Cursor),
-                "devin" | "windsurf" => Some(ClientSource::Devin),
-                "vscode" => Some(ClientSource::VSCodeCopilot),
-                "copilot-cli" | "copilot" => Some(ClientSource::CopilotCli),
-                "gemini-cli" => Some(ClientSource::GeminiCli),
-                "codex-cli" => Some(ClientSource::CodexCli),
-                "grok-build" | "grok" => Some(ClientSource::GrokBuild),
-                "opencode" => Some(ClientSource::OpenCode),
-                "zed" => Some(ClientSource::Zed),
-                "cline" => Some(ClientSource::Cline),
-                "cline-cli" => Some(ClientSource::ClineCli),
-                "roocode" => Some(ClientSource::RooCode),
-                "factory" => Some(ClientSource::Factory),
-                "nanobot" => Some(ClientSource::Nanobot),
-                "junie" => Some(ClientSource::Junie),
-                "kilo" => Some(ClientSource::Kilo),
-                "pi" => Some(ClientSource::Pi),
-                "warp" => Some(ClientSource::Warp),
-                "kiro" => Some(ClientSource::Kiro),
-                "kimi-code" => Some(ClientSource::KimiCode),
-                "qwen-code" => Some(ClientSource::QwenCode),
-                "antigravity" => Some(ClientSource::Antigravity),
-                "goose" => Some(ClientSource::Goose),
-                "hermes" => Some(ClientSource::Hermes),
-                "amp" => Some(ClientSource::Amp),
-                "openclaw" => Some(ClientSource::OpenClaw),
-                "lm-studio" => Some(ClientSource::LmStudio),
-                "muse-code" => Some(ClientSource::MuseCode),
-                _ => None,
-            })
-            .collect(),
-        None => ClientSource::all().to_vec(),
-    };
-
-    let existing = match plug_core::config::load_config(config_path) {
-        Ok(cfg) => cfg.servers,
-        Err(_) => std::collections::HashMap::new(),
-    };
-
-    if matches!(output, OutputFormat::Text) {
-        print_banner(
-            "◆",
-            "Import",
-            "Scan existing AI client configs for MCP servers",
-        );
-        print_info_line(style("Scanning for MCP servers...").bold());
-    }
-    let report = import::import(&existing, &sources);
-
-    match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text => {
-            for res in &report.scanned {
-                if let Some(ref e) = res.error {
-                    eprintln!(
-                        "  {} {:<16} {}",
-                        style("!").yellow().bold(),
-                        res.source,
-                        style(e).red()
-                    );
-                }
-            }
-            if report.new_servers.is_empty() {
-                println!();
-                print_success_line("No new servers found.");
-                return Ok(());
-            }
-            if dry_run {
-                println!();
-                print_success_line(format!(
-                    "Found {} importable server(s).",
-                    report.new_servers.len()
-                ));
-                return Ok(());
-            }
-
-            println!();
-            print_heading("Discovered");
-            for server in &report.new_servers {
-                println!(
-                    "  {} {:<18} {}",
-                    style("·").dim(),
-                    style(&server.name).bold(),
-                    style(format!("from {}", server.source)).dim()
-                );
-            }
-
-            let selections = if yes {
-                (0..report.new_servers.len()).collect::<Vec<_>>()
-            } else {
-                let labels: Vec<_> = report
-                    .new_servers
-                    .iter()
-                    .map(|s| {
-                        format!(
-                            "{:<15} {}",
-                            style(&s.name).bold(),
-                            style(format!("(from {})", s.source)).dim()
-                        )
-                    })
-                    .collect();
-                MultiSelect::with_theme(&cli_prompt_theme())
-                    .with_prompt("Select servers to import")
-                    .items(&labels)
-                    .defaults(&vec![true; labels.len()])
-                    .interact()?
-            };
-            if selections.is_empty() {
-                return Ok(());
-            }
-
-            let config_file = config_path
-                .cloned()
-                .unwrap_or_else(plug_core::config::default_config_path);
-            let to_import: Vec<plug_core::import::DiscoveredServer> = selections
-                .iter()
-                .map(|&i| report.new_servers[i].clone())
-                .collect();
-            let existing_names: Vec<String> = existing.keys().cloned().collect();
-            let toml = import::servers_to_toml(&to_import, &existing_names);
-
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&config_file)?;
-            file.write_all(toml.as_bytes())?;
-            println!();
-            print_success_line(format!("Imported {} server(s).", to_import.len()));
-        }
-    }
-    Ok(())
+/// What a client's Plug entry runs.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlugLinkDisposition {
+    Canonical,
+    RecognizedLegacy,
+    UnknownCommand,
+    Http,
+    Missing,
 }
 
-/// Runs diagnostics and returns the computed process exit code
-/// (`0` = all pass, `1` = at least one failure, `2` = warnings only).
-/// The caller is responsible for exiting the process with this code.
+impl PlugLinkDisposition {
+    /// A stdio link that does not run the canonical command.
+    pub fn needs_repair(&self) -> bool {
+        matches!(self, Self::RecognizedLegacy | Self::UnknownCommand)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientRepairItem {
+    pub target: String,
+    pub path: PathBuf,
+    pub disposition: PlugLinkDisposition,
+    pub changed: bool,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ClientRepairReport {
+    pub canonical_command: PathBuf,
+    pub items: Vec<ClientRepairItem>,
+}
+
+/// Everything doctor learned about who owns the install. The app reads it
+/// from `plug doctor --output json` as `unified_install`.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct UnifiedInstallSnapshot {
+    pub app: Option<crate::install::VerifiedAppInstallation>,
+    pub shell_resolution: Option<PathBuf>,
+    pub daemon_version: Option<String>,
+    pub daemon_executable: Option<PathBuf>,
+    pub ownership: plug_core::ipc::DaemonOwnershipMode,
+    pub linked_clients: Vec<ClientRepairItem>,
+    pub adapters: Vec<crate::install::AdapterVersionState>,
+    pub shadows: Vec<crate::install::ShadowInstallation>,
+    pub launchd_jobs: Vec<crate::service::LaunchdJobRecord>,
+    pub daemon_inspection_complete: bool,
+    pub adapter_inspection_complete: bool,
+    pub launchd_inspection_complete: bool,
+    pub app_service_daemon_invocation_verified: bool,
+    pub inspection_errors: Vec<String>,
+    pub client_repair_needed: bool,
+}
+
+/// Classify a stdio `plug` entry without executing its configured command.
+///
+/// Repair is intentionally limited to paths that can only reasonably be a
+/// Plug installation. A bare `plug` command or an arbitrary executable might
+/// be another program, so it remains untouched.
+pub fn classify_plug_client_command(
+    command: &str,
+    args: &[String],
+    canonical: &Path,
+) -> PlugLinkDisposition {
+    if !plug_core::clients::is_connect_args(args) {
+        return PlugLinkDisposition::UnknownCommand;
+    }
+
+    let command_path = Path::new(command);
+    if crate::install::paths_match(command_path, canonical) {
+        return PlugLinkDisposition::Canonical;
+    }
+
+    let identified_path = command_path
+        .canonicalize()
+        .unwrap_or_else(|_| command_path.into());
+    if is_recognized_legacy_plug_path(&identified_path) {
+        PlugLinkDisposition::RecognizedLegacy
+    } else {
+        PlugLinkDisposition::UnknownCommand
+    }
+}
+
+fn is_recognized_legacy_plug_path(path: &Path) -> bool {
+    if crate::service::is_recognized_legacy_program(path) {
+        return true;
+    }
+
+    let path_components = path.components().collect::<Vec<_>>();
+    let has_suffix = |suffix: &[&str]| {
+        path_components.len() >= suffix.len()
+            && path_components[path_components.len() - suffix.len()..]
+                .iter()
+                .map(|component| component.as_os_str())
+                .eq(suffix.iter().map(std::ffi::OsStr::new))
+    };
+
+    let home = dirs::home_dir();
+    let is_home_legacy = home
+        .as_ref()
+        .is_some_and(|home| path == home.join(".local/bin/plug"));
+    let is_old_app = path == Path::new("/Applications/Plug.app/Contents/Resources/plug")
+        || home
+            .as_ref()
+            .is_some_and(|home| path == home.join("Applications/Plug.app/Contents/Resources/plug"));
+
+    is_home_legacy
+        || is_old_app
+        || has_suffix(&["target", "debug", "plug"])
+        || has_suffix(&["target", "release", "plug"])
+}
+
+/// What Plug's entry in `content` runs, and `content` pointed at `canonical`
+/// when the entry is a recognized older Plug.
+fn repair_content(
+    target: ClientTarget,
+    content: &str,
+    canonical: &Path,
+) -> anyhow::Result<(PlugLinkDisposition, Option<String>, &'static str)> {
+    let layout = target.layout();
+    let Some(plug) = layout.read_plug(content) else {
+        return Ok((
+            PlugLinkDisposition::Missing,
+            None,
+            "No Plug entry found; left unchanged.",
+        ));
+    };
+    if plug.url.is_some() {
+        return Ok((
+            PlugLinkDisposition::Http,
+            None,
+            "HTTP Plug entry does not need a command repair.",
+        ));
+    }
+    let disposition = match (plug.command.as_deref(), plug.args.as_deref()) {
+        (Some(command), Some(args)) => classify_plug_client_command(command, args, canonical),
+        _ => PlugLinkDisposition::UnknownCommand,
+    };
+    Ok(match disposition {
+        PlugLinkDisposition::RecognizedLegacy => (
+            disposition,
+            Some(layout.set_plug_command(
+                content,
+                &canonical.to_string_lossy(),
+                &target.connect_args(),
+            )?),
+            "Repaired a recognized legacy Plug command.",
+        ),
+        PlugLinkDisposition::Canonical => (
+            disposition,
+            None,
+            "Already uses the canonical Plug command.",
+        ),
+        _ => (
+            disposition,
+            None,
+            "Plug command is not recognized; left unchanged.",
+        ),
+    })
+}
+
+/// Inspect `target`'s link against `canonical`, and repair it when `write`.
+/// `None` when the client has no settings file.
+pub(crate) fn inspect_link(
+    target: ClientTarget,
+    canonical: &Path,
+    write: bool,
+) -> Option<ClientRepairItem> {
+    let path = target.config_path(Scope::User)?;
+    let item = |disposition, message: String| ClientRepairItem {
+        target: target.slug().to_string(),
+        path: path.clone(),
+        disposition,
+        changed: false,
+        message,
+    };
+    let content = match std::fs::read_to_string(&path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) => {
+            return Some(item(
+                PlugLinkDisposition::UnknownCommand,
+                format!("Could not read client config; left unchanged: {error}"),
+            ));
+        }
+    };
+    let (disposition, updated, message) = match repair_content(target, &content, canonical) {
+        Ok(repair) => repair,
+        Err(error) => {
+            return Some(item(
+                PlugLinkDisposition::UnknownCommand,
+                format!("Could not inspect client config; left unchanged: {error}"),
+            ));
+        }
+    };
+    let mut result = item(disposition, message.to_string());
+    match updated {
+        Some(_) if !write => {
+            result.message = "Recognized legacy Plug command needs repair.".to_string();
+        }
+        Some(updated) => match std::fs::write(&path, updated) {
+            Ok(()) => result.changed = true,
+            Err(error) => {
+                result.message = format!("Could not repair recognized Plug command: {error}");
+            }
+        },
+        None => {}
+    }
+    Some(result)
+}
+
+/// Runs diagnostics and returns the process exit code: `0` all pass, `1` at
+/// least one failure, `2` warnings only.
 pub(crate) async fn cmd_doctor(
     config_path: Option<&std::path::PathBuf>,
     output: &OutputFormat,
@@ -172,11 +232,9 @@ pub(crate) async fn cmd_doctor(
         .unwrap_or_else(plug_core::config::default_config_path);
     let config = plug_core::config::load_config(config_path)?;
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
-    report.checks.extend(runtime_doctor_checks().await);
+    report.checks.extend(runtime_doctor_checks(&config).await);
     fold_daemon_liveness_checks(&mut report.checks);
-    #[cfg(target_os = "macos")]
     let unified_snapshot = unified_install_snapshot().await;
-    #[cfg(target_os = "macos")]
     report
         .checks
         .push(unified_install_check_from_snapshot(&unified_snapshot));
@@ -186,35 +244,30 @@ pub(crate) async fn cmd_doctor(
     report.exit_code = if report
         .checks
         .iter()
-        .any(|c| matches!(c.status, plug_core::doctor::CheckStatus::Fail))
+        .any(|c| matches!(c.status, CheckStatus::Fail))
     {
         1
     } else if report
         .checks
         .iter()
-        .any(|c| matches!(c.status, plug_core::doctor::CheckStatus::Warn))
+        .any(|c| matches!(c.status, CheckStatus::Warn))
     {
         2
     } else {
         0
     };
     match output {
-        OutputFormat::Json => {
-            #[cfg(target_os = "macos")]
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&doctor_json_value(&report, &unified_snapshot))?
-            );
-            #[cfg(not(target_os = "macos"))]
-            println!("{}", serde_json::to_string_pretty(&report)?);
-        }
+        OutputFormat::Json => println!(
+            "{}",
+            serde_json::to_string_pretty(&doctor_json_value(&report, &unified_snapshot))?
+        ),
         OutputFormat::Text => {
             print_banner("◆", "Checkup", "The whole setup, and what to fix");
             for c in &report.checks {
                 let marker = match c.status {
-                    plug_core::doctor::CheckStatus::Pass => style("●").green().bold(),
-                    plug_core::doctor::CheckStatus::Warn => style("!").yellow().bold(),
-                    plug_core::doctor::CheckStatus::Fail => style("×").red().bold(),
+                    CheckStatus::Pass => style("●").green().bold(),
+                    CheckStatus::Warn => style("!").yellow().bold(),
+                    CheckStatus::Fail => style("×").red().bold(),
                 };
                 let title = c.title();
                 let prefix_text = format!("  {} {:<26} ", "•", title);
@@ -241,10 +294,9 @@ pub(crate) async fn cmd_doctor(
     Ok(report.exit_code)
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn doctor_json_value(
     report: &plug_core::doctor::DoctorReport,
-    snapshot: &crate::install::UnifiedInstallSnapshot,
+    snapshot: &UnifiedInstallSnapshot,
 ) -> serde_json::Value {
     serde_json::json!({
         "checks": report.checks,
@@ -253,12 +305,7 @@ fn doctor_json_value(
     })
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn unified_install_check_from_snapshot(
-    snapshot: &crate::install::UnifiedInstallSnapshot,
-) -> plug_core::doctor::CheckResult {
-    use plug_core::doctor::{CheckResult, CheckStatus};
-
+fn unified_install_check_from_snapshot(snapshot: &UnifiedInstallSnapshot) -> CheckResult {
     let Some(app) = snapshot.app.as_ref() else {
         return CheckResult {
             name: "unified_install".to_string(),
@@ -301,7 +348,7 @@ fn unified_install_check_from_snapshot(
     if !snapshot
         .shell_resolution
         .as_ref()
-        .is_some_and(|path| install_paths_match(path, &app.executable_path))
+        .is_some_and(|path| crate::install::paths_match(path, &app.executable_path))
     {
         drift.push(format!(
             "shell resolves {} instead of {}",
@@ -322,7 +369,7 @@ fn unified_install_check_from_snapshot(
     if !snapshot
         .daemon_executable
         .as_ref()
-        .is_some_and(|path| install_paths_match(path, &app.executable_path))
+        .is_some_and(|path| crate::install::paths_match(path, &app.executable_path))
     {
         drift.push(format!(
             "daemon executable is {} instead of {}",
@@ -337,7 +384,8 @@ fn unified_install_check_from_snapshot(
         drift.push(format!("daemon ownership is {:?}", snapshot.ownership));
     }
     let expected_service_present = snapshot.launchd_jobs.iter().any(|job| {
-        job.label == "com.plug.daemon" && install_paths_match(&job.program, &app.executable_path)
+        job.label == crate::service::LABEL
+            && crate::install::paths_match(&job.program, &app.executable_path)
     });
     if !expected_service_present {
         drift.push("expected app service is absent".to_string());
@@ -347,14 +395,7 @@ fn unified_install_check_from_snapshot(
     let stale_clients = snapshot
         .linked_clients
         .iter()
-        .filter(|item| {
-            !matches!(
-                item.disposition,
-                PlugLinkDisposition::Canonical
-                    | PlugLinkDisposition::Http
-                    | PlugLinkDisposition::Missing
-            )
-        })
+        .filter(|item| item.disposition.needs_repair())
         .map(|item| item.target.as_str())
         .collect::<Vec<_>>();
     if snapshot.client_repair_needed || !stale_clients.is_empty() {
@@ -395,8 +436,8 @@ fn unified_install_check_from_snapshot(
     let mut leftover_legacy_jobs = Vec::new();
     let mut unknown_launchd_jobs = Vec::new();
     for job in &snapshot.launchd_jobs {
-        let is_expected_current =
-            job.label == "com.plug.daemon" && install_paths_match(&job.program, app_executable);
+        let is_expected_current = job.label == crate::service::LABEL
+            && crate::install::paths_match(&job.program, app_executable);
         if is_expected_current {
             continue;
         }
@@ -445,30 +486,12 @@ fn unified_install_check_from_snapshot(
     }
 }
 
-#[cfg(any(target_os = "macos", test))]
 fn client_repair_needed(linked_clients: &[ClientRepairItem]) -> bool {
-    linked_clients.iter().any(|item| {
-        !matches!(
-            item.disposition,
-            PlugLinkDisposition::Canonical
-                | PlugLinkDisposition::Http
-                | PlugLinkDisposition::Missing
-        )
-    })
+    linked_clients
+        .iter()
+        .any(|item| item.disposition.needs_repair())
 }
 
-#[cfg(any(target_os = "macos", test))]
-fn install_paths_match(left: &std::path::Path, right: &std::path::Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
-#[cfg(any(target_os = "macos", test))]
 async fn bounded_ipc_probe<F>(
     future: F,
     timeout: std::time::Duration,
@@ -482,8 +505,7 @@ where
         .map_err(|_| anyhow::anyhow!("{name} timed out after {}ms", timeout.as_millis()))?
 }
 
-#[cfg(target_os = "macos")]
-async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
+async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
     use plug_core::ipc::{
         DaemonOwnershipMode, IpcRequest, IpcResponse, OPERATOR_IPC_MAX, OPERATOR_IPC_MIN,
     };
@@ -593,11 +615,11 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
     let app_service_daemon_invocation_verified = match app.as_ref() {
         Some(app)
             if launchd_jobs.iter().any(|job| {
-                job.label == "com.plug.daemon"
-                    && install_paths_match(&job.program, &app.executable_path)
+                job.label == crate::service::LABEL
+                    && crate::install::paths_match(&job.program, &app.executable_path)
             }) =>
         {
-            match crate::install::prove_app_daemon_invocation("com.plug.daemon", app) {
+            match crate::install::prove_app_daemon_invocation(app) {
                 Ok(verified) => verified,
                 Err(error) => {
                     launchd_inspection_complete = false;
@@ -612,7 +634,7 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
     };
     let shadows = crate::install::discover_shadow_installations(app.as_ref());
     let client_repair_needed = client_repair_needed(&linked_clients);
-    crate::install::UnifiedInstallSnapshot {
+    UnifiedInstallSnapshot {
         app,
         shell_resolution,
         daemon_version,
@@ -631,62 +653,18 @@ async fn unified_install_snapshot() -> crate::install::UnifiedInstallSnapshot {
     }
 }
 
-#[cfg(target_os = "macos")]
 fn inspect_linked_clients(
     app: Option<&crate::install::VerifiedAppInstallation>,
 ) -> Vec<ClientRepairItem> {
     let Some(app) = app else {
         return Vec::new();
     };
-    let http_url = crate::commands::clients::configured_http_export_url(None)
-        .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
-    crate::commands::clients::all_client_targets()
-        .iter()
-        .filter_map(|(_, target)| {
-            let target_enum: plug_core::export::ExportTarget = target.parse().ok()?;
-            let path = plug_core::export::default_config_path(target_enum, false)?;
-            if !path.exists() {
-                return None;
-            }
-            let content = match std::fs::read_to_string(&path) {
-                Ok(content) => content,
-                Err(error) => {
-                    return Some(ClientRepairItem {
-                        target: (*target).to_string(),
-                        path,
-                        disposition: PlugLinkDisposition::UnknownCommand,
-                        changed: false,
-                        message: format!("Could not read client config; left untouched: {error}"),
-                    });
-                }
-            };
-            match repair_client_content(
-                target_enum,
-                &path,
-                &content,
-                &app.executable_path,
-                &http_url,
-            ) {
-                Ok(repair) => Some(ClientRepairItem {
-                    target: (*target).to_string(),
-                    path,
-                    disposition: repair.disposition,
-                    changed: false,
-                    message: repair.message,
-                }),
-                Err(error) => Some(ClientRepairItem {
-                    target: (*target).to_string(),
-                    path,
-                    disposition: PlugLinkDisposition::UnknownCommand,
-                    changed: false,
-                    message: format!("Could not inspect client config; left untouched: {error}"),
-                }),
-            }
-        })
+    ClientTarget::listed()
+        .filter_map(|target| inspect_link(target, &app.executable_path, false))
         .collect()
 }
 
-async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
+async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckResult> {
     let mut checks = Vec::new();
     let daemon_reachable = crate::runtime::daemon_running().await;
     let status_response = crate::daemon::ipc_request(&plug_core::ipc::IpcRequest::Status).await;
@@ -698,9 +676,9 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
             Ok(plug_core::ipc::IpcResponse::Status { .. })
         )
     {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "runtime_availability".to_string(),
-            status: plug_core::doctor::CheckStatus::Warn,
+            status: CheckStatus::Warn,
             message: "Daemon socket is reachable, but runtime status inspection failed".to_string(),
             fix_suggestion: Some(
                 "Run `plug status` and inspect daemon logs to diagnose IPC/runtime availability problems.".to_string(),
@@ -713,9 +691,9 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
             Ok(plug_core::ipc::IpcResponse::AuthStatus { .. })
         )
     {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "auth_availability".to_string(),
-            status: plug_core::doctor::CheckStatus::Warn,
+            status: CheckStatus::Warn,
             message: "Daemon socket is reachable, but auth status inspection failed".to_string(),
             fix_suggestion: Some(
                 "Run `plug auth status` and inspect daemon logs to diagnose auth/runtime availability problems.".to_string(),
@@ -730,80 +708,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         ..
     }) = status_response
     {
-        let mut healthy = 0usize;
-        let mut degraded = 0usize;
-        let mut failed = 0usize;
-        let mut auth_required = 0usize;
-        let mut failed_servers = Vec::new();
-        let mut degraded_servers = Vec::new();
-
-        for server in servers
-            .iter()
-            .filter(|s| s.server_id != "__plug_internal__")
-        {
-            match server.health {
-                plug_core::types::ServerHealth::Healthy => healthy += 1,
-                plug_core::types::ServerHealth::Degraded => {
-                    degraded += 1;
-                    degraded_servers.push(server_with_reason(server));
-                }
-                plug_core::types::ServerHealth::Failed => {
-                    failed += 1;
-                    failed_servers.push(server_with_reason(server));
-                }
-                plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
-            }
-        }
-
-        let runtime_status = if failed > 0 || degraded > 0 || auth_required > 0 {
-            plug_core::doctor::CheckStatus::Warn
-        } else {
-            plug_core::doctor::CheckStatus::Pass
-        };
-
-        checks.push(plug_core::doctor::CheckResult {
-            name: "runtime_health".to_string(),
-            status: runtime_status,
-            message: runtime_health_message(
-                uptime_secs,
-                clients,
-                RuntimeServerCounts {
-                    healthy,
-                    degraded,
-                    auth_required,
-                    failed,
-                },
-            ),
-            fix_suggestion: if failed > 0 || degraded > 0 || auth_required > 0 {
-                Some(
-                    "Use `plug status` for affected servers, then `plug auth status` for auth recovery details".to_string(),
-                )
-            } else {
-                None
-            },
-        });
-
-        if !failed_servers.is_empty() {
-            checks.push(plug_core::doctor::CheckResult {
-                name: "runtime_failures".to_string(),
-                status: plug_core::doctor::CheckStatus::Fail,
-                message: format!("failing servers: {}", failed_servers.join("; ")),
-                fix_suggestion: Some(
-                    "Fix the cause named for each server. Plug keeps retrying and picks the server back up without a restart".to_string(),
-                ),
-            });
-        }
-
-        if !degraded_servers.is_empty() {
-            checks.push(plug_core::doctor::CheckResult {
-                name: "runtime_degraded".to_string(),
-                status: plug_core::doctor::CheckStatus::Warn,
-                message: format!("degraded servers: {}", degraded_servers.join("; ")),
-                fix_suggestion: Some(
-                    "Compare `plug status` and `plug doctor` to separate transient runtime degradation from cold connectivity or auth issues".to_string(),
-                ),
-            });
-        }
+        checks.extend(runtime_health_checks(&servers, clients, uptime_secs));
     }
 
     if let Ok(plug_core::ipc::IpcResponse::AuthStatus { servers }) = auth_response {
@@ -817,16 +722,12 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
         .await;
         if let Ok(plug_core::ipc::IpcResponse::OperatorSnapshot { snapshot }) = snapshot {
             // A registration the owner named is one they know about.
-            let named = plug_core::config::load_config(None)
-                .map(|config| {
-                    config
-                        .clients
-                        .into_iter()
-                        .filter(|(_, settings)| settings.name.is_some())
-                        .filter_map(|(key, _)| key.strip_prefix("oauth:").map(str::to_owned))
-                        .collect()
-                })
-                .unwrap_or_default();
+            let named = config
+                .clients
+                .iter()
+                .filter(|(_, settings)| settings.name.is_some())
+                .filter_map(|(key, _)| key.strip_prefix("oauth:").map(str::to_owned))
+                .collect();
             checks.extend(duplicate_downstream_client_check(
                 &snapshot.downstream_clients,
                 &named,
@@ -845,7 +746,7 @@ async fn runtime_doctor_checks() -> Vec<plug_core::doctor::CheckResult> {
 fn duplicate_downstream_client_check(
     clients: &[plug_core::downstream_oauth::RegisteredClientSummary],
     named: &std::collections::BTreeSet<String>,
-) -> Option<plug_core::doctor::CheckResult> {
+) -> Option<CheckResult> {
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     for client in clients {
         let unfinished = !client.signed_in && client.last_used_at.is_none();
@@ -862,9 +763,9 @@ fn duplicate_downstream_client_check(
     if duplicates.is_empty() {
         return None;
     }
-    Some(plug_core::doctor::CheckResult {
+    Some(CheckResult {
         name: "downstream_oauth_clients".to_string(),
-        status: plug_core::doctor::CheckStatus::Warn,
+        status: CheckStatus::Warn,
         message: format!(
             "Clients signed in more than once: {}. Each old sign-in keeps its access until 90 days after its last use",
             duplicates.join(", ")
@@ -878,13 +779,13 @@ fn duplicate_downstream_client_check(
 /// With the daemon answering, `runtime_health` already says it is running.
 /// The cold port and PID checks only repeat that when they pass, so they are
 /// dropped then and kept whenever they found something wrong.
-fn fold_daemon_liveness_checks(checks: &mut Vec<plug_core::doctor::CheckResult>) {
+fn fold_daemon_liveness_checks(checks: &mut Vec<CheckResult>) {
     if !checks.iter().any(|check| check.name == "runtime_health") {
         return;
     }
     checks.retain(|check| {
         !(matches!(check.name.as_str(), "port_available" | "pid_staleness")
-            && matches!(check.status, plug_core::doctor::CheckStatus::Pass))
+            && matches!(check.status, CheckStatus::Pass))
     });
 }
 
@@ -936,95 +837,89 @@ fn server_with_reason(server: &plug_core::types::ServerStatus) -> String {
     }
 }
 
-#[cfg(test)]
-fn runtime_health_checks_for_tests(
+/// The live daemon's server health: one summary, then the failing and
+/// degraded servers by name.
+fn runtime_health_checks(
     servers: &[plug_core::types::ServerStatus],
     clients: usize,
     uptime_secs: u64,
-) -> Vec<plug_core::doctor::CheckResult> {
-    let mut healthy = 0usize;
-    let mut degraded = 0usize;
-    let mut failed = 0usize;
-    let mut auth_required = 0usize;
+) -> Vec<CheckResult> {
+    let mut counts = RuntimeServerCounts {
+        healthy: 0,
+        degraded: 0,
+        auth_required: 0,
+        failed: 0,
+    };
     let mut failed_servers = Vec::new();
     let mut degraded_servers = Vec::new();
-
     for server in servers
         .iter()
         .filter(|s| s.server_id != "__plug_internal__")
     {
         match server.health {
-            plug_core::types::ServerHealth::Healthy => healthy += 1,
+            plug_core::types::ServerHealth::Healthy => counts.healthy += 1,
             plug_core::types::ServerHealth::Degraded => {
-                degraded += 1;
+                counts.degraded += 1;
                 degraded_servers.push(server_with_reason(server));
             }
             plug_core::types::ServerHealth::Failed => {
-                failed += 1;
+                counts.failed += 1;
                 failed_servers.push(server_with_reason(server));
             }
-            plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
+            plug_core::types::ServerHealth::AuthRequired => counts.auth_required += 1,
         }
     }
+    let troubled = counts.failed > 0 || counts.degraded > 0 || counts.auth_required > 0;
 
-    let mut checks = vec![plug_core::doctor::CheckResult {
+    let mut checks = vec![CheckResult {
         name: "runtime_health".to_string(),
-        status: if failed > 0 || degraded > 0 || auth_required > 0 {
-            plug_core::doctor::CheckStatus::Warn
+        status: if troubled {
+            CheckStatus::Warn
         } else {
-            plug_core::doctor::CheckStatus::Pass
+            CheckStatus::Pass
         },
-        message: runtime_health_message(
-            uptime_secs,
-            clients,
-            RuntimeServerCounts {
-                healthy,
-                degraded,
-                auth_required,
-                failed,
-            },
-        ),
-        fix_suggestion: None,
+        message: runtime_health_message(uptime_secs, clients, counts),
+        fix_suggestion: troubled.then(|| {
+            "Use `plug status` for affected servers, then `plug auth status` for auth recovery details".to_string()
+        }),
     }];
-
     if !failed_servers.is_empty() {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "runtime_failures".to_string(),
-            status: plug_core::doctor::CheckStatus::Fail,
+            status: CheckStatus::Fail,
             message: format!("failing servers: {}", failed_servers.join("; ")),
-            fix_suggestion: None,
+            fix_suggestion: Some(
+                "Fix the cause named for each server. Plug keeps retrying and picks the server back up without a restart".to_string(),
+            ),
         });
     }
-
     if !degraded_servers.is_empty() {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "runtime_degraded".to_string(),
-            status: plug_core::doctor::CheckStatus::Warn,
+            status: CheckStatus::Warn,
             message: format!("degraded servers: {}", degraded_servers.join("; ")),
-            fix_suggestion: None,
+            fix_suggestion: Some(
+                "Compare `plug status` and `plug doctor` to separate transient runtime degradation from cold connectivity or auth issues".to_string(),
+            ),
         });
     }
-
     checks
 }
 
-fn synthesize_doctor_interpretation(
-    checks: &[plug_core::doctor::CheckResult],
-) -> Option<plug_core::doctor::CheckResult> {
+fn synthesize_doctor_interpretation(checks: &[CheckResult]) -> Option<CheckResult> {
     let connectivity = checks
         .iter()
         .find(|check| check.name == "server_connectivity")?;
     let runtime_health = checks.iter().find(|check| check.name == "runtime_health");
     let runtime_failures = checks.iter().find(|check| check.name == "runtime_failures");
     let runtime_auth_attention = checks.iter().any(|check| {
-        matches!(check.status, plug_core::doctor::CheckStatus::Warn)
-            && (check.name == "runtime_auth"
-                || check.name == "runtime_auth_missing"
+        matches!(check.status, CheckStatus::Warn)
+            && (check.name == "runtime_auth_missing"
                 || check.name == "runtime_auth_reauth"
                 || check.name == "runtime_auth_degraded")
     });
 
-    use plug_core::doctor::CheckStatus::{Fail, Pass, Warn};
+    use CheckStatus::{Fail, Pass, Warn};
 
     let (status, message, fix_suggestion) = match (
         &connectivity.status,
@@ -1077,7 +972,7 @@ fn synthesize_doctor_interpretation(
         _ => return None,
     };
 
-    Some(plug_core::doctor::CheckResult {
+    Some(CheckResult {
         name: "doctor_interpretation".to_string(),
         status,
         message,
@@ -1085,9 +980,7 @@ fn synthesize_doctor_interpretation(
     })
 }
 
-fn runtime_auth_checks(
-    servers: &[plug_core::ipc::IpcAuthServerInfo],
-) -> Vec<plug_core::doctor::CheckResult> {
+fn runtime_auth_checks(servers: &[plug_core::ipc::IpcAuthServerInfo]) -> Vec<CheckResult> {
     let mut reauth = Vec::new();
     let mut missing = Vec::new();
     let mut degraded = Vec::new();
@@ -1108,9 +1001,9 @@ fn runtime_auth_checks(
     let mut checks = Vec::new();
 
     if !missing.is_empty() {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "runtime_auth_missing".to_string(),
-            status: plug_core::doctor::CheckStatus::Warn,
+            status: CheckStatus::Warn,
             message: format!("missing credentials: {}", missing.join(", ")),
             fix_suggestion: Some(
                 "Run `plug auth login --server <name>` for each server missing credentials."
@@ -1120,9 +1013,9 @@ fn runtime_auth_checks(
     }
 
     if !reauth.is_empty() {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "runtime_auth_reauth".to_string(),
-            status: plug_core::doctor::CheckStatus::Warn,
+            status: CheckStatus::Warn,
             message: format!("re-auth required: {}", reauth.join(", ")),
             fix_suggestion: Some(
                 "Stored credentials exist but must be refreshed — run `plug auth login --server <name>`."
@@ -1132,9 +1025,9 @@ fn runtime_auth_checks(
     }
 
     if !degraded.is_empty() {
-        checks.push(plug_core::doctor::CheckResult {
+        checks.push(CheckResult {
             name: "runtime_auth_degraded".to_string(),
-            status: plug_core::doctor::CheckStatus::Warn,
+            status: CheckStatus::Warn,
             message: format!("degraded auth/runtime: {}", degraded.join(", ")),
             fix_suggestion: Some(
                 "Run `plug auth status` and compare with `plug status` to separate auth drift from broader runtime degradation."
@@ -1146,7 +1039,7 @@ fn runtime_auth_checks(
     checks
 }
 
-fn doctor_check_details(check: &plug_core::doctor::CheckResult) -> String {
+fn doctor_check_details(check: &CheckResult) -> String {
     match check.fix_suggestion.as_deref() {
         Some(suggestion) if !suggestion.trim().is_empty() => {
             format!("{} Next: {}", check.message, suggestion.trim())
@@ -1155,16 +1048,14 @@ fn doctor_check_details(check: &plug_core::doctor::CheckResult) -> String {
     }
 }
 
-fn doctor_next_steps(checks: &[plug_core::doctor::CheckResult]) -> Vec<String> {
+fn doctor_next_steps(checks: &[CheckResult]) -> Vec<String> {
     let mut seen = std::collections::BTreeSet::new();
     let mut steps = Vec::new();
 
-    for check in checks.iter().filter(|check| {
-        matches!(
-            check.status,
-            plug_core::doctor::CheckStatus::Warn | plug_core::doctor::CheckStatus::Fail
-        )
-    }) {
+    for check in checks
+        .iter()
+        .filter(|check| matches!(check.status, CheckStatus::Warn | CheckStatus::Fail))
+    {
         if let Some(suggestion) = check.fix_suggestion.as_deref() {
             let trimmed = suggestion.trim();
             if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
@@ -1176,201 +1067,9 @@ fn doctor_next_steps(checks: &[plug_core::doctor::CheckResult]) -> Vec<String> {
     steps
 }
 
-pub(crate) async fn cmd_reload(output: &OutputFormat) -> anyhow::Result<()> {
-    let auth = crate::daemon::read_auth_token()?;
-    let req = plug_core::ipc::IpcRequest::Reload { auth_token: auth };
-    match crate::daemon::ipc_request(&req).await? {
-        plug_core::ipc::IpcResponse::Reloaded { report } => {
-            if matches!(output, OutputFormat::Json) {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else if report.restart_required.is_empty() {
-                print_success_line("Config reloaded.");
-            } else {
-                print_success_line("Config reloaded with restart-required changes.");
-                for warning in report.restart_required {
-                    print_info_line(format!("Restart required: {warning}"));
-                }
-                print_info_line(format!(
-                    "{} before relying on those changes in live sessions.",
-                    crate::runtime::restart_advice()
-                ));
-            }
-        }
-        plug_core::ipc::IpcResponse::Ok => {}
-        plug_core::ipc::IpcResponse::Error { code, message } => {
-            anyhow::bail!("{code}: {message}");
-        }
-        other => anyhow::bail!("unexpected daemon response: {other:?}"),
-    }
-    Ok(())
-}
-
-pub(crate) fn cmd_setup(
-    config_path: Option<&std::path::PathBuf>,
-    yes: bool,
-    transport: Option<plug_core::export::ExportTransport>,
-) -> anyhow::Result<()> {
-    use dialoguer::Confirm;
-
-    print_banner(
-        "◆",
-        "Plug setup",
-        "Discover servers, import config, and link your AI clients",
-    );
-    let existing = match plug_core::config::load_config(config_path) {
-        Ok(cfg) => cfg.servers,
-        Err(_) => std::collections::HashMap::new(),
-    };
-    let report = plug_core::import::import(&existing, plug_core::import::ClientSource::all());
-    if !report.new_servers.is_empty() {
-        print_heading("Discovered");
-        print_success_line(format!("Found {} server(s).", report.new_servers.len()));
-        for server in &report.new_servers {
-            println!(
-                "  {} {:<18} {}",
-                style("·").dim(),
-                style(&server.name).bold(),
-                style(format!("from {}", server.source)).dim()
-            );
-        }
-        println!();
-        if yes
-            || Confirm::with_theme(&cli_prompt_theme())
-                .with_prompt("Import them?")
-                .default(true)
-                .interact()?
-        {
-            let path = config_path
-                .cloned()
-                .unwrap_or_else(plug_core::config::default_config_path);
-            if let Some(p) = path.parent() {
-                std::fs::create_dir_all(p)?;
-            }
-            let existing_names: Vec<String> = existing.keys().cloned().collect();
-            let toml = plug_core::import::servers_to_toml(&report.new_servers, &existing_names);
-            use std::io::Write as _;
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)?;
-            file.write_all(toml.as_bytes())?;
-        }
-    }
-    cmd_link(config_path, Vec::new(), false, yes, transport)?;
-    Ok(())
-}
-
-#[cfg(test)]
-fn repair_export_endpoint(
-    linked_endpoint: Option<&str>,
-    config_path: Option<&std::path::PathBuf>,
-) -> String {
-    linked_endpoint.map(str::to_owned).unwrap_or_else(|| {
-        crate::commands::clients::configured_http_export_url(config_path)
-            .unwrap_or_else(|| "http://localhost:3282/mcp".to_string())
-    })
-}
-
-fn repair_targets(requested: Vec<String>, all: bool) -> anyhow::Result<Vec<String>> {
-    let known_targets = crate::commands::clients::all_client_targets()
-        .iter()
-        .map(|(_, target)| (*target).to_string())
-        .collect::<std::collections::BTreeSet<_>>();
-
-    if all {
-        return Ok(known_targets.into_iter().collect());
-    }
-
-    if requested.is_empty() {
-        return Ok(known_targets.into_iter().collect());
-    }
-
-    let mut selected = Vec::new();
-    let mut unknown = Vec::new();
-    for target in requested {
-        if known_targets.contains(&target) {
-            selected.push(target);
-        } else {
-            unknown.push(target);
-        }
-    }
-
-    if !unknown.is_empty() {
-        anyhow::bail!("unknown client target(s): {}", unknown.join(", "));
-    }
-
-    selected.sort_unstable();
-    selected.dedup();
-    Ok(selected)
-}
-
-fn repair_attention_messages(report: &ClientRepairReport) -> Vec<String> {
-    report
-        .items
-        .iter()
-        .filter(|item| {
-            !item.changed
-                && !matches!(
-                    item.disposition,
-                    PlugLinkDisposition::Canonical
-                        | PlugLinkDisposition::Http
-                        | PlugLinkDisposition::Missing
-                )
-        })
-        .map(|item| format!("{}: {}", item.target, item.message))
-        .collect()
-}
-
-fn repair_text_summary(report: &ClientRepairReport, repaired_count: usize) -> String {
-    let needing_attention = repair_attention_messages(report);
-    if !needing_attention.is_empty() {
-        format!(
-            "Repair finished with {} client configuration(s) needing attention.",
-            needing_attention.len()
-        )
-    } else if repaired_count > 0 {
-        format!("Successfully repaired {repaired_count} client configuration(s).")
-    } else if report
-        .items
-        .iter()
-        .any(|item| !matches!(item.disposition, PlugLinkDisposition::Missing))
-    {
-        "Linked client configurations already use the canonical command.".to_string()
-    } else {
-        "No linked clients found to repair.".to_string()
-    }
-}
-
-fn persist_client_repair(
-    path: &std::path::Path,
-    updated: &str,
-    dry_run: bool,
-) -> std::io::Result<bool> {
-    if dry_run {
-        return Ok(false);
-    }
-    std::fs::write(path, updated)?;
-    Ok(true)
-}
-
-fn repair_canonical_command(dry_run: bool) -> anyhow::Result<std::path::PathBuf> {
-    if dry_run {
-        return Ok(std::env::current_exe()?);
-    }
-    crate::install::canonical_client_command()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        ClientRepairItem, ClientRepairReport, PlugLinkDisposition, RuntimeServerCounts,
-        doctor_check_details, doctor_next_steps, duplicate_downstream_client_check,
-        fold_daemon_liveness_checks, persist_client_repair, repair_attention_messages,
-        repair_canonical_command, repair_client_content, repair_export_endpoint, repair_targets,
-        repair_text_summary, runtime_auth_checks, runtime_health_checks_for_tests,
-        runtime_health_message, synthesize_doctor_interpretation,
-    };
-    use plug_core::doctor::{CheckResult, CheckStatus};
+    use super::*;
     use plug_core::ipc::IpcAuthServerInfo;
     use plug_core::types::{ServerHealth, ServerStatus};
 
@@ -1383,9 +1082,9 @@ mod tests {
         }
     }
 
-    fn unified_snapshot() -> crate::install::UnifiedInstallSnapshot {
+    fn unified_snapshot() -> UnifiedInstallSnapshot {
         let executable = std::path::PathBuf::from("/Applications/Plug.app/Contents/Resources/plug");
-        crate::install::UnifiedInstallSnapshot {
+        UnifiedInstallSnapshot {
             app: Some(crate::install::VerifiedAppInstallation {
                 bundle_path: std::path::PathBuf::from("/Applications/Plug.app"),
                 executable_path: executable.clone(),
@@ -1705,43 +1404,23 @@ mod tests {
         let canonical_command = app.executable_path.to_string_lossy().into_owned();
 
         // Canonical stdio export points clients at the app-owned executable.
-        let exported = plug_core::export::export_config(&plug_core::export::ExportOptions {
-            target: plug_core::export::ExportTarget::Cursor,
-            transport: plug_core::export::ExportTransport::Stdio,
-            port: 3282,
-            http_url: None,
-            command: canonical_command.clone(),
-        });
-        let exported: serde_json::Value = serde_json::from_str(&exported).unwrap();
-        assert_eq!(exported["mcpServers"]["plug"]["command"], canonical_command);
-        assert_eq!(
-            exported["mcpServers"]["plug"]["args"],
-            serde_json::json!(["connect", "--client", "cursor"])
+        let exported = ClientTarget::Cursor.plug_entry(
+            plug_core::clients::LinkTransport::Stdio,
+            &canonical_command,
+            "",
         );
-
-        // Production delegation is a full exec plan into the verified app.
+        assert_eq!(exported["command"], canonical_command);
         assert_eq!(
-            crate::install::delegation_decision(
-                std::path::Path::new("/opt/homebrew/bin/plug"),
-                Some(&app),
-                false,
-            )
-            .unwrap(),
-            crate::install::DelegationDecision::Exec(app.executable_path.clone())
+            exported["args"],
+            serde_json::json!(["connect", "--client", "cursor"])
         );
 
         // A recognized legacy client entry migrates to the canonical command.
         let legacy = r#"{"mcpServers":{"plug":{"command":"/opt/homebrew/bin/plug","args":["connect"]},"unrelated":{"command":"other","custom":true}},"unknown":{"preserved":true}}"#;
-        let migrated = repair_client_content(
-            plug_core::export::ExportTarget::Cursor,
-            std::path::Path::new("/tmp/cursor.json"),
-            legacy,
-            &app.executable_path,
-            "http://localhost:3282/mcp",
-        )
-        .unwrap()
-        .updated
-        .expect("recognized legacy entry must migrate");
+        let migrated = repair_content(ClientTarget::Cursor, legacy, &app.executable_path)
+            .unwrap()
+            .1
+            .expect("recognized legacy entry must migrate");
         let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
         assert_eq!(
             migrated["mcpServers"]["plug"]["command"],
@@ -1752,15 +1431,9 @@ mod tests {
 
         // Unknown commands are represented exactly and never receive a rewrite.
         let unknown_source = r#"{"mcpServers":{"plug":{"command":"/tmp/not-plug","args":["connect"]}},"unknown":{"preserved":true}}"#;
-        let unknown = repair_client_content(
-            plug_core::export::ExportTarget::Cursor,
-            std::path::Path::new("/tmp/unknown.json"),
-            unknown_source,
-            &app.executable_path,
-            "http://localhost:3282/mcp",
-        )
-        .unwrap();
-        assert_eq!(unknown.updated, None);
+        let (disposition, updated, _) =
+            repair_content(ClientTarget::Cursor, unknown_source, &app.executable_path).unwrap();
+        assert_eq!(updated, None);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(unknown_source).unwrap()["unknown"],
             serde_json::json!({"preserved": true})
@@ -1771,7 +1444,7 @@ mod tests {
             items: vec![ClientRepairItem {
                 target: "cursor".to_string(),
                 path: std::path::PathBuf::from("/tmp/unknown.json"),
-                disposition: unknown.disposition,
+                disposition,
                 changed: false,
                 message: "Unknown command was left untouched.".to_string(),
             }],
@@ -1790,53 +1463,6 @@ mod tests {
             })
         );
 
-        // Old adapter and daemon payloads remain decodable; new evidence is exact.
-        let old_register: plug_core::ipc::IpcRequest = serde_json::from_value(serde_json::json!({
-            "type": "Register",
-            "protocol_version": plug_core::ipc::IPC_PROTOCOL_VERSION,
-            "client_id": "legacy-client",
-            "client_info": "cursor"
-        }))
-        .unwrap();
-        assert!(matches!(
-            old_register,
-            plug_core::ipc::IpcRequest::Register {
-                adapter_version: None,
-                host: None,
-                link_target: None,
-                ..
-            }
-        ));
-        let new_register = plug_core::ipc::IpcRequest::Register {
-            protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
-            client_id: "current-client".to_string(),
-            client_info: Some("cursor".to_string()),
-            adapter_version: Some("0.6.4".to_string()),
-            host: None,
-            link_target: None,
-        };
-        assert_eq!(
-            serde_json::to_value(new_register).unwrap()["adapter_version"],
-            "0.6.4"
-        );
-
-        let old_handshake: plug_core::ipc::IpcResponse =
-            serde_json::from_value(serde_json::json!({
-                "type": "OperatorHandshake",
-                "handshake": {
-                    "daemon_version": "0.6.3",
-                    "ipc_min": 3,
-                    "ipc_max": 4,
-                    "ownership": "cli_managed",
-                    "capabilities": []
-                }
-            }))
-            .unwrap();
-        let plug_core::ipc::IpcResponse::OperatorHandshake { handshake } = old_handshake else {
-            panic!("expected old operator handshake");
-        };
-        assert_eq!(handshake.daemon_executable, None);
-
         let snapshot = unified_snapshot();
         let report = plug_core::doctor::DoctorReport {
             checks: vec![super::unified_install_check_from_snapshot(&snapshot)],
@@ -1854,20 +1480,6 @@ mod tests {
             "/Applications/Plug.app/Contents/Resources/plug"
         );
         assert_eq!(doctor["unified_install"]["adapters"][0], "current");
-
-        #[cfg(not(target_os = "macos"))]
-        {
-            assert_eq!(crate::install::resolve_verified_app().unwrap(), None);
-            assert_eq!(
-                crate::install::delegation_decision(
-                    std::path::Path::new("/usr/local/bin/plug"),
-                    None,
-                    false,
-                )
-                .unwrap(),
-                crate::install::DelegationDecision::Stay
-            );
-        }
     }
 
     #[tokio::test(start_paused = true)]
@@ -2135,7 +1747,7 @@ mod tests {
 
     #[test]
     fn runtime_checks_split_summary_from_named_failures() {
-        let checks = runtime_health_checks_for_tests(
+        let checks = runtime_health_checks(
             &[
                 ServerStatus {
                     server_id: "healthy".to_string(),
@@ -2199,7 +1811,7 @@ mod tests {
 
     #[test]
     fn runtime_checks_include_named_degraded_servers() {
-        let checks = runtime_health_checks_for_tests(
+        let checks = runtime_health_checks(
             &[
                 ServerStatus {
                     server_id: "healthy".to_string(),
@@ -2344,57 +1956,22 @@ mod tests {
     }
 
     #[test]
-    fn repair_export_endpoint_prefers_linked_endpoint_when_present() {
-        let endpoint = repair_export_endpoint(Some("https://plug.example.com/mcp"), None);
-        assert_eq!(endpoint, "https://plug.example.com/mcp");
-    }
-
-    #[test]
-    fn repair_targets_accepts_known_requested_targets() {
-        let targets = repair_targets(vec!["cursor".to_string(), "codex-cli".to_string()], false)
-            .expect("known targets should pass");
-        assert_eq!(targets, vec!["codex-cli", "cursor"]);
-    }
-
-    #[test]
-    fn repair_targets_rejects_unknown_targets() {
-        let error = repair_targets(vec!["made-up-client".to_string()], false)
-            .expect_err("unknown target should fail");
-        assert!(error.to_string().contains("unknown client target"));
-    }
-
-    #[test]
     fn repair_content_preserves_canonical_and_unknown_json_entries() {
         let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
         let canonical_content = format!(
             r#"{{"mcpServers":{{"plug":{{"command":"{}","args":["connect"],"custom":true}},"other":{{"command":"other"}}}},"unknown":{{"preserved":true}}}}"#,
             canonical.display()
         );
-        let canonical_repair = repair_client_content(
-            plug_core::export::ExportTarget::Cursor,
-            std::path::Path::new("config.json"),
-            &canonical_content,
-            canonical,
-            "http://localhost:3282/mcp",
-        )
-        .expect("canonical config should parse");
-        assert_eq!(canonical_repair.disposition, PlugLinkDisposition::Canonical);
-        assert_eq!(canonical_repair.updated, None);
+        let canonical_repair = repair_content(ClientTarget::Cursor, &canonical_content, canonical)
+            .expect("canonical config should parse");
+        assert_eq!(canonical_repair.0, PlugLinkDisposition::Canonical);
+        assert_eq!(canonical_repair.1, None);
 
         let unknown_content = r#"{"mcpServers":{"plug":{"command":"/tmp/other","args":["connect"]},"other":{"command":"other"}},"unknown":{"preserved":true}}"#;
-        let unknown_repair = repair_client_content(
-            plug_core::export::ExportTarget::Cursor,
-            std::path::Path::new("config.json"),
-            unknown_content,
-            canonical,
-            "http://localhost:3282/mcp",
-        )
-        .expect("unknown config should parse");
-        assert_eq!(
-            unknown_repair.disposition,
-            PlugLinkDisposition::UnknownCommand
-        );
-        assert_eq!(unknown_repair.updated, None);
+        let unknown_repair = repair_content(ClientTarget::Cursor, unknown_content, canonical)
+            .expect("unknown config should parse");
+        assert_eq!(unknown_repair.0, PlugLinkDisposition::UnknownCommand);
+        assert_eq!(unknown_repair.1, None);
     }
 
     #[test]
@@ -2407,33 +1984,24 @@ mod tests {
             .into_owned();
         let fixtures = vec![
             (
-                plug_core::export::ExportTarget::Cursor,
-                std::path::Path::new("config.json"),
+                ClientTarget::Cursor,
                 format!(r#"{{"mcpServers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}},"other":{{"command":"other"}}}},"unknown":{{"preserved":true}}}}"#),
             ),
             (
-                plug_core::export::ExportTarget::CodexCli,
-                std::path::Path::new("config.toml"),
+                ClientTarget::CodexCli,
                 "[mcp_servers.plug]\ncommand = \"/opt/homebrew/bin/plug\"\nargs = [\"connect\"]\nunknown = \"keep\"\n\n[mcp_servers.other]\ncommand = \"other\"\n".to_string(),
             ),
             (
-                plug_core::export::ExportTarget::Goose,
-                std::path::Path::new("config.yaml"),
+                ClientTarget::Goose,
                 "extensions:\n  plug:\n    type: stdio\n    command: /Users/rob/src/plug/target/release/plug\n    args: [connect]\n    unknown: keep\n  other:\n    type: stdio\n    command: other\nunknown: preserved\n".to_string(),
             ),
         ];
 
-        for (target, path, content) in &fixtures {
-            let repair = repair_client_content(
-                *target,
-                path,
-                content,
-                canonical,
-                "http://localhost:3282/mcp",
-            )
-            .expect("legacy config should parse");
-            assert_eq!(repair.disposition, PlugLinkDisposition::RecognizedLegacy);
-            let updated = repair.updated.expect("legacy entry should update");
+        for (target, content) in &fixtures {
+            let repair =
+                repair_content(*target, content, canonical).expect("legacy config should parse");
+            assert_eq!(repair.0, PlugLinkDisposition::RecognizedLegacy);
+            let updated = repair.1.expect("legacy entry should update");
             assert!(updated.contains(canonical.to_str().unwrap()));
             assert!(updated.contains("other"));
             assert!(updated.contains("unknown"));
@@ -2454,42 +2022,21 @@ mod tests {
         let valid_args = format!(
             r#"{{"mcpServers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}}}}}}"#
         );
-        let recognized = repair_client_content(
-            plug_core::export::ExportTarget::Cursor,
-            std::path::Path::new("config.json"),
-            &valid_args,
-            canonical,
-            "http://localhost:3282/mcp",
-        )
-        .expect("recognized Cargo path should be repairable with valid args");
-        assert_eq!(
-            recognized.disposition,
-            PlugLinkDisposition::RecognizedLegacy
-        );
-        let invalid = repair_client_content(
-            plug_core::export::ExportTarget::Cursor,
-            std::path::Path::new("config.json"),
-            &invalid_args,
-            canonical,
-            "http://localhost:3282/mcp",
-        )
-        .expect("invalid args are reported, not repaired");
-        assert_eq!(invalid.disposition, PlugLinkDisposition::UnknownCommand);
-        assert_eq!(invalid.updated, None);
+        let recognized = repair_content(ClientTarget::Cursor, &valid_args, canonical)
+            .expect("recognized Cargo path should be repairable with valid args");
+        assert_eq!(recognized.0, PlugLinkDisposition::RecognizedLegacy);
+        let invalid = repair_content(ClientTarget::Cursor, &invalid_args, canonical)
+            .expect("invalid args are reported, not repaired");
+        assert_eq!(invalid.0, PlugLinkDisposition::UnknownCommand);
+        assert_eq!(invalid.1, None);
 
         let dual_container = format!(
             r#"{{"mcpServers":{{"other":{{"command":"other"}}}},"context_servers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}}}}}}"#
         );
-        let repaired = repair_client_content(
-            plug_core::export::ExportTarget::Zed,
-            std::path::Path::new("config.json"),
-            &dual_container,
-            canonical,
-            "http://localhost:3282/mcp",
-        )
-        .expect("dual container config should repair");
+        let repaired = repair_content(ClientTarget::Zed, &dual_container, canonical)
+            .expect("dual container config should repair");
         let updated = repaired
-            .updated
+            .1
             .expect("context_servers Plug entry should update");
         let json: serde_json::Value = serde_json::from_str(&updated).unwrap();
         assert_eq!(
@@ -2512,22 +2059,19 @@ mod tests {
             .into_owned();
         let fixtures = vec![
             (
-                plug_core::export::ExportTarget::CodexCli,
-                std::path::Path::new("config.toml"),
+                ClientTarget::CodexCli,
                 "# keep this document comment\n[mcp_servers.plug]\n# keep this entry comment\ncommand = \"/opt/homebrew/bin/plug\" # command note\nargs = [\"connect\"] # args note\nunknown = \"keep\"\n\n# keep neighboring comment\n[mcp_servers.other]\ncommand = \"other\"\n".to_string(),
                 "# keep neighboring comment",
             ),
             (
-                plug_core::export::ExportTarget::Goose,
-                std::path::Path::new("config.yaml"),
+                ClientTarget::Goose,
                 format!("# keep this document comment\nextensions:\n  plug:\n    # keep this entry comment\n    command: {cargo_command} # command note\n    args: [connect] # args note\n    unknown: keep\n  # keep neighboring comment\n  other:\n    command: other\n"),
                 "# keep neighboring comment",
             ),
         ];
-        for (target, path, content, retained_comment) in fixtures {
-            let repair =
-                repair_client_content(target, path, &content, canonical, "unused").unwrap();
-            let updated = repair.updated.expect("legacy entry should update");
+        for (target, content, retained_comment) in fixtures {
+            let repair = repair_content(target, &content, canonical).unwrap();
+            let updated = repair.1.expect("legacy entry should update");
             assert!(updated.contains("# keep this document comment"));
             assert!(updated.contains(retained_comment));
             assert!(updated.contains("# command note"));
@@ -2546,30 +2090,27 @@ mod tests {
             .into_owned();
         let fixtures = vec![
             (
-                plug_core::export::ExportTarget::CodexCli,
-                std::path::Path::new("config.toml"),
+                ClientTarget::CodexCli,
                 "[mcp_servers.plug]\ncommand = \"/opt/homebrew/bin/plug\"\nargs = [\n  \"connect\",\n]\n\n# retain this unrelated comment\n[mcp_servers.other]\ncommand = \"other\"\n".to_string(),
             ),
             (
-                plug_core::export::ExportTarget::Goose,
-                std::path::Path::new("config.yaml"),
+                ClientTarget::Goose,
                 format!("extensions:\n  plug:\n    command: {cargo_command}\n    args:\n\n      - connect\n\n  # retain this unrelated comment\n  other:\n    command: other\n"),
             ),
         ];
-        for (target, path, content) in fixtures {
-            let repair =
-                repair_client_content(target, path, &content, canonical, "unused").unwrap();
-            let updated = repair.updated.expect("legacy entry should update");
+        for (target, content) in fixtures {
+            let repair = repair_content(target, &content, canonical).unwrap();
+            let updated = repair.1.expect("legacy entry should update");
             assert!(updated.contains("# retain this unrelated comment"));
             assert!(
                 updated.contains("[mcp_servers.other]\ncommand = \"other\"")
                     || updated.contains("other:\n    command: other")
             );
             match target {
-                plug_core::export::ExportTarget::CodexCli => {
+                ClientTarget::CodexCli => {
                     assert!(toml::from_str::<toml::Value>(&updated).is_ok());
                 }
-                plug_core::export::ExportTarget::Goose => {
+                ClientTarget::Goose => {
                     assert!(serde_norway::from_str::<serde_norway::Value>(&updated).is_ok());
                 }
                 _ => unreachable!(),
@@ -2578,198 +2119,83 @@ mod tests {
     }
 
     #[test]
-    fn repair_text_reports_attention_without_a_success_summary() {
-        let report = ClientRepairReport {
-            canonical_command: std::path::PathBuf::from(
-                "/Applications/Plug.app/Contents/Resources/plug",
+    fn classifies_only_canonical_or_recognized_legacy_connect_commands() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let connect = vec!["connect".to_string()];
+        let home = dirs::home_dir().expect("test home directory");
+
+        assert_eq!(
+            classify_plug_client_command(canonical.to_str().unwrap(), &connect, canonical),
+            PlugLinkDisposition::Canonical
+        );
+        for legacy in [
+            home.join(".cargo/bin/plug").to_string_lossy().into_owned(),
+            "/opt/homebrew/bin/plug".to_string(),
+            home.join("Applications/Plug.app/Contents/Resources/plug")
+                .to_string_lossy()
+                .into_owned(),
+            "/Users/rob/src/plug/target/release/plug".to_string(),
+        ] {
+            assert_eq!(
+                classify_plug_client_command(&legacy, &connect, canonical),
+                PlugLinkDisposition::RecognizedLegacy,
+                "{legacy} should be a recognized legacy Plug command"
+            );
+        }
+        assert_eq!(
+            classify_plug_client_command("/usr/local/bin/not-plug", &connect, canonical),
+            PlugLinkDisposition::UnknownCommand
+        );
+        assert_eq!(
+            classify_plug_client_command(
+                "/Users/rob/project/target/release/plug",
+                &["serve".to_string()],
+                canonical,
             ),
-            items: vec![ClientRepairItem {
-                target: "cursor".to_string(),
-                path: std::path::PathBuf::from("/tmp/cursor.json"),
-                disposition: PlugLinkDisposition::UnknownCommand,
-                changed: false,
-                message: "Plug command is not recognized; left unchanged.".to_string(),
-            }],
-        };
-        assert_eq!(
-            repair_attention_messages(&report),
-            vec!["cursor: Plug command is not recognized; left unchanged.".to_string()]
+            PlugLinkDisposition::UnknownCommand
         );
-        assert!(repair_text_summary(&report, 0).contains("needing attention"));
-        assert!(!repair_text_summary(&report, 0).contains("Successfully"));
+
+        // A link that says which client it serves is the same link.
+        let named = ["connect", "--client", "cursor"].map(str::to_string);
+        assert_eq!(
+            classify_plug_client_command(canonical.to_str().unwrap(), &named, canonical),
+            PlugLinkDisposition::Canonical
+        );
+        assert_eq!(
+            classify_plug_client_command("/opt/homebrew/bin/plug", &named, canonical),
+            PlugLinkDisposition::RecognizedLegacy
+        );
+        for other in [
+            vec!["connect", "--client"],
+            vec!["connect", "--config", "/tmp/other.toml"],
+            vec!["connect", "--client", "cursor", "--verbose"],
+        ] {
+            let other: Vec<String> = other.into_iter().map(str::to_string).collect();
+            assert_eq!(
+                classify_plug_client_command(canonical.to_str().unwrap(), &other, canonical),
+                PlugLinkDisposition::UnknownCommand,
+                "{other:?} is not an argument list plug link writes"
+            );
+        }
     }
 
     #[test]
-    fn dry_run_preserves_client_file_byte_for_byte() {
-        let path =
-            std::env::temp_dir().join(format!("plug-repair-dry-run-{}.json", uuid::Uuid::new_v4()));
-        let original = b"{\"mcpServers\":{\"plug\":{\"command\":\"legacy\"}}}\n";
-        std::fs::write(&path, original).unwrap();
-
-        let changed = persist_client_repair(&path, "replacement", true).unwrap();
-
-        assert!(!changed);
-        assert_eq!(std::fs::read(&path).unwrap(), original);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn dry_run_inspection_uses_current_executable_without_app_discovery() {
-        assert_eq!(
-            repair_canonical_command(true).unwrap(),
-            std::env::current_exe().unwrap()
-        );
-    }
-}
-
-pub(crate) fn cmd_repair(
-    config_path: Option<&std::path::PathBuf>,
-    targets: Vec<String>,
-    all: bool,
-    dry_run: bool,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
-    let repair_targets = repair_targets(targets, all)?;
-    let canonical_command = repair_canonical_command(dry_run)?;
-    let mut report = ClientRepairReport {
-        canonical_command: canonical_command.clone(),
-        items: Vec::new(),
-    };
-    let http_url = crate::commands::clients::configured_http_export_url(config_path)
-        .unwrap_or_else(|| "http://localhost:3282/mcp".to_string());
-
-    if matches!(output, OutputFormat::Text) {
-        println!(
-            "{} {}",
-            style("◆").cyan().bold(),
-            style(if dry_run {
-                "Inspecting AI client configurations..."
-            } else {
-                "Repairing AI client configurations..."
-            })
-            .bold()
-        );
-    }
-
-    let mut repaired_count = 0;
-
-    for target in repair_targets {
-        let target_enum: plug_core::export::ExportTarget = target
-            .parse()
-            .map_err(|error: String| anyhow::anyhow!(error))?;
-        let Some(path) = plug_core::export::default_config_path(target_enum, false) else {
-            report.items.push(ClientRepairItem {
-                target,
-                path: std::path::PathBuf::new(),
-                disposition: PlugLinkDisposition::Missing,
-                changed: false,
-                message: "This client has no supported config path on this platform.".to_string(),
-            });
-            continue;
-        };
-        if !path.exists() {
-            report.items.push(ClientRepairItem {
-                target,
-                path,
-                disposition: PlugLinkDisposition::Missing,
-                changed: false,
-                message: "Client config file does not exist.".to_string(),
-            });
-            continue;
-        }
-
-        let content = match std::fs::read_to_string(&path) {
-            Ok(content) => content,
-            Err(error) => {
-                report.items.push(ClientRepairItem {
-                    target,
-                    path,
-                    disposition: PlugLinkDisposition::UnknownCommand,
-                    changed: false,
-                    message: format!("Could not read client config; left unchanged: {error}"),
-                });
-                continue;
-            }
-        };
-        let repair = match repair_client_content(
-            target_enum,
-            &path,
-            &content,
-            &canonical_command,
-            &http_url,
-        ) {
-            Ok(repair) => repair,
-            Err(error) => {
-                report.items.push(ClientRepairItem {
-                    target,
-                    path,
-                    disposition: PlugLinkDisposition::UnknownCommand,
-                    changed: false,
-                    message: format!("Could not inspect client config; left unchanged: {error}"),
-                });
-                continue;
-            }
-        };
-
-        let mut item = ClientRepairItem {
-            target: target.clone(),
-            path: path.clone(),
-            disposition: repair.disposition,
-            changed: false,
-            message: repair.message,
-        };
-        if let Some(updated) = repair.updated {
-            match persist_client_repair(&path, &updated, dry_run) {
-                Ok(false) => {
-                    item.message = "Recognized legacy Plug command needs repair.".to_string();
-                }
-                Err(error) => {
-                    item.message = format!("Could not repair recognized Plug command: {error}");
-                }
-                Ok(true) => {
-                    item.changed = true;
-                    repaired_count += 1;
-                    if matches!(output, OutputFormat::Text) {
-                        println!(
-                            "  {} Refreshing {}... {}",
-                            style("›").cyan().bold(),
-                            target,
-                            style("done").green()
-                        );
-                    }
-                }
-            }
-        }
-        report.items.push(item);
-    }
-
-    match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text => {
-            let needing_attention = repair_attention_messages(&report);
-            for message in &needing_attention {
-                print_warning_line(message);
-            }
-            println!("\n{}", repair_text_summary(&report, repaired_count));
+    fn rejects_broad_legacy_path_shapes() {
+        let canonical = std::path::Path::new("/Applications/Plug.app/Contents/Resources/plug");
+        let connect = vec!["connect".to_string()];
+        for command in [
+            "/tmp/homebrew/bin/plug",
+            "/tmp/opt/homebrew/bin/plug",
+            "/tmp/usr/local/bin/plug",
+            "/Applications/Other Plug.app/Contents/Resources/plug",
+            "/Users/rob/project/target/custom/plug",
+            "/Users/rob/target/release/plug/not-a-plug/plug",
+        ] {
+            assert_eq!(
+                classify_plug_client_command(command, &connect, canonical),
+                PlugLinkDisposition::UnknownCommand,
+                "{command} must not be adopted"
+            );
         }
     }
-
-    Ok(())
-}
-
-pub(crate) fn cmd_uninstall_cleanup(output: &OutputFormat) -> anyhow::Result<()> {
-    let report = crate::install::uninstall_cleanup()?;
-    match output {
-        OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&report)?),
-        OutputFormat::Text => {
-            for item in report.items {
-                if item.changed {
-                    print_success_line(item.message);
-                } else {
-                    print_info_line(item.message);
-                }
-            }
-        }
-    }
-    Ok(())
 }

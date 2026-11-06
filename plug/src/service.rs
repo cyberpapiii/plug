@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-const LABEL: &str = "com.plug.daemon";
+pub(crate) const LABEL: &str = "com.plug.daemon";
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct LaunchdJobRecord {

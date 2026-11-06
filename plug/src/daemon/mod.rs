@@ -1703,7 +1703,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     client_blocks,
                     events,
                     config_error,
-                    client_address: Some(crate::commands::clients::http_export_url(&config)),
+                    client_address: Some(config.http.mcp_url()),
                 }),
             }
         }

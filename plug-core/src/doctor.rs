@@ -574,10 +574,9 @@ async fn check_tool_collisions(config: &Config) -> CheckResult {
 
 /// A published ceiling on how many MCP tools one client will accept at once.
 struct ClientToolLimit {
-    client: &'static str,
-    /// `ExportTarget` name, so the ceiling is only raised for a client that is
-    /// actually pointed at plug.
-    target: &'static str,
+    /// The ceiling is only raised for a client that is actually pointed at
+    /// plug.
+    target: crate::clients::ClientTarget,
     limit: usize,
     /// Date this entry was last checked against `source`, `YYYY-MM-DD`.
     verified: &'static str,
@@ -614,8 +613,7 @@ struct ClientToolLimit {
 ///   nothing about Cascade. `ClientType::Devin` still carries that 100 for the
 ///   session filter, keyed on the `windsurf-client` identity Cascade reports.
 const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[ClientToolLimit {
-    client: "VS Code Copilot",
-    target: "vscode",
+    target: crate::clients::ClientTarget::VSCodeCopilot,
     limit: 128,
     verified: "2026-08-30",
     // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
@@ -623,68 +621,20 @@ const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[ClientToolLimit {
     source: "https://github.com/microsoft/vscode/issues/290356",
 }];
 
-/// Number of plug entries a client config file declares.
-///
-/// More than one is a duplicate to repair; at least one means the client is
-/// pointed at plug. Shared so both readings come from the same parse.
-fn plug_entry_count(content: &str, extension: Option<&str>) -> usize {
-    match extension {
-        Some("toml") => content
-            .lines()
-            .filter(|l| l.trim() == "[mcp_servers.plug]")
-            .count(),
-        // Goose and Hermes Agent key their servers by name. A link written
-        // by hand in Hermes is often `Plug:`.
-        Some("yaml") | Some("yml") => content
-            .lines()
-            .filter(|l| l.trim().eq_ignore_ascii_case("plug:"))
-            .count(),
-        _ => {
-            let Ok(json) = serde_json::from_str::<serde_json::Value>(content) else {
-                return 0;
-            };
-            let mut count = 0;
-            for key in [
-                "mcpServers",
-                "context_servers",
-                "amp.mcpServers",
-                "mcp_servers",
-            ] {
-                if json.get(key).and_then(|v| v.get("plug")).is_some() {
-                    count += 1;
-                }
-            }
-            for path in [["mcp", "servers"], ["tools", "mcpServers"]] {
-                if json
-                    .get(path[0])
-                    .and_then(|v| v.get(path[1]))
-                    .and_then(|s| s.get("plug"))
-                    .is_some()
-                {
-                    count += 1;
-                }
-            }
-            count
-        }
-    }
+/// Each settings file of `target` that exists, with its contents.
+fn client_files(target: crate::clients::ClientTarget) -> Vec<(std::path::PathBuf, String)> {
+    [crate::clients::Scope::User, crate::clients::Scope::Project]
+        .into_iter()
+        .filter_map(|scope| target.config_path(scope))
+        .filter_map(|path| Some((path.clone(), std::fs::read_to_string(&path).ok()?)))
+        .collect()
 }
 
 /// Whether `target`'s own config points at plug, globally or per project.
-fn client_is_linked_to_plug(target: &str) -> bool {
-    let Ok(target_enum) = target.parse::<crate::export::ExportTarget>() else {
-        return false;
-    };
-    [
-        crate::export::default_config_path(target_enum, false),
-        crate::export::default_config_path(target_enum, true),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|path| {
-        std::fs::read_to_string(&path).is_ok_and(|content| {
-            plug_entry_count(&content, path.extension().and_then(|e| e.to_str())) > 0
-        })
-    })
+fn client_is_linked_to_plug(target: crate::clients::ClientTarget) -> bool {
+    client_files(target)
+        .iter()
+        .any(|(_, content)| target.layout().plug_entry_count(content) > 0)
 }
 
 /// Check 7: report published tool ceilings for the clients actually using plug.
@@ -721,7 +671,7 @@ async fn check_client_limits(_config: &Config) -> CheckResult {
             // without going and finding this table first.
             format!(
                 "{} caps at {} tools (verified {}, {})",
-                entry.client, entry.limit, entry.verified, entry.source
+                entry.target, entry.limit, entry.verified, entry.source
             )
         })
         .collect();
@@ -954,99 +904,20 @@ async fn check_client_configs() -> CheckResult {
     let name = "client_configs".to_string();
     let mut issues = Vec::new();
 
-    let all_targets = [
-        "claude-desktop",
-        "claude-code",
-        "cursor",
-        "vscode",
-        "copilot-cli",
-        "devin",
-        "gemini-cli",
-        "codex-cli",
-        "grok-build",
-        "opencode",
-        "zed",
-        "cline",
-        "cline-cli",
-        "roocode",
-        "factory",
-        "nanobot",
-        "junie",
-        "kilo",
-        "pi",
-        "warp",
-        "kiro",
-        "kimi-code",
-        "qwen-code",
-        "antigravity",
-        "goose",
-        "hermes",
-        "amp",
-        "openclaw",
-        "lm-studio",
-        "muse-code",
-    ];
-
-    for target in all_targets {
-        let target_enum: crate::export::ExportTarget = match target.parse() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-
-        // Check both global and project paths (if applicable)
-        let paths = vec![
-            crate::export::default_config_path(target_enum, false),
-            crate::export::default_config_path(target_enum, true),
-        ];
-
-        for path in paths.into_iter().flatten() {
-            if !path.exists() {
-                continue;
-            }
-
-            let content = match std::fs::read_to_string(&path) {
-                Ok(c) => c,
-                Err(_) => continue,
-            };
-
-            let ext = path.extension().and_then(|e| e.to_str());
-
-            if plug_entry_count(&content, ext) > 1 {
+    for target in crate::clients::ClientTarget::all() {
+        let layout = target.layout();
+        for (path, content) in client_files(target) {
+            if layout.plug_entry_count(&content) > 1 {
                 issues.push(format!(
                     "{} (duplicate entries in {})",
-                    target,
+                    target.slug(),
                     path.display()
                 ));
             }
-
             // A file plug cannot parse is worth reporting on its own: a
             // duplicate hiding inside it would go uncounted above.
-            match ext {
-                Some("toml") => {
-                    if let Err(e) = validate_toml_document(&content) {
-                        issues.push(format!(
-                            "{} (invalid TOML in {}: {})",
-                            target,
-                            path.display(),
-                            e
-                        ));
-                    }
-                }
-                Some("yaml") | Some("yml") => {
-                    if let Err(e) = serde_norway::from_str::<serde_norway::Value>(&content) {
-                        issues.push(format!(
-                            "{} (invalid YAML in {}: {})",
-                            target,
-                            path.display(),
-                            e
-                        ));
-                    }
-                }
-                _ => {
-                    if serde_json::from_str::<serde_json::Value>(&content).is_err() {
-                        issues.push(format!("{} (invalid JSON in {})", target, path.display()));
-                    }
-                }
+            if let Err(error) = layout.check_syntax(&content) {
+                issues.push(format!("{} ({error} in {})", target.slug(), path.display()));
             }
         }
     }
@@ -1064,15 +935,11 @@ async fn check_client_configs() -> CheckResult {
             status: CheckStatus::Warn,
             message: format!("Issues found in client configs: {}", issues.join(", ")),
             fix_suggestion: Some(
-                "Run `plug repair` to automatically clean up your client configurations"
+                "Fix a file that does not parse, then run `plug link <client>` again to leave one Plug entry"
                     .to_string(),
             ),
         }
     }
-}
-
-fn validate_toml_document(content: &str) -> Result<(), toml::de::Error> {
-    toml::from_str::<toml::Value>(content).map(|_| ())
 }
 
 /// Check 11: Downstream HTTP auth configuration and token state.
@@ -1573,22 +1440,6 @@ auth_token = "keychain:b.token"
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn client_config_validation_parses_complete_toml_documents() {
-        let document = r#"
-[mcp_servers.plug]
-url = "http://127.0.0.1:3282/mcp"
-
-[mcp_servers.example]
-command = "example-server"
-"#;
-
-        assert!(validate_toml_document(document).is_ok());
-        assert!(validate_toml_document("[broken").is_err());
-    }
-
-    // -- check_config_permissions --
-
     #[tokio::test]
     async fn config_permissions_no_file() {
         let config = test_config();
@@ -2086,57 +1937,17 @@ command = "example-server"
             assert!(
                 entry.source.starts_with("https://"),
                 "{} needs a source URL that can be re-checked",
-                entry.client
+                entry.target
             );
             let parts: Vec<&str> = entry.verified.split('-').collect();
             assert!(
                 parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
                 "{} needs a YYYY-MM-DD verified date, got {:?}",
-                entry.client,
+                entry.target,
                 entry.verified
             );
-            assert!(entry.limit > 0, "{} has a meaningless limit", entry.client);
-            assert!(
-                entry.target.parse::<crate::export::ExportTarget>().is_ok(),
-                "{} names an export target that does not exist: {}",
-                entry.client,
-                entry.target
-            );
+            assert!(entry.limit > 0, "{} has a meaningless limit", entry.target);
         }
-    }
-
-    #[test]
-    fn plug_entry_count_reads_every_supported_client_layout() {
-        assert_eq!(
-            plug_entry_count("[mcp_servers.plug]\ncommand = \"plug\"\n", Some("toml")),
-            1
-        );
-        assert_eq!(plug_entry_count("extensions:\n  plug:\n", Some("yaml")), 1);
-        assert_eq!(plug_entry_count("mcp_servers:\n  Plug:\n", Some("yaml")), 1);
-        assert_eq!(
-            plug_entry_count(r#"{"mcpServers":{"plug":{}}}"#, Some("json")),
-            1
-        );
-        assert_eq!(
-            plug_entry_count(r#"{"mcp":{"servers":{"plug":{}}}}"#, Some("json")),
-            1
-        );
-        assert_eq!(
-            plug_entry_count(r#"{"tools":{"mcpServers":{"plug":{}}}}"#, Some("json")),
-            1
-        );
-
-        // Two locations in one file is the duplicate `plug repair` cleans up.
-        assert_eq!(
-            plug_entry_count(
-                r#"{"mcpServers":{"plug":{}},"mcp":{"servers":{"plug":{}}}}"#,
-                Some("json")
-            ),
-            2
-        );
-
-        assert_eq!(plug_entry_count(r#"{"mcpServers":{"other":{}}}"#, None), 0);
-        assert_eq!(plug_entry_count("not json at all", Some("json")), 0);
     }
 
     // -- check_pid_staleness --

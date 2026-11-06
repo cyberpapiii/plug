@@ -1,7 +1,7 @@
 use dialoguer::console::style;
 use dialoguer::{MultiSelect, Select};
 
-use crate::commands::config::{load_editable_config, save_config};
+use crate::commands::config::load_editable_config;
 use crate::runtime::ensure_daemon_with_feedback;
 use crate::ui::{
     cli_prompt_theme, print_banner, print_info_line, print_label_value, print_success_line,
@@ -10,27 +10,15 @@ use crate::{OutputFormat, ToolCommands};
 
 pub(crate) async fn cmd_tool_command(
     config_path: Option<&std::path::PathBuf>,
-    command: Option<ToolCommands>,
-    server: Option<String>,
+    command: ToolCommands,
     output: &OutputFormat,
-    verbose: u8,
 ) -> anyhow::Result<()> {
     match command {
-        None => {
-            crate::views::tools::cmd_tool_list(
-                config_path,
-                output,
-                verbose,
-                server.as_deref(),
-                None,
-            )
-            .await
-        }
-        Some(ToolCommands::Disabled) => cmd_tool_disabled(config_path, output),
-        Some(ToolCommands::Disable { server, patterns }) => {
+        ToolCommands::Disabled => cmd_tool_disabled(config_path, output),
+        ToolCommands::Disable { server, patterns } => {
             cmd_tool_disable(config_path, tool_patterns_for_server(server, patterns)?).await
         }
-        Some(ToolCommands::Enable { server, patterns }) => {
+        ToolCommands::Enable { server, patterns } => {
             cmd_tool_enable(config_path, tool_patterns_for_server(server, patterns)?)
         }
     }
@@ -161,7 +149,7 @@ pub(crate) async fn cmd_tool_disable(
         }
     }
     config.disabled_tools.sort();
-    save_config(&path, &config)?;
+    plug_core::operator::persist_config_atomic(&path, &config)?;
 
     if added.is_empty() {
         print_info_line("No new disabled tool patterns were added.");
@@ -200,7 +188,7 @@ pub(crate) fn cmd_tool_enable(
     config
         .disabled_tools
         .retain(|existing| !patterns.iter().any(|pattern| pattern == existing));
-    save_config(&path, &config)?;
+    plug_core::operator::persist_config_atomic(&path, &config)?;
 
     let removed = before.saturating_sub(config.disabled_tools.len());
     if removed == 0 {

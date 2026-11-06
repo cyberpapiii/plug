@@ -92,7 +92,6 @@ pub(crate) async fn cmd_server_list(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut started = false;
 
     loop {
         let (availability, live_status) = daemon_query(
@@ -169,9 +168,6 @@ pub(crate) async fn cmd_server_list(
                                     .count()
                             ),
                         );
-                        if started {
-                            println!();
-                        }
                         print_heading("Summary");
                         print_label_value("Running", style(healthy).green().bold());
                         print_label_value("Unsteady", style(degraded).yellow().bold());
@@ -351,7 +347,6 @@ pub(crate) async fn cmd_server_list(
             break;
         }
         println!();
-        started = false;
     }
     Ok(())
 }

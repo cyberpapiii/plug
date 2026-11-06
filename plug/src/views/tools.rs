@@ -131,13 +131,8 @@ pub(crate) async fn cmd_tool_list(
     output: &OutputFormat,
     verbose: u8,
     server: Option<&str>,
-    started: Option<bool>,
 ) -> anyhow::Result<()> {
     let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-    let mut started = match started {
-        Some(started) => started,
-        None => false,
-    };
 
     loop {
         let (status_availability, runtime_status) = daemon_query(
@@ -323,9 +318,6 @@ pub(crate) async fn cmd_tool_list(
                     "Tools",
                     &format!("{tool_count} tools across {server_count} server(s)"),
                 );
-                if started {
-                    println!();
-                }
                 print_heading("Summary");
                 print_label_value("Tools", style(tool_count).bold());
                 print_label_value("Servers", style(server_count).bold());
@@ -374,11 +366,7 @@ pub(crate) async fn cmd_tool_list(
                             let display_text = title.as_deref().or(desc.as_deref());
                             if let Some(text) = display_text {
                                 let cleaned = text.replace('\n', " ").replace('\r', "");
-                                let short = if cleaned.len() > available_width {
-                                    format!("{}...", &cleaned[..available_width.max(0)])
-                                } else {
-                                    cleaned
-                                };
+                                let short = crate::ui::truncate_tail(&cleaned, available_width);
                                 println!("{}  {}", name_styled, style(short).dim());
                             } else {
                                 println!("{}", name_styled);
@@ -398,7 +386,6 @@ pub(crate) async fn cmd_tool_list(
             break;
         }
         println!();
-        started = false;
     }
     Ok(())
 }

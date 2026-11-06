@@ -288,7 +288,7 @@ fn local_operator_client(
     if operator_token.is_empty() {
         anyhow::bail!("the local operator token is empty");
     }
-    let scheme = if cfg.http.tls_cert_path.is_some() && cfg.http.tls_key_path.is_some() {
+    let scheme = if cfg.http.tls_enabled() {
         "https"
     } else {
         "http"
