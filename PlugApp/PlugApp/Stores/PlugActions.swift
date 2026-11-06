@@ -221,7 +221,7 @@ final class PlugActions {
             await loadConnectableApps()
             await refresh()
         } catch {
-            let name = AppIcons.displayName(forTarget: target) ?? target
+            let name = ClientIdentity.displayName(forTarget: target) ?? target
             report(linked ? "add Plug to \(name)" : "remove Plug from \(name)", error)
         }
     }

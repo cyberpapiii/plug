@@ -46,15 +46,11 @@ struct AppRoster: Equatable {
     }
 
     /// The client the daemon takes a session for, else every client its
-    /// reported names could be. The daemon knows only the clients it can
-    /// link; a remote product such as ChatGPT is known here by its name.
+    /// reported names could be.
     static func targets(of session: LiveSession) -> Set<String> {
         if let target = session.target { return [target] }
-        var targets = [AppIcons.target(forClientType: session.clientType)]
-        if let info = session.clientInfo, !info.isEmpty {
-            targets.append(AppIcons.target(forClientType: info))
-        }
-        return Set(targets)
+        let names = [session.clientType, session.clientInfo].compactMap { $0 }.filter { !$0.isEmpty }
+        return Set(names.map(ClientIdentity.guess(from:)))
     }
 }
 
@@ -67,11 +63,10 @@ extension LiveSession {
 
     /// The product name of a client Plug knows, nil for any other.
     var knownName: String? {
-        if let name = target.flatMap(AppIcons.displayName(forTarget:)) { return name }
+        if let name = target.flatMap(ClientIdentity.displayName(forTarget:)) { return name }
         for value in [clientType, clientInfo].compactMap({ $0 }) {
-            let target = AppIcons.target(forClientType: value)
-            if let canonical = AppIcons.displayName(forTarget: target) {
-                return canonical
+            if let known = ClientIdentity.knownTarget(named: value) {
+                return ClientIdentity.displayName(forTarget: known)
             }
         }
         return nil
@@ -163,33 +158,23 @@ struct ClientNames: Equatable {
     /// The client a name belongs to, when the name is one Plug knows. An
     /// owner who names a client "Grok Bot" has said what it is, whatever the
     /// client reports about itself.
-    func knownTarget(named name: String?) -> String? {
-        guard let name else { return nil }
-        let target = AppIcons.target(forClientType: name)
-        return AppIcons.displayName(forTarget: target) == nil ? nil : target
+    func knownTarget(named name: String?) -> String? { ClientIdentity.knownTarget(named: name) }
+
+    /// The client a remote sign-in is pictured as.
+    func target(ofGrant grant: DownstreamClient) -> String {
+        ClientIdentity.resolve(
+            ownerName: name(forKey: grant.clientKey), daemonTarget: grant.target,
+            reported: nil, grantName: grant.clientName
+        )
     }
 
-    /// The name a remote client is pictured by: the owner's, when it is a
-    /// client Plug knows, else the one on its grant.
-    func picturedName(forGrant grant: DownstreamClient) -> String {
-        let owned = name(forKey: grant.clientKey)
-        return knownTarget(named: owned) == nil ? grant.clientName : (owned ?? grant.clientName)
-    }
-
-    /// The target whose icon a session shows: the client its owner named it
-    /// as, else the one the daemon takes it for, else a product Plug knows
-    /// by the name it reports, else the client its sign-in names. A call is
-    /// pictured the same way.
+    /// The target whose icon a session shows. A call is pictured the same way.
     func target(of session: LiveSession) -> String {
         let key = session.clientKey
-        if let named = knownTarget(named: name(forKey: key)) { return named }
-        if let target = session.target { return target }
-        let reported = AppIcons.target(forClientType: session.clientType)
-        if AppIcons.displayName(forTarget: reported) != nil { return reported }
-        if let grant = key.flatMap({ grantNames[$0] }) {
-            return AppIcons.target(forClientType: grant)
-        }
-        return reported
+        return ClientIdentity.resolve(
+            ownerName: name(forKey: key), daemonTarget: session.target,
+            reported: session.clientType, grantName: key.flatMap { grantNames[$0] }
+        )
     }
 
     /// The distinct clients behind a set of open sessions, first seen first,
@@ -198,7 +183,7 @@ struct ClientNames: Equatable {
         var seen = Set<String>()
         return sessions.compactMap { session in
             let target = target(of: session)
-            let known = AppIcons.displayName(forTarget: target) != nil
+            let known = ClientIdentity.displayName(forTarget: target) != nil
             // A client Plug knows is one client however it is keyed. Any
             // other is told apart by its key.
             let identity = known ? target : (session.clientKey ?? target)

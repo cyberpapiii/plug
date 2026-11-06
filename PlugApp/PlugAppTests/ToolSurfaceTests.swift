@@ -326,8 +326,8 @@ final class AppRosterTests: XCTestCase {
             apps: try apps(#"[{"target":"codex-cli","linked":true,"detected":true},{"target":"cursor","detected":true}]"#),
             sessions: try sessions(
                 """
-                [{"transport":"ipc","session_id":"a1","client_type":"codex","connected_secs":5},
-                 {"transport":"ipc","session_id":"a2","client_type":"codex","connected_secs":9}]
+                [{"transport":"daemon_proxy","session_id":"a1","client_type":"CodexCli","target":"codex-cli","connected_secs":5},
+                 {"transport":"daemon_proxy","session_id":"a2","client_type":"CodexCli","target":"codex-cli","connected_secs":9}]
                 """
             )
         )
@@ -356,7 +356,7 @@ final class AppRosterTests: XCTestCase {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"cursor","detected":true}]"#),
             sessions: try sessions(
-                #"[{"transport":"ipc","session_id":"z9","client_type":"unknown","client_info":"ditto-history","connected_secs":1}]"#
+                #"[{"transport":"daemon_proxy","session_id":"z9","client_type":"Unknown","client_info":"ditto-history","connected_secs":1}]"#
             )
         )
         XCTAssertTrue(roster.connected.isEmpty)
@@ -677,7 +677,7 @@ final class AppRosterTests: XCTestCase {
     func testClaudeCodeAndCodexSessionsStayWithTheirOwnApps() throws {
         let roster = AppRoster(
             apps: try apps(#"[{"target":"codex-cli","detected":true},{"target":"claude-code","detected":true}]"#),
-            sessions: try sessions(#"[{"transport":"ipc","session_id":"codex-1","client_type":"Codex CLI","client_info":"codex-mcp-client","connected_secs":5},{"transport":"ipc","session_id":"claude-1","client_type":"Claude Code","client_info":"claude-code","connected_secs":9}]"#)
+            sessions: try sessions(#"[{"transport":"daemon_proxy","session_id":"codex-1","client_type":"CodexCli","client_info":"codex-mcp-client","target":"codex-cli","connected_secs":5},{"transport":"daemon_proxy","session_id":"claude-1","client_type":"ClaudeCode","client_info":"claude-code","target":"claude-code","connected_secs":9}]"#)
         )
         XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["codex-1"])
         XCTAssertEqual(roster.connected[1].sessions.map(\.sessionId), ["claude-1"])
@@ -703,10 +703,10 @@ final class AppRosterTests: XCTestCase {
          {"target":"claude-code","detected":true,"linked":true,"linked_transport":"stdio"},
          {"target":"codex-cli","detected":true,"linked_transport":"http"}]
         """#)
-        XCTAssertTrue(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Cursor"]))
-        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[0], grantNames: ["Claude Code"]))
-        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[1], grantNames: ["Claude Code"]))
-        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[2], grantNames: ["Codex CLI"]))
+        XCTAssertTrue(ClientStatus.hasNetworkRepresentation(list[0], grantTargets: ["cursor"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[0], grantTargets: ["claude-code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[1], grantTargets: ["claude-code"]))
+        XCTAssertFalse(ClientStatus.hasNetworkRepresentation(list[2], grantTargets: ["codex-cli"]))
     }
 }
 
@@ -785,10 +785,8 @@ final class PopoverRecentTests: XCTestCase {
         let hermes = call("Unknown", grant: "Hermes Agent")
         XCTAssertEqual(hermes.caller, "Hermes Agent")
         XCTAssertEqual(hermes.callerTarget, "hermes")
-        // A script is pictured by its language, under its own name.
         let script = call("mcp", grant: "Ditto email-manager")
         XCTAssertEqual(script.caller, "Ditto email-manager")
-        XCTAssertEqual(script.callerIconName, "Python")
         // What a known client reports still outranks its sign-in.
         XCTAssertEqual(call("Cursor", grant: "Something").callerTarget, "cursor")
         XCTAssertEqual(call("Unknown", grant: nil).caller, "Unknown client")
@@ -817,7 +815,7 @@ final class PopoverRecentTests: XCTestCase {
     func testAFailedCallSaysWhyAndWhatToDo() {
         let failed = CallFacts(ActivityEvent(
             sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
-            tool: "Notion__search", clientType: "claude-code", latencyMs: 30_000,
+            tool: "Notion__search", clientType: "ClaudeCode", target: "claude-code", latencyMs: 30_000,
             outcome: .error, reason: "upstream request timed out"
         ))
         XCTAssertEqual(failed.result, "Failed")
@@ -839,7 +837,7 @@ final class PopoverRecentTests: XCTestCase {
     func testACallIsPicturedAsTheClientTheDaemonTookItFor() {
         let call = CallFacts(ActivityEvent(
             sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
-            clientType: "unknown", clientLabel: "mcp", clientKey: "codex-cli", target: "codex-cli",
+            clientType: "Unknown", clientLabel: "mcp", clientKey: "codex-cli", target: "codex-cli",
             latencyMs: 1, outcome: .success
         ))
         XCTAssertEqual(call.callerTarget, "codex-cli")

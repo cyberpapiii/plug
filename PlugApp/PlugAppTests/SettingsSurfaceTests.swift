@@ -89,7 +89,7 @@ final class AppIconTests: XCTestCase {
         )
         XCTAssertEqual(
             AppIcons.symbol(target: "codex-cli", name: "Codex CLI"),
-            AppIcons.symbol(target: "codex", name: "Codex")
+            AppIcons.symbol(target: "codex-cli", name: "Codex")
         )
         XCTAssertEqual(AppIcons.symbol(target: "goose", name: "Goose"), "bird")
     }
@@ -101,19 +101,7 @@ final class AppIconTests: XCTestCase {
         )
     }
 
-    func testRemoteClientsAndTextAgentsAreNamedAndPictured() {
-        XCTAssertEqual(AppIcons.target(forClientType: "gemini-cli-mcp-client"), "gemini-cli")
-        XCTAssertEqual(AppIcons.target(forClientType: "Gemini"), "gemini")
-        XCTAssertEqual(AppIcons.target(forClientType: "Perplexity"), "perplexity")
-        XCTAssertEqual(AppIcons.target(forClientType: "Mistral Le Chat"), "le-chat")
-        XCTAssertEqual(AppIcons.target(forClientType: "hermes-agent"), "hermes")
-        XCTAssertEqual(AppIcons.target(forClientType: "Ditto history"), "python")
-        XCTAssertEqual(AppIcons.target(forClientType: "Ditto email-manager"), "python")
-        XCTAssertEqual(AppIcons.displayName(forTarget: "hermes"), "Hermes Agent")
-        XCTAssertEqual(AppIcons.displayName(forTarget: "poke"), "Poke")
-        XCTAssertEqual(AppIcons.target(forClientType: "Muse"), "muse")
-        XCTAssertEqual(AppIcons.target(forClientType: "muse-code"), "muse-code")
-        XCTAssertEqual(AppIcons.displayName(forTarget: "muse"), "Muse")
+    func testRemoteClientsAndTextAgentsArePictured() {
         XCTAssertEqual(AppIcons.symbol(target: "muse"), "globe")
         XCTAssertEqual(AppIcons.symbol(target: "amp"), "terminal")
         XCTAssertEqual(AppIcons.symbol(target: "openclaw"), "terminal")
@@ -134,11 +122,6 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(AppIcons.lookupKey("1password"), "1password")
     }
 
-    func testAnOpenAIConnectorIsChatGPT() {
-        XCTAssertEqual(AppIcons.target(forClientType: "openai-mcp 1.0.0"), "chatgpt")
-        XCTAssertEqual(AppIcons.target(forClientType: "codex-mcp-client"), "codex-cli")
-    }
-
     func testGoogleServersShareOneIconUnlessTheirAppIsHere() {
         XCTAssertEqual(AppIcons.appName(forServer: "workspace"), "googledrive")
         XCTAssertEqual(AppIcons.appName(forServer: "Gmail"), "googledrive")
@@ -155,29 +138,8 @@ final class AppIconTests: XCTestCase {
         XCTAssertEqual(MonogramTile.tintIndex(for: "Workspace"), MonogramTile.tintIndex(for: "workspace"))
     }
 
-    func testLiveSessionsAreMatchedToTheAppTheyBelongTo() {
-        XCTAssertEqual(AppIcons.target(forClientType: "claude_code"), "claude-code")
-        XCTAssertEqual(AppIcons.target(forClientType: "Claude Desktop"), "claude-desktop")
-        XCTAssertEqual(AppIcons.target(forClientType: "Codex CLI"), "codex-cli")
-        XCTAssertEqual(AppIcons.target(forClientType: "codex-mcp-client"), "codex-cli")
-        XCTAssertEqual(AppIcons.target(forClientType: "Devin"), "devin")
-        XCTAssertEqual(AppIcons.target(forClientType: "Cascade (Devin Desktop)"), "devin")
-        XCTAssertEqual(AppIcons.target(forClientType: "windsurf-client"), "devin")
-        XCTAssertEqual(AppIcons.displayName(forTarget: "devin"), "Devin")
-        XCTAssertEqual(AppIcons.target(forClientType: "Grok Build"), "grok-build")
-        XCTAssertEqual(AppIcons.target(forClientType: "GitHub Copilot CLI"), "copilot-cli")
-        XCTAssertEqual(AppIcons.target(forClientType: "VS Code Copilot"), "vscode")
-        XCTAssertEqual(AppIcons.displayName(forTarget: "copilot-cli"), "GitHub Copilot CLI")
-        XCTAssertEqual(AppIcons.target(forClientType: "Grok Bot"), "grok-bot")
-        XCTAssertEqual(AppIcons.displayName(forTarget: "grok-bot"), "Grok Bot")
+    func testAGrokBuildIsACommandLineTool() {
         XCTAssertEqual(AppIcons.symbol(target: "grok-build", name: "Grok Build"), "terminal")
-        XCTAssertEqual(AppIcons.target(forClientType: "cursor"), "cursor")
-        XCTAssertEqual(AppIcons.target(forClientType: "Some Agent"), "some-agent")
-        XCTAssertNil(AppIcons.displayName(forTarget: "some-agent"))
-    }
-
-    func testAnUnrecognizedClientTypeIsPassedThroughRatherThanGuessed() {
-        XCTAssertEqual(AppIcons.target(forClientType: "some_new_client"), "some-new-client")
     }
 }
 

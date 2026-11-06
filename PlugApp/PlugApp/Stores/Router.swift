@@ -62,7 +62,7 @@ final class Router {
 
     func reveal(clientID: String) {
         section = .clients
-        selectedClient = "grant:\(clientID)"
+        selectedClient = ClientEntry.id(grant: clientID)
     }
 }
 

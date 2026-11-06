@@ -41,6 +41,7 @@
 		3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 907978AE95DA344593F3BCA3 /* AppModelTests.swift */; };
 		41353FD5A02B0974ECCA4B44 /* InstallationState.swift in Sources */ = {isa = PBXBuildFile; fileRef = 64E2869334004AD1B34ADA93 /* InstallationState.swift */; };
 		439BBF5F8CD4BD5A46937D60 /* SheetFrame.swift in Sources */ = {isa = PBXBuildFile; fileRef = 00F9BAFB363C8A2D0C0D4CEA /* SheetFrame.swift */; };
+		441633AC9FBEF5CF047F04F8 /* ClientIdentity.swift in Sources */ = {isa = PBXBuildFile; fileRef = D97424501A61AF4D01984F21 /* ClientIdentity.swift */; };
 		4CCD74568EADAD432672189D /* UpdateService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 2D1B09D36EE0E0D152888537 /* UpdateService.swift */; };
 		50797473E2686B0D6C4EDDC1 /* ClientAccess.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C7A1BCB7B048048AF22C9D6 /* ClientAccess.swift */; };
 		52895501276459EDCBEB65D9 /* EventSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */; };
@@ -87,6 +88,7 @@
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
 		DA977D5A585A7F5874F62500 /* TestHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = A23AD7DAA7A354D4BD19C47A /* TestHome.swift */; };
+		DAE7A2B35F1C6F8C2F0DCE14 /* ClientIdentityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6F245936AD61787A94D7680A /* ClientIdentityTests.swift */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
 		DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */; };
 		DE0DE8E045D314CA6649390C /* CallFacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0993B719DCBE5C267E5CD50D /* CallFacts.swift */; };
@@ -160,6 +162,7 @@
 		66F5C1631CDEC940569658B5 /* DaemonServiceManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonServiceManager.swift; sourceTree = "<group>"; };
 		6904150E3E88BB44913F2231 /* AddAccountView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddAccountView.swift; sourceTree = "<group>"; };
 		6E5390A094EAB1E48AC50E51 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist; path = Info.plist; sourceTree = "<group>"; };
+		6F245936AD61787A94D7680A /* ClientIdentityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientIdentityTests.swift; sourceTree = "<group>"; };
 		6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NotificationService.swift; sourceTree = "<group>"; };
 		7064392FEB7D9C4D2C6E502B /* ImportService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ImportService.swift; sourceTree = "<group>"; };
 		722932029558C08A810E4AF7 /* PlugApp.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = PlugApp.app; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -204,6 +207,7 @@
 		D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugPaths.swift; sourceTree = "<group>"; };
 		D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugVerdictTests.swift; sourceTree = "<group>"; };
 		D8D7D69F66C0A8E7DE86521E /* AccountDraft.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AccountDraft.swift; sourceTree = "<group>"; };
+		D97424501A61AF4D01984F21 /* ClientIdentity.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientIdentity.swift; sourceTree = "<group>"; };
 		E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsSurfaceTests.swift; sourceTree = "<group>"; };
 		E2CE0F95D117A8AF3CB9F7E4 /* DaemonClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DaemonClient.swift; sourceTree = "<group>"; };
 		E5046B427725A1A125529AF2 /* ToolRow.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolRow.swift; sourceTree = "<group>"; };
@@ -259,6 +263,7 @@
 				1C50BD9ED2A357A131BFF7A6 /* AppIcons.swift */,
 				899F68D039BEDFAFF85EAC5D /* AppSection.swift */,
 				0993B719DCBE5C267E5CD50D /* CallFacts.swift */,
+				D97424501A61AF4D01984F21 /* ClientIdentity.swift */,
 				F7711E0CB2972E0B9D45D9D9 /* EventFacts.swift */,
 				8ED784B5E25355F76D511A51 /* Explain.swift */,
 				AC08658F0B6AA141C8835368 /* FirstRunGuide.swift */,
@@ -313,6 +318,7 @@
 				C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */,
 				907978AE95DA344593F3BCA3 /* AppModelTests.swift */,
 				FC27919600003A59354FBEF6 /* AuthFlowServiceTests.swift */,
+				6F245936AD61787A94D7680A /* ClientIdentityTests.swift */,
 				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
 				46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */,
@@ -679,6 +685,7 @@
 				ED5AA2C62BC373A923CBA61E /* AppInstallationInspectorTests.swift in Sources */,
 				3F4AA7F9205B184BCD780539 /* AppModelTests.swift in Sources */,
 				3A88F7B8DAA6D4AAF6FF0ED0 /* AuthFlowServiceTests.swift in Sources */,
+				DAE7A2B35F1C6F8C2F0DCE14 /* ClientIdentityTests.swift in Sources */,
 				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
 				52895501276459EDCBEB65D9 /* EventSurfaceTests.swift in Sources */,
@@ -725,6 +732,7 @@
 				32A55214AC71673E0CE1EF64 /* ClientDetail.swift in Sources */,
 				598731E8AD048ABFC056805F /* ClientEntry.swift in Sources */,
 				02F900FF2B0B846C149735B7 /* ClientFacts.swift in Sources */,
+				441633AC9FBEF5CF047F04F8 /* ClientIdentity.swift in Sources */,
 				D0772B5549DF956CF161CB01 /* ClientRepairService.swift in Sources */,
 				7F4794228FEEBCA056599581 /* ClientRows.swift in Sources */,
 				F217168291DF7F5D7D464B18 /* ClientsView.swift in Sources */,
