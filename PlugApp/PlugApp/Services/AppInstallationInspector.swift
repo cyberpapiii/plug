@@ -41,7 +41,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
         bundleURL = { Bundle.main.bundleURL }
         signatureReader = Self.readSignature
         infoReader = Self.readBundleInfo
-        embeddedVersionReader = Self.readEmbeddedVersion
+        embeddedVersionReader = { try await Self.readEmbeddedVersion(at: $0) }
     }
 
     init(
@@ -91,7 +91,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
         )
     }
 
-    private static func readSignature(at bundleURL: URL) throws -> AppSignatureEvidence {
+    static func readSignature(at bundleURL: URL) throws -> AppSignatureEvidence {
         var staticCode: SecStaticCode?
         guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode) == errSecSuccess,
               let staticCode
@@ -121,7 +121,7 @@ struct AppInstallationInspector: AppInstallationInspecting {
         )
     }
 
-    private static func readBundleInfo(at bundleURL: URL) throws -> [String: String] {
+    static func readBundleInfo(at bundleURL: URL) throws -> [String: String] {
         guard let bundle = Bundle(url: bundleURL) else {
             throw AppInstallationError.missingMetadata
         }
@@ -131,11 +131,15 @@ struct AppInstallationInspector: AppInstallationInspecting {
         ]
     }
 
-    private static func readEmbeddedVersion(at executableURL: URL) async throws -> String {
+    /// The version `plug --version` prints, its last word.
+    static func readEmbeddedVersion(
+        at executableURL: URL,
+        runner: any ProcessRunning = ProcessRunner()
+    ) async throws -> String {
         guard FileManager.default.isExecutableFile(atPath: executableURL.path) else {
             throw AppInstallationError.missingEmbeddedExecutable(executableURL)
         }
-        let result = try await ProcessRunner().run(
+        let result = try await runner.run(
             executable: executableURL,
             arguments: ["--version"],
             // Right after login the first run of a fresh binary can wait on
