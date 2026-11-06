@@ -11,7 +11,7 @@ final class LaunchdJobProbeTests: XCTestCase {
     )
 
     func testReportsUnchangedWhenTheLabelStillNamesTheSameProgram() async throws {
-        let runner = PrintingLaunchctlRunner(
+        let runner = StubProcessRunner(
             result: ProcessResult(
                 status: 0,
                 stdout: Data("program = /opt/homebrew/opt/plug/bin/plug\nstate = running\n".utf8),
@@ -22,12 +22,12 @@ final class LaunchdJobProbeTests: XCTestCase {
         let outcome = try await LaunchdJobProbe(runner: runner, userID: 501).verify(record)
 
         XCTAssertEqual(outcome, .unchanged)
-        let calls = await runner.calls
+        let calls = await runner.arguments
         XCTAssertEqual(calls, [["print", "gui/501/local.plug.legacy"]])
     }
 
     func testReportsReplacedWhenTheLabelNowNamesADifferentProgram() async throws {
-        let runner = PrintingLaunchctlRunner(
+        let runner = StubProcessRunner(
             result: ProcessResult(
                 status: 0,
                 stdout: Data("program = /usr/local/bin/something-else\nstate = running\n".utf8),
@@ -43,7 +43,7 @@ final class LaunchdJobProbeTests: XCTestCase {
     /// A job that reports no program path cannot be matched against the record
     /// that authorized removing it, so it is not removed.
     func testReportsReplacedWhenTheProgramPathCannotBeRead() async throws {
-        let runner = PrintingLaunchctlRunner(
+        let runner = StubProcessRunner(
             result: ProcessResult(status: 0, stdout: Data("state = running\n".utf8), stderr: Data())
         )
 
@@ -53,7 +53,7 @@ final class LaunchdJobProbeTests: XCTestCase {
     }
 
     func testReportsVanishedWhenTheJobIsAlreadyGone() async throws {
-        let runner = PrintingLaunchctlRunner(
+        let runner = StubProcessRunner(
             result: ProcessResult(
                 status: 113,
                 stdout: Data(),
@@ -67,7 +67,7 @@ final class LaunchdJobProbeTests: XCTestCase {
     }
 
     func testRejectsARecordWithNoProgramEvidence() async {
-        let runner = PrintingLaunchctlRunner(
+        let runner = StubProcessRunner(
             result: ProcessResult(status: 0, stdout: Data(), stderr: Data())
         )
         let unproven = LaunchdJobRecord(
@@ -83,21 +83,7 @@ final class LaunchdJobProbeTests: XCTestCase {
         } catch {
             XCTAssertEqual(error as? DaemonServiceError, .invalidJobEvidence)
         }
-        let calls = await runner.calls
+        let calls = await runner.arguments
         XCTAssertTrue(calls.isEmpty)
-    }
-}
-
-private actor PrintingLaunchctlRunner: ProcessRunning {
-    private(set) var calls: [[String]] = []
-    private let result: ProcessResult
-
-    init(result: ProcessResult) {
-        self.result = result
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        calls.append(arguments)
-        return result
     }
 }

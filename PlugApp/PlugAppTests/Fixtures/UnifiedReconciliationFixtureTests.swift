@@ -901,7 +901,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         self.socketURL = socketURL.standardizedFileURL
         self.executableURL = executableURL.standardizedFileURL
         self.daemonVersion = daemonVersion
-        let listener = try Self.makeListener(path: socketURL.path)
+        let listener = try TestSocket.listen(at: socketURL.path, backlog: 4)
         self.listener = listener
         socketOwned = true
 
@@ -1296,9 +1296,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             }
         }
 
-        while let payload = Self.readFrame(connection),
-              let object = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
-              let type = object["type"] as? String {
+        while let object = TestSocket.readRequest(connection), let type = object["type"] as? String {
             lock.lock()
             let method = object["method"] as? String
             requestStorage.append(method.map { "\(type):\($0)" } ?? type)
@@ -1306,7 +1304,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             switch type {
             case "OperatorHandshake":
                 guard let executableURL, let daemonVersion else { break }
-                Self.sendJSON([
+                TestSocket.writeJSON([
                     "type": "OperatorHandshake",
                     "handshake": [
                         "daemon_version": daemonVersion,
@@ -1325,7 +1323,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 sessionStorage.append(session)
                 let clientID = object["client_id"] as? String ?? "fixture-client"
                 lock.unlock()
-                Self.sendJSON([
+                TestSocket.writeJSON([
                     "type": "Registered",
                     "protocol_version": object["protocol_version"] as? Int ?? 3,
                     "client_id": clientID,
@@ -1334,103 +1332,28 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                     "cancellation_capability": "fixture-cancellation",
                 ], to: connection)
             case "Capabilities":
-                Self.sendJSON(["type": "Capabilities", "capabilities": [:]], to: connection)
+                TestSocket.writeJSON(["type": "Capabilities", "capabilities": [:]], to: connection)
             case "UpdateSession", "UpdateCapabilities", "RestoreResourceSubscriptions":
                 if type == "UpdateCapabilities" && generation > 1 {
                     lock.lock()
                     replayStorage += 1
                     lock.unlock()
                 }
-                Self.sendJSON(["type": "Ok"], to: connection)
+                TestSocket.writeJSON(["type": "Ok"], to: connection)
             case "Ping":
-                Self.sendJSON(["type": "Pong"], to: connection)
+                TestSocket.writeJSON(["type": "Pong"], to: connection)
             case "ModernDownstreamGate":
-                Self.sendJSON(["type": "ModernDownstreamGate", "enabled": false], to: connection)
+                TestSocket.writeJSON(["type": "ModernDownstreamGate", "enabled": false], to: connection)
             case "McpRequest", "McpRequestWithContext":
                 let method = object["method"] as? String ?? ""
                 switch method {
                 case "tools/list":
-                    Self.sendJSON(["type": "McpResponse", "payload": ["tools": []]], to: connection)
+                    TestSocket.writeJSON(["type": "McpResponse", "payload": ["tools": []]], to: connection)
                 default:
-                    Self.sendJSON(["type": "McpResponse", "payload": [:]], to: connection)
+                    TestSocket.writeJSON(["type": "McpResponse", "payload": [:]], to: connection)
                 }
             default:
-                Self.sendJSON(["type": "Ok"], to: connection)
-            }
-        }
-    }
-
-    private static func makeListener(path: String) throws -> Int32 {
-        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw FixtureConnectorError.socket(errno) }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8CString)
-        guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
-            Darwin.close(descriptor)
-            throw FixtureConnectorError.socketPathTooLong
-        }
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
-        }
-        let offset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
-        let length = socklen_t(offset + bytes.count)
-        let result = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(descriptor, $0, length)
-            }
-        }
-        guard result == 0, Darwin.listen(descriptor, 4) == 0 else {
-            let code = errno
-            Darwin.close(descriptor)
-            throw FixtureConnectorError.socket(code)
-        }
-        return descriptor
-    }
-
-    private static func readFrame(_ descriptor: Int32) -> Data? {
-        guard let header = readExactly(4, from: descriptor) else { return nil }
-        let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-        guard length <= UInt32(FrameCodec.maximumPayloadSize) else { return nil }
-        return readExactly(Int(length), from: descriptor)
-    }
-
-    private static func readExactly(_ count: Int, from descriptor: Int32) -> Data? {
-        var result = Data()
-        result.reserveCapacity(count)
-        while result.count < count {
-            var buffer = [UInt8](repeating: 0, count: count - result.count)
-            let readCount = buffer.withUnsafeMutableBytes { bytes in
-                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
-            }
-            if readCount == 0 { return nil }
-            if readCount < 0 {
-                if errno == EINTR { continue }
-                return nil
-            }
-            result.append(buffer, count: readCount)
-        }
-        return result
-    }
-
-    private static func sendJSON(_ object: [String: Any], to descriptor: Int32) {
-        guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
-        var length = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
-        frame.append(payload)
-        frame.withUnsafeBytes { bytes in
-            var offset = 0
-            while offset < bytes.count {
-                let written = Darwin.write(
-                    descriptor,
-                    bytes.baseAddress!.advanced(by: offset),
-                    bytes.count - offset
-                )
-                if written <= 0 {
-                    if errno == EINTR { continue }
-                    break
-                }
-                offset += written
+                TestSocket.writeJSON(["type": "Ok"], to: connection)
             }
         }
     }
@@ -1469,8 +1392,6 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
 private enum FixtureConnectorError: Error {
     case processDidNotInitialize(String)
     case processDidNotListTools(String)
-    case socket(Int32)
-    case socketPathTooLong
 }
 
 @MainActor

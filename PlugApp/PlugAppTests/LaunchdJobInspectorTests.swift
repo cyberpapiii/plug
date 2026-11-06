@@ -155,7 +155,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testBroadEnumerationFindsPlugProgramBehindUnrelatedLabel() async throws {
-        let runner = RecordingLaunchctlRunner()
+        let runner = launchctlPrintingOneOwner()
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
 
         let state = try await inspector.daemonJobs(
@@ -170,8 +170,8 @@ final class LaunchdJobInspectorTests: XCTestCase {
             parentVersion: nil
         )
         XCTAssertEqual(state, .recognizedLegacy([legacy]))
-        let printedLabels = await runner.printedLabels
-        XCTAssertEqual(printedLabels, ["unexpected.owner"])
+        let printed = await runner.arguments.filter { $0 != ["list"] }
+        XCTAssertEqual(printed, [["print", "gui/501/unexpected.owner"]])
     }
 
     func testAppleNamespaceLabelsAreNotInspected() {
@@ -190,7 +190,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testLiveSMAppServiceShapeResolvesBundleRelativeDaemon() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: canonical.buildVersion,
             arguments: ["Contents/Resources/plug", "serve", "--daemon"]
@@ -211,7 +211,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testLiveSMAppServiceShapeWithOlderBundleVersionIsRecognizedAsStale() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: "19",
             arguments: ["Contents/Resources/plug", "serve", "--daemon"]
@@ -232,7 +232,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testLiveSMAppServiceShapeWithMismatchedBundleIdentifierRemainsUnknown() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: "com.example.other",
             parentBundleVersion: canonical.buildVersion,
             arguments: ["Contents/Resources/plug", "serve", "--daemon"]
@@ -245,7 +245,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testLiveSMAppServiceShapeWithMismatchedArgumentsRemainsUnknown() async throws {
-        let runner = SMAppServiceLaunchctlRunner(
+        let runner = launchctlWithAppServiceJob(
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
             parentBundleVersion: canonical.buildVersion,
             arguments: ["Contents/Resources/plug", "serve"]
@@ -259,7 +259,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testLaunchctlListFailureIsPropagatedInsteadOfReportingUnmanaged() async {
         let inspector = LaunchdJobInspector(
-            runner: FailingLaunchctlRunner(failure: .list),
+            runner: launchctlFailing(list: true),
             userID: 501
         )
 
@@ -275,7 +275,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testAnyLaunchctlPrintFailureIsPropagatedInsteadOfDroppingTheJob() async {
         let inspector = LaunchdJobInspector(
-            runner: FailingLaunchctlRunner(failure: .print),
+            runner: launchctlFailing(list: false),
             userID: 501
         )
 
@@ -294,7 +294,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testSlowLaunchctlPrintForUnrelatedJobIsIgnored() async throws {
         let inspector = LaunchdJobInspector(
-            runner: TimingOutLaunchctlRunner(slowLabel: "com.example.other"),
+            runner: launchctlTimingOut(on: "com.example.other"),
             userID: 501
         )
 
@@ -308,7 +308,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
 
     func testSlowLaunchctlPrintForPlugDaemonIsPropagated() async {
         let inspector = LaunchdJobInspector(
-            runner: TimingOutLaunchctlRunner(slowLabel: "com.plug.daemon"),
+            runner: launchctlTimingOut(on: "com.plug.daemon"),
             userID: 501
         )
 
@@ -322,7 +322,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     }
 
     func testVanishedUnrelatedLaunchdJobIsIgnored() async throws {
-        let runner = VanishedUnrelatedLaunchctlRunner()
+        let runner = launchctl(listing: "123\t0\tcom.apple.transient\n") { _ in .notFound }
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
 
         let state = try await inspector.daemonJobs(
@@ -336,7 +336,7 @@ final class LaunchdJobInspectorTests: XCTestCase {
     func testLaunchdProgramSymlinkResolvesToRecognizedLegacyBinary() async throws {
         let fixture = try LaunchdSymlinkFixture()
         defer { fixture.cleanup() }
-        let runner = SymlinkLaunchctlRunner(programURL: fixture.shellLink)
+        let runner = launchctlRunning( fixture.shellLink)
         let inspector = LaunchdJobInspector(runner: runner, userID: 501)
 
         let state = try await inspector.daemonJobs(
@@ -407,115 +407,54 @@ private struct LegacyPlugProgramFixture: Decodable {
     }
 }
 
-private actor TimingOutLaunchctlRunner: ProcessRunning {
-    private let slowLabel: String
-
-    init(slowLabel: String) {
-        self.slowLabel = slowLabel
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\t\(slowLabel)\n124\t0\tcom.example.fast\n".utf8),
-                stderr: Data()
-            )
-        }
-        if arguments.last?.hasSuffix(slowLabel) == true {
-            throw ProcessRunnerError.timedOut
-        }
-        return ProcessResult(
-            status: 113,
-            stdout: Data(),
-            stderr: Data("Could not find service".utf8)
-        )
+/// `launchctl list` names `labels`; each `print` gets `print`'s answer for
+/// the label it asks about.
+private func launchctl(
+    listing labels: String,
+    print: @escaping @Sendable (_ label: String) throws -> ProcessResult
+) -> StubProcessRunner {
+    StubProcessRunner { _, arguments in
+        if arguments == ["list"] { return .exited(stdout: "PID\tStatus\tLabel\n" + labels) }
+        return try print(arguments.last?.split(separator: "/").last.map(String.init) ?? "")
     }
 }
 
-private actor VanishedUnrelatedLaunchctlRunner: ProcessRunning {
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\tcom.apple.transient\n".utf8),
-                stderr: Data()
-            )
-        }
-        return ProcessResult(
-            status: 113,
-            stdout: Data(),
-            stderr: Data("Could not find service".utf8)
-        )
+private extension ProcessResult {
+    static let notFound = ProcessResult.exited(113, stderr: "Could not find service")
+}
+
+private func launchctlTimingOut(on slowLabel: String) -> StubProcessRunner {
+    launchctl(listing: "123\t0\t\(slowLabel)\n124\t0\tcom.example.fast\n") { label in
+        if label == slowLabel { throw ProcessRunnerError.timedOut }
+        return .notFound
     }
 }
 
-private actor FailingLaunchctlRunner: ProcessRunning {
-    enum Failure: Equatable, Sendable {
-        case list
-        case print
-    }
-
-    let failure: Failure
-
-    init(failure: Failure) {
-        self.failure = failure
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+private func launchctlFailing(list: Bool) -> StubProcessRunner {
+    StubProcessRunner { _, arguments in
         if arguments == ["list"] {
-            if failure == .list {
-                return ProcessResult(status: 113, stdout: Data(), stderr: Data("list unavailable".utf8))
-            }
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n".utf8),
-                stderr: Data()
-            )
+            return list
+                ? .exited(113, stderr: "list unavailable")
+                : .exited(stdout: "PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n")
         }
-        return ProcessResult(status: 113, stdout: Data(), stderr: Data("print unavailable".utf8))
+        return .exited(113, stderr: "print unavailable")
     }
 }
 
-private actor SymlinkLaunchctlRunner: ProcessRunning {
-    let programURL: URL
-
-    init(programURL: URL) {
-        self.programURL = programURL
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            return ProcessResult(
-                status: 0,
-                stdout: Data("PID\tStatus\tLabel\n123\t0\tlocal.claude-rc.plug\n".utf8),
-                stderr: Data()
-            )
-        }
-        let output = "program = \(programURL.path)\nstate = running\n"
-        return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
+private func launchctlRunning(_ programURL: URL) -> StubProcessRunner {
+    launchctl(listing: "123\t0\tlocal.claude-rc.plug\n") { _ in
+        .exited(stdout: "program = \(programURL.path)\nstate = running\n")
     }
 }
 
-private actor SMAppServiceLaunchctlRunner: ProcessRunning {
-    let parentBundleIdentifier: String
-    let parentBundleVersion: String
-    let arguments: [String]
-
-    init(parentBundleIdentifier: String, parentBundleVersion: String, arguments: [String]) {
-        self.parentBundleIdentifier = parentBundleIdentifier
-        self.parentBundleVersion = parentBundleVersion
-        self.arguments = arguments
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            let output = "PID\tStatus\tLabel\n123\t0\tcom.plug.daemon\n"
-            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
-        }
-
-        let argumentLines = self.arguments.map { "    \($0)" }.joined(separator: "\n")
-        let output = """
+private func launchctlWithAppServiceJob(
+    parentBundleIdentifier: String,
+    parentBundleVersion: String,
+    arguments: [String]
+) -> StubProcessRunner {
+    let argumentLines = arguments.map { "    \($0)" }.joined(separator: "\n")
+    return launchctl(listing: "123\t0\tcom.plug.daemon\n") { _ in
+        .exited(stdout: """
         program identifier = Contents/Resources/plug (mode: 2)
         parent bundle identifier = \(parentBundleIdentifier)
         parent bundle version = \(parentBundleVersion)
@@ -523,8 +462,16 @@ private actor SMAppServiceLaunchctlRunner: ProcessRunning {
         \(argumentLines)
         }
         state = running
-        """
-        return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
+        """)
+    }
+}
+
+/// An unrelated label whose program is a recognized Plug, beside one in
+/// Apple's namespace.
+private func launchctlPrintingOneOwner() -> StubProcessRunner {
+    launchctl(listing: "-\t0\tcom.apple.unrelated\n123\t0\tunexpected.owner\n") { label in
+        guard label == "unexpected.owner" else { return .exited(stdout: "state = running\n") }
+        return .exited(stdout: "program = /Users/me/.local/bin/plug\nstate = running\n")
     }
 }
 
@@ -555,27 +502,5 @@ private final class LaunchdSymlinkFixture: @unchecked Sendable {
 
     func cleanup() {
         try? FileManager.default.removeItem(at: root)
-    }
-}
-
-private actor RecordingLaunchctlRunner: ProcessRunning {
-    private(set) var printedLabels: [String] = []
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        if arguments == ["list"] {
-            let output = "PID\tStatus\tLabel\n-\t0\tcom.apple.unrelated\n123\t0\tunexpected.owner\n"
-            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
-        }
-
-        let label = arguments.last?.split(separator: "/").last.map(String.init) ?? ""
-        printedLabels.append(label)
-        if label == "unexpected.owner" {
-            let output = """
-            program = /Users/me/.local/bin/plug
-            state = running
-            """
-            return ProcessResult(status: 0, stdout: Data(output.utf8), stderr: Data())
-        }
-        return ProcessResult(status: 0, stdout: Data("state = running\n".utf8), stderr: Data())
     }
 }

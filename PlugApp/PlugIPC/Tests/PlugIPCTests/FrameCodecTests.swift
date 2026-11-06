@@ -352,30 +352,14 @@ final class FrameCodecTests: XCTestCase {
 private struct IPCRequestMirror: Decodable { let type: String }
 
 private final class AcceptWithoutReplyServer: @unchecked Sendable {
-    let socketURL: URL
+    let socketURL = TestSocket.uniquePath("plug-stale-ipc")
     private let listener: Int32
     private let release = DispatchSemaphore(value: 0)
     private let finished = DispatchSemaphore(value: 0)
 
     init() throws {
-        socketURL = URL(fileURLWithPath: "/tmp")
-            .appending(path: "plug-stale-ipc-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(socketURL.path)
+        listener = try TestSocket.listen(at: socketURL.path)
         let listenerFD = listener
-        var (address, addressLength) = try PlugIPCClient.unixSocketAddress(path: socketURL.path)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listenerFD, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listenerFD, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
-
         let release = release
         let finished = finished
         DispatchQueue.global(qos: .userInitiated).async {
@@ -397,30 +381,15 @@ private final class AcceptWithoutReplyServer: @unchecked Sendable {
 }
 
 private final class AcceptedNeverReadServer: @unchecked Sendable {
-    let socketURL: URL
+    let socketURL = TestSocket.uniquePath("plug-blocked-write")
     private let listener: Int32
     private let accepted = DispatchSemaphore(value: 0)
     private let release = DispatchSemaphore(value: 0)
     private let finished = DispatchSemaphore(value: 0)
 
     init() throws {
-        socketURL = URL(fileURLWithPath: "/tmp")
-            .appending(path: "plug-blocked-write-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(socketURL.path)
+        listener = try TestSocket.listen(at: socketURL.path)
         let listenerFD = listener
-        var (address, addressLength) = try PlugIPCClient.unixSocketAddress(path: socketURL.path)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listenerFD, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listenerFD, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
 
         // Establish a first connection so readiness is signaled only after accept
         // succeeds. The second connection is the request socket that never reads.

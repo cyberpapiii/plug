@@ -53,7 +53,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testRemovesFormulaOnlyThroughTrustedBrewCommand() async throws {
-        let runner = RecordingProcessRunner { executable, arguments in
+        let runner = StubProcessRunner { executable, arguments in
             if arguments.first == "list" {
                 return ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
             }
@@ -70,7 +70,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testFailedBrewUninstallPreservesLegacyFiles() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
+        let runner = StubProcessRunner { _, arguments in
             if arguments.first == "list" {
                 return ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
             }
@@ -92,7 +92,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     /// Without a keg under brew's prefix there is no formula, so brew is not
     /// run at all. Each call costs about a second, more at login.
     func testBrewIsNotAskedWhenNoFormulaKegExists() async throws {
-        let runner = RecordingProcessRunner { _, _ in
+        let runner = StubProcessRunner { _, _ in
             ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
         }
         let fixture = try Fixture(runner: runner)
@@ -107,7 +107,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
 
     /// A keg reached through `opt/plug` alone still sends the question to brew.
     func testOptLinkAloneStillAsksBrew() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
+        let runner = StubProcessRunner { _, arguments in
             ProcessResult(
                 status: 0,
                 stdout: Data(arguments.first == "list" ? "plug 0.6.4\n".utf8 : "".utf8),
@@ -130,7 +130,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testFormulaMustBeRemovedBeforeShellLinkRepair() async throws {
-        let runner = RecordingProcessRunner { _, arguments in
+        let runner = StubProcessRunner { _, arguments in
             if arguments.first == "list" {
                 return ProcessResult(status: 0, stdout: Data("plug 0.6.4\n".utf8), stderr: Data())
             }
@@ -148,7 +148,7 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 
     func testUnprovenCargoBinaryIsNeverExecutedOrDeleted() async throws {
-        let runner = RecordingProcessRunner { _, _ in
+        let runner = StubProcessRunner { _, _ in
             ProcessResult(status: 0, stdout: Data("plug 0.7.0\n".utf8), stderr: Data())
         }
         let fixture = try Fixture(runner: runner)
@@ -266,25 +266,6 @@ final class LegacyInstallMigratorTests: XCTestCase {
     }
 }
 
-private actor RecordingProcessRunner: ProcessRunning {
-    struct Call: Sendable {
-        let executable: URL
-        let arguments: [String]
-    }
-
-    private(set) var calls: [Call] = []
-    private let handler: @Sendable (URL, [String]) -> ProcessResult
-
-    init(handler: @escaping @Sendable (URL, [String]) -> ProcessResult) {
-        self.handler = handler
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        calls.append(Call(executable: executable, arguments: arguments))
-        return handler(executable, arguments)
-    }
-}
-
 private final class Fixture {
     let root: URL
     let home: URL
@@ -303,7 +284,7 @@ private final class Fixture {
     }
 
     init(
-        runner: any ProcessRunning = RecordingProcessRunner { _, _ in
+        runner: any ProcessRunning = StubProcessRunner { _, _ in
             ProcessResult(status: 1, stdout: Data(), stderr: Data())
         },
         identityReader: @escaping @Sendable (URL) -> LegacyBinaryIdentity? = { _ in nil },
