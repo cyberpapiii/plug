@@ -21,3 +21,30 @@ pub fn mock_server(tools: &str) -> ServerConfig {
         ..Default::default()
     }
 }
+
+/// SSE events from a response body, until the stream ends, `max_events`
+/// arrive, or two seconds pass.
+pub async fn collect_sse_events(body: axum::body::Body, max_events: usize) -> Vec<String> {
+    use futures::StreamExt;
+
+    let mut events = Vec::new();
+    let mut stream = body.into_data_stream();
+
+    let timeout = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while let Some(Ok(chunk)) = stream.next().await {
+            let text = String::from_utf8_lossy(&chunk).to_string();
+            for part in text.split("\n\n") {
+                let trimmed = part.trim();
+                if !trimmed.is_empty() {
+                    events.push(trimmed.to_string());
+                }
+            }
+            if events.len() >= max_events {
+                break;
+            }
+        }
+    });
+
+    let _ = timeout.await;
+    events
+}

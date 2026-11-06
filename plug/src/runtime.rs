@@ -802,36 +802,35 @@ fn build_configured_http_runtime(
         events.spawn(engine.cancel_token().clone());
     }
 
-    let http_state = Arc::new(plug_core::http::server::HttpState {
-        router: tool_router.clone(),
-        sessions: Arc::clone(&sessions),
-        cancel: engine.cancel_token().clone(),
-        auth_mode: config.http.auth_mode.clone(),
-        downstream_oauth: downstream_oauth.clone(),
-        slack_events,
-        watch_events,
-        sse_channel_capacity: config.http.sse_channel_capacity,
-        allowed_origins: config
-            .http
-            .allowed_origins
-            .iter()
-            .cloned()
-            .map(Arc::<str>::from)
-            .chain(
-                config
-                    .http
-                    .public_base_url
-                    .as_deref()
-                    .and_then(public_host_allowance),
-            )
-            .collect(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let http_state = Arc::new(
+        plug_core::http::server::HttpState::new(
+            tool_router.clone(),
+            Arc::clone(&sessions),
+            engine.cancel_token().clone(),
+        )
+        .with_auth_mode(config.http.auth_mode.clone())
+        .with_auth_token(auth_token)
+        .with_downstream_oauth(downstream_oauth.clone())
+        .with_slack_events(slack_events)
+        .with_watch_events(watch_events)
+        .with_sse_channel_capacity(config.http.sse_channel_capacity)
+        .with_allowed_origins(
+            config
+                .http
+                .allowed_origins
+                .iter()
+                .cloned()
+                .map(Arc::<str>::from)
+                .chain(
+                    config
+                        .http
+                        .public_base_url
+                        .as_deref()
+                        .and_then(public_host_allowance),
+                )
+                .collect(),
+        ),
+    );
 
     let http_state_for_expiry = Arc::clone(&http_state);
     tokio::spawn(async move {
@@ -1849,7 +1848,7 @@ mod tests {
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
     use std::path::PathBuf;
     use std::sync::Arc;
-    use std::sync::atomic::AtomicBool;
+
     use std::time::Duration;
 
     use axum::body::{Body, to_bytes};
@@ -2418,23 +2417,11 @@ mod tests {
         let sessions: Arc<dyn plug_core::session::SessionStore> =
             Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
         sessions.spawn_cleanup_task(engine.cancel_token().clone());
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
+        let state = Arc::new(plug_core::http::server::HttpState::new(
+            engine.tool_router().clone(),
             sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+            engine.cancel_token().clone(),
+        ));
         let router = build_runtime_router(
             state,
             Arc::from("test-operator-token"),
@@ -2931,23 +2918,11 @@ mod tests {
         engine.start().await.expect("engine start");
         let sessions: Arc<dyn plug_core::session::SessionStore> =
             Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
+        let state = Arc::new(plug_core::http::server::HttpState::new(
+            engine.tool_router().clone(),
             sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+            engine.cancel_token().clone(),
+        ));
 
         let app = build_runtime_router(
             state,
@@ -2981,23 +2956,11 @@ mod tests {
             .set_client_type(&session_id, plug_core::types::ClientType::ClaudeDesktop)
             .expect("set client type");
         let sessions: Arc<dyn plug_core::session::SessionStore> = Arc::new(store);
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
+        let state = Arc::new(plug_core::http::server::HttpState::new(
+            engine.tool_router().clone(),
             sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+            engine.cancel_token().clone(),
+        ));
 
         let app = build_runtime_router(
             state,
@@ -3048,23 +3011,15 @@ mod tests {
             state_path.clone(),
         )
         .expect("OAuth manager");
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
-            sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(manager),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+        let state = Arc::new(
+            plug_core::http::server::HttpState::new(
+                engine.tool_router().clone(),
+                sessions,
+                engine.cancel_token().clone(),
+            )
+            .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(manager)),
+        );
         (
             build_runtime_router(state, Arc::from("operator-secret"), authority),
             state_path,
@@ -3431,23 +3386,15 @@ mod tests {
         engine.start().await.expect("engine start");
         let sessions: Arc<dyn plug_core::session::SessionStore> =
             Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
-            sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(manager.clone()),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+        let state = Arc::new(
+            plug_core::http::server::HttpState::new(
+                engine.tool_router().clone(),
+                sessions,
+                engine.cancel_token().clone(),
+            )
+            .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(manager.clone())),
+        );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind operator listener");
@@ -3709,23 +3656,15 @@ mod tests {
 
         let sessions: Arc<dyn plug_core::session::SessionStore> =
             Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        let http_state = Arc::new(plug_core::http::server::HttpState {
-            router: tool_router.clone(),
-            sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(manager),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+        let http_state = Arc::new(
+            plug_core::http::server::HttpState::new(
+                tool_router.clone(),
+                sessions,
+                engine.cancel_token().clone(),
+            )
+            .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(manager)),
+        );
         let app = build_runtime_router(
             http_state,
             Arc::from("operator-secret"),
@@ -3761,23 +3700,11 @@ mod tests {
 
         let sessions: Arc<dyn plug_core::session::SessionStore> =
             Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100));
-        let http_state = Arc::new(plug_core::http::server::HttpState {
-            router: tool_router.clone(),
+        let http_state = Arc::new(plug_core::http::server::HttpState::new(
+            tool_router.clone(),
             sessions,
-            cancel: engine.cancel_token().clone(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+            engine.cancel_token().clone(),
+        ));
 
         let session_id = "expiring-session";
         let owner = plug_core::proxy::ToolRouter::task_owner_for_http_session(session_id);

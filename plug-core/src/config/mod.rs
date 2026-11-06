@@ -443,6 +443,8 @@ pub struct HttpConfig {
     pub sse_channel_capacity: usize,
 }
 
+pub const DEFAULT_SSE_CHANNEL_CAPACITY: usize = 32;
+
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
@@ -458,7 +460,7 @@ impl Default for HttpConfig {
             tls_key_path: None,
             session_timeout_secs: 1800,
             max_sessions: 100,
-            sse_channel_capacity: 32,
+            sse_channel_capacity: DEFAULT_SSE_CHANNEL_CAPACITY,
         }
     }
 }

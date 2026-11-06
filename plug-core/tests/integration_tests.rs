@@ -32,7 +32,7 @@ use plug_core::oauth;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::session::SessionStore;
-use plug_core::test_helpers::mock_server;
+use plug_core::test_helpers::{collect_sse_events, mock_server};
 use plug_core::types::ClientType;
 use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
@@ -1482,30 +1482,6 @@ async fn reserve_unused_local_port() -> u16 {
     listener.local_addr().expect("ephemeral local addr").port()
 }
 
-async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
-    let mut events = Vec::new();
-    let mut stream = body.into_data_stream();
-    use futures::StreamExt;
-
-    let timeout = tokio::time::timeout(Duration::from_secs(2), async {
-        while let Some(Ok(chunk)) = stream.next().await {
-            let text = String::from_utf8_lossy(&chunk).to_string();
-            for part in text.split("\n\n") {
-                let trimmed = part.trim();
-                if !trimmed.is_empty() {
-                    events.push(trimmed.to_string());
-                }
-            }
-            if events.len() >= max_events {
-                break;
-            }
-        }
-    });
-
-    let _ = timeout.await;
-    events
-}
-
 // ---------------------------------------------------------------------------
 // ProxyHandler: list_tools with no upstream servers
 // ---------------------------------------------------------------------------
@@ -2528,24 +2504,11 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let state = Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-        downstream_oauth: None,
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let state = Arc::new(HttpState::new(
+        engine.tool_router().clone(),
+        Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100)) as Arc<dyn SessionStore>,
+        CancellationToken::new(),
+    ));
     let app = build_router(state.clone());
 
     let initialize_body = serde_json::json!({
@@ -3058,24 +3021,11 @@ async fn test_http_structured_content_passes_through_end_to_end() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let state = Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-        downstream_oauth: None,
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let state = Arc::new(HttpState::new(
+        engine.tool_router().clone(),
+        Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100)) as Arc<dyn SessionStore>,
+        CancellationToken::new(),
+    ));
     let app = build_router(state.clone());
 
     let initialize_body = serde_json::json!({
@@ -3146,24 +3096,11 @@ async fn test_http_resource_link_passes_through_end_to_end() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let state = Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-        downstream_oauth: None,
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let state = Arc::new(HttpState::new(
+        engine.tool_router().clone(),
+        Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100)) as Arc<dyn SessionStore>,
+        CancellationToken::new(),
+    ));
     let app = build_router(state.clone());
 
     let initialize_body = serde_json::json!({
@@ -3235,24 +3172,11 @@ async fn test_http_oversized_tool_result_spills_to_artifact_link() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let state = Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-        downstream_oauth: None,
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let state = Arc::new(HttpState::new(
+        engine.tool_router().clone(),
+        Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100)) as Arc<dyn SessionStore>,
+        CancellationToken::new(),
+    ));
     let app = build_router(state.clone());
 
     let initialize_body = serde_json::json!({
@@ -4445,24 +4369,16 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     )
     .expect("isolated OAuth manager");
     let approval_manager = manager.clone();
-    let app = build_router(Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Oauth,
-        downstream_oauth: Some(manager),
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    }));
+    let app = build_router(Arc::new(
+        HttpState::new(
+            engine.tool_router().clone(),
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+                as Arc<dyn SessionStore>,
+            CancellationToken::new(),
+        )
+        .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
+        .with_downstream_oauth(Some(manager)),
+    ));
 
     let unauth_req = HttpRequest::builder()
         .method("GET")
@@ -4817,24 +4733,11 @@ async fn test_http_elicitation_reverse_request_round_trip() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let state = Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-        downstream_oauth: None,
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let state = Arc::new(HttpState::new(
+        engine.tool_router().clone(),
+        Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100)) as Arc<dyn SessionStore>,
+        CancellationToken::new(),
+    ));
     let app = build_router(state.clone());
 
     // 1. Initialize with elicitation + sampling capabilities
@@ -5004,24 +4907,11 @@ async fn test_http_sampling_reverse_request_round_trip() {
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
 
-    let state = Arc::new(HttpState {
-        router: engine.tool_router().clone(),
-        sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-            as Arc<dyn SessionStore>,
-        cancel: CancellationToken::new(),
-        auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-        downstream_oauth: None,
-        slack_events: None,
-        watch_events: None,
-        sse_channel_capacity: 32,
-        allowed_origins: Vec::new(),
-        notification_task_started: std::sync::atomic::AtomicBool::new(false),
-        auth_token: None,
-        roots_capable_sessions: dashmap::DashMap::new(),
-        pending_client_requests: dashmap::DashMap::new(),
-        reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-        client_capabilities: dashmap::DashMap::new(),
-    });
+    let state = Arc::new(HttpState::new(
+        engine.tool_router().clone(),
+        Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100)) as Arc<dyn SessionStore>,
+        CancellationToken::new(),
+    ));
     let app = build_router(state.clone());
 
     // 1. Initialize with sampling capability

@@ -3020,12 +3020,27 @@ mod tests {
         let config = plug_core::config::load_config(Some(&config_path)).unwrap();
         let engine = Arc::new(Engine::new(config));
         let (client_registry, _count_rx) = ClientRegistry::new();
+        test_connection_context(
+            &engine,
+            CancellationToken::new(),
+            client_registry,
+            config_path,
+        )
+    }
+
+    /// A connection that has not registered yet, holding the token `test-token`.
+    fn test_connection_context(
+        engine: &Arc<Engine>,
+        cancel: CancellationToken,
+        client_registry: ClientRegistry,
+        config_path: impl Into<std::path::PathBuf>,
+    ) -> ConnectionContext {
         ConnectionContext {
-            cancel: CancellationToken::new(),
+            cancel,
             auth_token: Arc::from("test-token"),
             server_manager: Arc::clone(engine.server_manager()),
-            engine,
-            config_path,
+            engine: Arc::clone(engine),
+            config_path: config_path.into(),
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
             http_sessions: None,
@@ -3814,19 +3829,12 @@ mod tests {
 
             // Server side: accept exactly one connection and run the real handler.
             let (client_registry, _count_rx) = ClientRegistry::new();
-            let ctx = ConnectionContext {
-                cancel: cancel.clone(),
-                auth_token: Arc::from("test-token"),
-                server_manager: Arc::clone(engine.server_manager()),
-                engine: Arc::clone(&engine),
-                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
-                started_at: Instant::now(),
-                client_registry: Arc::new(client_registry),
-                http_sessions: None,
-                downstream_oauth: None,
-                session_id: None,
-                reverse_request_rx: None,
-            };
+            let ctx = test_connection_context(
+                &engine,
+                cancel.clone(),
+                client_registry,
+                "/tmp/plug-ipc-test-config.toml",
+            );
             let server_task = tokio::spawn(async move {
                 if let Ok((stream, _addr)) = listener.accept().await {
                     let _ = handle_ipc_connection(stream, ctx).await;
@@ -4069,19 +4077,14 @@ mod tests {
         // directly on the initial context, bypassing a real `Register` call
         // (whose handler would create its own channel and discard ours).
         let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
-        let ctx = ConnectionContext {
-            cancel: cancel.clone(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine: Arc::clone(&engine),
-            config_path: std::path::PathBuf::from("/tmp/plug-ipc-idle-reverse-config.toml"),
-            started_at: Instant::now(),
-            client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
-            session_id: Some(session_id.clone()),
-            reverse_request_rx: Some(reverse_rx),
-        };
+        let mut ctx = test_connection_context(
+            &engine,
+            cancel.clone(),
+            client_registry,
+            "/tmp/plug-ipc-idle-reverse-config.toml",
+        );
+        ctx.session_id = Some(session_id.clone());
+        ctx.reverse_request_rx = Some(reverse_rx);
 
         let server_task = tokio::spawn(async move {
             if let Ok((stream, _addr)) = listener.accept().await {
@@ -4225,19 +4228,13 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
         let (client_registry, _count_rx) = ClientRegistry::new();
-        let ctx = ConnectionContext {
-            cancel: cancel.clone(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine: Arc::clone(&engine),
-            config_path: std::path::PathBuf::from("/tmp/plug-ipc-gate-push-config.toml"),
-            started_at: Instant::now(),
-            client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
-            session_id: Some("gate-push-session".to_string()),
-            reverse_request_rx: None,
-        };
+        let mut ctx = test_connection_context(
+            &engine,
+            cancel.clone(),
+            client_registry,
+            "/tmp/plug-ipc-gate-push-config.toml",
+        );
+        ctx.session_id = Some("gate-push-session".to_string());
         let server_task = tokio::spawn(async move {
             if let Ok((stream, _addr)) = listener.accept().await {
                 let _ = handle_ipc_connection(stream, ctx).await;
@@ -4308,19 +4305,14 @@ mod tests {
         // `idle_registered_connection_services_reverse_request_without_new_client_frame`:
         // pre-seed `session_id` and a hand-built reverse-request channel.
         let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
-        let ctx = ConnectionContext {
-            cancel: cancel.clone(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine: Arc::clone(&engine),
-            config_path: std::path::PathBuf::from("/tmp/plug-ipc-failed-dereg-config.toml"),
-            started_at: Instant::now(),
-            client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
-            session_id: Some(session_id.clone()),
-            reverse_request_rx: Some(reverse_rx),
-        };
+        let mut ctx = test_connection_context(
+            &engine,
+            cancel.clone(),
+            client_registry,
+            "/tmp/plug-ipc-failed-dereg-config.toml",
+        );
+        ctx.session_id = Some(session_id.clone());
+        ctx.reverse_request_rx = Some(reverse_rx);
 
         let server_task = tokio::spawn(async move {
             if let Ok((stream, _addr)) = listener.accept().await {
@@ -4651,24 +4643,12 @@ mod tests {
 
         let engine = parity_mock_engine();
         engine.start().await.expect("engine start");
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
-            sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
+        let state = Arc::new(plug_core::http::server::HttpState::new(
+            engine.tool_router().clone(),
+            Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
                 as Arc<dyn SessionStore>,
-            cancel: CancellationToken::new(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: std::sync::atomic::AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+            CancellationToken::new(),
+        ));
         let app = plug_core::http::server::build_router(state);
 
         let init_body = serde_json::json!({
@@ -5692,19 +5672,12 @@ mod tests {
         ] {
             let (client_registry, _count_rx) = ClientRegistry::new();
             let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
-            let mut ctx = ConnectionContext {
-                cancel: CancellationToken::new(),
-                auth_token: Arc::from("test-token"),
-                server_manager: Arc::clone(engine.server_manager()),
-                engine: Arc::clone(&engine),
-                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
-                started_at: Instant::now(),
-                client_registry: Arc::new(client_registry),
-                http_sessions: None,
-                downstream_oauth: None,
-                session_id: None,
-                reverse_request_rx: None,
-            };
+            let mut ctx = test_connection_context(
+                &engine,
+                CancellationToken::new(),
+                client_registry,
+                "/tmp/plug-ipc-test-config.toml",
+            );
             let response = dispatch_request(
                 &IpcRequest::Register {
                     protocol_version: version,

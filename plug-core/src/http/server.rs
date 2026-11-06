@@ -56,26 +56,26 @@ use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 pub struct HttpState {
     pub router: Arc<ToolRouter>,
     pub sessions: Arc<dyn SessionStore>,
-    pub cancel: CancellationToken,
-    pub auth_mode: crate::config::DownstreamAuthMode,
+    pub(crate) cancel: CancellationToken,
+    pub(crate) auth_mode: crate::config::DownstreamAuthMode,
     pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
-    pub slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
+    pub(crate) slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
     /// Events made by watching a tool. See `crate::events`.
-    pub watch_events: Option<Arc<crate::events::WatchEvents>>,
-    pub sse_channel_capacity: usize,
-    pub allowed_origins: Vec<Arc<str>>,
-    pub notification_task_started: AtomicBool,
+    pub(crate) watch_events: Option<Arc<crate::events::WatchEvents>>,
+    pub(crate) sse_channel_capacity: usize,
+    pub(crate) allowed_origins: Vec<Arc<str>>,
+    pub(crate) notification_task_started: AtomicBool,
     /// Bearer token for downstream client authentication.
     /// `None` means the current downstream auth mode does not require bearer auth.
-    pub auth_token: Option<Arc<str>>,
+    pub(crate) auth_token: Option<Arc<str>>,
     /// Sessions whose clients advertise `roots` capability.
-    pub roots_capable_sessions: DashMap<String, ()>,
+    pub(crate) roots_capable_sessions: DashMap<String, ()>,
     /// Pending reverse requests sent to HTTP clients (keyed by session_id + request_id).
-    pub pending_client_requests: DashMap<(String, i64), oneshot::Sender<ClientResult>>,
+    pub(crate) pending_client_requests: DashMap<(String, i64), oneshot::Sender<ClientResult>>,
     /// Counter for generating unique reverse-request IDs.
-    pub reverse_request_counter: AtomicU64,
+    pub(crate) reverse_request_counter: AtomicU64,
     /// Per-session client capabilities for reverse-request gating.
-    pub client_capabilities: DashMap<String, ClientCapabilities>,
+    pub(crate) client_capabilities: DashMap<String, ClientCapabilities>,
 }
 
 /// HTTP adapter for the shared `tools/call` dispatcher. Carries the per-call
@@ -474,6 +474,83 @@ impl DownstreamBridge for HttpBridge {
 }
 
 impl HttpState {
+    /// State with `auth_mode = auto`, no bearer token, no downstream OAuth, no
+    /// events, no extra allowed origins, and the default SSE channel capacity.
+    pub fn new(
+        router: Arc<ToolRouter>,
+        sessions: Arc<dyn SessionStore>,
+        cancel: CancellationToken,
+    ) -> Self {
+        Self {
+            router,
+            sessions,
+            cancel,
+            auth_mode: crate::config::DownstreamAuthMode::default(),
+            downstream_oauth: None,
+            slack_events: None,
+            watch_events: None,
+            sse_channel_capacity: crate::config::DEFAULT_SSE_CHANNEL_CAPACITY,
+            allowed_origins: Vec::new(),
+            notification_task_started: AtomicBool::new(false),
+            auth_token: None,
+            roots_capable_sessions: DashMap::new(),
+            pending_client_requests: DashMap::new(),
+            reverse_request_counter: AtomicU64::new(1),
+            client_capabilities: DashMap::new(),
+        }
+    }
+
+    #[must_use]
+    pub fn with_auth_mode(mut self, auth_mode: crate::config::DownstreamAuthMode) -> Self {
+        self.auth_mode = auth_mode;
+        self
+    }
+
+    #[must_use]
+    pub fn with_auth_token(mut self, auth_token: Option<Arc<str>>) -> Self {
+        self.auth_token = auth_token;
+        self
+    }
+
+    #[must_use]
+    pub fn with_downstream_oauth(
+        mut self,
+        downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
+    ) -> Self {
+        self.downstream_oauth = downstream_oauth;
+        self
+    }
+
+    #[must_use]
+    pub fn with_slack_events(
+        mut self,
+        slack_events: Option<Arc<crate::slack_events::SlackEvents>>,
+    ) -> Self {
+        self.slack_events = slack_events;
+        self
+    }
+
+    #[must_use]
+    pub fn with_watch_events(
+        mut self,
+        watch_events: Option<Arc<crate::events::WatchEvents>>,
+    ) -> Self {
+        self.watch_events = watch_events;
+        self
+    }
+
+    #[must_use]
+    pub fn with_sse_channel_capacity(mut self, sse_channel_capacity: usize) -> Self {
+        self.sse_channel_capacity = sse_channel_capacity;
+        self
+    }
+
+    #[must_use]
+    pub fn with_allowed_origins(mut self, allowed_origins: Vec<Arc<str>>) -> Self {
+        self.allowed_origins = allowed_origins;
+        self
+    }
+
     /// Release everything the daemon holds for an HTTP session that has left
     /// the session store, whether by `DELETE /mcp` or by idle expiry.
     ///
@@ -2999,6 +3076,7 @@ mod tests {
         AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
     };
     use crate::proxy::RouterSnapshot;
+    use crate::test_helpers::collect_sse_events;
     use axum::body::Body;
     use http::Request as HttpRequest;
     use std::collections::HashMap;
@@ -3069,23 +3147,15 @@ mod tests {
     ) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(manager),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        })
+        Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(manager)),
+        )
     }
 
     async fn oauth_test_client(
@@ -3283,10 +3353,6 @@ mod tests {
         );
     }
 
-    async fn collect_sse_events(body: Body, max_events: usize) -> Vec<String> {
-        crate::http::sse::collect_sse_events(body, max_events).await
-    }
-
     fn sse_event_id(event: &str) -> Option<u64> {
         event.lines().find_map(|line| {
             line.strip_prefix("id: ")
@@ -3297,23 +3363,11 @@ mod tests {
     fn test_state_with_router_config(router_config: crate::proxy::RouterConfig) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, router_config));
-        Arc::new(HttpState {
+        Arc::new(HttpState::new(
             router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        })
+            Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+            CancellationToken::new(),
+        ))
     }
 
     #[test]
@@ -4423,23 +4477,17 @@ mod tests {
         let access_token = issue_test_oauth_token(&manager, "resources:read").await;
         let state = test_state();
         state.router.set_modern_downstream_enabled(true);
-        let state = Arc::new(HttpState {
-            router: Arc::clone(&state.router),
-            sessions: Arc::clone(&state.sessions),
-            cancel: state.cancel.clone(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(manager),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: state.sse_channel_capacity,
-            allowed_origins: state.allowed_origins.clone(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(
+            HttpState::new(
+                Arc::clone(&state.router),
+                Arc::clone(&state.sessions),
+                state.cancel.clone(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(manager))
+            .with_sse_channel_capacity(state.sse_channel_capacity)
+            .with_allowed_origins(state.allowed_origins.clone()),
+        );
         let app = build_router(state);
         let authorized = |method: &str| {
             let mut request = modern_request(method, json!({}));
@@ -5029,23 +5077,11 @@ mod tests {
         let session_id = sessions.create_session().unwrap();
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router: Arc::clone(&router),
-            sessions: Arc::clone(&sessions) as Arc<dyn SessionStore>,
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(HttpState::new(
+            Arc::clone(&router),
+            Arc::clone(&sessions) as Arc<dyn SessionStore>,
+            CancellationToken::new(),
+        ));
         let app = build_router(state);
 
         let post_body = serde_json::json!({
@@ -5292,23 +5328,14 @@ mod tests {
     async fn origin_allowlisted_external_origin_accepted() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: vec![Arc::from("https://claude.ai")],
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_allowed_origins(vec![Arc::from("https://claude.ai")]),
+        );
         let app = build_router(state);
 
         let body = serde_json::json!({
@@ -6393,23 +6420,15 @@ mod tests {
     fn test_state_with_auth(token: &str) -> Arc<HttpState> {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Bearer,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: Some(Arc::from(token)),
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        })
+        Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Bearer)
+            .with_auth_token(Some(Arc::from(token))),
+        )
     }
 
     #[tokio::test]
@@ -6508,23 +6527,15 @@ mod tests {
     async fn oauth_mode_metadata_endpoint_returns_server_metadata() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+        );
         let app = build_router(state);
 
         let req = HttpRequest::builder()
@@ -6558,23 +6569,15 @@ mod tests {
     async fn oauth_mode_metadata_advertises_public_clients_only() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+        );
         let app = build_router(state);
 
         let req = HttpRequest::builder()
@@ -6608,26 +6611,18 @@ mod tests {
     async fn oauth_protected_resource_metadata_endpoint_returns_rfc9728_metadata() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec![
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(isolated_oauth_manager(vec![
                 "tools:read".to_string(),
                 "offline_access".to_string(),
-            ])),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+            ]))),
+        );
         let app = build_router(state);
 
         let req = HttpRequest::builder()
@@ -7823,26 +7818,18 @@ mod tests {
     async fn oauth_client_credentials_flow_is_rejected() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec![
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(isolated_oauth_manager(vec![
                 "tools:read".to_string(),
                 "offline_access".to_string(),
-            ])),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+            ]))),
+        );
         let app = build_router(state);
 
         let token_req = HttpRequest::builder()
@@ -7868,23 +7855,15 @@ mod tests {
     async fn oauth_mode_requires_access_token_for_mcp_requests() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+        );
         let app = build_router(state);
 
         let req = HttpRequest::builder()
@@ -8469,23 +8448,15 @@ mod tests {
     async fn discovery_server_card_when_unauth_on_oauth_protected_server_is_static() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
-        let state = Arc::new(HttpState {
-            router,
-            sessions: Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
-            cancel: CancellationToken::new(),
-            auth_mode: crate::config::DownstreamAuthMode::Oauth,
-            downstream_oauth: Some(isolated_oauth_manager(vec!["tools:read".to_string()])),
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: DashMap::new(),
-            pending_client_requests: DashMap::new(),
-            reverse_request_counter: AtomicU64::new(1),
-            client_capabilities: DashMap::new(),
-        });
+        let state = Arc::new(
+            HttpState::new(
+                router,
+                Arc::new(crate::session::StatefulSessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
+            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+        );
         let app = build_router(state);
 
         let req = HttpRequest::builder()
