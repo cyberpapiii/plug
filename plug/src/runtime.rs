@@ -668,7 +668,7 @@ fn build_configured_http_runtime(
     let watch_events = downstream_oauth.clone().and_then(|oauth| {
         plug_core::events::WatchEvents::open(
             &plug_core::paths::events_dir().join("watch"),
-            Arc::new(plug_core::events::RuntimeWatchAccess::new(engine, oauth)),
+            Arc::new(plug_core::engine::RuntimeWatchAccess::new(engine, oauth)),
             Arc::new(plug_core::events::HttpsDelivery),
         )
         .inspect_err(|error| tracing::warn!(%error, "watch events unavailable"))
@@ -799,7 +799,7 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         .unwrap_or_else(plug_core::paths::default_config_path);
     let config = plug_core::config::load_config(Some(&config_path))?;
     preflight_http_bind(&config.http)?;
-    let engine = std::sync::Arc::new(plug_core::engine::Engine::new(config));
+    let engine = plug_core::engine::Engine::new(config);
 
     // Upstream startup no longer gates the IPC socket. `Engine::start` waits on
     // third-party server processes, so it can run for tens of seconds, and
@@ -1174,9 +1174,7 @@ mod tests {
 
     #[tokio::test]
     async fn serve_router_supports_https() {
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(plug_core::http::server::HttpState::new(
@@ -1439,9 +1437,7 @@ mod tests {
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
 
         let daemon_engine = Arc::clone(&engine);
@@ -1480,9 +1476,7 @@ mod tests {
     }
 
     async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state_path = unique_temp_dir("owner-operator").join("oauth.json");
@@ -1861,9 +1855,7 @@ mod tests {
         )
         .expect("reopen CIMD fixture");
 
-        let engine = Arc::new(plug_core::engine::Engine::new(
-            plug_core::config::Config::default(),
-        ));
+        let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await.expect("engine start");
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
         let state = Arc::new(
@@ -2038,7 +2030,7 @@ mod tests {
             "mock".to_string(),
             plug_core::test_helpers::mock_server("echo"),
         );
-        let engine = Arc::new(plug_core::engine::Engine::new(config));
+        let engine = plug_core::engine::Engine::new(config);
         engine.start().await.expect("engine start");
         let tool_router = engine.tool_router().clone();
 

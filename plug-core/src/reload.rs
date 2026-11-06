@@ -1,5 +1,5 @@
 //! Config hot-reload: what changed between two configs, and what each change
-//! takes. [`crate::engine::Engine::reload_config`] applies it.
+//! takes. The engine's `reload_config` applies it.
 //!
 //! Reload is triggered by:
 //! - `plug reload` CLI command via daemon IPC
