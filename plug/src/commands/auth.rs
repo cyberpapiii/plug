@@ -143,7 +143,6 @@ async fn refresh_live_daemon_server(server_name: &str) -> anyhow::Result<bool> {
     }
 }
 
-/// Top-level auth command dispatcher.
 pub(crate) async fn cmd_auth(
     config_path: Option<&PathBuf>,
     command: crate::AuthCommands,
@@ -706,8 +705,6 @@ async fn cmd_downstream_oauth_owner(
     Ok(())
 }
 
-// login
-
 async fn cmd_auth_login(
     config_path: Option<&PathBuf>,
     server_name: &str,
@@ -822,7 +819,6 @@ async fn cmd_auth_login(
             .configure_client(oauth_config)
             .map_err(|e| anyhow::anyhow!("failed to configure OAuth client: {e}"))?;
     } else {
-        // Dynamic client registration
         if has_persisted_credentials {
             ui::print_warning_line(format!(
                 "Stored credentials for '{server_name}' do not include reusable dynamic registration metadata. Plug will register one new OAuth client so future reauth can reuse it safely."
@@ -864,7 +860,6 @@ async fn cmd_auth_login(
     }
 
     let (code, csrf_state, callback_issuer) = if let Some(listener) = callback_listener {
-        // Localhost callback: wait for the OAuth redirect with a 120s timeout.
         ui::print_info_line("Waiting for OAuth callback on localhost...");
         await_oauth_callback(listener, Duration::from_secs(120)).await?
     } else {
@@ -1038,8 +1033,6 @@ async fn cmd_auth_complete(
     Ok(())
 }
 
-// inject
-
 /// Persist an externally obtained token for `server_name`.
 ///
 /// For an OAuth server the store is bound to the server's discovered
@@ -1162,8 +1155,6 @@ async fn cmd_auth_inject(
 
     Ok(())
 }
-
-// status
 
 async fn cmd_auth_status(
     config_path: Option<&PathBuf>,
@@ -1466,7 +1457,6 @@ async fn await_oauth_callback_inner(
         .to_string();
     let issuer = params.get("iss").cloned();
 
-    // Respond with a success page and close.
     let success_html = callback_page(
         "Authentication successful",
         "<p>You can close this tab and return to the terminal.</p>",
@@ -1507,8 +1497,6 @@ fn html_escape(s: &str) -> String {
         .replace('"', "&quot;")
         .replace('\'', "&#x27;")
 }
-
-// logout
 
 async fn cmd_auth_logout(server_name: &str) -> anyhow::Result<()> {
     let store = oauth::get_or_create_store(server_name);
