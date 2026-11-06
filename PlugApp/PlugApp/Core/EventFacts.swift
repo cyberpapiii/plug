@@ -1,8 +1,7 @@
 import Foundation
 import PlugIPC
 
-/// One event as the interface reads it. Pure value, so the wording can be
-/// tested without a daemon.
+/// One event as the interface reads it.
 struct EventFacts: Identifiable, Equatable, Sendable {
     enum Health: Equatable, Sendable {
         case waiting, watching, toolMissing, notReadOnly, callFailed, tooLarge

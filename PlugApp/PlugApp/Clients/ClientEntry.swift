@@ -1,8 +1,7 @@
 import PlugIPC
 import SwiftUI
 
-/// The one line under a client's name in its detail. Pure value so the
-/// wording can be tested.
+/// The one line under a client's name in its detail.
 struct ClientStatus: Equatable, Sendable {
     let text: String
 

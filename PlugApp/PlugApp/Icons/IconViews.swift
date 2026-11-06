@@ -93,7 +93,7 @@ struct MonogramTile: View {
 
     /// Which tint a name gets.
     ///
-    /// Pure, so it can be tested: the same name always gets the same tint.
+    /// The same name always gets the same tint.
     nonisolated static func tintIndex(for name: String) -> Int {
         let sum = name.lowercased().unicodeScalars.reduce(0) { ($0 &* 31 &+ Int($1.value)) % 1_000_003 }
         return sum % tints.count

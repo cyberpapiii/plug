@@ -63,8 +63,7 @@ final class InstallationCoordinator {
     private var transientFailures = 0
     private var retryGeneration = 0
 
-    /// The follow-up scheduled after a timeout. Tests await it; nothing else
-    /// needs to.
+    /// The follow-up scheduled after a timeout or a failure.
     private(set) var scheduledRetry: Task<Void, Never>?
 
     static let defaultLogURL = PlugPaths.logs.appending(path: "installation-reconciliation.log")

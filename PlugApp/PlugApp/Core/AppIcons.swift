@@ -68,7 +68,6 @@ enum AppIcons {
 
     /// The symbol that stands in for an app with no icon on this Mac.
     ///
-    /// Pure, so the choice can be tested without a filesystem.
     static func symbol(target: String, name: String = "") -> String {
         let key = target.lowercased()
         let text = "\(key) \(name.lowercased())"
@@ -126,7 +125,6 @@ enum AppIcons {
     /// The app a command lives inside, when it lives inside one: a server
     /// started from `/Applications/Foo.app/Contents/MacOS/foo-mcp` is Foo.
     ///
-    /// Pure, so the matching is testable.
     static func appBundle(containing command: String) -> String? {
         guard let end = command.range(of: ".app/") else { return nil }
         return String(command[..<end.lowerBound]) + ".app"
@@ -147,7 +145,6 @@ enum AppIcons {
     /// by many names, one per product, and a Mac has an app for only a few
     /// of them, so the rest share Google Drive's icon.
     ///
-    /// Pure, so the matching is testable.
     static func appName(forServer name: String, installed: (String) -> Bool = { _ in false }) -> String {
         let key = lookupKey(name)
         if let alias = serverAliases[key] { return alias }
@@ -158,7 +155,6 @@ enum AppIcons {
     /// A name with everything but its letters and digits removed, so
     /// "agent-admin" finds AgentAdmin.app.
     ///
-    /// Pure, so the matching is testable.
     static func lookupKey(_ name: String) -> String {
         String(name.lowercased().unicodeScalars.filter { CharacterSet.alphanumerics.contains($0) })
     }
@@ -202,7 +198,6 @@ enum AppIcons {
     /// Match a live session's reported client type to a known target, so a
     /// session row can show the same icon the app row shows.
     ///
-    /// Pure, so the matching rules are testable.
     static func target(forClientType clientType: String) -> String {
         let value = clientType
             .lowercased()
@@ -220,13 +215,11 @@ enum AppIcons {
             compact.contains("windsurf") || compact.contains("codeium") {
             return "devin"
         }
-        // Copilot runs in VS Code and in a terminal. The daemon's own
-        // detection splits them the same way.
+        // Copilot runs in VS Code and in a terminal.
         if compact.contains("copilot") {
             return compact.contains("cli") ? "copilot-cli" : "vscode"
         }
-        // The two xAI clients share a first word. The daemon's own
-        // detection splits them the same way.
+        // The two xAI clients share a first word.
         if compact.contains("grok") {
             return compact.contains("bot") ? "grok-bot" : "grok-build"
         }

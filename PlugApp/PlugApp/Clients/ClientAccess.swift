@@ -1,8 +1,7 @@
 import PlugIPC
 
 /// What one client may reach, as its row offers it. A block belongs to a
-/// client, so it is looked up through the key its requests carry. Pure value
-/// so the lookup can be tested.
+/// client, so it is looked up through the key its requests carry.
 struct ClientAccess: Equatable {
     let key: String
     let name: String

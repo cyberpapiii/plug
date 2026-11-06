@@ -1,7 +1,6 @@
 import Foundation
 
-/// The three things a newcomer does, and how far along they are. Pure value,
-/// so what counts as done can be tested without a daemon.
+/// The three things a newcomer does, and how far along they are.
 struct FirstRunGuide: Equatable, Sendable {
     enum Step: String, CaseIterable, Identifiable, Sendable {
         case server, client, activity

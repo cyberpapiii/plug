@@ -66,8 +66,8 @@ final class Router {
     }
 }
 
-/// The single place an interface action turns into work. Views name a
-/// `PlugIntent`; nothing in the view layer talks to the model directly.
+/// Where a `PlugIntent` turns into work: navigation here, everything else
+/// through the model.
 @MainActor
 struct PlugIntentRunner {
     let model: AppModel

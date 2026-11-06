@@ -2,7 +2,7 @@ import Foundation
 import PlugIPC
 
 /// The apps on this Mac, split by the one thing a person checks first: is it
-/// talking to Plug right now. Pure value so the grouping can be tested.
+/// talking to Plug right now.
 struct AppRoster: Equatable {
     struct Connected: Identifiable, Equatable {
         var id: String { app.target }
@@ -68,7 +68,7 @@ extension LiveSession {
 
     /// What to call a session, best witness first: a client Plug knows, then
     /// the program that started the connector, then whatever the client said
-    /// about itself. Pure, so the order can be tested.
+    /// about itself.
     var displayName: String {
         if let knownName { return knownName }
         let type = clientType
@@ -96,7 +96,7 @@ extension LiveSession {
 /// The names the owner gave clients, and which client each session is.
 ///
 /// A name belongs to a client, not a session, so it is looked up through the
-/// key the daemon stores it under. Pure value so the lookup can be tested.
+/// key the daemon stores it under.
 struct ClientNames: Equatable {
     private let keys: [String: String]
     private let names: [String: String]
@@ -267,7 +267,6 @@ enum ClientPlaces {
 }
 
 /// Telling one sign-in over the network from another by when it happened.
-/// Pure values so the wording and the matching can be tested.
 enum SignInFacts {
     /// How long a new sign-in keeps asking which client it is.
     static let newFor: TimeInterval = 14 * 86_400
