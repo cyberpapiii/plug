@@ -24,7 +24,8 @@ pub struct Config {
     pub log_level: String,
     /// Tool name prefix delimiter.
     pub prefix_delimiter: String,
-    /// Kept so old files load. Tool names are always prefixed.
+    /// Whether tool names carry their server's prefix. Off, a tool keeps
+    /// its own name unless two servers share it.
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     ///
@@ -1485,21 +1486,19 @@ LOG_LEVEL = "debug"
     // ---- env var override via Figment ----
 
     #[test]
-    fn env_override_via_figment() {
-        // Test that the Figment pipeline supports env overrides by verifying the
-        // provider chain works. We build a Figment with an env provider that reads
-        // from a custom prefix, and prove the merge order is correct.
-        // (We cannot call env::set_var in edition 2024 tests since it is unsafe.)
-        use figment::providers::Env;
-
-        let fig = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string("startup_concurrency = 7"))
-            .merge(Env::prefixed("PLUG_").split("__"));
-
-        let cfg: Config = fig.extract().expect("extract failed");
-        // TOML override should win over default when no env var is actually set
-        assert_eq!(cfg.startup_concurrency, 7);
+    #[allow(clippy::result_large_err)] // figment::Jail returns figment::Error.
+    fn a_plug_variable_beats_the_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "tool_description_max_chars = 7\nstartup_concurrency = 3\n",
+            )?;
+            jail.set_env("PLUG_TOOL_DESCRIPTION_MAX_CHARS", "9");
+            let config = load_config(Some(&jail.directory().join("config.toml")))?;
+            assert_eq!(config.tool_description_max_chars, Some(9));
+            assert_eq!(config.startup_concurrency, 3);
+            Ok(())
+        });
     }
 
     // ---- validation ----

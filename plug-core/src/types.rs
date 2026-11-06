@@ -159,7 +159,7 @@ fn is_non_forwarded_meta_key(key: &str) -> bool {
             | "io.modelcontextprotocol/clientInfo"
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"
-            | "plug.dev/legacy-task"
+            | crate::protocol::LEGACY_TASK_REQUEST_KEY
     )
 }
 
@@ -1222,7 +1222,7 @@ pub struct UpstreamMetricsSnapshot {
     /// Circuit-breaker state: `"closed"`, `"open"`, or `"half-open"`.
     pub circuit_state: String,
     /// How many times this upstream has been restarted since start by recovery
-    /// or supervision (item 2b). Always present; `0` for a never-restarted
+    /// or supervision. Always present; `0` for a never-restarted
     /// upstream.
     #[serde(default)]
     pub restart_count: u64,

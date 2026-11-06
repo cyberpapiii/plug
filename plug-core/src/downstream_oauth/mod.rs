@@ -1976,8 +1976,12 @@ fn registered_redirect_matches(registered: &str, requested: &str) -> bool {
     // Only the port may vary; token exchange still requires the actual callback.
     if registered.scheme() != "http"
         || requested.scheme() != "http"
-        || !registered.host_str().is_some_and(is_loopback_host)
-        || !requested.host_str().is_some_and(is_loopback_host)
+        || !registered
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
+        || !requested
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
     {
         return false;
     }
@@ -2006,17 +2010,9 @@ fn valid_redirect_uri(value: &str) -> bool {
     }
     match uri.scheme() {
         "https" => true,
-        "http" => uri.host_str().is_some_and(is_loopback_host),
+        "http" => uri.host_str().is_some_and(crate::config::is_loopback_host),
         _ => false,
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn validate_metadata_document(
