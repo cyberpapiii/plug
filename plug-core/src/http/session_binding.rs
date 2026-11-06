@@ -100,7 +100,7 @@ pub(super) fn bind_session_to_caller(
 /// start a new one when told theirs is gone, and fail every call from then
 /// on. The caller has already proved who it is, so its session is opened
 /// again under the same id, as its own.
-pub(super) fn reopen_lost_session(
+pub(super) async fn reopen_lost_session(
     state: &Arc<HttpState>,
     headers: &HeaderMap,
     auth_status: &AuthStatus,
@@ -108,6 +108,7 @@ pub(super) fn reopen_lost_session(
     let Ok(session_id) = extract_session_id(headers) else {
         return;
     };
+    let _turn = state.session_turnover.lock().await;
     if !matches!(state.sessions.reopen_session(&session_id), Ok(true)) {
         return;
     }
@@ -126,9 +127,16 @@ pub(super) fn reopen_lost_session(
     // gone: what it holds was read from a Plug that no longer exists. What it
     // declared at `initialize` is still known when the session only timed
     // out; after Plug restarts it is not, until the client initializes again.
+    // A session whose teardown has not run yet still has them in place.
     let capabilities = state
         .lapsed_capabilities
         .take(&session_id)
+        .or_else(|| {
+            state
+                .client_capabilities
+                .get(&session_id)
+                .map(|entry| entry.clone())
+        })
         .unwrap_or_default();
     state
         .client_capabilities
@@ -445,7 +453,7 @@ mod tests {
             SESSION_ID_HEADER,
             HeaderValue::from_str(&session_id).unwrap(),
         );
-        reopen_lost_session(&state, &headers, &AuthStatus::NoAuthRequired);
+        reopen_lost_session(&state, &headers, &AuthStatus::NoAuthRequired).await;
         let capabilities = state
             .client_capabilities
             .get(&session_id)
@@ -453,5 +461,62 @@ mod tests {
             .expect("the reopened session has its capabilities");
         assert!(capabilities.roots.is_some());
         assert!(capabilities.elicitation.is_some());
+    }
+
+    /// Reopening prunes the expired session first, which queues its teardown.
+    /// That teardown runs after the reopen and must leave the reopened session
+    /// alone.
+    #[tokio::test]
+    async fn a_session_reopened_before_its_teardown_ran_keeps_what_it_was_given() {
+        let state = Arc::new(HttpState::new(
+            bare_router(),
+            Arc::new(crate::session::SessionStore::new(60, 100)),
+            CancellationToken::new(),
+        ));
+        let initialize = HttpRequest::builder()
+            .method("POST")
+            .uri("/mcp")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": 1,
+                    "method": "initialize",
+                    "params": {
+                        "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
+                        "capabilities": {"roots": {}},
+                        "clientInfo": {"name": "returning-client", "version": "1"}
+                    }
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let response = build_router(Arc::clone(&state))
+            .oneshot(initialize)
+            .await
+            .unwrap();
+        let session_id = response.headers()[SESSION_ID_HEADER]
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Let the cleanup task take its first tick, then age the session out
+        // without anything else noticing.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        state.sessions.backdate_for_tests(&session_id);
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            SESSION_ID_HEADER,
+            HeaderValue::from_str(&session_id).unwrap(),
+        );
+        reopen_lost_session(&state, &headers, &AuthStatus::NoAuthRequired).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let capabilities = state
+            .client_capabilities
+            .get(&session_id)
+            .map(|entry| entry.clone())
+            .expect("the reopened session keeps its capabilities");
+        assert!(capabilities.roots.is_some());
     }
 }
