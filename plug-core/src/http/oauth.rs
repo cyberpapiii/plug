@@ -1,7 +1,6 @@
 //! Downstream OAuth authorization-server and owner-passkey HTTP handlers.
 
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use axum::Json;
 use axum::extract::rejection::{FormRejection, JsonRejection, QueryRejection};
@@ -10,11 +9,13 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
 
-use super::server::HttpState;
 use crate::downstream_oauth::{
-    AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError, PublicKeyCredential,
-    RegisterPublicKeyCredential, resource_scopes,
+    AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError, DownstreamOauthManager,
+    PublicKeyCredential, RegisterPublicKeyCredential, paths, resource_scopes,
 };
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
+use axum::routing::{get, post};
 
 #[derive(Debug, serde::Deserialize)]
 pub(super) struct OAuthAuthorizeParams {
@@ -58,18 +59,13 @@ pub(super) struct OAuthOwnerEnrollmentCompleteRequest {
 }
 
 pub(super) async fn get_oauth_authorization_server_metadata(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
 ) -> impl IntoResponse {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let base = manager.base_url();
     let response = Json(json!({
-        "issuer": base,
-        "authorization_endpoint": manager.authorization_endpoint(),
-        "token_endpoint": manager.token_endpoint(),
-        "registration_endpoint": manager.registration_endpoint(),
+        "issuer": manager.base_url(),
+        "authorization_endpoint": manager.url(paths::AUTHORIZE),
+        "token_endpoint": manager.url(paths::TOKEN),
+        "registration_endpoint": manager.url(paths::REGISTER),
         "response_types_supported": ["code"],
         "grant_types_supported": ["authorization_code", "refresh_token"],
         "code_challenge_methods_supported": ["S256"],
@@ -81,16 +77,11 @@ pub(super) async fn get_oauth_authorization_server_metadata(
 }
 
 pub(super) async fn get_oauth_protected_resource_metadata(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
 ) -> impl IntoResponse {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-
-    let base = manager.base_url();
     let response = Json(json!({
-        "resource": format!("{base}/mcp"),
-        "authorization_servers": [base],
+        "resource": manager.resource(),
+        "authorization_servers": [manager.base_url()],
         "scopes_supported": resource_scopes(&manager.config.oauth_scopes),
         "bearer_methods_supported": ["header"],
     }));
@@ -98,14 +89,11 @@ pub(super) async fn get_oauth_protected_resource_metadata(
 }
 
 pub(super) async fn oauth_register(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     peer: Option<axum::Extension<axum::extract::ConnectInfo<std::net::SocketAddr>>>,
     headers: HeaderMap,
     request: Result<Json<ClientRegistrationRequest>, JsonRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let Json(request) = match request {
         Ok(request) => request,
         Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidClientMetadata),
@@ -121,13 +109,10 @@ pub(super) async fn oauth_register(
 }
 
 pub(super) async fn oauth_authorize(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     params: Result<Query<OAuthAuthorizeParams>, QueryRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let Query(params) = match params {
         Ok(params) => params,
         Err(_) if accepts_html(&headers) => {
@@ -182,11 +167,11 @@ pub(super) async fn oauth_authorize(
 }
 
 pub(super) async fn oauth_consent_javascript(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
     browser_asset(
-        &state,
+        &manager,
         &headers,
         super::oauth_ui::CONSENT_JAVASCRIPT,
         super::oauth_ui::JAVASCRIPT_TYPE,
@@ -194,11 +179,11 @@ pub(super) async fn oauth_consent_javascript(
 }
 
 pub(super) async fn oauth_enroll_javascript(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
     browser_asset(
-        &state,
+        &manager,
         &headers,
         super::oauth_ui::ENROLL_JAVASCRIPT,
         super::oauth_ui::JAVASCRIPT_TYPE,
@@ -206,11 +191,11 @@ pub(super) async fn oauth_enroll_javascript(
 }
 
 pub(super) async fn oauth_stylesheet(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
     browser_asset(
-        &state,
+        &manager,
         &headers,
         super::oauth_ui::STYLESHEET,
         super::oauth_ui::STYLESHEET_TYPE,
@@ -218,11 +203,11 @@ pub(super) async fn oauth_stylesheet(
 }
 
 pub(super) async fn oauth_icon(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
     browser_asset(
-        &state,
+        &manager,
         &headers,
         super::oauth_ui::ICON,
         super::oauth_ui::ICON_TYPE,
@@ -231,14 +216,11 @@ pub(super) async fn oauth_icon(
 
 /// A file the sign-in pages load, served only where those pages are.
 fn browser_asset(
-    state: &HttpState,
+    manager: &DownstreamOauthManager,
     headers: &HeaderMap,
     source: &'static str,
     content_type: &'static str,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     if !public_browser_request_allowed(manager, headers, false) {
         return oauth_forbidden_response();
     }
@@ -246,27 +228,21 @@ fn browser_asset(
 }
 
 pub(super) async fn oauth_owner_enroll(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, false) {
+    if !public_browser_request_allowed(&manager, &headers, false) {
         return oauth_forbidden_response();
     }
     super::oauth_ui::enrollment_page()
 }
 
 pub(super) async fn oauth_consent_challenge(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     request: Result<Json<OAuthConsentChallengeRequest>, JsonRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
+    if !public_browser_request_allowed(&manager, &headers, true) {
         return oauth_forbidden_response();
     }
     let Json(request) = match request {
@@ -281,14 +257,11 @@ pub(super) async fn oauth_consent_challenge(
 }
 
 pub(super) async fn oauth_consent_decision(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     decision: Result<Json<OAuthConsentDecision>, JsonRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
+    if !public_browser_request_allowed(&manager, &headers, true) {
         return oauth_forbidden_response();
     }
     let Json(decision) = match decision {
@@ -319,14 +292,11 @@ pub(super) async fn oauth_consent_decision(
 }
 
 pub(super) async fn oauth_owner_enroll_challenge(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     request: Result<Json<OAuthOwnerEnrollmentChallengeRequest>, JsonRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
+    if !public_browser_request_allowed(&manager, &headers, true) {
         return oauth_forbidden_response();
     }
     let Json(request) = match request {
@@ -340,14 +310,11 @@ pub(super) async fn oauth_owner_enroll_challenge(
 }
 
 pub(super) async fn oauth_owner_enroll_complete(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     request: Result<Json<OAuthOwnerEnrollmentCompleteRequest>, JsonRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
-    if !public_browser_request_allowed(manager, &headers, true) {
+    if !public_browser_request_allowed(&manager, &headers, true) {
         return oauth_forbidden_response();
     }
     let Json(request) = match request {
@@ -364,13 +331,10 @@ pub(super) async fn oauth_owner_enroll_complete(
 }
 
 pub(super) async fn oauth_token(
-    State(state): State<Arc<HttpState>>,
+    State(manager): State<DownstreamOauthManager>,
     headers: HeaderMap,
     params: Result<Form<HashMap<String, String>>, FormRejection>,
 ) -> Response {
-    let Some(manager) = &state.downstream_oauth else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
     let Form(params) = match params {
         Ok(params) => params,
         Err(_) => return oauth_error_response(&DownstreamOauthError::InvalidAuthorizationRequest),
@@ -623,7 +587,7 @@ pub(super) fn oauth_forbidden_response() -> Response {
 }
 
 pub(super) fn public_browser_request_allowed(
-    manager: &crate::downstream_oauth::DownstreamOauthManager,
+    manager: &DownstreamOauthManager,
     headers: &HeaderMap,
     require_origin: bool,
 ) -> bool {
@@ -716,11 +680,48 @@ pub(super) fn oauth_authorization_error_redirect(
     )
 }
 
-pub(super) fn protected_resource_metadata_url(base_url: &str) -> String {
-    format!(
-        "{}/.well-known/oauth-protected-resource",
-        base_url.trim_end_matches('/')
-    )
+/// Where a client learns how to sign in to this resource.
+pub(super) fn protected_resource_metadata_url(manager: &DownstreamOauthManager) -> String {
+    manager.url(paths::PROTECTED_RESOURCE_METADATA)
+}
+
+/// The authorization server and sign-in pages. Served only when the
+/// listener signs clients in with OAuth.
+pub(super) fn router(manager: DownstreamOauthManager) -> Router {
+    Router::new()
+        .route(
+            paths::AUTHORIZATION_SERVER_METADATA,
+            get(get_oauth_authorization_server_metadata),
+        )
+        .route(
+            paths::PROTECTED_RESOURCE_METADATA,
+            get(get_oauth_protected_resource_metadata),
+        )
+        .route(
+            paths::PROTECTED_RESOURCE_METADATA_FOR_MCP,
+            get(get_oauth_protected_resource_metadata),
+        )
+        .route(paths::REGISTER, post(oauth_register))
+        .route(paths::AUTHORIZE, get(oauth_authorize))
+        .route(paths::CONSENT_SCRIPT, get(oauth_consent_javascript))
+        .route(paths::CONSENT_CHALLENGE, post(oauth_consent_challenge))
+        .route(paths::CONSENT_DECISION, post(oauth_consent_decision))
+        .route(paths::OWNER_ENROLL, get(oauth_owner_enroll))
+        .route(paths::ENROLL_SCRIPT, get(oauth_enroll_javascript))
+        .route(paths::STYLESHEET, get(oauth_stylesheet))
+        .route(paths::ICON, get(oauth_icon))
+        .route(
+            paths::OWNER_ENROLL_CHALLENGE,
+            post(oauth_owner_enroll_challenge),
+        )
+        .route(
+            paths::OWNER_ENROLL_COMPLETE,
+            post(oauth_owner_enroll_complete),
+        )
+        .route(paths::TOKEN, post(oauth_token))
+        .route(paths::ASSUMED_TOKEN, post(oauth_token))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .with_state(manager)
 }
 
 #[cfg(test)]
@@ -897,6 +898,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oauth_routes_are_not_served_without_oauth() {
+        for state in [test_state(), test_state_with_auth("token")] {
+            let app = build_router(state);
+            for path in [
+                paths::AUTHORIZATION_SERVER_METADATA,
+                paths::PROTECTED_RESOURCE_METADATA,
+                paths::AUTHORIZE,
+                paths::CONSENT_SCRIPT,
+            ] {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        HttpRequest::builder()
+                            .uri(path)
+                            .header(header::HOST, "localhost:3282")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn oauth_mode_metadata_endpoint_returns_server_metadata() {
         let sm = Arc::new(crate::server::ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()));
@@ -906,8 +933,9 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+            .with_auth(crate::http::server::HttpAuth::Oauth(
+                isolated_oauth_manager(vec!["tools:read".to_string()]),
+            )),
         );
         let app = build_router(state);
 
@@ -948,8 +976,9 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+            .with_auth(crate::http::server::HttpAuth::Oauth(
+                isolated_oauth_manager(vec!["tools:read".to_string()]),
+            )),
         );
         let app = build_router(state);
 
@@ -990,11 +1019,12 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(isolated_oauth_manager(vec![
-                "tools:read".to_string(),
-                "offline_access".to_string(),
-            ]))),
+            .with_auth(crate::http::server::HttpAuth::Oauth(
+                isolated_oauth_manager(vec![
+                    "tools:read".to_string(),
+                    "offline_access".to_string(),
+                ]),
+            )),
         );
         let app = build_router(state);
 
@@ -1577,7 +1607,6 @@ mod tests {
         let config = crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
-            local_port: 3282,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             config.clone(),
@@ -1818,7 +1847,7 @@ mod tests {
             .body(Body::from("consent_id=unknown&decision=approve"))
             .expect("legacy request");
         let legacy = app.oneshot(legacy).await.expect("legacy response");
-        assert_eq!(legacy.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
         assert!(legacy.headers().get(header::LOCATION).is_none());
     }
 
@@ -1939,7 +1968,6 @@ mod tests {
             crate::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
-                local_port: 3282,
             },
             state_path.clone(),
         )
@@ -2197,11 +2225,12 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(isolated_oauth_manager(vec![
-                "tools:read".to_string(),
-                "offline_access".to_string(),
-            ]))),
+            .with_auth(crate::http::server::HttpAuth::Oauth(
+                isolated_oauth_manager(vec![
+                    "tools:read".to_string(),
+                    "offline_access".to_string(),
+                ]),
+            )),
         );
         let app = build_router(state);
 
@@ -2233,7 +2262,6 @@ mod tests {
         let oauth_config = crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
-            local_port: 3282,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),
@@ -2612,7 +2640,6 @@ mod tests {
         let oauth_config = crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
-            local_port: 3282,
         };
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),

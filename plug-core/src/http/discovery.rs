@@ -1,13 +1,26 @@
 use super::server::*;
 use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 use axum::Json;
+use axum::Router;
+use axum::extract::DefaultBodyLimit;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
+use axum::routing::get;
 use serde_json::json;
 use std::sync::Arc;
 
 /// GET /.well-known/mcp-server-card and legacy /.well-known/mcp.json.
+/// The server card, at its current address and the one older clients read.
+/// Any page may read it, so it sits outside the Origin check.
+pub(super) fn discovery_router(state: Arc<HttpState>) -> Router {
+    Router::new()
+        .route("/.well-known/mcp.json", get(get_server_card))
+        .route("/.well-known/mcp-server-card", get(get_server_card))
+        .layer(DefaultBodyLimit::max(64 * 1024))
+        .with_state(state)
+}
+
 pub(super) async fn get_server_card(
     State(state): State<Arc<HttpState>>,
     _headers: HeaderMap,
@@ -17,7 +30,7 @@ pub(super) async fn get_server_card(
         "url": "/mcp",
         "supportedProtocolVersions": [SUPPORTED_PROTOCOL_VERSION],
     });
-    if state.auth_mode == crate::config::DownstreamAuthMode::Oauth || state.auth_token.is_some() {
+    if !matches!(state.auth, HttpAuth::Open) {
         remote["headers"] = json!([
             {
                 "name": "Authorization",
@@ -206,8 +219,9 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+            .with_auth(crate::http::server::HttpAuth::Oauth(
+                isolated_oauth_manager(vec!["tools:read".to_string()]),
+            )),
         );
         let app = build_router(state);
 

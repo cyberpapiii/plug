@@ -36,12 +36,8 @@ impl crate::events::EventDelivery for EchoEventDelivery {
 async fn slack_events_http_requires_selected_client_scope_and_live_grant() {
     let manager = isolated_oauth_manager(vec!["events:subscribe".into(), "tools:read".into()]);
     let (client, tokens) = issue_test_oauth_grant(&manager, "events:subscribe").await;
-    assert!(
-        manager
-            .permits_event_delivery(&client, "events:subscribe")
-            .await
-    );
-    assert!(!manager.permits_event_delivery(&client, "tools:read").await);
+    assert!(manager.holds_live_grant(&client, "events:subscribe").await);
+    assert!(!manager.holds_live_grant(&client, "tools:read").await);
     let wrong_token = issue_test_oauth_token(&manager, "events:subscribe").await;
     let no_scope_token = issue_test_oauth_token(&manager, "tools:read").await;
     let dir = tempfile::tempdir().unwrap();
@@ -133,11 +129,7 @@ async fn slack_events_http_requires_selected_client_scope_and_live_grant() {
     let value: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(value["result"]["capabilities"]["events"], json!({}));
     assert!(manager.revoke_client(&client).await.unwrap());
-    assert!(
-        !manager
-            .permits_event_delivery(&client, "events:subscribe")
-            .await
-    );
+    assert!(!manager.holds_live_grant(&client, "events:subscribe").await);
     let mut req = modern_request("events/list", json!({}));
     req.headers_mut().insert(
         header::AUTHORIZATION,

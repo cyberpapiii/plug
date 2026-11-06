@@ -2,7 +2,7 @@ use std::sync::{Arc, Weak};
 
 use serde_json::{Map, Value};
 
-use super::{EVENT_SCOPE, WatchAccess, WatchConfig};
+use super::{WatchAccess, WatchConfig};
 
 /// Reads the live config, grants, and servers. Nothing is copied into event
 /// storage: every check goes to the running daemon.
@@ -58,11 +58,7 @@ impl WatchAccess for RuntimeWatchAccess {
     }
 
     async fn permits(&self, client_id: &str, watch: &WatchConfig) -> bool {
-        self.may_use(client_id, watch)
-            && self
-                .oauth
-                .permits_event_delivery(client_id, EVENT_SCOPE)
-                .await
+        self.may_use(client_id, watch) && super::delivery_permitted(&self.oauth, client_id).await
     }
 
     fn tool(&self, watch: &WatchConfig) -> Option<(String, bool)> {

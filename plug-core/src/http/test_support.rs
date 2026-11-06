@@ -80,7 +80,6 @@ pub(crate) fn isolated_oauth_manager(
         crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: scopes,
-            local_port: 3282,
         },
         path,
     )
@@ -102,8 +101,7 @@ pub(crate) fn oauth_test_state_with_manager(
             Arc::new(crate::session::SessionStore::new(1800, 100)),
             CancellationToken::new(),
         )
-        .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-        .with_downstream_oauth(Some(manager)),
+        .with_auth(crate::http::server::HttpAuth::Oauth(manager)),
     )
 }
 
@@ -394,7 +392,6 @@ pub(crate) fn test_state_with_auth(token: &str) -> Arc<HttpState> {
             Arc::new(crate::session::SessionStore::new(1800, 100)),
             CancellationToken::new(),
         )
-        .with_auth_mode(crate::config::DownstreamAuthMode::Bearer)
-        .with_auth_token(Some(Arc::from(token))),
+        .with_auth(crate::http::server::HttpAuth::Bearer(Arc::from(token))),
     )
 }

@@ -1418,7 +1418,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             let mut server_statuses = ctx.server_manager.server_statuses();
             strip_upstream_icons(&mut server_statuses);
             let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
-            let downstream_clients = match ctx.http.downstream_oauth.as_ref() {
+            let downstream_clients = match ctx.http.downstream_oauth() {
                 Some(manager) => manager.list_clients().await,
                 None => Vec::new(),
             };
@@ -2644,7 +2644,6 @@ mod tests {
             plug_core::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
-                local_port: 3282,
             },
             oauth_path.clone(),
         )
@@ -2675,7 +2674,7 @@ mod tests {
                 Arc::new(plug_core::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_downstream_oauth(Some(manager.clone())),
+            .with_auth(plug_core::http::server::HttpAuth::Oauth(manager.clone())),
         );
         let session_id = ctx.http.sessions.create_session().expect("session");
         ctx.http

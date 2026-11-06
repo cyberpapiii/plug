@@ -1,6 +1,6 @@
 use super::{EventAccess, SlackEventsConfig};
 use crate::config::SLACK_SERVER;
-use crate::events::{Access, EVENT_SCOPE};
+use crate::events::Access;
 use rmcp::model::CallToolResult;
 use serde_json::{Value, json};
 use std::sync::{Arc, Weak};
@@ -72,9 +72,7 @@ impl EventAccess for RuntimeAccess {
     }
     async fn check(&self, channel: Option<&str>) -> Access {
         if !self.enabled()
-            || !self
-                .oauth
-                .permits_event_delivery(&self.config.subscriber_client_id, EVENT_SCOPE)
+            || !crate::events::delivery_permitted(&self.oauth, &self.config.subscriber_client_id)
                 .await
         {
             return Access::Denied;

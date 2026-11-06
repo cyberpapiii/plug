@@ -19,77 +19,48 @@ pub(super) fn check_bearer_token(headers: &HeaderMap, expected: &str) -> bool {
         .is_some_and(|token| crate::auth::verify_auth_token(token, expected))
 }
 
-/// Validate bearer token for non-loopback HTTP servers.
-///
-/// When `HttpState.auth_token` is `Some`, requests must include a valid
-/// `Authorization: Bearer <token>` header. When `None`, all requests pass through.
+/// Settle who the caller is under the listener's [`HttpAuth`] and record it
+/// on the request as an [`AuthStatus`], or refuse the request.
 pub(super) async fn validate_bearer_auth(
     State(state): State<Arc<HttpState>>,
     mut req: Request,
     next: Next,
 ) -> Result<Response, HttpError> {
-    if state.auth_mode == crate::config::DownstreamAuthMode::Oauth {
-        let manager = state
-            .downstream_oauth
-            .as_ref()
-            .ok_or_else(|| HttpError::Internal("missing downstream OAuth manager".to_string()))?;
-        let metadata_url = protected_resource_metadata_url(manager.base_url());
-        let advertised_scopes = resource_scopes(&manager.config.oauth_scopes);
-        let scope = (!advertised_scopes.is_empty()).then(|| advertised_scopes.join(" "));
-
-        let auth_status = if let Some(auth_header) = req.headers().get(header::AUTHORIZATION) {
-            let auth = auth_header
-                .to_str()
-                .map_err(|_| HttpError::UnauthorizedWithMetadata {
-                    metadata_url: metadata_url.clone(),
-                    scope: scope.clone(),
-                })?
-                .strip_prefix("Bearer ")
-                .ok_or(HttpError::UnauthorizedWithMetadata {
-                    metadata_url: metadata_url.clone(),
-                    scope: scope.clone(),
-                })?;
-            match manager
-                .validate_access_token_for(auth, &[], &manager.resource())
-                .await
-            {
-                AccessTokenValidation::Valid(claims) => AuthStatus::Authenticated(Some(claims)),
-                AccessTokenValidation::InsufficientScope => {
-                    return Err(HttpError::InsufficientScopeWithMetadata {
-                        metadata_url,
-                        scope: scope.unwrap_or_else(|| "tools:read".to_string()),
-                    });
-                }
-                AccessTokenValidation::Invalid => {
-                    return Err(HttpError::UnauthorizedWithMetadata {
-                        metadata_url,
-                        scope,
-                    });
-                }
-            }
-        } else {
-            return Err(HttpError::UnauthorizedWithMetadata {
-                metadata_url,
-                scope,
-            });
-        };
-
-        req.extensions_mut().insert(auth_status);
-        return Ok(next.run(req).await);
-    }
-
-    let auth_status = match &state.auth_token {
-        None => AuthStatus::NoAuthRequired,
-        Some(expected) => {
-            if check_bearer_token(req.headers(), expected.as_ref()) {
-                AuthStatus::Authenticated(None)
-            } else {
+    let auth_status = match &state.auth {
+        HttpAuth::Open => AuthStatus::NoAuthRequired,
+        HttpAuth::Bearer(expected) => {
+            if !check_bearer_token(req.headers(), expected) {
                 tracing::warn!("bearer auth failed from downstream client");
                 return Err(HttpError::Unauthorized);
             }
+            AuthStatus::Authenticated(None)
+        }
+        HttpAuth::Oauth(manager) => {
+            let token = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.strip_prefix("Bearer "));
+            let claims = match token {
+                Some(token) => match manager
+                    .validate_access_token_for(token, &manager.resource())
+                    .await
+                {
+                    AccessTokenValidation::Valid(claims) => Some(claims),
+                    AccessTokenValidation::Invalid => None,
+                },
+                None => None,
+            };
+            let Some(claims) = claims else {
+                let advertised_scopes = resource_scopes(&manager.config.oauth_scopes);
+                return Err(HttpError::UnauthorizedWithMetadata {
+                    metadata_url: protected_resource_metadata_url(manager),
+                    scope: (!advertised_scopes.is_empty()).then(|| advertised_scopes.join(" ")),
+                });
+            };
+            AuthStatus::Authenticated(Some(claims))
         }
     };
-
     req.extensions_mut().insert(auth_status);
     Ok(next.run(req).await)
 }
@@ -508,7 +479,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_auth_required_loopback_passes_through() {
-        // State with auth_token = None (loopback)
         let state = test_state();
         let app = build_router(state);
 
@@ -554,8 +524,9 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 CancellationToken::new(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(isolated_oauth_manager(vec!["tools:read".to_string()]))),
+            .with_auth(crate::http::server::HttpAuth::Oauth(
+                isolated_oauth_manager(vec!["tools:read".to_string()]),
+            )),
         );
         let app = build_router(state);
 

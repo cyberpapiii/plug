@@ -176,7 +176,7 @@ mod tests {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
         let claims = match manager
-            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .validate_access_token_for(&access_token, &manager.resource())
             .await
         {
             AccessTokenValidation::Valid(claims) => claims,
@@ -220,7 +220,7 @@ mod tests {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
         let claims = match manager
-            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .validate_access_token_for(&access_token, &manager.resource())
             .await
         {
             AccessTokenValidation::Valid(claims) => claims,
@@ -255,7 +255,7 @@ mod tests {
             let manager = isolated_oauth_manager(vec![scope.to_string()]);
             let token = issue_test_oauth_token(&manager, scope).await;
             let claims = match manager
-                .validate_access_token_for(&token, &[], &manager.resource())
+                .validate_access_token_for(&token, &manager.resource())
                 .await
             {
                 AccessTokenValidation::Valid(claims) => claims,
@@ -312,13 +312,9 @@ mod tests {
         let app = build_router(Arc::clone(&state));
         let session_id = legacy_oauth_session(&app, &access_token).await;
 
-        let oauth = state.downstream_oauth.as_ref().expect("OAuth manager");
+        let oauth = state.downstream_oauth().expect("OAuth manager");
         let client_id = match oauth
-            .validate_access_token_for(
-                &access_token,
-                &["tools:read".to_string()],
-                &oauth.resource(),
-            )
+            .validate_access_token_for(&access_token, &oauth.resource())
             .await
         {
             crate::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,

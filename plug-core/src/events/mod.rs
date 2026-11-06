@@ -25,6 +25,16 @@ pub use hub::{Access, Hub, Pending, Source, SourceState, State, Subscription};
 pub use watch::{EventStatus, WatchAccess, WatchEvents, WatchHealth, WatchSource, WatchState};
 
 pub(crate) const DAY: u64 = 86_400;
+
+/// Whether an event may still go to `client_id`. A durable subscription
+/// outlives the access token it was made with, so each delivery asks again:
+/// the client must still hold a live grant carrying the events scope.
+pub(crate) async fn delivery_permitted(
+    oauth: &crate::downstream_oauth::DownstreamOauthManager,
+    client_id: &str,
+) -> bool {
+    oauth.holds_live_grant(client_id, EVENT_SCOPE).await
+}
 /// The largest event, and the largest body a source accepts from outside.
 pub(crate) const MAX_BODY: usize = 256 * 1024;
 

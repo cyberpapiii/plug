@@ -380,16 +380,15 @@ async fn operator_owner_bootstrap(
     .await?;
     let manager = state
         .http_state
-        .downstream_oauth
-        .as_ref()
+        .downstream_oauth()
         .ok_or(StatusCode::NOT_FOUND)?;
     let bootstrap = manager
         .create_owner_bootstrap()
         .await
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     let enrollment_url = format!(
-        "{}/oauth/owner/enroll#bootstrap={bootstrap}",
-        manager.base_url()
+        "{}#bootstrap={bootstrap}",
+        manager.url(plug_core::downstream_oauth::paths::OWNER_ENROLL)
     );
     Ok(sensitive_json(OwnerBootstrapResponse { enrollment_url }))
 }
@@ -408,8 +407,7 @@ async fn operator_owner_credentials(
     .await?;
     let manager = state
         .http_state
-        .downstream_oauth
-        .as_ref()
+        .downstream_oauth()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(sensitive_json(manager.list_owner_credentials().await))
 }
@@ -427,7 +425,7 @@ async fn operator_remove_owner_credential(
     {
         return status;
     }
-    let Some(manager) = state.http_state.downstream_oauth.as_ref() else {
+    let Some(manager) = state.http_state.downstream_oauth() else {
         return StatusCode::NOT_FOUND;
     };
     match manager
@@ -454,8 +452,7 @@ async fn operator_oauth_clients(
     operator_proof_authorized(&state, &headers, "GET", OPERATOR_OAUTH_CLIENTS_PATH, false).await?;
     let manager = state
         .http_state
-        .downstream_oauth
-        .as_ref()
+        .downstream_oauth()
         .ok_or(StatusCode::NOT_FOUND)?;
     Ok(Json(manager.list_clients().await))
 }
@@ -637,6 +634,11 @@ fn build_configured_http_runtime(
             .map(plug_core::downstream_oauth::DownstreamOauthManager::try_new)
             .transpose()
             .map_err(|error| anyhow::anyhow!(error))?;
+    if config.http.auth_mode == plug_core::config::DownstreamAuthMode::Oauth
+        && downstream_oauth.is_none()
+    {
+        anyhow::bail!("http.public_base_url is required when http.auth_mode = \"oauth\"");
+    }
 
     // Slack events are one feature among many: a secret that cannot be read
     // or state that cannot be opened leaves them off, and everything else on.
@@ -691,15 +693,18 @@ fn build_configured_http_runtime(
         .chain(watch_events.map(|events| events as Arc<dyn plug_core::events::EventSource>))
         .collect();
 
+    let auth = match (downstream_oauth.clone(), auth_token) {
+        (Some(manager), _) => plug_core::http::server::HttpAuth::Oauth(manager),
+        (None, Some(token)) => plug_core::http::server::HttpAuth::Bearer(token),
+        (None, None) => plug_core::http::server::HttpAuth::Open,
+    };
     let http_state = Arc::new(
         plug_core::http::server::HttpState::new(
             tool_router.clone(),
             sessions,
             engine.cancel_token().clone(),
         )
-        .with_auth_mode(config.http.auth_mode.clone())
-        .with_auth_token(auth_token)
-        .with_downstream_oauth(downstream_oauth.clone())
+        .with_auth(auth)
         .with_event_sources(event_sources)
         .with_sse_channel_capacity(config.http.sse_channel_capacity)
         .with_allowed_origins(
@@ -1503,7 +1508,6 @@ mod tests {
             plug_core::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
-                local_port: 3282,
             },
             state_path.clone(),
         )
@@ -1514,8 +1518,7 @@ mod tests {
                 sessions,
                 engine.cancel_token().clone(),
             )
-            .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(manager)),
+            .with_auth(plug_core::http::server::HttpAuth::Oauth(manager)),
         );
         (
             build_runtime_router(state, Arc::from("operator-secret"), authority),
@@ -1808,7 +1811,6 @@ mod tests {
         let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
-            local_port: 3282,
         };
         let initial = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             oauth_config.clone(),
@@ -1888,8 +1890,7 @@ mod tests {
                 sessions,
                 engine.cancel_token().clone(),
             )
-            .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(manager.clone())),
+            .with_auth(plug_core::http::server::HttpAuth::Oauth(manager.clone())),
         );
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1920,11 +1921,7 @@ mod tests {
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
         assert!(matches!(
             manager
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    &manager.resource(),
-                )
+                .validate_access_token_for(&tokens.access_token, &manager.resource(),)
                 .await,
             plug_core::downstream_oauth::AccessTokenValidation::Invalid
         ));
@@ -2068,7 +2065,6 @@ mod tests {
             plug_core::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string(), "tasks:use".to_string()],
-                local_port: 3282,
             },
             oauth_path.clone(),
         )
@@ -2125,11 +2121,7 @@ mod tests {
         // Barrier: middleware validation has completed and captured the old
         // client generation, but task dispatch has not begun.
         let claims = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                &manager.resource(),
-            )
+            .validate_access_token_for(&tokens.access_token, &manager.resource())
             .await
         {
             plug_core::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
@@ -2157,8 +2149,7 @@ mod tests {
                 sessions,
                 engine.cancel_token().clone(),
             )
-            .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(manager)),
+            .with_auth(plug_core::http::server::HttpAuth::Oauth(manager)),
         );
         let app = build_runtime_router(
             http_state,

@@ -4240,7 +4240,6 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
         public_base_url: "https://plug.example.com".to_string(),
         oauth_scopes: vec!["tools:read".to_string()],
-        local_port: 3282,
     };
     let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
         oauth_config,
@@ -4254,8 +4253,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
             Arc::new(plug_core::session::SessionStore::new(1800, 100)),
             CancellationToken::new(),
         )
-        .with_auth_mode(plug_core::config::DownstreamAuthMode::Oauth)
-        .with_downstream_oauth(Some(manager)),
+        .with_auth(plug_core::http::server::HttpAuth::Oauth(manager)),
     ));
 
     let unauth_req = HttpRequest::builder()

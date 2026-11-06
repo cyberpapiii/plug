@@ -1,13 +1,12 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 
-use axum::Json;
 use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::middleware::{self};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::post;
 use axum::{Router, extract::DefaultBodyLimit};
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
@@ -24,12 +23,6 @@ use super::events::*;
 use super::fanout::*;
 use super::guard::*;
 use super::identity::*;
-use super::oauth::{
-    get_oauth_authorization_server_metadata, get_oauth_protected_resource_metadata,
-    oauth_authorize, oauth_consent_challenge, oauth_consent_decision, oauth_consent_javascript,
-    oauth_enroll_javascript, oauth_icon, oauth_owner_enroll, oauth_owner_enroll_challenge,
-    oauth_owner_enroll_complete, oauth_register, oauth_stylesheet, oauth_token,
-};
 use super::response::*;
 use super::reverse::*;
 use super::session_binding::*;
@@ -53,21 +46,28 @@ pub(super) const PLUG_TRACE_ID_HEADER: &str = "x-plug-trace-id";
 /// The MCP protocol version we implement.
 use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
+/// How callers of `/mcp` prove who they are.
+pub enum HttpAuth {
+    /// No credential. Config validation allows this only for a listener no
+    /// other machine can reach.
+    Open,
+    /// The one shared token every client presents.
+    Bearer(Arc<str>),
+    /// Access tokens Plug's own authorization server issued.
+    Oauth(crate::downstream_oauth::DownstreamOauthManager),
+}
+
 /// Shared state for all HTTP handlers.
 pub struct HttpState {
     pub router: Arc<ToolRouter>,
     pub sessions: Arc<SessionStore>,
     pub(crate) cancel: CancellationToken,
-    pub(crate) auth_mode: crate::config::DownstreamAuthMode,
-    pub downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
+    pub(crate) auth: HttpAuth,
     /// Where MCP Events come from. See `crate::events`.
     pub(crate) event_sources: Vec<Arc<dyn EventSource>>,
     pub(crate) sse_channel_capacity: usize,
     pub(crate) allowed_origins: Vec<Arc<str>>,
     pub(crate) notification_task_started: AtomicBool,
-    /// Bearer token for downstream client authentication.
-    /// `None` means the current downstream auth mode does not require bearer auth.
-    pub(crate) auth_token: Option<Arc<str>>,
     /// Sessions whose clients advertise `roots` capability.
     pub(crate) roots_capable_sessions: Arc<DashMap<String, ()>>,
     /// Pending reverse requests sent to HTTP clients (keyed by session_id + request_id).
@@ -116,8 +116,7 @@ pub enum ClientRevocation {
 }
 
 impl HttpState {
-    /// State with `auth_mode = auto`, no bearer token, no downstream OAuth, no
-    /// events, no extra allowed origins, and the default SSE channel capacity.
+    /// State with [`HttpAuth::Open`], no events, no extra allowed origins, and the default SSE channel capacity.
     ///
     /// From here on `sessions` drops expired sessions on its own, and what
     /// Plug holds for any session that lapses is released. Must be called on
@@ -131,13 +130,11 @@ impl HttpState {
             router,
             sessions,
             cancel,
-            auth_mode: crate::config::DownstreamAuthMode::default(),
-            downstream_oauth: None,
+            auth: HttpAuth::Open,
             event_sources: Vec::new(),
             sse_channel_capacity: crate::config::DEFAULT_SSE_CHANNEL_CAPACITY,
             allowed_origins: Vec::new(),
             notification_task_started: AtomicBool::new(false),
-            auth_token: None,
             roots_capable_sessions: Arc::default(),
             pending_client_requests: Arc::default(),
             reverse_request_counter: AtomicU64::new(1),
@@ -168,24 +165,17 @@ impl HttpState {
     }
 
     #[must_use]
-    pub fn with_auth_mode(mut self, auth_mode: crate::config::DownstreamAuthMode) -> Self {
-        self.auth_mode = auth_mode;
+    pub fn with_auth(mut self, auth: HttpAuth) -> Self {
+        self.auth = auth;
         self
     }
 
-    #[must_use]
-    pub fn with_auth_token(mut self, auth_token: Option<Arc<str>>) -> Self {
-        self.auth_token = auth_token;
-        self
-    }
-
-    #[must_use]
-    pub fn with_downstream_oauth(
-        mut self,
-        downstream_oauth: Option<crate::downstream_oauth::DownstreamOauthManager>,
-    ) -> Self {
-        self.downstream_oauth = downstream_oauth;
-        self
+    /// The authorization server, when callers sign in with OAuth.
+    pub fn downstream_oauth(&self) -> Option<&crate::downstream_oauth::DownstreamOauthManager> {
+        match &self.auth {
+            HttpAuth::Oauth(manager) => Some(manager),
+            HttpAuth::Open | HttpAuth::Bearer(_) => None,
+        }
     }
 
     /// Event sources, in the order `events/list` shows their events.
@@ -220,7 +210,7 @@ impl HttpState {
     /// Take a downstream OAuth client's access away: its tokens stop
     /// working, its sessions end, and the tasks it owns as its principal go.
     pub async fn revoke_downstream_client(&self, client_id: &str) -> ClientRevocation {
-        let Some(manager) = self.downstream_oauth.as_ref() else {
+        let Some(manager) = self.downstream_oauth() else {
             return ClientRevocation::OauthDisabled;
         };
         match manager.revoke_client(client_id).await {
@@ -258,47 +248,6 @@ impl HttpState {
 pub fn build_router(state: Arc<HttpState>) -> Router {
     state.spawn_notification_fanout();
 
-    // Discovery endpoint — exempt from origin validation
-    let discovery = Router::new()
-        .route("/.well-known/mcp.json", get(get_server_card))
-        .route("/.well-known/mcp-server-card", get(get_server_card))
-        .route(
-            "/.well-known/oauth-authorization-server",
-            get(get_oauth_authorization_server_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource",
-            get(get_oauth_protected_resource_metadata),
-        )
-        .route(
-            "/.well-known/oauth-protected-resource/mcp",
-            get(get_oauth_protected_resource_metadata),
-        )
-        .route("/oauth/register", post(oauth_register))
-        .route("/oauth/authorize", get(oauth_authorize))
-        .route("/oauth/assets/consent.js", get(oauth_consent_javascript))
-        .route("/oauth/consent/challenge", post(oauth_consent_challenge))
-        .route("/oauth/consent/decision", post(oauth_consent_decision))
-        .route("/oauth/owner/enroll", get(oauth_owner_enroll))
-        .route("/oauth/assets/enroll.js", get(oauth_enroll_javascript))
-        .route("/oauth/assets/plug.css", get(oauth_stylesheet))
-        .route("/oauth/assets/plug-icon.svg", get(oauth_icon))
-        .route(
-            "/oauth/owner/enroll/challenge",
-            post(oauth_owner_enroll_challenge),
-        )
-        .route(
-            "/oauth/owner/enroll/complete",
-            post(oauth_owner_enroll_complete),
-        )
-        .route("/oauth/token", post(oauth_token))
-        // A client that renews before it has read the metadata again posts
-        // to the address older MCP clients assume. Without it a stored
-        // sign-in cannot renew after the client restarts.
-        .route("/token", post(oauth_token))
-        .layer(DefaultBodyLimit::max(64 * 1024))
-        .with_state(state.clone());
-
     // MCP protocol routes — protected by auth + origin validation middleware
     // Layer order (innermost first): origin validation → bearer auth → body limit
     // Bearer auth runs first; if authenticated, origin validation is skipped.
@@ -316,29 +265,16 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .layer(RequestBodyLimitLayer::new(4 * 1024 * 1024)) // 4MB DoS prevention
         .with_state(state.clone());
 
-    // Sources that take events pushed from outside sign those requests
-    // themselves, so these routes sit outside the MCP auth layers.
-    let mut router = discovery.merge(mcp);
-    for source in &state.event_sources {
-        let Some(path) = source.ingest_path() else {
-            continue;
-        };
-        let source = Arc::clone(source);
-        let ingest = Router::new()
-            .route(
-                path,
-                post(move |headers: HeaderMap, body: Bytes| async move {
-                    match source.ingest(&headers, &body).await {
-                        Ok(value) => Json(value).into_response(),
-                        Err(error) => (error.http_status(), Json(json!({"error":error.message})))
-                            .into_response(),
-                    }
-                }),
-            )
-            .layer(DefaultBodyLimit::max(crate::events::MAX_BODY));
-        router = ingest.merge(router);
+    let mut router =
+        discovery_router(Arc::clone(&state)).merge(ingest_router(&state.event_sources));
+    if let HttpAuth::Oauth(manager) = &state.auth {
+        router = router.merge(super::oauth::router(manager.clone()));
     }
+    // axum runs a merged router's layers on its fallback too. A path Plug
+    // does not serve is not found, whatever the `/mcp` guards would say.
     router
+        .merge(mcp)
+        .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
 /// POST /mcp — handle JSON-RPC requests, notifications, and client responses.
@@ -386,8 +322,7 @@ pub(super) async fn post_mcp(
             &headers,
             &state.allowed_origins,
             state
-                .downstream_oauth
-                .as_ref()
+                .downstream_oauth()
                 .map(crate::downstream_oauth::DownstreamOauthManager::base_url),
         )?;
         validate_modern_origin(&headers, &state.allowed_origins)?;
@@ -979,7 +914,7 @@ mod tests {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
         let claims = match manager
-            .validate_access_token_for(&access_token, &[], &manager.resource())
+            .validate_access_token_for(&access_token, &manager.resource())
             .await
         {
             AccessTokenValidation::Valid(claims) => claims,
@@ -1508,8 +1443,7 @@ mod tests {
                 Arc::new(crate::session::SessionStore::new(1800, 100)),
                 state.cancel.clone(),
             )
-            .with_auth_mode(crate::config::DownstreamAuthMode::Oauth)
-            .with_downstream_oauth(Some(manager))
+            .with_auth(crate::http::server::HttpAuth::Oauth(manager))
             .with_sse_channel_capacity(state.sse_channel_capacity)
             .with_allowed_origins(state.allowed_origins.clone()),
         );
@@ -2016,7 +1950,7 @@ mod tests {
             Arc::new(crate::session::SessionStore::new(1800, 100)),
             CancellationToken::new(),
         )
-        .with_downstream_oauth(Some(manager.clone()));
+        .with_auth(crate::http::server::HttpAuth::Oauth(manager.clone()));
         let theirs = state.sessions.create_session().unwrap();
         state
             .sessions

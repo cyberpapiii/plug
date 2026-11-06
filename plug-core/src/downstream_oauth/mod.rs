@@ -5,6 +5,7 @@
 //! former single configured client: upgrading is a clean security boundary.
 
 pub mod owner;
+pub mod paths;
 
 pub use owner::{
     OwnerApprovalChallenge, OwnerAuthenticationCeremony, OwnerBootstrap, OwnerCredential,
@@ -65,7 +66,6 @@ const CURSOR_NATIVE_REDIRECT: &str = "cursor://anysphere.cursor-mcp/oauth/callba
 pub struct DownstreamOauthConfig {
     pub public_base_url: String,
     pub oauth_scopes: Vec<String>,
-    pub local_port: u16,
 }
 
 impl DownstreamOauthConfig {
@@ -81,7 +81,6 @@ impl DownstreamOauthConfig {
                     .map(ToString::to_string)
                     .collect()
             }),
-            local_port: http.port,
         })
     }
 }
@@ -382,7 +381,6 @@ pub struct AccessTokenClaims {
 pub enum AccessTokenValidation {
     Valid(AccessTokenClaims),
     Invalid,
-    InsufficientScope,
 }
 
 #[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
@@ -698,10 +696,6 @@ struct ClientMetadataDocument {
 }
 
 impl DownstreamOauthManager {
-    pub fn new(config: DownstreamOauthConfig) -> Self {
-        Self::try_new(config).expect("downstream OAuth state must be readable")
-    }
-
     pub fn try_new(config: DownstreamOauthConfig) -> Result<Self, DownstreamOauthError> {
         let state_dir = crate::paths::downstream_oauth_dir();
         Self::try_new_with_state_dir(config, &state_dir)
@@ -820,20 +814,14 @@ impl DownstreamOauthManager {
         self.config.public_base_url.trim_end_matches('/')
     }
 
+    /// This issuer's address for `path`, one of [`paths`].
+    pub fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url())
+    }
+
+    /// The protected resource tokens from this issuer are bound to.
     pub fn resource(&self) -> String {
-        format!("{}/mcp", self.base_url())
-    }
-
-    pub fn authorization_endpoint(&self) -> String {
-        format!("{}/oauth/authorize", self.base_url())
-    }
-
-    pub fn token_endpoint(&self) -> String {
-        format!("{}/oauth/token", self.base_url())
-    }
-
-    pub fn registration_endpoint(&self) -> String {
-        format!("{}/oauth/register", self.base_url())
+        self.url(paths::MCP)
     }
 
     #[cfg(test)]
@@ -1360,9 +1348,9 @@ impl DownstreamOauthManager {
         clients
     }
 
-    /// Recheck a durable event subscription without retaining an access token.
-    /// A live access or refresh grant must still authorize this resource/scope.
-    pub async fn permits_event_delivery(&self, client_id: &str, scope: &str) -> bool {
+    /// Whether `client_id` still holds a live access or refresh grant for
+    /// this resource that carries `scope`.
+    pub async fn holds_live_grant(&self, client_id: &str, scope: &str) -> bool {
         if self.durability_degraded() {
             return false;
         }
@@ -1380,17 +1368,28 @@ impl DownstreamOauthManager {
         {
             return false;
         }
-        let resource = format!("{}/mcp", self.base_url().trim_end_matches('/'));
+        let resource = self.resource();
+        let live =
+            |grant_client: &str, expires_at: u64, grant_resource: &str, scopes: &[String]| {
+                grant_client == client_id
+                    && expires_at > now
+                    && grant_resource == resource
+                    && scopes.iter().any(|s| s == scope)
+            };
         guard.access_tokens.values().any(|grant| {
-            grant.client_id == client_id
-                && grant.expires_at > now
-                && grant.resource == resource
-                && grant.scopes.iter().any(|s| s == scope)
+            live(
+                &grant.client_id,
+                grant.expires_at,
+                &grant.resource,
+                &grant.scopes,
+            )
         }) || guard.refresh_tokens.values().any(|grant| {
-            grant.client_id == client_id
-                && grant.expires_at > now
-                && grant.resource == resource
-                && grant.scopes.iter().any(|s| s == scope)
+            live(
+                &grant.client_id,
+                grant.expires_at,
+                &grant.resource,
+                &grant.scopes,
+            )
         })
     }
 
@@ -1719,7 +1718,6 @@ impl DownstreamOauthManager {
     pub async fn validate_access_token_for(
         &self,
         token: &str,
-        required_scopes: &[String],
         resource: &str,
     ) -> AccessTokenValidation {
         if self.durability_degraded() {
@@ -1734,12 +1732,6 @@ impl DownstreamOauthManager {
             || !guard.clients.contains_key(&record.client_id)
         {
             return AccessTokenValidation::Invalid;
-        }
-        if required_scopes
-            .iter()
-            .any(|scope| !record.scopes.contains(scope))
-        {
-            return AccessTokenValidation::InsufficientScope;
         }
         AccessTokenValidation::Valid(AccessTokenClaims {
             client_id: record.client_id.clone(),
@@ -2739,7 +2731,6 @@ mod tests {
         DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
-            local_port: 3282,
         }
     }
 
@@ -4138,27 +4129,15 @@ mod tests {
         let manager = DownstreamOauthManager::new_with_state_path(wider, path)
             .expect("v3 state with scope_model loads");
         let resource = manager.resource();
-        assert!(matches!(
-            manager
-                .validate_access_token_for(
-                    "access-existing",
-                    &["tools:read".to_string()],
-                    &resource
-                )
-                .await,
-            AccessTokenValidation::Valid(_)
-        ));
-        assert!(
-            matches!(
-                manager
-                    .validate_access_token_for(
-                        "access-existing",
-                        &["tools:call".to_string()],
-                        &resource
-                    )
-                    .await,
-                AccessTokenValidation::InsufficientScope
-            ),
+        let AccessTokenValidation::Valid(claims) = manager
+            .validate_access_token_for("access-existing", &resource)
+            .await
+        else {
+            panic!("the stored grant still works");
+        };
+        assert_eq!(
+            claims.scopes,
+            vec!["tools:read".to_string()],
             "a stored grant must not widen to the configured scope set"
         );
         let state = manager.state.lock().await;
@@ -4292,7 +4271,7 @@ mod tests {
         let tokens = issue_tokens(&manager, &client).await;
         let resource = "https://plug.example.com/mcp";
         let AccessTokenValidation::Valid(open) = manager
-            .validate_access_token_for(&tokens.access_token, &[], resource)
+            .validate_access_token_for(&tokens.access_token, resource)
             .await
         else {
             panic!("a fresh token works");
@@ -4379,7 +4358,7 @@ mod tests {
         for pair in [&first, &second] {
             assert!(matches!(
                 manager
-                    .validate_access_token_for(&pair.access_token, &[], resource)
+                    .validate_access_token_for(&pair.access_token, resource)
                     .await,
                 AccessTokenValidation::Valid(_)
             ));
@@ -4399,7 +4378,7 @@ mod tests {
             .expect("the idle process, an hour later, renews too");
         assert!(matches!(
             manager
-                .validate_access_token_for(&first.access_token, &[], resource)
+                .validate_access_token_for(&first.access_token, resource)
                 .await,
             AccessTokenValidation::Valid(_)
         ));
@@ -4457,7 +4436,7 @@ mod tests {
 
         // The rotated pair works before the replay.
         let AccessTokenValidation::Valid(open_under_it) = manager
-            .validate_access_token_for(&rotated.access_token, &[], "https://plug.example.com/mcp")
+            .validate_access_token_for(&rotated.access_token, "https://plug.example.com/mcp")
             .await
         else {
             panic!("the rotated pair works before the replay");
@@ -4486,11 +4465,7 @@ mod tests {
         // present has to die too, or the stolen token keeps a live descendant.
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &rotated.access_token,
-                    &[],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&rotated.access_token, "https://plug.example.com/mcp",)
                 .await,
             AccessTokenValidation::Invalid,
             "the descendant access token must not outlive the replay"
@@ -4552,7 +4527,6 @@ mod tests {
                 manager
                     .validate_access_token_for(
                         &bystander.access_token,
-                        &[],
                         "https://plug.example.com/mcp",
                     )
                     .await,
@@ -4618,11 +4592,7 @@ mod tests {
         drop(memory);
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &original.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&original.access_token, "https://plug.example.com/mcp",)
                 .await,
             AccessTokenValidation::Invalid
         );
@@ -4673,11 +4643,7 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let lease = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                "https://plug.example.com/mcp",
-            )
+            .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
             AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
@@ -4692,11 +4658,7 @@ mod tests {
         assert!(!lease.is_active());
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp",)
                 .await,
             AccessTokenValidation::Invalid
         );
@@ -4723,11 +4685,7 @@ mod tests {
         );
         assert_eq!(
             restarted
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp",
-                )
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp",)
                 .await,
             AccessTokenValidation::Invalid
         );
@@ -5027,7 +4985,6 @@ mod tests {
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
-                local_port: 3282,
             },
             temp_state_path(),
         )
@@ -5587,11 +5544,7 @@ mod tests {
         let access = cursor_tokens.access_token.clone();
         assert!(matches!(
             manager
-                .validate_access_token_for(
-                    &access,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
+                .validate_access_token_for(&access, "https://plug.example.com/mcp")
                 .await,
             AccessTokenValidation::Valid(_)
         ));
@@ -5618,11 +5571,7 @@ mod tests {
         // The original access token outlives the rotation itself.
         assert!(matches!(
             manager
-                .validate_access_token_for(
-                    &access,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
+                .validate_access_token_for(&access, "https://plug.example.com/mcp")
                 .await,
             AccessTokenValidation::Valid(_)
         ));
@@ -5643,11 +5592,7 @@ mod tests {
         // the replay was the whole response and the chain stayed live.
         assert_eq!(
             manager
-                .validate_access_token_for(
-                    &access,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
+                .validate_access_token_for(&access, "https://plug.example.com/mcp")
                 .await,
             AccessTokenValidation::Invalid
         );
@@ -5659,7 +5604,6 @@ mod tests {
             manager
                 .validate_access_token_for(
                     &claude_tokens.access_token,
-                    &["tools:read".to_string()],
                     "https://plug.example.com/mcp"
                 )
                 .await,
@@ -5743,11 +5687,7 @@ mod tests {
         assert_eq!(restarted.list_clients().await.len(), 1);
         assert!(matches!(
             restarted
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
                 .await,
             AccessTokenValidation::Valid(_)
         ));
@@ -5763,11 +5703,7 @@ mod tests {
         assert!(after_revoke.list_clients().await.is_empty());
         assert!(matches!(
             after_revoke
-                .validate_access_token_for(
-                    &tokens.access_token,
-                    &["tools:read".to_string()],
-                    "https://plug.example.com/mcp"
-                )
+                .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
                 .await,
             AccessTokenValidation::Invalid
         ));
@@ -5788,11 +5724,7 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let lease = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                "https://plug.example.com/mcp",
-            )
+            .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
             AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
@@ -5811,11 +5743,7 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let tokens = issue_tokens(&manager, &client).await;
         let lease = match manager
-            .validate_access_token_for(
-                &tokens.access_token,
-                &["tools:read".to_string()],
-                "https://plug.example.com/mcp",
-            )
+            .validate_access_token_for(&tokens.access_token, "https://plug.example.com/mcp")
             .await
         {
             AccessTokenValidation::Valid(claims) => claims.principal_lifecycle,
@@ -5902,11 +5830,7 @@ mod tests {
 
         let request = tokio::spawn(async move {
             let claims = match request_manager
-                .validate_access_token_for(
-                    &access_token,
-                    &["tools:read".to_string()],
-                    &request_manager.resource(),
-                )
+                .validate_access_token_for(&access_token, &request_manager.resource())
                 .await
             {
                 AccessTokenValidation::Valid(claims) => claims,

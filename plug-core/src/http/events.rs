@@ -5,13 +5,47 @@ use super::response::*;
 use super::server::*;
 use crate::downstream_oauth::AccessTokenClaims;
 use crate::events::{EVENT_SCOPE, EventSource};
-use axum::response::Response;
+use axum::body::Bytes;
+use axum::extract::DefaultBodyLimit;
+use axum::http::HeaderMap;
+use axum::response::{IntoResponse, Response};
+use axum::routing::post;
+use axum::{Json, Router};
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
 use serde_json::json;
 use std::sync::Arc;
 
 /// The asking client and the event sources it can see, when there are any.
+/// Sources that take events pushed from outside sign those requests
+/// themselves, so these routes sit outside the MCP auth layers.
+pub(super) fn ingest_router(sources: &[Arc<dyn EventSource>]) -> Router {
+    let mut router = Router::new();
+    for source in sources {
+        let Some(path) = source.ingest_path() else {
+            continue;
+        };
+        let source = Arc::clone(source);
+        router = router.merge(
+            Router::new()
+                .route(
+                    path,
+                    post(move |headers: HeaderMap, body: Bytes| async move {
+                        match source.ingest(&headers, &body).await {
+                            Ok(value) => Json(value).into_response(),
+                            Err(error) => {
+                                (error.http_status(), Json(json!({"error":error.message})))
+                                    .into_response()
+                            }
+                        }
+                    }),
+                )
+                .layer(DefaultBodyLimit::max(crate::events::MAX_BODY)),
+        );
+    }
+    router
+}
+
 pub(super) fn event_sources_for<'a>(
     state: &'a HttpState,
     auth: &'a AuthStatus,
@@ -65,7 +99,7 @@ pub(super) async fn event_request(
     if let Some(method) = subscription_method
         && sources.is_some()
         && !has_scope
-        && let Some(manager) = &state.downstream_oauth
+        && let Some(manager) = state.downstream_oauth()
     {
         tracing::info!(
             method,
@@ -74,7 +108,7 @@ pub(super) async fn event_request(
             "MCP Events subscription outcome"
         );
         return Err(HttpError::InsufficientScopeWithMetadata {
-            metadata_url: protected_resource_metadata_url(manager.base_url()),
+            metadata_url: protected_resource_metadata_url(manager),
             scope: EVENT_SCOPE.to_string(),
         });
     }

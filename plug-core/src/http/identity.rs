@@ -39,8 +39,7 @@ impl HttpDownstreamContext {
         request_meta: Option<&RequestMetaObject>,
     ) -> Self {
         let oauth_issuer = state
-            .downstream_oauth
-            .as_ref()
+            .downstream_oauth()
             .map(|manager| Arc::<str>::from(manager.base_url()));
         let (session_id, client_type, client_metadata, modern_task_client, protocol_era) =
             match session {
@@ -96,9 +95,8 @@ impl HttpDownstreamContext {
     }
 }
 
-/// What a request proved about its caller. `NoAuthRequired` is produced only
-/// when `auth_mode` is not OAuth and no bearer token is configured, a
-/// combination config validation permits only for a loopback bind.
+/// What a request proved about its caller. `NoAuthRequired` comes only from
+/// a listener under [`HttpAuth::Open`].
 pub(super) fn http_credential<'a>(
     auth_status: &'a AuthStatus,
     oauth_issuer: Option<&'a str>,
@@ -129,10 +127,7 @@ pub(super) fn legacy_http_policy_context(
     apply_http_auth(
         context,
         auth_status,
-        state
-            .downstream_oauth
-            .as_ref()
-            .map(|manager| manager.base_url()),
+        state.downstream_oauth().map(|manager| manager.base_url()),
     )
 }
 

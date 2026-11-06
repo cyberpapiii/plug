@@ -504,7 +504,7 @@ fn validate_owner_enrollment_url<'a>(
         || candidate.origin() != expected.origin()
         || !candidate.username().is_empty()
         || candidate.password().is_some()
-        || candidate.path() != "/oauth/owner/enroll"
+        || candidate.path() != plug_core::downstream_oauth::paths::OWNER_ENROLL
         || candidate.query().is_some()
         || !valid_bootstrap
     {
