@@ -258,13 +258,6 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn watcher_smoke_spawns_and_cancels_cleanly() {
-        let fixture = WatcherFixture::new().await;
-        assert!(fixture.engine.server_statuses().is_empty());
-        fixture.shutdown().await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
     async fn watcher_applies_config_change_from_disk() {
         let mut fixture = WatcherFixture::new().await;
         assert!(fixture.engine.server_statuses().is_empty());

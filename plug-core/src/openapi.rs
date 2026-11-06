@@ -1144,7 +1144,10 @@ mod tests {
         let error = parse_document(&text, "/tmp/big.json", None, &[])
             .unwrap_err()
             .to_string();
-        assert!(error.contains("51 operations"), "{error}");
+        assert!(
+            error.contains(&format!("{} operations", MAX_OPERATIONS + 1)),
+            "{error}"
+        );
 
         let chosen = ["thing1".to_string(), "thing4*".to_string()];
         let document = parse_document(&text, "/tmp/big.json", None, &chosen).expect("parse");
