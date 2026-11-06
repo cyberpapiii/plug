@@ -3,16 +3,16 @@ use super::events::{event_request, events_discoverable, ingest_router};
 use super::fanout::drain_targeted_notifications;
 use super::guard::{validate_bearer_auth, validate_modern_request, validate_origin};
 use super::identity::{
-    AuthStatus, HttpDownstreamContext, HttpRequestCancellationGuard, legacy_http_policy_context,
+    AuthStatus, HttpDownstreamContext, HttpRequestCancellationGuard, grant_task_owner,
 };
 use super::response::{
     LONG_CALL_AFTER, answer_or_keep_open, header_mismatch_response, json_response_for_era,
     json_response_with_session, mark_private, modern_sse_response,
 };
-use super::reverse::{HttpBridge, handle_client_response, maybe_request_http_roots};
+use super::reverse::{handle_client_response, maybe_request_http_roots};
 use super::session_binding::{
     bind_session_to_caller, extract_session_id, reopen_lost_session, session_is_the_callers,
-    validate_session_header,
+    validate_session_header, wire_session,
 };
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -27,7 +27,6 @@ use axum::{Router, extract::DefaultBodyLimit};
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
 use rmcp::model::*;
-use serde_json::json;
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
@@ -35,14 +34,12 @@ use tower_http::limit::RequestBodyLimitLayer;
 
 use super::error::HttpError;
 use super::sse::sse_stream_with_heartbeat;
-use crate::downstream_identity::HttpCredential;
 use crate::events::EventSource;
 use crate::mcp_http_headers::{
     TRACEPARENT_HEADER, inject_trace_context, validate_mirrored_headers,
     validate_required_mirrored_headers,
 };
-use crate::notifications::NotificationTarget;
-use crate::proxy::{DownstreamCallContext, ToolRouter};
+use crate::proxy::ToolRouter;
 use crate::session::{SessionEnd, SessionStore};
 
 pub(super) const SESSION_ID_HEADER: &str = "Mcp-Session-Id";
@@ -72,6 +69,7 @@ pub struct HttpState {
     pub(crate) event_sources: Vec<Arc<dyn EventSource>>,
     pub(crate) sse_channel_capacity: usize,
     /// Browser origins allowed besides this Mac's own, exactly as written.
+    /// Their hosts are also hosts a modern request may name in Host.
     pub(crate) allowed_origins: Vec<Arc<str>>,
     /// The host of `http.public_base_url`. A modern request may name it in
     /// Host; a page served from it is not thereby allowed.
@@ -151,8 +149,8 @@ pub enum ClientRevocation {
     Revoked,
     UnknownClient,
     OauthDisabled,
-    /// The grant stopped working before the save was tried, so its sessions
-    /// ended even though saving the revocation failed.
+    /// Saving the revocation failed. The grant stopped working before the
+    /// save was tried, so its sessions and tasks went all the same.
     SaveFailed(crate::downstream_oauth::DownstreamOauthError),
 }
 
@@ -271,33 +269,22 @@ impl HttpState {
         let Some(manager) = self.downstream_oauth() else {
             return ClientRevocation::OauthDisabled;
         };
-        match manager.revoke_client(client_id).await {
-            Ok(true) => {
-                self.end_sessions_of(client_id).await;
-                // The manager already refuses the grant's tokens, and the
-                // task store's create guard keeps a create that is under way
-                // from outliving this cleanup.
-                let resource = manager.resource();
-                let owner = HttpCredential::Grant {
-                    issuer: manager.base_url(),
-                    client_id,
-                    resource: &resource,
-                }
-                .task_owner(None);
-                self.router.cleanup_tasks_for_owner(&owner).await;
-                ClientRevocation::Revoked
-            }
-            Ok(false) => ClientRevocation::UnknownClient,
-            Err(error) => {
-                self.end_sessions_of(client_id).await;
-                ClientRevocation::SaveFailed(error)
-            }
+        let revoked = manager.revoke_client(client_id).await;
+        if matches!(revoked, Ok(false)) {
+            return ClientRevocation::UnknownClient;
         }
-    }
-
-    async fn end_sessions_of(&self, client_id: &str) {
+        // Saved or not, the manager already refuses the grant's tokens, and
+        // the task store's create guard keeps a create that is under way
+        // from outliving this cleanup.
         for session_id in self.sessions.sessions_of(client_id) {
             self.end_session(&session_id, SessionEnd::Revoked).await;
+        }
+        self.router
+            .cleanup_tasks_for_owner(&grant_task_owner(manager, client_id))
+            .await;
+        match revoked {
+            Ok(_) => ClientRevocation::Revoked,
+            Err(error) => ClientRevocation::SaveFailed(error),
         }
     }
 }
@@ -333,7 +320,6 @@ pub fn build_router(state: Arc<HttpState>) -> Router {
         .fallback(|| async { StatusCode::NOT_FOUND })
 }
 
-/// POST /mcp — handle JSON-RPC requests, notifications, and client responses.
 pub(super) async fn post_mcp(
     State(state): State<Arc<HttpState>>,
     axum::Extension(auth_status): axum::Extension<AuthStatus>,
@@ -382,7 +368,7 @@ pub(super) async fn post_mcp(
         crate::protocol::rewrite_legacy_request(&mut raw_message);
         // `initialize` opens a session of its own.
         if raw_message.get("method").and_then(|method| method.as_str()) != Some("initialize") {
-            reopen_lost_session(&state, &headers, &auth_status).await;
+            reopen_lost_session(&state, &headers, &auth_status).await?;
         }
     }
     let method = raw_message
@@ -398,10 +384,10 @@ pub(super) async fn post_mcp(
         }
     })?;
 
-    validate_protocol_version_for_post(&headers, era)?;
     let mirrored = if era == crate::protocol::ProtocolEra::Modern {
         validate_required_mirrored_headers(&headers, &message)
     } else {
+        validate_legacy_protocol_version(&headers)?;
         validate_mirrored_headers(&headers, &message)
     };
     if let Err(err) = mirrored {
@@ -465,36 +451,25 @@ pub(super) async fn post_mcp(
             match notification.notification {
                 ClientNotification::CancelledNotification(cancelled) => {
                     if let Some(request_id) = cancelled.params.request_id.clone() {
-                        state.router.forward_cancel_from_downstream(
-                            &DownstreamCallContext::http(
-                                Arc::<str>::from(session_id.as_str()),
+                        // Built as the call it cancels was, so both name the
+                        // same downstream call.
+                        let context = crate::dispatch::DownstreamContext::downstream_call_context(
+                            &HttpDownstreamContext::new(
+                                &state,
+                                auth_status,
+                                Some(&session_id),
                                 request_id,
-                                crate::types::ClientType::Unknown,
-                            )
-                            .with_trace_id(Arc::clone(&trace_id)),
-                            cancelled.params.reason,
+                                trace_id,
+                                None,
+                            ),
                         );
+                        state
+                            .router
+                            .cancel_downstream_request(&context, cancelled.params.reason);
                     }
                 }
                 ClientNotification::InitializedNotification(_) => {
-                    maybe_request_http_roots(Arc::clone(&state), session_id.clone());
-                    let caps = state
-                        .client_capabilities
-                        .get(&session_id)
-                        .map(|c| c.clone())
-                        .unwrap_or_default();
-                    let session_arc = Arc::<str>::from(session_id.as_str());
-                    let bridge = Arc::new(HttpBridge {
-                        state: Arc::clone(&state),
-                        session_id: Arc::clone(&session_arc),
-                        capabilities: caps,
-                    });
-                    state.router.register_downstream_bridge(
-                        NotificationTarget::Http {
-                            session_id: session_arc,
-                        },
-                        bridge,
-                    );
+                    wire_session(&state, &session_id);
                 }
                 ClientNotification::RootsListChangedNotification(_) => {
                     maybe_request_http_roots(Arc::clone(&state), session_id.clone());
@@ -512,13 +487,7 @@ pub(super) async fn post_mcp(
     }
 }
 
-pub(super) fn validate_protocol_version_for_post(
-    headers: &HeaderMap,
-    era: crate::protocol::ProtocolEra,
-) -> Result<(), HttpError> {
-    if era == crate::protocol::ProtocolEra::Modern {
-        return Ok(());
-    }
+fn validate_legacy_protocol_version(headers: &HeaderMap) -> Result<(), HttpError> {
     match headers.get(PROTOCOL_VERSION_HEADER) {
         Some(value) => {
             let version = value
@@ -571,14 +540,13 @@ pub(super) fn extract_trace_id(headers: &HeaderMap) -> String {
     crate::proxy::new_trace_id()
 }
 
-/// GET /mcp — open SSE stream for server-initiated notifications.
 pub(super) async fn get_mcp(
     State(state): State<Arc<HttpState>>,
     axum::Extension(auth_status): axum::Extension<AuthStatus>,
     headers: HeaderMap,
 ) -> Result<Response, HttpError> {
     let session_id = extract_session_id(&headers)?;
-    reopen_lost_session(&state, &headers, &auth_status).await;
+    reopen_lost_session(&state, &headers, &auth_status).await?;
     state.sessions.validate(&session_id)?;
     session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
@@ -609,7 +577,6 @@ pub(super) async fn get_mcp(
     Ok(response)
 }
 
-/// DELETE /mcp — terminate a session.
 pub(super) async fn delete_mcp(
     State(state): State<Arc<HttpState>>,
     axum::Extension(auth_status): axum::Extension<AuthStatus>,
@@ -652,7 +619,7 @@ pub(super) async fn handle_request(
         _ => None,
     };
     if let Some(method) = discovery_method {
-        tracing::info!(
+        tracing::debug!(
             method,
             protocol_era = if modern { "modern" } else { "legacy" },
             selected_event_client = events_discoverable(state, &auth_status),
@@ -687,7 +654,7 @@ pub(super) async fn handle_request(
                 );
             }
         };
-        return event_request(state, &auth_status, custom, request_id, era).await;
+        return event_request(state, &auth_status, custom, request_id).await;
     }
 
     // A legacy request belongs to a session, which only `initialize` opens.
@@ -706,14 +673,8 @@ pub(super) async fn handle_request(
                 selected_protocol = crate::protocol::SUPPORTED_PROTOCOL_VERSION,
                 "HTTP client connected"
             );
-            let _ = state.sessions.set_client_type(&session_id, client_type);
-            let policy_context = legacy_http_policy_context(
-                state,
-                &auth_status,
-                request_id.clone(),
-                Arc::clone(&trace_id),
-            );
-            bind_session_to_caller(state, &session_id, &auth_status, &policy_context)?;
+            state.sessions.set_client_type(&session_id, client_type)?;
+            bind_session_to_caller(state, &session_id, &auth_status)?;
             state
                 .client_capabilities
                 .insert(session_id.clone(), init_req.params.capabilities.clone());
@@ -775,19 +736,7 @@ pub(super) async fn handle_request(
         return json_response_for_era(&message, era);
     }
 
-    let mut outcome = crate::dispatch::handle(&state.router, &ctx, &method, params).await;
-    if matches!(req.request, ClientRequest::DiscoverRequest(_))
-        && let Ok(result) = outcome.as_mut()
-        && events_discoverable(state, &ctx.auth_status)
-    {
-        tracing::info!(
-            method = "server/discover",
-            status = 200,
-            events_advertised = true,
-            "MCP Events discovery outcome"
-        );
-        result["capabilities"]["events"] = json!({});
-    }
+    let outcome = crate::dispatch::handle(&state.router, &ctx, &method, params).await;
     let message = dispatch_message(outcome, request_id);
     match (&req.request, session_id) {
         (ClientRequest::InitializeRequest(_), Some(session_id)) => {
@@ -933,11 +882,15 @@ mod tests {
             .await
             .expect("issued token must validate");
         let state = test_state();
-        let context = legacy_http_policy_context(
-            &state,
-            &AuthStatus::Authenticated(Some(claims)),
-            RequestId::Number(91),
-            Arc::from("legacy-oauth-scope-gate"),
+        let context = crate::dispatch::DownstreamContext::downstream_call_context(
+            &HttpDownstreamContext::new(
+                &state,
+                AuthStatus::Authenticated(Some(claims)),
+                Some("legacy-oauth-scope-gate"),
+                RequestId::Number(91),
+                Arc::from("legacy-oauth-scope-gate"),
+                None,
+            ),
         );
 
         assert!(
@@ -1388,7 +1341,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_off_rejects_every_modern_http_task_method_before_dispatch() {
+    async fn the_modern_gate_refuses_every_http_task_method() {
         let state = test_state();
         enable_test_task_surface(state.router.as_ref());
         for (method, params) in [
@@ -1399,11 +1352,28 @@ mod tests {
             ),
             ("tasks/cancel", json!({"taskId":"task_1"})),
         ] {
-            let response = build_router(Arc::clone(&state))
-                .oneshot(modern_request(method, params))
-                .await
-                .expect("task response");
-            assert_ne!(response.status(), StatusCode::OK, "{method} escaped gate");
+            let answer = |enabled: bool| {
+                state.router.set_modern_downstream_enabled(enabled);
+                let request = modern_request(method, params.clone());
+                let app = build_router(Arc::clone(&state));
+                async move {
+                    let response = app.oneshot(request).await.expect("task response");
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("body");
+                    (status, String::from_utf8_lossy(&body).into_owned())
+                }
+            };
+            let refused = answer(false).await;
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{method}: {refused:?}");
+            assert!(
+                refused.1.contains(crate::protocol::MODERN_PROTOCOL_VERSION),
+                "{method}: {refused:?}"
+            );
+            // With the gate open the same request reaches the task methods,
+            // so the refusal above is the gate's.
+            assert_ne!(answer(true).await, refused, "{method}");
         }
     }
 
@@ -1922,7 +1892,7 @@ mod tests {
         enable_test_task_surface(&router);
         let state = HttpState::new(
             Arc::clone(&router),
-            Arc::new(crate::session::SessionStore::new(0, 100)),
+            Arc::new(crate::session::SessionStore::new(60, 100)),
             CancellationToken::new(),
         );
         let session_id = state.sessions.create_session().unwrap();
@@ -1933,7 +1903,7 @@ mod tests {
             .await
             .expect("enqueue a task for the session");
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        state.sessions.backdate_for_tests(&session_id);
         assert!(state.sessions.validate(&session_id).is_err());
 
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -1948,45 +1918,45 @@ mod tests {
 
     #[tokio::test]
     async fn revoking_a_client_ends_its_sessions_and_the_tasks_it_owns() {
-        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
-        let (client_id, _tokens) = issue_test_oauth_grant(&manager, "tools:read").await;
-        let router = bare_router();
-        enable_test_task_surface(&router);
-        let state = HttpState::new(
-            Arc::clone(&router),
-            Arc::new(crate::session::SessionStore::new(1800, 100)),
-            CancellationToken::new(),
-        )
-        .with_auth(crate::http::server::HttpAuth::Oauth(manager.clone()));
-        let theirs = state.sessions.create_session().unwrap();
-        state
-            .sessions
-            .set_grant(&theirs, client_id.clone())
-            .unwrap();
-        let other = state.sessions.create_session().unwrap();
-        let resource = manager.resource();
-        let owner = HttpCredential::Grant {
-            issuer: manager.base_url(),
-            client_id: &client_id,
-            resource: &resource,
-        }
-        .task_owner(None);
-        router
-            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
-            .await
-            .expect("enqueue a task for the client");
+        for save_fails in [false, true] {
+            let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+            let (client_id, _tokens) = issue_test_oauth_grant(&manager, "tools:read").await;
+            let router = bare_router();
+            enable_test_task_surface(&router);
+            let state = HttpState::new(
+                Arc::clone(&router),
+                Arc::new(crate::session::SessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth(crate::http::server::HttpAuth::Oauth(manager.clone()));
+            let theirs = state.sessions.create_session().unwrap();
+            bind_for_tests(&state.sessions, &theirs, Some(&client_id));
+            let other = state.sessions.create_session().unwrap();
+            let owner = grant_task_owner(&manager, &client_id);
+            router
+                .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+                .await
+                .expect("enqueue a task for the client");
 
-        assert!(matches!(
-            state.revoke_downstream_client(&client_id).await,
-            ClientRevocation::Revoked
-        ));
-        assert!(state.sessions.validate(&theirs).is_err());
-        assert!(state.sessions.validate(&other).is_ok());
-        assert_eq!(router.task_count_for_owner(&owner).await, 0);
-        assert!(matches!(
-            state.revoke_downstream_client(&client_id).await,
-            ClientRevocation::UnknownClient
-        ));
+            if save_fails {
+                crate::fs_perm::faults::fail_next_rename();
+            }
+            let revocation = state.revoke_downstream_client(&client_id).await;
+            assert_eq!(
+                matches!(revocation, ClientRevocation::SaveFailed(_)),
+                save_fails,
+                "{revocation:?}"
+            );
+            assert!(state.sessions.validate(&theirs).is_err());
+            assert!(state.sessions.validate(&other).is_ok());
+            assert_eq!(router.task_count_for_owner(&owner).await, 0);
+            if !save_fails {
+                assert!(matches!(
+                    state.revoke_downstream_client(&client_id).await,
+                    ClientRevocation::UnknownClient
+                ));
+            }
+        }
     }
 
     /// Drop guard that flips a flag when the future holding it stops

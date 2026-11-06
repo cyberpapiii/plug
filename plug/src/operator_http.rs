@@ -883,10 +883,10 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = initial
-            .decide_consent(&consent.consent_id, true)
-            .await
-            .expect("approve fixture consent");
+        let redirect =
+            plug_core::downstream_oauth::test_owner::approve_consent(&initial, &consent.consent_id)
+                .await
+                .expect("approve fixture consent");
         let code = reqwest::Url::parse(&redirect.location)
             .unwrap()
             .query_pairs()
@@ -1129,10 +1129,10 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
-            .await
-            .expect("approve consent");
+        let redirect =
+            plug_core::downstream_oauth::test_owner::approve_consent(&manager, &consent.consent_id)
+                .await
+                .expect("approve consent");
         let code = reqwest::Url::parse(&redirect.location)
             .expect("redirect URL")
             .query_pairs()

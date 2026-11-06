@@ -23,9 +23,7 @@ pub(super) use crate::mcp_http_headers::{
 pub(super) use crate::notifications::{NotificationTarget, ProtocolNotification};
 pub(super) use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 pub(super) use crate::proxy::{DownstreamBridge, DownstreamCallContext, ToolRouter};
-pub(super) use crate::session::{
-    SessionEnd, SessionSendOutcome, SessionStore, SseMessage, SseReplayKey,
-};
+pub(super) use crate::session::{SessionEnd, SessionStore, SseMessage, SseReplayKey};
 pub(super) use axum::Json;
 pub(super) use axum::body::Bytes;
 pub(super) use axum::extract::State;
@@ -49,7 +47,7 @@ pub(super) use tokio::sync::oneshot;
 pub(super) use tokio_util::sync::CancellationToken;
 pub(super) use tower_http::limit::RequestBodyLimitLayer;
 
-use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+use crate::downstream_oauth::test_owner::BrowserAuthenticator;
 use crate::downstream_oauth::{
     AuthorizationRequest, ClientRegistrationRequest, DownstreamOauthError,
 };
@@ -298,10 +296,10 @@ pub(crate) async fn issue_test_oauth_grant(
         })
         .await
         .expect("begin authorization");
-    let redirect = manager
-        .decide_consent(&consent.consent_id, true)
-        .await
-        .expect("approve consent");
+    let redirect =
+        crate::downstream_oauth::test_owner::approve_consent(manager, &consent.consent_id)
+            .await
+            .expect("approve consent");
     let code = url::Url::parse(&redirect.location)
         .expect("redirect URL")
         .query_pairs()
@@ -390,4 +388,21 @@ pub(crate) fn test_state_with_auth(token: &str) -> Arc<HttpState> {
 pub(crate) fn bare_router() -> Arc<ToolRouter> {
     let sm = Arc::new(crate::server::ServerManager::new());
     Arc::new(ToolRouter::new(sm, crate::proxy::RouterConfig::default()))
+}
+
+/// Bind `session_id` the way `initialize` would, under `grant`'s client when
+/// one is given, with every broadcast admitted.
+pub(crate) fn bind_for_tests(sessions: &SessionStore, session_id: &str, grant: Option<&str>) {
+    sessions
+        .bind(
+            session_id,
+            crate::session::SessionBinding {
+                grant: grant.map(|client_id| crate::session::GrantBinding {
+                    client_id: client_id.to_string(),
+                    still_allowed: Arc::new(|| true),
+                }),
+                broadcast_audience: crate::session::BroadcastAudience::unrestricted(),
+            },
+        )
+        .expect("bind test session");
 }

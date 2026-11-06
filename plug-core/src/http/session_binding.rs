@@ -1,38 +1,41 @@
 use super::error::HttpError;
 use super::fanout::notification_to_sse_message;
-use super::identity::{AuthStatus, legacy_http_policy_context};
+use super::identity::{AuthStatus, http_credential};
 use super::reverse::{HttpBridge, maybe_request_http_roots};
-use super::server::{HttpState, SESSION_ID_HEADER, extract_trace_id};
+use super::server::{HttpState, SESSION_ID_HEADER};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
-use crate::proxy::DownstreamCallContext;
-use crate::session::SessionStore;
+use crate::session::{BroadcastAudience, GrantBinding, SessionBinding, SessionError, SessionStore};
 use axum::http::HeaderMap;
-use rmcp::model::*;
 use std::sync::Arc;
 
-/// Resolve which broadcast notifications this principal may observe.
-///
-/// The SSE fan-out task is shared by every HTTP session and holds no request
-/// context, so the decision has to be made here, at `initialize`, while the
-/// full policy input is still in hand. `decide_method` stays the single source
-/// of policy; this only records its verdict per session.
+/// Which broadcast notifications this caller may observe on a legacy
+/// session. `decide_method` stays the single source of policy; this only
+/// records its verdict.
 pub(super) fn broadcast_audience_for(
-    context: &DownstreamCallContext,
-) -> crate::session::BroadcastAudience {
-    use crate::protocol::MethodFamily;
-    crate::session::BroadcastAudience {
-        tools: context
-            .policy_decision(MethodFamily::ToolsList)
-            .is_allowed(),
-        resources: context
-            .policy_decision(MethodFamily::ResourcesList)
-            .is_allowed(),
-        prompts: context
-            .policy_decision(MethodFamily::PromptsList)
-            .is_allowed(),
-        logging: context
-            .policy_decision(MethodFamily::LoggingRead)
-            .is_allowed(),
+    state: &HttpState,
+    auth_status: &AuthStatus,
+) -> BroadcastAudience {
+    use crate::protocol::{CapabilityPolicyInput, MethodFamily, ProtocolEra, decide_method};
+    let issuer = state.downstream_oauth().map(|manager| manager.base_url());
+    let principal = http_credential(auth_status, issuer).principal();
+    let (scopes, local_trust) = match auth_status {
+        AuthStatus::Authenticated(Some(claims)) => (claims.scopes.iter().cloned().collect(), false),
+        AuthStatus::Authenticated(None) | AuthStatus::NoAuthRequired => (Default::default(), true),
+    };
+    let input = CapabilityPolicyInput {
+        era: ProtocolEra::Legacy,
+        principal: Some(&principal),
+        scopes: &scopes,
+        local_trust,
+        modern_direction_enabled: false,
+        bridge_implemented: false,
+    };
+    let allows = |family| decide_method(&input, family).is_allowed();
+    BroadcastAudience {
+        tools: allows(MethodFamily::ToolsList),
+        resources: allows(MethodFamily::ResourcesList),
+        prompts: allows(MethodFamily::PromptsList),
+        logging: allows(MethodFamily::LoggingRead),
     }
 }
 
@@ -64,84 +67,41 @@ pub(super) fn session_is_the_callers(
     }
 }
 
-/// Tie a session to the caller that proved who it is.
+/// Tie a session to the caller that proved who it is. The grant is what
+/// Plug verified; the name a client gives is only what it said, so settings
+/// for a remote client hang on the grant.
 pub(super) fn bind_session_to_caller(
     state: &HttpState,
     session_id: &str,
     auth_status: &AuthStatus,
-    policy_context: &DownstreamCallContext,
 ) -> Result<(), HttpError> {
-    // The grant is what Plug verified. The name a client gives is only what
-    // it said, so settings for a remote client hang on the grant.
-    if let AuthStatus::Authenticated(Some(claims)) = auth_status {
-        let _ = state
-            .sessions
-            .set_grant(session_id, claims.client_id.clone());
-        // The session lives only while the grant does. Asked of the grant
-        // itself, so it holds however the grant ended: removed, expired, or
-        // removed with the save failing afterward.
-        let lifecycle = claims.principal_lifecycle.clone();
-        let _ = state
-            .sessions
-            .set_access_check(session_id, Arc::new(move || lifecycle.is_active()));
-    }
-
-    // Record what this principal may observe on the shared SSE fan-out. Not
-    // ignorable: until this lands the session denies every broadcast, so a
-    // failure here would silently mute the client.
-    state
-        .sessions
-        .set_broadcast_audience(session_id, broadcast_audience_for(policy_context))
-        .map_err(Into::into)
+    let grant = match auth_status {
+        AuthStatus::Authenticated(Some(claims)) => {
+            let lifecycle = claims.principal_lifecycle.clone();
+            Some(GrantBinding {
+                client_id: claims.client_id.clone(),
+                still_allowed: Arc::new(move || lifecycle.is_active()),
+            })
+        }
+        AuthStatus::Authenticated(None) | AuthStatus::NoAuthRequired => None,
+    };
+    let binding = SessionBinding {
+        grant,
+        broadcast_audience: broadcast_audience_for(state, auth_status),
+    };
+    Ok(state.sessions.bind(session_id, binding)?)
 }
 
-/// A client that was connected when Plug restarted, or that stayed quiet past
-/// the session timeout, goes on sending the session it was given. Many never
-/// start a new one when told theirs is gone, and fail every call from then
-/// on. The caller has already proved who it is, so its session is opened
-/// again under the same id, as its own.
-pub(super) async fn reopen_lost_session(
-    state: &Arc<HttpState>,
-    headers: &HeaderMap,
-    auth_status: &AuthStatus,
-) {
-    let Ok(session_id) = extract_session_id(headers) else {
-        return;
-    };
-    let _turn = state.session_turnover.lock().await;
-    if !matches!(state.sessions.reopen_session(&session_id), Ok(true)) {
-        return;
-    }
-    let policy_context = legacy_http_policy_context(
-        state,
-        auth_status,
-        RequestId::Number(0),
-        Arc::<str>::from(extract_trace_id(headers)),
-    );
-    // Binding fails only for a session that is already gone again.
-    if bind_session_to_caller(state, &session_id, auth_status, &policy_context).is_err() {
-        return;
-    }
-    // The client will not say `initialized` again, so the session is wired for
-    // notifications here, and told its lists may have changed while it was
-    // gone: what it holds was read from a Plug that no longer exists. What it
-    // declared at `initialize` is still known when the session only timed
-    // out; after Plug restarts it is not, until the client initializes again.
-    // A session whose teardown has not run yet still has them in place.
+/// Let upstream servers reach the session's client: register its bridge for
+/// reverse requests, with what the client declared at `initialize`, and ask
+/// for its roots.
+pub(super) fn wire_session(state: &Arc<HttpState>, session_id: &str) {
     let capabilities = state
-        .lapsed_capabilities
-        .take(&session_id)
-        .or_else(|| {
-            state
-                .client_capabilities
-                .get(&session_id)
-                .map(|entry| entry.clone())
-        })
-        .unwrap_or_default();
-    state
         .client_capabilities
-        .insert(session_id.clone(), capabilities.clone());
-    let session_arc = Arc::<str>::from(session_id.as_str());
+        .get(session_id)
+        .map(|entry| entry.clone())
+        .unwrap_or_default();
+    let session_arc = Arc::<str>::from(session_id);
     state.router.register_downstream_bridge(
         NotificationTarget::Http {
             session_id: Arc::clone(&session_arc),
@@ -152,7 +112,42 @@ pub(super) async fn reopen_lost_session(
             capabilities,
         }),
     );
-    maybe_request_http_roots(Arc::clone(state), session_id.clone());
+    maybe_request_http_roots(Arc::clone(state), session_id.to_string());
+}
+
+/// A client that was connected when Plug restarted, or that stayed quiet past
+/// the session timeout, goes on sending the session it was given. Many never
+/// start a new one when told theirs is gone, and fail every call from then
+/// on. The caller has already proved who it is, so its session is opened
+/// again under the same id, as its own. Fails only when there is no room for
+/// it.
+pub(super) async fn reopen_lost_session(
+    state: &Arc<HttpState>,
+    headers: &HeaderMap,
+    auth_status: &AuthStatus,
+) -> Result<(), HttpError> {
+    let Ok(session_id) = extract_session_id(headers) else {
+        return Ok(());
+    };
+    let _turn = state.session_turnover.lock().await;
+    match state.sessions.reopen_session(&session_id) {
+        Ok(true) => {}
+        Ok(false) | Err(SessionError::NotFound) => return Ok(()),
+        Err(error @ SessionError::TooMany) => return Err(error.into()),
+    }
+    bind_session_to_caller(state, &session_id, auth_status)?;
+    // The client will not say `initialized` again, so the session is wired
+    // here, and told its lists may have changed while it was gone: what it
+    // holds was read from a Plug that no longer exists. What it declared at
+    // `initialize` is still known when the session only timed out; after Plug
+    // restarts it is not, until the client initializes again. A session
+    // whose teardown has not run yet still has them in place.
+    if let Some(capabilities) = state.lapsed_capabilities.take(&session_id) {
+        state
+            .client_capabilities
+            .insert(session_id.clone(), capabilities);
+    }
+    wire_session(state, &session_id);
     for notification in [
         ProtocolNotification::ToolListChanged,
         ProtocolNotification::ResourceListChanged,
@@ -166,6 +161,7 @@ pub(super) async fn reopen_lost_session(
         session = %session_id,
         "reopened a session this client still held and Plug no longer had"
     );
+    Ok(())
 }
 
 pub(super) fn validate_session_header(
@@ -198,12 +194,8 @@ mod tests {
         let theirs = sessions.create_session().unwrap();
         let someone_elses = sessions.create_session().unwrap();
         let unowned = sessions.create_session().unwrap();
-        sessions
-            .set_grant(&theirs, claims.client_id.clone())
-            .unwrap();
-        sessions
-            .set_grant(&someone_elses, "another-client".to_string())
-            .unwrap();
+        bind_for_tests(&sessions, &theirs, Some(&claims.client_id));
+        bind_for_tests(&sessions, &someone_elses, Some("another-client"));
         let with = |session_id: &str| {
             let mut headers = HeaderMap::new();
             headers.insert(
@@ -236,12 +228,7 @@ mod tests {
             .await
             .expect("issued token must validate");
         let state = test_state();
-        let scoped = broadcast_audience_for(&legacy_http_policy_context(
-            &state,
-            &AuthStatus::Authenticated(Some(claims)),
-            RequestId::Number(92),
-            Arc::from("broadcast-audience-scoped"),
-        ));
+        let scoped = broadcast_audience_for(&state, &AuthStatus::Authenticated(Some(claims)));
 
         assert!(scoped.tools, "tools:read admits tool list notifications");
         assert!(
@@ -267,12 +254,7 @@ mod tests {
                 .validate_access_token_for(&token, &manager.resource())
                 .await
                 .expect("issued token must validate");
-            let audience = broadcast_audience_for(&legacy_http_policy_context(
-                &state,
-                &AuthStatus::Authenticated(Some(claims)),
-                RequestId::Number(94),
-                Arc::from("broadcast-audience-logging"),
-            ));
+            let audience = broadcast_audience_for(&state, &AuthStatus::Authenticated(Some(claims)));
             assert_eq!(
                 audience.logging,
                 expected,
@@ -283,12 +265,7 @@ mod tests {
 
         // A loopback listener that requires no auth keeps the full audience,
         // so turning auth off does not silence notifications.
-        let loopback = broadcast_audience_for(&legacy_http_policy_context(
-            &state,
-            &AuthStatus::NoAuthRequired,
-            RequestId::Number(93),
-            Arc::from("broadcast-audience-loopback"),
-        ));
+        let loopback = broadcast_audience_for(&state, &AuthStatus::NoAuthRequired);
         assert_eq!(
             loopback,
             crate::session::BroadcastAudience::unrestricted(),
@@ -407,13 +384,11 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::NOT_FOUND);
     }
 
-    #[tokio::test]
-    async fn a_session_that_timed_out_keeps_what_its_client_declared() {
-        let state = Arc::new(HttpState::new(
-            bare_router(),
-            Arc::new(crate::session::SessionStore::new(0, 100)),
-            CancellationToken::new(),
-        ));
+    /// Open a legacy session whose client declares `capabilities`.
+    async fn initialized_session(
+        state: &Arc<HttpState>,
+        capabilities: serde_json::Value,
+    ) -> String {
         let initialize = HttpRequest::builder()
             .method("POST")
             .uri("/mcp")
@@ -425,35 +400,68 @@ mod tests {
                     "method": "initialize",
                     "params": {
                         "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
-                        "capabilities": {"roots": {}, "elicitation": {}},
+                        "capabilities": capabilities,
                         "clientInfo": {"name": "returning-client", "version": "1"}
                     }
                 }))
                 .unwrap(),
             ))
             .unwrap();
-        let response = build_router(Arc::clone(&state))
+        let response = build_router(Arc::clone(state))
             .oneshot(initialize)
             .await
             .unwrap();
-        let session_id = response.headers()[SESSION_ID_HEADER]
+        response.headers()[SESSION_ID_HEADER]
             .to_str()
             .unwrap()
-            .to_string();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while state.client_capabilities.contains_key(&session_id) {
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("the session lapses");
+            .to_string()
+    }
 
+    fn holding(session_id: &str) -> HeaderMap {
         let mut headers = HeaderMap::new();
         headers.insert(
             SESSION_ID_HEADER,
-            HeaderValue::from_str(&session_id).unwrap(),
+            HeaderValue::from_str(session_id).unwrap(),
         );
-        reopen_lost_session(&state, &headers, &AuthStatus::NoAuthRequired).await;
+        headers
+    }
+
+    /// Age `session_id` out and have the store notice, which queues its
+    /// teardown.
+    fn lapse(state: &HttpState, session_id: &str) {
+        state.sessions.backdate_for_tests(session_id);
+        assert!(state.sessions.validate(session_id).is_err());
+    }
+
+    /// Wait until the teardowns queued so far have run. They run in order, so
+    /// once a session lapsed now is released, every earlier one has been.
+    async fn teardowns_ran(state: &HttpState) {
+        let marker = state.sessions.create_session().unwrap();
+        state
+            .client_capabilities
+            .insert(marker.clone(), ClientCapabilities::default());
+        lapse(state, &marker);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.client_capabilities.contains_key(&marker) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("queued teardowns run");
+    }
+
+    #[tokio::test]
+    async fn a_session_that_timed_out_keeps_what_its_client_declared() {
+        let state = test_state();
+        let session_id =
+            initialized_session(&state, serde_json::json!({"roots": {}, "elicitation": {}})).await;
+        lapse(&state, &session_id);
+        teardowns_ran(&state).await;
+        assert!(!state.client_capabilities.contains_key(&session_id));
+
+        reopen_lost_session(&state, &holding(&session_id), &AuthStatus::NoAuthRequired)
+            .await
+            .unwrap();
         let capabilities = state
             .client_capabilities
             .get(&session_id)
@@ -468,49 +476,16 @@ mod tests {
     /// alone.
     #[tokio::test]
     async fn a_session_reopened_before_its_teardown_ran_keeps_what_it_was_given() {
-        let state = Arc::new(HttpState::new(
-            bare_router(),
-            Arc::new(crate::session::SessionStore::new(60, 100)),
-            CancellationToken::new(),
-        ));
-        let initialize = HttpRequest::builder()
-            .method("POST")
-            .uri("/mcp")
-            .header("content-type", "application/json")
-            .body(Body::from(
-                serde_json::to_vec(&serde_json::json!({
-                    "jsonrpc": "2.0",
-                    "id": 1,
-                    "method": "initialize",
-                    "params": {
-                        "protocolVersion": SUPPORTED_PROTOCOL_VERSION,
-                        "capabilities": {"roots": {}},
-                        "clientInfo": {"name": "returning-client", "version": "1"}
-                    }
-                }))
-                .unwrap(),
-            ))
-            .unwrap();
-        let response = build_router(Arc::clone(&state))
-            .oneshot(initialize)
-            .await
-            .unwrap();
-        let session_id = response.headers()[SESSION_ID_HEADER]
-            .to_str()
-            .unwrap()
-            .to_string();
-        // Let the cleanup task take its first tick, then age the session out
-        // without anything else noticing.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        let state = test_state();
+        let session_id = initialized_session(&state, serde_json::json!({"roots": {}})).await;
+        // Age the session out without anything noticing, so the reopen below
+        // is what finds it expired.
         state.sessions.backdate_for_tests(&session_id);
 
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            SESSION_ID_HEADER,
-            HeaderValue::from_str(&session_id).unwrap(),
-        );
-        reopen_lost_session(&state, &headers, &AuthStatus::NoAuthRequired).await;
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        reopen_lost_session(&state, &holding(&session_id), &AuthStatus::NoAuthRequired)
+            .await
+            .unwrap();
+        teardowns_ran(&state).await;
 
         let capabilities = state
             .client_capabilities
@@ -518,5 +493,21 @@ mod tests {
             .map(|entry| entry.clone())
             .expect("the reopened session keeps its capabilities");
         assert!(capabilities.roots.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_lost_session_with_no_room_for_it_is_told_to_wait() {
+        let state = Arc::new(HttpState::new(
+            bare_router(),
+            Arc::new(crate::session::SessionStore::new(1800, 1)),
+            CancellationToken::new(),
+        ));
+        state.sessions.create_session().unwrap();
+        let lost = uuid::Uuid::new_v4().to_string();
+
+        assert!(matches!(
+            reopen_lost_session(&state, &holding(&lost), &AuthStatus::NoAuthRequired).await,
+            Err(HttpError::TooManySessions)
+        ));
     }
 }

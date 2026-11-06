@@ -23,6 +23,7 @@ pub(super) struct HttpDownstreamContext {
     /// What a modern request declared in `_meta`. HTTP serves the modern
     /// tasks extension, so a modern request always has one.
     pub(super) modern_task_client: Option<ClientCapabilities>,
+    pub(super) events_discoverable: bool,
 }
 
 impl HttpDownstreamContext {
@@ -76,6 +77,8 @@ impl HttpDownstreamContext {
                     )
                 }
             };
+        let events_discoverable = protocol_era == crate::protocol::ProtocolEra::Modern
+            && super::events::events_discoverable(state, &auth_status);
         Self {
             session_id,
             request_id,
@@ -88,6 +91,7 @@ impl HttpDownstreamContext {
             modern_direction_enabled: state.router.modern_downstream_enabled(),
             client_metadata,
             modern_task_client,
+            events_discoverable,
         }
     }
 }
@@ -109,23 +113,18 @@ pub(super) fn http_credential<'a>(
     }
 }
 
-pub(super) fn legacy_http_policy_context(
-    state: &HttpState,
-    auth_status: &AuthStatus,
-    request_id: RequestId,
-    trace_id: Arc<str>,
-) -> DownstreamCallContext {
-    let context = DownstreamCallContext::http(
-        "legacy-http-policy",
-        request_id,
-        crate::types::ClientType::Unknown,
-    )
-    .with_trace_id(trace_id);
-    apply_http_auth(
-        context,
-        auth_status,
-        state.downstream_oauth().map(|manager| manager.base_url()),
-    )
+/// Who owns the tasks `client_id`'s grant creates.
+pub(super) fn grant_task_owner(
+    manager: &crate::downstream_oauth::DownstreamOauthManager,
+    client_id: &str,
+) -> crate::tasks::TaskOwner {
+    let resource = manager.resource();
+    HttpCredential::Grant {
+        issuer: manager.base_url(),
+        client_id,
+        resource: &resource,
+    }
+    .task_owner(None)
 }
 
 /// Attach what the request proved about its caller to a call context.
@@ -191,6 +190,10 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
 
     fn modern_task_client(&self) -> Option<&ClientCapabilities> {
         self.modern_task_client.as_ref()
+    }
+
+    fn events_discoverable(&self) -> bool {
+        self.events_discoverable
     }
 }
 

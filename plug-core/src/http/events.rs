@@ -75,7 +75,6 @@ pub(super) async fn event_request(
     auth_status: &AuthStatus,
     custom: &CustomRequest,
     request_id: RequestId,
-    era: crate::protocol::ProtocolEra,
 ) -> Result<Response, HttpError> {
     let subscription_method = match custom.method.as_str() {
         "events/subscribe" => Some("events/subscribe"),
@@ -83,11 +82,7 @@ pub(super) async fn event_request(
         _ => None,
     };
     if let Some(method) = subscription_method {
-        tracing::info!(
-            method,
-            status = "received",
-            "MCP Events subscription request"
-        );
+        tracing::debug!(method, "MCP Events subscription request");
     }
     let sources = event_sources_for(state, auth_status);
     let has_scope = sources
@@ -101,11 +96,10 @@ pub(super) async fn event_request(
         && !has_scope
         && let Some(manager) = state.downstream_oauth()
     {
-        tracing::info!(
+        tracing::debug!(
             method,
-            status = 403,
             missing_scope = EVENT_SCOPE,
-            "MCP Events subscription outcome"
+            "MCP Events subscription refused"
         );
         return Err(HttpError::InsufficientScopeWithMetadata {
             metadata_url: protected_resource_metadata_url(manager),
@@ -125,11 +119,6 @@ pub(super) async fn event_request(
                 {
                     Err(crate::events::invalid("invalid event list parameters"))
                 } else {
-                    tracing::info!(
-                        method = "events/list",
-                        status = 200,
-                        "MCP Events discovery outcome"
-                    );
                     let events: Vec<_> = sources
                         .iter()
                         .flat_map(|source| source.catalog(&claims.client_id))
@@ -150,13 +139,9 @@ pub(super) async fn event_request(
         },
     };
     if let Some(method) = subscription_method {
-        tracing::info!(
+        tracing::debug!(
             method,
-            status = if result.is_ok() {
-                "200"
-            } else {
-                "jsonrpc_error"
-            },
+            ok = result.is_ok(),
             "MCP Events subscription outcome"
         );
     }
@@ -177,7 +162,7 @@ pub(super) async fn event_request(
             Some(request_id),
         ),
     };
-    json_response_for_era(&response, era)
+    json_response_for_era(&response, crate::protocol::ProtocolEra::Modern)
 }
 
 #[cfg(test)]

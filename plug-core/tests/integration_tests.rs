@@ -4344,10 +4344,10 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     // Public WebAuthn ceremony coverage lives in server router tests. This
     // integration test continues from a manager-level grant to focus on the
     // protected discovery and MCP-token boundary it owns.
-    let redirect = approval_manager
-        .decide_consent(consent_id, true)
-        .await
-        .expect("approve integration-test consent");
+    let redirect =
+        plug_core::downstream_oauth::test_owner::approve_consent(&approval_manager, consent_id)
+            .await
+            .expect("approve integration-test consent");
     let redirect = reqwest::Url::parse(&redirect.location).expect("parse redirect URL");
     let code = redirect
         .query_pairs()

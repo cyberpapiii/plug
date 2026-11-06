@@ -1,7 +1,9 @@
-//! Filesystem helpers: owner-only directories and atomic file replacement.
+//! Filesystem helpers for secrets: owner-only directories and files.
 
 use std::io::Write as _;
 use std::path::Path;
+
+pub const DIR_SYNC_ATTEMPTS: usize = 3;
 
 /// Create `path` (and any missing parents) with mode 0700.
 ///
@@ -16,15 +18,27 @@ pub fn ensure_dir_0700(path: &Path) -> std::io::Result<()> {
         .create(path)
 }
 
+/// Whether a write that replaced its file has reached the disk.
+#[derive(Debug)]
+#[must_use]
+pub enum Durability {
+    Durable,
+    /// The new file is in place, but syncing its directory failed, so the
+    /// rename may not survive a crash.
+    Uncertain(std::io::Error),
+}
+
 /// Replace `path` with `contents`, readable by its owner only. A reader
-/// sees the old file or the new one, never part of either.
+/// sees the old file or the new one, never part of either. An error means
+/// `path` was left as it was.
 ///
-/// The bytes go to a temporary file beside `path`, created exclusively with
-/// mode 0600 (so a file or link planted under that name is refused, not
-/// written through), synced, and renamed over `path`. The rename replaces a
-/// link at `path` instead of following it.
-pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
-    replace_atomic(path, contents, Some(0o600))
+/// Missing parents are created with mode 0700. The bytes go to a temporary
+/// file beside `path`, created exclusively with mode 0600 (so a file or link
+/// planted under that name is refused, not written through), synced, and
+/// renamed over `path`. The rename replaces a link at `path` instead of
+/// following it.
+pub fn write_private(path: &Path, contents: &[u8]) -> std::io::Result<Durability> {
+    replace(path, contents, Some(0o600), ensure_dir_0700)
 }
 
 /// Replace a file another program also owns, such as a client's settings,
@@ -33,27 +47,38 @@ pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()>
 /// is followed, so the file it points at is the one replaced.
 pub fn write_atomic_keeping_mode(path: &Path, contents: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt as _;
-    match std::fs::canonicalize(path) {
+    let durability = match std::fs::canonicalize(path) {
         Ok(target) => {
             let mode = std::fs::metadata(&target)?.permissions().mode() & 0o7777;
-            replace_atomic(&target, contents, Some(mode))
+            replace(&target, contents, Some(mode), |dir| {
+                std::fs::create_dir_all(dir)
+            })?
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            replace_atomic(path, contents, None)
+            replace(path, contents, None, |dir| std::fs::create_dir_all(dir))?
         }
-        Err(error) => Err(error),
+        Err(error) => return Err(error),
+    };
+    match durability {
+        Durability::Durable => Ok(()),
+        Durability::Uncertain(error) => Err(error),
     }
 }
 
 /// Write `contents` to a temporary file beside `path` and rename it over
 /// `path`. `mode` is set exactly; `None` leaves the umask's default.
-fn replace_atomic(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::Result<()> {
+fn replace(
+    path: &Path,
+    contents: &[u8],
+    mode: Option<u32>,
+    make_parent: fn(&Path) -> std::io::Result<()>,
+) -> std::io::Result<Durability> {
     use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let parent = path
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
         .unwrap_or(Path::new("."));
-    std::fs::create_dir_all(parent)?;
+    make_parent(parent)?;
     let name = path.file_name().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path names no file")
     })?;
@@ -71,18 +96,101 @@ fn replace_atomic(path: &Path, contents: &[u8], mode: Option<u32>) -> std::io::R
         .mode(if mode.is_some() { 0o600 } else { 0o666 })
         .open(&temporary)
         .and_then(|mut file| {
-            if let Some(mode) = mode {
+            if let Some(mode) = mode.filter(|mode| *mode != 0o600) {
                 file.set_permissions(std::fs::Permissions::from_mode(mode))?;
             }
             file.write_all(contents)?;
             file.sync_all()
         })
-        .and_then(|()| std::fs::rename(&temporary, path));
+        .and_then(|()| faults::rename(&temporary, path));
     if written.is_err() {
         let _ = std::fs::remove_file(&temporary);
     }
     written?;
-    std::fs::File::open(parent)?.sync_all()
+    Ok(match sync_dir(parent) {
+        Ok(()) => Durability::Durable,
+        Err(error) => Durability::Uncertain(error),
+    })
+}
+
+/// [`write_private`], counting a directory sync that fails as a failed write.
+pub fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+    match write_private(path, contents)? {
+        Durability::Durable => Ok(()),
+        Durability::Uncertain(error) => Err(error),
+    }
+}
+
+/// Sync `dir`, so the entries renamed into it survive a crash. Tried
+/// [`DIR_SYNC_ATTEMPTS`] times, 10 ms apart.
+pub fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    let mut attempt = 1;
+    loop {
+        match faults::sync_dir_once(dir) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt == DIR_SYNC_ATTEMPTS => return Err(error),
+            Err(_) => {
+                attempt += 1;
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+mod faults {
+    use std::path::Path;
+
+    pub(super) fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+        std::fs::rename(from, to)
+    }
+
+    pub(super) fn sync_dir_once(dir: &Path) -> std::io::Result<()> {
+        std::fs::File::open(dir)?.sync_all()
+    }
+}
+
+/// Failures a test arms on its own thread for the writes it makes next.
+#[cfg(test)]
+pub(crate) mod faults {
+    use std::cell::Cell;
+    use std::path::Path;
+
+    std::thread_local! {
+        static RENAMES_TO_FAIL: Cell<usize> = const { Cell::new(0) };
+        static DIR_SYNCS_TO_FAIL: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// The next private write on this thread fails without replacing its
+    /// file.
+    pub(crate) fn fail_next_rename() {
+        RENAMES_TO_FAIL.set(1);
+    }
+
+    /// The next `attempts` directory syncs on this thread fail.
+    pub(crate) fn fail_next_dir_syncs(attempts: usize) {
+        DIR_SYNCS_TO_FAIL.set(attempts);
+    }
+
+    fn take(counter: &'static std::thread::LocalKey<Cell<usize>>) -> bool {
+        let remaining = counter.get();
+        counter.set(remaining.saturating_sub(1));
+        remaining > 0
+    }
+
+    pub(super) fn rename(from: &Path, to: &Path) -> std::io::Result<()> {
+        if take(&RENAMES_TO_FAIL) {
+            return Err(std::io::Error::other("injected rename failure"));
+        }
+        std::fs::rename(from, to)
+    }
+
+    pub(super) fn sync_dir_once(dir: &Path) -> std::io::Result<()> {
+        if take(&DIR_SYNCS_TO_FAIL) {
+            return Err(std::io::Error::other("injected directory sync failure"));
+        }
+        std::fs::File::open(dir)?.sync_all()
+    }
 }
 
 #[cfg(test)]

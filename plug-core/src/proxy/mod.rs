@@ -862,6 +862,38 @@ pub(crate) struct ContinuationInsertGate {
     pub release: Arc<std::sync::Barrier>,
 }
 
+/// A request an upstream server makes of the downstream client, which Plug
+/// relays through the client's [`DownstreamBridge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverseRequest {
+    Elicitation,
+    Sampling,
+}
+
+impl ReverseRequest {
+    /// Refuse a request the client did not declare at `initialize`.
+    pub fn check_declared(self, capabilities: Option<&ClientCapabilities>) -> Result<(), McpError> {
+        let (declared, name) = match self {
+            Self::Elicitation => (
+                capabilities.is_some_and(|c| c.elicitation.is_some()),
+                "elicitation",
+            ),
+            Self::Sampling => (
+                capabilities.is_some_and(|c| c.sampling.is_some()),
+                "sampling",
+            ),
+        };
+        if declared {
+            Ok(())
+        } else {
+            Err(McpError::internal_error(
+                format!("client does not support {name}"),
+                None,
+            ))
+        }
+    }
+}
+
 /// Abstraction for forwarding reverse requests (elicitation, sampling) to a downstream client.
 ///
 /// Each transport implements this trait differently:

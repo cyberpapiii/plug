@@ -1,8 +1,8 @@
 use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 
-/// HTTP-layer errors that map to HTTP status codes.
-/// Separate from `ProtocolError` which maps to JSON-RPC error codes.
+/// What the HTTP transport refuses a request with. Each one is answered
+/// with its own HTTP status, some with a JSON-RPC error body as well.
 #[derive(Debug, thiserror::Error)]
 pub enum HttpError {
     #[error("forbidden: invalid origin")]

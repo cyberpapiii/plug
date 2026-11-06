@@ -21,7 +21,7 @@ use plug_core::ipc::{
     self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse, OperatorRequest,
 };
 use plug_core::proxy::{ConnectorAfter, EndedSession};
-use plug_core::proxy::{DownstreamBridge, ToolRouter};
+use plug_core::proxy::{DownstreamBridge, ReverseRequest, ToolRouter};
 
 mod framing;
 use framing::FrameReader;
@@ -383,13 +383,8 @@ impl DownstreamBridge for DaemonBridge {
         request: ElicitRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
         let caps = self.client_registry.capabilities(&self.session_id);
-        if caps.as_ref().and_then(|c| c.elicitation.as_ref()).is_none() {
-            return Box::pin(async {
-                Err(McpError::internal_error(
-                    format!("client {} does not support elicitation", self.session_id),
-                    None,
-                ))
-            });
+        if let Err(error) = ReverseRequest::Elicitation.check_declared(caps.as_ref()) {
+            return Box::pin(async { Err(error) });
         }
         Box::pin(async move {
             match self
@@ -413,13 +408,8 @@ impl DownstreamBridge for DaemonBridge {
         request: CreateMessageRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
         let caps = self.client_registry.capabilities(&self.session_id);
-        if caps.as_ref().and_then(|c| c.sampling.as_ref()).is_none() {
-            return Box::pin(async {
-                Err(McpError::internal_error(
-                    format!("client {} does not support sampling", self.session_id),
-                    None,
-                ))
-            });
+        if let Err(error) = ReverseRequest::Sampling.check_declared(caps.as_ref()) {
+            return Box::pin(async { Err(error) });
         }
         Box::pin(async move {
             match self
@@ -2464,8 +2454,17 @@ allowed_servers = ["slack"]
         let session_id = ctx.http.sessions.create_session().expect("session");
         ctx.http
             .sessions
-            .set_grant(&session_id, client.client_id.clone())
-            .expect("set grant");
+            .bind(
+                &session_id,
+                plug_core::session::SessionBinding {
+                    grant: Some(plug_core::session::GrantBinding {
+                        client_id: client.client_id.clone(),
+                        still_allowed: Arc::new(|| true),
+                    }),
+                    broadcast_audience: plug_core::session::BroadcastAudience::unrestricted(),
+                },
+            )
+            .expect("bind session");
         let resource = manager.resource();
         let owner = plug_core::downstream_identity::HttpCredential::Grant {
             issuer: manager.base_url(),

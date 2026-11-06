@@ -6,9 +6,7 @@ use dashmap::DashMap;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-use super::{
-    DownstreamSessionSnapshot, SessionError, SessionSendOutcome, SseEvent, SseMessage, SseReplayKey,
-};
+use super::{DownstreamSessionSnapshot, SessionError, SseEvent, SseMessage, SseReplayKey};
 
 /// The in-memory store of downstream HTTP sessions.
 pub struct SessionStore {
@@ -301,82 +299,53 @@ impl SessionStore {
         Ok(f(&mut entry))
     }
 
-    fn try_send_to_session(
-        &self,
-        session_id: &str,
-        message: SseMessage,
-        queue_if_unavailable: bool,
-    ) -> SessionSendOutcome {
-        let mut remove_session = false;
-        let mut clear_sender = false;
+    /// Deliver `message` to the session's stream, or queue it for the next
+    /// stream. Returns whether the session was there to take it.
+    pub fn send_to_live_session(&self, session_id: &str, message: SseMessage) -> bool {
         let mut failed_sender: Option<mpsc::Sender<SseEvent>> = None;
-        let mut queue_event: Option<SseEvent> = None;
-        let mut delivered = false;
-
-        if let Some(mut entry) = self.sessions.get_mut(session_id) {
+        let event;
+        {
+            let Some(mut entry) = self.sessions.get_mut(session_id) else {
+                return false;
+            };
             if entry.last_activity.elapsed() > self.timeout {
-                remove_session = true;
-            } else if entry.access_ended() {
+                drop(entry);
+                self.remove_if_expired(session_id);
+                return false;
+            }
+            if entry.access_ended() {
                 drop(entry);
                 self.end(session_id, SessionEnd::Lapsed);
-                return SessionSendOutcome::SessionNotFound;
-            } else if let Some(sender) = entry.sse_sender.clone() {
-                let event = Self::next_event(&mut entry, message);
-                match sender.try_send(event.clone()) {
+                return false;
+            }
+            let next = Self::next_event(&mut entry, message);
+            if let Some(sender) = entry.sse_sender.clone() {
+                match sender.try_send(next.clone()) {
                     Ok(()) => {
                         entry.last_activity = Instant::now();
-                        delivered = true;
+                        return true;
                     }
-                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                        clear_sender = true;
-                        failed_sender = Some(sender);
-                        if queue_if_unavailable {
-                            queue_event = Some(event);
-                        }
-                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
                     Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                         tracing::warn!(
                             session_id = %session_id,
                             "dropping slow SSE client from targeted notification delivery"
                         );
-                        clear_sender = true;
-                        failed_sender = Some(sender);
-                        if queue_if_unavailable {
-                            queue_event = Some(event);
-                        }
                     }
                 }
-            } else if queue_if_unavailable {
-                queue_event = Some(Self::next_event(&mut entry, message));
+                failed_sender = Some(sender);
             }
+            event = next;
+        }
+        if failed_sender.is_some() {
+            self.clear_sender_if_matching(session_id, failed_sender.as_ref(), Some(event));
         } else {
-            return SessionSendOutcome::SessionNotFound;
+            self.enqueue_or_deliver_racy(session_id, event);
         }
-
-        if remove_session {
-            self.remove_if_expired(session_id);
-            return SessionSendOutcome::SessionNotFound;
-        }
-
-        let queued = queue_event.is_some();
-        if clear_sender {
-            self.clear_sender_if_matching(session_id, failed_sender.as_ref(), queue_event);
-        } else if let Some(event) = queue_event
-            && self.enqueue_or_deliver_racy(session_id, event)
-        {
-            delivered = true;
-        }
-
-        if delivered {
-            SessionSendOutcome::Delivered
-        } else if queued {
-            SessionSendOutcome::Queued
-        } else {
-            SessionSendOutcome::SessionNotFound
-        }
+        true
     }
 
-    /// Second phase of `try_send_to_session`'s no-live-sender-at-first-check
+    /// Second phase of `send_to_live_session`'s no-live-sender-at-first-check
     /// path. A reconnecting client may install a fresh sender in the window
     /// between the initial `None` check (phase 1, where no sender was found)
     /// and re-acquiring this entry's guard here (phase 2); blindly enqueuing
@@ -410,10 +379,10 @@ impl SessionStore {
         }
     }
 
-    /// Second phase of `try_send_to_session`'s clear path. Only nulls the entry's
+    /// Second phase of `send_to_live_session`'s clear path. Only nulls the entry's
     /// `sse_sender` if it is still the same channel that failed delivery; a
     /// reconnecting client may have installed a fresh, live sender in the window
-    /// between `try_send_to_session` releasing and re-acquiring this entry's guard,
+    /// between `send_to_live_session` releasing and re-acquiring this entry's guard,
     /// and wiping that out would silently break the new connection.
     fn clear_sender_if_matching(
         &self,
@@ -562,14 +531,14 @@ impl SessionStore {
         Ok(true)
     }
 
-    /// Make `session_id` look idle for two minutes.
+    /// Make `session_id` look idle for two minutes past its timeout.
     #[cfg(test)]
     pub(crate) fn backdate_for_tests(&self, session_id: &str) {
         self.sessions
             .get_mut(session_id)
             .expect("session")
             .last_activity = Instant::now()
-            .checked_sub(Duration::from_secs(120))
+            .checked_sub(self.timeout + Duration::from_secs(120))
             .expect("backdate instant");
     }
 
@@ -626,38 +595,23 @@ impl SessionStore {
         Ok(())
     }
 
-    pub fn set_grant(&self, session_id: &str, client_id: String) -> Result<(), SessionError> {
-        let mut entry = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionError::NotFound)?;
-        entry.grant = Some(client_id);
-        Ok(())
-    }
-
-    pub fn set_access_check(
+    /// Tie `session_id` to the caller that opened it.
+    pub fn bind(
         &self,
         session_id: &str,
-        check: crate::session::AccessCheck,
+        binding: crate::session::SessionBinding,
     ) -> Result<(), SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
             .ok_or(SessionError::NotFound)?;
-        entry.still_allowed = Some(check);
-        Ok(())
-    }
-
-    pub fn set_broadcast_audience(
-        &self,
-        session_id: &str,
-        audience: crate::session::BroadcastAudience,
-    ) -> Result<(), SessionError> {
-        let mut entry = self
-            .sessions
-            .get_mut(session_id)
-            .ok_or(SessionError::NotFound)?;
-        entry.broadcast_audience = audience;
+        let (grant, still_allowed) = binding
+            .grant
+            .map(|grant| (grant.client_id, grant.still_allowed))
+            .unzip();
+        entry.grant = grant;
+        entry.still_allowed = still_allowed;
+        entry.broadcast_audience = binding.broadcast_audience;
         Ok(())
     }
 
@@ -733,14 +687,6 @@ impl SessionStore {
         }
     }
 
-    pub fn send_to_live_session(
-        &self,
-        session_id: &str,
-        message: SseMessage,
-    ) -> SessionSendOutcome {
-        self.try_send_to_session(session_id, message, true)
-    }
-
     pub fn remove_replay_events_by_key(&self, session_id: &str, key: &SseReplayKey) {
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
             entry
@@ -804,6 +750,27 @@ impl SessionStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::{AccessCheck, BroadcastAudience, GrantBinding, SessionBinding};
+
+    /// Bind `id` with the full audience, under `grant` when one is given.
+    fn bind(store: &SessionStore, id: &str, grant: Option<(&str, AccessCheck)>) {
+        store
+            .bind(
+                id,
+                SessionBinding {
+                    grant: grant.map(|(client_id, still_allowed)| GrantBinding {
+                        client_id: client_id.to_string(),
+                        still_allowed,
+                    }),
+                    broadcast_audience: BroadcastAudience::unrestricted(),
+                },
+            )
+            .unwrap();
+    }
+
+    fn always() -> AccessCheck {
+        Arc::new(|| true)
+    }
 
     fn store_reporting_to(
         timeout_secs: u64,
@@ -1014,11 +981,11 @@ mod tests {
         assert!(store.create_session().is_err());
     }
 
-    #[tokio::test]
-    async fn create_session_prunes_expired_sessions_before_enforcing_cap() {
-        let store = SessionStore::new(0, 1);
-        store.create_session().unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    #[test]
+    fn create_session_prunes_expired_sessions_before_enforcing_cap() {
+        let store = SessionStore::new(60, 1);
+        let id = store.create_session().unwrap();
+        store.backdate_for_tests(&id);
         assert!(store.create_session().is_ok());
     }
 
@@ -1111,15 +1078,13 @@ mod tests {
         let allowed = Arc::new(AtomicBool::new(true));
         for id in [&used, &idle] {
             let allowed = Arc::clone(&allowed);
-            store
-                .set_access_check(id, Arc::new(move || allowed.load(Ordering::SeqCst)))
-                .unwrap();
+            bind(
+                &store,
+                id,
+                Some(("client", Arc::new(move || allowed.load(Ordering::SeqCst)))),
+            );
         }
-        for id in [&used, &idle, &other] {
-            store
-                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
-                .unwrap();
-        }
+        bind(&store, &other, None);
         assert!(store.validate(&used).is_ok());
 
         // Nobody ended these sessions by name. Access went away underneath.
@@ -1130,17 +1095,16 @@ mod tests {
         let (stream, mut events) = mpsc::channel(4);
         store.set_sse_sender(&sent_to, stream, None).unwrap();
         let allowed_too = Arc::clone(&allowed);
-        store
-            .set_access_check(
-                &sent_to,
+        bind(
+            &store,
+            &sent_to,
+            Some((
+                "client",
                 Arc::new(move || allowed_too.load(Ordering::SeqCst)),
-            )
-            .unwrap();
+            )),
+        );
         let message = crate::session::SseMessage::from_json_value(serde_json::json!({})).unwrap();
-        assert!(matches!(
-            store.send_to_live_session(&sent_to, message),
-            SessionSendOutcome::SessionNotFound
-        ));
+        assert!(!store.send_to_live_session(&sent_to, message));
         assert!(matches!(
             events.try_recv(),
             Err(mpsc::error::TryRecvError::Disconnected)
@@ -1168,12 +1132,10 @@ mod tests {
         let store = SessionStore::new(60, 100);
         let theirs = store.create_session().unwrap();
         let shared = store.create_session().unwrap();
-        store.set_grant(&theirs, "client-abc".to_string()).unwrap();
+        bind(&store, &theirs, Some(("client-abc", always())));
+        bind(&store, &shared, None);
         let mut streams = Vec::new();
         for id in [&theirs, &shared] {
-            store
-                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
-                .unwrap();
             let (stream, events) = mpsc::channel(4);
             store.set_sse_sender(id, stream, None).unwrap();
             streams.push(events);
@@ -1201,8 +1163,8 @@ mod tests {
         let theirs = store.create_session().unwrap();
         let other = store.create_session().unwrap();
         let unowned = store.create_session().unwrap();
-        store.set_grant(&theirs, "client-abc".to_string()).unwrap();
-        store.set_grant(&other, "client-xyz".to_string()).unwrap();
+        bind(&store, &theirs, Some(("client-abc", always())));
+        bind(&store, &other, Some(("client-xyz", always())));
         let (stream, mut events) = mpsc::channel(4);
         store.set_sse_sender(&theirs, stream, None).unwrap();
         assert_eq!(store.grant_of(&theirs).as_deref(), Some("client-abc"));
@@ -1228,22 +1190,26 @@ mod tests {
     fn a_session_opened_with_a_grant_reports_that_grant() {
         let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
-        store.set_grant(&id, "client-abc".to_string()).unwrap();
+        bind(&store, &id, Some(("client-abc", always())));
 
         assert_eq!(store.snapshots()[0].grant.as_deref(), Some("client-abc"));
-        assert!(
-            store
-                .set_grant("missing", "client-abc".to_string())
-                .is_err()
+        assert_eq!(
+            store.bind(
+                "missing",
+                SessionBinding {
+                    grant: None,
+                    broadcast_audience: BroadcastAudience::unrestricted(),
+                },
+            ),
+            Err(SessionError::NotFound)
         );
     }
 
     #[test]
     fn snapshots_filter_expired_sessions() {
-        let store = SessionStore::new(0, 100);
+        let store = SessionStore::new(60, 100);
         let id = store.create_session().unwrap();
-
-        std::thread::sleep(Duration::from_millis(10));
+        store.backdate_for_tests(&id);
 
         assert!(
             store
@@ -1254,26 +1220,23 @@ mod tests {
         assert_eq!(store.session_count(), 1);
     }
 
-    #[tokio::test]
-    async fn expired_session_fails_validation() {
-        let store = SessionStore::new(0, 100);
+    #[test]
+    fn expired_session_fails_validation() {
+        let store = SessionStore::new(60, 100);
         let id = store.create_session().unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        store.backdate_for_tests(&id);
         assert!(store.validate(&id).is_err());
     }
 
     #[tokio::test]
     async fn broadcast_prunes_expired_sessions_before_delivery() {
-        let store = SessionStore::new(0, 100);
+        let store = SessionStore::new(60, 100);
         let id = store.create_session().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx, None).unwrap();
         // Admit the kind, so expiry is the only thing that can stop delivery.
-        store
-            .set_broadcast_audience(&id, crate::session::BroadcastAudience::unrestricted())
-            .unwrap();
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        bind(&store, &id, None);
+        store.backdate_for_tests(&id);
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "test"}))
                 .unwrap(),
@@ -1298,9 +1261,7 @@ mod tests {
         store.set_sse_sender(&fast_id, fast_tx, None).unwrap();
         // Admit the kind on both, so a full sender is the only obstacle.
         for id in [&slow_id, &fast_id] {
-            store
-                .set_broadcast_audience(id, crate::session::BroadcastAudience::unrestricted())
-                .unwrap();
+            bind(&store, id, None);
         }
 
         slow_tx
@@ -1345,19 +1306,20 @@ mod tests {
             .unwrap();
 
         store
-            .set_broadcast_audience(
+            .bind(
                 &narrow_id,
-                crate::session::BroadcastAudience {
-                    tools: true,
-                    resources: false,
-                    prompts: false,
-                    logging: false,
+                SessionBinding {
+                    grant: None,
+                    broadcast_audience: BroadcastAudience {
+                        tools: true,
+                        resources: false,
+                        prompts: false,
+                        logging: false,
+                    },
                 },
             )
             .unwrap();
-        store
-            .set_broadcast_audience(&wide_id, crate::session::BroadcastAudience::unrestricted())
-            .unwrap();
+        bind(&store, &wide_id, None);
 
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "resources"}))
@@ -1456,7 +1418,7 @@ mod tests {
     #[tokio::test]
     async fn racing_reconnect_sender_is_not_clobbered_by_stale_clear() {
         // Reproduces the fix directly: `clear_sender_if_matching` is the exact
-        // second-phase decision `try_send_to_session` makes after releasing and
+        // second-phase decision `send_to_live_session` makes after releasing and
         // re-acquiring the session guard. Here we drive it with a failed sender
         // (A) while the entry's live sender has already moved on to a
         // reconnected sender (B) -- simulating a client reconnect racing into
@@ -1624,7 +1586,7 @@ mod tests {
     #[tokio::test]
     async fn enqueue_recheck_flushes_to_new_sender() {
         // Reproduces the fix directly: `enqueue_or_deliver_racy` is the exact
-        // second-phase decision `try_send_to_session` makes after releasing
+        // second-phase decision `send_to_live_session` makes after releasing
         // and re-acquiring the session guard when phase 1 found no sender.
         // Here a live sender is installed AFTER the point where phase 1 would
         // have observed `None`, simulating a client reconnect racing into the
@@ -1634,7 +1596,7 @@ mod tests {
         let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
-        // No sender yet -- this is what phase 1 of `try_send_to_session`
+        // No sender yet -- this is what phase 1 of `send_to_live_session`
         // would have seen.
         assert!(!store.has_live_sse_sender(&id).unwrap());
 

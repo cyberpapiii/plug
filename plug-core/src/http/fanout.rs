@@ -24,11 +24,8 @@ impl HttpState {
                     recv = rx.recv() => {
                         match recv {
                             Ok(notification) => {
-                                // Unlike the daemon (one fan-out task per client, comparing
-                                // target to "self"), this task is shared by every HTTP session,
-                                // so a targeted resolution names which session to route to
-                                // rather than answering "is this me?". See
-                                // plug-core/src/notifications.rs::fanout.
+                                // One task serves every HTTP session, so a targeted
+                                // notification is routed by the session it names.
                                 use crate::notifications::fanout::{
                                     NotificationClass, ResolvedDelivery, classify, resolve,
                                 };
@@ -321,13 +318,7 @@ mod tests {
         // This test drives the SSE stream without going through initialize, so
         // it has to record the audience initialize would have resolved for an
         // unauthenticated loopback listener.
-        state
-            .sessions
-            .set_broadcast_audience(
-                &session_id,
-                crate::session::BroadcastAudience::unrestricted(),
-            )
-            .unwrap();
+        bind_for_tests(&state.sessions, &session_id, None);
         let sse_req = HttpRequest::builder()
             .method("GET")
             .uri("/mcp")

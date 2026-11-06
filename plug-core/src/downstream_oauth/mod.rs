@@ -6,6 +6,8 @@
 
 pub mod owner;
 pub mod paths;
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_owner;
 
 pub use owner::OwnerCredentialSummary;
 use owner::{
@@ -26,7 +28,7 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
 use crate::config::HttpConfig;
 
@@ -55,7 +57,6 @@ const MAX_PENDING_CONSENTS_PER_CLIENT: usize = 5;
 const MAX_ACCESS_TOKENS_PER_CLIENT: usize = 10;
 const MAX_REGISTRATION_RATE_KEYS: usize = 10_000;
 const MAX_METADATA_DOCUMENT_BYTES: usize = 64 * 1024;
-const PARENT_DIR_SYNC_ATTEMPTS: usize = 3;
 /// Attempts to take the issuer state lock, spread over
 /// [`STATE_LOCK_RETRY_INTERVAL`]. Long enough to outlast a departing writer's
 /// close, short enough that a genuinely occupied lock still fails startup fast.
@@ -119,7 +120,6 @@ pub(crate) fn inspect_owner_enrollment_in_dir(
         Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
     };
     {
-        use std::os::unix::fs::PermissionsExt as _;
         let Ok(metadata) = file.metadata() else {
             return OwnerEnrollmentStatus::StateUnavailable;
         };
@@ -731,7 +731,7 @@ impl DownstreamOauthManager {
         let state_dir = state_path
             .parent()
             .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
-        sync_parent_dir_with_retry(state_dir).map_err(|error| {
+        crate::fs_perm::sync_dir(state_dir).map_err(|error| {
             DownstreamOauthError::Persistence(format!(
                 "downstream OAuth startup directory sync failed for {}: {error}",
                 state_dir.display()
@@ -775,7 +775,7 @@ impl DownstreamOauthManager {
             && self
                 .state_path
                 .parent()
-                .is_some_and(|dir| sync_parent_dir(dir).is_ok())
+                .is_some_and(|dir| run_blocking_io(|| crate::fs_perm::sync_dir(dir)).is_ok())
         {
             self.durability_degraded.store(false, Ordering::SeqCst);
             tracing::info!("downstream OAuth state is durable again");
@@ -799,8 +799,8 @@ impl DownstreamOauthManager {
         let outcome = persist_state(&self.state_path, &next)?;
         *live = next;
         match outcome {
-            PersistOutcome::Durable => Ok(()),
-            PersistOutcome::CommittedDurabilityUncertain(error) => {
+            crate::fs_perm::Durability::Durable => Ok(()),
+            crate::fs_perm::Durability::Uncertain(error) => {
                 self.durability_degraded.store(true, Ordering::SeqCst);
                 tracing::error!(
                     state_path = %self.state_path.display(),
@@ -808,7 +808,8 @@ impl DownstreamOauthManager {
                     "downstream OAuth entered fail-closed durability-degraded state"
                 );
                 Err(DownstreamOauthError::Persistence(format!(
-                    "state rename committed but parent directory durability remains uncertain after {PARENT_DIR_SYNC_ATTEMPTS} attempts: {error}"
+                    "state rename committed but parent directory durability remains uncertain after {} attempts: {error}",
+                    crate::fs_perm::DIR_SYNC_ATTEMPTS
                 )))
             }
         }
@@ -1402,25 +1403,24 @@ impl DownstreamOauthManager {
         })
     }
 
+    /// Revoke `client_id`'s grant. `Ok(false)` when there is no such client.
+    /// Any error still leaves the grant refused by this process: only saving
+    /// the revocation failed.
     pub async fn revoke_client(&self, client_id: &str) -> Result<bool, DownstreamOauthError> {
-        self.ensure_durable()?;
         let mut guard = self.state.lock().await;
-        let existed = guard.clients.contains_key(client_id);
-        if !existed {
+        if !guard.clients.contains_key(client_id) {
             return Ok(false);
         }
-        // Invalidate validation-time leases before removing credentials or
-        // starting task cleanup. If persistence fails, this process remains
-        // fail-closed; the operator did not receive a successful revocation.
         if let Some(lifecycle) = self.principal_lifecycles.get(client_id) {
             lifecycle.deactivate();
         }
+        self.ensure_durable()?;
         let mut next = guard.clone();
         next.remove_client_material(client_id);
         next.revoked_client_ids.insert(client_id.to_string());
         self.commit_state(&mut guard, next)?;
         self.principal_lifecycles.remove(client_id);
-        Ok(existed)
+        Ok(true)
     }
 
     pub async fn begin_authorization(
@@ -1511,66 +1511,6 @@ impl DownstreamOauthManager {
             csrf_token,
             expires_at,
         })
-    }
-
-    /// Approve or deny a consent without the owner passkey ceremony.
-    ///
-    /// Test-only: production approval goes through
-    /// [`Self::finish_owner_approval`] and denial through
-    /// [`Self::deny_consent`]. Tests in other crates reach this through the
-    /// `test-helpers` feature, which only dev-dependencies enable.
-    #[cfg(any(test, feature = "test-helpers"))]
-    pub async fn decide_consent(
-        &self,
-        consent_id: &str,
-        approved: bool,
-    ) -> Result<AuthorizationRedirect, DownstreamOauthError> {
-        self.ensure_durable()?;
-        let mut guard = self.state.lock().await;
-        let now = epoch_secs();
-        guard
-            .completed_consents
-            .retain(|_, completed| completed.expires_at > now);
-        if let Some(completed) = guard.completed_consents.get(consent_id) {
-            return Ok(completed.redirect.clone());
-        }
-        let consent = guard
-            .pending_consents
-            .get(consent_id)
-            .cloned()
-            .ok_or(DownstreamOauthError::InvalidAuthorizationRequest)?;
-        if consent.expires_at <= now {
-            let mut next = guard.clone();
-            let expired = expire_consent(&mut next, consent_id, &consent);
-            self.commit_state(&mut guard, next)?;
-            return Err(expired);
-        }
-        if !approved {
-            let redirect = AuthorizationRedirect {
-                location: redirect_with_params(
-                    &consent.redirect_uri,
-                    &[("error", "access_denied"), ("state", &consent.state)],
-                ),
-            };
-            let mut next = guard.clone();
-            next.pending_consents.remove(consent_id);
-            next.completed_consents.insert(
-                consent_id.to_string(),
-                CompletedConsent {
-                    client_id: consent.client_id,
-                    redirect: redirect.clone(),
-                    expires_at: now + AUTH_CODE_LIFETIME_SECS,
-                    approval_ceremony_ids: Vec::new(),
-                },
-            );
-            self.commit_state(&mut guard, next)?;
-            return Ok(redirect);
-        }
-
-        let mut next = guard.clone();
-        let redirect = issue_code_for_consent(&mut next, consent_id, consent, Vec::new(), now);
-        self.commit_state(&mut guard, next)?;
-        Ok(redirect)
     }
 
     pub async fn exchange_authorization_code(
@@ -1976,8 +1916,12 @@ fn registered_redirect_matches(registered: &str, requested: &str) -> bool {
     // Only the port may vary; token exchange still requires the actual callback.
     if registered.scheme() != "http"
         || requested.scheme() != "http"
-        || !registered.host_str().is_some_and(is_loopback_host)
-        || !requested.host_str().is_some_and(is_loopback_host)
+        || !registered
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
+        || !requested
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
     {
         return false;
     }
@@ -2006,17 +1950,9 @@ fn valid_redirect_uri(value: &str) -> bool {
     }
     match uri.scheme() {
         "https" => true,
-        "http" => uri.host_str().is_some_and(is_loopback_host),
+        "http" => uri.host_str().is_some_and(crate::config::is_loopback_host),
         _ => false,
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn validate_metadata_document(
@@ -2435,19 +2371,14 @@ fn load_persisted_state(
     Ok(state)
 }
 
-#[derive(Debug)]
-enum PersistOutcome {
-    Durable,
-    CommittedDurabilityUncertain(std::io::Error),
-}
-
 fn persist_state(
     path: &std::path::Path,
     state: &DownstreamOauthState,
-) -> Result<PersistOutcome, DownstreamOauthError> {
+) -> Result<crate::fs_perm::Durability, DownstreamOauthError> {
     let json = serde_json::to_vec(state)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    run_blocking_io(|| persist_bytes(path, &json))
+    run_blocking_io(|| crate::fs_perm::write_private(path, &json))
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))
 }
 
 /// Run a blocking state write without stalling the other tasks scheduled on
@@ -2467,76 +2398,6 @@ fn run_blocking_io<T>(write: impl FnOnce() -> T) -> T {
         }
         _ => write(),
     }
-}
-
-fn persist_bytes(
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> Result<PersistOutcome, DownstreamOauthError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
-    crate::fs_perm::ensure_dir_0700(dir)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    let tmp = temporary_state_path(path);
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    options.mode(0o600);
-    {
-        use std::io::Write as _;
-        let mut file = options
-            .open(&tmp)
-            .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-        let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
-        drop(file);
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(DownstreamOauthError::Persistence(error.to_string()));
-        }
-    }
-    if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(error.to_string()));
-    }
-    #[cfg(test)]
-    if FAIL_NEXT_STATE_RENAME.replace(false) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(
-            "injected state rename failure".to_string(),
-        ));
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(error.to_string()));
-    }
-    Ok(match sync_parent_dir_with_retry(dir) {
-        Ok(()) => PersistOutcome::Durable,
-        Err(error) => PersistOutcome::CommittedDurabilityUncertain(error),
-    })
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FAIL_PARENT_DIR_SYNC_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FAIL_NEXT_STATE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn fail_next_parent_dir_sync_attempts_for_tests(attempts: usize) {
-    FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(attempts);
-}
-
-#[cfg(test)]
-fn fail_next_state_rename_for_tests() {
-    FAIL_NEXT_STATE_RENAME.set(true);
-}
-
-fn temporary_state_path(path: &std::path::Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()))
 }
 
 fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, DownstreamOauthError> {
@@ -2559,22 +2420,21 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
     // and refusing there turns an ordinary daemon restart into a startup failure
     // that only a second restart clears. A live writer still holds the lock well
     // past this window, so the guard keeps its meaning.
-    for attempt in 0..STATE_LOCK_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match fs4::FileExt::try_lock(&file) {
             Ok(()) => return Ok(file),
             // An I/O error will not resolve itself by waiting.
             Err(error @ fs4::TryLockError::Error(_)) => {
                 return Err(lock_held_error(path, &error));
             }
-            Err(error @ fs4::TryLockError::WouldBlock) => {
-                if attempt + 1 == STATE_LOCK_ATTEMPTS {
-                    return Err(lock_held_error(path, &error));
-                }
+            Err(error @ fs4::TryLockError::WouldBlock) if attempt == STATE_LOCK_ATTEMPTS => {
+                return Err(lock_held_error(path, &error));
             }
+            Err(fs4::TryLockError::WouldBlock) => attempt += 1,
         }
         std::thread::sleep(STATE_LOCK_RETRY_INTERVAL);
     }
-    Err(lock_held_error(path, &fs4::TryLockError::WouldBlock))
 }
 
 fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> DownstreamOauthError {
@@ -2584,39 +2444,10 @@ fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> Downstr
     ))
 }
 
-fn sync_parent_dir_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
-    let mut last_error = None;
-    for attempt in 0..PARENT_DIR_SYNC_ATTEMPTS {
-        match sync_parent_dir(dir) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        if attempt + 1 < PARENT_DIR_SYNC_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("directory sync was not attempted")))
-}
-
-fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    {
-        let remaining = FAIL_PARENT_DIR_SYNC_ATTEMPTS.get();
-        if remaining > 0 {
-            FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(remaining - 1);
-            return Err(std::io::Error::other(
-                "injected parent directory sync failure",
-            ));
-        }
-    }
-
-    std::fs::File::open(dir)?.sync_all()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::downstream_oauth::owner::tests::BrowserAuthenticator;
+    use crate::downstream_oauth::test_owner::{self, BrowserAuthenticator};
     use serde_json::json;
 
     fn temp_state_path() -> PathBuf {
@@ -3276,7 +3107,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
         assert!(matches!(
             manager
                 .finish_owner_registration(&challenge.ceremony_id, response)
@@ -3323,7 +3154,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         assert!(matches!(
             manager
                 .finish_owner_approval(&challenge.ceremony_id, response)
@@ -3617,7 +3448,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
         assert!(matches!(
             manager
                 .finish_owner_approval(&challenge.ceremony_id, response)
@@ -3884,14 +3715,12 @@ mod tests {
             .await
             .expect("start owner approval");
         let denial_consent = begin_test_authorization(&manager, "expired-consent-denial").await;
-        let legacy_consent = begin_test_authorization(&manager, "expired-consent-legacy").await;
         {
             let mut state = manager.state.lock().await;
             for consent_id in [
                 &challenge_consent.consent_id,
                 &assertion_consent.consent_id,
                 &denial_consent.consent_id,
-                &legacy_consent.consent_id,
             ] {
                 state
                     .pending_consents
@@ -3924,13 +3753,6 @@ mod tests {
                 .await
                 .unwrap_err(),
             "expired-consent-denial",
-        );
-        assert_expired_callback(
-            manager
-                .decide_consent(&legacy_consent.consent_id, false)
-                .await
-                .unwrap_err(),
-            "expired-consent-legacy",
         );
     }
 
@@ -4202,7 +4024,7 @@ mod tests {
     async fn authorization_start_sync_failure_fails_closed_with_aligned_recovery() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager
             .begin_authorization(AuthorizationRequest {
@@ -4552,7 +4374,7 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let original = issue_tokens(&manager, &client).await;
         let original_refresh = original.refresh_token.expect("original refresh token");
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager
             .exchange_refresh_token(
@@ -4584,7 +4406,7 @@ mod tests {
             None
         );
         // While the directory still cannot be synced, nothing new is issued.
-        fail_next_parent_dir_sync_attempts_for_tests(1);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         assert!(matches!(
             manager
                 .exchange_refresh_token(
@@ -4636,7 +4458,7 @@ mod tests {
             Some(claims) => claims.principal_lifecycle,
             other => panic!("expected valid token before revoke, got {other:?}"),
         };
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager.revoke_client(&client.client_id).await;
 
@@ -4653,7 +4475,7 @@ mod tests {
         assert!(disk.revoked_client_ids.contains(&client.client_id));
         drop(manager);
 
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         let restart_error =
             DownstreamOauthManager::new_with_state_path(test_config(), path.clone()).expect_err(
                 "restart must refuse service while directory durability remains uncertain",
@@ -4682,7 +4504,7 @@ mod tests {
     async fn pre_rename_failure_publishes_nothing_and_restart_matches() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
 
         let result = manager
             .begin_authorization(AuthorizationRequest {
@@ -4716,7 +4538,7 @@ mod tests {
     async fn parent_directory_sync_retry_can_recover_without_degrading() {
         let (manager, _) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_attempts_for_tests(1);
+        crate::fs_perm::faults::fail_next_dir_syncs(1);
 
         let consent = manager
             .begin_authorization(AuthorizationRequest {
@@ -4741,19 +4563,6 @@ mod tests {
                 .pending_consents
                 .contains_key(&consent.consent_id)
         );
-    }
-
-    #[test]
-    fn persistence_temp_paths_are_unique_per_writer() {
-        let path = temp_state_path();
-        let first = temporary_state_path(&path);
-        let second = temporary_state_path(&path);
-
-        assert_eq!(first.parent(), path.parent());
-        assert_eq!(second.parent(), path.parent());
-        assert_ne!(first, second);
-        assert_ne!(first, path.with_extension("json.tmp"));
-        assert_ne!(second, path.with_extension("json.tmp"));
     }
 
     #[test]
@@ -4804,8 +4613,7 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(&manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let code = url::Url::parse(&redirect.location)
@@ -4922,8 +4730,7 @@ mod tests {
             })
             .await
             .expect("begin authorization");
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let parsed = url::Url::parse(&redirect.location).expect("redirect URL");
@@ -4964,7 +4771,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_grant_issuance_covers_all_six_scope_families() {
+    async fn default_grant_issuance_covers_every_scope_family() {
         let manager = DownstreamOauthManager::new_with_state_path(
             DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
@@ -4999,8 +4806,7 @@ mod tests {
             consent.scopes, expected,
             "scopeless authorization must request the sorted default grant"
         );
-        let redirect = manager
-            .decide_consent(&consent.consent_id, true)
+        let redirect = test_owner::approve_consent(&manager, &consent.consent_id)
             .await
             .expect("approve consent");
         let code = url::Url::parse(&redirect.location)
@@ -5070,16 +4876,30 @@ mod tests {
             .await
             .expect("begin authorization");
 
+        let mut authenticator = BrowserAuthenticator::new();
+        enroll_owner(&manager, &authenticator).await;
+        let challenge = manager
+            .start_owner_approval(&consent.consent_id)
+            .await
+            .expect("start approval");
+        let mut assert = || {
+            authenticator.authentication_response(
+                &challenge.public_key.challenge,
+                &manager.owner_security.rp_id,
+                "https://plug.example.com",
+                true,
+            )
+        };
         let first = manager
-            .decide_consent(&consent.consent_id, true)
+            .finish_owner_approval(&challenge.ceremony_id, assert())
             .await
             .expect("approve consent");
         let repeated = manager
-            .decide_consent(&consent.consent_id, true)
+            .finish_owner_approval(&challenge.ceremony_id, assert())
             .await
             .expect("repeat approval");
         let later_denial = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("later denial");
 
@@ -5107,11 +4927,11 @@ mod tests {
             .expect("begin authorization");
 
         let first = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("deny consent");
         let repeated = manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("repeat denial");
 
@@ -5143,7 +4963,7 @@ mod tests {
                 .await
                 .expect("begin authorization within cap");
             manager
-                .decide_consent(&consent.consent_id, false)
+                .deny_consent(&consent.consent_id, &consent.csrf_token)
                 .await
                 .expect("deny consent");
         }
@@ -5212,7 +5032,7 @@ mod tests {
             .await
             .expect("begin authorization");
         manager
-            .decide_consent(&consent.consent_id, false)
+            .deny_consent(&consent.consent_id, &consent.csrf_token)
             .await
             .expect("deny consent");
 
@@ -5245,7 +5065,7 @@ mod tests {
             .await
             .expect("begin second authorization");
         manager
-            .decide_consent(&second.consent_id, false)
+            .deny_consent(&second.consent_id, &second.csrf_token)
             .await
             .expect("deny second consent");
         assert!(manager.revoke_client(&client.client_id).await.unwrap());

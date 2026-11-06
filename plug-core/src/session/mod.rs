@@ -69,13 +69,6 @@ impl SseMessage {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SessionSendOutcome {
-    Delivered,
-    Queued,
-    SessionNotFound,
-}
-
 /// Which class of broadcast a notification belongs to.
 ///
 /// Targeted notifications (progress, cancellation, resource updates) are not
@@ -95,19 +88,18 @@ pub enum BroadcastKind {
 
 /// Which broadcast notifications a session's principal may observe.
 ///
-/// Computed once at `initialize` from that request's `DownstreamCallContext`,
-/// because initialize is the only point where the whole policy input (era,
-/// transport, principal, scopes, local trust) is in hand; the fan-out task is
-/// shared by every session and has none of it.
+/// Recorded when the session is bound to its caller, at `initialize` or when
+/// a lost session is reopened, because only the request has the principal and
+/// its scopes; the fan-out task is shared by every session and has none of it.
 ///
 /// The default denies everything, and deliberately so. `create_session` makes a
 /// session visible to the fan-out task — which runs on another worker thread —
-/// before `initialize` can record the audience. A notification arriving inside
-/// that window would be buffered by `enqueue_pending` and replayed once the SSE
-/// stream opens, so an admit-by-default would hand it to a client that never
+/// before the session is bound. A notification arriving inside that window
+/// would be buffered by `enqueue_pending` and replayed once the SSE stream
+/// opens, so an admit-by-default would hand it to a client that never
 /// qualified for it. Denying by default makes that window silent instead of
 /// leaky. A loopback listener with no scopes to narrow gets
-/// [`BroadcastAudience::unrestricted`] the moment initialize resolves it.
+/// [`BroadcastAudience::unrestricted`] the moment the session is bound.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct BroadcastAudience {
     pub tools: bool,
@@ -140,6 +132,19 @@ impl BroadcastAudience {
 
 /// Whether a session's client still has the access it opened the session with.
 pub type AccessCheck = std::sync::Arc<dyn Fn() -> bool + Send + Sync>;
+
+/// Who a session answers to, recorded once when it opens.
+pub struct SessionBinding {
+    /// The OAuth grant whose token opened the session, when one did.
+    pub grant: Option<GrantBinding>,
+    pub broadcast_audience: BroadcastAudience,
+}
+
+pub struct GrantBinding {
+    pub client_id: String,
+    /// Asked of the grant itself, so the session ends however the grant does.
+    pub still_allowed: AccessCheck,
+}
 
 /// Read-only snapshot of a downstream HTTP session for operator inventory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
