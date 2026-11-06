@@ -439,9 +439,16 @@ pub(super) fn oauth_validated_callback_error_response(
 
 pub(super) fn oauth_json_response<T: serde::Serialize>(status: StatusCode, payload: T) -> Response {
     let mut response = (status, Json(payload)).into_response();
-    super::oauth_ui::apply_oauth_json_security_headers(&mut response);
+    super::oauth_ui::apply_oauth_security_headers(&mut response);
     response
 }
+
+static OWNER_CREDENTIAL_LIMIT: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
+    format!(
+        "Plug already has {} owner passkeys. Remove one locally before enrolling another.",
+        crate::downstream_oauth::owner::MAX_OWNER_CREDENTIALS
+    )
+});
 
 pub(super) fn oauth_public_error(
     error: &DownstreamOauthError,
@@ -515,7 +522,7 @@ pub(super) fn oauth_public_error(
         DownstreamOauthError::OwnerCredentialLimit => (
             StatusCode::BAD_REQUEST,
             "owner_credential_limit",
-            "Plug already has five owner passkeys. Remove one locally before enrolling another.",
+            OWNER_CREDENTIAL_LIMIT.as_str(),
         ),
         DownstreamOauthError::OwnerCredentialNotFound => (
             StatusCode::BAD_REQUEST,
@@ -582,7 +589,7 @@ pub(super) fn oauth_authorization_error_response(error: &DownstreamOauthError) -
 
 pub(super) fn oauth_forbidden_response() -> Response {
     let mut response = StatusCode::FORBIDDEN.into_response();
-    super::oauth_ui::apply_oauth_json_security_headers(&mut response);
+    super::oauth_ui::apply_oauth_security_headers(&mut response);
     response
 }
 

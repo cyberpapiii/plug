@@ -2,10 +2,17 @@ use axum::http::{HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use sha2::{Digest as _, Sha256};
 
-use crate::downstream_oauth::{ClientSource, ConsentRequest};
+use crate::downstream_oauth::{AUTH_REQUEST_LIFETIME_SECS, ClientSource, ConsentRequest, paths};
 
-pub const CONSENT_JAVASCRIPT: &str = include_str!("oauth_ui/consent.js");
-pub const ENROLL_JAVASCRIPT: &str = include_str!("oauth_ui/enroll.js");
+/// Each page's script, after the passkey and request helpers both share.
+pub const CONSENT_JAVASCRIPT: &str = concat!(
+    include_str!("oauth_ui/passkey.js"),
+    include_str!("oauth_ui/consent.js")
+);
+pub const ENROLL_JAVASCRIPT: &str = concat!(
+    include_str!("oauth_ui/passkey.js"),
+    include_str!("oauth_ui/enroll.js")
+);
 pub const STYLESHEET: &str = include_str!("oauth_ui/plug.css");
 pub const ICON: &str = include_str!("../../../docs/assets/plug-icon.svg");
 pub const JAVASCRIPT_TYPE: &str = "application/javascript; charset=utf-8";
@@ -15,7 +22,8 @@ pub const ICON_TYPE: &str = "image/svg+xml";
 const HTML_SECURITY_POLICY: &str = "default-src 'none'; script-src 'self'; style-src 'self'; img-src 'self'; connect-src 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'";
 const ASSET_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
 
-pub fn apply_oauth_html_security_headers(response: &mut Response) {
+/// The headers every OAuth response carries, page or JSON.
+pub fn apply_oauth_security_headers(response: &mut Response) {
     response
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
@@ -33,10 +41,6 @@ pub fn apply_oauth_html_security_headers(response: &mut Response) {
     response
         .headers_mut()
         .insert("X-Frame-Options", HeaderValue::from_static("DENY"));
-}
-
-pub fn apply_oauth_json_security_headers(response: &mut Response) {
-    apply_oauth_html_security_headers(response);
 }
 
 pub fn consent_page(consent: &ConsentRequest, owner_enrolled: bool) -> Response {
@@ -69,7 +73,7 @@ pub fn consent_page(consent: &ConsentRequest, owner_enrolled: bool) -> Response 
         .as_ref()
         .and_then(|url| {
             let host = url.host_str()?;
-            matches!(host, "localhost" | "127.0.0.1" | "::1").then(|| {
+            crate::config::is_loopback_host(host).then(|| {
                 format!(
                     "<p><strong>Local app callback:</strong> This approval returns to <code>{}</code> on this device.</p>",
                     html_escape(&callback_destination)
@@ -83,14 +87,17 @@ pub fn consent_page(consent: &ConsentRequest, owner_enrolled: bool) -> Response 
         "<section aria-labelledby=\"setup-heading\"><h2 id=\"setup-heading\">Owner passkey required</h2><p>On the Mac running Plug, run <code>plug auth owner enroll</code>, then start this connection again.</p></section>"
     };
     let script_url = html_escape(&versioned_asset_url(
-        "/oauth/assets/consent.js",
+        paths::CONSENT_SCRIPT,
         CONSENT_JAVASCRIPT,
     ));
+    let lifetime_minutes = AUTH_REQUEST_LIFETIME_SECS / 60;
     let head = page_head(&format!("Allow {client_name} to use Plug?"));
     let html = format!(
-        "{head}<main id=\"consent\" data-consent-id=\"{}\" data-csrf-token=\"{}\" data-challenge-endpoint=\"/oauth/consent/challenge\" data-decision-endpoint=\"/oauth/consent/decision\"><h1>Allow {client_name} to use Plug?</h1><p><strong>{client_name}</strong></p><p>{identity}</p><section aria-labelledby=\"destination-heading\"><h2 id=\"destination-heading\">Connection destination</h2><p>Callback: <strong>{}</strong></p><details><summary>Show full callback address</summary><code>{}</code></details>{callback_warning}</section><section aria-labelledby=\"resource-heading\"><h2 id=\"resource-heading\">Plug resource</h2><p>Plug MCP server</p><code>{}</code></section><section aria-labelledby=\"permissions-heading\"><h2 id=\"permissions-heading\">Permissions</h2><ul>{scopes}</ul></section><p>This request expires in 5 minutes.</p>{allow}<button id=\"deny\" type=\"button\">Deny</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to verify your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>",
+        "{head}<main id=\"consent\" data-consent-id=\"{}\" data-csrf-token=\"{}\" data-challenge-endpoint=\"{}\" data-decision-endpoint=\"{}\"><h1>Allow {client_name} to use Plug?</h1><p><strong>{client_name}</strong></p><p>{identity}</p><section aria-labelledby=\"destination-heading\"><h2 id=\"destination-heading\">Connection destination</h2><p>Callback: <strong>{}</strong></p><details><summary>Show full callback address</summary><code>{}</code></details>{callback_warning}</section><section aria-labelledby=\"resource-heading\"><h2 id=\"resource-heading\">Plug resource</h2><p>Plug MCP server</p><code>{}</code></section><section aria-labelledby=\"permissions-heading\"><h2 id=\"permissions-heading\">Permissions</h2><ul>{scopes}</ul></section><p>This request expires in {lifetime_minutes} minutes.</p>{allow}<button id=\"deny\" type=\"button\">Deny</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to verify your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>",
         html_escape(&consent.consent_id),
         html_escape(&consent.csrf_token),
+        paths::CONSENT_CHALLENGE,
+        paths::CONSENT_DECISION,
         html_escape(&callback_destination),
         html_escape(&consent.redirect_uri),
         html_escape(&consent.resource),
@@ -112,12 +119,14 @@ fn callback_authority(url: &url::Url) -> Option<String> {
 
 pub fn enrollment_page() -> Response {
     let script_url = html_escape(&versioned_asset_url(
-        "/oauth/assets/enroll.js",
+        paths::ENROLL_SCRIPT,
         ENROLL_JAVASCRIPT,
     ));
+    let challenge = paths::OWNER_ENROLL_CHALLENGE;
+    let complete = paths::OWNER_ENROLL_COMPLETE;
     let head = page_head("Set up Plug owner passkey");
     let html = format!(
-        "{head}<main id=\"enrollment\"><h1>Set up your Plug owner passkey</h1><p>Use Touch ID or another passkey to approve future Plug connections.</p><button id=\"enroll\" type=\"button\">Create owner passkey</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to create your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>"
+        "{head}<main id=\"enrollment\" data-challenge-endpoint=\"{challenge}\" data-complete-endpoint=\"{complete}\"><h1>Set up your Plug owner passkey</h1><p>Use Touch ID or another passkey to approve future Plug connections.</p><button id=\"enroll\" type=\"button\">Create owner passkey</button><p id=\"status\" role=\"status\" aria-live=\"polite\"></p><noscript>This page needs JavaScript to create your passkey. Enable JavaScript and reload this page.</noscript></main><script src=\"{script_url}\"></script></body></html>"
     );
     html_response(StatusCode::OK, html)
 }
@@ -135,8 +144,8 @@ pub fn authorization_error_page(status: StatusCode, code: &str, description: &st
 /// The start of every page: Plug's icon in the tab and at the top, and the
 /// page's look, both served by Plug itself.
 fn page_head(title: &str) -> String {
-    let icon = html_escape(&versioned_asset_url("/oauth/assets/plug-icon.svg", ICON));
-    let stylesheet = html_escape(&versioned_asset_url("/oauth/assets/plug.css", STYLESHEET));
+    let icon = html_escape(&versioned_asset_url(paths::ICON, ICON));
+    let stylesheet = html_escape(&versioned_asset_url(paths::STYLESHEET, STYLESHEET));
     format!(
         "<!doctype html><html lang=\"en\"><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\"><title>{}</title><link rel=\"icon\" type=\"image/svg+xml\" href=\"{icon}\"><link rel=\"stylesheet\" href=\"{stylesheet}\"></head><body><img class=\"brand\" src=\"{icon}\" alt=\"\">",
         html_escape(title)
@@ -150,7 +159,7 @@ pub fn asset(source: &'static str, content_type: &'static str) -> Response {
         source,
     )
         .into_response();
-    apply_oauth_html_security_headers(&mut response);
+    apply_oauth_security_headers(&mut response);
     response.headers_mut().insert(
         header::CACHE_CONTROL,
         HeaderValue::from_static(ASSET_CACHE_CONTROL),
@@ -178,24 +187,19 @@ fn html_response(status: StatusCode, html: String) -> Response {
         html,
     )
         .into_response();
-    apply_oauth_html_security_headers(&mut response);
+    apply_oauth_security_headers(&mut response);
     response
 }
 
 fn scope_description(scope: &str) -> &'static str {
-    match scope {
-        "tools:read" => "Use Plug tools",
-        "resources:read" => "Read resources available through Plug",
-        "prompts:read" => "Use prompts available through Plug",
-        "completion:use" => "Use argument completion through Plug",
-        "tasks:use" => "Run and manage long-running tasks through Plug",
-        "subscriptions:listen" => "Receive change notifications from Plug",
-        "logging:configure" => "Change the log verbosity of Plug and its servers",
-        "logging:read" => "Receive log output from Plug and its servers",
-        "continuations:complete" => "Answer follow-up questions from a tool while it runs",
-        "offline_access" => "Stay connected after this browser window closes",
-        _ => "Use the requested Plug capability",
-    }
+    crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS
+        .iter()
+        .find(|(granted, _)| *granted == scope)
+        .map(|(_, description)| *description)
+        .unwrap_or(match scope {
+            "offline_access" => "Stay connected after this browser window closes",
+            _ => "Use the requested Plug capability",
+        })
 }
 
 fn html_escape(value: &str) -> String {
@@ -209,16 +213,66 @@ fn html_escape(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{page_head, scope_description, versioned_asset_url};
+    use super::{consent_page, enrollment_page, page_head, versioned_asset_url};
+    use crate::downstream_oauth::{ClientSource, ConsentRequest, paths};
 
-    #[test]
-    fn every_default_scope_has_a_specific_description() {
-        let fallback = scope_description("not-a-real-scope");
-        for scope in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
-            assert_ne!(
-                scope_description(scope),
-                fallback,
-                "{scope} is in the default grant but the consent page has no text for it"
+    async fn page_text(response: axum::response::Response) -> String {
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("page body");
+        String::from_utf8(body.to_vec()).expect("page HTML")
+    }
+
+    fn consent(redirect_uri: &str) -> ConsentRequest {
+        ConsentRequest {
+            consent_id: "consent".to_string(),
+            client_id: "client".to_string(),
+            client_name: "Client".to_string(),
+            client_source: ClientSource::DynamicRegistration,
+            redirect_uri: redirect_uri.to_string(),
+            redirect_host: "unused".to_string(),
+            scopes: vec!["tools:read".to_string()],
+            resource: "https://plug.example.com/mcp".to_string(),
+            csrf_token: "csrf".to_string(),
+            expires_at: 0,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ipv6_loopback_callback_is_called_local() {
+        let page = page_text(consent_page(&consent("http://[::1]:8787/callback"), true)).await;
+        assert!(page.contains("Local app callback:"));
+        assert!(page.contains("returns to <code>[::1]:8787</code>"));
+        let page = page_text(consent_page(
+            &consent("https://client.example.com/cb"),
+            true,
+        ))
+        .await;
+        assert!(!page.contains("Local app callback:"));
+    }
+
+    #[tokio::test]
+    async fn pages_name_the_endpoints_their_scripts_post_to() {
+        let page = page_text(consent_page(
+            &consent("https://client.example.com/cb"),
+            true,
+        ))
+        .await;
+        assert!(page.contains(&format!(
+            "data-challenge-endpoint=\"{}\" data-decision-endpoint=\"{}\"",
+            paths::CONSENT_CHALLENGE,
+            paths::CONSENT_DECISION
+        )));
+        let page = page_text(enrollment_page()).await;
+        assert!(page.contains(&format!(
+            "data-challenge-endpoint=\"{}\" data-complete-endpoint=\"{}\"",
+            paths::OWNER_ENROLL_CHALLENGE,
+            paths::OWNER_ENROLL_COMPLETE
+        )));
+        for script in [super::CONSENT_JAVASCRIPT, super::ENROLL_JAVASCRIPT] {
+            assert!(
+                !script.contains("/oauth/"),
+                "scripts read endpoints from the page"
             );
         }
     }

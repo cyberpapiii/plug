@@ -1,31 +1,3 @@
-"use strict";
-
-function decodeBase64url(value) {
-  const base64 = value.replace(/-/g, "+").replace(/_/g, "/") + "===".slice((value.length + 3) % 4);
-  return Uint8Array.from(atob(base64), character => character.charCodeAt(0));
-}
-
-function encodeBase64url(value) {
-  const bytes = new Uint8Array(value);
-  let binary = "";
-  for (const byte of bytes) binary += String.fromCharCode(byte);
-  return btoa(binary).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
-}
-
-async function postJson(path, body) {
-  const response = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    credentials: "same-origin",
-    body: JSON.stringify(body),
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (!response.ok) {
-    throw new Error(payload.error_description || "Plug could not complete owner passkey setup.");
-  }
-  return payload;
-}
-
 function creationOptions(publicKey) {
   return {
     ...publicKey,
@@ -54,6 +26,8 @@ function registrationResponse(credential) {
   return response;
 }
 
+const SETUP_FAILED = "Plug could not complete owner passkey setup.";
+const page = document.getElementById("enrollment");
 const enroll = document.getElementById("enroll");
 const status = document.getElementById("status");
 const fragment = new URLSearchParams(window.location.hash.slice(1));
@@ -72,14 +46,14 @@ async function enrollOwner() {
   enroll.disabled = true;
   status.textContent = "Waiting for Touch ID or your passkey provider…";
   try {
-    const challenge = await postJson("/oauth/owner/enroll/challenge", { bootstrap });
+    const challenge = await postJson(page.dataset.challengeEndpoint, { bootstrap }, SETUP_FAILED);
     const credential = await navigator.credentials.create({
       publicKey: creationOptions(challenge.public_key),
     });
-    await postJson("/oauth/owner/enroll/complete", {
+    await postJson(page.dataset.completeEndpoint, {
       ceremony_id: challenge.ceremony_id,
       credential: registrationResponse(credential),
-    });
+    }, SETUP_FAILED);
     status.textContent = "Owner passkey created. You can close this window and connect to Plug.";
     enroll.hidden = true;
   } catch (error) {

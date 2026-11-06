@@ -146,18 +146,45 @@ pub enum MethodFamily {
 }
 
 /// Default downstream OAuth grant: the method families a normal MCP client
-/// exercises. Every entry must be a `MethodFamily::required_scope` string.
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 9] = [
-    "tools:read",
-    "resources:read",
-    "prompts:read",
-    "completion:use",
-    "tasks:use",
-    "subscriptions:listen",
-    "logging:configure",
-    "logging:read",
-    "continuations:complete",
+/// exercises, each with what the consent page says granting it allows. Every
+/// scope must be a `MethodFamily::required_scope` string.
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS: [(&str, &str); 9] = [
+    ("tools:read", "Use Plug tools"),
+    ("resources:read", "Read resources available through Plug"),
+    ("prompts:read", "Use prompts available through Plug"),
+    ("completion:use", "Use argument completion through Plug"),
+    (
+        "tasks:use",
+        "Run and manage long-running tasks through Plug",
+    ),
+    (
+        "subscriptions:listen",
+        "Receive change notifications from Plug",
+    ),
+    (
+        "logging:configure",
+        "Change the log verbosity of Plug and its servers",
+    ),
+    (
+        "logging:read",
+        "Receive log output from Plug and its servers",
+    ),
+    (
+        "continuations:complete",
+        "Answer follow-up questions from a tool while it runs",
+    ),
 ];
+
+/// The scopes of [`DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS`].
+pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 9] = {
+    let mut scopes = [""; 9];
+    let mut index = 0;
+    while index < scopes.len() {
+        scopes[index] = DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS[index].0;
+        index += 1;
+    }
+    scopes
+};
 
 impl MethodFamily {
     pub fn from_method(method: &str) -> Self {

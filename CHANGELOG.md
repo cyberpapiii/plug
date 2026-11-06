@@ -48,6 +48,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- The sign-in page calls a callback on `[::1]` a local app callback, as it does one on `127.0.0.1` or `localhost`.
 - Revoking a remote client from the app or with `plug auth clients revoke` ends the tasks it started as well as its sessions. Only a revoke through the local HTTP operator route used to end them.
 - A tool called as a task gets the same care as one called directly. It is refused while its server waits for sign-in or is failing, it counts in the server's call figures and trips its circuit breaker, skill links in its result name their server, and it waits for a free call slot as long as a direct call does instead of failing after a second. A task whose server dropped the connection mid-call is no longer sent a second time unless the server says the tool only reads; it fails saying the call may or may not have completed. A task an upstream server ran itself gets the same result cleanup and skill links when you fetch its result.
 - `tasks/list` refuses a cursor Plug never gave out with invalid params, and answers one past the end with an empty last page. Both used to start the list over, which could loop a client.

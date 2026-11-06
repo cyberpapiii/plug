@@ -31,7 +31,8 @@ use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use crate::config::HttpConfig;
 
 const STATE_VERSION: u8 = 3;
-const AUTH_REQUEST_LIFETIME_SECS: u64 = 300;
+/// How long a sign-in request waits for the owner to approve it.
+pub const AUTH_REQUEST_LIFETIME_SECS: u64 = 300;
 const AUTH_CODE_LIFETIME_SECS: u64 = 300;
 const ACCESS_TOKEN_LIFETIME_SECS: u64 = 3600;
 const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
