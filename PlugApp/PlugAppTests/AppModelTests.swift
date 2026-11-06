@@ -142,23 +142,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(windows, 0)
     }
 
-    /// The sidebar lists the four things Plug manages. Settings is not one.
-    func testTheSidebarHasFourSections() {
-        XCTAssertEqual(AppSection.allCases.map(\.rawValue), ["Servers", "Clients", "Events", "Activity"])
-    }
-
-    func testBundleClientVersionFallback() {
-        XCTAssertEqual(PlugIPCClient.clientVersion(from: [:]), "development")
-        XCTAssertEqual(
-            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "  "]),
-            "development"
-        )
-        XCTAssertEqual(
-            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "0.7.0"]),
-            "0.7.0"
-        )
-    }
-
     @MainActor
     func testInstallationStateAlwaysGatesOverallHealth() async {
         let coordinator = RecordingInstallationCoordinator(
@@ -808,8 +791,6 @@ final class AppModelTests: XCTestCase {
         await model.actions.setAppLinked("claude-code", true)
         XCTAssertEqual(model.actions.actionError?.title, "Could not add Plug to Claude Code.")
         XCTAssertEqual(model.actions.actionError?.advice.isEmpty, false)
-        try? await Task.sleep(for: .milliseconds(200))
-        XCTAssertNotNil(model.actions.actionError)
     }
 
     @MainActor

@@ -149,7 +149,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     var transportLabel: String {
         switch transport.lowercased() {
         case "stdio": "On this Mac"
-        case "http", "sse", "streamable_http": "Over the network"
+        case "http", "sse": "Over the network"
         case "openapi": "Web API"
         default: transport.capitalized
         }
@@ -295,8 +295,9 @@ struct PlugSituation: Equatable, Sendable {
 
 // MARK: - Intents
 
-/// Every action the interface can start, in one list. Views name an intent;
-/// a single dispatcher performs it. Nothing else calls the model directly.
+/// Every press the interface can make, in one list. Views name an intent and
+/// `PlugIntentRunner` performs it. A sheet that waits for its answer calls a
+/// named action on `AppModel.actions` instead; neither builds a request.
 enum PlugIntent: Equatable, Sendable {
     case allowBackgroundRunning
     case repairInstallation
@@ -327,16 +328,11 @@ enum PlugIntent: Equatable, Sendable {
     case setClientToolAllowed(key: String, tool: String, allowed: Bool)
     case setClientAllowList(key: String, on: Bool)
     case addServer
-    /// Open the sheet that adds Plug to a client.
     case addClient
-    /// Open the sheet that picks a tool to watch.
     case addWatch
-    /// Stop watching, by event name.
     case removeWatch(event: String)
     case openWindow(AppSection)
-    /// Open the Settings window.
     case openSettings
-    /// Open the first-run guide.
     case showGuide
     /// Open Settings and check everything.
     case checkup
@@ -354,10 +350,8 @@ enum PlugIntent: Equatable, Sendable {
     case reloadConfiguration
     /// Copy servers over from the other clients on this Mac.
     case importServers
-    /// Forget a server's stored account.
     case signOut(server: String)
     case openLogs
-    /// Hide the message about a press that failed.
     case dismissActionError
     case quit
 }

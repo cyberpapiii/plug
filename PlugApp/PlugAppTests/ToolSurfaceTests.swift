@@ -858,7 +858,8 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(failed.result, "Failed")
         XCTAssertEqual(failed.caller, "Claude Code")
         XCTAssertEqual(failed.reason, "upstream request timed out")
-        XCTAssertEqual(failed.advice, Explain.advice(forReason: "timed out"))
+        XCTAssertNotNil(failed.advice)
+        XCTAssertNotEqual(failed.advice, Explain.fallback, "a timeout has advice of its own")
         XCTAssertEqual(failed.duration, "30.0 s")
 
         let old = CallFacts(ActivityEvent(

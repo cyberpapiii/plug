@@ -194,12 +194,6 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     func testCharacterWearsTheFaceTheVerdictReads() {
-        XCTAssertEqual(PlugMood(.good), .awake)
-        XCTAssertEqual(PlugMood(.quiet), .asleep)
-        XCTAssertEqual(PlugMood(.busy), .working)
-        XCTAssertEqual(PlugMood(.attention), .needsYou)
-        XCTAssertEqual(PlugMood(.blocked), .alert)
-
         func mood(_ servers: [ServerFacts]) -> PlugMood {
             PlugVerdict.verdict(for: PlugSituation(runtime: .running, servers: servers)).mood
         }

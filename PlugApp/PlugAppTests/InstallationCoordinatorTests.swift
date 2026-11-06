@@ -590,7 +590,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let coordinator = InstallationCoordinator(
             appInspector: FailingAppInspector(
                 events: events,
-                error: ClientRepairError.commandFailed(status: 1, stderr: "boom")
+                error: DescribedFailure()
             ),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -604,7 +604,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         guard case let .blocked(failure) = coordinator.state else {
             return XCTFail("Expected blocked state, got \(coordinator.state)")
         }
-        XCTAssertFalse(failure.detail.isEmpty)
+        XCTAssertEqual(failure.detail, DescribedFailure().errorDescription)
     }
 
     func testBlockedStateDoesNotSelfRetryUntilExplicitRetry() async {
@@ -1606,6 +1606,10 @@ private actor AsyncGate {
 
 private final class OpenedURL: @unchecked Sendable {
     var value: URL?
+}
+
+private struct DescribedFailure: LocalizedError {
+    var errorDescription: String? { "The app bundle could not be read." }
 }
 
 private enum TestFailure: Error {
