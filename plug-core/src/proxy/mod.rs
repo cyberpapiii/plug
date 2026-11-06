@@ -2402,7 +2402,7 @@ impl ToolRouter {
     async fn refresh_tools_once(&self) {
         #[cfg(test)]
         self.refresh_pass_count.fetch_add(1, Ordering::SeqCst);
-        let upstream_tools = self.server_manager.get_tools().await;
+        let upstream_tools = self.server_manager.get_tools();
         let (resources_result, resource_templates_result, prompts_result) = tokio::join!(
             self.server_manager.get_resources(),
             self.server_manager.get_resource_templates(),

@@ -1709,7 +1709,7 @@ fn test_proxy_handler_get_info() {
 #[tokio::test]
 async fn test_server_manager_tools_empty() {
     let sm = Arc::new(ServerManager::new());
-    let tools = sm.get_tools().await;
+    let tools = sm.get_tools();
     assert!(
         tools.is_empty(),
         "expected no tools from empty ServerManager"

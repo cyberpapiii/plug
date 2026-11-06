@@ -2,9 +2,6 @@
 //!
 //! The Engine owns all shared state (servers, routing, config, health) and
 //! exposes it through a query API. The daemon and CLI are thin frontends.
-//!
-//! All fields are private — consumers access state through methods that
-//! return value types, never through direct field access.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -461,7 +458,6 @@ impl Engine {
         Ok(())
     }
 
-    /// Persist and apply one operator mutation under the same lock as reload.
     /// Hand the engine the watch events the daemon opened, so operator
     /// requests can report on them.
     pub fn set_watch_events(&self, events: Arc<crate::events::WatchEvents>) {
@@ -511,6 +507,7 @@ impl Engine {
         }
     }
 
+    /// Persist and apply one operator mutation under the same lock as reload.
     pub async fn apply_operator_mutation(
         self: &Arc<Self>,
         config_path: &std::path::Path,

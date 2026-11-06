@@ -1,5 +1,3 @@
-#![allow(clippy::mutable_key_type)]
-
 use std::collections::{BTreeSet, HashMap};
 use std::ffi::OsStr;
 #[cfg(target_os = "macos")]
@@ -44,10 +42,8 @@ use failure::StderrTail;
 
 type McpClient = rmcp::service::RunningService<rmcp::RoleClient, Arc<UpstreamClientHandler>>;
 const UPSTREAM_REPLACEMENT_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
-#[cfg(test)]
-const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const UPSTREAM_REPLACEMENT_GRACE_PERIOD: Duration = Duration::from_secs(30);
+/// How long a replaced upstream stays open for the calls still using it.
+const REPLACEMENT_GRACE: Duration = Duration::from_secs(30);
 
 fn upstream_metadata_from_implementation(
     implementation: &Implementation,
@@ -750,30 +746,36 @@ pub(crate) struct UpstreamClientHandler {
     /// Bound on the re-list a `tools/list_changed` notification triggers: the
     /// server's `call_timeout_secs`, the same bound every other listing uses.
     list_timeout: Duration,
-    #[cfg(test)]
-    protocol_version_override: Option<rmcp::model::ProtocolVersion>,
+    /// The protocol version offered in `initialize`.
+    protocol_version: rmcp::model::ProtocolVersion,
 }
 
-#[cfg(test)]
 impl UpstreamClientHandler {
-    /// Test-support constructor so tests outside this module (e.g.
-    /// `proxy::tests` driving `refresh_tools` against in-process duplex
-    /// upstreams) can build a connected `UpstreamServer` without making the
-    /// fields themselves crate-visible.
+    pub(crate) fn new(
+        server_id: &str,
+        tools: Arc<ArcSwap<Vec<Tool>>>,
+        router: std::sync::Weak<ToolRouter>,
+        list_timeout: Duration,
+    ) -> Self {
+        Self {
+            server_id: Arc::from(server_id),
+            tools,
+            router,
+            list_timeout,
+            protocol_version: crate::protocol::supported_protocol_version(),
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn new_for_tests(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
         router: std::sync::Weak<ToolRouter>,
     ) -> Self {
-        Self {
-            server_id,
-            tools,
-            router,
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        }
+        Self::new(&server_id, tools, router, Duration::from_secs(300))
     }
 
+    #[cfg(test)]
     pub(crate) fn new_for_tests_with_protocol(
         server_id: Arc<str>,
         tools: Arc<ArcSwap<Vec<Tool>>>,
@@ -781,11 +783,8 @@ impl UpstreamClientHandler {
         protocol_version: rmcp::model::ProtocolVersion,
     ) -> Self {
         Self {
-            server_id,
-            tools,
-            router,
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: Some(protocol_version),
+            protocol_version,
+            ..Self::new_for_tests(server_id, tools, router)
         }
     }
 }
@@ -821,18 +820,7 @@ impl ClientHandler for UpstreamClientHandler {
             .extensions
             .get_or_insert_with(Default::default)
             .insert(MCP_APPS_EXTENSION_ID.to_string(), apps);
-        let protocol_version = {
-            #[cfg(test)]
-            if let Some(version) = &self.protocol_version_override {
-                version.clone()
-            } else {
-                crate::protocol::supported_protocol_version()
-            }
-            #[cfg(not(test))]
-            crate::protocol::supported_protocol_version()
-        };
-        info = info.with_protocol_version(protocol_version);
-        info
+        info.with_protocol_version(self.protocol_version.clone())
     }
 
     fn list_roots(
@@ -1250,9 +1238,10 @@ pub struct ServerManager {
     /// Grace-period retirement tasks spawned by `replace_server` for
     /// old-generation upstreams still held by in-flight requests. Tracked so
     /// `shutdown_all` can force them to retire immediately instead of leaving
-    /// them to complete their sleep up to `UPSTREAM_REPLACEMENT_GRACE_PERIOD`
+    /// them to complete their sleep up to `replacement_grace`
     /// after the engine reports shutdown complete. Otherwise self-cleaning.
     retire_tasks: tokio::sync::Mutex<tokio::task::JoinSet<()>>,
+    replacement_grace: Duration,
     /// Set to `true` by `shutdown_all` to tell every pending grace-period
     /// retirement task to skip its sleep and retire now. Normal operation
     /// (no shutdown) never observes a `true` value, so the grace period is
@@ -1331,6 +1320,7 @@ impl ServerManager {
             semaphores: DashMap::new(),
             tool_router: std::sync::RwLock::new(None),
             retire_tasks: tokio::sync::Mutex::new(tokio::task::JoinSet::new()),
+            replacement_grace: REPLACEMENT_GRACE,
             shutdown_signal,
             check_now: Arc::new(tokio::sync::Notify::new()),
             modern_upstream_gate_state: AtomicU64::new(0),
@@ -1457,12 +1447,7 @@ impl ServerManager {
     pub(crate) fn update_availability(&self, degraded: &BTreeSet<String>) {
         let servers = self.servers.load();
         for name in servers.keys() {
-            let routable = self
-                .health
-                .get(name)
-                .map(|h| h.health.is_routable())
-                .unwrap_or(true);
-            let availability = if !routable {
+            let availability = if !self.is_routable(name) {
                 Availability::Absent
             } else if degraded.contains(name) {
                 Availability::Degraded
@@ -1714,7 +1699,6 @@ impl ServerManager {
         tool_router: std::sync::Weak<ToolRouter>,
         modern_upstream_gate_state: u64,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        // Recursion shield: never start a server named "plug"
         if name == "plug" {
             anyhow::bail!("recursion shield: ignoring upstream server named 'plug'");
         }
@@ -1775,14 +1759,12 @@ impl ServerManager {
                     }
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-                    let handler = Arc::new(UpstreamClientHandler {
-                        server_id: Arc::from(name),
-                        tools: Arc::clone(&tools),
-                        router: tool_router.clone(),
-                        list_timeout: Duration::from_secs(config.call_timeout_secs),
-                        #[cfg(test)]
-                        protocol_version_override: None,
-                    });
+                    let handler = Arc::new(UpstreamClientHandler::new(
+                        name,
+                        Arc::clone(&tools),
+                        tool_router.clone(),
+                        Duration::from_secs(config.call_timeout_secs),
+                    ));
 
                     let client: McpClient = handler
                         .serve_with_lifecycle(
@@ -1844,14 +1826,12 @@ impl ServerManager {
                     );
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-                    let handler = Arc::new(UpstreamClientHandler {
-                        server_id: Arc::from(name),
-                        tools: Arc::clone(&tools),
-                        router: tool_router.clone(),
-                        list_timeout: Duration::from_secs(config.call_timeout_secs),
-                        #[cfg(test)]
-                        protocol_version_override: None,
-                    });
+                    let handler = Arc::new(UpstreamClientHandler::new(
+                        name,
+                        Arc::clone(&tools),
+                        tool_router.clone(),
+                        Duration::from_secs(config.call_timeout_secs),
+                    ));
 
                     match handler
                         .serve_with_lifecycle(
@@ -1930,14 +1910,12 @@ impl ServerManager {
                     });
 
                     let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-                    let handler = Arc::new(UpstreamClientHandler {
-                        server_id: Arc::from(name),
-                        tools: Arc::clone(&tools),
-                        router: tool_router.clone(),
-                        list_timeout: Duration::from_secs(config.call_timeout_secs),
-                        #[cfg(test)]
-                        protocol_version_override: None,
-                    });
+                    let handler = Arc::new(UpstreamClientHandler::new(
+                        name,
+                        Arc::clone(&tools),
+                        tool_router.clone(),
+                        Duration::from_secs(config.call_timeout_secs),
+                    ));
                     let client: McpClient = handler
                         .serve(client_io)
                         .await
@@ -2024,14 +2002,12 @@ impl ServerManager {
         let transport = LegacySseClientTransport::from_config(transport_config)?;
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from(name),
-            tools: Arc::clone(&tools),
-            router: tool_router,
-            list_timeout: Duration::from_secs(config.call_timeout_secs),
-            #[cfg(test)]
-            protocol_version_override: None,
-        });
+        let handler = Arc::new(UpstreamClientHandler::new(
+            name,
+            Arc::clone(&tools),
+            tool_router,
+            Duration::from_secs(config.call_timeout_secs),
+        ));
 
         let client: McpClient = handler
             .serve(transport)
@@ -2051,9 +2027,7 @@ impl ServerManager {
         .await
     }
 
-    /// Finalize an upstream connection: list tools, extract capabilities, build UpstreamServer.
-    ///
-    /// Every transport ends here, so the three start paths cannot drift apart.
+    /// Every transport ends here, so the start paths cannot drift apart.
     #[allow(clippy::too_many_arguments)]
     async fn finish_upstream_connection(
         name: &str,
@@ -2136,282 +2110,148 @@ impl ServerManager {
         })
     }
 
-    /// Return all tools from all healthy servers, each paired with the server name.
-    pub async fn get_tools(&self) -> Vec<(String, rmcp::model::Tool)> {
-        let servers = self.servers.load();
+    /// Whether calls may be routed to `name`. A server not checked yet may.
+    fn is_routable(&self, name: &str) -> bool {
+        self.health
+            .get(name)
+            .is_none_or(|entry| entry.health.is_routable())
+    }
+
+    /// The running servers calls may be routed to, sorted by name.
+    pub fn healthy_upstreams(&self) -> Vec<(String, Arc<UpstreamServer>)> {
+        let mut routable: Vec<_> = self
+            .servers
+            .load()
+            .iter()
+            .filter(|(name, _)| self.is_routable(name))
+            .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
+            .collect();
+        routable.sort_by(|a, b| a.0.cmp(&b.0));
+        routable
+    }
+
+    /// Every tool of every routable server, with its server's name.
+    pub fn get_tools(&self) -> Vec<(String, rmcp::model::Tool)> {
         let mut result = Vec::new();
-        for (server_name, upstream) in servers.iter() {
-            let health_ok = self
-                .health
-                .get(server_name)
-                .map(|h| h.health.is_routable())
-                .unwrap_or(true);
-            if !health_ok {
-                continue;
-            }
+        for (server_name, upstream) in self.healthy_upstreams() {
             let tools = upstream.tools.load();
-            result.reserve(tools.len());
             result.extend(tools.iter().map(|tool| (server_name.clone(), tool.clone())));
         }
         result
     }
 
     pub(crate) async fn get_resources(&self) -> ListingResult<Resource> {
-        let servers = self.servers.load();
-        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
-            .iter()
-            .filter_map(|(server_name, upstream)| {
-                let health_ok = self
-                    .health
-                    .get(server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true);
-                (health_ok && upstream.capabilities.resources.is_some())
-                    .then(|| (server_name.clone(), Arc::clone(upstream)))
-            })
-            .collect();
-        targets.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let results = join_all(
-            targets
-                .into_iter()
-                .map(|(server_name, upstream)| async move {
-                    // Bound each per-server listing call so one stalled-but-
-                    // connected upstream cannot block the whole catalog
-                    // refresh (the rmcp list_all_* calls carry no timeout).
-                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let outcome = match tokio::time::timeout(
-                        timeout,
-                        upstream.client.peer().list_all_resources(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(resources)) => ListingOutcome::Fresh(resources),
-                        // A server without this list has an empty one. It
-                        // is not a failure, and warning on every refresh
-                        // buried the real ones.
-                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
-                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
-                        {
-                            ListingOutcome::Fresh(Vec::new())
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(server = %server_name, error = %error, "failed to list resources; carrying last-known-good");
-                            ListingOutcome::Unavailable
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                server = %server_name,
-                                timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing resources; carrying last-known-good"
-                            );
-                            ListingOutcome::Unavailable
-                        }
-                    };
-                    (server_name, outcome)
-                }),
+        self.list_all(
+            "resources",
+            |caps| caps.resources.is_some(),
+            &self.last_resources,
+            |upstream| async move { upstream.client.peer().list_all_resources().await },
         )
-        .await;
-
-        let mut items = Vec::new();
-        let mut degraded = BTreeSet::new();
-        for (server_name, outcome) in results {
-            match outcome {
-                ListingOutcome::Fresh(resources) => {
-                    let cached = Arc::new(resources);
-                    self.last_resources
-                        .insert(server_name.clone(), Arc::clone(&cached));
-                    for resource in cached.iter() {
-                        items.push((server_name.clone(), resource.clone()));
-                    }
-                }
-                ListingOutcome::Unavailable => {
-                    // A routable upstream that fails to list is degraded whether or
-                    // not we have last-known-good to serve — including its first,
-                    // uncached listing. Marking degraded only when a cache exists
-                    // would report a present-but-failing server as healthy.
-                    if let Some(cached) = self.last_resources.get(&server_name) {
-                        for resource in cached.iter() {
-                            items.push((server_name.clone(), resource.clone()));
-                        }
-                    }
-                    degraded.insert(server_name);
-                }
-            }
-        }
-        ListingResult { items, degraded }
+        .await
     }
 
     pub(crate) async fn get_resource_templates(&self) -> ListingResult<ResourceTemplate> {
-        let servers = self.servers.load();
-        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
-            .iter()
-            .filter_map(|(server_name, upstream)| {
-                let health_ok = self
-                    .health
-                    .get(server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true);
-                (health_ok && upstream.capabilities.resources.is_some())
-                    .then(|| (server_name.clone(), Arc::clone(upstream)))
-            })
-            .collect();
-        targets.sort_by(|a, b| a.0.cmp(&b.0));
-
-        let results = join_all(
-            targets
-                .into_iter()
-                .map(|(server_name, upstream)| async move {
-                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let outcome = match tokio::time::timeout(
-                        timeout,
-                        upstream.client.peer().list_all_resource_templates(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(templates)) => ListingOutcome::Fresh(templates),
-                        // A server without this list has an empty one. It
-                        // is not a failure, and warning on every refresh
-                        // buried the real ones.
-                        Ok(Err(rmcp::service::ServiceError::McpError(error)))
-                            if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
-                        {
-                            ListingOutcome::Fresh(Vec::new())
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(server = %server_name, error = %error, "failed to list resource templates; carrying last-known-good");
-                            ListingOutcome::Unavailable
-                        }
-                        Err(_) => {
-                            tracing::warn!(
-                                server = %server_name,
-                                timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing resource templates; carrying last-known-good"
-                            );
-                            ListingOutcome::Unavailable
-                        }
-                    };
-                    (server_name, outcome)
-                }),
+        self.list_all(
+            "resource templates",
+            |caps| caps.resources.is_some(),
+            &self.last_resource_templates,
+            |upstream| async move { upstream.client.peer().list_all_resource_templates().await },
         )
-        .await;
-
-        let mut items = Vec::new();
-        let mut degraded = BTreeSet::new();
-        for (server_name, outcome) in results {
-            match outcome {
-                ListingOutcome::Fresh(templates) => {
-                    let cached = Arc::new(templates);
-                    self.last_resource_templates
-                        .insert(server_name.clone(), Arc::clone(&cached));
-                    for template in cached.iter() {
-                        items.push((server_name.clone(), template.clone()));
-                    }
-                }
-                ListingOutcome::Unavailable => {
-                    // Degraded whether or not last-known-good exists (see get_resources).
-                    if let Some(cached) = self.last_resource_templates.get(&server_name) {
-                        for template in cached.iter() {
-                            items.push((server_name.clone(), template.clone()));
-                        }
-                    }
-                    degraded.insert(server_name);
-                }
-            }
-        }
-        ListingResult { items, degraded }
+        .await
     }
 
     pub(crate) async fn get_prompts(&self) -> ListingResult<Prompt> {
-        let servers = self.servers.load();
-        let mut targets: Vec<(String, Arc<UpstreamServer>)> = servers
-            .iter()
-            .filter_map(|(server_name, upstream)| {
-                let health_ok = self
-                    .health
-                    .get(server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true);
-                (health_ok && upstream.capabilities.prompts.is_some())
-                    .then(|| (server_name.clone(), Arc::clone(upstream)))
-            })
-            .collect();
-        targets.sort_by(|a, b| a.0.cmp(&b.0));
+        self.list_all(
+            "prompts",
+            |caps| caps.prompts.is_some(),
+            &self.last_prompts,
+            |upstream| async move { upstream.client.peer().list_all_prompts().await },
+        )
+        .await
+    }
 
-        let results = join_all(
-            targets
-                .into_iter()
-                .map(|(server_name, upstream)| async move {
-                    let timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-                    let outcome = match tokio::time::timeout(
-                        timeout,
-                        upstream.client.peer().list_all_prompts(),
-                    )
-                    .await
-                    {
-                        Ok(Ok(prompts)) => ListingOutcome::Fresh(prompts),
-                        // A server without this list has an empty one. It
-                        // is not a failure, and warning on every refresh
-                        // buried the real ones.
+    /// List one catalog dimension from every routable server that offers it,
+    /// all at once, each bounded by its server's `call_timeout_secs` (the
+    /// rmcp `list_all_*` calls carry no timeout of their own), so one stalled
+    /// server cannot hold the whole refresh.
+    async fn list_all<T, Fut>(
+        &self,
+        what: &str,
+        offers: impl Fn(&ServerCapabilities) -> bool,
+        last_known_good: &DashMap<String, Arc<Vec<T>>>,
+        list: impl Fn(Arc<UpstreamServer>) -> Fut,
+    ) -> ListingResult<T>
+    where
+        T: Clone,
+        Fut: Future<Output = Result<Vec<T>, rmcp::service::ServiceError>>,
+    {
+        let targets: Vec<_> = self
+            .healthy_upstreams()
+            .into_iter()
+            .filter(|(_, upstream)| offers(&upstream.capabilities))
+            .collect();
+        let results = join_all(targets.into_iter().map(|(server_name, upstream)| {
+            let timeout_secs = upstream.config.call_timeout_secs;
+            let listing = list(upstream);
+            async move {
+                let outcome =
+                    match tokio::time::timeout(Duration::from_secs(timeout_secs), listing).await {
+                        Ok(Ok(items)) => ListingOutcome::Fresh(items),
+                        // A server without this list has an empty one. It is
+                        // not a failure, and warning on every refresh buried
+                        // the real ones.
                         Ok(Err(rmcp::service::ServiceError::McpError(error)))
                             if error.code == rmcp::model::ErrorCode::METHOD_NOT_FOUND =>
                         {
                             ListingOutcome::Fresh(Vec::new())
                         }
                         Ok(Err(error)) => {
-                            tracing::warn!(server = %server_name, error = %error, "failed to list prompts; carrying last-known-good");
+                            tracing::warn!(server = %server_name, error = %error, "failed to list {what}; carrying last-known-good");
                             ListingOutcome::Unavailable
                         }
                         Err(_) => {
                             tracing::warn!(
                                 server = %server_name,
-                                timeout_secs = upstream.config.call_timeout_secs,
-                                "timed out listing prompts; carrying last-known-good"
+                                timeout_secs,
+                                "timed out listing {what}; carrying last-known-good"
                             );
                             ListingOutcome::Unavailable
                         }
                     };
-                    (server_name, outcome)
-                }),
-        )
+                (server_name, outcome)
+            }
+        }))
         .await;
 
         let mut items = Vec::new();
         let mut degraded = BTreeSet::new();
         for (server_name, outcome) in results {
-            match outcome {
-                ListingOutcome::Fresh(prompts) => {
-                    let cached = Arc::new(prompts);
-                    self.last_prompts
-                        .insert(server_name.clone(), Arc::clone(&cached));
-                    for prompt in cached.iter() {
-                        items.push((server_name.clone(), prompt.clone()));
-                    }
+            let listed = match outcome {
+                ListingOutcome::Fresh(fresh) => {
+                    let fresh = Arc::new(fresh);
+                    last_known_good.insert(server_name.clone(), Arc::clone(&fresh));
+                    Some(fresh)
                 }
                 ListingOutcome::Unavailable => {
-                    // Degraded whether or not last-known-good exists (see get_resources).
-                    if let Some(cached) = self.last_prompts.get(&server_name) {
-                        for prompt in cached.iter() {
-                            items.push((server_name.clone(), prompt.clone()));
-                        }
-                    }
-                    degraded.insert(server_name);
+                    // Degraded whether or not there is a last-known-good to
+                    // serve, its first listing included: marking it only when
+                    // a cache exists would report a failing server healthy.
+                    degraded.insert(server_name.clone());
+                    last_known_good
+                        .get(&server_name)
+                        .map(|cached| Arc::clone(cached.value()))
                 }
+            };
+            for item in listed.iter().flat_map(|listed| listed.iter()) {
+                items.push((server_name.clone(), item.clone()));
             }
         }
         ListingResult { items, degraded }
     }
 
     pub fn healthy_capabilities(&self) -> Vec<ServerCapabilities> {
-        let servers = self.servers.load();
-        servers
-            .iter()
-            .filter(|(server_name, _)| {
-                self.health
-                    .get(*server_name)
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true)
-            })
+        self.healthy_upstreams()
+            .into_iter()
             .map(|(_, upstream)| upstream.capabilities.clone())
             .collect()
     }
@@ -2428,21 +2268,6 @@ impl ServerManager {
         servers
             .get(server_name)
             .and_then(|upstream| upstream.upstream.clone())
-    }
-
-    /// Get all healthy upstream servers as (name, server) pairs.
-    pub fn healthy_upstreams(&self) -> Vec<(String, Arc<UpstreamServer>)> {
-        let servers = self.servers.load();
-        servers
-            .iter()
-            .filter(|(name, _)| {
-                self.health
-                    .get(name.as_str())
-                    .map(|h| h.health.is_routable())
-                    .unwrap_or(true)
-            })
-            .map(|(name, upstream)| (name.clone(), Arc::clone(upstream)))
-            .collect()
     }
 
     /// Gracefully shutdown all upstream servers.
@@ -2787,8 +2612,11 @@ impl ServerManager {
         }
     }
 
-    /// Replace an upstream server (used after reconnection).
-    /// Updates the servers map and resets circuit breaker and health state.
+    /// Swap in a reconnected upstream and reset its health and breaker.
+    ///
+    /// Only for an upstream connected against the live config: use
+    /// `Engine::commit_replacement`, which checks that, or a removed server
+    /// comes back.
     ///
     /// Unlike [`stop_server`], the last-known-good listing caches (`last_resources`,
     /// `last_resource_templates`, `last_prompts`) and `availability` are intentionally
@@ -2797,7 +2625,7 @@ impl ServerManager {
     /// first post-reconnect listing succeeds. They are overwritten on the next Fresh
     /// listing and reclaimed by `stop_server`/`update_availability` if the server is
     /// removed from config.
-    pub async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
+    pub(crate) async fn replace_server(&self, name: &str, upstream: UpstreamServer) {
         self.install_call_guards(name, &upstream.config, false);
         self.spawn_initial_log_level(name, &upstream);
         let old_upstream = self.insert_upstream(name.to_string(), Arc::new(upstream));
@@ -2813,10 +2641,11 @@ impl ServerManager {
             if Arc::strong_count(&old_upstream) > 1 {
                 let name = name.to_string();
                 let mut shutdown_rx = self.shutdown_signal.subscribe();
+                let grace = self.replacement_grace;
                 let mut retire_tasks = self.retire_tasks.lock().await;
                 retire_tasks.spawn(async move {
                     tokio::select! {
-                        _ = tokio::time::sleep(UPSTREAM_REPLACEMENT_GRACE_PERIOD) => {}
+                        _ = tokio::time::sleep(grace) => {}
                         // Engine is shutting down: skip the rest of the grace
                         // period and retire immediately.
                         _ = shutdown_rx.wait_for(|v| *v) => {}
@@ -4037,13 +3866,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from(name.to_string()),
-            tools: Arc::clone(&tools),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from(name.to_string()),
+            Arc::clone(&tools),
+            std::sync::Weak::new(),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -4100,13 +3927,11 @@ mod tests {
         }
         let _cleanup = KillOnExit(child_pid);
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("eof-ignorer"),
-            tools: Arc::clone(&tools),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("eof-ignorer"),
+            Arc::clone(&tools),
+            std::sync::Weak::new(),
+        ));
         let client: McpClient = rmcp::service::serve_directly(handler, transport, None);
         let upstream = UpstreamServer {
             name: "eof-ignorer".to_string(),
@@ -4146,13 +3971,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from(name.to_string()),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from(name.to_string()),
+            Arc::clone(&tools),
+            Arc::downgrade(router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -4444,7 +4267,10 @@ mod tests {
 
     #[tokio::test]
     async fn replace_server_cancels_replaced_upstream_when_old_arc_is_still_held() {
-        let mgr = ServerManager::new();
+        let mgr = ServerManager {
+            replacement_grace: Duration::from_millis(50),
+            ..ServerManager::new()
+        };
 
         let (upstream_server_a, tools_rx_a) = MutableToolServer::new(vec![make_tool("echo")]);
         let upstream_peer_a = Arc::clone(&upstream_server_a.peer);
@@ -4462,13 +4288,11 @@ mod tests {
         });
 
         let tools_a = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler_a = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("replace-test"),
-            tools: Arc::clone(&tools_a),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler_a = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("replace-test"),
+            Arc::clone(&tools_a),
+            std::sync::Weak::new(),
+        ));
         let client_a: McpClient = upstream_handler_a
             .serve(client_transport_a)
             .await
@@ -4522,13 +4346,11 @@ mod tests {
         });
 
         let tools_b = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler_b = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("replace-test"),
-            tools: Arc::clone(&tools_b),
-            router: std::sync::Weak::new(),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler_b = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("replace-test"),
+            Arc::clone(&tools_b),
+            std::sync::Weak::new(),
+        ));
         let client_b: McpClient = upstream_handler_b
             .serve(client_transport_b)
             .await
@@ -4572,13 +4394,16 @@ mod tests {
         .expect("replaced upstream should be cancelled even with lingering Arc");
     }
 
-    // Plan 012: grace-period retirement tasks are tracked so `shutdown_all`
-    // can retire them immediately instead of leaving orphaned upstreams
-    // alive up to `UPSTREAM_REPLACEMENT_GRACE_PERIOD` after shutdown returns.
+    // Grace-period retirement tasks are tracked so `shutdown_all` can retire
+    // them at once instead of leaving replaced upstreams alive for the rest
+    // of their grace after shutdown returns.
 
     #[tokio::test]
     async fn replace_grace_still_waits_in_normal_operation() {
-        let mgr = ServerManager::new();
+        let mgr = ServerManager {
+            replacement_grace: Duration::from_millis(50),
+            ..ServerManager::new()
+        };
         let upstream = make_connected_test_upstream("grace-normal").await;
         mgr.insert_upstream("grace-normal".to_string(), Arc::new(upstream));
 
@@ -4589,8 +4414,8 @@ mod tests {
         let replacement = make_connected_test_upstream("grace-normal").await;
         mgr.replace_server("grace-normal", replacement).await;
 
-        // Immediately after replace_server returns, the grace period (50ms
-        // in test builds) has not elapsed yet — normal operation must not
+        // Immediately after replace_server returns, the 50ms grace has not
+        // elapsed yet — normal operation must not
         // retire the old upstream early.
         assert!(
             !old_upstream.client.is_closed(),
@@ -4618,7 +4443,7 @@ mod tests {
 
         // Hold a second reference so replace_server takes the grace-period
         // path, leaving a pending retirement task asleep for
-        // UPSTREAM_REPLACEMENT_GRACE_PERIOD (50ms in test builds).
+        // the 30s grace.
         let old_upstream = mgr
             .get_upstream("grace-shutdown")
             .expect("initial upstream");
@@ -4809,13 +4634,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -4919,13 +4742,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5254,13 +5075,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5379,13 +5198,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("upstream"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("upstream"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await
@@ -5521,13 +5338,11 @@ mod tests {
         });
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
-        let upstream_handler = Arc::new(UpstreamClientHandler {
-            server_id: Arc::from("catalog"),
-            tools: Arc::clone(&tools),
-            router: Arc::downgrade(&router),
-            list_timeout: Duration::from_secs(300),
-            protocol_version_override: None,
-        });
+        let upstream_handler = Arc::new(UpstreamClientHandler::new_for_tests(
+            Arc::from("catalog"),
+            Arc::clone(&tools),
+            Arc::downgrade(&router),
+        ));
         let client: McpClient = upstream_handler
             .serve(client_transport)
             .await

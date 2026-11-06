@@ -30,15 +30,6 @@ impl ProtocolError {
             ProtocolError::InvalidRequest { .. } => -32600, // Invalid request
         }
     }
-
-    /// Creates a JSON-RPC error object from this error.
-    pub fn to_json_rpc_error(&self) -> serde_json::Value {
-        serde_json::json!({
-            "code": self.code(),
-            "message": self.to_string(),
-            "data": null
-        })
-    }
 }
 
 impl From<ProtocolError> for rmcp::ErrorData {
@@ -46,24 +37,4 @@ impl From<ProtocolError> for rmcp::ErrorData {
         let code = rmcp::model::ErrorCode(err.code() as i32);
         rmcp::ErrorData::new(code, err.to_string(), None)
     }
-}
-
-/// Internal operational errors. Logged but not returned to clients.
-#[derive(Debug, thiserror::Error)]
-pub enum InternalError {
-    #[error("config parse error at {path}: {detail}")]
-    ConfigParseError {
-        path: std::path::PathBuf,
-        detail: String,
-    },
-
-    #[error("failed to start server {server_id}: {reason}")]
-    ServerStartFailed { server_id: String, reason: String },
-
-    #[error("transport error ({context}): {source}")]
-    TransportError {
-        context: String,
-        #[source]
-        source: anyhow::Error,
-    },
 }
