@@ -228,13 +228,20 @@ async fn operator_live_sessions(
                 }
             },
             client_id: None,
-            grant: snapshot.grant,
             link_target: None,
             session_id: snapshot.session_id,
             client_type: snapshot.client_type,
             client_info: None,
             adapter_version: None,
             host: None,
+            client_key: plug_core::downstream_identity::remote_client_key(
+                snapshot.grant.as_deref(),
+                snapshot.client_type,
+            ),
+            access_key: Some(plug_core::downstream_identity::remote_access_key(
+                snapshot.grant.as_deref(),
+            )),
+            grant: snapshot.grant,
             connected_secs: snapshot.connected_seconds,
             last_activity_secs: Some(snapshot.idle_seconds),
         })
@@ -562,15 +569,17 @@ async fn operator_revoke_oauth_client(
             // manager rejects future token use before this point; task cleanup
             // then uses TaskStore's create guard/tombstone ledger so an
             // in-flight create cannot survive the revocation.
-            let principal = plug_core::types::PrincipalId::downstream_oauth(
-                manager.base_url(),
-                client_id,
-                manager.resource(),
-            );
+            let resource = manager.resource();
+            let owner = plug_core::downstream_identity::HttpCredential::Grant {
+                issuer: manager.base_url(),
+                client_id: &client_id,
+                resource: &resource,
+            }
+            .task_owner(None);
             state
                 .http_state
                 .router
-                .cleanup_tasks_for_owner(&plug_core::tasks::TaskOwner::new(principal.owner_key()))
+                .cleanup_tasks_for_owner(&owner)
                 .await;
             StatusCode::NO_CONTENT
         }
@@ -2599,6 +2608,8 @@ mod tests {
             host: None,
             grant: None,
             link_target: None,
+            client_key: None,
+            access_key: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2612,6 +2623,8 @@ mod tests {
             host: None,
             grant: None,
             link_target: None,
+            client_key: None,
+            access_key: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2641,6 +2654,8 @@ mod tests {
             host: None,
             grant: None,
             link_target: None,
+            client_key: None,
+            access_key: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2670,6 +2685,8 @@ mod tests {
             host: None,
             grant: None,
             link_target: None,
+            client_key: None,
+            access_key: None,
             connected_secs: 10,
             last_activity_secs: None,
         }];
@@ -2699,6 +2716,8 @@ mod tests {
             host: None,
             grant: None,
             link_target: None,
+            client_key: None,
+            access_key: None,
             connected_secs: 5,
             last_activity_secs: Some(1),
         }];
@@ -2780,6 +2799,8 @@ mod tests {
                 host: None,
                 grant: None,
                 link_target: None,
+                client_key: None,
+                access_key: None,
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -2793,6 +2814,8 @@ mod tests {
                 host: None,
                 grant: None,
                 link_target: None,
+                client_key: None,
+                access_key: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },
@@ -3645,12 +3668,12 @@ mod tests {
             claims.resource.clone(),
         );
         let owner = plug_core::tasks::TaskOwner::new(principal.owner_key());
-        let context = plug_core::proxy::DownstreamCallContext::http_for_client_with_trace(
+        let context = plug_core::proxy::DownstreamCallContext::http(
             "validated-before-revoke",
             rmcp::model::RequestId::from(rmcp::model::NumberOrString::Number(1)),
             plug_core::types::ClientType::Unknown,
-            Arc::<str>::from("00000000000000000000000000000001"),
         )
+        .with_trace_id(Arc::<str>::from("00000000000000000000000000000001"))
         .with_authorization(principal, claims.scopes)
         .with_principal_lifecycle(claims.principal_lifecycle);
 
@@ -3707,7 +3730,7 @@ mod tests {
         ));
 
         let session_id = "expiring-session";
-        let owner = plug_core::proxy::ToolRouter::task_owner_for_http_session(session_id);
+        let owner = plug_core::downstream_identity::http_session_task_owner(session_id);
 
         // Spot-check a second cleanup also runs, guarding the extraction from
         // silently dropping one of the other seven teardown steps.

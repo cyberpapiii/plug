@@ -13,6 +13,7 @@ use rmcp::model::{
 };
 use serde::{Deserialize, Serialize};
 
+use crate::downstream_identity::ClientHost;
 use crate::types::{SecretString, ServerHealth, ServerStatus, UpstreamServerMetadata};
 
 /// Maximum IPC message size (4 MB). Reject before allocating buffer.
@@ -150,11 +151,6 @@ pub struct ClientBlocks {
     /// The servers those single tools belong to.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub partly_allowed_servers: Vec<String>,
-}
-
-/// The settings key of a remote client that holds a grant.
-pub fn grant_client_key(client_id: &str) -> String {
-    format!("oauth:{client_id}")
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -891,86 +887,6 @@ pub enum LiveSessionInventoryScope {
     Unavailable,
 }
 
-/// The program on this Mac that started a `plug connect` process.
-///
-/// The connector reads it from the process table, so unlike the name a client
-/// sends in MCP `initialize` it cannot be chosen by the client. It is used for
-/// display only.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientHost {
-    /// What to call it: the app bundle's name, or the executable's file name.
-    pub name: String,
-    /// Path of the executable that started the connector.
-    pub executable: String,
-    /// Path of the outermost `.app` bundle the executable runs from, if any.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub app: Option<String>,
-    /// What an interpreter was started to run: a script path or a module
-    /// name. Tells apart two clients that both run under a bare `python3`.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub script: Option<String>,
-}
-
-impl ClientHost {
-    /// The settings key of a local client known only by its host.
-    pub fn client_key(&self) -> String {
-        let program = self.app.as_ref().unwrap_or(&self.executable);
-        match &self.script {
-            Some(script) => format!("host:{program}#{script}"),
-            None => format!("host:{program}"),
-        }
-    }
-}
-
-/// The settings key every remote client without a grant of its own shares:
-/// the configured bearer token and an open loopback listener cannot tell one
-/// caller from another.
-pub const SHARED_REMOTE_CLIENT_KEY: &str = "remote:shared";
-
-/// What a target the owner made up for a client Plug has no entry for
-/// starts with. The app writes it into the command it hands that client.
-pub const CUSTOM_CLIENT_PREFIX: &str = "custom:";
-
-/// The settings key a link target stands for: a client Plug knows, or one
-/// the owner named in the app. Anything else is dropped, so a key is never
-/// made from free text.
-pub fn link_target_key(target: &str) -> Option<String> {
-    if let Some(known) = crate::clients::ClientTarget::from_slug(target) {
-        return Some(known.slug().to_string());
-    }
-    let slug = target.strip_prefix(CUSTOM_CLIENT_PREFIX)?;
-    let shaped = !slug.is_empty()
-        && slug.len() <= 40
-        && slug
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-');
-    shaped.then(|| target.to_string())
-}
-
-/// The settings key of a local client.
-///
-/// The target `plug link` wrote into the client's config comes first: the
-/// client cannot change it by reporting a different name. The name it reports
-/// in `initialize` is the fallback for a connector linked before targets were
-/// written, and the host program is what is left for a client Plug does not
-/// know.
-pub fn local_client_key(
-    link_target: Option<&str>,
-    client_type: crate::types::ClientType,
-    host: Option<&ClientHost>,
-) -> Option<String> {
-    if let Some(key) = link_target.and_then(link_target_key) {
-        return Some(key);
-    }
-    if let Some(slug) = client_type.target_slug() {
-        return Some(slug.to_string());
-    }
-    if client_type != crate::types::ClientType::Unknown {
-        return None;
-    }
-    host.map(ClientHost::client_key)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcLiveSessionInfo {
     pub transport: LiveSessionTransport,
@@ -992,45 +908,20 @@ pub struct IpcLiveSessionInfo {
     /// for a remote session.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub link_target: Option<String>,
+    /// What this client's settings are stored under. See
+    /// [`crate::downstream_identity::local_client_key`] and
+    /// [`crate::downstream_identity::remote_client_key`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_key: Option<String>,
+    /// The key this session's requests carry, which per-client blocks are
+    /// read under. It differs from `client_key` only for a remote session
+    /// with no grant: its requests cannot be told from any other on the
+    /// shared token, so they share one key, while its row is still named
+    /// after what it reports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access_key: Option<String>,
     pub connected_secs: u64,
     pub last_activity_secs: Option<u64>,
-}
-
-impl IpcLiveSessionInfo {
-    /// What this client's settings are stored under.
-    ///
-    /// A remote session is the grant it came in on, which Plug verified. A
-    /// local client is the target it was linked as, or failing that the
-    /// target Plug works out from the name it reports. One Plug does not know
-    /// is the program that started it, read from the process table. A session
-    /// with none of these has no key.
-    ///
-    /// Only the grant is verified. Any program running as the owner can start
-    /// a connector and claim a local key.
-    pub fn client_key(&self) -> Option<String> {
-        if let Some(grant) = &self.grant {
-            return Some(grant_client_key(grant));
-        }
-        local_client_key(
-            self.link_target.as_deref(),
-            self.client_type,
-            self.host.as_ref(),
-        )
-    }
-
-    /// The key this session's requests carry, which is the key per-client
-    /// blocks are read under. It differs from `client_key` for one kind of
-    /// session: a remote one with no grant. Its requests cannot be told from
-    /// any other on the shared token, so they share one key, while the row it
-    /// shows under is still named after what it reports.
-    pub fn access_key(&self) -> Option<String> {
-        match self.transport {
-            LiveSessionTransport::Http | LiveSessionTransport::Sse if self.grant.is_none() => {
-                Some(SHARED_REMOTE_CLIENT_KEY.to_string())
-            }
-            _ => self.client_key(),
-        }
-    }
 }
 
 /// Per-server OAuth authentication info returned by `AuthStatus`.
@@ -1834,6 +1725,8 @@ mod tests {
                     host: None,
                     grant: None,
                     link_target: None,
+                    client_key: None,
+                    access_key: None,
                     connected_secs: 12,
                     last_activity_secs: Some(1),
                 }],
@@ -1972,29 +1865,6 @@ mod tests {
         assert_eq!(risk.plug_inferred.destructive, Some(true));
         assert_eq!(risk.effective.idempotent, Some(false));
         assert!(risk.has_conflict);
-    }
-
-    #[test]
-    fn a_client_the_owner_named_keeps_its_own_key() {
-        use crate::types::ClientType;
-        // A known target wins, however it is spelled.
-        assert_eq!(link_target_key("codex").as_deref(), Some("codex-cli"));
-        // One the owner made up is its own key, whatever the client reports.
-        assert_eq!(
-            local_client_key(Some("custom:my-tool"), ClientType::Cursor, None).as_deref(),
-            Some("custom:my-tool")
-        );
-        // Free text is not a key.
-        for target in [
-            "my tool",
-            "custom:",
-            "custom:My Tool",
-            "custom:a/b",
-            "other:x",
-        ] {
-            assert_eq!(link_target_key(target), None, "{target}");
-        }
-        assert_eq!(link_target_key(&format!("custom:{}", "a".repeat(41))), None);
     }
 
     #[test]
@@ -2189,79 +2059,6 @@ mod tests {
                 ..
             } if version == "0.6.5"
         ));
-    }
-
-    #[test]
-    fn a_client_key_comes_from_what_plug_observes_never_from_what_the_client_says() {
-        let session = |client_type, host| IpcLiveSessionInfo {
-            transport: LiveSessionTransport::DaemonProxy,
-            client_id: Some("client-1".to_string()),
-            session_id: "session-1".to_string(),
-            client_type,
-            client_info: Some("Cursor".to_string()),
-            adapter_version: None,
-            host,
-            grant: None,
-            link_target: None,
-            connected_secs: 1,
-            last_activity_secs: None,
-        };
-        let host = |app: Option<&str>| ClientHost {
-            name: "Hermes".to_string(),
-            executable: "/opt/hermes/bin/python3".to_string(),
-            app: app.map(str::to_string),
-            script: None,
-        };
-        use crate::types::ClientType;
-
-        assert_eq!(
-            session(ClientType::Cursor, Some(host(None)))
-                .client_key()
-                .as_deref(),
-            Some("cursor")
-        );
-        assert_eq!(
-            session(
-                ClientType::Unknown,
-                Some(host(Some("/Applications/Hermes.app")))
-            )
-            .client_key()
-            .as_deref(),
-            Some("host:/Applications/Hermes.app")
-        );
-        assert_eq!(
-            session(ClientType::Unknown, Some(host(None)))
-                .client_key()
-                .as_deref(),
-            Some("host:/opt/hermes/bin/python3")
-        );
-        // It calls itself Cursor, but nothing Plug can see backs that up.
-        assert_eq!(session(ClientType::Unknown, None).client_key(), None);
-        assert_eq!(session(ClientType::GrokBot, None).client_key(), None);
-
-        // The target it was linked as outranks the name it reports, and any
-        // spelling `plug link` accepts lands on one key.
-        let mut linked = session(ClientType::Cursor, Some(host(None)));
-        linked.link_target = Some("codex".to_string());
-        assert_eq!(linked.client_key().as_deref(), Some("codex-cli"));
-        // A target Plug never wrote is ignored.
-        linked.link_target = Some("root".to_string());
-        assert_eq!(linked.client_key().as_deref(), Some("cursor"));
-
-        // Two clients under the same interpreter are told apart by script.
-        let mut scripted = host(None);
-        scripted.script = Some("/opt/hermes/agent.py".to_string());
-        assert_eq!(
-            session(ClientType::Unknown, Some(scripted))
-                .client_key()
-                .as_deref(),
-            Some("host:/opt/hermes/bin/python3#/opt/hermes/agent.py")
-        );
-
-        // A remote session is the grant it came in on, whatever it says it is.
-        let mut remote = session(ClientType::Cursor, None);
-        remote.grant = Some("client-abc".to_string());
-        assert_eq!(remote.client_key().as_deref(), Some("oauth:client-abc"));
     }
 
     #[test]
@@ -2620,6 +2417,8 @@ mod tests {
                         host: None,
                         grant: None,
                         link_target: None,
+                        client_key: None,
+                        access_key: None,
                         connected_secs: 30,
                         last_activity_secs: Some(2),
                     }],

@@ -74,14 +74,6 @@ impl Drop for UpstreamRequestCancelGuard {
 }
 
 impl super::ToolRouter {
-    pub fn task_owner_for_ipc_client(client_id: &str) -> TaskOwner {
-        TaskOwner::new(Arc::<str>::from(format!("ipc:{client_id}")))
-    }
-
-    pub fn task_owner_for_http_session(session_id: &str) -> TaskOwner {
-        TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")))
-    }
-
     pub async fn enqueue_tool_task(
         self: &Arc<Self>,
         tool_name: &str,
@@ -169,12 +161,8 @@ impl super::ToolRouter {
         // still tombstones this in-flight owner during cleanup, preventing a
         // late record from surviving. A revocation that already completed is
         // rejected here before route lookup or any upstream request.
-        if let Some(context) = downstream.as_ref()
-            && let Some(lifecycle) = context.principal_lifecycle.as_ref()
-            && !lifecycle.is_active()
-        {
-            return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
-                .into_error(context.protocol_era));
+        if let Some(context) = downstream.as_ref() {
+            context.ensure_principal_lifecycle_active()?;
         }
 
         if canonical_plug_meta_tool_name(tool_name).is_some() {
@@ -1369,7 +1357,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_tasks_for_owner_aborts_long_running_local_task_for_http_session() {
-        let owner = ToolRouter::task_owner_for_http_session("session-abort-http");
+        let owner = crate::downstream_identity::http_session_task_owner("session-abort-http");
         assert_owner_teardown_aborts_long_running_local_task(owner).await;
     }
 
@@ -1379,7 +1367,7 @@ mod tests {
         // through the same `cleanup_tasks_for_owner` — the owner key is the
         // only thing that differs (`ipc:<client_id>` vs `http:<session_id>`)
         // — so this is the shared-layer proof for the daemon teardown path.
-        let owner = ToolRouter::task_owner_for_ipc_client("client-abort-ipc");
+        let owner = crate::downstream_identity::ipc_task_owner("client-abort-ipc");
         assert_owner_teardown_aborts_long_running_local_task(owner).await;
     }
 
@@ -1387,8 +1375,8 @@ mod tests {
     async fn cleanup_tasks_for_owner_ignores_other_owners_running_tasks() {
         let sm = Arc::new(ServerManager::new());
         let router = ToolRouter::new(sm, RouterConfig::default());
-        let owner_a = ToolRouter::task_owner_for_http_session("session-a");
-        let owner_b = ToolRouter::task_owner_for_http_session("session-b");
+        let owner_a = crate::downstream_identity::http_session_task_owner("session-a");
+        let owner_b = crate::downstream_identity::http_session_task_owner("session-b");
 
         let dropped = Arc::new(AtomicBool::new(false));
         let observer = AbortObserver(Arc::clone(&dropped));
@@ -1787,7 +1775,7 @@ mod tests {
         )
         .await;
 
-        let owner = ToolRouter::task_owner_for_http_session("session-hung-teardown");
+        let owner = crate::downstream_identity::http_session_task_owner("session-hung-teardown");
 
         // Record 1: passthrough task on the unresponsive upstream.
         // Record 2: still-running local future whose abort we observe.
@@ -1862,7 +1850,7 @@ mod tests {
         )
         .await;
 
-        let owner = ToolRouter::task_owner_for_http_session("session-expired-upstream");
+        let owner = crate::downstream_identity::http_session_task_owner("session-expired-upstream");
         {
             let mut store = router.task_store.lock().await;
             store
@@ -1907,7 +1895,7 @@ mod tests {
         )
         .await;
 
-        let owner = ToolRouter::task_owner_for_http_session("session-hung-cancel");
+        let owner = crate::downstream_identity::http_session_task_owner("session-hung-cancel");
         let task = router
             .task_store
             .lock()
@@ -1978,7 +1966,7 @@ mod tests {
             tool_risk_inventory: HashMap::new(),
         });
 
-        let owner = ToolRouter::task_owner_for_http_session("session-native-race");
+        let owner = crate::downstream_identity::http_session_task_owner("session-native-race");
         let enqueue_router = Arc::clone(&router);
         let enqueue_owner = owner.clone();
         let enqueue = tokio::spawn(async move {
@@ -2082,7 +2070,7 @@ mod tests {
             tool_risk_inventory: HashMap::new(),
         });
 
-        let owner = ToolRouter::task_owner_for_http_session("session-full-peer-queue");
+        let owner = crate::downstream_identity::http_session_task_owner("session-full-peer-queue");
         let result = tokio::time::timeout(
             Duration::from_secs(60),
             router.enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None),
@@ -2127,12 +2115,12 @@ mod tests {
         principal: crate::types::PrincipalId,
         request_id: i64,
     ) -> DownstreamCallContext {
-        DownstreamCallContext::http_for_client_with_trace(
+        DownstreamCallContext::http(
             format!("quota-session-{request_id}"),
             RequestId::from(NumberOrString::Number(request_id)),
             ClientType::Unknown,
-            Arc::<str>::from(format!("{request_id:032x}")),
         )
+        .with_trace_id(Arc::<str>::from(format!("{request_id:032x}")))
         .with_authorization(
             principal,
             std::collections::BTreeSet::from(["tools:read".to_string(), "tasks:use".to_string()]),
@@ -2345,7 +2333,7 @@ mod tests {
     async fn enqueue_refuses_when_owner_liveness_probe_reports_closed() {
         let sm = Arc::new(ServerManager::new());
         let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
-        let owner = ToolRouter::task_owner_for_http_session("session-already-gone");
+        let owner = crate::downstream_identity::http_session_task_owner("session-already-gone");
 
         let probe: OwnerLivenessProbe = Arc::new(|| false);
         let error = router
@@ -2392,7 +2380,8 @@ mod tests {
         .await;
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-hung-native-create");
+        let owner =
+            crate::downstream_identity::http_session_task_owner("session-hung-native-create");
         let enqueue_router = Arc::clone(&router);
         let enqueue_owner = owner.clone();
         let enqueue = tokio::spawn(async move {
@@ -2502,7 +2491,7 @@ mod tests {
         .await;
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-caller-drop");
+        let owner = crate::downstream_identity::http_session_task_owner("session-caller-drop");
         let enqueue_router = Arc::clone(&router);
         let enqueue_owner = owner.clone();
         let enqueue = tokio::spawn(async move {
@@ -2681,7 +2670,7 @@ mod tests {
         sm.apply_live_settings("mock", &one_call_at_a_time());
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-record-vanish");
+        let owner = crate::downstream_identity::http_session_task_owner("session-record-vanish");
         let created = router
             .enqueue_tool_task("Mock__hang", None, None, owner.clone(), None, None)
             .await
@@ -2759,7 +2748,7 @@ mod tests {
         sm.apply_live_settings("mock", &one_call_at_a_time());
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-abort-in-gap");
+        let owner = crate::downstream_identity::http_session_task_owner("session-abort-in-gap");
         let created = router
             .enqueue_tool_task("Mock__hang", None, None, owner.clone(), None, None)
             .await

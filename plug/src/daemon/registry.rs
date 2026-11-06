@@ -21,11 +21,28 @@ struct ClientSession {
     client_id: String,
     client_info: Option<String>,
     adapter_version: Option<String>,
-    host: Option<plug_core::ipc::ClientHost>,
+    host: Option<plug_core::downstream_identity::ClientHost>,
     link_target: Option<String>,
     connected_at: Instant,
     capabilities: ClientCapabilities,
     cancellation_capability: String,
+}
+
+impl ClientSession {
+    fn client_type(&self) -> plug_core::types::ClientType {
+        self.client_info
+            .as_deref()
+            .map(plug_core::client_detect::detect_client)
+            .unwrap_or(plug_core::types::ClientType::Unknown)
+    }
+
+    fn client_key(&self) -> Option<String> {
+        plug_core::downstream_identity::local_client_key(
+            self.link_target.as_deref(),
+            self.client_type(),
+            self.host.as_ref(),
+        )
+    }
 }
 
 pub(super) struct RegistrationResult {
@@ -59,7 +76,7 @@ impl ClientRegistry {
         client_id: String,
         client_info: Option<String>,
         adapter_version: Option<String>,
-        host: Option<plug_core::ipc::ClientHost>,
+        host: Option<plug_core::downstream_identity::ClientHost>,
     ) -> RegistrationResult {
         let session_id = uuid::Uuid::new_v4().to_string();
         let cancellation_capability = format!(
@@ -136,7 +153,8 @@ impl ClientRegistry {
     /// neither a client `plug link` accepts nor one the owner named is
     /// dropped, so a key is never invented from free text.
     pub(super) fn set_link_target(&self, session_id: &str, link_target: Option<&str>) {
-        let Some(target) = link_target.and_then(plug_core::ipc::link_target_key) else {
+        let Some(target) = link_target.and_then(plug_core::downstream_identity::link_target_key)
+        else {
             return;
         };
         if let Some(mut entry) = self.sessions.get_mut(session_id) {
@@ -146,16 +164,7 @@ impl ClientRegistry {
 
     /// The key this session's settings are stored under.
     pub(super) fn client_key(&self, session_id: &str) -> Option<String> {
-        let entry = self.sessions.get(session_id)?;
-        plug_core::ipc::local_client_key(
-            entry.link_target.as_deref(),
-            entry
-                .client_info
-                .as_deref()
-                .map(plug_core::client_detect::detect_client)
-                .unwrap_or(plug_core::types::ClientType::Unknown),
-            entry.host.as_ref(),
-        )
+        self.sessions.get(session_id)?.client_key()
     }
 
     /// Update client_info for an existing session.
@@ -229,16 +238,14 @@ impl ClientRegistry {
                 transport: plug_core::ipc::LiveSessionTransport::DaemonProxy,
                 client_id: Some(entry.client_id.clone()),
                 session_id: entry.key().clone(),
-                client_type: entry
-                    .client_info
-                    .as_deref()
-                    .map(plug_core::client_detect::detect_client)
-                    .unwrap_or(plug_core::types::ClientType::Unknown),
+                client_type: entry.client_type(),
                 client_info: entry.client_info.clone(),
                 adapter_version: entry.adapter_version.clone(),
                 host: entry.host.clone(),
                 grant: None,
                 link_target: entry.link_target.clone(),
+                client_key: entry.client_key(),
+                access_key: entry.client_key(),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })
@@ -329,7 +336,7 @@ mod tests {
     #[test]
     fn registration_keeps_the_host_program_in_live_inventory() {
         let (registry, _count_rx) = ClientRegistry::new();
-        let host = plug_core::ipc::ClientHost {
+        let host = plug_core::downstream_identity::ClientHost {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),

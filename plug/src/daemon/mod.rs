@@ -786,10 +786,8 @@ async fn handle_ipc_connection(
                 .await;
         }
         ctx.engine.tool_router().remove_client_log_level(session_id);
-        let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Ipc,
-            session_id,
-        );
+        let lazy_session_key =
+            plug_core::downstream_identity::DownstreamTransport::Ipc.lazy_session_key(session_id);
         ctx.engine
             .tool_router()
             .clear_lazy_session(&lazy_session_key);
@@ -797,9 +795,9 @@ async fn handle_ipc_connection(
             && !ctx.client_registry.client_sessions.contains_key(&client_id)
         {
             ctx.engine.tool_router().revoke_continuations_for_principal(
-                &plug_core::types::PrincipalId::daemon_ipc_registry(&client_id),
+                &plug_core::downstream_identity::ipc_registry_principal(&client_id),
             );
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
             ctx.engine
                 .tool_router()
                 .cleanup_tasks_for_owner(&owner)
@@ -815,13 +813,13 @@ async fn handle_ipc_connection(
 fn live_session_lazy_key(session: &plug_core::ipc::IpcLiveSessionInfo) -> String {
     let transport = match session.transport {
         plug_core::ipc::LiveSessionTransport::DaemonProxy => {
-            plug_core::proxy::DownstreamTransport::Ipc
+            plug_core::downstream_identity::DownstreamTransport::Ipc
         }
         plug_core::ipc::LiveSessionTransport::Http | plug_core::ipc::LiveSessionTransport::Sse => {
-            plug_core::proxy::DownstreamTransport::Http
+            plug_core::downstream_identity::DownstreamTransport::Http
         }
     };
-    plug_core::proxy::ToolRouter::lazy_session_key(transport, &session.session_id)
+    transport.lazy_session_key(&session.session_id)
 }
 
 /// Resolves when the modern downstream gate may have changed. Never resolves
@@ -1500,13 +1498,20 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     }
                 },
                 client_id: None,
-                grant: snapshot.grant,
                 link_target: None,
                 session_id: snapshot.session_id,
                 client_type: snapshot.client_type,
                 client_info: None,
                 adapter_version: None,
                 host: None,
+                client_key: plug_core::downstream_identity::remote_client_key(
+                    snapshot.grant.as_deref(),
+                    snapshot.client_type,
+                ),
+                access_key: Some(plug_core::downstream_identity::remote_access_key(
+                    snapshot.grant.as_deref(),
+                )),
+                grant: snapshot.grant,
                 connected_secs: snapshot.connected_seconds,
                 last_activity_secs: Some(snapshot.idle_seconds),
             })
@@ -1601,10 +1606,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                         .list_tools_for_client_session(
                             session.client_type,
                             Some(live_session_lazy_key(session).as_str()),
-                            session.access_key().as_deref(),
+                            session.access_key.as_deref(),
                         )
                         .len(),
-                    client_key: session.client_key(),
+                    client_key: session.client_key.clone(),
                 })
                 .collect();
             let client_names = config
@@ -2009,10 +2014,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 ctx.engine
                     .tool_router()
                     .remove_client_log_level(replaced_session_id);
-                let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                    plug_core::proxy::DownstreamTransport::Ipc,
-                    replaced_session_id,
-                );
+                let lazy_session_key = plug_core::downstream_identity::DownstreamTransport::Ipc
+                    .lazy_session_key(replaced_session_id);
                 ctx.engine
                     .tool_router()
                     .clear_lazy_session(&lazy_session_key);
@@ -2073,10 +2076,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     .await;
             }
             ctx.engine.tool_router().remove_client_log_level(session_id);
-            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                plug_core::proxy::DownstreamTransport::Ipc,
-                session_id,
-            );
+            let lazy_session_key = plug_core::downstream_identity::DownstreamTransport::Ipc
+                .lazy_session_key(session_id);
             ctx.engine
                 .tool_router()
                 .clear_lazy_session(&lazy_session_key);
@@ -2084,9 +2085,9 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 && !ctx.client_registry.client_sessions.contains_key(&client_id)
             {
                 ctx.engine.tool_router().revoke_continuations_for_principal(
-                    &plug_core::types::PrincipalId::daemon_ipc_registry(&client_id),
+                    &plug_core::downstream_identity::ipc_registry_principal(&client_id),
                 );
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
                 ctx.engine
                     .tool_router()
                     .cleanup_tasks_for_owner(&owner)
@@ -2408,14 +2409,12 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 .as_deref()
                 .map(plug_core::client_detect::detect_client)
                 .unwrap_or(plug_core::types::ClientType::Unknown);
-            let downstream = plug_core::proxy::DownstreamCallContext::ipc_for_client(
+            let downstream = plug_core::proxy::DownstreamCallContext::ipc(
                 session_id.as_str(),
                 request_id.clone(),
                 client_type,
+                Some(client_id),
             )
-            .with_local_principal(plug_core::types::PrincipalId::daemon_ipc_registry(
-                client_id,
-            ))
             .with_client_key(ctx.client_registry.client_key(session_id));
             ctx.engine
                 .tool_router()
@@ -4184,17 +4183,15 @@ mod tests {
             host: None,
             grant: None,
             link_target: None,
+            client_key: None,
+            access_key: None,
             connected_secs: 0,
             last_activity_secs: None,
         };
-        let ipc = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Ipc,
-            "sess-1",
-        );
-        let http = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Http,
-            "sess-1",
-        );
+        let ipc =
+            plug_core::downstream_identity::DownstreamTransport::Ipc.lazy_session_key("sess-1");
+        let http =
+            plug_core::downstream_identity::DownstreamTransport::Http.lazy_session_key("sess-1");
         assert_eq!(
             live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::DaemonProxy)),
             ipc

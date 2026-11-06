@@ -5,7 +5,7 @@
 //! witness: the connector's parent is the program that launched it, whatever
 //! that program chooses to say.
 
-use plug_core::ipc::ClientHost;
+use plug_core::downstream_identity::ClientHost;
 
 /// Launchers that start a connector on behalf of something else. Their parent
 /// is the program worth naming.

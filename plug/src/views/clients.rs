@@ -779,7 +779,7 @@ mod tests {
     #[test]
     fn an_unrecognised_session_is_grouped_under_the_program_that_started_it() {
         let mut hosted = session("Unknown", "daemon_proxy", 30);
-        hosted.host = Some(plug_core::ipc::ClientHost {
+        hosted.host = Some(plug_core::downstream_identity::ClientHost {
             name: "Hermes".to_string(),
             executable: "/Applications/Hermes.app/Contents/MacOS/Hermes".to_string(),
             app: Some("/Applications/Hermes.app".to_string()),
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn a_session_whose_link_names_its_client_shows_under_that_client() {
         let mut linked = session("Unknown", "daemon_proxy", 30);
-        linked.host = Some(plug_core::ipc::ClientHost {
+        linked.host = Some(plug_core::downstream_identity::ClientHost {
             name: "node".to_string(),
             executable: "/opt/homebrew/bin/node".to_string(),
             app: None,
@@ -855,7 +855,7 @@ mod tests {
     fn a_client_to_rename_is_found_by_the_name_it_shows_under() {
         use crate::commands::clients::resolve_client_key;
         let mut hermes = session("Unknown", "daemon_proxy", 30);
-        hermes.host = Some(plug_core::ipc::ClientHost {
+        hermes.host = Some(plug_core::downstream_identity::ClientHost {
             name: "python3".to_string(),
             executable: "/opt/hermes/bin/python3".to_string(),
             app: None,

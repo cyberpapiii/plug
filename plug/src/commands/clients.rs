@@ -35,7 +35,7 @@ pub(crate) struct LiveSessionView {
     /// The program that started a local connector, read from the process
     /// table rather than from what the client says about itself.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) host: Option<plug_core::ipc::ClientHost>,
+    pub(crate) host: Option<plug_core::downstream_identity::ClientHost>,
     /// What `plug clients rename` takes to name this client.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) key: Option<String>,
@@ -510,9 +510,9 @@ pub(crate) fn live_session_views(
 ) -> Vec<LiveSessionView> {
     let mut views = live
         .iter()
-        .map(|session| (session, session.client_key()))
+        .map(|session| (session, session.client_key.clone()))
         .map(|(session, key)| LiveSessionView {
-            access_key: session.access_key(),
+            access_key: session.access_key.clone(),
             name: key
                 .as_ref()
                 .and_then(|key| config?.clients.get(key)?.name.clone()),
@@ -522,7 +522,9 @@ pub(crate) fn live_session_views(
             grant_name: key.as_ref().and_then(|key| {
                 grants
                     .iter()
-                    .find(|grant| plug_core::ipc::grant_client_key(&grant.client_id) == *key)
+                    .find(|grant| {
+                        plug_core::downstream_identity::grant_client_key(&grant.client_id) == *key
+                    })
                     .map(|grant| grant.client_name.trim().to_string())
                     .filter(|name| !name.is_empty())
             }),

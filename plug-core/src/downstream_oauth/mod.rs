@@ -5915,12 +5915,12 @@ mod tests {
             validated_tx.send(()).expect("signal validated request");
             resume_rx.await.expect("release request after revocation");
 
-            let context = crate::proxy::DownstreamCallContext::http_for_client_with_trace(
+            let context = crate::proxy::DownstreamCallContext::http(
                 "session-before-revoke",
                 rmcp::model::RequestId::from(rmcp::model::NumberOrString::Number(1)),
                 crate::types::ClientType::Unknown,
-                Arc::<str>::from("00000000000000000000000000000001"),
             )
+            .with_trace_id(Arc::<str>::from("00000000000000000000000000000001"))
             .with_authorization(
                 crate::types::PrincipalId::downstream_oauth(
                     request_manager.base_url(),

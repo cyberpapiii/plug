@@ -40,6 +40,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- On the 2026-07-28 protocol over HTTP with no token (a loopback-only listener), a client can now read and cancel the tasks it starts and cancel a call it made. The tasks were owned under a name the task methods never looked for, and cancellations were ignored.
 - `plug import` finds the servers in OpenCode and Kilo Code settings, which keep them under `mcp`, and imports an entry marked `"type": "sse"` as SSE where it came in as HTTP.
 - `plug import` and `plug setup` refuse to write into a config that does not load. They used to add servers to the end of the broken file.
 - `plug unlink` from Codex no longer deletes a server called `plugin` that follows Plug's entry.

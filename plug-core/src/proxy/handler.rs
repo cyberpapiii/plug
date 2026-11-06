@@ -70,7 +70,7 @@ struct StdioDownstreamContext {
 
 impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        let mut context = DownstreamCallContext::stdio_for_client(
+        let mut context = DownstreamCallContext::stdio(
             Arc::clone(&self.client_id),
             self.request_id.clone(),
             self.client_type,
@@ -83,7 +83,11 @@ impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
         .with_lifecycle(None, self.cancellation.clone(), None)
         // A foreground stdio server has one client and no connector to say
         // how it was linked, so the name it reports is all there is.
-        .with_client_key(crate::ipc::local_client_key(None, self.client_type, None));
+        .with_client_key(crate::downstream_identity::local_client_key(
+            None,
+            self.client_type,
+            None,
+        ));
         if let Some(metadata) = &self.client_metadata {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
@@ -98,9 +102,9 @@ impl crate::dispatch::DownstreamContext for StdioDownstreamContext {
     }
 
     fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        Ok(TaskOwner::new(Arc::<str>::from(
-            format!("stdio:{}", self.client_id).as_str(),
-        )))
+        Ok(crate::downstream_identity::stdio_task_owner(
+            &self.client_id,
+        ))
     }
 }
 
@@ -173,18 +177,14 @@ pub struct ProxyHandler {
 impl Drop for ProxyHandler {
     fn drop(&mut self) {
         self.shutdown.cancel();
-        self.router
-            .revoke_continuations_for_principal(&PrincipalId::stdio_process(stable_instance_uuid(
-                "stdio",
-                &self.client_id,
-            )));
-        let session_key =
-            ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
+        self.router.revoke_continuations_for_principal(
+            &crate::downstream_identity::stdio_principal(&self.client_id),
+        );
+        let session_key = DownstreamTransport::Stdio.lazy_session_key(self.client_id.as_ref());
         self.router.clear_lazy_session(&session_key);
-        self.router
-            .unregister_downstream_bridge(&NotificationTarget::Stdio {
-                client_id: Arc::clone(&self.client_id),
-            });
+        self.router.unregister_downstream_bridge(
+            &DownstreamTransport::Stdio.notification_target(&self.client_id),
+        );
     }
 }
 
@@ -244,7 +244,7 @@ impl ProxyHandler {
             .read()
             .map(|ct| *ct)
             .unwrap_or(ClientType::Unknown);
-        crate::ipc::local_client_key(None, client_type, None)
+        crate::downstream_identity::local_client_key(None, client_type, None)
     }
 
     fn downstream_context_for_call(
@@ -303,14 +303,7 @@ impl ProxyHandler {
         );
         let downstream = adapter.downstream_call_context();
         downstream.authorize(crate::protocol::MethodFamily::Tasks)?;
-        if downstream
-            .principal_lifecycle
-            .as_ref()
-            .is_some_and(|lifecycle| !lifecycle.is_active())
-        {
-            return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
-                .into_error(downstream.protocol_era));
-        }
+        downstream.ensure_principal_lifecycle_active()?;
         self.router.admit_modern_request(&downstream)
     }
 
@@ -352,7 +345,7 @@ impl ServerHandler for ProxyHandler {
             .unwrap_or(ClientType::Unknown);
         self.router.get_tool_definition(
             name,
-            crate::ipc::local_client_key(None, client_type, None).as_deref(),
+            crate::downstream_identity::local_client_key(None, client_type, None).as_deref(),
         )
     }
 
@@ -702,14 +695,13 @@ impl ServerHandler for ProxyHandler {
                 .read()
                 .map(|ct| *ct)
                 .unwrap_or(ClientType::Unknown);
-            let session_key =
-                ToolRouter::lazy_session_key(DownstreamTransport::Stdio, self.client_id.as_ref());
+            let session_key = DownstreamTransport::Stdio.lazy_session_key(self.client_id.as_ref());
             let modern = is_modern_protocol(&context);
             Ok(strip_legacy_catalog_cache(
                 self.router.list_tools_page_for_client_session(
                     ct,
                     Some(&session_key),
-                    crate::ipc::local_client_key(None, ct, None).as_deref(),
+                    crate::downstream_identity::local_client_key(None, ct, None).as_deref(),
                     request,
                 ),
                 modern,
@@ -795,7 +787,7 @@ impl ServerHandler for ProxyHandler {
         request: rmcp::model::GetTaskParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<rmcp::model::GetTaskResult, McpError>> + Send + '_ {
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        let owner = crate::downstream_identity::stdio_task_owner(&self.client_id);
         async move {
             let _request_lease = self.admit_modern_task_method(&context)?;
             self.router
@@ -811,7 +803,7 @@ impl ServerHandler for ProxyHandler {
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
         async move {
             let _request_lease = self.admit_modern_task_method(&context)?;
-            let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+            let owner = crate::downstream_identity::stdio_task_owner(&self.client_id);
             self.router
                 .validate_task_owner(&owner, &request.task_id)
                 .await?;
@@ -827,7 +819,7 @@ impl ServerHandler for ProxyHandler {
         request: rmcp::model::CancelTaskParams,
         context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<(), McpError>> + Send + '_ {
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        let owner = crate::downstream_identity::stdio_task_owner(&self.client_id);
         async move {
             let _request_lease = self.admit_modern_task_method(&context)?;
             self.router
@@ -843,7 +835,7 @@ impl ServerHandler for ProxyHandler {
         _context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CustomResult, McpError>> + Send + '_ {
         let router = Arc::clone(&self.router);
-        let owner = TaskOwner::new(Arc::<str>::from(format!("stdio:{}", self.client_id)));
+        let owner = crate::downstream_identity::stdio_task_owner(&self.client_id);
         async move {
             let value = match request.method.as_str() {
                 "plug/legacy/tasks/list" => {
@@ -906,7 +898,11 @@ impl ServerHandler for ProxyHandler {
         async move {
             if let Some(request_id) = notification.request_id {
                 self.router.forward_cancel_from_downstream(
-                    &DownstreamCallContext::stdio(Arc::clone(&self.client_id), request_id),
+                    &DownstreamCallContext::stdio(
+                        Arc::clone(&self.client_id),
+                        request_id,
+                        crate::types::ClientType::Unknown,
+                    ),
                     notification.reason,
                 );
             }

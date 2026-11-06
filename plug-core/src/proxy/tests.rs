@@ -27,18 +27,14 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     // without an adapter having declared how the caller authenticated must be
     // able to do nothing, not everything.
     for context in [
-        DownstreamCallContext::http("bare-session", RequestId::Number(1)),
-        DownstreamCallContext::http_for_client(
+        DownstreamCallContext::http(
             "bare-session",
-            RequestId::Number(2),
-            ClientType::Unknown,
+            RequestId::Number(1),
+            crate::types::ClientType::Unknown,
         ),
-        DownstreamCallContext::http_for_client_with_trace(
-            "bare-session",
-            RequestId::Number(3),
-            ClientType::Unknown,
-            "0123456789abcdef0123456789abcdef",
-        ),
+        DownstreamCallContext::http("bare-session", RequestId::Number(2), ClientType::Unknown),
+        DownstreamCallContext::http("bare-session", RequestId::Number(3), ClientType::Unknown)
+            .with_trace_id("0123456789abcdef0123456789abcdef"),
     ] {
         assert!(
             !context.local_trust,
@@ -53,11 +49,15 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     }
 
     // The two explicit opt-ins still work, so no legitimate caller regresses.
-    let bearer = DownstreamCallContext::http("oauth-session", RequestId::Number(4))
-        .with_authorization(
-            crate::types::PrincipalId::configured_credential("test-bearer", 0),
-            ["tools:read".to_string()],
-        );
+    let bearer = DownstreamCallContext::http(
+        "oauth-session",
+        RequestId::Number(4),
+        crate::types::ClientType::Unknown,
+    )
+    .with_authorization(
+        crate::types::PrincipalId::configured_credential("test-bearer", 0),
+        ["tools:read".to_string()],
+    );
     assert!(!bearer.local_trust);
     assert!(
         bearer
@@ -71,10 +71,15 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
         "an authorized context is still bounded by its scopes"
     );
 
-    let loopback =
-        DownstreamCallContext::http("loopback-session", RequestId::Number(5)).with_local_principal(
-            crate::types::PrincipalId::configured_credential("downstream-http-loopback", 0),
-        );
+    let loopback = DownstreamCallContext::http(
+        "loopback-session",
+        RequestId::Number(5),
+        crate::types::ClientType::Unknown,
+    )
+    .with_local_principal(crate::types::PrincipalId::configured_credential(
+        "downstream-http-loopback",
+        0,
+    ));
     assert!(loopback.local_trust);
     assert!(
         loopback
@@ -85,11 +90,16 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
 
     // Stdio and IPC are local by construction and must stay trusted.
     for context in [
-        DownstreamCallContext::stdio("stdio-client", RequestId::Number(6)),
-        DownstreamCallContext::ipc_for_client(
+        DownstreamCallContext::stdio(
+            "stdio-client",
+            RequestId::Number(6),
+            crate::types::ClientType::Unknown,
+        ),
+        DownstreamCallContext::ipc(
             "ipc-client",
             RequestId::Number(7),
             ClientType::Unknown,
+            None,
         ),
     ] {
         assert!(context.local_trust, "local transports keep local trust");
@@ -103,12 +113,12 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
 
 #[test]
 fn downstream_context_preserves_supplied_http_trace_id() {
-    let context = DownstreamCallContext::http_for_client_with_trace(
+    let context = DownstreamCallContext::http(
         "session-a",
         RequestId::from(NumberOrString::Number(1)),
         ClientType::ClaudeCode,
-        Arc::<str>::from("4bf92f3577b34da6a3ce929d0e0e4736"),
-    );
+    )
+    .with_trace_id(Arc::<str>::from("4bf92f3577b34da6a3ce929d0e0e4736"));
 
     assert_eq!(
         context.trace_id.as_ref(),
@@ -119,17 +129,10 @@ fn downstream_context_preserves_supplied_http_trace_id() {
 #[test]
 fn client_metadata_never_changes_principal_identity() {
     let request = RequestId::from(NumberOrString::Number(1));
-    let original = DownstreamCallContext::stdio_for_client(
-        "process-instance",
-        request.clone(),
-        ClientType::Unknown,
-    );
-    let changed = DownstreamCallContext::stdio_for_client(
-        "process-instance",
-        request,
-        ClientType::ClaudeCode,
-    )
-    .with_client_metadata("forged-client", "999");
+    let original =
+        DownstreamCallContext::stdio("process-instance", request.clone(), ClientType::Unknown);
+    let changed = DownstreamCallContext::stdio("process-instance", request, ClientType::ClaudeCode)
+        .with_client_metadata("forged-client", "999");
     assert_eq!(original.principal, changed.principal);
     assert_ne!(original.client_metadata, changed.client_metadata);
 }
@@ -1000,7 +1003,7 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
         .with_indexes(),
     ));
 
-    let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+    let session_key = DownstreamTransport::Stdio.lazy_session_key("client-a");
     assert_eq!(
         router
             .list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None)
@@ -1010,11 +1013,8 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
 
     let mut args = serde_json::Map::new();
     args.insert("query".to_string(), serde_json::json!("commit"));
-    let downstream = DownstreamCallContext::stdio_for_client(
-        "client-a",
-        RequestId::Number(1),
-        ClientType::OpenCode,
-    );
+    let downstream =
+        DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::OpenCode);
     router
         .handle_search_tools(Some(args), Some(&downstream))
         .expect("search and load tool");
@@ -1066,11 +1066,8 @@ fn bridge_search_keeps_session_working_set_bounded() {
         .with_indexes(),
     ));
 
-    let downstream = DownstreamCallContext::stdio_for_client(
-        "client-a",
-        RequestId::Number(1),
-        ClientType::OpenCode,
-    );
+    let downstream =
+        DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::OpenCode);
     for index in 0..(BRIDGE_WORKING_SET_MAX_TOOLS + 5) {
         let mut args = serde_json::Map::new();
         args.insert(
@@ -1083,7 +1080,7 @@ fn bridge_search_keeps_session_working_set_bounded() {
             .expect("search and load tool");
     }
 
-    let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+    let session_key = DownstreamTransport::Stdio.lazy_session_key("client-a");
     let visible =
         router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
     let names = visible
@@ -1134,11 +1131,8 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
     ));
 
     let mut notifications = router.subscribe_notifications();
-    let downstream = DownstreamCallContext::stdio_for_client(
-        "client-a",
-        RequestId::Number(1),
-        ClientType::OpenCode,
-    );
+    let downstream =
+        DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::OpenCode);
     let mut args = serde_json::Map::new();
     args.insert("query".to_string(), serde_json::json!("commit"));
     router
@@ -1199,7 +1193,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
         .with_indexes(),
     ));
 
-    let session_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "client-a");
+    let session_key = DownstreamTransport::Stdio.lazy_session_key("client-a");
     router.list_tools_for_client_session(ClientType::OpenCode, Some(&session_key), None);
 
     let err = router
@@ -1207,7 +1201,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
             "git__commit",
             None,
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::stdio(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
@@ -1227,7 +1221,7 @@ async fn bridge_session_rejects_unloaded_direct_tool_call_before_tools_list() {
             "git__commit",
             None,
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::stdio(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
@@ -1250,7 +1244,7 @@ async fn bridge_session_rejects_unloaded_task_tool_call() {
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::stdio(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
@@ -1275,7 +1269,7 @@ async fn bridge_session_rejects_task_wrapped_search_meta_tool() {
             None,
             TaskOwner::new(Arc::<str>::from("stdio:client-a")),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::stdio(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
@@ -1298,7 +1292,7 @@ async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
             "plug__invoke_tool",
             Some(args),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::stdio(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
@@ -1333,7 +1327,7 @@ async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
             "plug__search_tools",
             Some(args),
             None,
-            Some(DownstreamCallContext::stdio_for_client(
+            Some(DownstreamCallContext::stdio(
                 "client-a",
                 RequestId::Number(1),
                 ClientType::OpenCode,
@@ -1592,7 +1586,7 @@ async fn queued_tool_call_resolves_reconnected_upstream_after_permit() {
                 "Queued__tool",
                 None,
                 None,
-                Some(DownstreamCallContext::stdio_for_client(
+                Some(DownstreamCallContext::stdio(
                     "queued-client",
                     RequestId::Number(1),
                     ClientType::Unknown,
@@ -1704,6 +1698,7 @@ async fn route_upstream_progress_publishes_targeted_notification() {
                 downstream: DownstreamCallContext::stdio(
                     Arc::from("client-1"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "upstream".to_string(),
                 upstream_request_id: None,
@@ -2165,6 +2160,7 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
                 downstream: DownstreamCallContext::stdio(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2181,6 +2177,7 @@ fn test_upstream_request_lookup_uses_request_id_not_server_uniqueness() {
                 downstream: DownstreamCallContext::http(
                     Arc::from("session-b"),
                     RequestId::from(NumberOrString::Number(2)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(202))),
@@ -2215,6 +2212,7 @@ fn test_route_upstream_progress_restores_downstream_token() {
                 downstream: DownstreamCallContext::stdio(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2268,6 +2266,7 @@ fn test_anonymous_upstream_cancellation_preserves_active_call() {
                 downstream: DownstreamCallContext::stdio(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(101))),
@@ -2299,6 +2298,7 @@ fn test_attach_upstream_request_id_preserves_pending_cancel_reason() {
                 downstream: DownstreamCallContext::stdio(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: None,
@@ -2347,6 +2347,7 @@ fn test_register_active_call_uses_upstream_progress_token_for_lookup() {
                 downstream: DownstreamCallContext::stdio(
                     Arc::from("client-a"),
                     RequestId::from(NumberOrString::Number(1)),
+                    crate::types::ClientType::Unknown,
                 ),
                 upstream_server_id: "s1".to_string(),
                 upstream_request_id: Some(RequestId::from(NumberOrString::Number(42))),
@@ -2389,7 +2390,8 @@ fn test_downstream_context_notification_target() {
     assert_eq!(
         DownstreamCallContext::stdio(
             Arc::from("client-a"),
-            RequestId::from(NumberOrString::Number(1))
+            RequestId::from(NumberOrString::Number(1)),
+            crate::types::ClientType::Unknown
         )
         .notification_target(),
         NotificationTarget::Stdio {
@@ -2405,10 +2407,11 @@ fn test_downstream_context_notification_target() {
 /// correctness win the split delivers.
 #[test]
 fn ipc_context_has_distinct_identity_from_stdio() {
-    let ipc = DownstreamCallContext::ipc_for_client(
+    let ipc = DownstreamCallContext::ipc(
         Arc::from("sess-1"),
         RequestId::from(NumberOrString::Number(1)),
         ClientType::Unknown,
+        None,
     );
     assert_eq!(
         ipc.notification_target(),
@@ -2419,16 +2422,13 @@ fn ipc_context_has_distinct_identity_from_stdio() {
 
     // Distinct lazy-session-key namespaces: a stdio and an IPC client sharing an
     // id no longer collide in the lazy working-set map.
-    let ipc_key = ToolRouter::lazy_session_key(DownstreamTransport::Ipc, "sess-1");
-    let stdio_key = ToolRouter::lazy_session_key(DownstreamTransport::Stdio, "sess-1");
+    let ipc_key = DownstreamTransport::Ipc.lazy_session_key("sess-1");
+    let stdio_key = DownstreamTransport::Stdio.lazy_session_key("sess-1");
     assert_eq!(ipc_key, "ipc:sess-1");
     assert_ne!(ipc_key, stdio_key);
     // A reconnecting IPC client with the same session id resolves to the same
     // namespaced key — its working set is not orphaned by the namespace change.
-    assert_eq!(
-        ToolRouter::lazy_session_key(DownstreamTransport::Ipc, "sess-1"),
-        ipc_key,
-    );
+    assert_eq!(DownstreamTransport::Ipc.lazy_session_key("sess-1"), ipc_key,);
 }
 
 // ── dispatch::dispatch_tools_call characterization (U1) ──────────────────
@@ -2446,7 +2446,7 @@ struct MockDownstream {
 
 impl crate::dispatch::DownstreamContext for MockDownstream {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::stdio_for_client(
+        DownstreamCallContext::stdio(
             Arc::<str>::from("test-client"),
             RequestId::from(NumberOrString::Number(1)),
             ClientType::Unknown,
@@ -2470,12 +2470,12 @@ struct ScopedTaskDownstream {
 
 impl crate::dispatch::DownstreamContext for ScopedTaskDownstream {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        DownstreamCallContext::http_for_client_with_trace(
+        DownstreamCallContext::http(
             "session-scoped",
             RequestId::from(NumberOrString::Number(1)),
             ClientType::Unknown,
-            Arc::<str>::from("00000000000000000000000000000001"),
         )
+        .with_trace_id(Arc::<str>::from("00000000000000000000000000000001"))
         .with_authorization(
             crate::types::PrincipalId::downstream_oauth(
                 "https://issuer.example",
@@ -3394,7 +3394,7 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
     sm.replace_server("modern", first).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(99));
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(99));
     let mut params = CallToolRequestParams::new("Modern__tool");
     let input_requests = InputRequests::from_iter([(
         "answer".to_string(),
@@ -3442,10 +3442,11 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
     replacement.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", replacement).await;
 
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(2)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
@@ -3473,7 +3474,7 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "old_tool");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(100));
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(100));
     let mut params = CallToolRequestParams::new("Modern__tool");
     let input_requests = InputRequests::from_iter([(
         "answer".to_string(),
@@ -3519,10 +3520,11 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
 
     // The server Arc is unchanged; only the exposed-name mapping moved.
     publish_tool_route_snapshot_with_original(&router, "Modern__tool", "modern", "new_tool");
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(3)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
@@ -3560,15 +3562,16 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(101));
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(101));
     let _full = router
         .continuation_registry
         .reserve(&principal, MRTR_MAX_BYTES)
         .unwrap();
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(4)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
@@ -3602,7 +3605,7 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
 
     let principal =
         crate::types::PrincipalId::downstream_oauth("https://issuer.example", "client", "plug");
-    let context = DownstreamCallContext::http_for_client(
+    let context = DownstreamCallContext::http(
         "modern-session",
         RequestId::from(NumberOrString::Number(9)),
         ClientType::Unknown,
@@ -3646,11 +3649,12 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(102));
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(102));
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(5)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal.clone())
     .with_protocol(
@@ -3714,11 +3718,12 @@ async fn continuation_keeps_max_byte_reservation_across_larger_second_input_requ
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
 
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(103));
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(103));
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(8)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal)
     .with_protocol(
@@ -3795,7 +3800,7 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
     let principal =
         crate::types::PrincipalId::downstream_oauth("https://issuer.example", "client", "plug");
     let lifecycle = crate::downstream_oauth::PrincipalLifecycleLease::active_for_tests();
-    let context = DownstreamCallContext::http_for_client(
+    let context = DownstreamCallContext::http(
         "modern-session",
         RequestId::from(NumberOrString::Number(6)),
         ClientType::Unknown,
@@ -3864,11 +3869,12 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
         release: Arc::new(std::sync::Barrier::new(2)),
     });
     router.set_continuation_insert_gate(Some(Arc::clone(&gate)));
-    let principal = crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(105));
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::types::PrincipalId::daemon_ipc(uuid::Uuid::from_u128(105));
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(10)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal.clone())
     .with_protocol(
@@ -3931,11 +3937,12 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
         release: Arc::new(std::sync::Barrier::new(2)),
     });
     router.set_continuation_insert_gate(Some(Arc::clone(&gate)));
-    let principal = crate::types::PrincipalId::daemon_ipc_registry("ipc-client-race");
-    let context = DownstreamCallContext::ipc_for_client(
+    let principal = crate::downstream_identity::ipc_registry_principal("ipc-client-race");
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(11)),
         ClientType::Unknown,
+        None,
     )
     .with_local_principal(principal.clone())
     .with_protocol(
@@ -4015,10 +4022,11 @@ async fn invoke_meta_tool_applies_pair_suppression_to_resolved_target() {
     upstream.protocol_era = crate::protocol::ProtocolEra::Modern;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "legacy-client",
         RequestId::from(NumberOrString::Number(7)),
         ClientType::Unknown,
+        None,
     );
     let arguments = serde_json::Map::from_iter([
         ("tool_name".to_string(), serde_json::json!("Modern__tool")),
@@ -4051,12 +4059,15 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
     let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
     sm.replace_server("modern", upstream).await;
     publish_tool_route_snapshot(&router, "Modern__tool", "modern");
-    let context = DownstreamCallContext::ipc_for_client(
+    let context = DownstreamCallContext::ipc(
         "modern-client",
         RequestId::from(NumberOrString::Number(9)),
         ClientType::Unknown,
+        None,
     )
-    .with_local_principal(crate::types::PrincipalId::daemon_ipc(Uuid::from_u128(104)))
+    .with_local_principal(crate::types::PrincipalId::daemon_ipc(
+        uuid::Uuid::from_u128(104),
+    ))
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
@@ -4820,7 +4831,7 @@ fn router_with_client_blocks(config: RouterConfig) -> ToolRouter {
 }
 
 fn context_for(client_key: Option<&str>) -> DownstreamCallContext {
-    DownstreamCallContext::stdio_for_client("client-a", RequestId::Number(1), ClientType::Unknown)
+    DownstreamCallContext::stdio("client-a", RequestId::Number(1), ClientType::Unknown)
         .with_client_key(client_key)
 }
 

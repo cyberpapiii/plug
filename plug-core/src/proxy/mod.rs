@@ -17,13 +17,13 @@ use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContex
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::artifacts::ArtifactStore;
 use crate::branding;
 use crate::circuit::CircuitBreakerError;
 use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
+use crate::downstream_identity::DownstreamTransport;
 use crate::engine::Engine;
 use crate::error::ProtocolError;
 use crate::notifications::{NotificationTarget, ProtocolNotification};
@@ -505,16 +505,6 @@ impl Drop for RefreshLeaderGuard<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DownstreamTransport {
-    Stdio,
-    Http,
-    /// Daemon IPC client (`plug connect` over the Unix socket). Has its own
-    /// lazy-session-key namespace (`ipc:`) and `NotificationTarget::Ipc` so it no
-    /// longer masquerades as `Stdio`.
-    Ipc,
-}
-
 #[derive(Clone, Debug)]
 pub struct DownstreamCallContext {
     pub transport: DownstreamTransport,
@@ -532,34 +522,32 @@ pub struct DownstreamCallContext {
     /// Reloadable transport gate captured when this request context is built.
     /// Modern policy remains fail-closed unless the owning adapter sets it.
     pub modern_direction_enabled: bool,
-    pub principal: Option<PrincipalId>,
-    pub scopes: Arc<BTreeSet<String>>,
-    pub local_trust: bool,
+    principal: Option<PrincipalId>,
+    scopes: Arc<BTreeSet<String>>,
+    local_trust: bool,
     pub client_metadata: Option<crate::protocol::ClientMetadata>,
     pub deadline: Option<std::time::Instant>,
     pub cancellation: CancellationToken,
     pub durable_owner: Option<TaskOwner>,
     /// OAuth client generation captured during bearer validation. Durable
     /// admission rechecks it after registering the TaskStore create guard.
-    pub principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
+    principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
     /// Admitted peer metadata stays opaque to authorization and routing code.
     pub(crate) extension_envelope: Option<ExtensionEnvelope>,
 }
 
 impl DownstreamCallContext {
-    pub fn stdio(client_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
-        Self::stdio_for_client(client_id, request_id, ClientType::Unknown)
-    }
-
-    pub fn stdio_for_client(
-        client_id: impl Into<Arc<str>>,
+    fn new(
+        transport: DownstreamTransport,
+        client_id: Arc<str>,
         request_id: RequestId,
         client_type: ClientType,
+        principal: Option<PrincipalId>,
+        local_trust: bool,
     ) -> Self {
-        let client_id = client_id.into();
         Self {
-            transport: DownstreamTransport::Stdio,
-            client_id: Arc::clone(&client_id),
+            transport,
+            client_id,
             request_id,
             client_type,
             client_key: None,
@@ -567,11 +555,9 @@ impl DownstreamCallContext {
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
             modern_direction_enabled: false,
-            principal: Some(PrincipalId::stdio_process(stable_instance_uuid(
-                "stdio", &client_id,
-            ))),
+            principal,
             scopes: Arc::new(BTreeSet::new()),
-            local_trust: true,
+            local_trust,
             client_metadata: None,
             deadline: None,
             cancellation: CancellationToken::new(),
@@ -581,102 +567,76 @@ impl DownstreamCallContext {
         }
     }
 
-    pub fn ipc_for_client(
+    /// An in-process stdio client. Local by construction, so trusted.
+    pub fn stdio(
         client_id: impl Into<Arc<str>>,
         request_id: RequestId,
         client_type: ClientType,
     ) -> Self {
         let client_id = client_id.into();
-        Self {
-            transport: DownstreamTransport::Ipc,
-            client_id: Arc::clone(&client_id),
+        let principal = crate::downstream_identity::stdio_principal(&client_id);
+        Self::new(
+            DownstreamTransport::Stdio,
+            client_id,
             request_id,
             client_type,
-            client_key: None,
-            trace_id: Arc::from(new_trace_id()),
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: Some(PrincipalId::daemon_ipc(stable_instance_uuid(
-                "ipc", &client_id,
-            ))),
-            scopes: Arc::new(BTreeSet::new()),
-            local_trust: true,
-            client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
-            principal_lifecycle: None,
-            extension_envelope: None,
-        }
+            Some(principal),
+            true,
+        )
     }
 
-    pub fn http(session_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
-        Self::http_for_client(session_id, request_id, ClientType::Unknown)
+    /// A `plug connect` session. Local by construction, so trusted; see
+    /// [`crate::downstream_identity::ipc_principal`] for who it is.
+    pub fn ipc(
+        session_id: impl Into<Arc<str>>,
+        request_id: RequestId,
+        client_type: ClientType,
+        registry_client_id: Option<&str>,
+    ) -> Self {
+        let session_id = session_id.into();
+        let principal = crate::downstream_identity::ipc_principal(&session_id, registry_client_id);
+        Self::new(
+            DownstreamTransport::Ipc,
+            session_id,
+            request_id,
+            client_type,
+            Some(principal),
+            true,
+        )
     }
 
     /// HTTP is the only internet-reachable transport, so its contexts start
     /// untrusted and an adapter opts in — `with_authorization` for a bearer
     /// principal, `with_local_principal` for a loopback listener that requires
-    /// no auth. Stdio and IPC are local by construction and stay trusted.
-    /// An adapter that forgets to say which it is gets a context that can do
-    /// nothing, rather than one that can do everything.
-    pub fn http_for_client(
-        session_id: impl Into<Arc<str>>,
+    /// no auth. An adapter that forgets to say which it is gets a context
+    /// that can do nothing, rather than one that can do everything.
+    pub fn http(
+        client_id: impl Into<Arc<str>>,
         request_id: RequestId,
         client_type: ClientType,
     ) -> Self {
-        let session_id = session_id.into();
-        Self {
-            transport: DownstreamTransport::Http,
-            client_id: session_id,
+        Self::new(
+            DownstreamTransport::Http,
+            client_id.into(),
             request_id,
             client_type,
-            client_key: None,
-            trace_id: Arc::from(new_trace_id()),
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: None,
-            scopes: Arc::new(BTreeSet::new()),
-            local_trust: false,
-            client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
-            principal_lifecycle: None,
-            extension_envelope: None,
-        }
+            None,
+            false,
+        )
     }
 
-    /// Untrusted by default, for the reasons on [`Self::http_for_client`].
-    pub fn http_for_client_with_trace(
-        session_id: impl Into<Arc<str>>,
-        request_id: RequestId,
-        client_type: ClientType,
-        trace_id: impl Into<Arc<str>>,
-    ) -> Self {
-        let session_id = session_id.into();
-        Self {
-            transport: DownstreamTransport::Http,
-            client_id: session_id,
-            request_id,
-            client_type,
-            client_key: None,
-            trace_id: trace_id.into(),
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: None,
-            scopes: Arc::new(BTreeSet::new()),
-            local_trust: false,
-            client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
-            principal_lifecycle: None,
-            extension_envelope: None,
-        }
+    pub fn with_trace_id(mut self, trace_id: impl Into<Arc<str>>) -> Self {
+        self.trace_id = trace_id.into();
+        self
+    }
+
+    pub fn principal(&self) -> Option<&PrincipalId> {
+        self.principal.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_principal_lifecycle(&self) -> bool {
+        self.principal_lifecycle.is_some()
     }
 
     pub fn with_authorization(
@@ -798,7 +758,7 @@ impl DownstreamCallContext {
         }
     }
 
-    fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
+    pub(crate) fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
         if self
             .principal_lifecycle
             .as_ref()
@@ -812,29 +772,8 @@ impl DownstreamCallContext {
     }
 
     pub fn notification_target(&self) -> NotificationTarget {
-        match self.transport {
-            DownstreamTransport::Stdio => NotificationTarget::Stdio {
-                client_id: Arc::clone(&self.client_id),
-            },
-            DownstreamTransport::Http => NotificationTarget::Http {
-                session_id: Arc::clone(&self.client_id),
-            },
-            DownstreamTransport::Ipc => NotificationTarget::Ipc {
-                client_id: Arc::clone(&self.client_id),
-            },
-        }
+        self.transport.notification_target(&self.client_id)
     }
-}
-
-fn stable_instance_uuid(namespace: &str, value: &str) -> Uuid {
-    let mut first = std::collections::hash_map::DefaultHasher::new();
-    namespace.hash(&mut first);
-    value.hash(&mut first);
-    let mut second = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut second);
-    namespace.hash(&mut second);
-    0x706c_7567_u32.hash(&mut second);
-    Uuid::from_u128(((first.finish() as u128) << 64) | second.finish() as u128)
 }
 
 /// Correlates a call's ToolCallStarted and ToolCallCompleted events.
@@ -1570,10 +1509,7 @@ impl ToolRouter {
         context: &DownstreamCallContext,
     ) -> Result<crate::protocol::QuotaLease, McpError> {
         let principal = context.principal.clone().unwrap_or_else(|| {
-            PrincipalId::stdio_process(stable_instance_uuid(
-                "modern-request",
-                context.client_id.as_ref(),
-            ))
+            crate::downstream_identity::quota_principal_for_anonymous(context.client_id.as_ref())
         });
         self.admission_quotas
             .try_acquire(
@@ -1647,14 +1583,6 @@ impl ToolRouter {
 
     pub fn clear_lazy_session(&self, session_key: &str) {
         self.lazy_working_sets.remove(session_key);
-    }
-
-    pub fn lazy_session_key(transport: DownstreamTransport, client_id: &str) -> String {
-        match transport {
-            DownstreamTransport::Stdio => format!("stdio:{client_id}"),
-            DownstreamTransport::Http => format!("http:{client_id}"),
-            DownstreamTransport::Ipc => format!("ipc:{client_id}"),
-        }
     }
 
     /// Recalculate effective level as the most permissive (lowest severity) across all clients.
@@ -4331,10 +4259,9 @@ impl ToolRouter {
                 detail: "lazy tool working-set actions require a downstream session".to_string(),
             }));
         };
-        Ok(Self::lazy_session_key(
-            downstream.transport,
-            downstream.client_id.as_ref(),
-        ))
+        Ok(downstream
+            .transport
+            .lazy_session_key(downstream.client_id.as_ref()))
     }
 
     fn json_tool_result(&self, value: serde_json::Value) -> Result<CallToolResult, McpError> {
@@ -4357,8 +4284,9 @@ impl ToolRouter {
         ) {
             return Ok(());
         }
-        let session_key =
-            Self::lazy_session_key(downstream.transport, downstream.client_id.as_ref());
+        let session_key = downstream
+            .transport
+            .lazy_session_key(downstream.client_id.as_ref());
         let Some(mut loaded) = self.lazy_working_sets.get_mut(&session_key) else {
             return Err(McpError::from(ProtocolError::InvalidRequest {
                 detail: format!(
@@ -4515,6 +4443,7 @@ mod lifecycle_regression_tests {
         let context = DownstreamCallContext::stdio(
             "same-principal",
             RequestId::from(NumberOrString::Number(77)),
+            crate::types::ClientType::Unknown,
         )
         .with_protocol(
             crate::protocol::ProtocolEra::Modern,

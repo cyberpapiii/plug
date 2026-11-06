@@ -31,6 +31,7 @@ use super::oauth::{
     protected_resource_metadata_url,
 };
 use super::sse::sse_stream_with_heartbeat;
+use crate::downstream_identity::HttpCredential;
 use crate::downstream_oauth::{AccessTokenClaims, AccessTokenValidation, resource_scopes};
 use crate::events::{EVENT_SCOPE, EventSource};
 use crate::mcp_http_headers::{
@@ -96,45 +97,22 @@ struct HttpDownstreamContext {
     client_metadata: Option<crate::protocol::ClientMetadata>,
 }
 
-fn http_principal(
-    auth_status: &AuthStatus,
-    oauth_issuer: Option<&str>,
-) -> Option<crate::types::PrincipalId> {
+/// What a request proved about its caller. `NoAuthRequired` is produced only
+/// when `auth_mode` is not OAuth and no bearer token is configured, a
+/// combination config validation permits only for a loopback bind.
+fn http_credential<'a>(
+    auth_status: &'a AuthStatus,
+    oauth_issuer: Option<&'a str>,
+) -> HttpCredential<'a> {
     match auth_status {
-        AuthStatus::Authenticated(Some(claims)) => {
-            Some(crate::types::PrincipalId::downstream_oauth(
-                oauth_issuer.unwrap_or("unknown-issuer"),
-                claims.client_id.clone(),
-                claims.resource.clone(),
-            ))
-        }
-        AuthStatus::Authenticated(None) => Some(crate::types::PrincipalId::configured_credential(
-            "downstream-http-bearer",
-            0,
-        )),
-        AuthStatus::NoAuthRequired => None,
+        AuthStatus::Authenticated(Some(claims)) => HttpCredential::Grant {
+            issuer: oauth_issuer.unwrap_or("unknown-issuer"),
+            client_id: &claims.client_id,
+            resource: &claims.resource,
+        },
+        AuthStatus::Authenticated(None) => HttpCredential::SharedBearer,
+        AuthStatus::NoAuthRequired => HttpCredential::Loopback,
     }
-}
-
-/// The principal for a request that arrived with no authentication at all.
-///
-/// `AuthStatus::NoAuthRequired` is produced only when `auth_mode` is not OAuth
-/// *and* no bearer token is configured, a combination config validation permits
-/// only for a loopback bind. The trust comes from the listener, not from
-/// anything the client sent, so these requests opt into local trust explicitly
-/// rather than inheriting it from a permissive constructor default.
-fn http_loopback_principal() -> crate::types::PrincipalId {
-    crate::types::PrincipalId::configured_credential("downstream-http-loopback", 0)
-}
-
-fn http_task_owner(
-    session_id: &str,
-    auth_status: &AuthStatus,
-    oauth_issuer: Option<&str>,
-) -> crate::tasks::TaskOwner {
-    http_principal(auth_status, oauth_issuer)
-        .map(|principal| crate::tasks::TaskOwner::new(principal.owner_key()))
-        .unwrap_or_else(|| crate::proxy::ToolRouter::task_owner_for_http_session(session_id))
 }
 
 fn modern_http_call_context(
@@ -149,25 +127,20 @@ fn modern_http_call_context(
         .downstream_oauth
         .as_ref()
         .map(|manager| manager.base_url());
-    let principal = http_principal(auth_status, oauth_issuer);
-    let client_id: Arc<str> = principal
-        .as_ref()
-        .map(|principal| Arc::from(principal.owner_key()))
-        .unwrap_or_else(|| {
-            client_info
-                .as_ref()
-                .map(|info| Arc::from(format!("anonymous:{}:{}", info.name, info.version)))
-                .unwrap_or_else(|| Arc::from(format!("anonymous:{trace_id}")))
-        });
-    let mut context = DownstreamCallContext::http_for_client_with_trace(
+    let client_id: Arc<str> = Arc::from(
+        http_credential(auth_status, oauth_issuer)
+            .principal()
+            .owner_key(),
+    );
+    let mut context = DownstreamCallContext::http(
         client_id,
         request_id,
         client_info
             .as_ref()
             .map(|info| crate::client_detect::detect_client(&info.name))
             .unwrap_or(crate::types::ClientType::Unknown),
-        trace_id,
     )
+    .with_trace_id(trace_id)
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
@@ -185,12 +158,12 @@ fn legacy_http_policy_context(
     request_id: RequestId,
     trace_id: Arc<str>,
 ) -> DownstreamCallContext {
-    let context = DownstreamCallContext::http_for_client_with_trace(
+    let context = DownstreamCallContext::http(
         "legacy-http-policy",
         request_id,
         crate::types::ClientType::Unknown,
-        trace_id,
-    );
+    )
+    .with_trace_id(trace_id);
     apply_http_auth(
         context,
         auth_status,
@@ -203,28 +176,25 @@ fn legacy_http_policy_context(
 
 /// Attach what the request proved about its caller to a call context.
 ///
-/// An OAuth token carries its granted scopes and principal lifecycle; a
-/// configured bearer is a local principal; an unauthenticated request can
-/// only exist on a loopback-only listener, so it gets the loopback principal.
-/// The trust comes from that listener, not from client-provided metadata, and
+/// An OAuth token carries its granted scopes and principal lifecycle. The
+/// configured bearer and an unauthenticated request, which only a
+/// loopback-only listener accepts, are local principals: the trust comes from
+/// the credential or the listener, not from client-provided metadata, and
 /// holds in both protocol eras.
 fn apply_http_auth(
     context: DownstreamCallContext,
     auth_status: &AuthStatus,
     oauth_issuer: Option<&str>,
 ) -> DownstreamCallContext {
-    match (auth_status, http_principal(auth_status, oauth_issuer)) {
-        (AuthStatus::Authenticated(Some(claims)), Some(principal)) => context
-            .with_authorization(principal, claims.scopes.clone())
-            .with_principal_lifecycle(claims.principal_lifecycle.clone())
-            .with_client_key(Some(crate::ipc::grant_client_key(&claims.client_id))),
-        (AuthStatus::Authenticated(None), Some(principal)) => context
-            .with_local_principal(principal)
-            .with_client_key(Some(crate::ipc::SHARED_REMOTE_CLIENT_KEY)),
-        (AuthStatus::NoAuthRequired, _) => context
-            .with_local_principal(http_loopback_principal())
-            .with_client_key(Some(crate::ipc::SHARED_REMOTE_CLIENT_KEY)),
-        (AuthStatus::Authenticated(_), None) => context,
+    let credential = http_credential(auth_status, oauth_issuer);
+    let context = context.with_client_key(Some(credential.client_key()));
+    match auth_status {
+        AuthStatus::Authenticated(Some(claims)) => context
+            .with_authorization(credential.principal(), claims.scopes.clone())
+            .with_principal_lifecycle(claims.principal_lifecycle.clone()),
+        AuthStatus::Authenticated(None) | AuthStatus::NoAuthRequired => {
+            context.with_local_principal(credential.principal())
+        }
     }
 }
 
@@ -305,28 +275,21 @@ fn admit_modern_task_operation(
         ));
     }
     context.authorize(crate::protocol::MethodFamily::Tasks)?;
-    if context
-        .principal_lifecycle
-        .as_ref()
-        .is_some_and(|lifecycle| !lifecycle.is_active())
-    {
-        return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
-            .into_error(context.protocol_era));
-    }
-    let principal = context.principal.as_ref().ok_or_else(|| {
+    context.ensure_principal_lifecycle_active()?;
+    let principal = context.principal().ok_or_else(|| {
         crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
     })?;
-    Ok(TaskOwner::new(principal.owner_key()))
+    Ok(crate::downstream_identity::principal_task_owner(principal))
 }
 
 impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
     fn downstream_call_context(&self) -> DownstreamCallContext {
-        let mut context = DownstreamCallContext::http_for_client_with_trace(
+        let mut context = DownstreamCallContext::http(
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
-            Arc::clone(&self.trace_id),
         )
+        .with_trace_id(Arc::clone(&self.trace_id))
         .with_protocol(
             self.protocol_era,
             match self.protocol_era {
@@ -342,17 +305,12 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
         }
-        // Unauthenticated ownership stays scoped to the server-minted session
-        // id in `task_owner`.
         apply_http_auth(context, &self.auth_status, self.oauth_issuer.as_deref())
     }
 
     fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        Ok(http_task_owner(
-            &self.session_id,
-            &self.auth_status,
-            self.oauth_issuer.as_deref(),
-        ))
+        let session_id = self.session_bound.then_some(self.session_id.as_ref());
+        Ok(http_credential(&self.auth_status, self.oauth_issuer.as_deref()).task_owner(session_id))
     }
 
     fn supports_tasks(&self) -> bool {
@@ -563,12 +521,10 @@ impl HttpState {
         // A stale per-client log level would keep the effective level
         // permanently at a permissive value.
         self.router.remove_client_log_level(session_id);
-        let lazy_session_key = crate::proxy::ToolRouter::lazy_session_key(
-            crate::proxy::DownstreamTransport::Http,
-            session_id,
-        );
+        let lazy_session_key =
+            crate::downstream_identity::DownstreamTransport::Http.lazy_session_key(session_id);
         self.router.clear_lazy_session(&lazy_session_key);
-        let owner = crate::proxy::ToolRouter::task_owner_for_http_session(session_id);
+        let owner = crate::downstream_identity::http_session_task_owner(session_id);
         self.router.cleanup_tasks_for_owner(&owner).await;
     }
 
@@ -1084,13 +1040,7 @@ async fn post_mcp(
         {
             match notification.notification {
                 ClientNotification::CancelledNotification(cancelled) => {
-                    let oauth_issuer = state
-                        .downstream_oauth
-                        .as_ref()
-                        .map(|manager| manager.base_url());
-                    if http_principal(&auth_status, oauth_issuer).is_some()
-                        && let Some(request_id) = cancelled.params.request_id.clone()
-                    {
+                    if let Some(request_id) = cancelled.params.request_id.clone() {
                         let context = modern_http_call_context(
                             &state,
                             &auth_status,
@@ -1118,12 +1068,12 @@ async fn post_mcp(
                 ClientNotification::CancelledNotification(cancelled) => {
                     if let Some(request_id) = cancelled.params.request_id.clone() {
                         state.router.forward_cancel_from_downstream(
-                            &DownstreamCallContext::http_for_client_with_trace(
+                            &DownstreamCallContext::http(
                                 Arc::<str>::from(session_id.as_str()),
                                 request_id,
                                 crate::types::ClientType::Unknown,
-                                Arc::clone(&trace_id),
-                            ),
+                            )
+                            .with_trace_id(Arc::clone(&trace_id)),
                             cancelled.params.reason,
                         );
                     }
@@ -1806,10 +1756,7 @@ async fn handle_request(
                 })
                 .unwrap_or(crate::types::ClientType::Unknown);
             let lazy_session_key = session_id_str.as_deref().map(|session_id| {
-                crate::proxy::ToolRouter::lazy_session_key(
-                    crate::proxy::DownstreamTransport::Http,
-                    session_id,
-                )
+                crate::downstream_identity::DownstreamTransport::Http.lazy_session_key(session_id)
             });
             let result = state.router.list_tools_page_for_client_session(
                 client_type,
@@ -2581,10 +2528,7 @@ fn may_be_told(
     grant: Option<&str>,
     notification: &ProtocolNotification,
 ) -> bool {
-    let key = match grant {
-        Some(client_id) => crate::ipc::grant_client_key(client_id),
-        None => crate::ipc::SHARED_REMOTE_CLIENT_KEY.to_string(),
-    };
+    let key = crate::downstream_identity::remote_access_key(grant);
     router.client_may_be_told(Some(&key), notification)
 }
 
@@ -3265,22 +3209,6 @@ mod tests {
         assert!(validate_modern_origin(&headers, &[]).is_err());
     }
 
-    #[test]
-    fn authenticated_http_task_owner_is_stable_across_sessions() {
-        let authenticated = AuthStatus::Authenticated(None);
-        assert_eq!(
-            http_task_owner("session-a", &authenticated, None),
-            http_task_owner("session-b", &authenticated, None),
-            "the configured credential, not the replaceable HTTP session, owns durable tasks"
-        );
-
-        assert_ne!(
-            http_task_owner("session-a", &AuthStatus::NoAuthRequired, None),
-            http_task_owner("session-b", &AuthStatus::NoAuthRequired, None),
-            "legacy unauthenticated sessions retain session-scoped ownership"
-        );
-    }
-
     fn sse_event_id(event: &str) -> Option<u64> {
         event.lines().find_map(|line| {
             line.strip_prefix("id: ")
@@ -3303,7 +3231,7 @@ mod tests {
         let state = test_state();
         let mut clients = std::collections::BTreeMap::new();
         clients.insert(
-            crate::ipc::grant_client_key("watcher"),
+            crate::downstream_identity::grant_client_key("watcher"),
             crate::config::ClientSettings {
                 blocked_servers: vec!["git".to_string()],
                 ..Default::default()
@@ -3386,16 +3314,20 @@ mod tests {
         gate_enabled: bool,
         scopes: impl IntoIterator<Item = String>,
     ) -> DownstreamCallContext {
-        DownstreamCallContext::http("task-client", RequestId::Number(1))
-            .with_protocol(
-                crate::protocol::ProtocolEra::Modern,
-                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-            )
-            .with_modern_direction_enabled(gate_enabled)
-            .with_authorization(
-                crate::types::PrincipalId::configured_credential("task-test", 1),
-                scopes,
-            )
+        DownstreamCallContext::http(
+            "task-client",
+            RequestId::Number(1),
+            crate::types::ClientType::Unknown,
+        )
+        .with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        )
+        .with_modern_direction_enabled(gate_enabled)
+        .with_authorization(
+            crate::types::PrincipalId::configured_credential("task-test", 1),
+            scopes,
+        )
     }
 
     fn modern_request(method: &str, mut params: serde_json::Value) -> HttpRequest<Body> {
@@ -3601,11 +3533,11 @@ mod tests {
         );
 
         assert!(
-            context.principal.is_some(),
+            context.principal().is_some(),
             "verified principal is preserved"
         );
         assert!(
-            context.principal_lifecycle.is_some(),
+            context.has_principal_lifecycle(),
             "revocation lifecycle is preserved"
         );
         for family in [
@@ -3864,7 +3796,11 @@ mod tests {
         // stateless request is placed as surely as a legacy one.
         let context = |auth: &AuthStatus| {
             apply_http_auth(
-                DownstreamCallContext::http("any", RequestId::Number(1)),
+                DownstreamCallContext::http(
+                    "any",
+                    RequestId::Number(1),
+                    crate::types::ClientType::Unknown,
+                ),
                 auth,
                 None,
             )
@@ -3880,7 +3816,7 @@ mod tests {
         for auth in [AuthStatus::Authenticated(None), AuthStatus::NoAuthRequired] {
             assert_eq!(
                 context(&auth).client_key.as_deref(),
-                Some(crate::ipc::SHARED_REMOTE_CLIENT_KEY)
+                Some(crate::downstream_identity::SHARED_REMOTE_CLIENT_KEY)
             );
         }
     }
@@ -4059,11 +3995,15 @@ mod tests {
     fn legacy_initialize_projects_capabilities_through_the_principal_scopes() {
         fn advertised(scopes: &[&str]) -> ServerCapabilities {
             let mut result = InitializeResult::new(every_legacy_capability());
-            let context = DownstreamCallContext::http("cap-session", RequestId::Number(1))
-                .with_authorization(
-                    crate::types::PrincipalId::configured_credential("cap-test", 0),
-                    scopes.iter().map(ToString::to_string),
-                );
+            let context = DownstreamCallContext::http(
+                "cap-session",
+                RequestId::Number(1),
+                crate::types::ClientType::Unknown,
+            )
+            .with_authorization(
+                crate::types::PrincipalId::configured_credential("cap-test", 0),
+                scopes.iter().map(ToString::to_string),
+            );
             project_legacy_capabilities(&mut result, &context);
             result.capabilities
         }
@@ -4130,8 +4070,12 @@ mod tests {
         let mut local = InitializeResult::new(every_legacy_capability());
         project_legacy_capabilities(
             &mut local,
-            &DownstreamCallContext::http("loopback", RequestId::Number(2))
-                .with_local_principal(http_loopback_principal()),
+            &DownstreamCallContext::http(
+                "loopback",
+                RequestId::Number(2),
+                crate::types::ClientType::Unknown,
+            )
+            .with_local_principal(HttpCredential::Loopback.principal()),
         );
         assert_eq!(local.capabilities, every_legacy_capability());
     }
@@ -4339,7 +4283,7 @@ mod tests {
             .expect("fully admitted task method");
         assert_eq!(
             owner.as_key(),
-            allowed.principal.as_ref().expect("principal").owner_key()
+            allowed.principal().expect("principal").owner_key()
         );
     }
 
@@ -4454,16 +4398,20 @@ mod tests {
     fn modern_capability_projection_is_permission_filtered_and_bridge_free() {
         let state = test_state();
         state.router.set_modern_downstream_enabled(true);
-        let context = DownstreamCallContext::http("scoped-client", RequestId::Number(1))
-            .with_protocol(
-                crate::protocol::ProtocolEra::Modern,
-                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-            )
-            .with_modern_direction_enabled(true)
-            .with_authorization(
-                crate::types::PrincipalId::configured_credential("test", 1),
-                ["tools:read".to_string()],
-            );
+        let context = DownstreamCallContext::http(
+            "scoped-client",
+            RequestId::Number(1),
+            crate::types::ClientType::Unknown,
+        )
+        .with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
+        )
+        .with_modern_direction_enabled(true)
+        .with_authorization(
+            crate::types::PrincipalId::configured_credential("test", 1),
+            ["tools:read".to_string()],
+        );
         let capabilities = projected_modern_capabilities(state.router.as_ref(), &context);
         assert!(
             context
@@ -5076,7 +5024,7 @@ mod tests {
             value["error"]["message"],
             "session closed during task creation"
         );
-        let owner = ToolRouter::task_owner_for_http_session(&session_id);
+        let owner = crate::downstream_identity::http_session_task_owner(&session_id);
         assert_eq!(router.task_count_for_owner(&owner).await, 0);
     }
 
@@ -5113,7 +5061,7 @@ mod tests {
             tool_risk_inventory: std::collections::HashMap::new(),
         });
 
-        let owner = ToolRouter::task_owner_for_http_session(&session_id);
+        let owner = crate::downstream_identity::http_session_task_owner(&session_id);
         state
             .router
             .enqueue_tool_task("git__commit", None, None, owner.clone(), None, None)
@@ -5151,7 +5099,7 @@ mod tests {
     async fn delete_mcp_aborts_still_running_session_task() {
         let state = test_state();
         let session_id = state.sessions.create_session().unwrap();
-        let owner = ToolRouter::task_owner_for_http_session(&session_id);
+        let owner = crate::downstream_identity::http_session_task_owner(&session_id);
 
         let dropped = Arc::new(AtomicBool::new(false));
         let observer = AbortObserver(Arc::clone(&dropped));

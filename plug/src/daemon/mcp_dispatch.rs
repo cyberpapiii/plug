@@ -42,18 +42,13 @@ struct IpcDownstreamContext {
 
 impl plug_core::dispatch::DownstreamContext for IpcDownstreamContext {
     fn downstream_call_context(&self) -> plug_core::proxy::DownstreamCallContext {
-        let context = plug_core::proxy::DownstreamCallContext::ipc_for_client(
+        let context = plug_core::proxy::DownstreamCallContext::ipc(
             Arc::clone(&self.session_id),
             self.request_id.clone(),
             self.client_type,
+            self.registry_client_id.as_deref(),
         )
         .with_client_key(self.client_key.clone());
-        let context = match &self.registry_client_id {
-            Some(client_id) => context.with_local_principal(
-                plug_core::types::PrincipalId::daemon_ipc_registry(client_id),
-            ),
-            None => context,
-        };
         match &self.request_context {
             Some(request) => {
                 let version = serde_json::from_value(serde_json::Value::String(
@@ -180,10 +175,8 @@ pub(super) async fn dispatch_mcp_request(
 
             let request = params
                 .and_then(|p| serde_json::from_value::<PaginatedRequestParams>(p.clone()).ok());
-            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                plug_core::proxy::DownstreamTransport::Ipc,
-                session_id,
-            );
+            let lazy_session_key = plug_core::downstream_identity::DownstreamTransport::Ipc
+                .lazy_session_key(session_id);
             let result = tool_router.list_tools_page_for_client_session(
                 client_type,
                 Some(&lazy_session_key),
@@ -402,7 +395,7 @@ pub(super) async fn dispatch_mcp_request(
                             message: "session not found".to_string(),
                         };
                     };
-                    let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+                    let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
                     let registry = Arc::clone(&ctx.client_registry);
                     let probe: plug_core::tasks::OwnerLivenessProbe =
                         Arc::new(move || registry.client_sessions.contains_key(&client_id));
@@ -477,7 +470,7 @@ pub(super) async fn dispatch_mcp_request(
                     message: "session not found".to_string(),
                 };
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
             ipc_result!(tool_router.list_tasks_for_owner(&owner, request).await)
         }
 
@@ -501,7 +494,7 @@ pub(super) async fn dispatch_mcp_request(
                     message: "session not found".to_string(),
                 };
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
             ipc_result!(tool_router.get_task_info_for_owner(&owner, task_id).await)
         }
 
@@ -525,7 +518,7 @@ pub(super) async fn dispatch_mcp_request(
                     message: "session not found".to_string(),
                 };
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
             ipc_result!(tool_router.get_task_result_for_owner(&owner, task_id).await)
         }
 
@@ -549,7 +542,7 @@ pub(super) async fn dispatch_mcp_request(
                     message: "session not found".to_string(),
                 };
             };
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
+            let owner = plug_core::downstream_identity::ipc_task_owner(&client_id);
             ipc_result!(tool_router.cancel_task_for_owner(&owner, task_id).await)
         }
 
@@ -734,8 +727,8 @@ mod tests {
         assert!(downstream.modern_direction_enabled);
         assert_eq!(downstream.protocol_version.as_ref(), "2026-07-28");
         assert_eq!(
-            downstream.principal,
-            Some(plug_core::types::PrincipalId::daemon_ipc_registry(
+            downstream.principal(),
+            Some(&plug_core::downstream_identity::ipc_registry_principal(
                 "stable-client"
             ))
         );
