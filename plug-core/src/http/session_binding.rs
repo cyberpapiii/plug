@@ -182,13 +182,10 @@ mod tests {
     async fn a_session_answers_only_to_the_client_that_opened_it() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
-        let claims = match manager
+        let claims = manager
             .validate_access_token_for(&access_token, &manager.resource())
             .await
-        {
-            AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("issued token must validate, got {other:?}"),
-        };
+            .expect("issued token must validate");
         let sessions = crate::session::SessionStore::new(60, 10);
         let theirs = sessions.create_session().unwrap();
         let someone_elses = sessions.create_session().unwrap();
@@ -226,13 +223,10 @@ mod tests {
     async fn broadcast_audience_follows_the_principal_scopes() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
-        let claims = match manager
+        let claims = manager
             .validate_access_token_for(&access_token, &manager.resource())
             .await
-        {
-            AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("issued token must validate, got {other:?}"),
-        };
+            .expect("issued token must validate");
         let state = test_state();
         let scoped = broadcast_audience_for(&legacy_http_policy_context(
             &state,
@@ -261,13 +255,10 @@ mod tests {
         for (scope, expected) in [("logging:configure", false), ("logging:read", true)] {
             let manager = isolated_oauth_manager(vec![scope.to_string()]);
             let token = issue_test_oauth_token(&manager, scope).await;
-            let claims = match manager
+            let claims = manager
                 .validate_access_token_for(&token, &manager.resource())
                 .await
-            {
-                AccessTokenValidation::Valid(claims) => claims,
-                other => panic!("issued token must validate, got {other:?}"),
-            };
+                .expect("issued token must validate");
             let audience = broadcast_audience_for(&legacy_http_policy_context(
                 &state,
                 &AuthStatus::Authenticated(Some(claims)),
@@ -320,13 +311,10 @@ mod tests {
         let session_id = legacy_oauth_session(&app, &access_token).await;
 
         let oauth = state.downstream_oauth().expect("OAuth manager");
-        let client_id = match oauth
+        let client_id = oauth
             .validate_access_token_for(&access_token, &oauth.resource())
             .await
-        {
-            crate::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("token must validate: {other:?}"),
-        };
+            .expect("token must validate");
         let claims = client_id;
         let client_id = claims.client_id.clone();
         let snapshots = state.sessions.snapshots();

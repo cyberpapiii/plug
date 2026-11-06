@@ -917,13 +917,10 @@ mod tests {
     async fn legacy_oauth_principal_scopes_gate_method_families() {
         let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
         let access_token = issue_test_oauth_token(&manager, "tools:read").await;
-        let claims = match manager
+        let claims = manager
             .validate_access_token_for(&access_token, &manager.resource())
             .await
-        {
-            AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("issued token must validate, got {other:?}"),
-        };
+            .expect("issued token must validate");
         let state = test_state();
         let context = legacy_http_policy_context(
             &state,

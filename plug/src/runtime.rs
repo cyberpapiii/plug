@@ -1907,12 +1907,12 @@ mod tests {
         .await
         .expect("authenticated CIMD revocation");
         assert_eq!(response.status(), reqwest::StatusCode::NO_CONTENT);
-        assert!(matches!(
+        assert!(
             manager
                 .validate_access_token_for(&tokens.access_token, &manager.resource(),)
-                .await,
-            plug_core::downstream_oauth::AccessTokenValidation::Invalid
-        ));
+                .await
+                .is_none()
+        );
 
         server.abort();
         engine.shutdown().await;
@@ -2108,13 +2108,10 @@ mod tests {
 
         // Barrier: middleware validation has completed and captured the old
         // client generation, but task dispatch has not begun.
-        let claims = match manager
+        let claims = manager
             .validate_access_token_for(&tokens.access_token, &manager.resource())
             .await
-        {
-            plug_core::downstream_oauth::AccessTokenValidation::Valid(claims) => claims,
-            other => panic!("token must validate before revocation: {other:?}"),
-        };
+            .expect("token must validate before revocation");
         let principal = plug_core::types::PrincipalId::downstream_oauth(
             manager.base_url(),
             claims.client_id.clone(),

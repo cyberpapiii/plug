@@ -2,7 +2,7 @@ use super::error::HttpError;
 use super::identity::AuthStatus;
 use super::oauth::protected_resource_metadata_url;
 use super::server::{HttpAuth, HttpState};
-use crate::downstream_oauth::{AccessTokenValidation, resource_scopes};
+use crate::downstream_oauth::resource_scopes;
 use axum::extract::Request;
 use axum::extract::State;
 use axum::http::{HeaderMap, header};
@@ -41,17 +41,15 @@ pub(super) async fn validate_bearer_auth(
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.strip_prefix("Bearer "));
             let claims = match token {
-                Some(token) => match manager
-                    .validate_access_token_for(token, &manager.resource())
-                    .await
-                {
-                    AccessTokenValidation::Valid(claims) => Some(claims),
-                    AccessTokenValidation::Invalid => None,
-                },
+                Some(token) => {
+                    manager
+                        .validate_access_token_for(token, &manager.resource())
+                        .await
+                }
                 None => None,
             };
             let Some(claims) = claims else {
-                let advertised_scopes = resource_scopes(&manager.config.oauth_scopes);
+                let advertised_scopes = resource_scopes(manager.scopes());
                 return Err(HttpError::UnauthorizedWithMetadata {
                     metadata_url: protected_resource_metadata_url(manager),
                     scope: (!advertised_scopes.is_empty()).then(|| advertised_scopes.join(" ")),

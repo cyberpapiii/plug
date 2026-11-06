@@ -3,9 +3,7 @@
 #![allow(unused_imports)]
 
 pub(super) use crate::downstream_identity::HttpCredential;
-pub(super) use crate::downstream_oauth::{
-    AccessTokenClaims, AccessTokenValidation, resource_scopes,
-};
+pub(super) use crate::downstream_oauth::{AccessTokenClaims, resource_scopes};
 pub(super) use crate::events::{EVENT_SCOPE, EventSource};
 pub(super) use crate::http::discovery::*;
 pub(super) use crate::http::error::HttpError;
