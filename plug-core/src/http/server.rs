@@ -1343,7 +1343,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn gate_off_rejects_every_modern_http_task_method_before_dispatch() {
+    async fn the_modern_gate_refuses_every_http_task_method() {
         let state = test_state();
         enable_test_task_surface(state.router.as_ref());
         for (method, params) in [
@@ -1354,11 +1354,28 @@ mod tests {
             ),
             ("tasks/cancel", json!({"taskId":"task_1"})),
         ] {
-            let response = build_router(Arc::clone(&state))
-                .oneshot(modern_request(method, params))
-                .await
-                .expect("task response");
-            assert_ne!(response.status(), StatusCode::OK, "{method} escaped gate");
+            let answer = |enabled: bool| {
+                state.router.set_modern_downstream_enabled(enabled);
+                let request = modern_request(method, params.clone());
+                let app = build_router(Arc::clone(&state));
+                async move {
+                    let response = app.oneshot(request).await.expect("task response");
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                        .await
+                        .expect("body");
+                    (status, String::from_utf8_lossy(&body).into_owned())
+                }
+            };
+            let refused = answer(false).await;
+            assert_eq!(refused.0, StatusCode::BAD_REQUEST, "{method}: {refused:?}");
+            assert!(
+                refused.1.contains(crate::protocol::MODERN_PROTOCOL_VERSION),
+                "{method}: {refused:?}"
+            );
+            // With the gate open the same request reaches the task methods,
+            // so the refusal above is the gate's.
+            assert_ne!(answer(true).await, refused, "{method}");
         }
     }
 
@@ -1877,7 +1894,7 @@ mod tests {
         enable_test_task_surface(&router);
         let state = HttpState::new(
             Arc::clone(&router),
-            Arc::new(crate::session::SessionStore::new(0, 100)),
+            Arc::new(crate::session::SessionStore::new(60, 100)),
             CancellationToken::new(),
         );
         let session_id = state.sessions.create_session().unwrap();
@@ -1888,7 +1905,7 @@ mod tests {
             .await
             .expect("enqueue a task for the session");
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        state.sessions.backdate_for_tests(&session_id);
         assert!(state.sessions.validate(&session_id).is_err());
 
         tokio::time::timeout(Duration::from_secs(5), async {

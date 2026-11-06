@@ -981,11 +981,11 @@ mod tests {
         assert!(store.create_session().is_err());
     }
 
-    #[tokio::test]
-    async fn create_session_prunes_expired_sessions_before_enforcing_cap() {
-        let store = SessionStore::new(0, 1);
-        store.create_session().unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+    #[test]
+    fn create_session_prunes_expired_sessions_before_enforcing_cap() {
+        let store = SessionStore::new(60, 1);
+        let id = store.create_session().unwrap();
+        store.backdate_for_tests(&id);
         assert!(store.create_session().is_ok());
     }
 
@@ -1207,10 +1207,9 @@ mod tests {
 
     #[test]
     fn snapshots_filter_expired_sessions() {
-        let store = SessionStore::new(0, 100);
+        let store = SessionStore::new(60, 100);
         let id = store.create_session().unwrap();
-
-        std::thread::sleep(Duration::from_millis(10));
+        store.backdate_for_tests(&id);
 
         assert!(
             store
@@ -1221,24 +1220,23 @@ mod tests {
         assert_eq!(store.session_count(), 1);
     }
 
-    #[tokio::test]
-    async fn expired_session_fails_validation() {
-        let store = SessionStore::new(0, 100);
+    #[test]
+    fn expired_session_fails_validation() {
+        let store = SessionStore::new(60, 100);
         let id = store.create_session().unwrap();
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        store.backdate_for_tests(&id);
         assert!(store.validate(&id).is_err());
     }
 
     #[tokio::test]
     async fn broadcast_prunes_expired_sessions_before_delivery() {
-        let store = SessionStore::new(0, 100);
+        let store = SessionStore::new(60, 100);
         let id = store.create_session().unwrap();
         let (tx, mut rx) = mpsc::channel(1);
         store.set_sse_sender(&id, tx, None).unwrap();
         // Admit the kind, so expiry is the only thing that can stop delivery.
         bind(&store, &id, None);
-
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        store.backdate_for_tests(&id);
         store.broadcast(
             crate::session::SseMessage::from_json_value(serde_json::json!({"type": "test"}))
                 .unwrap(),

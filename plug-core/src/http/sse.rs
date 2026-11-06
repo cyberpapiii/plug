@@ -83,12 +83,10 @@ mod tests {
         let response = sse.into_response();
         let body = response.into_body();
 
-        // Drop sender so stream ends after priming event
         drop(tx);
 
         let events = collect_sse_events(body, 2).await;
         assert!(!events.is_empty(), "expected at least the priming event");
-        // Priming event should have id: 0
         assert!(
             events[0].contains("id: 0"),
             "first event should have id 0, got: {}",
@@ -97,7 +95,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_forwarded_with_incrementing_ids() {
+    async fn messages_are_forwarded_with_their_ids() {
         let (tx, rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
@@ -105,7 +103,6 @@ mod tests {
         let response = sse.into_response();
         let body = response.into_body();
 
-        // Send two messages
         tx.send(SseEvent {
             id: 1,
             message: crate::session::SseMessage::from_json_value(
@@ -127,7 +124,6 @@ mod tests {
         drop(tx);
 
         let events = collect_sse_events(body, 4).await;
-        // Should have: priming (id 0) + 2 messages (id 1, id 2)
         assert!(events.len() >= 3, "expected 3 events, got: {events:?}");
         assert!(events[1].contains("id: 1"), "second event should be id 1");
         assert!(events[2].contains("id: 2"), "third event should be id 2");
@@ -143,20 +139,20 @@ mod tests {
         let cancel = CancellationToken::new();
 
         let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
-        let response = sse.into_response();
-        let body = response.into_body();
-
-        // Cancel immediately after priming
-        tokio::task::yield_now().await;
+        let mut body = sse.into_response().into_body().into_data_stream();
         cancel.cancel();
 
-        let events = collect_sse_events(body, 5).await;
-        // Should have at most the priming event — stream should close
-        assert!(
-            events.len() <= 2,
-            "stream should close after cancel, got {} events",
-            events.len()
-        );
+        // The sender is still held and the keepalive is 15 s away, so only
+        // the cancel can end the stream within the timeout.
+        let mut chunks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                chunks.push(chunk.expect("SSE chunk"));
+            }
+        })
+        .await
+        .expect("the stream ends once cancelled");
+        assert_eq!(chunks.len(), 1, "only the priming event: {chunks:?}");
     }
 
     #[tokio::test]
