@@ -1,3 +1,9 @@
+use super::*;
+use crate::http::test_support::*;
+use axum::body::Body;
+use http::Request as HttpRequest;
+use tower::ServiceExt;
+
 struct AllowedEventAccess;
 #[async_trait::async_trait]
 impl crate::slack_events::EventAccess for AllowedEventAccess {
@@ -56,7 +62,8 @@ async fn slack_events_http_requires_selected_client_scope_and_live_grant() {
     .unwrap();
     let mut state = oauth_test_state_with_manager(manager.clone());
     state.router.set_modern_downstream_enabled(true);
-    Arc::get_mut(&mut state).unwrap().event_sources = vec![events as Arc<dyn crate::events::EventSource>];
+    Arc::get_mut(&mut state).unwrap().event_sources =
+        vec![events as Arc<dyn crate::events::EventSource>];
     let app = build_router(state);
     let unsigned = HttpRequest::builder()
         .method("POST")
@@ -164,7 +171,8 @@ async fn slack_events_selected_client_can_discover_scope_challenge_before_consen
     .unwrap();
     let mut state = oauth_test_state_with_manager(manager);
     state.router.set_modern_downstream_enabled(true);
-    Arc::get_mut(&mut state).unwrap().event_sources = vec![events as Arc<dyn crate::events::EventSource>];
+    Arc::get_mut(&mut state).unwrap().event_sources =
+        vec![events as Arc<dyn crate::events::EventSource>];
     let app = build_router(state);
     let mut discover = modern_request("server/discover", json!({}));
     discover.headers_mut().insert(
