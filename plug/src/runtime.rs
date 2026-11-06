@@ -3606,45 +3606,13 @@ mod tests {
         let _ = std::fs::remove_file(state_path);
     }
 
-    /// Minimal stdio mock-upstream `ServerConfig` with an `echo` tool.
-    fn task_test_mock_config() -> plug_core::config::ServerConfig {
-        plug_core::config::ServerConfig {
-            command: Some(
-                plug_test_harness::mock_server_bin()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            args: vec!["--tools".to_string(), "echo".to_string()],
-            env: std::collections::HashMap::new(),
-            enabled: true,
-            transport: plug_core::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 10,
-            call_timeout_secs: 5,
-            max_concurrent: 4,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
-    }
-
     #[tokio::test]
     async fn oauth_revoke_204_blocks_request_validated_before_revocation_from_creating_task() {
         let mut config = plug_core::config::Config::default();
-        config
-            .servers
-            .insert("mock".to_string(), task_test_mock_config());
+        config.servers.insert(
+            "mock".to_string(),
+            plug_core::test_helpers::mock_server("echo"),
+        );
         let engine = Arc::new(plug_core::engine::Engine::new(config));
         engine.start().await.expect("engine start");
         let tool_router = engine.tool_router().clone();
@@ -3783,9 +3751,10 @@ mod tests {
     #[tokio::test]
     async fn expired_http_session_cleans_up_tasks() {
         let mut config = plug_core::config::Config::default();
-        config
-            .servers
-            .insert("mock".to_string(), task_test_mock_config());
+        config.servers.insert(
+            "mock".to_string(),
+            plug_core::test_helpers::mock_server("echo"),
+        );
         let engine = Arc::new(plug_core::engine::Engine::new(config));
         engine.start().await.expect("engine start");
         let tool_router = engine.tool_router().clone();

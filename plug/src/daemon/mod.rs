@@ -2721,6 +2721,7 @@ pub fn read_auth_token() -> anyhow::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plug_core::test_helpers::mock_server;
 
     #[test]
     fn the_log_starts_a_new_file_when_its_folder_is_emptied() {
@@ -2981,30 +2982,16 @@ mod tests {
             config.servers.insert(
                 (*name).to_string(),
                 plug_core::config::ServerConfig {
-                    command: None,
-                    args: Vec::new(),
-                    env: HashMap::new(),
                     enabled,
                     transport: plug_core::config::TransportType::Http,
-                    protocol_mode: Default::default(),
                     url: Some("https://example.com/mcp".to_string()),
-                    auth_token: None,
                     auth: Some("oauth".to_string()),
                     oauth_client_id: Some("test-client".to_string()),
                     oauth_scopes: Some(vec!["read".to_string()]),
-                    timeout_secs: 30,
                     call_timeout_secs: 30,
                     max_concurrent: 4,
-                    health_check_interval_secs: 60,
                     circuit_breaker_enabled: false,
-                    enrichment: false,
-                    tool_renames: HashMap::new(),
-                    tool_groups: Vec::new(),
-
-                    sandbox: None,
-                    spec: None,
-                    operations: Vec::new(),
-                    token_in: None,
+                    ..Default::default()
                 },
             );
         }
@@ -3380,26 +3367,10 @@ mod tests {
                 command: Some("/bin/sh".to_string()),
                 args: vec!["-c".to_string(), "touch \"$MARKER\"".to_string()],
                 env: HashMap::from([("MARKER".to_string(), marker.display().to_string())]),
-                enabled: true,
-                transport: plug_core::config::TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
                 timeout_secs: 1,
                 call_timeout_secs: 1,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         std::fs::write(
@@ -3444,7 +3415,7 @@ mod tests {
 
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
         // flight until the upstream timeout expires.
-        let mut server = ipc_harness_mock_config("noop");
+        let mut server = mock_server("noop");
         server.command = Some("/bin/sleep".to_string());
         server.args = vec!["30".to_string()];
         server.timeout_secs = 20;
@@ -3776,48 +3747,15 @@ mod tests {
     // Each harness binds a unique temp socket and touches no global runtime path,
     // so it is safe under the parallel test suite without the runtime-paths lock.
 
-    /// Build a stdio mock-upstream `ServerConfig` exposing `tools` (comma-separated).
-    fn ipc_harness_mock_config(tools: &str) -> plug_core::config::ServerConfig {
-        ipc_harness_mock_config_with(tools, &[])
-    }
-
-    /// Mock upstream config with extra mock-server flags appended (e.g. to enable
+    /// `mock_server` with extra mock-server flags appended (e.g. to enable
     /// the resources / prompts / completions capability fixtures).
     fn ipc_harness_mock_config_with(
         tools: &str,
         extra_args: &[&str],
     ) -> plug_core::config::ServerConfig {
-        let mut args = vec!["--tools".to_string(), tools.to_string()];
-        args.extend(extra_args.iter().map(|a| a.to_string()));
-        plug_core::config::ServerConfig {
-            command: Some(
-                plug_test_harness::mock_server_bin()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            args,
-            env: HashMap::new(),
-            enabled: true,
-            transport: plug_core::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 10,
-            call_timeout_secs: 5,
-            max_concurrent: 4,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
+        let mut server = mock_server(tools);
+        server.args.extend(extra_args.iter().map(|a| a.to_string()));
+        server
     }
 
     /// A connected, registered IPC client wired to a real daemon connection loop
@@ -3833,7 +3771,7 @@ mod tests {
 
     impl IpcTestHarness {
         async fn start(tools: &str) -> Self {
-            Self::start_with_config(ipc_harness_mock_config(tools)).await
+            Self::start_with_config(mock_server(tools)).await
         }
 
         /// Full-capability variant for the parity matrix: same upstream config as
@@ -5417,7 +5355,7 @@ mod tests {
                 "slow",
                 ipc_harness_mock_config_with("echo", &["--delay-ms", "1500"]),
             ),
-            ("fast", ipc_harness_mock_config("echo,chunked_text")),
+            ("fast", mock_server("echo,chunked_text")),
         ]
     }
 

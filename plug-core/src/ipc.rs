@@ -1960,28 +1960,8 @@ mod tests {
         let config = crate::config::ServerConfig {
             command: Some("uvx".to_string()),
             args: vec!["third-party-mcp".to_string()],
-            env: std::collections::HashMap::new(),
-            enabled: true,
-            transport: crate::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
             auth_token: Some(crate::types::SecretString::from("secret-token".to_string())),
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let source = IpcServerSourceInfo::from_config(&config);
@@ -2444,7 +2424,7 @@ mod tests {
 
     mod golden_ipc_fixtures {
         use super::*;
-        use std::collections::HashMap;
+
         use std::path::PathBuf;
 
         fn golden_dir() -> PathBuf {
@@ -2486,27 +2466,7 @@ mod tests {
             crate::config::ServerConfig {
                 command: Some("uvx".to_string()),
                 args: vec!["workspace-mcp".to_string()],
-                env: HashMap::new(),
-                enabled: true,
-                transport: crate::config::TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             }
         }
 

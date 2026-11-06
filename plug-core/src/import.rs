@@ -573,24 +573,8 @@ fn yaml_entry_to_server_config(entry: &serde_norway::Value) -> Option<ServerConf
         env,
         enabled,
         transport,
-        protocol_mode: Default::default(),
         url,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 300,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
+        ..Default::default()
     })
 }
 
@@ -762,26 +746,9 @@ fn json_entry_to_server_config(entry: &serde_json::Value) -> Option<ServerConfig
         command,
         args,
         env,
-        enabled: true,
         transport,
-        protocol_mode: Default::default(),
         url,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 300,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
+        ..Default::default()
     })
 }
 
@@ -865,26 +832,9 @@ fn toml_entry_to_server_config(entry: &toml::Value) -> Option<ServerConfig> {
         command,
         args,
         env,
-        enabled: true,
         transport,
-        protocol_mode: Default::default(),
         url,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 300,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
+        ..Default::default()
     })
 }
 
@@ -1356,31 +1306,6 @@ extensions:
     }
 
     fn test_config() -> ServerConfig {
-        ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
+        ServerConfig::default()
     }
 }

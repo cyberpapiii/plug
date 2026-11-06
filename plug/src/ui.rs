@@ -345,32 +345,7 @@ mod tests {
     use plug_core::config::{ServerConfig, TransportType};
 
     fn server_config() -> ServerConfig {
-        ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: Default::default(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: Default::default(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
+        ServerConfig::default()
     }
 
     #[test]

@@ -27,13 +27,11 @@ pub struct Config {
     /// cannot afford the spawn burst.
     pub startup_concurrency: usize,
     /// Enable client-aware tool filtering (default: true).
-    #[serde(default = "default_true")]
     pub tool_filter_enabled: bool,
     /// Max chars for tool descriptions (None = no truncation).
     #[serde(default)]
     pub tool_description_max_chars: Option<usize>,
     /// Tool count threshold to activate search_tools meta-tool (default: 50).
-    #[serde(default = "default_tool_search_threshold")]
     pub tool_search_threshold: usize,
     /// Expose only plug meta-tools instead of the full merged tool catalog.
     /// Deprecated compatibility input; `lazy_tools` is the controlling policy model.
@@ -73,7 +71,6 @@ pub struct Config {
     /// Seconds to keep daemon alive after last client disconnects.
     /// Default is 0, which disables auto-shutdown and keeps the daemon alive
     /// until explicit shutdown.
-    #[serde(default = "default_grace_period")]
     pub daemon_grace_period_secs: u64,
     /// Active upstream supervision policy (item 2b): bounded restart of an
     /// upstream that stays degraded past a threshold.
@@ -502,25 +499,23 @@ pub fn downstream_mcp_url(http: &HttpConfig) -> String {
 
 /// Configuration for a single upstream MCP server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ServerConfig {
     /// Command to execute (for stdio transport).
     pub command: Option<String>,
     /// Arguments for the command.
-    #[serde(default)]
     pub args: Vec<String>,
     /// Environment variables to set for the child process.
-    #[serde(default, serialize_with = "in_name_order")]
+    #[serde(serialize_with = "in_name_order")]
     pub env: HashMap<String, String>,
     /// Whether this server is enabled.
-    #[serde(default = "default_true")]
     pub enabled: bool,
     /// Transport type.
-    #[serde(default)]
     pub transport: TransportType,
     /// MCP lifecycle negotiation policy for this upstream. Omitted is always
     /// `legacy`; `auto` and `modern` only take effect while the global modern
     /// upstream gate is enabled.
-    #[serde(default, rename = "protocol", alias = "protocol_mode")]
+    #[serde(rename = "protocol", alias = "protocol_mode")]
     pub protocol_mode: UpstreamProtocolMode,
     /// URL for HTTP transport.
     pub url: Option<String>,
@@ -532,49 +527,70 @@ pub struct ServerConfig {
     /// OAuth client ID for pre-registered clients. If absent, dynamic client registration is used.
     pub oauth_client_id: Option<String>,
     /// OAuth scopes to request during authorization.
-    #[serde(default)]
     pub oauth_scopes: Option<Vec<String>>,
     /// Startup timeout in seconds.
-    #[serde(default = "default_timeout")]
     pub timeout_secs: u64,
     /// Tool call timeout in seconds (default: 300). Set higher for slow tools.
-    #[serde(default = "default_call_timeout")]
     pub call_timeout_secs: u64,
     /// Max concurrent requests to this server (default: 1).
-    #[serde(default = "default_max_concurrent")]
     pub max_concurrent: usize,
     /// Health check interval in seconds (default: 60).
-    #[serde(default = "default_health_interval")]
     pub health_check_interval_secs: u64,
     /// Enable circuit breaker for this server (default: true).
-    #[serde(default = "default_true")]
     pub circuit_breaker_enabled: bool,
     /// Enable tool enrichment (annotation inference + title normalization).
-    #[serde(default)]
     pub enrichment: bool,
     /// Manual tool renames (original_name -> new_name).
-    #[serde(default, serialize_with = "in_name_order")]
+    #[serde(serialize_with = "in_name_order")]
     pub tool_renames: HashMap<String, String>,
     /// Tool group classification for sub-service decomposition.
     /// Maps group prefix (e.g. "Gmail") to match rules.
     /// When set, tools matching a rule get `GroupPrefix__tool_name` instead of `ServerName__tool_name`.
-    #[serde(default)]
     pub tool_groups: Vec<ToolGroupRule>,
     /// Optional sandbox policy for stdio upstream processes.
-    #[serde(default)]
     pub sandbox: Option<StdioSandboxConfig>,
     /// OpenAPI document for the openapi transport: a URL or a file path.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub spec: Option<String>,
     /// Operations of the OpenAPI document to expose, by tool name or
     /// `operationId`; `*` is a wildcard. Empty means all of them.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub operations: Vec<String>,
     /// Where an openapi server sends `auth_token`: `bearer`,
     /// `header:<name>`, or `query:<name>`. Omitted, the OpenAPI document
     /// decides, and a bearer token is the fallback.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub token_in: Option<String>,
+}
+
+impl Default for ServerConfig {
+    fn default() -> Self {
+        Self {
+            command: None,
+            args: Vec::new(),
+            env: HashMap::new(),
+            enabled: true,
+            transport: TransportType::default(),
+            protocol_mode: UpstreamProtocolMode::default(),
+            url: None,
+            auth_token: None,
+            auth: None,
+            oauth_client_id: None,
+            oauth_scopes: None,
+            timeout_secs: 30,
+            call_timeout_secs: 300,
+            max_concurrent: 1,
+            health_check_interval_secs: 60,
+            circuit_breaker_enabled: true,
+            enrichment: false,
+            tool_renames: HashMap::new(),
+            tool_groups: Vec::new(),
+            sandbox: None,
+            spec: None,
+            operations: Vec::new(),
+            token_in: None,
+        }
+    }
 }
 
 /// Stand-in the daemon sends in place of a stored secret. Operator clients hand
@@ -643,34 +659,6 @@ pub struct StdioSandboxConfig {
     pub allow_read: Vec<PathBuf>,
     pub allow_write: Vec<PathBuf>,
     pub profile_path: Option<PathBuf>,
-}
-
-fn default_true() -> bool {
-    true
-}
-
-fn default_timeout() -> u64 {
-    30
-}
-
-fn default_call_timeout() -> u64 {
-    300
-}
-
-fn default_max_concurrent() -> usize {
-    1
-}
-
-fn default_health_interval() -> u64 {
-    60
-}
-
-fn default_tool_search_threshold() -> usize {
-    50
-}
-
-fn default_grace_period() -> u64 {
-    0
 }
 
 /// Check whether a bind address refers to loopback (localhost-only).
@@ -1895,29 +1883,7 @@ LOG_LEVEL = "debug"
             "ok".to_string(),
             ServerConfig {
                 command: Some("node".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -1951,35 +1917,8 @@ LOG_LEVEL = "debug"
     #[test]
     fn validate_stdio_without_command() {
         let mut cfg = Config::default();
-        cfg.servers.insert(
-            "bad".to_string(),
-            ServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
-            },
-        );
+        cfg.servers
+            .insert("bad".to_string(), ServerConfig::default());
         let errors = validate_config(&cfg);
         assert!(
             errors
@@ -1994,30 +1933,8 @@ LOG_LEVEL = "debug"
         cfg.servers.insert(
             "bad".to_string(),
             ServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2035,29 +1952,8 @@ LOG_LEVEL = "debug"
             "bad".to_string(),
             ServerConfig {
                 command: Some("node".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
                 timeout_secs: 0,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2377,29 +2273,7 @@ LOG_LEVEL = "debug"
             "".to_string(),
             ServerConfig {
                 command: Some("node".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2416,30 +2290,8 @@ LOG_LEVEL = "debug"
         cfg.servers.insert(
             "bad_stdio".to_string(),
             ServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
                 timeout_secs: 0,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2453,30 +2305,11 @@ LOG_LEVEL = "debug"
         cfg.servers.insert(
             "bad".to_string(),
             ServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some("https://example.com/mcp".to_string()),
                 auth_token: Some(crate::types::SecretString::from("token".to_string())),
                 auth: Some("oauth".to_string()),
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2490,29 +2323,8 @@ LOG_LEVEL = "debug"
             "bad".to_string(),
             ServerConfig {
                 command: Some("node".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
                 auth: Some("oauth".to_string()),
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2525,30 +2337,10 @@ LOG_LEVEL = "debug"
         cfg.servers.insert(
             "bad".to_string(),
             ServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some("https://example.com/mcp".to_string()),
-                auth_token: None,
                 auth: Some("basic".to_string()),
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2562,29 +2354,7 @@ LOG_LEVEL = "debug"
             "../etc/passwd".to_string(),
             ServerConfig {
                 command: Some("node".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);
@@ -2601,30 +2371,11 @@ LOG_LEVEL = "debug"
         cfg.servers.insert(
             "notion".to_string(),
             ServerConfig {
-                command: None,
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some("https://mcp.notion.so/mcp".to_string()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
-                oauth_client_id: None,
                 oauth_scopes: Some(vec!["mcp:read".to_string(), "mcp:write".to_string()]),
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         let errors = validate_config(&cfg);

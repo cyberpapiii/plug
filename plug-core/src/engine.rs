@@ -1375,7 +1375,6 @@ fn is_auth_reconnect_error(error: &anyhow::Error) -> bool {
 mod tests {
     use super::*;
     use crate::config::{Config, TransportType};
-    use std::collections::HashMap;
 
     fn test_config() -> Config {
         Config::default()
@@ -1386,75 +1385,21 @@ mod tests {
         config.servers.insert(
             "oauth-mock".to_string(),
             crate::config::ServerConfig {
-                command: Some(
-                    plug_test_harness::mock_server_bin()
-                        .to_string_lossy()
-                        .into_owned(),
-                ),
-                args: vec!["--tools".to_string(), "echo".to_string()],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..crate::test_helpers::mock_server("echo")
             },
         );
         config
     }
 
-    /// A real (non-oauth) mock stdio `ServerConfig` backed by
-    /// `plug-test-harness`'s `mock-mcp-server` binary — same connect
-    /// mechanics as `oauth_mock_stdio_config` above, parameterized so tests
-    /// can produce configs that are materially different (`tools` feeds
-    /// `args`, which `server_config_changed` compares) or only
-    /// non-materially different (`max_concurrent`, which it omits).
+    /// `tools` feeds `args`, which `server_config_changed` compares;
+    /// `max_concurrent` is a field it omits.
     fn mock_stdio_server_config(tools: &str, max_concurrent: usize) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
-            command: Some(
-                plug_test_harness::mock_server_bin()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            args: vec!["--tools".to_string(), tools.to_string()],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
             max_concurrent,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..crate::test_helpers::mock_server(tools)
         }
     }
 
@@ -1803,30 +1748,9 @@ mod tests {
         config.servers.insert(
             "foo".to_string(),
             crate::config::ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(format!("http://{address}/mcp")),
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -1979,36 +1903,13 @@ mod tests {
     #[tokio::test]
     async fn engine_set_server_enabled_noop() {
         use crate::config::ServerConfig;
-        use std::collections::HashMap;
 
         let mut config = Config::default();
         config.servers.insert(
             "test".to_string(),
             ServerConfig {
                 command: Some("test-server".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -2021,36 +1922,13 @@ mod tests {
     #[tokio::test]
     async fn engine_set_server_enabled_toggle() {
         use crate::config::ServerConfig;
-        use std::collections::HashMap;
 
         let mut config = Config::default();
         config.servers.insert(
             "test".to_string(),
             ServerConfig {
                 command: Some("test-server".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -2385,7 +2263,6 @@ HOME_DIR = "$HOME"
     #[tokio::test]
     async fn reload_preserves_failed_server_visibility_for_added_server() {
         use crate::config::ServerConfig;
-        use std::collections::HashMap;
 
         let engine = Arc::new(Engine::new(Config::default()));
         engine.start().await.expect("engine start");
@@ -2395,29 +2272,7 @@ HOME_DIR = "$HOME"
             "broken".to_string(),
             ServerConfig {
                 command: Some("definitely-not-a-real-command".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -2710,7 +2565,7 @@ HOME_DIR = "$HOME"
     #[tokio::test]
     async fn concurrent_reads_during_reload() {
         use crate::config::ServerConfig;
-        use std::collections::HashMap;
+
         use std::sync::atomic::{AtomicBool, Ordering};
 
         // Config A: has "alpha" server (will be removed by reload)
@@ -2719,29 +2574,7 @@ HOME_DIR = "$HOME"
             "alpha".to_string(),
             ServerConfig {
                 command: Some("test-server".to_string()),
-                args: vec![],
-                env: HashMap::new(),
-                enabled: true,
-                transport: TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 

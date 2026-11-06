@@ -1642,30 +1642,11 @@ mod tests {
     fn reusable_dynamic_registration_skips_configured_clients() {
         crate::install_test_credential_environment();
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
             oauth_client_id: Some("configured-client".to_string()),
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         assert!(
@@ -1680,30 +1661,10 @@ mod tests {
         crate::install_test_credential_environment();
         let server_name = format!("auth-registration-{}", std::process::id());
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let store = oauth::get_or_create_store(&server_name);
@@ -1737,30 +1698,11 @@ mod tests {
     #[test]
     fn injected_client_identity_requires_configured_oauth_client_for_refresh() {
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
             oauth_client_id: Some("client-123".to_string()),
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -1785,30 +1727,10 @@ mod tests {
     #[test]
     fn injected_client_identity_reuses_existing_oauth_client_for_refresh() {
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
 
         let (client_id, refreshable) = oauth::injected_client_identity(
@@ -2098,29 +2020,10 @@ mod tests {
         let resource_url = format!("http://{address}/mcp");
         let server_name = format!("auth-inject-{}", uuid::Uuid::new_v4());
         let server = plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: std::collections::HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some(resource_url.clone()),
-            auth_token: None,
             auth: Some("oauth".to_string()),
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: std::collections::HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         };
         let store = oauth::get_or_create_store(&server_name);
         store.clear().await.unwrap();

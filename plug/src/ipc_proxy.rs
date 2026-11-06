@@ -1918,9 +1918,10 @@ mod tests {
     use std::path::PathBuf;
 
     use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
-    use plug_core::config::{Config, ServerConfig, TransportType};
+    use plug_core::config::{Config, ServerConfig};
     use plug_core::engine::Engine;
     use plug_core::legacy_tasks::TaskMetadata;
+    use plug_core::test_helpers::mock_server;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
         CallToolRequest, CallToolRequestParams, ClientRequest, GetTaskParams, GetTaskRequest,
@@ -2001,10 +2002,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(artifact_base_dir().join(id));
     }
 
-    fn ensure_mock_server_built() -> PathBuf {
-        plug_test_harness::mock_server_bin()
-    }
-
     #[derive(Clone)]
     struct TestClient;
 
@@ -2054,42 +2051,8 @@ mod tests {
         }
     }
 
-    fn mock_server_config_with_tools(tools: &str) -> ServerConfig {
-        let mock_server = ensure_mock_server_built();
-        ServerConfig {
-            command: Some(mock_server.display().to_string()),
-            args: vec!["--tools".to_string(), tools.to_string()],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 10,
-            call_timeout_secs: 5,
-            max_concurrent: 4,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
-    }
-
-    fn mock_server_config() -> ServerConfig {
-        mock_server_config_with_tools("echo")
-    }
-
     fn mock_server_config_with_resources() -> ServerConfig {
-        let mut config = mock_server_config_with_tools("echo");
+        let mut config = mock_server("echo");
         config.args.push("--resources".to_string());
         config
     }
@@ -2166,7 +2129,7 @@ mod tests {
         let mut config = Config::default();
         config
             .servers
-            .insert("mock".to_string(), mock_server_config());
+            .insert("mock".to_string(), mock_server("echo"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -2312,7 +2275,7 @@ mod tests {
         let mut config = Config::default();
         config
             .servers
-            .insert("mock".to_string(), mock_server_config());
+            .insert("mock".to_string(), mock_server("echo"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -2579,7 +2542,7 @@ mod tests {
         let mut config = Config::default();
         config
             .servers
-            .insert("mock".to_string(), mock_server_config());
+            .insert("mock".to_string(), mock_server("echo"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -2723,7 +2686,7 @@ mod tests {
         let mut config = Config::default();
         config
             .servers
-            .insert("mock".to_string(), mock_server_config());
+            .insert("mock".to_string(), mock_server("echo"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -2817,10 +2780,9 @@ mod tests {
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
-        config.servers.insert(
-            "mock".to_string(),
-            mock_server_config_with_tools("chunked_text"),
-        );
+        config
+            .servers
+            .insert("mock".to_string(), mock_server("chunked_text"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -2891,10 +2853,9 @@ mod tests {
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
-        config.servers.insert(
-            "mock".to_string(),
-            mock_server_config_with_tools("artifact_text"),
-        );
+        config
+            .servers
+            .insert("mock".to_string(), mock_server("artifact_text"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -2968,10 +2929,9 @@ mod tests {
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
-        config.servers.insert(
-            "mock".to_string(),
-            mock_server_config_with_tools("artifact_text"),
-        );
+        config
+            .servers
+            .insert("mock".to_string(), mock_server("artifact_text"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),
@@ -3079,10 +3039,9 @@ mod tests {
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
-        config.servers.insert(
-            "mock".to_string(),
-            mock_server_config_with_tools("artifact_text"),
-        );
+        config
+            .servers
+            .insert("mock".to_string(), mock_server("artifact_text"));
         std::fs::write(
             &config_path,
             toml::to_string(&config).expect("serialize config"),

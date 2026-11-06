@@ -1669,28 +1669,9 @@ mod tests {
     fn gated_task_server_config(call_timeout_secs: u64) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
             command: Some("fake".to_string()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: crate::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
             call_timeout_secs,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
             circuit_breaker_enabled: false,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 

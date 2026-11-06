@@ -152,8 +152,8 @@ async fn run_watcher(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Config, ServerConfig, TransportType};
-    use std::collections::HashMap;
+    use crate::config::Config;
+
     use tempfile::TempDir;
 
     fn write_config(path: &std::path::Path, config: &Config) {
@@ -161,43 +161,11 @@ mod tests {
             .expect("write config file");
     }
 
-    fn mock_server_config(tools: &str) -> ServerConfig {
-        ServerConfig {
-            command: Some(
-                plug_test_harness::mock_server_bin()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            args: vec!["--tools".to_string(), tools.to_string()],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 10,
-            call_timeout_secs: 5,
-            max_concurrent: 4,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
-    }
-
     fn config_with_mock_server() -> Config {
         let mut config = Config::default();
         config
             .servers
-            .insert("mock".to_string(), mock_server_config("echo"));
+            .insert("mock".to_string(), crate::test_helpers::mock_server("echo"));
         config
     }
 

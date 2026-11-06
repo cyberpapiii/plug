@@ -516,39 +516,19 @@ async fn health_check_server(
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+
     use std::sync::Arc;
     use std::time::Duration;
 
-    use crate::config::{Config, ServerConfig, TransportType};
+    use crate::config::{Config, ServerConfig};
     use crate::engine::Engine;
     use crate::types::{HealthState, ServerHealth};
 
     fn unstartable_server_config(health_check_interval_secs: u64) -> ServerConfig {
         ServerConfig {
             command: Some("/nonexistent/plug-health-test-binary".to_string()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
             health_check_interval_secs,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 

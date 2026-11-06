@@ -519,24 +519,7 @@ pub(crate) async fn cmd_server_add(
                 env: env_updates,
                 enabled: !disabled,
                 transport,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             }
         }
         plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse => {
@@ -560,29 +543,10 @@ pub(crate) async fn cmd_server_add(
                     .interact()?
             };
             let mut server = plug_core::config::ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
                 enabled,
                 transport,
-                protocol_mode: Default::default(),
                 url: Some(url),
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             };
             if let Some(selection) = noninteractive_remote_auth_selection(
                 auth,
@@ -624,29 +588,15 @@ pub(crate) async fn cmd_server_add(
                     .into_owned()
             };
             let server = plug_core::config::ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
                 enabled: !disabled,
                 transport,
-                protocol_mode: Default::default(),
                 url,
                 auth_token: bearer_token.map(Into::into),
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
-                timeout_secs: 30,
-                call_timeout_secs: 300,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
-                circuit_breaker_enabled: true,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
                 spec: Some(spec),
                 operations,
                 token_in,
+                ..Default::default()
             };
             // Read the document now, so a bad address or an API too large to
             // add whole is reported here and not later in a log.
@@ -1074,58 +1024,15 @@ mod tests {
     fn stdio_server(command: &str) -> plug_core::config::ServerConfig {
         plug_core::config::ServerConfig {
             command: Some(command.to_string()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: plug_core::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 
     fn remote_server() -> plug_core::config::ServerConfig {
         plug_core::config::ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
             transport: plug_core::config::TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some("https://example.com/mcp".to_string()),
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 

@@ -47,3 +47,6 @@ pub mod watcher;
 
 #[cfg(test)]
 mod test_log;
+
+#[cfg(any(test, feature = "test-helpers"))]
+pub mod test_helpers;

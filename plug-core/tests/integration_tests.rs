@@ -32,6 +32,7 @@ use plug_core::oauth;
 use plug_core::proxy::ProxyHandler;
 use plug_core::server::ServerManager;
 use plug_core::session::SessionStore;
+use plug_core::test_helpers::mock_server;
 use plug_core::types::ClientType;
 use rmcp::ErrorData as McpError;
 use rmcp::ServiceExt as _;
@@ -1192,48 +1193,12 @@ impl ClientHandler for TestClient {
     }
 }
 
-fn mock_server_config(tools: &str) -> ServerConfig {
-    ServerConfig {
-        // Exec the prebuilt mock binary directly rather than `cargo run` per spawn:
-        // under parallel test threads, concurrent `cargo run` processes would
-        // contend on Cargo's target lock.
-        command: Some(
-            plug_test_harness::mock_server_bin()
-                .to_string_lossy()
-                .into_owned(),
-        ),
-        args: vec!["--tools".to_string(), tools.to_string()],
-        env: HashMap::new(),
-        enabled: true,
-        transport: TransportType::Stdio,
-        protocol_mode: Default::default(),
-        url: None,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 10,
-        call_timeout_secs: 5,
-        max_concurrent: 4,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
-    }
-}
-
 fn lifecycle_server_config(
     fixture_mode: &str,
     configured_mode: UpstreamProtocolMode,
     request_log_file: &std::path::Path,
 ) -> ServerConfig {
-    let mut config = mock_server_config("echo");
+    let mut config = mock_server("echo");
     config.args = vec![
         "--lifecycle".to_string(),
         fixture_mode.to_string(),
@@ -1444,7 +1409,7 @@ async fn forced_modern_rejects_a_legacy_only_upstream_without_fallback() {
 
 #[tokio::test]
 async fn legacy_task_child_process_stdio_preserves_full_lifecycle_under_rmcp3() {
-    let mut server = mock_server_config("echo");
+    let mut server = mock_server("echo");
     server.args = vec!["--legacy-tasks".to_string()];
     let mut config = Config::default();
     config.servers.insert("legacy-task".to_string(), server);
@@ -1574,7 +1539,7 @@ async fn test_proxy_handler_refresh_tools_empty() {
 #[tokio::test]
 async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
     let mut config = Config::default();
-    let mut server = mock_server_config("echo");
+    let mut server = mock_server("echo");
     // Advertise resources and hang on list_resources (fail-mode timeout).
     server.args.push("--resources".to_string());
     server.args.push("--fail-mode".to_string());
@@ -1618,7 +1583,7 @@ async fn test_refresh_tools_skips_upstream_that_stalls_on_resource_listing() {
 #[tokio::test]
 async fn catalog_families_fetch_concurrently() {
     let mut config = Config::default();
-    let mut server = mock_server_config("echo");
+    let mut server = mock_server("echo");
     server.args.push("--resources".to_string());
     server.args.push("--resource-templates".to_string());
     server.args.push("--prompts".to_string());
@@ -1663,7 +1628,7 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     let _ = std::fs::remove_file(&empty_flag);
 
     let mut config = Config::default();
-    let mut server = mock_server_config("echo");
+    let mut server = mock_server("echo");
     server.args.push("--resources".to_string());
     server.args.push("--list-fail-flag-file".to_string());
     server.args.push(fail_flag.to_string_lossy().to_string());
@@ -1972,29 +1937,7 @@ fn test_config_validation_valid() {
         "valid".to_string(),
         ServerConfig {
             command: Some("node".to_string()),
-            args: vec![],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         },
     );
     let errors = validate_config(&cfg);
@@ -2004,35 +1947,8 @@ fn test_config_validation_valid() {
 #[test]
 fn test_config_validation_catches_missing_command() {
     let mut cfg = Config::default();
-    cfg.servers.insert(
-        "bad".to_string(),
-        ServerConfig {
-            command: None,
-            args: vec![],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        },
-    );
+    cfg.servers
+        .insert("bad".to_string(), ServerConfig::default());
     let errors = validate_config(&cfg);
     assert!(
         errors.iter().any(|e| e.contains("command")),
@@ -2079,28 +1995,9 @@ async fn test_stdio_timeout_reconnects_cleanly() {
         ServerConfig {
             command: Some(script.display().to_string()),
             args: vec![marker.display().to_string()],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
             timeout_secs: 10,
             call_timeout_secs: 1,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         },
     );
 
@@ -2164,28 +2061,9 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
         ServerConfig {
             command: Some(script.display().to_string()),
             args: vec![marker.display().to_string()],
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
             timeout_secs: 10,
             call_timeout_secs: 5,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         },
     );
 
@@ -2452,30 +2330,13 @@ async fn run_http_upstream_crash_restart_scenario(
     config.servers.insert(
         "httpcrash".to_string(),
         ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
             transport: TransportType::Http,
-            protocol_mode: Default::default(),
             url: Some(format!("http://{addr}/mcp")),
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
             timeout_secs: 10,
             call_timeout_secs: 5,
             max_concurrent: 4,
-            health_check_interval_secs: 60,
             circuit_breaker_enabled: false,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         },
     );
 
@@ -2636,7 +2497,7 @@ async fn test_stdio_end_to_end_proxy_path() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("echo,greet"));
+        .insert("mock".to_string(), mock_server("echo,greet"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -2718,7 +2579,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("echo"));
+        .insert("mock".to_string(), mock_server("echo"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -2846,7 +2707,7 @@ async fn test_http_end_to_end_proxy_path_with_sse() {
 #[tokio::test]
 async fn an_mcp_app_reaches_the_client_whole() {
     let mut config = Config::default();
-    let mut mock = mock_server_config("widget");
+    let mut mock = mock_server("widget");
     mock.args.push("--resources".to_string());
     config.servers.insert("mock".to_string(), mock);
 
@@ -2925,7 +2786,7 @@ async fn a_tool_turned_off_for_everyone_is_neither_listed_nor_callable() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("echo,greet"));
+        .insert("mock".to_string(), mock_server("echo,greet"));
     config.disabled_tools = vec!["Mock__greet".to_string()];
 
     let engine = Arc::new(Engine::new(config));
@@ -2972,7 +2833,7 @@ async fn test_stdio_structured_content_passes_through_end_to_end() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("structured"));
+        .insert("mock".to_string(), mock_server("structured"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3013,7 +2874,7 @@ async fn test_stdio_resource_link_passes_through_end_to_end() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("resource_link"));
+        .insert("mock".to_string(), mock_server("resource_link"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3054,7 +2915,7 @@ async fn test_stdio_oversized_tool_result_spills_to_artifact_link() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("artifact_text"));
+        .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3099,7 +2960,7 @@ async fn test_stdio_artifact_manifest_is_readable() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("artifact_text"));
+        .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3154,7 +3015,7 @@ async fn test_stdio_artifact_chunk_is_readable() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("artifact_text"));
+        .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3207,7 +3068,7 @@ async fn test_stdio_attachment_like_tool_result_spills_to_artifact_link() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("attachment_blob"));
+        .insert("mock".to_string(), mock_server("attachment_blob"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3248,7 +3109,7 @@ async fn test_http_structured_content_passes_through_end_to_end() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("structured"));
+        .insert("mock".to_string(), mock_server("structured"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3336,7 +3197,7 @@ async fn test_http_resource_link_passes_through_end_to_end() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("resource_link"));
+        .insert("mock".to_string(), mock_server("resource_link"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3425,7 +3286,7 @@ async fn test_http_oversized_tool_result_spills_to_artifact_link() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("artifact_text"));
+        .insert("mock".to_string(), mock_server("artifact_text"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3513,7 +3374,7 @@ async fn test_multi_client_shared_engine_isolation() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("echo"));
+        .insert("mock".to_string(), mock_server("echo"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -3721,30 +3582,15 @@ async fn test_upstream_http_sends_protocol_version_header() {
     // Connect through plug's upstream HTTP path (ServerManager::start_server).
     let sm = Arc::new(ServerManager::new());
     let config = ServerConfig {
-        command: None,
-        args: Vec::new(),
-        env: HashMap::new(),
-        enabled: true,
         transport: TransportType::Http,
-        protocol_mode: Default::default(),
         url: Some(resource_url),
-        auth_token: None,
         auth: Some("oauth".to_string()),
         oauth_client_id: Some("test-client".to_string()),
-        oauth_scopes: None,
         timeout_secs: 10,
         call_timeout_secs: 5,
         max_concurrent: 4,
-        health_check_interval_secs: 60,
         circuit_breaker_enabled: false,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
+        ..Default::default()
     };
 
     let upstream = sm
@@ -3928,30 +3774,16 @@ async fn test_oauth_refresh_persists_credentials_and_reconnects_with_fresh_token
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -4064,92 +3896,46 @@ async fn test_engine_mixed_auth_fleet_reports_distinct_server_states() {
         let mut config = Config::default();
         config
             .servers
-            .insert("stdio".to_string(), mock_server_config("echo"));
+            .insert("stdio".to_string(), mock_server("echo"));
         config.servers.insert(
             oauth_healthy.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         config.servers.insert(
             oauth_auth_required.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         config.servers.insert(
             "failed".to_string(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(format!("http://127.0.0.1:{failed_port}/mcp")),
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
                 timeout_secs: 1,
                 call_timeout_secs: 1,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -4265,30 +4051,16 @@ async fn test_oauth_stateless_http_server_with_valid_credentials_starts_healthy(
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -4367,31 +4139,17 @@ async fn test_oauth_startup_failure_with_valid_credentials_is_not_auth_required(
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
-            },
+..Default::default()
+},
         );
 
         let started_engine = Arc::new(Engine::new(config));
@@ -4461,31 +4219,17 @@ async fn test_oauth_server_can_start_when_initialized_notification_is_rejected()
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
-            },
+..Default::default()
+},
         );
 
         let started_engine = Arc::new(Engine::new(config));
@@ -4570,30 +4314,16 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_is_auth_
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -4670,30 +4400,16 @@ async fn test_oauth_server_does_not_start_when_initialized_notification_returns_
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
                 timeout_secs: 10,
                 call_timeout_secs: 5,
                 max_concurrent: 4,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -4769,7 +4485,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     let mut config = Config::default();
     config
         .servers
-        .insert("mock".to_string(), mock_server_config("echo"));
+        .insert("mock".to_string(), mock_server("echo"));
 
     let engine = Arc::new(Engine::new(config));
     engine.start().await.expect("engine start");
@@ -5019,28 +4735,9 @@ fn mock_server_config_with_reverse_request(tools: &str, reverse_request: &str) -
             "--reverse-request".to_string(),
             reverse_request.to_string(),
         ],
-        env: HashMap::new(),
-        enabled: true,
-        transport: TransportType::Stdio,
-        protocol_mode: Default::default(),
-        url: None,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
         call_timeout_secs: 30,
         max_concurrent: 4,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
+        ..Default::default()
     }
 }
 
@@ -5772,14 +5469,8 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
         config.servers.insert(
             server_name.clone(),
             ServerConfig {
-                command: None,
-                args: Vec::new(),
-                env: HashMap::new(),
-                enabled: true,
                 transport: TransportType::Http,
-                protocol_mode: Default::default(),
                 url: Some(provider.mcp_url()),
-                auth_token: None,
                 auth: Some("oauth".to_string()),
                 oauth_client_id: Some("test-client".to_string()),
                 oauth_scopes: Some(vec!["read".to_string()]),
@@ -5790,14 +5481,7 @@ async fn test_oauth_refresh_under_load_no_auth_errors() {
                 max_concurrent: 4,
                 health_check_interval_secs: 3600,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
 
@@ -5956,7 +5640,7 @@ async fn an_openapi_document_becomes_a_server() {
     )
     .expect("write document");
 
-    let mut api = mock_server_config("unused");
+    let mut api = mock_server("unused");
     api.command = None;
     api.args = Vec::new();
     api.transport = TransportType::OpenApi;
