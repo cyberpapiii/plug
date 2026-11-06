@@ -7,11 +7,11 @@ import PlugIPC
 func makeTestHandshake(
     version: String,
     executable: URL? = URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
-    ownership: String = OperatorHandshake.appManaged
+    ownership: DaemonOwnership = .appManaged
 ) -> OperatorHandshake {
     var object: [String: Any] = [
         "daemon_version": version,
-        "ownership": ownership,
+        "ownership": ownership.rawValue,
     ]
     if let executable { object["daemon_executable"] = executable.path }
     let decoder = JSONDecoder()

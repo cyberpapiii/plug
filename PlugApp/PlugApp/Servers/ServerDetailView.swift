@@ -33,7 +33,7 @@ struct ServerDetailView: View {
                         reason: server.error,
                         actionTitle: fix.title,
                         action: { run(fix.intent) },
-                        failed: server.health == .down || server.health == .unknown
+                        failed: server.health == .down
                     )
                 }
             }

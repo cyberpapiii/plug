@@ -11,19 +11,10 @@ public enum FrameCodec {
         frame.append(payload)
         return frame
     }
-
-    public static func decode<T: Decodable>(_ type: T.Type, from frame: Data, decoder: JSONDecoder = JSONDecoder()) throws -> T {
-        guard frame.count >= 4 else { throw PlugIPCError.truncatedFrame }
-        let length = frame.prefix(4).reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-        guard length <= maximumPayloadSize else { throw PlugIPCError.frameTooLarge(Int(length)) }
-        guard frame.count == Int(length) + 4 else { throw PlugIPCError.truncatedFrame }
-        return try decoder.decode(type, from: frame.dropFirst(4))
-    }
 }
 
 public enum PlugIPCError: LocalizedError, Equatable {
     case frameTooLarge(Int)
-    case truncatedFrame
     case socketPathTooLong
     case timedOut
     case disconnected
@@ -34,7 +25,6 @@ public enum PlugIPCError: LocalizedError, Equatable {
     public var errorDescription: String? {
         switch self {
         case .frameTooLarge: "Plug sent an unexpectedly large response."
-        case .truncatedFrame: "Plug closed the connection mid-response."
         case .socketPathTooLong: "Plug's local socket path is too long."
         case .timedOut: "Plug did not respond before the local IPC deadline."
         case let .systemCall(name, code): "\(name) failed (\(code))."

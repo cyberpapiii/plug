@@ -222,16 +222,10 @@ final class LinkableAppTests: XCTestCase {
         XCTAssertNil(ClientSignIn.command(target: "claude-code"))
         XCTAssertTrue(ClientSignIn.about(target: "codex-cli", name: "Codex CLI").contains("Press Sign In."))
 
-        // A daemon older than the field says nothing, which is signed in.
         let decoder = JSONDecoder()
-        let old = try decoder.decode(
-            DownstreamClient.self,
-            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a"}"#.utf8)
-        )
-        XCTAssertFalse(old.needsSignIn)
         let lapsed = try decoder.decode(
             DownstreamClient.self,
-            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a","signedIn":false}"#.utf8)
+            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a","signedIn":false,"createdAt":1,"expiresAt":2}"#.utf8)
         )
         XCTAssertTrue(lapsed.needsSignIn)
     }
@@ -426,8 +420,8 @@ final class AppRosterTests: XCTestCase {
         )
         // The daemon's own reply, read the way the app reads it.
         let snapshot = try decoder.decode(OperatorSnapshot.self, from: Data(#"""
-        {"runtime_version":"1","uptime_secs":1,"ownership":"app_managed","configured_servers":[],
-         "servers":[],"live_sessions":[],"client_visibility":[],"upstream_auth":[],"downstream_clients":[],
+        {"runtime_version":"1","uptime_secs":1,"tool_catalog_revision":0,"ownership":"app_managed","configured_servers":[],
+         "servers":[],"live_sessions":[],"upstream_auth":[],"downstream_clients":[],
          "client_places":[{"key":"claude-code","place":"Work laptop"}]}
         """#.utf8))
         XCTAssertEqual(ClientNames(snapshot: snapshot).place(forKey: "claude-code"), "Work laptop")
@@ -485,10 +479,10 @@ final class AppRosterTests: XCTestCase {
              {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
               "client_key":"oauth:def","access_key":"oauth:def"},
              {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
-              "client_key":"custom:my-tool","access_key":"custom:my-tool"}]
+              "client_key":"custom:my-tool","access_key":"custom:my-tool","target":"custom:my-tool"}]
             """
         )
-        // One the owner made up keeps its own icon, whatever it reports.
+        // The daemon's target wins over what the client reports.
         XCTAssertEqual(names.target(of: live[2]), "custom:my-tool")
         XCTAssertEqual(names.target(of: live[0]), "grok-bot")
         // A name Plug does not know leaves the icon to what the client reports.
@@ -619,8 +613,8 @@ final class AppRosterTests: XCTestCase {
             [DownstreamClient].self,
             from: Data(
                 #"""
-                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic","client_key":"oauth:abc"},
-                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic","client_key":"oauth:def"}]
+                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic","client_key":"oauth:abc","signed_in":true,"created_at":1,"expires_at":2},
+                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic","client_key":"oauth:def","signed_in":true,"created_at":1,"expires_at":2}]
                 """#.utf8
             )
         )
@@ -727,7 +721,7 @@ final class PopoverRecentTests: XCTestCase {
             server: server,
             tool: tool,
             latencyMs: 10,
-            outcome: "success"
+            outcome: .success
         )
     }
 
@@ -735,7 +729,7 @@ final class PopoverRecentTests: XCTestCase {
         let reported = ActivityEvent(
             sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
             tool: "IMessage__get_messages", clientType: "Cursor", clientLabel: "Cursor 1.0",
-            clientKey: "oauth:abc", latencyMs: 1, outcome: "success"
+            clientKey: "oauth:abc", latencyMs: 1, outcome: .success
         )
         let named = CallFacts(reported, ownerName: "GrokBot")
         XCTAssertEqual(named.caller, "GrokBot")
@@ -757,7 +751,7 @@ final class PopoverRecentTests: XCTestCase {
             ActivityEvent(
                 sequence: sequence, occurredAtMs: ms, client: "s", method: "tools/call", server: "gmail",
                 tool: "Gmail__search_messages", clientType: "Unknown", clientLabel: "radar",
-                clientKey: key, latencyMs: 1, outcome: "success"
+                clientKey: key, latencyMs: 1, outcome: .success
             )
         }
         let events = [
@@ -784,7 +778,7 @@ final class PopoverRecentTests: XCTestCase {
             CallFacts(ActivityEvent(
                 sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
                 tool: "IMessage__get_messages", clientType: type, clientKey: "oauth:abc",
-                latencyMs: 1, outcome: "success"
+                latencyMs: 1, outcome: .success
             ), grantName: grant)
         }
         // A client that says nothing useful about itself takes its sign-in's name.
@@ -824,7 +818,7 @@ final class PopoverRecentTests: XCTestCase {
         let failed = CallFacts(ActivityEvent(
             sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
             tool: "Notion__search", clientType: "claude-code", latencyMs: 30_000,
-            outcome: "error", reason: "upstream request timed out"
+            outcome: .error, reason: "upstream request timed out"
         ))
         XCTAssertEqual(failed.result, "Failed")
         XCTAssertEqual(failed.caller, "Claude Code")
@@ -835,28 +829,38 @@ final class PopoverRecentTests: XCTestCase {
 
         let old = CallFacts(ActivityEvent(
             sequence: 2, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
-            latencyMs: 12, outcome: "error"
+            latencyMs: 12, outcome: .error
         ))
         XCTAssertNil(old.reason)
         XCTAssertNotNil(old.advice, "a failure always has a next step")
         XCTAssertEqual(old.duration, "12 ms")
     }
 
+    func testACallIsPicturedAsTheClientTheDaemonTookItFor() {
+        let call = CallFacts(ActivityEvent(
+            sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
+            clientType: "unknown", clientLabel: "mcp", clientKey: "codex-cli", target: "codex-cli",
+            latencyMs: 1, outcome: .success
+        ))
+        XCTAssertEqual(call.callerTarget, "codex-cli")
+        XCTAssertEqual(call.caller, "Codex CLI")
+    }
+
     func testACancelledCallIsNotAFailure() {
-        func call(_ outcome: String) -> CallFacts {
+        func call(_ outcome: CallOutcome) -> CallFacts {
             CallFacts(ActivityEvent(
                 sequence: 1, occurredAtMs: 1, client: nil, method: "tools/call", server: "notion",
                 latencyMs: 12, outcome: outcome
             ))
         }
-        let cancelled = call("cancelled")
+        let cancelled = call(.cancelled)
         XCTAssertTrue(cancelled.cancelled)
         XCTAssertFalse(cancelled.failed)
         XCTAssertFalse(cancelled.succeeded)
         XCTAssertEqual(cancelled.result, "Canceled")
         XCTAssertEqual(cancelled.advice, "The client stopped this call before it finished.")
 
-        let failed = call("error")
+        let failed = call(.error)
         XCTAssertTrue(failed.failed)
         XCTAssertFalse(failed.cancelled)
         XCTAssertEqual(failed.result, "Failed")
@@ -890,7 +894,7 @@ final class PopoverRecentTests: XCTestCase {
     func testANewSignInAsksAboutEarlierOnesWithItsName() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         func grant(_ id: String, _ name: String, at created: UInt64, used: UInt64? = 1) -> DownstreamClient {
-            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"signed_in":true,"client_key":"oauth:\#(id)"}"#
+            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"expires_at":3000000,"signed_in":true,"client_key":"oauth:\#(id)"}"#
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             var client = try! decoder.decode(DownstreamClient.self, from: Data(json.utf8))
@@ -920,7 +924,6 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_000_030, now: now), "gone soon")
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_001_500, now: now), "gone in 25 min")
         XCTAssertEqual(SignInFacts.goneIn(expiresAt: 1_007_300, now: now), "gone in 2 hr")
-        XCTAssertEqual(SignInFacts.goneIn(expiresAt: nil, now: now), "")
         XCTAssertEqual(SignInFacts.day(1_000_000, now: now), "today")
     }
 }

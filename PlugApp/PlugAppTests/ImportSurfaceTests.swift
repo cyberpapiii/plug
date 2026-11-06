@@ -19,19 +19,27 @@ final class ImportScanTests: XCTestCase {
               "source": "Cursor", "source_target": "cursor", "source_name": "Cursor",
               "config": {
                 "command": "npx", "args": ["-y", "linear-mcp"],
-                "env": { "LINEAR_API_KEY": "lin_1" }, "url": null
+                "env": { "LINEAR_API_KEY": "lin_1" }, "transport": "stdio", "url": null
               }
             },
             {
               "name": "notion",
               "source": "ClaudeDesktop", "source_target": "claude-desktop", "source_name": "Claude Desktop",
-              "config": { "command": null, "args": [], "env": {}, "url": "https://mcp.notion.com/mcp" }
+              "config": { "command": null, "args": [], "env": {}, "transport": "http", "url": "https://mcp.notion.com/mcp" }
+            },
+            {
+              "name": "events",
+              "source": "Cursor", "source_target": "cursor", "source_name": "Cursor",
+              "config": {
+                "command": null, "args": [], "env": {}, "transport": "sse", "url": "https://example.com/sse",
+                "auth_token": "$EVENTS_TOKEN", "timeout_secs": 90
+              }
             }
           ]
         }
         """)
 
-        XCTAssertEqual(result.servers.count, 2)
+        XCTAssertEqual(result.servers.count, 3)
         let linear = result.servers[0]
         XCTAssertEqual(linear.name, "linear")
         XCTAssertEqual(linear.source, "cursor")
@@ -48,6 +56,12 @@ final class ImportScanTests: XCTestCase {
         XCTAssertEqual(notion.config.transport, "http")
         XCTAssertEqual(notion.config.url, "https://mcp.notion.com/mcp")
         XCTAssertEqual(notion.detail, "https://mcp.notion.com/mcp")
+
+        // Every field the report carries comes along, so an SSE server stays one.
+        let events = result.servers[2]
+        XCTAssertEqual(events.config.transport, "sse")
+        XCTAssertEqual(events.config.authToken, "$EVENTS_TOKEN")
+        XCTAssertEqual(events.config.timeoutSecs, 90)
     }
 
     /// Every linked app has a Plug entry of its own. Importing it would point
@@ -62,7 +76,7 @@ final class ImportScanTests: XCTestCase {
               "source": "Cursor", "source_target": "cursor", "source_name": "Cursor",
               "config": {
                 "command": "/Users/someone/.local/bin/plug",
-                "args": ["connect"], "env": {}, "url": null
+                "args": ["connect"], "env": {}, "transport": "stdio", "url": null
               }
             }
           ]

@@ -116,8 +116,8 @@ struct PlugIntentRunner {
             perform("remove that client's access", .revokeClient(clientID: id))
         case let .renameClient(key, name):
             perform("rename the client", .mutate(.renameClient(key: key, name: name)))
-        case let .replaceClient(oldID, newID):
-            Task { await model.actions.replaceClient(oldID: oldID, newID: newID) }
+        case let .replaceClient(old, new):
+            Task { await model.actions.replaceClient(old: old, new: new) }
         case let .setClientPlace(key, place):
             perform("say where the client runs", .mutate(.setClientPlace(key: key, place: place)))
         case let .setClientServerBlocked(key, server, blocked):

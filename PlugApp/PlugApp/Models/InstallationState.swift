@@ -50,12 +50,6 @@ struct InstallationFailure: Equatable, Sendable {
     let logURL: URL?
 }
 
-extension OperatorHandshake {
-    /// The daemon's `DaemonOwnershipMode` names for itself.
-    static let appManaged = "app_managed"
-    static let unknownOwnership = "unknown"
-}
-
 /// This app's bundle, signed by Plug's team, and the daemon binary inside it.
 struct VerifiedAppInstallation: Equatable, Sendable {
     let bundleURL: URL
@@ -111,7 +105,7 @@ struct OwnDaemonProof: Sendable {
     let app: VerifiedAppInstallation
 
     init?(app: VerifiedAppInstallation, handshake: OperatorHandshake, shellLink: ShellLinkState) {
-        guard handshake.ownership == OperatorHandshake.appManaged,
+        guard handshake.ownership == .appManaged,
               app.answers(version: handshake.daemonVersion, executable: handshake.daemonExecutable),
               case let .canonical(target) = shellLink, app.isExecutable(target)
         else { return nil }

@@ -580,6 +580,13 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
             },
         ),
         (
+            "remote_server_config",
+            IpcResponse::ServerConfig {
+                name: "notes".to_string(),
+                server: Box::new(remote_server()),
+            },
+        ),
+        (
             "activity",
             IpcResponse::ActivitySnapshot {
                 events: vec![

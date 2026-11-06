@@ -432,7 +432,7 @@ struct ClientsView: View {
         if grant.isUnfinished { return unfinishedEntry(grant, name: name) }
         let access = access(key: grant.clientKey, name: name, isRemote: true)
         let host = URL(string: grant.clientId)?.host()
-        let since = grant.createdAt.map { SignInFacts.day($0) }
+        let since = SignInFacts.day(grant.createdAt)
         // A client with a connection open is plainly signed in.
         let needsSignIn = grant.needsSignIn && sessions.isEmpty
         let target = AppIcons.target(forClientType: names.picturedName(forGrant: grant))
@@ -459,26 +459,29 @@ struct ClientsView: View {
             },
             about: needsSignIn
                 ? ClientSignIn.about(target: target, name: name)
-                : [since.map { "Signed in \($0)." }, "Turn this off to remove its access."]
-                    .compactMap { $0 }.joined(separator: " "),
+                : "Signed in \(since). Turn this off to remove its access.",
             access: access,
             renameKey: grant.clientKey,
             placeKey: grant.clientKey,
-            disambiguator: host ?? since.map { $0 == "today" ? $0 : "since \($0)" },
+            disambiguator: host ?? (since == "today" ? since : "since \(since)"),
             grantID: grant.clientId,
             needsSignIn: needsSignIn,
             signInCommand: needsSignIn ? ClientSignIn.command(target: target) : nil,
             asking: earlier.isEmpty ? nil : ClientEntry.Asking(
-                when: since ?? "",
+                when: since,
                 choices: earlier.map { other in
                     ClientEntry.Asking.Choice(
                         id: other.clientId,
                         name: names.name(forKey: other.clientKey)
-                            ?? [other.clientName, other.createdAt.map { "since \(SignInFacts.day($0))" }]
-                                .compactMap { $0 }.joined(separator: ", ")
+                            ?? "\(other.clientName), since \(SignInFacts.day(other.createdAt))"
                     )
                 },
-                replace: { run(.replaceClient(oldID: $0, newID: grant.clientId)); answer(grant.clientId) },
+                replace: { id in
+                    if let old = earlier.first(where: { $0.clientId == id }) {
+                        run(.replaceClient(old: old, new: grant))
+                    }
+                    answer(grant.clientId)
+                },
                 keep: { answer(grant.clientId) }
             )
         )
@@ -488,9 +491,8 @@ struct ClientsView: View {
     /// no access, so there is nothing to choose for it; its switch forgets
     /// it now.
     private func unfinishedEntry(_ grant: DownstreamClient, name: String) -> ClientEntry {
-        let until = grant.expiresAt.map {
-            Date(timeIntervalSince1970: TimeInterval($0)).formatted(date: .omitted, time: .shortened)
-        }
+        let until = Date(timeIntervalSince1970: TimeInterval(grant.expiresAt))
+            .formatted(date: .omitted, time: .shortened)
         return ClientEntry(
             id: "grant:\(grant.clientId)",
             group: .unfinished,
@@ -505,8 +507,7 @@ struct ClientsView: View {
             switchLabel: "Access",
             isOn: nil,
             setOn: { _ in },
-            about: "Something asked to use Plug under this name, and the sign-in was never finished. It cannot use anything."
-                + (until.map { " Plug forgets it at \($0)." } ?? ""),
+            about: "Something asked to use Plug under this name, and the sign-in was never finished. It cannot use anything. Plug forgets it at \(until).",
             access: nil,
             renameKey: nil,
             placeKey: nil,

@@ -131,7 +131,7 @@ extension ServerHealth {
         case .working: StatusColor.working
         case .starting, .off: StatusColor.quiet
         case .signInNeeded, .notLoaded: StatusColor.needsYou
-        case .down, .unknown: StatusColor.stopped
+        case .down: StatusColor.stopped
         }
     }
 
@@ -145,7 +145,7 @@ extension ServerHealth {
         case .working: .working
         case .starting: .starting
         case .signInNeeded: .signIn
-        case .down, .unknown: .stopped
+        case .down: .stopped
         case .notLoaded: .needsYou
         case .off: .off
         }

@@ -156,18 +156,18 @@ final class GoldenPayloadTests: XCTestCase {
         guard case let .handshake(handshake) = try response("handshake") else { return XCTFail() }
         XCTAssertEqual(handshake.daemonVersion, "0.9.0")
         XCTAssertEqual(handshake.daemonExecutable?.path, "/Applications/Plug.app/Contents/Resources/plug")
-        XCTAssertEqual(handshake.ownership, "app_managed")
+        XCTAssertEqual(handshake.ownership, .appManaged)
     }
 
     func testSnapshot() throws {
         guard case let .snapshot(snapshot) = try response("snapshot") else { return XCTFail() }
         XCTAssertEqual(snapshot.runtimeVersion, "0.9.0")
         XCTAssertEqual(snapshot.toolCatalogRevision, 7)
-        XCTAssertEqual(snapshot.ownership, "app_managed")
+        XCTAssertEqual(snapshot.ownership, .appManaged)
         XCTAssertEqual(snapshot.configuredServers.map(\.name), ["healthy", "degraded", "failed", "auth-required", "notes"])
         XCTAssertEqual(snapshot.configuredServers.map(\.transport), ["stdio", "stdio", "stdio", "stdio", "sse"])
         XCTAssertEqual(snapshot.configuredServers.map(\.oauth), [false, false, false, true, true])
-        XCTAssertEqual(snapshot.servers.map(\.health), ["Healthy", "Degraded", "Failed", "AuthRequired"])
+        XCTAssertEqual(snapshot.servers.map(\.health), [.healthy, .degraded, .failed, .authRequired])
         XCTAssertEqual(snapshot.servers.map(\.toolCount), [0, 4, 8, 12])
         XCTAssertEqual(snapshot.servers[2].error, "failed to spawn `npx`: not found")
         XCTAssertEqual(snapshot.servers[0].upstream?.websiteUrl, "https://example.com")
@@ -213,7 +213,7 @@ final class GoldenPayloadTests: XCTestCase {
         let events = try XCTUnwrap(snapshot.events)
         XCTAssertEqual(
             events.map(\.state),
-            ["waiting", "watching", "tool_missing", "not_read_only", "call_failed", "too_large", "watching"]
+            [.waiting, .watching, .toolMissing, .notReadOnly, .callFailed, .tooLarge, .watching]
         )
         XCTAssertEqual(events[0].lastChanged, 1_700_000_000)
         XCTAssertNil(events[1].lastChanged)
@@ -234,12 +234,16 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(server, Self.stdioServer)
         guard case let .serverConfig(_, api) = try response("api_server_config") else { return XCTFail() }
         XCTAssertEqual(api, Self.apiServer)
+        // A field whose name ends in an initialism is read back, so a save
+        // does not drop it.
+        guard case let .serverConfig(_, remote) = try response("remote_server_config") else { return XCTFail() }
+        XCTAssertEqual(remote, Self.remoteServer)
     }
 
     func testActivity() throws {
         guard case let .activity(events) = try response("activity") else { return XCTFail() }
         XCTAssertEqual(events.map(\.sequence), [42, 43, 44])
-        XCTAssertEqual(events.map(\.outcome), ["success", "error", "cancelled"])
+        XCTAssertEqual(events.map(\.outcome), [.success, .error, .cancelled])
         XCTAssertEqual(events[0].clientKey, "claude-code")
         XCTAssertEqual(events[0].clientLabel, "claude-code 2.0")
         XCTAssertEqual(events[0].tool, "healthy__send")

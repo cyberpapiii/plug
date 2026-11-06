@@ -352,7 +352,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [healthyService(), healthyService()],
-                handshakes: [handshake(version: canonical.appVersion, ownership: "cli_managed")]
+                handshakes: [handshake(version: canonical.appVersion, ownership: .cliManaged)]
             ),
             openURL: { _ in },
             logWriter: { _, _ in }
@@ -392,7 +392,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [healthyService(), healthyService()],
-                handshakes: [handshake(version: canonical.appVersion, ownership: "unknown")]
+                handshakes: [handshake(version: canonical.appVersion, ownership: .unknown)]
             ),
             openURL: { _ in },
             logWriter: { _, _ in }
@@ -1237,7 +1237,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
     }
 
-    private func handshake(version: String, ownership: String = OperatorHandshake.appManaged) -> OperatorHandshake {
+    private func handshake(version: String, ownership: DaemonOwnership = .appManaged) -> OperatorHandshake {
         makeTestHandshake(version: version, executable: canonical.executableURL, ownership: ownership)
     }
 }

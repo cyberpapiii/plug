@@ -13,7 +13,7 @@ final class SteadiedSnapshotTests: XCTestCase {
         ]
         snapshot.upstreamAuth = [
             AuthServer(
-                name: "notes", url: nil, authenticated: authenticated, health: "healthy",
+                name: "notes", url: nil, authenticated: authenticated, health: .healthy,
                 scopes: nil, tokenExpiresInSecs: expires, warnings: []
             ),
         ]

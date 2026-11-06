@@ -79,51 +79,54 @@ struct ImportService: ImportScanning {
 // MARK: - Reading the report
 
 extension ImportScan {
-    /// Built by hand rather than by `Decodable` conformance: the report carries
-    /// every field of a server's configuration, and the app only needs the few
-    /// it can actually show and re-create.
-    init(json data: Data) throws {
-        guard let root = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            throw ImportError.failed("Plug gave an answer it could not read. Try again.")
+    /// The parts of `plug import --output json` the sheet reads. Each server
+    /// keeps its whole configuration, so what is imported is what was found.
+    fileprivate struct Report: Decodable {
+        struct Scanned: Decodable {
+            let sourceName: String
+            let error: String?
         }
 
-        var unreadable: [String] = []
-        for scan in root["scanned"] as? [[String: Any]] ?? [] {
-            guard let error = scan["error"] as? String, !error.isEmpty else { continue }
-            unreadable.append(scan["source_name"] as? String ?? "Another client")
+        struct Found: Decodable {
+            let name: String
+            let sourceTarget: String
+            let sourceName: String
+            let config: ServerConfig
         }
 
-        let found = root["new_servers"] as? [[String: Any]] ?? []
-        let servers = found.compactMap(Self.server(from:)).filter { !$0.config.isPlugItself }
-
-        self.init(servers: servers, unreadable: unreadable.sorted())
+        let scanned: [Scanned]
+        let newServers: [Found]
     }
 
-    private static func server(from raw: [String: Any]) -> DiscoveredServer? {
-        guard let name = raw["name"] as? String, !name.isEmpty,
-              let body = raw["config"] as? [String: Any]
-        else { return nil }
+    init(json data: Data) throws {
+        let decoder = JSONDecoder()
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+        guard let report = try? decoder.decode(Report.self, from: data) else {
+            throw ImportError.failed("Plug gave an answer it could not read. Try again.")
+        }
+        let unreadable = report.scanned.filter { !($0.error ?? "").isEmpty }.map(\.sourceName)
+        let servers = report.newServers.compactMap(DiscoveredServer.init).filter { !$0.config.isPlugItself }
+        self.init(servers: servers, unreadable: unreadable.sorted())
+    }
+}
 
-        let env = body["env"] as? [String: String] ?? [:]
-
-        var config: ServerConfig
-        var detail: String
-        if let url = body["url"] as? String, !url.isEmpty {
-            config = .remote(url)
+private extension DiscoveredServer {
+    /// Nil for an entry with no name, or nothing to run or reach.
+    init?(_ found: ImportScan.Report.Found) {
+        let config = found.config
+        let detail: String
+        if let url = config.url, !url.isEmpty {
             detail = url
-        } else if let command = body["command"] as? String, !command.isEmpty {
-            let args = body["args"] as? [String] ?? []
-            config = .command(command, args: args)
-            detail = ([command] + args).joined(separator: " ")
+        } else if let command = config.command, !command.isEmpty {
+            detail = ([command] + config.args).joined(separator: " ")
         } else {
             return nil
         }
-        config.env = env
-
-        return DiscoveredServer(
-            name: name,
-            source: raw["source_target"] as? String ?? "",
-            sourceName: raw["source_name"] as? String ?? "Another client",
+        guard !found.name.isEmpty else { return nil }
+        self.init(
+            name: found.name,
+            source: found.sourceTarget,
+            sourceName: found.sourceName,
             config: config,
             detail: detail
         )

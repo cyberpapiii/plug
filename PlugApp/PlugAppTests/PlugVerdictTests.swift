@@ -172,7 +172,6 @@ final class PlugVerdictTests: XCTestCase {
         )
         XCTAssertNil(server("Notion", health: .signInNeeded).cancelSignIn)
         XCTAssertEqual(server("Linear", health: .down).fix?.intent, .restartServer("Linear"))
-        XCTAssertEqual(server("Odd", health: .unknown).fix?.intent, .restartServer("Odd"))
         for health in [ServerHealth.working, .starting, .off] {
             XCTAssertNil(server("fine", health: health).fix, "\(health) needs no fix")
         }
@@ -326,27 +325,27 @@ final class PlugVerdictTests: XCTestCase {
     }
 
     func testHealthNeverLeaksProtocolVocabulary() {
-        XCTAssertEqual(ServerHealth(daemonValue: "AuthRequired", enabled: true).label, "Sign-in needed")
-        XCTAssertEqual(ServerHealth(daemonValue: "Failed", enabled: true).label, "Down")
-        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: false), .off)
+        XCTAssertEqual(ServerHealth(daemonValue: .authRequired, enabled: true).label, "Sign-in needed")
+        XCTAssertEqual(ServerHealth(daemonValue: .failed, enabled: true).label, "Down")
+        XCTAssertEqual(ServerHealth(daemonValue: .healthy, enabled: false), .off)
         XCTAssertEqual(ServerHealth(daemonValue: nil, enabled: true), .starting)
     }
 
     func testDegradedServerStillReadsAsRunning() {
-        let health = ServerHealth(daemonValue: "Degraded", enabled: true)
+        let health = ServerHealth(daemonValue: .degraded, enabled: true)
         XCTAssertEqual(health, .working)
         XCTAssertFalse(health.needsAttention)
     }
 
     func testWorkingHealthUsesLiveDotInsteadOfCompletionCheckmark() {
-        XCTAssertEqual(ServerHealth(daemonValue: "Healthy", enabled: true).icon, .working)
+        XCTAssertEqual(ServerHealth(daemonValue: .healthy, enabled: true).icon, .working)
     }
 
     /// Only a state that is changing moves. A running server used to pulse,
     /// so a healthy list looked busy.
     func testOnlySettlingServersPulse() {
         XCTAssertTrue(ServerHealth.starting.pulses)
-        for health in [ServerHealth.working, .signInNeeded, .down, .notLoaded, .off, .unknown] {
+        for health in [ServerHealth.working, .signInNeeded, .down, .notLoaded, .off] {
             XCTAssertFalse(health.pulses, "\(health) should hold still")
         }
     }

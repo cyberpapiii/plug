@@ -98,13 +98,11 @@ final class PlugActions {
 
     /// The settings move first: if that fails, the old sign-in keeps both its
     /// settings and its access.
-    func replaceClient(oldID: String, newID: String) async {
+    func replaceClient(old: DownstreamClient, new: DownstreamClient) async {
         do {
-            let from = DownstreamClient.clientKey(id: oldID)
-            let to = DownstreamClient.clientKey(id: newID)
             try await change { daemon in
-                _ = try await daemon.send(.mutate(.moveClientSettings(from: from, to: to)))
-                _ = try await daemon.send(.revokeClient(clientID: oldID))
+                _ = try await daemon.send(.mutate(.moveClientSettings(from: old.clientKey, to: new.clientKey)))
+                _ = try await daemon.send(.revokeClient(clientID: old.clientId))
             }
         } catch { report("replace the old sign-in", error) }
     }

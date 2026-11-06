@@ -358,7 +358,7 @@ struct PanelTrouble: Equatable {
         }
         let troubled = situation.troubledServers
         guard !troubled.isEmpty else { return nil }
-        let stopped = troubled.contains { $0.health == .down || $0.health == .unknown }
+        let stopped = troubled.contains { $0.health == .down }
         var card = PanelTrouble(
             servers: Array(troubled.prefix(visibleServers)), wash: stopped ? .blocked : .attention
         )

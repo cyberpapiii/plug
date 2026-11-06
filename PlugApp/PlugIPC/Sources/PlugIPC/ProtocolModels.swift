@@ -1,9 +1,43 @@
 import Foundation
 
+/// Who started the daemon, as launchd records it.
+public enum DaemonOwnership: String, Codable, Sendable {
+    case unmanaged
+    /// The daemon could not read its own launchd registration.
+    case unknown
+    case cliManaged = "cli_managed"
+    case appManaged = "app_managed"
+}
+
+/// An upstream server's health, as the daemon names it.
+public enum DaemonHealth: String, Codable, Sendable {
+    case healthy = "Healthy"
+    case degraded = "Degraded"
+    case failed = "Failed"
+    case authRequired = "AuthRequired"
+}
+
+/// How a watched event is doing.
+public enum WatchState: String, Codable, Sendable {
+    case waiting
+    case watching
+    case toolMissing = "tool_missing"
+    case notReadOnly = "not_read_only"
+    case callFailed = "call_failed"
+    case tooLarge = "too_large"
+}
+
+/// How a call ended.
+public enum CallOutcome: String, Codable, Sendable {
+    case success
+    case error
+    case cancelled
+}
+
 public struct OperatorHandshake: Codable, Equatable, Sendable {
     public let daemonVersion: String
     public let daemonExecutable: URL?
-    public let ownership: String
+    public let ownership: DaemonOwnership
 
     private enum CodingKeys: String, CodingKey {
         case daemonVersion, daemonExecutable, ownership
@@ -19,14 +53,14 @@ public struct OperatorHandshake: Codable, Equatable, Sendable {
         } else {
             daemonExecutable = nil
         }
-        ownership = try container.decode(String.self, forKey: .ownership)
+        ownership = try container.decode(DaemonOwnership.self, forKey: .ownership)
     }
 }
 
 public struct ServerStatus: Codable, Identifiable, Equatable, Sendable {
     public var id: String { serverId }
     public let serverId: String
-    public let health: String
+    public let health: DaemonHealth
     public let toolCount: Int
     public let error: String?
     /// What the server said about itself when it connected.
@@ -134,7 +168,7 @@ public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
     public let name: String
     public let url: String?
     public let authenticated: Bool
-    public let health: String
+    public let health: DaemonHealth
     public let scopes: [String]?
     public var tokenExpiresInSecs: UInt64?
     public let warnings: [String]
@@ -146,15 +180,14 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public let clientName: String
     public let redirectUris: [String]
     public let source: String
-    /// False when the client holds no token that still works. Absent from a
-    /// daemon older than the field, which is read as signed in.
-    public var signedIn: Bool?
+    /// False when the client holds no token that still works.
+    public var signedIn: Bool
     /// When the client asked to be let in, in seconds since 1970.
-    public var createdAt: UInt64?
+    public var createdAt: UInt64
     /// When it last signed in or renewed. Nil for one that never has.
     public var lastUsedAt: UInt64?
     /// When Plug forgets it unless it signs in again before then.
-    public var expiresAt: UInt64?
+    public var expiresAt: UInt64
     /// What this client's settings are stored under.
     public let clientKey: String
     /// The client Plug takes this one for by the name it registered.
@@ -162,13 +195,11 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
 
     /// Its sign-in ran out or was revoked, and only the client can start
     /// another.
-    public var needsSignIn: Bool { signedIn == false }
+    public var needsSignIn: Bool { !signedIn }
 
     /// It asked to be let in and nobody finished the sign-in. Plug forgets
     /// it at `expiresAt`.
-    public var isUnfinished: Bool { signedIn == false && lastUsedAt == nil && createdAt != nil }
-
-    public static func clientKey(id: String) -> String { "oauth:\(id)" }
+    public var isUnfinished: Bool { !signedIn && lastUsedAt == nil }
 }
 
 /// One event a client can subscribe to, and how it is doing.
@@ -180,9 +211,7 @@ public struct EventStatus: Codable, Identifiable, Equatable, Sendable {
     /// The watched tool. Nil for an event Plug does not make by watching.
     public let tool: String?
     public let everySecs: UInt64?
-    /// `waiting`, `watching`, `tool_missing`, `not_read_only`, `call_failed`,
-    /// or `too_large`.
-    public let state: String
+    public let state: WatchState
     /// Unix seconds of the last check that reached the tool.
     public let lastChecked: UInt64?
     /// Unix seconds of the last change that became an event.
@@ -194,7 +223,7 @@ public struct EventStatus: Codable, Identifiable, Equatable, Sendable {
         server: String,
         tool: String? = nil,
         everySecs: UInt64? = nil,
-        state: String = "waiting",
+        state: WatchState = .waiting,
         lastChecked: UInt64? = nil,
         lastChanged: UInt64? = nil,
         subscribers: Int = 0
@@ -209,21 +238,6 @@ public struct EventStatus: Codable, Identifiable, Equatable, Sendable {
         self.subscribers = subscribers
     }
 
-    private enum CodingKeys: String, CodingKey {
-        case name, server, tool, everySecs, state, lastChecked, lastChanged, subscribers
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        name = try container.decode(String.self, forKey: .name)
-        server = try container.decode(String.self, forKey: .server)
-        tool = try container.decodeIfPresent(String.self, forKey: .tool)
-        everySecs = try container.decodeIfPresent(UInt64.self, forKey: .everySecs)
-        state = try container.decodeIfPresent(String.self, forKey: .state) ?? "waiting"
-        lastChecked = try container.decodeIfPresent(UInt64.self, forKey: .lastChecked)
-        lastChanged = try container.decodeIfPresent(UInt64.self, forKey: .lastChanged)
-        subscribers = try container.decodeIfPresent(Int.self, forKey: .subscribers) ?? 0
-    }
 }
 
 /// Any JSON value, for the arguments a watched tool is called with.
@@ -317,8 +331,8 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     /// Changes when the daemon's tool list would answer differently. The
     /// snapshot is cheap and polled often; the tool list is nearly a megabyte
     /// and almost never changes between two polls.
-    public var toolCatalogRevision: UInt64?
-    public let ownership: String
+    public var toolCatalogRevision: UInt64
+    public let ownership: DaemonOwnership
     public let configuredServers: [ConfiguredServer]
     public let servers: [ServerStatus]
     public var liveSessions: [LiveSession]
@@ -336,7 +350,7 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public var clientAddress: String?
 
     public static let empty = OperatorSnapshot(
-        runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",
+        runtimeVersion: "", uptimeSecs: 0, toolCatalogRevision: 0, ownership: .unmanaged,
         configuredServers: [], servers: [], liveSessions: [],
         upstreamAuth: [], downstreamClients: []
     )
@@ -379,17 +393,17 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
     public let tool: String?
     public let clientType: String?
     public let clientLabel: String?
-    /// The key the client's name is kept under. Absent from a daemon older
-    /// than this field.
+    /// The key the client's name is kept under. Nil for a caller Plug
+    /// cannot tell apart.
     public let clientKey: String?
     /// The client Plug took the caller for, by its link target.
     public let target: String?
     /// The call came over the network rather than from this Mac.
     public let remote: Bool
     public let latencyMs: UInt64
-    public let outcome: String
-    /// Why a failed call failed, in the error's own words. Absent for a call
-    /// that worked, and from a daemon older than this field.
+    public let outcome: CallOutcome
+    /// Why a failed call failed, in the error's own words. Nil for a call
+    /// that worked.
     public let reason: String?
 
     public init(
@@ -405,7 +419,7 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         target: String? = nil,
         remote: Bool = false,
         latencyMs: UInt64,
-        outcome: String,
+        outcome: CallOutcome,
         reason: String? = nil
     ) {
         self.sequence = sequence
@@ -523,7 +537,9 @@ public struct ServerConfig: Codable, Equatable, Sendable {
 extension ServerConfig {
     private enum CodingKeys: String, CodingKey {
         case command, args, env, enabled, transport, protocolMode = "protocol", url, authToken
-        case auth, oauthClientID, oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
+        // As the snake-case decoder spells `oauth_client_id`; `oauthClientID`
+        // never matched it, so a read lost the field and a save dropped it.
+        case auth, oauthClientID = "oauthClientId", oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
         case healthCheckIntervalSecs, circuitBreakerEnabled, enrichment, toolRenames, toolGroups
         case sandbox, spec, operations, tokenIn
     }

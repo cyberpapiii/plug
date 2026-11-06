@@ -45,7 +45,11 @@ struct AppRoster: Equatable {
         self.other = sessions.filter { !claimed.contains($0.sessionId) }
     }
 
+    /// The client the daemon takes a session for, else every client its
+    /// reported names could be. The daemon knows only the clients it can
+    /// link; a remote product such as ChatGPT is known here by its name.
     static func targets(of session: LiveSession) -> Set<String> {
+        if let target = session.target { return [target] }
         var targets = [AppIcons.target(forClientType: session.clientType)]
         if let info = session.clientInfo, !info.isEmpty {
             targets.append(AppIcons.target(forClientType: info))
@@ -63,6 +67,7 @@ extension LiveSession {
 
     /// The product name of a client Plug knows, nil for any other.
     var knownName: String? {
+        if let name = target.flatMap(AppIcons.displayName(forTarget:)) { return name }
         for value in [clientType, clientInfo].compactMap({ $0 }) {
             let target = AppIcons.target(forClientType: value)
             if let canonical = AppIcons.displayName(forTarget: target) {
@@ -150,12 +155,8 @@ struct ClientNames: Equatable {
 
     /// What a session is called before the owner names it.
     func originalName(_ session: LiveSession) -> String {
-        let key = session.clientKey
-        return session.knownName
-            // A link says which client it was written for; that outranks
-            // the program that happened to start the connector.
-            ?? key.flatMap(AppIcons.displayName(forTarget:))
-            ?? key.flatMap { grantNames[$0] }
+        session.knownName
+            ?? session.clientKey.flatMap { grantNames[$0] }
             ?? session.displayName
     }
 
@@ -176,16 +177,15 @@ struct ClientNames: Equatable {
     }
 
     /// The target whose icon a session shows: the client its owner named it
-    /// as, else its own when the owner made it up in Add a Client, else the
-    /// client it reports, else the client its link was written for, else
-    /// the client its sign-in names. A call is pictured the same way.
+    /// as, else the one the daemon takes it for, else a product Plug knows
+    /// by the name it reports, else the client its sign-in names. A call is
+    /// pictured the same way.
     func target(of session: LiveSession) -> String {
         let key = session.clientKey
         if let named = knownTarget(named: name(forKey: key)) { return named }
-        if let key, key.hasPrefix(AddClient.customPrefix) { return key }
+        if let target = session.target { return target }
         let reported = AppIcons.target(forClientType: session.clientType)
         if AppIcons.displayName(forTarget: reported) != nil { return reported }
-        if let key, AppIcons.displayName(forTarget: key) != nil { return key }
         if let grant = key.flatMap({ grantNames[$0] }) {
             return AppIcons.target(forClientType: grant)
         }
@@ -267,8 +267,7 @@ enum SignInFacts {
     }
 
     /// What an unfinished sign-in's row says in place of a switch.
-    static func goneIn(expiresAt: UInt64?, now: Date = Date()) -> String {
-        guard let expiresAt else { return "" }
+    static func goneIn(expiresAt: UInt64, now: Date = Date()) -> String {
         let left = TimeInterval(expiresAt) - now.timeIntervalSince1970
         if left < 60 { return "gone soon" }
         if left < 3_600 { return "gone in \(Int(left / 60)) min" }
@@ -284,14 +283,15 @@ enum SignInFacts {
         answered: Set<String>,
         now: Date = Date()
     ) -> [DownstreamClient] {
-        guard let created = grant.createdAt, !grant.needsSignIn, !ownerNamed,
+        let created = grant.createdAt
+        guard !grant.needsSignIn, !ownerNamed,
               !answered.contains(grant.clientId),
               now.timeIntervalSince1970 - TimeInterval(created) < newFor
         else { return [] }
         return grants.filter {
             $0.clientId != grant.clientId && !$0.isUnfinished
                 && $0.clientName.caseInsensitiveCompare(grant.clientName) == .orderedSame
-                && ($0.createdAt ?? 0) <= created
+                && $0.createdAt <= created
         }
     }
 }

@@ -1,9 +1,10 @@
 import Foundation
+import PlugIPC
 
 // MARK: - Server health
 
-/// Health of one upstream server, normalized out of the daemon's string form so
-/// the interface never compares raw protocol vocabulary.
+/// Health of one upstream server as the interface tells it, from the daemon's
+/// health and whether the server is on.
 enum ServerHealth: Equatable, Sendable {
     case working
     case starting
@@ -13,13 +14,12 @@ enum ServerHealth: Equatable, Sendable {
     /// nothing about it. Usually a server added to the file without a reload.
     case notLoaded
     case off
-    case unknown
 
     /// How long a running daemon may say nothing about a configured server
     /// before that silence stops meaning "still starting".
     static let notLoadedAfterSecs: UInt64 = 60
 
-    init(daemonValue: String?, enabled: Bool, daemonUptimeSecs: UInt64 = 0) {
+    init(daemonValue: DaemonHealth?, enabled: Bool, daemonUptimeSecs: UInt64 = 0) {
         guard enabled else {
             self = .off
             return
@@ -27,12 +27,11 @@ enum ServerHealth: Equatable, Sendable {
         switch daemonValue {
         // Degraded still routes calls, so it reads as running rather than
         // as an unknown state that asks for attention.
-        case "Healthy", "Degraded": self = .working
+        case .healthy, .degraded: self = .working
         case nil where daemonUptimeSecs > Self.notLoadedAfterSecs: self = .notLoaded
         case nil: self = .starting
-        case "AuthRequired": self = .signInNeeded
-        case "Failed": self = .down
-        default: self = .unknown
+        case .authRequired: self = .signInNeeded
+        case .failed: self = .down
         }
     }
 
@@ -45,14 +44,13 @@ enum ServerHealth: Equatable, Sendable {
         case .down: "Down"
         case .notLoaded: "Not loaded"
         case .off: "Off"
-        case .unknown: "Not responding"
         }
     }
 
     /// True when this server is the reason someone opened Plug.
     var needsAttention: Bool {
         switch self {
-        case .signInNeeded, .down, .notLoaded, .unknown: true
+        case .signInNeeded, .down, .notLoaded: true
         case .working, .starting, .off: false
         }
     }
@@ -113,7 +111,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     var fix: Verdict.Button? {
         switch health {
         case .signInNeeded: .init(isSigningIn ? "Try Again" : "Sign In", .signIn(server: name))
-        case .down, .unknown: .init("Restart", .restartServer(name))
+        case .down: .init("Restart", .restartServer(name))
         case .notLoaded: .init("Reload", .reloadConfiguration)
         case .working, .starting, .off: nil
         }
@@ -132,7 +130,6 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         case .signInNeeded: isSigningIn ? "Finish signing in with your browser" : "Needs sign-in"
         case .down: error ?? "Stopped"
         case .notLoaded: "Not loaded yet"
-        case .unknown: "Not responding"
         case .working, .starting, .off: health.label
         }
     }
@@ -320,7 +317,7 @@ enum PlugIntent: Equatable, Sendable {
     case renameClient(key: String, name: String)
     /// A client signed in again under a new id: it takes over the settings
     /// of the sign-in it replaces, and that one loses its access.
-    case replaceClient(oldID: String, newID: String)
+    case replaceClient(old: DownstreamClient, new: DownstreamClient)
     case setClientPlace(key: String, place: String)
     case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case setClientToolBlocked(key: String, tool: String, blocked: Bool)

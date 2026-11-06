@@ -8,7 +8,7 @@ final class EventSurfaceTests: XCTestCase {
     func testAWatchSaysWhereItComesFromAndHowItIsDoing() {
         let event = EventFacts(EventStatus(
             name: "gmail.unread", server: "gmail", tool: "search_messages", everySecs: 300,
-            state: "watching", lastChecked: 1_000, lastChanged: 400, subscribers: 1
+            state: .watching, lastChecked: 1_000, lastChanged: 400, subscribers: 1
         ))
         XCTAssertEqual(event.source, "search_messages on gmail, every 5 minutes")
         XCTAssertEqual(event.healthLine(now: 1_030), "Checked just now. Last changed 10 min ago.")
@@ -18,13 +18,11 @@ final class EventSurfaceTests: XCTestCase {
     }
 
     func testAWatchInTroubleSaysWhy() {
-        let missing = EventFacts(EventStatus(name: "a.b", server: "a", tool: "t", state: "tool_missing"))
+        let missing = EventFacts(EventStatus(name: "a.b", server: "a", tool: "t", state: .toolMissing))
         XCTAssertTrue(missing.health.needsAttention)
         XCTAssertEqual(missing.healthLine(now: 0), "Plug cannot find this tool. Check that the server is running.")
-        let failed = EventFacts(EventStatus(name: "a.b", server: "a", tool: "t", state: "call_failed", lastChecked: 0))
+        let failed = EventFacts(EventStatus(name: "a.b", server: "a", tool: "t", state: .callFailed, lastChecked: 0))
         XCTAssertEqual(failed.healthLine(now: 7_200), "The last check failed (2 hr ago). Plug keeps trying.")
-        // A state this build has not heard of reads as a watch still waiting.
-        XCTAssertEqual(EventFacts.Health(state: "something_new"), .waiting)
     }
 
     func testAnEventPlugDoesNotWatchCannotBeStoppedHere() {

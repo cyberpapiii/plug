@@ -1055,8 +1055,8 @@ final class AppModelTests: XCTestCase {
         """
         let payload = """
         {
-          "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "ownership": "app_managed",
-          "configuredServers": [], "servers": [], "liveSessions": [], 
+          "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "toolCatalogRevision": 0,
+          "ownership": "app_managed", "configuredServers": [], "servers": [], "liveSessions": [],
           "upstreamAuth": [\(twice), \(twice)], "downstreamClients": []
         }
         """
@@ -1075,17 +1075,17 @@ final class AppModelTests: XCTestCase {
         clientSignedIn: Bool = true
     ) -> OperatorSnapshot {
         let clientJSON = includeClient
-            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn),"clientKey":"oauth:client-1"}]"#
+            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn),"clientKey":"oauth:client-1","createdAt":1,"expiresAt":2}]"#
             : "[]"
         let payload = """
         {
           "runtimeVersion": "\(currentTestAppVersion)",
           "uptimeSecs": 1,
+          "toolCatalogRevision": 0,
           "ownership": "app_managed",
           "configuredServers": [],
           "servers": [],
           "liveSessions": [],
-          
           "upstreamAuth": [{
             "name": "alpha",
             "url": null,
@@ -1308,7 +1308,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                             "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app_managed",
                             "tool_catalog_revision": catalogRevision,
                             "configured_servers": [], "servers": [], "live_sessions": [],
-                            "client_visibility": [], "upstream_auth": [], "downstream_clients": [],
+                            "upstream_auth": [], "downstream_clients": [],
                         ],
                     ], to: accepted)
                 case "ListTools":

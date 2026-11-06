@@ -182,6 +182,34 @@
       ]
     }
   },
+  "remote_server_config": {
+    "type": "ServerConfig",
+    "name": "notes",
+    "server": {
+      "command": null,
+      "args": [],
+      "env": {},
+      "enabled": true,
+      "transport": "sse",
+      "protocol": "legacy",
+      "url": "https://example.com/sse",
+      "auth_token": null,
+      "auth": "oauth",
+      "oauth_client_id": "plug",
+      "oauth_scopes": [
+        "read"
+      ],
+      "timeout_secs": 30,
+      "call_timeout_secs": 300,
+      "max_concurrent": 1,
+      "health_check_interval_secs": 60,
+      "circuit_breaker_enabled": true,
+      "enrichment": false,
+      "tool_renames": {},
+      "tool_groups": [],
+      "sandbox": null
+    }
+  },
   "revoked": {
     "type": "DownstreamClientRevoked",
     "client_id": "abc"

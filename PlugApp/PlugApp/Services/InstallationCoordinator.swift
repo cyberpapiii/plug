@@ -585,7 +585,7 @@ final class InstallationCoordinator {
         // the whole adoption path on every trigger, so folding absence into
         // drift would keep replacing a daemon nobody has proved is ours. Fail
         // closed and wait to be asked.
-        if handshake.ownership == OperatorHandshake.unknownOwnership {
+        if handshake.ownership == .unknown {
             throw CoordinatorError.unknownOwnership
         }
         guard let proof = OwnDaemonProof(app: canonical, handshake: handshake, shellLink: shellLink) else {
