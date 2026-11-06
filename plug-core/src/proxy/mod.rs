@@ -103,6 +103,18 @@ impl RouterSnapshot {
             .unwrap_or(false)
     }
 
+    /// Whether a call to `name` that reached its server and lost the answer
+    /// may be sent again: the server says the tool only reads, or that a
+    /// second run has no further effect. Only the server's own word counts.
+    fn may_resend(&self, name: &str) -> bool {
+        self.tool_risk_inventory
+            .get(name)
+            .and_then(|risk| risk.upstream_declared.as_ref())
+            .is_some_and(|hints| {
+                hints.read_only_hint == Some(true) || hints.idempotent_hint == Some(true)
+            })
+    }
+
     /// Populate O(1) lookup indexes after routes/tools are finalized.
     pub(crate) fn with_indexes(mut self) -> Self {
         self.routes_lower = self
@@ -3420,7 +3432,7 @@ impl ToolRouter {
 
             let server_id = server_id.clone();
             let original_name = original_name.to_string();
-            let safe_to_repeat = cache.safe_to_repeat(tool_name);
+            let safe_to_repeat = cache.may_resend(tool_name);
             drop(cache);
 
             if matches!(kind, CallKind::Direct) {
