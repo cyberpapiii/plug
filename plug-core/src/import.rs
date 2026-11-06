@@ -13,6 +13,7 @@ pub struct DiscoveredServer {
     /// Server name as defined in the source config.
     pub name: String,
     pub config: ServerConfig,
+    #[serde(skip)]
     pub source: ClientTarget,
     /// `source`'s slug, as `plug link` takes it.
     pub source_target: &'static str,
@@ -22,6 +23,7 @@ pub struct DiscoveredServer {
 /// Result of scanning a single client.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanResult {
+    #[serde(skip)]
     pub source: ClientTarget,
     pub source_target: &'static str,
     pub source_name: &'static str,
@@ -99,16 +101,18 @@ fn report(existing: &HashMap<String, ServerConfig>, scanned: Vec<ScanResult>) ->
 }
 
 /// Add `servers` to `config`. A name already taken gets the client's slug
-/// after it. Returns the names they were added under.
+/// after it, and a number after that if it is taken too. Returns the names
+/// they were added under.
 pub fn add_to_config(config: &mut Config, servers: &[DiscoveredServer]) -> Vec<String> {
     servers
         .iter()
         .map(|server| {
-            let name = if config.servers.contains_key(&server.name) {
-                format!("{}-{}", server.name, server.source.slug())
-            } else {
-                server.name.clone()
-            };
+            let renamed = format!("{}-{}", server.name, server.source.slug());
+            let name = std::iter::once(server.name.clone())
+                .chain(std::iter::once(renamed.clone()))
+                .chain((2..).map(|n| format!("{renamed}-{n}")))
+                .find(|name| !config.servers.contains_key(name))
+                .expect("an unused name");
             config.servers.insert(name.clone(), server.config.clone());
             name
         })
@@ -301,10 +305,33 @@ mod tests {
 
     #[test]
     fn import_json_names_each_source_by_slug_and_name() {
-        let report = report(&HashMap::new(), vec![scan_client(ClientTarget::KimiCode)]);
-        let json = serde_json::to_value(&report).unwrap();
-        assert_eq!(json["scanned"][0]["source"], "KimiCode");
+        let source = ClientTarget::KimiCode;
+        let scanned = ScanResult {
+            source,
+            source_target: source.slug(),
+            source_name: source.display_name(),
+            servers: Vec::new(),
+            error: None,
+        };
+        let json = serde_json::to_value(report(&HashMap::new(), vec![scanned])).unwrap();
         assert_eq!(json["scanned"][0]["source_target"], "kimi-code");
         assert_eq!(json["scanned"][0]["source_name"], "Kimi Code");
+        assert!(json["scanned"][0].get("source").is_none());
+    }
+
+    #[test]
+    fn a_renamed_server_never_replaces_one_already_there() {
+        let found = read(
+            ClientTarget::Cursor,
+            r#"{"mcpServers":{"github":{"command":"npx"}}}"#,
+        );
+        let mut config = Config::default();
+        for taken in ["github", "github-cursor", "github-cursor-2"] {
+            config
+                .servers
+                .insert(taken.to_string(), ServerConfig::default());
+        }
+        assert_eq!(add_to_config(&mut config, &found), ["github-cursor-3"]);
+        assert_eq!(config.servers.len(), 4);
     }
 }

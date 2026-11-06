@@ -715,7 +715,7 @@ mod tests {
     #[test]
     fn enrichment_works_after_sanitization() {
         // Simulate the full pipeline: original kebab-case -> sanitize -> enrich
-        use crate::enrichment::enrich_tool;
+        use crate::enrichment::normalize_annotations;
         use rmcp::model::Tool;
         use std::borrow::Cow;
         use std::sync::Arc;
@@ -733,7 +733,7 @@ mod tests {
         );
 
         // Enrich should detect get_* pattern
-        enrich_tool(&mut tool);
+        normalize_annotations(&mut tool, "get_comments");
         assert_eq!(
             tool.annotations.as_ref().unwrap().read_only_hint,
             Some(true),

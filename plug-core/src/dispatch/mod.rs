@@ -450,6 +450,7 @@ async fn tools_call(
     let remote = call.transport == crate::downstream_identity::DownstreamTransport::Http;
     let tool = params.name.to_string();
     let server = router.server_for_tool(&tool);
+    let cancellation = call.cancellation.clone();
     let result = tools_call_inner(router, ctx, call, params, modern_task || legacy_task).await;
     router.record_activity(crate::activity::ActivityEvent {
         sequence: 0,
@@ -464,10 +465,10 @@ async fn tools_call(
         target,
         remote,
         latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
-        outcome: if result.is_ok() {
-            crate::activity::ActivityOutcome::Success
-        } else {
-            crate::activity::ActivityOutcome::Error
+        outcome: match &result {
+            Ok(_) => crate::activity::ActivityOutcome::Success,
+            Err(_) if cancellation.is_cancelled() => crate::activity::ActivityOutcome::Cancelled,
+            Err(_) => crate::activity::ActivityOutcome::Error,
         },
         reason: result
             .as_ref()

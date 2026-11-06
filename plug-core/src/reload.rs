@@ -197,15 +197,6 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
         sse_channel_capacity,
     } = http;
 
-    let enriched = |config: &Config| -> std::collections::BTreeSet<String> {
-        config
-            .servers
-            .iter()
-            .filter(|(_, server)| server.enrichment)
-            .map(|(name, _)| name.clone())
-            .collect()
-    };
-
     let old_http = &old.http;
     [
         ("log_level", *log_level != old.log_level),
@@ -257,7 +248,6 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
         ("lazy_tools", *lazy_tools != old.lazy_tools),
         ("priority_tools", *priority_tools != old.priority_tools),
         ("disabled_tools", *disabled_tools != old.disabled_tools),
-        ("servers.*.enrichment", enriched(old) != enriched(new)),
     ]
     .into_iter()
     .filter(|(_, changed)| *changed)

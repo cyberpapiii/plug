@@ -122,6 +122,12 @@ pub fn events_dir() -> PathBuf {
     dir().join("events")
 }
 
+/// Slack event state, one folder a source config. It predates
+/// `events_dir`, and existing installs keep their state here.
+pub fn slack_events_dir() -> PathBuf {
+    dir().join("slack-events")
+}
+
 /// Large tool results kept for a client to read in parts.
 pub fn artifacts_dir() -> PathBuf {
     #[cfg(any(test, feature = "test-helpers"))]
@@ -185,6 +191,24 @@ pub mod test {
     impl Drop for Set {
         fn drop(&mut self) {
             *slot().lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
+    }
+
+    /// Plug's folders under `root`, for one test at a time, until this drops.
+    /// It takes `lock` and sets the paths in the one call, and lets go in
+    /// the right order, so a test cannot get either wrong.
+    pub struct Isolated {
+        _paths: Set,
+        _lock: tokio::sync::MutexGuard<'static, ()>,
+    }
+
+    /// Wait for any other test that set the paths, then put Plug's folder
+    /// under `root`.
+    pub async fn isolate(root: &std::path::Path) -> Isolated {
+        let lock = lock().lock().await;
+        Isolated {
+            _paths: set(root.join("runtime"), root.join("state")),
+            _lock: lock,
         }
     }
 

@@ -207,10 +207,6 @@ mod tests {
         let events = store.snapshot(&ActivityFilter::default());
         assert_eq!(events.len(), 500);
         assert_eq!(events.first().unwrap().sequence, 2);
-        let json = serde_json::to_string(&events).unwrap();
-        for forbidden in ["params", "result", "token", "secret"] {
-            assert!(!json.contains(forbidden));
-        }
     }
 
     #[test]

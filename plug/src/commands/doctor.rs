@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 
 use dialoguer::console::style;
 use plug_core::clients::{ClientTarget, Scope};
-use plug_core::doctor::{CheckResult, CheckStatus};
+use plug_core::doctor::{CheckResult, CheckStatus, check};
 
 use crate::OutputFormat;
 use crate::ui::{print_banner, print_heading, print_next_step};
@@ -307,7 +307,7 @@ fn doctor_json_value(
 fn unified_install_check_from_snapshot(snapshot: &UnifiedInstallSnapshot) -> CheckResult {
     let Some(app) = snapshot.app.as_ref() else {
         return CheckResult {
-            name: "unified_install".to_string(),
+            name: check::UNIFIED_INSTALL.to_string(),
             status: CheckStatus::Fail,
             message: "No verified Plug.app installation was found.".to_string(),
             fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
@@ -336,7 +336,7 @@ fn unified_install_check_from_snapshot(snapshot: &UnifiedInstallSnapshot) -> Che
             failures.push("launchd inspection was incomplete".to_string());
         }
         return CheckResult {
-            name: "unified_install".to_string(),
+            name: check::UNIFIED_INSTALL.to_string(),
             status: CheckStatus::Fail,
             message: failures.join("; "),
             fix_suggestion: Some("Open Plug.app and retry reconciliation.".to_string()),
@@ -466,14 +466,14 @@ fn unified_install_check_from_snapshot(snapshot: &UnifiedInstallSnapshot) -> Che
 
     if drift.is_empty() {
         CheckResult {
-            name: "unified_install".to_string(),
+            name: check::UNIFIED_INSTALL.to_string(),
             status: CheckStatus::Pass,
             message: "Plug.app owns the app, command line, daemon, and client links.".to_string(),
             fix_suggestion: None,
         }
     } else {
         CheckResult {
-            name: "unified_install".to_string(),
+            name: check::UNIFIED_INSTALL.to_string(),
             status: CheckStatus::Warn,
             message: drift.join("; "),
             fix_suggestion: Some(if leftover_legacy_jobs.is_empty() {
@@ -671,7 +671,7 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
         )
     {
         checks.push(CheckResult {
-            name: "runtime_availability".to_string(),
+            name: check::RUNTIME_AVAILABILITY.to_string(),
             status: CheckStatus::Warn,
             message: "Daemon socket is reachable, but runtime status inspection failed".to_string(),
             fix_suggestion: Some(
@@ -686,7 +686,7 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
         )
     {
         checks.push(CheckResult {
-            name: "auth_availability".to_string(),
+            name: check::AUTH_AVAILABILITY.to_string(),
             status: CheckStatus::Warn,
             message: "Daemon socket is reachable, but auth status inspection failed".to_string(),
             fix_suggestion: Some(
@@ -757,7 +757,7 @@ fn duplicate_downstream_client_check(
         return None;
     }
     Some(CheckResult {
-        name: "downstream_oauth_clients".to_string(),
+        name: check::DOWNSTREAM_OAUTH_CLIENTS.to_string(),
         status: CheckStatus::Warn,
         message: format!(
             "Clients signed in more than once: {}. Each old sign-in keeps its access until 90 days after its last use",
@@ -773,12 +773,17 @@ fn duplicate_downstream_client_check(
 /// The cold port and PID checks only repeat that when they pass, so they are
 /// dropped then and kept whenever they found something wrong.
 fn fold_daemon_liveness_checks(checks: &mut Vec<CheckResult>) {
-    if !checks.iter().any(|check| check.name == "runtime_health") {
+    if !checks
+        .iter()
+        .any(|check| check.name == check::RUNTIME_HEALTH)
+    {
         return;
     }
     checks.retain(|check| {
-        !(matches!(check.name.as_str(), "port_available" | "pid_staleness")
-            && matches!(check.status, CheckStatus::Pass))
+        !(matches!(
+            check.name.as_str(),
+            check::PORT_AVAILABLE | check::PID_STALENESS
+        ) && matches!(check.status, CheckStatus::Pass))
     });
 }
 
@@ -865,7 +870,7 @@ fn runtime_health_checks(
     let troubled = counts.failed > 0 || counts.degraded > 0 || counts.auth_required > 0;
 
     let mut checks = vec![CheckResult {
-        name: "runtime_health".to_string(),
+        name: check::RUNTIME_HEALTH.to_string(),
         status: if troubled {
             CheckStatus::Warn
         } else {
@@ -878,7 +883,7 @@ fn runtime_health_checks(
     }];
     if !failed_servers.is_empty() {
         checks.push(CheckResult {
-            name: "runtime_failures".to_string(),
+            name: check::RUNTIME_FAILURES.to_string(),
             status: CheckStatus::Fail,
             message: format!("failing servers: {}", failed_servers.join("; ")),
             fix_suggestion: Some(
@@ -888,7 +893,7 @@ fn runtime_health_checks(
     }
     if !degraded_servers.is_empty() {
         checks.push(CheckResult {
-            name: "runtime_degraded".to_string(),
+            name: check::RUNTIME_DEGRADED.to_string(),
             status: CheckStatus::Warn,
             message: format!("degraded servers: {}", degraded_servers.join("; ")),
             fix_suggestion: Some(
@@ -902,14 +907,18 @@ fn runtime_health_checks(
 fn synthesize_doctor_interpretation(checks: &[CheckResult]) -> Option<CheckResult> {
     let connectivity = checks
         .iter()
-        .find(|check| check.name == "server_connectivity")?;
-    let runtime_health = checks.iter().find(|check| check.name == "runtime_health");
-    let runtime_failures = checks.iter().find(|check| check.name == "runtime_failures");
+        .find(|check| check.name == check::SERVER_CONNECTIVITY)?;
+    let runtime_health = checks
+        .iter()
+        .find(|check| check.name == check::RUNTIME_HEALTH);
+    let runtime_failures = checks
+        .iter()
+        .find(|check| check.name == check::RUNTIME_FAILURES);
     let runtime_auth_attention = checks.iter().any(|check| {
         matches!(check.status, CheckStatus::Warn)
-            && (check.name == "runtime_auth_missing"
-                || check.name == "runtime_auth_reauth"
-                || check.name == "runtime_auth_degraded")
+            && (check.name == check::RUNTIME_AUTH_MISSING
+                || check.name == check::RUNTIME_AUTH_REAUTH
+                || check.name == check::RUNTIME_AUTH_DEGRADED)
     });
 
     use CheckStatus::{Fail, Pass, Warn};
@@ -966,7 +975,7 @@ fn synthesize_doctor_interpretation(checks: &[CheckResult]) -> Option<CheckResul
     };
 
     Some(CheckResult {
-        name: "doctor_interpretation".to_string(),
+        name: check::DOCTOR_INTERPRETATION.to_string(),
         status,
         message,
         fix_suggestion,
@@ -995,7 +1004,7 @@ fn runtime_auth_checks(servers: &[plug_core::ipc::IpcAuthServerInfo]) -> Vec<Che
 
     if !missing.is_empty() {
         checks.push(CheckResult {
-            name: "runtime_auth_missing".to_string(),
+            name: check::RUNTIME_AUTH_MISSING.to_string(),
             status: CheckStatus::Warn,
             message: format!("missing credentials: {}", missing.join(", ")),
             fix_suggestion: Some(
@@ -1007,7 +1016,7 @@ fn runtime_auth_checks(servers: &[plug_core::ipc::IpcAuthServerInfo]) -> Vec<Che
 
     if !reauth.is_empty() {
         checks.push(CheckResult {
-            name: "runtime_auth_reauth".to_string(),
+            name: check::RUNTIME_AUTH_REAUTH.to_string(),
             status: CheckStatus::Warn,
             message: format!("re-auth required: {}", reauth.join(", ")),
             fix_suggestion: Some(
@@ -1019,7 +1028,7 @@ fn runtime_auth_checks(servers: &[plug_core::ipc::IpcAuthServerInfo]) -> Vec<Che
 
     if !degraded.is_empty() {
         checks.push(CheckResult {
-            name: "runtime_auth_degraded".to_string(),
+            name: check::RUNTIME_AUTH_DEGRADED.to_string(),
             status: CheckStatus::Warn,
             message: format!("degraded auth/runtime: {}", degraded.join(", ")),
             fix_suggestion: Some(

@@ -2,21 +2,26 @@ use super::*;
 use crate::events::{DeliveryResponse, EventSource};
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use hmac::{Hmac, Mac};
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use tokio::sync::Mutex;
 
-struct FakeAccess(AtomicU8);
+/// Answers every access check with what it holds.
+struct FakeAccess(std::sync::Mutex<Access>);
+impl FakeAccess {
+    fn allowed() -> Self {
+        Self(std::sync::Mutex::new(Access::Allowed))
+    }
+    fn set(&self, access: Access) {
+        *self.0.lock().unwrap() = access;
+    }
+}
 #[async_trait::async_trait]
 impl EventAccess for FakeAccess {
     fn enabled(&self) -> bool {
-        self.0.load(Ordering::SeqCst) != 3
+        true
     }
     async fn check(&self, _channel: Option<&str>) -> Access {
-        match self.0.load(Ordering::SeqCst) {
-            0 => Access::Allowed,
-            1 => Access::Denied,
-            _ => Access::Unavailable,
-        }
+        *self.0.lock().unwrap()
     }
 }
 #[derive(Default)]
@@ -70,7 +75,7 @@ fn fixture() -> (
     Arc<FakeDelivery>,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let access = Arc::new(FakeAccess(AtomicU8::new(0)));
+    let access = Arc::new(FakeAccess::allowed());
     let sender = Arc::new(FakeDelivery::default());
     sender.status.store(200, Ordering::SeqCst);
     let events = SlackEvents::open(
@@ -253,7 +258,7 @@ async fn retries_keep_event_id_and_body_and_revoked_access_stops() {
     ingest(&events, envelope("Ev2", "<@U456>", None))
         .await
         .unwrap();
-    access.0.store(1, Ordering::SeqCst);
+    access.set(Access::Denied);
     events.deliver_one().await.unwrap();
     assert!(events.state().await.subscriptions.is_empty());
     assert_eq!(sender.calls.lock().await.len(), 3);
@@ -378,7 +383,7 @@ async fn a_version_2_state_file_keeps_its_subscription_and_queue() {
         config(),
         "fake-signing-secret".to_owned().into(),
         &state_dir,
-        Arc::new(FakeAccess(AtomicU8::new(0))),
+        Arc::new(FakeAccess::allowed()),
         sender.clone(),
     )
     .unwrap();
@@ -600,7 +605,66 @@ fn owner_proof_window_preserves_existing_subscription_storage_key() {
     let baseline = config();
     let mut proof = baseline.clone();
     proof.owner_proof_until = Some(now() + 3600);
-    assert_eq!(state_key(&baseline).unwrap(), state_key(&proof).unwrap());
+    assert_eq!(state_dir(&baseline).unwrap(), state_dir(&proof).unwrap());
     proof.owner_proof_until = Some(now() + 3601);
     assert!(!proof.validate().is_empty());
+}
+
+#[tokio::test]
+async fn an_owner_proof_window_refreshes_and_unsubscribes_the_existing_subscription() {
+    let (dir, original, access, sender) = fixture();
+    let first = original
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
+    drop(original);
+    let mut proof = config();
+    proof.owner_proof_until = Some(now() + 3600);
+    let events = SlackEvents::open(
+        proof,
+        "fake-signing-secret".to_owned().into(),
+        &dir.path().join("events"),
+        access,
+        sender,
+    )
+    .unwrap();
+    let refreshed = events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
+    assert_eq!(first["id"], refreshed["id"]);
+    events
+        .unsubscribe("existing-client", &params())
+        .await
+        .unwrap();
+    assert!(events.state().await.subscriptions.is_empty());
+}
+
+#[tokio::test]
+async fn only_the_chosen_client_may_subscribe() {
+    let (_dir, events, _, _) = fixture();
+    let error = events
+        .subscribe("another-client", &params())
+        .await
+        .unwrap_err();
+    assert_eq!(error.code, denied().code);
+    assert!(events.state().await.subscriptions.is_empty());
+}
+
+#[tokio::test]
+async fn unknown_access_waits_out_a_backoff_before_asking_again() {
+    let (_dir, events, access, sender) = fixture();
+    events
+        .subscribe("existing-client", &params())
+        .await
+        .unwrap();
+    ingest(&events, envelope("Ev1", "<@U456>", None))
+        .await
+        .unwrap();
+    access.set(Access::Unavailable);
+    events.deliver_one().await.unwrap();
+    let pending = events.state().await.queue[0].clone();
+    assert_eq!(pending.attempts, 1);
+    assert!(pending.next_at > now());
+    assert_eq!(sender.calls.lock().await.len(), 1, "only the challenge");
 }

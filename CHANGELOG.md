@@ -11,6 +11,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 - `plug auth status --output json` drops `status_scope`, which repeated `status_source`. `plug servers` and `plug` call an OpenAPI server a "Web API", as the app does.
 - `plug`, `plug status` and `plug clients` with `--output json` drop `inventory_partial`, `inventory_unavailable_sources`, `http_sessions_included`, the SSE count in `live_session_transports` (a legacy SSE stream counts as HTTP) and, from `plug`, `live_client_count`, which repeated `live_session_count`. The text output says in one line whether the live list is complete.
+- `plug clients --output json` no longer has `live_session_transports.sse`. No session ever counted there: a legacy SSE stream belongs to its HTTP session.
+- `plug import --output json` no longer has a `source` field holding the client's internal variant name. `source_target` and `source_name` name the client, as before.
+- A server's `enrichment` setting is ignored, and changing it no longer says Plug must restart. It had stopped doing anything: Plug reads every tool's safety hints from its name and gives every tool its own title.
+- `plug doctor` and the app no longer list a "Tool names" check. It always passed and only said whether tool prefixing was on.
 - A client's servers and tools in the app show what the daemon enforces for it, as the daemon reports it, where the app used to work it out again from the client's lists. A client's summary now counts every tool it is kept from: a rule such as `git__*` counts each tool it covers, and an allow list counts each tool of a partly listed server that is not on it.
 - A client connected through `plug connect` gets the JSON-RPC error codes an HTTP client gets. Bad parameters, an unknown method and a protocol version Plug does not serve now arrive as invalid params (`-32602`), method not found (`-32601`) and unsupported protocol version, where they used to arrive as an internal error (`-32603`) whose message began with a code such as `INVALID_PARAMS:`.
 - A remote client whose grant leaves out `tasks:use` is no longer told at `initialize` that Plug runs tasks, the way it is not told about other families its grant cannot use.
@@ -61,6 +65,14 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Revoking a remote client whose revocation could not be saved now also stops the tasks it started. They used to keep running, though its sessions ended and its tokens stopped working.
 - `plug reload` and a config file edit now say a restart is needed when you change `enable_prefix`, `log_level`, `http.auth_mode`, `http.public_base_url`, `http.oauth_scopes`, `http.tls_cert_path`, `http.tls_key_path` or `http.slack_events`. These take effect only when Plug starts, but the reload used to report nothing for them.
 - `plug auth login` and `plug auth inject` no longer crash on a server whose Keychain entry is bound to its sign-in server but whose token file is missing. Reading the entry tried to rewrite the file by itself, without the shared mark a bound pair needs; Plug now leaves a bound file to a full save.
+- A tool call its client cancelled shows as cancelled in Activity. It used to show as failed.
+- Importing a server whose name is taken, and whose `<name>-<client>` is taken too, adds it as `<name>-<client>-2` and so on. It used to replace the server already under that name.
+- A second account of a Google Workspace server gets the Workspace tool groups whatever the server is called. Only a server named `workspace` used to get them, so a second account of one named otherwise listed its tools under the same names as the first.
+- `plug doctor` fails on an unset `$NAME` only when Plug's own settings use it, and warns when a server does. A server whose name began with `plug`, such as `plugin-x`, used to fail the check.
+- Only the client named in `subscriber_client_id` may subscribe to Slack events. Another remote client with the events scope used to be let in.
+- Setting `owner_proof_until` for Slack events keeps the existing subscription. A client that subscribed again during the window used to get a second subscription next to the first.
+- When Plug cannot tell whether a client may still have an event, it tries that event again after the usual wait. It used to ask again on every delivery tick and log a warning each time.
+- Event delivery that stopped because its state could not be saved stays quiet until Plug restarts. It used to keep checking access and log a warning on every delivery tick.
 - Editing a server in the app no longer drops its `oauth_client_id`. The app could not read the field back, so saving the server wrote it out without one.
 - Importing servers in the app keeps each server's whole entry. It used to copy only the command, arguments, environment and URL, so an SSE server came in as HTTP and a token or timeout was left behind.
 - Asking a server that runs tasks itself for a task's status or result gives up after the server's `call_timeout_secs`. A server that never answered used to hold the client's request open for good.

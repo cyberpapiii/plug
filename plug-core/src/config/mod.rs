@@ -24,7 +24,8 @@ pub struct Config {
     pub log_level: String,
     /// Tool name prefix delimiter.
     pub prefix_delimiter: String,
-    /// Kept so old files load. Tool names are always prefixed.
+    /// Whether tool names carry their server's prefix. Off, a tool keeps
+    /// its own name unless two servers share it.
     pub enable_prefix: bool,
     /// How many servers to start in parallel.
     ///
@@ -33,12 +34,12 @@ pub struct Config {
     /// buys wall-clock time on a cold start; the knob stays for machines that
     /// cannot afford the spawn burst.
     pub startup_concurrency: usize,
-    /// Enable client-aware tool filtering (default: true).
+    /// Enable client-aware tool filtering.
     pub tool_filter_enabled: bool,
     /// Max chars for tool descriptions (None = no truncation).
     #[serde(default)]
     pub tool_description_max_chars: Option<usize>,
-    /// Tool count threshold to activate search_tools meta-tool (default: 50).
+    /// Tool count threshold to activate search_tools meta-tool.
     pub tool_search_threshold: usize,
     /// Expose only plug meta-tools instead of the full merged tool catalog.
     /// Deprecated compatibility input; `lazy_tools` is the controlling policy model.
@@ -408,15 +409,16 @@ pub struct ServerConfig {
     pub oauth_scopes: Option<Vec<String>>,
     /// Startup timeout in seconds.
     pub timeout_secs: u64,
-    /// Tool call timeout in seconds (default: 300). Set higher for slow tools.
+    /// Tool call timeout in seconds. Set higher for slow tools.
     pub call_timeout_secs: u64,
-    /// Max concurrent requests to this server (default: 1).
+    /// Max concurrent requests to this server.
     pub max_concurrent: usize,
-    /// Health check interval in seconds (default: 60).
+    /// Health check interval in seconds.
     pub health_check_interval_secs: u64,
-    /// Enable circuit breaker for this server (default: true).
+    /// Enable circuit breaker for this server.
     pub circuit_breaker_enabled: bool,
-    /// Enable tool enrichment (annotation inference + title normalization).
+    /// Does nothing: every tool's hints and title are Plug's own. A config
+    /// that still sets it loads.
     pub enrichment: bool,
     /// Manual tool renames (original_name -> new_name).
     #[serde(serialize_with = "in_name_order")]
@@ -1484,21 +1486,19 @@ LOG_LEVEL = "debug"
     // ---- env var override via Figment ----
 
     #[test]
-    fn env_override_via_figment() {
-        // Test that the Figment pipeline supports env overrides by verifying the
-        // provider chain works. We build a Figment with an env provider that reads
-        // from a custom prefix, and prove the merge order is correct.
-        // (We cannot call env::set_var in edition 2024 tests since it is unsafe.)
-        use figment::providers::Env;
-
-        let fig = Figment::new()
-            .merge(Serialized::defaults(Config::default()))
-            .merge(Toml::string("startup_concurrency = 7"))
-            .merge(Env::prefixed("PLUG_").split("__"));
-
-        let cfg: Config = fig.extract().expect("extract failed");
-        // TOML override should win over default when no env var is actually set
-        assert_eq!(cfg.startup_concurrency, 7);
+    #[allow(clippy::result_large_err)] // figment::Jail returns figment::Error.
+    fn a_plug_variable_beats_the_file() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_file(
+                "config.toml",
+                "tool_description_max_chars = 7\nstartup_concurrency = 3\n",
+            )?;
+            jail.set_env("PLUG_TOOL_DESCRIPTION_MAX_CHARS", "9");
+            let config = load_config(Some(&jail.directory().join("config.toml")))?;
+            assert_eq!(config.tool_description_max_chars, Some(9));
+            assert_eq!(config.startup_concurrency, 3);
+            Ok(())
+        });
     }
 
     // ---- validation ----
@@ -1949,9 +1949,17 @@ LOG_LEVEL = "debug"
                 ..Default::default()
             },
         );
-        let errors = validate_config(&cfg);
-        // Should catch port, startup_concurrency, missing command, and zero timeout
-        assert!(errors.len() >= 4, "expected >= 4 errors, got: {errors:?}");
+        let mut errors = validate_config(&cfg);
+        errors.sort();
+        assert_eq!(
+            errors,
+            [
+                "http.port must be in range 1-65535",
+                "server 'bad_stdio': stdio transport requires 'command' to be set",
+                "server 'bad_stdio': timeout must be > 0",
+                "startup_concurrency must be > 0",
+            ]
+        );
     }
 
     #[test]

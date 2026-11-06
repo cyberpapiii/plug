@@ -1,4 +1,4 @@
-//! Opt-in one-public-channel source for OpenAI's MCP Events webhook contract.
+//! Opt-in source, across all accessible public channels, for OpenAI's MCP Events webhook contract.
 //! Slack posts its Events API to `SOURCE_PATH`; matching messages become
 //! `slack.ditto_message` events in the shared `crate::events` hub. This does
 //! not forward resource subscriptions or replace the native dot app.
@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
 use crate::events::{
-    Access, DAY, EventDelivery, EventError, Hub, MAX_BODY, MAX_QUEUE, Pending, Source, SourceState,
-    State, Subscription, denied, hmac_sha256, invalid, iso_time, now, unavailable,
+    Access, DAY, EventDelivery, EventError, Hub, MAX_BODY, Pending, Source, SourceState, State,
+    Subscription, denied, hmac_sha256, invalid, now, subscription_id, unavailable,
 };
 
 pub use crate::config::{SLACK_EVENT_NAME as EVENT_NAME, SlackEventsConfig};
@@ -75,11 +75,19 @@ impl SourceState for SlackState {
     }
 }
 
-pub fn state_key(config: &SlackEventsConfig) -> anyhow::Result<String> {
-    // A temporary filter exception does not change subscription identity.
-    let mut identity = config.clone();
-    identity.owner_proof_until = None;
-    Ok(hex::encode(Sha256::digest(serde_json::to_vec(&identity)?)))
+/// The source's identity: its config without the owner-proof window, a
+/// temporary filter exception.
+fn identity(config: &SlackEventsConfig) -> SlackEventsConfig {
+    SlackEventsConfig {
+        owner_proof_until: None,
+        ..config.clone()
+    }
+}
+
+/// Where the state of the source `config` describes is kept.
+pub fn state_dir(config: &SlackEventsConfig) -> anyhow::Result<std::path::PathBuf> {
+    let key = hex::encode(Sha256::digest(serde_json::to_vec(&identity(config))?));
+    Ok(crate::paths::slack_events_dir().join(key))
 }
 
 fn scope_arguments() -> Value {
@@ -201,18 +209,22 @@ impl Source for SlackSource {
         url: &str,
     ) -> Result<String, EventError> {
         // The configured source identity is part of the ID, so a changed
-        // source config cannot reuse old grants.
-        let key = serde_json::to_vec(&json!([self.config, EVENT_NAME, url, scope_arguments()]))
-            .map_err(|_| unavailable())?;
-        Ok(format!("sub_{}", hex::encode(Sha256::digest(key))))
+        // source config cannot reuse old grants. The owner-proof window is
+        // not: setting one must refresh, not replace, the one subscription.
+        subscription_id(&json!([
+            identity(&self.config),
+            EVENT_NAME,
+            url,
+            scope_arguments()
+        ]))
     }
 
     fn accepts(&self, state: &SlackState) -> bool {
         !state.source_revoked
     }
 
-    async fn permits(&self, _client_id: &str, _event: &str) -> Access {
-        if !self.access.enabled() {
+    async fn permits(&self, client_id: &str, _event: &str) -> Access {
+        if !self.discoverable_to(client_id) {
             return Access::Denied;
         }
         self.access.check(None).await
@@ -359,9 +371,8 @@ impl Source for SlackSource {
                     let thread_key = format!("{channel}:{root}");
                     let reply = root != ts && next.source.threads.contains_key(&thread_key);
                     if mention || reply {
-                        if next.queue.len() >= MAX_QUEUE
-                            || (next.source.threads.len() >= MAX_SEEN
-                                && !next.source.threads.contains_key(&thread_key))
+                        if next.source.threads.len() >= MAX_SEEN
+                            && !next.source.threads.contains_key(&thread_key)
                         {
                             return Err(unavailable());
                         }
@@ -370,23 +381,24 @@ impl Source for SlackSource {
                             .next()
                             .and_then(|s| s.parse().ok())
                             .ok_or_else(|| invalid("invalid Slack timestamp"))?;
-                        let body = serde_json::to_vec(&json!({"eventId":event_id,"name":EVENT_NAME,"timestamp":iso_time(occurrence)?,"cursor":null,
-                            "data":{"team_id":config.team_id,"channel_id":channel,"user_id":user,
-                                "message_ts":ts,"thread_ts":root,"text":text,"reason":if mention {"mention"} else {"thread_reply"},
-                                "url":format!("https://app.slack.com/archives/{}/p{}",channel,ts.replace('.',""))}})).map_err(|_| unavailable())?;
-                        if body.len() > MAX_BODY {
-                            return Err(invalid("event payload exceeds size limit"));
-                        }
-                        if !owner_proof {
-                            next.source.threads.insert(thread_key, timestamp);
-                        }
-                        next.queue.push(Pending::new(
+                        let data = json!({"team_id":config.team_id,"channel_id":channel,"user_id":user,
+                            "message_ts":ts,"thread_ts":root,"text":text,"reason":if mention {"mention"} else {"thread_reply"},
+                            "url":format!("https://app.slack.com/archives/{}/p{}",channel,ts.replace('.',""))});
+                        let body = Pending::body(event_id, EVENT_NAME, occurrence, data)?
+                            .ok_or_else(|| invalid("event payload exceeds size limit"))?;
+                        let pending = Pending::new(
                             subscription_id,
                             event_id.to_owned(),
                             Some(channel.to_owned()),
                             body,
                             timestamp,
-                        ));
+                        );
+                        if !next.enqueue(pending) {
+                            return Err(unavailable());
+                        }
+                        if !owner_proof {
+                            next.source.threads.insert(thread_key, timestamp);
+                        }
                     }
                 }
             }

@@ -291,8 +291,6 @@ pub struct RouterConfig {
     pub meta_tool_mode: bool,
     pub lazy_tools: LazyToolsConfig,
     pub tool_filter_enabled: bool,
-    /// Servers with enrichment enabled (annotation inference + title normalization).
-    pub enrichment_servers: std::collections::HashSet<String>,
 }
 
 fn merge_call_extension_meta(params: &mut CallToolRequestParams, meta: MetaObject) {
@@ -318,12 +316,6 @@ impl From<&Config> for RouterConfig {
             meta_tool_mode: config.meta_tool_mode,
             lazy_tools: config.lazy_tools.clone(),
             tool_filter_enabled: config.tool_filter_enabled,
-            enrichment_servers: config
-                .servers
-                .iter()
-                .filter(|(_, sc)| sc.enrichment)
-                .map(|(name, _)| name.clone())
-                .collect(),
         }
     }
 }
@@ -526,6 +518,9 @@ pub struct DownstreamCallContext {
     principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
     /// Admitted peer metadata stays opaque to authorization and routing code.
     pub(crate) extension_envelope: Option<ExtensionEnvelope>,
+    /// Cancelled when the client cancels this request, so a call that then
+    /// fails is recorded as cancelled rather than as an error.
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
 }
 
 impl DownstreamCallContext {
@@ -553,6 +548,7 @@ impl DownstreamCallContext {
             client_metadata: None,
             principal_lifecycle: None,
             extension_envelope: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
         }
     }
 
@@ -2165,6 +2161,7 @@ impl ToolRouter {
         let Some(mut record) = self.active_calls.get_mut(&call_id) else {
             return;
         };
+        record.downstream.cancellation.cancel();
 
         let Some(upstream) = self.server_manager.get_upstream(&record.upstream_server_id) else {
             tracing::warn!(
@@ -2468,7 +2465,7 @@ impl ToolRouter {
 
         for (server_name, mut tool) in upstream_tools {
             // Peer metadata is admitted before the descriptor enters any
-            // cache, enrichment, fingerprint, or operator-observable path.
+            // cache, fingerprint, or operator-observable path.
             catalog_metadata_budget.admit(&server_name, &mut tool.meta, "tool");
             let mut exposed_name = tool.name.to_string();
 
@@ -2664,12 +2661,6 @@ impl ToolRouter {
                 inferred.annotations
             };
 
-            // Enrich BEFORE setting wire name (so get_* patterns match)
-            if self.config.enrichment_servers.contains(&c.server_name) {
-                prefixed_tool.name = Cow::Owned(final_name.clone());
-                crate::enrichment::enrich_tool(&mut prefixed_tool);
-            }
-
             crate::enrichment::normalize_annotations(&mut prefixed_tool, &final_name);
 
             // Display titles follow the same disambiguation path as wire names.
@@ -2753,11 +2744,12 @@ impl ToolRouter {
         // reader of these two fields, and it always returns `tools_all` early
         // when filtering is disabled, so these views are provably never read
         // in that case.
+        let capped = |client: ClientType| {
+            let limit = client.tool_limit().unwrap_or(usize::MAX);
+            Arc::new(tools.iter().take(limit).cloned().collect())
+        };
         let (tools_devin, tools_copilot) = if self.config.tool_filter_enabled {
-            (
-                Arc::new(tools.iter().take(100).cloned().collect()),
-                Arc::new(tools.iter().take(128).cloned().collect()),
-            )
+            (capped(ClientType::Devin), capped(ClientType::VSCodeCopilot))
         } else {
             (Arc::new(Vec::new()), Arc::new(Vec::new()))
         };

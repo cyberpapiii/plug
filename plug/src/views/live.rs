@@ -46,7 +46,7 @@ fn transport_counts(sessions: &[IpcLiveSessionInfo]) -> LiveSessionTransportCoun
     for session in sessions {
         match session.transport {
             LiveSessionTransport::DaemonProxy => counts.daemon_proxy += 1,
-            LiveSessionTransport::Http | LiveSessionTransport::Sse => counts.http += 1,
+            LiveSessionTransport::Http => counts.http += 1,
         }
     }
     counts
@@ -124,27 +124,10 @@ mod tests {
                 connected_secs: 20,
                 last_activity_secs: Some(2),
             },
-            plug_core::ipc::IpcLiveSessionInfo {
-                transport: plug_core::ipc::LiveSessionTransport::Sse,
-                client_id: None,
-                session_id: "s3".to_string(),
-                client_type: plug_core::types::ClientType::Cursor,
-                client_info: Some("Cursor".to_string()),
-                adapter_version: None,
-                host: None,
-                grant: None,
-                link_target: None,
-                client_key: None,
-                access_key: None,
-                target: None,
-                connected_secs: 30,
-                last_activity_secs: Some(3),
-            },
         ];
 
         let counts = transport_counts(&sessions);
         assert_eq!(counts.daemon_proxy, 1);
-        // A legacy SSE stream is part of an HTTP client's connection.
-        assert_eq!(counts.http, 2);
+        assert_eq!(counts.http, 1);
     }
 }

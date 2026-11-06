@@ -1,6 +1,7 @@
 //! IPC types for CLI ↔ daemon communication.
 //!
-//! Shared between `plug-core` (types) and `plug` (socket listener).
+//! Shared between `plug-core` (types) and `plug` (socket listener), and
+//! copied by the app in `PlugApp/PlugIPC`; `testdata/ipc` pins the two.
 //! Wire format: 4-byte big-endian u32 length prefix + JSON payload.
 
 use base64::Engine as _;
@@ -309,16 +310,9 @@ pub enum IpcRequest {
         method: String,
         /// JSON-RPC params object.
         params: Option<serde_json::Value>,
-    },
-
-    /// Context-preserving MCP request used by current proxy clients.
-    /// Legacy `McpRequest` remains for old callers; subscription reconnect
-    /// replay uses `RestoreResourceSubscriptions`.
-    McpRequestWithContext {
-        session_id: String,
-        method: String,
-        params: Option<serde_json::Value>,
-        context: IpcMcpRequestContext,
+        /// The downstream request this forwards. `None` for one the proxy
+        /// makes itself, such as replaying the log level after a reconnect.
+        context: Option<IpcMcpRequestContext>,
     },
 
     /// Cancel one in-flight downstream request. The daemon verifies that the
@@ -415,7 +409,6 @@ impl IpcRequest {
             | Self::Capabilities { session_id }
             | Self::ModernDownstreamGate { session_id }
             | Self::McpRequest { session_id, .. }
-            | Self::McpRequestWithContext { session_id, .. }
             | Self::UpdateRoots { session_id, .. }
             | Self::UpdateCapabilities { session_id, .. }
             | Self::RestoreResourceSubscriptions { session_id, .. } => Some(session_id),
@@ -629,7 +622,6 @@ impl IpcTrustInfo {
 pub enum LiveSessionTransport {
     DaemonProxy,
     Http,
-    Sse,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -696,7 +688,7 @@ pub struct IpcAuthServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcResponse {
-    /// Daemon version, compatibility range, ownership, and operator features.
+    /// The daemon's version and who owns it.
     OperatorHandshake {
         handshake: OperatorHandshake,
     },
@@ -732,9 +724,6 @@ pub enum IpcResponse {
         #[serde(default)]
         runtime_version: String,
         /// Resource URIs with at least one downstream subscriber.
-        ///
-        /// Defaulted so a newer CLI still reads an older daemon's response,
-        /// where the count reads as zero rather than failing the whole query.
         #[serde(default)]
         resource_subscriptions: usize,
     },
@@ -916,18 +905,38 @@ impl IpcResponse {
     /// Pushes the daemon sends a registered connection unasked. Everything
     /// else answers a request.
     pub fn is_push(&self) -> bool {
-        matches!(
-            self,
+        // Exhaustive, so a new response has to be placed on one side.
+        match self {
             IpcResponse::LoggingNotification { .. }
-                | IpcResponse::ToolListChangedNotification
-                | IpcResponse::ResourceListChangedNotification
-                | IpcResponse::ResourceUpdatedNotification { .. }
-                | IpcResponse::PromptListChangedNotification
-                | IpcResponse::ProgressNotification { .. }
-                | IpcResponse::CancelledNotification { .. }
-                | IpcResponse::AuthStateChanged { .. }
-                | IpcResponse::ModernDownstreamGateChanged { .. }
-        )
+            | IpcResponse::ToolListChangedNotification
+            | IpcResponse::ResourceListChangedNotification
+            | IpcResponse::ResourceUpdatedNotification { .. }
+            | IpcResponse::PromptListChangedNotification
+            | IpcResponse::ProgressNotification { .. }
+            | IpcResponse::CancelledNotification { .. }
+            | IpcResponse::AuthStateChanged { .. }
+            | IpcResponse::ModernDownstreamGateChanged { .. } => true,
+            IpcResponse::OperatorHandshake { .. }
+            | IpcResponse::ActivitySnapshot { .. }
+            | IpcResponse::OperatorSnapshot { .. }
+            | IpcResponse::ServerConfig { .. }
+            | IpcResponse::DownstreamClientRevoked { .. }
+            | IpcResponse::ServerValidated { .. }
+            | IpcResponse::ApiDescribed { .. }
+            | IpcResponse::OperatorMutation { .. }
+            | IpcResponse::Status { .. }
+            | IpcResponse::Tools { .. }
+            | IpcResponse::LiveSessions { .. }
+            | IpcResponse::Capabilities { .. }
+            | IpcResponse::ModernDownstreamGate { .. }
+            | IpcResponse::Ok
+            | IpcResponse::Reloaded { .. }
+            | IpcResponse::Pong
+            | IpcResponse::Error { .. }
+            | IpcResponse::Registered { .. }
+            | IpcResponse::McpResponse { .. }
+            | IpcResponse::AuthStatus { .. } => false,
+        }
     }
 
     pub fn error(code: IpcErrorCode, message: impl Into<String>) -> Self {
@@ -1382,6 +1391,7 @@ mod tests {
                 session_id: "s".to_string(),
                 method: "tools/list".to_string(),
                 params: Some(serde_json::json!({ "ipc_id": 99 })),
+                context: None,
             },
         ] {
             let bytes = encode_tagged(Some(7), &request).expect("encode request");
@@ -1593,19 +1603,6 @@ mod tests {
     }
 
     #[test]
-    fn every_push_is_classified_and_no_reply_is() {
-        assert!(
-            IpcResponse::ResourceUpdatedNotification {
-                params: serde_json::Value::Null
-            }
-            .is_push()
-        );
-        assert!(IpcResponse::ModernDownstreamGateChanged { enabled: true }.is_push());
-        assert!(!IpcResponse::Pong.is_push());
-        assert!(!IpcResponse::ModernDownstreamGate { enabled: true }.is_push());
-    }
-
-    #[test]
     fn cancellation_capability_preserves_wire_value_and_redaction() {
         let capability = IpcCancellationCapability::new("capability-secret".to_string());
 
@@ -1676,7 +1673,6 @@ mod tests {
 
     #[test]
     fn daemon_to_proxy_message_reverse_request_has_envelope_tag() {
-        // Build a CreateMessage request via JSON to avoid needing constructors
         let create_msg_json = serde_json::json!({
             "type": "CreateMessage",
             "params": {
@@ -1692,7 +1688,6 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"envelope\":\"ReverseRequest\""));
         assert!(json.contains("\"id\":42"));
-        // Verify it round-trips
         let deserialized: DaemonToProxyMessage = serde_json::from_str(&json).unwrap();
         let json2 = serde_json::to_string(&deserialized).unwrap();
         assert_eq!(json, json2);
@@ -1821,23 +1816,23 @@ mod tests {
         let request_id = RequestId::from(rmcp::model::NumberOrString::String(
             std::sync::Arc::from("req-7"),
         ));
-        let request = IpcRequest::McpRequestWithContext {
+        let request = IpcRequest::McpRequest {
             session_id: "session-1".to_string(),
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({"name": "server__tool"})),
-            context: IpcMcpRequestContext {
+            context: Some(IpcMcpRequestContext {
                 request_id: request_id.clone(),
                 protocol_version: "2026-07-28".to_string(),
                 client_name: Some("modern-client".to_string()),
                 client_version: Some("2.0".to_string()),
-            },
+            }),
         };
         let encoded = serde_json::to_vec(&request).expect("serialize contextual request");
         let decoded: IpcRequest =
             serde_json::from_slice(&encoded).expect("deserialize contextual request");
         assert!(matches!(
             decoded,
-            IpcRequest::McpRequestWithContext { context, .. }
+            IpcRequest::McpRequest { context: Some(context), .. }
                 if context.request_id == request_id
                     && context.protocol_version == "2026-07-28"
         ));

@@ -1720,14 +1720,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             method,
             params,
-        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await,
-
-        IpcRequest::McpRequestWithContext {
-            session_id,
-            method,
-            params,
             context,
-        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await,
+        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref(), context.as_ref()).await,
 
         IpcRequest::CancelMcpRequest {
             session_id,
@@ -3098,6 +3092,7 @@ allowed_servers = ["slack"]
                     session_id: self.session_id.clone(),
                     method: method.to_string(),
                     params: Some(params),
+                    context: None,
                 },
             )
             .await;
@@ -3119,6 +3114,7 @@ allowed_servers = ["slack"]
                     session_id: self.session_id.clone(),
                     method: "tools/call".to_string(),
                     params: Some(params),
+                    context: None,
                 },
             )
             .await;
@@ -3544,6 +3540,7 @@ allowed_servers = ["slack"]
                 "name": "Mock__echo",
                 "arguments": { "input": "fragmented-hello" }
             })),
+            context: None,
         };
         let payload = serde_json::to_vec(&request).expect("serialize ipc request");
         let len = u32::try_from(payload.len()).expect("payload fits in u32");
@@ -4192,6 +4189,7 @@ allowed_servers = ["slack"]
             session_id: session_id.to_string(),
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({ "name": name, "arguments": { "input": name } })),
+            context: None,
         }
     }
 
@@ -4243,6 +4241,7 @@ allowed_servers = ["slack"]
                 "name": "Slow__echo",
                 "arguments": { "input": input },
             })),
+            context: None,
         };
         write_tagged_ipc(&mut harness.stream, 1, &request).await;
         wait_for_a_running_call(harness.engine.tool_router()).await;

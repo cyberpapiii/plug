@@ -797,13 +797,11 @@ impl IpcProxyHandler {
     ) -> Result<IpcResponse, McpError> {
         let method = method.to_string();
         let request_context = Self::request_context(context);
-        self.session_round_trip(retry_policy, |session_id| {
-            IpcRequest::McpRequestWithContext {
-                session_id: session_id.to_string(),
-                method: method.clone(),
-                params: params.clone(),
-                context: request_context.clone(),
-            }
+        self.session_round_trip(retry_policy, |session_id| IpcRequest::McpRequest {
+            session_id: session_id.to_string(),
+            method: method.clone(),
+            params: params.clone(),
+            context: Some(request_context.clone()),
         })
         .await
     }
@@ -1096,6 +1094,7 @@ impl IpcProxyHandler {
                 session_id,
                 method: "logging/setLevel".to_string(),
                 params: Some(params),
+                context: None,
             };
             if let Err(e) = Self::send_replay_request(&conn.mux, &request).await {
                 tracing::warn!(error = %e, "reconnect: failed to replay log level");
@@ -1329,11 +1328,11 @@ impl ServerHandler for IpcProxyHandler {
             self.initialize(initialize, context).await?;
             let response = self
                 .session_round_trip(RetryPolicy::SafeToRetry, |session_id| {
-                    IpcRequest::McpRequestWithContext {
+                    IpcRequest::McpRequest {
                         session_id: session_id.to_string(),
                         method: "server/discover".to_string(),
                         params: None,
-                        context: request_context.clone(),
+                        context: Some(request_context.clone()),
                     }
                 })
                 .await?;
@@ -2885,8 +2884,7 @@ mod tests {
 
     fn is_mcp_request(request: &IpcRequest, expected_method: &str) -> bool {
         match request {
-            IpcRequest::McpRequest { method, .. }
-            | IpcRequest::McpRequestWithContext { method, .. } => method == expected_method,
+            IpcRequest::McpRequest { method, .. } => method == expected_method,
             _ => false,
         }
     }
@@ -3248,8 +3246,10 @@ mod tests {
                         .expect("send authoritative gate response");
                         continue;
                     }
-                    IpcRequest::McpRequestWithContext {
-                        method, context, ..
+                    IpcRequest::McpRequest {
+                        method,
+                        context: Some(context),
+                        ..
                     } if method == "server/discover" => {
                         assert_eq!(
                             context.protocol_version,
@@ -3257,8 +3257,7 @@ mod tests {
                         );
                         "server/discover"
                     }
-                    IpcRequest::McpRequest { method, .. }
-                    | IpcRequest::McpRequestWithContext { method, .. } => {
+                    IpcRequest::McpRequest { method, .. } => {
                         panic!("discover lifecycle must not forward {method} over IPC")
                     }
                     other => panic!("unexpected lifecycle IPC request: {other:?}"),
@@ -3791,6 +3790,7 @@ mod tests {
                     session_id: session_id.to_string(),
                     method: "tools/list".to_string(),
                     params: None,
+                    context: None,
                 }
             })
             .await
@@ -3886,8 +3886,7 @@ mod tests {
                 .expect("connection open");
             let req: IpcRequest = serde_json::from_slice(&frame).expect("parse retried tools/list");
             match req {
-                IpcRequest::McpRequest { method, .. }
-                | IpcRequest::McpRequestWithContext { method, .. } => assert_eq!(
+                IpcRequest::McpRequest { method, .. } => assert_eq!(
                     method, "tools/list",
                     "unsubscribed URI must NOT be re-subscribed on reconnect"
                 ),
@@ -4846,9 +4845,7 @@ mod tests {
             .expect("call result");
 
         let sent = daemon_task.await.expect("daemon task join");
-        let (IpcRequest::McpRequest { params, .. }
-        | IpcRequest::McpRequestWithContext { params, .. }) = sent
-        else {
+        let IpcRequest::McpRequest { params, .. } = sent else {
             panic!("expected a tools/call, got {sent:?}");
         };
         // The rmcp client numbers progress tokens itself.
@@ -4994,7 +4991,7 @@ mod tests {
 
     fn tool_call_name(request: &IpcRequest) -> String {
         match request {
-            IpcRequest::McpRequestWithContext {
+            IpcRequest::McpRequest {
                 params: Some(params),
                 ..
             } => params["name"].as_str().unwrap_or_default().to_string(),
@@ -5053,17 +5050,17 @@ mod tests {
         tokio::spawn(async move {
             proxy
                 .session_round_trip(RetryPolicy::UnsafeToRetry, |session_id| {
-                    IpcRequest::McpRequestWithContext {
+                    IpcRequest::McpRequest {
                         session_id: session_id.to_string(),
                         method: "tools/call".to_string(),
                         params: Some(serde_json::json!({ "name": name })),
-                        context: ipc::IpcMcpRequestContext {
+                        context: Some(ipc::IpcMcpRequestContext {
                             request_id: RequestId::Number(1),
                             protocol_version: plug_core::protocol::supported_protocol_version()
                                 .to_string(),
                             client_name: None,
                             client_version: None,
-                        },
+                        }),
                     }
                 })
                 .await

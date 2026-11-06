@@ -1,20 +1,9 @@
-//! Tool enrichment: annotation inference and name normalization.
-//!
-//! Opt-in per server via `enrichment = true` in config.toml.
-//! `plug` also applies semantic normalization to all routed tools so clients
-//! do not inherit obviously wrong upstream safety hints.
+//! Safety hints read from a tool's name. `plug` normalizes every routed
+//! tool, so clients do not inherit obviously wrong upstream hints.
 
 use rmcp::model::Tool;
 
 const LEGACY_TASK_SUPPORT_META_KEY: &str = "plug.dev/legacy-task-support";
-
-/// Apply enrichment to a tool: infer annotations from name patterns,
-/// normalize title from snake_case. Only fills missing values.
-pub fn enrich_tool(tool: &mut Tool) {
-    let name = tool.name.to_string();
-    normalize_annotations(tool, &name);
-    infer_title(tool);
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolSemantics {
@@ -654,36 +643,6 @@ pub fn normalize_annotations(tool: &mut Tool, name: &str) {
     }
 }
 
-/// Infer a human-readable title from a snake_case tool name.
-/// `create_github_issue` → `"Create Github Issue"`
-/// Only sets `title` if not already present.
-fn infer_title(tool: &mut Tool) {
-    let annotations = tool.annotations.get_or_insert_with(Default::default);
-    if annotations.title.is_some() {
-        return;
-    }
-
-    let title = tool
-        .name
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .map(capitalize)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if !title.is_empty() {
-        annotations.title = Some(title);
-    }
-}
-
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-    }
-}
-
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -691,6 +650,11 @@ mod tests {
     use super::*;
     use rmcp::model::Tool;
     use serde_json::json;
+
+    fn normalize(tool: &mut Tool) {
+        let name = tool.name.to_string();
+        normalize_annotations(tool, &name);
+    }
 
     fn make_tool(name: &str) -> Tool {
         serde_json::from_value(json!({
@@ -716,7 +680,7 @@ mod tests {
             "conversations_history",
         ] {
             let mut tool = make_tool(name);
-            enrich_tool(&mut tool);
+            normalize(&mut tool);
             assert_eq!(
                 tool.annotations.as_ref().unwrap().read_only_hint,
                 Some(true),
@@ -730,7 +694,7 @@ mod tests {
         for prefix in ["delete_", "remove_", "drop_", "destroy_"] {
             let name = format!("{prefix}items");
             let mut tool = make_tool(&name);
-            enrich_tool(&mut tool);
+            normalize(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
             assert_eq!(
                 ann.destructive_hint,
@@ -761,7 +725,7 @@ mod tests {
             "batch_update_variables",
         ] {
             let mut tool = make_tool(name);
-            enrich_tool(&mut tool);
+            normalize(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
             assert_eq!(
                 ann.read_only_hint,
@@ -769,16 +733,6 @@ mod tests {
                 "expected readOnlyHint=false for {name}"
             );
         }
-    }
-
-    #[test]
-    fn title_inferred_from_snake_case() {
-        let mut tool = make_tool("create_github_issue");
-        enrich_tool(&mut tool);
-        assert_eq!(
-            tool.annotations.as_ref().unwrap().title.as_deref(),
-            Some("Create Github Issue")
-        );
     }
 
     #[test]
@@ -793,7 +747,7 @@ mod tests {
         }))
         .unwrap();
 
-        enrich_tool(&mut tool);
+        normalize(&mut tool);
         let ann = tool.annotations.as_ref().unwrap();
         assert_eq!(ann.read_only_hint, Some(true)); // normalized from get_ semantics
         assert_eq!(ann.title.as_deref(), Some("Custom Title")); // not overridden
@@ -1193,11 +1147,11 @@ mod tests {
     #[test]
     fn no_pattern_match_no_annotation() {
         let mut tool = make_tool("do_something");
-        enrich_tool(&mut tool);
-        let ann = tool.annotations.as_ref().unwrap();
-        assert!(ann.read_only_hint.is_none());
-        assert!(ann.destructive_hint.is_none());
-        // But title should still be set
-        assert_eq!(ann.title.as_deref(), Some("Do Something"));
+        normalize(&mut tool);
+        assert!(
+            tool.annotations
+                .as_ref()
+                .is_none_or(|ann| ann.read_only_hint.is_none() && ann.destructive_hint.is_none())
+        );
     }
 }

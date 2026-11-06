@@ -48,6 +48,17 @@ pub struct Engine {
     ready: watch::Sender<bool>,
 }
 
+impl crate::operator::Live for Engine {
+    fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
+        self.tool_router.tool_behind(listed)
+    }
+    fn reported_name(&self, server: &str) -> Option<String> {
+        self.server_manager
+            .get_upstream_metadata(server)
+            .map(|metadata| metadata.name)
+    }
+}
+
 impl Engine {
     /// Create a new Engine from configuration.
     ///
@@ -486,11 +497,10 @@ impl Engine {
             let (mutation, kept_for, before, staged) = self
                 .keep_typed_secrets(config_path, mutation, store.to_string())
                 .await?;
-            let router = &self.tool_router;
             let result = match crate::operator::apply_operator_mutation_knowing(
                 config_path,
                 mutation,
-                &|listed| router.tool_behind(listed),
+                &**self,
             ) {
                 Ok((_, result)) => result,
                 // The file can be in place and the save still report a
@@ -574,11 +584,7 @@ impl Engine {
             return;
         }
         let _guard = self.reload_lock.lock().await;
-        let router = &self.tool_router;
-        let saved = crate::operator::pin_tool_blocks_in_file(config_path, &|listed| {
-            router.tool_behind(listed)
-        })
-        .and_then(|_| {
+        let saved = crate::operator::pin_tool_blocks_in_file(config_path, &**self).and_then(|_| {
             crate::config::load_config(Some(&config_path.to_path_buf())).map_err(Into::into)
         });
         match saved {

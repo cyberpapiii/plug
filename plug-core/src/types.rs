@@ -159,7 +159,7 @@ fn is_non_forwarded_meta_key(key: &str) -> bool {
             | "io.modelcontextprotocol/clientInfo"
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"
-            | "plug.dev/legacy-task"
+            | crate::protocol::LEGACY_TASK_REQUEST_KEY
     )
 }
 
@@ -1121,11 +1121,12 @@ pub enum Availability {
 
 /// Tracked health state with consecutive failure counting for state machine transitions.
 ///
-/// State machine:
-/// - Healthy → 3 consecutive failures → Degraded
-/// - Degraded → 3 more failures → Failed
+/// State machine, counting failures since the last success:
+/// - Healthy → `DEGRADED_AFTER` failures → Degraded
+/// - Degraded → `FAILED_AFTER` failures → Failed
 /// - Failed → 1 success → Degraded
 /// - Degraded → 1 success → Healthy
+/// - AuthRequired stays until something else clears it
 #[derive(Debug, Clone)]
 pub struct HealthState {
     pub health: ServerHealth,
@@ -1167,7 +1168,7 @@ impl HealthState {
             ServerHealth::Healthy => ServerHealth::Healthy,
             ServerHealth::Degraded => ServerHealth::Healthy,
             ServerHealth::Failed => ServerHealth::Degraded,
-            ServerHealth::AuthRequired => ServerHealth::AuthRequired, // sticky
+            ServerHealth::AuthRequired => ServerHealth::AuthRequired,
         };
         old != self.health
     }
@@ -1192,7 +1193,7 @@ impl HealthState {
                 }
             }
             ServerHealth::Failed => ServerHealth::Failed,
-            ServerHealth::AuthRequired => ServerHealth::AuthRequired, // sticky
+            ServerHealth::AuthRequired => ServerHealth::AuthRequired,
         };
         old != self.health
     }
@@ -1222,7 +1223,7 @@ pub struct UpstreamMetricsSnapshot {
     /// Circuit-breaker state: `"closed"`, `"open"`, or `"half-open"`.
     pub circuit_state: String,
     /// How many times this upstream has been restarted since start by recovery
-    /// or supervision (item 2b). Always present; `0` for a never-restarted
+    /// or supervision. Always present; `0` for a never-restarted
     /// upstream.
     #[serde(default)]
     pub restart_count: u64,
