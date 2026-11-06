@@ -71,25 +71,15 @@ struct ClientRepairService: ClientRepairing {
 }
 
 private struct ParsedRepairReport: Decodable {
-    let items: [ParsedRepairItem]
+    struct Item: Decodable {
+        let disposition: String
+    }
+
+    let items: [Item]
 
     var repairNeeded: Bool {
         items.contains { item in
             !["canonical", "http", "missing"].contains(item.disposition)
         }
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case items
-    }
-}
-
-private struct ParsedRepairItem: Decodable {
-    let changed: Bool
-    let disposition: String
-
-    private enum CodingKeys: String, CodingKey {
-        case changed
-        case disposition
     }
 }

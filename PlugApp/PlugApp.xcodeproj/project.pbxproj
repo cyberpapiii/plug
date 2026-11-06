@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		01F4E2FCFF1D85672E93BA32 /* StubProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = CA3BDFE60BC89789EB5D2355 /* StubProcessRunner.swift */; };
 		02F900FF2B0B846C149735B7 /* ClientFacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 436CE7BF15F1FB57B0EBBC50 /* ClientFacts.swift */; };
 		03E03124F4FD470CB50D26D3 /* ServiceDisabledMarker.swift in Sources */ = {isa = PBXBuildFile; fileRef = 922FACE8E1C7C4E492962647 /* ServiceDisabledMarker.swift */; };
 		062688B6975FB401D44A39F8 /* LaunchdJobProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 9487B911B8789572D0369E57 /* LaunchdJobProbeTests.swift */; };
@@ -14,6 +15,7 @@
 		0791E486D5B868802E1F53EC /* LoginItems.swift in Sources */ = {isa = PBXBuildFile; fileRef = 46BA1893EFAEE2F0A561DFB7 /* LoginItems.swift */; };
 		09CDEA0A92446FF939334D26 /* ImportServersView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 3C9504345828F0EF55E53933 /* ImportServersView.swift */; };
 		0A5A8232017C3F2DDFA8AAA8 /* PlugVerdictTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D7CB6DA0C714078356E50B50 /* PlugVerdictTests.swift */; };
+		0E0E50BCA75537CC5F4CCD99 /* TestSocket.swift in Sources */ = {isa = PBXBuildFile; fileRef = CFB5F14F3555D871E8C3F254 /* TestSocket.swift */; };
 		1216AAD3451CB024764635B9 /* AppSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = 899F68D039BEDFAFF85EAC5D /* AppSection.swift */; };
 		12A35C74598F87BEC6396C64 /* PlugPaths.swift in Sources */ = {isa = PBXBuildFile; fileRef = D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */; };
 		12F2AF20446996F31FA23F77 /* ServerSettingsPlace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1AF840C78BD0F5BEF851DA45 /* ServerSettingsPlace.swift */; };
@@ -191,8 +193,10 @@
 		BB031695DA969096D2B34BD3 /* AddServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddServerView.swift; sourceTree = "<group>"; };
 		C38F6464F4714A0BC61B86BA /* AppInstallationInspectorTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspectorTests.swift; sourceTree = "<group>"; };
 		C9D579210F78E7D32B77DDF8 /* ClientRows.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientRows.swift; sourceTree = "<group>"; };
+		CA3BDFE60BC89789EB5D2355 /* StubProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StubProcessRunner.swift; sourceTree = "<group>"; };
 		CC541E7062C47E08EF5F5B4B /* PlugAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PlugAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CF100219E986FE6F9888C003 /* AddClientView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddClientView.swift; sourceTree = "<group>"; };
+		CFB5F14F3555D871E8C3F254 /* TestSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSocket.swift; sourceTree = "<group>"; };
 		D3386E4BD7635FC4E33D53AA /* agent-setup.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "agent-setup.md"; sourceTree = "<group>"; };
 		D594C9C8A9E633E346F46C33 /* ClientDetail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientDetail.swift; sourceTree = "<group>"; };
 		D5F30B9BDD40BF87EACD202D /* PlugPaths.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugPaths.swift; sourceTree = "<group>"; };
@@ -239,6 +243,7 @@
 		10043433CB27D5E710092FAF /* Support */ = {
 			isa = PBXGroup;
 			children = (
+				CA3BDFE60BC89789EB5D2355 /* StubProcessRunner.swift */,
 				7F64E19345D5556D14BBD5F8 /* TestDaemon.swift */,
 			);
 			path = Support;
@@ -420,6 +425,7 @@
 				04A36C8D6B6A4C24BB4D517B /* Packages */,
 				CE4F4A93CF523388BD54586E /* PlugApp */,
 				4D7C2B22591EE4E275C9260F /* PlugAppTests */,
+				C5E40B7097EE1013CEED55D8 /* Support */,
 				557E637F362ACE0FA43BA7C8 /* testdata */,
 				7AA042891B4B51AA69A0DAFB /* Products */,
 			);
@@ -431,6 +437,15 @@
 				FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */,
 			);
 			path = Resources;
+			sourceTree = "<group>";
+		};
+		C5E40B7097EE1013CEED55D8 /* Support */ = {
+			isa = PBXGroup;
+			children = (
+				CFB5F14F3555D871E8C3F254 /* TestSocket.swift */,
+			);
+			name = Support;
+			path = PlugIPC/Tests/PlugIPCTests/Support;
 			sourceTree = "<group>";
 		};
 		C7335DD31E4332F0F92AB729 /* Services */ = {
@@ -674,7 +689,9 @@
 				273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */,
 				D0E6D2C5CE02C83CA2608F7D /* ServerDraftParserTests.swift in Sources */,
 				DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */,
+				01F4E2FCFF1D85672E93BA32 /* StubProcessRunner.swift in Sources */,
 				B9D65DB6A627F583DDDF0BBA /* TestDaemon.swift in Sources */,
+				0E0E50BCA75537CC5F4CCD99 /* TestSocket.swift in Sources */,
 				C5B0CCC1229F822317F64843 /* ToolSurfaceTests.swift in Sources */,
 				17D83615A424704B1CC1366D /* UnifiedReconciliationFixtureTests.swift in Sources */,
 			);

@@ -104,10 +104,10 @@ final class PlugActions {
     /// settings and its access.
     func replaceClient(oldID: String, newID: String) async {
         do {
+            let from = DownstreamClient.clientKey(id: oldID)
+            let to = DownstreamClient.clientKey(id: newID)
             try await change { daemon in
-                _ = try await daemon.send {
-                    .moveClientSettings(authToken: $0, from: "oauth:\(oldID)", to: "oauth:\(newID)")
-                }
+                _ = try await daemon.send { .moveClientSettings(authToken: $0, from: from, to: to) }
                 _ = try await daemon.send { .revokeClient(authToken: $0, clientID: oldID) }
             }
         } catch { report("replace the old sign-in", error) }

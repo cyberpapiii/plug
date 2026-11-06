@@ -60,6 +60,7 @@ targets:
     platform: macOS
     sources:
       - path: PlugAppTests
+      - path: PlugIPC/Tests/PlugIPCTests/Support/TestSocket.swift
       - path: ../testdata/legacy_plug_programs.json
         type: file
         buildPhase: resources

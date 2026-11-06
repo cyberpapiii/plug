@@ -33,46 +33,22 @@ final class ConnectionLifetimeTests: XCTestCase {
 /// Accepts one connection, answers its handshake, then reports when the
 /// client closes its end.
 private final class HandshakeThenWaitForCloseServer: @unchecked Sendable {
-    let socketURL: URL
+    let socketURL = TestSocket.uniquePath("plug-lifetime")
     private let listener: Int32
     private let peerClosed = DispatchSemaphore(value: 0)
 
     init() throws {
-        socketURL = URL(fileURLWithPath: "/tmp")
-            .appending(path: "plug-lifetime-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(socketURL.path)
+        listener = try TestSocket.listen(at: socketURL.path)
         let listenerFD = listener
-        var (address, addressLength) = try PlugIPCClient.unixSocketAddress(path: socketURL.path)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listenerFD, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listenerFD, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
-
         let peerClosed = peerClosed
         DispatchQueue.global(qos: .userInitiated).async {
             let accepted = Darwin.accept(listenerFD, nil, nil)
             guard accepted >= 0 else { return }
             defer { Darwin.close(accepted) }
-            guard let header = Self.readExact(accepted, count: 4) else { return }
-            let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-            guard Self.readExact(accepted, count: Int(length)) != nil else { return }
-            let payload = Data("""
+            guard TestSocket.readFrame(accepted) != nil else { return }
+            TestSocket.writeFrame(Data("""
             {"type":"OperatorHandshake","handshake":{"daemon_version":"0.7.0","ipc_min":3,"ipc_max":6,"ownership":"app_managed","capabilities":[]}}
-            """.utf8)
-            var frame = Data([
-                UInt8((payload.count >> 24) & 0xff), UInt8((payload.count >> 16) & 0xff),
-                UInt8((payload.count >> 8) & 0xff), UInt8(payload.count & 0xff),
-            ])
-            frame.append(payload)
-            frame.withUnsafeBytes { raw in _ = Darwin.write(accepted, raw.baseAddress!, raw.count) }
+            """.utf8), to: accepted)
             var byte: UInt8 = 0
             while true {
                 let count = Darwin.read(accepted, &byte, 1)
@@ -93,19 +69,5 @@ private final class HandshakeThenWaitForCloseServer: @unchecked Sendable {
         Darwin.shutdown(listener, SHUT_RDWR)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
-    }
-
-    private static func readExact(_ fd: Int32, count: Int) -> Data? {
-        var data = Data(count: count)
-        let ok = data.withUnsafeMutableBytes { raw -> Bool in
-            var offset = 0
-            while offset < count {
-                let readCount = Darwin.read(fd, raw.baseAddress!.advanced(by: offset), count - offset)
-                guard readCount > 0 else { return false }
-                offset += readCount
-            }
-            return true
-        }
-        return ok ? data : nil
     }
 }

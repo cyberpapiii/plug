@@ -24,7 +24,6 @@ struct PlugPopover: View {
         let latest = Self.latestCall(model.activities)
         PanelView(
             facts: PanelFacts(
-                verdict: model.verdict,
                 situation: model.situation,
                 serviceEnabled: model.serviceEnabled,
                 stale: model.dataIsStale,
@@ -70,7 +69,6 @@ struct PlugPopover: View {
 /// Everything the panel shows, as plain values, so it can be drawn and
 /// checked without a running Plug.
 struct PanelFacts: Equatable {
-    var verdict: Verdict
     var situation: PlugSituation
     var serviceEnabled = true
     /// The rows are what Plug said last, not what it says now.
@@ -80,6 +78,8 @@ struct PanelFacts: Equatable {
     /// The last tool call, and what tells one call from the next.
     var call: CallFacts?
     var callID: UInt64?
+
+    var verdict: Verdict { PlugVerdict.verdict(for: situation) }
 }
 
 struct PanelView<Power: View>: View {
@@ -92,7 +92,7 @@ struct PanelView<Power: View>: View {
 
     private var situation: PlugSituation { facts.situation }
     private var trouble: PanelTrouble? {
-        facts.serviceEnabled ? PanelTrouble.trouble(for: situation, verdict: facts.verdict) : nil
+        facts.serviceEnabled ? PanelTrouble.trouble(for: situation) : nil
     }
 
     /// Off, stopped, or with no servers, there is nothing under the card to
@@ -337,7 +337,8 @@ struct PanelTrouble: Equatable {
     /// With several, no fix outranks another.
     var fixIsPrimary: Bool { servers.count == 1 && primary == nil }
 
-    static func trouble(for situation: PlugSituation, verdict: Verdict) -> PanelTrouble? {
+    static func trouble(for situation: PlugSituation) -> PanelTrouble? {
+        let verdict = PlugVerdict.verdict(for: situation)
         guard situation.setup == .ready else { return general(verdict) }
         switch situation.runtime {
         case .running:

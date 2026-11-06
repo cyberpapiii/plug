@@ -795,11 +795,11 @@ final class AppModelTests: XCTestCase {
 
     @MainActor
     func testCancelStopsAnOpenSignIn() async {
-        let runner = BlockingAuthRunner()
+        let runner = Self.blockingSignIn()
         let model = makeSignInModel(runner: runner)
 
         let signIn = Task { await model.actions.signIn(server: "notion") }
-        let started = await eventually { await runner.starts == 1 }
+        let started = await eventually { await runner.calls.count == 1 }
         XCTAssertTrue(started)
         XCTAssertTrue(model.actions.signingInServers.contains("notion"))
 
@@ -816,13 +816,13 @@ final class AppModelTests: XCTestCase {
     /// returned at once and the first attempt kept waiting for minutes.
     @MainActor
     func testTryAgainReplacesAnOpenSignIn() async {
-        let runner = BlockingAuthRunner()
+        let runner = Self.blockingSignIn()
         let model = makeSignInModel(runner: runner)
 
         let first = Task { await model.actions.signIn(server: "notion") }
-        _ = await eventually { await runner.starts == 1 }
+        _ = await eventually { await runner.calls.count == 1 }
         let second = Task { await model.actions.signIn(server: "notion") }
-        let restarted = await eventually { await runner.starts == 2 }
+        let restarted = await eventually { await runner.calls.count == 2 }
         XCTAssertTrue(restarted)
         let cancellations = await runner.cancellations
         XCTAssertEqual(cancellations, 1)
@@ -835,8 +835,16 @@ final class AppModelTests: XCTestCase {
         XCTAssertNil(model.actions.actionError)
     }
 
+    /// A `plug auth login` that waits on the browser until it is cancelled.
+    private static func blockingSignIn() -> StubProcessRunner {
+        StubProcessRunner { _, _ in
+            try await Task.sleep(for: .seconds(5))
+            return .exited()
+        }
+    }
+
     @MainActor
-    private func makeSignInModel(runner: BlockingAuthRunner) -> AppModel {
+    private func makeSignInModel(runner: StubProcessRunner) -> AppModel {
         AppModel(
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
@@ -1148,23 +1156,6 @@ private struct FailingAppLinker: AppLinking {
     }
 }
 
-/// A `plug auth login` that waits on the browser until it is cancelled.
-private actor BlockingAuthRunner: ProcessRunning {
-    private(set) var starts = 0
-    private(set) var cancellations = 0
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        starts += 1
-        do {
-            try await Task.sleep(for: .seconds(5))
-        } catch {
-            cancellations += 1
-            throw error
-        }
-        return ProcessResult(status: 0, stdout: Data(), stderr: Data())
-    }
-}
-
 private final class LockedEvents: @unchecked Sendable {
     private let lock = NSLock()
     private var storage: [String] = []
@@ -1239,30 +1230,8 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     ) throws {
         self.events = events
         self.daemonVersion = daemonVersion
-        self.socketURL = providedSocketURL
-            ?? URL(fileURLWithPath: "/tmp/plug-app-model-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(self.socketURL.path)
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(self.socketURL.path.utf8CString)
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
-        }
-        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
-        let addressLength = socklen_t(pathOffset + bytes.count)
-        address.sun_len = UInt8(addressLength)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listener, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listener, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
+        self.socketURL = providedSocketURL ?? TestSocket.uniquePath("plug-app-model")
+        listener = try TestSocket.listen(at: self.socketURL.path)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.serve() }
     }
 
@@ -1308,13 +1277,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                 Darwin.close(accepted)
                 return
             }
-            while true {
-                guard let header = readExact(accepted, count: 4) else { break }
-                let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-                guard let payload = readExact(accepted, count: Int(length)),
-                      let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
-                      let type = object["type"] as? String
-                else { break }
+            while let object = TestSocket.readRequest(accepted), let type = object["type"] as? String {
                 switch type {
                 case "OperatorHandshake":
                     clientVersion = object["client_version"] as? String
@@ -1376,43 +1339,11 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     }
 
     private func wakeAccept() {
-        let wake = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard wake >= 0 else { return }
-        defer { Darwin.close(wake) }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(socketURL.path.utf8CString)
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
-        }
-        let length = socklen_t(MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)! + bytes.count)
-        address.sun_len = UInt8(length)
-        _ = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.connect(wake, $0, length) }
-        }
+        let wake = TestSocket.connect(to: socketURL.path)
+        if wake >= 0 { Darwin.close(wake) }
     }
 
     private func send(response: [String: Any], to fd: Int32) {
-        guard let payload = try? JSONSerialization.data(withJSONObject: response) else { return }
-        var frame = Data([
-            UInt8((payload.count >> 24) & 0xff), UInt8((payload.count >> 16) & 0xff),
-            UInt8((payload.count >> 8) & 0xff), UInt8(payload.count & 0xff),
-        ])
-        frame.append(payload)
-        frame.withUnsafeBytes { raw in _ = Darwin.write(fd, raw.baseAddress!, raw.count) }
-    }
-
-    private func readExact(_ fd: Int32, count: Int) -> Data? {
-        var data = Data(count: count)
-        let result = data.withUnsafeMutableBytes { raw -> Int in
-            var offset = 0
-            while offset < count {
-                let readCount = Darwin.read(fd, raw.baseAddress!.advanced(by: offset), count - offset)
-                guard readCount > 0 else { return -1 }
-                offset += readCount
-            }
-            return offset
-        }
-        return result == count ? data : nil
+        TestSocket.writeJSON(response, to: fd)
     }
 }

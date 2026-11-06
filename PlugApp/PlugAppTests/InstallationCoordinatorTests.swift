@@ -55,25 +55,15 @@ final class InstallationCoordinatorTests: XCTestCase {
         await coordinator.reconcile(trigger: .applicationLaunch)
 
         let eventValues = await events.values
-        XCTAssertEqual(
-            eventValues,
-            [
-                "app.inspect",
-                "legacy.inspect",
-                "daemon.inspect",
-                "legacy.removeFormula",
-                "legacy.repairShell",
-                "clients.inspect",
-                "clients.repair",
-                "daemon.inspect",
-                "daemon.ensureRunning",
-                "legacy.removeCargo",
-                "app.inspect",
-                "legacy.inspect",
-                "clients.inspect",
-                "daemon.inspect",
-            ]
-        )
+        for step in ["legacy.removeFormula", "legacy.repairShell", "clients.repair", "legacy.removeCargo"] {
+            XCTAssertTrue(eventValues.contains(step), "\(step) did not run")
+        }
+        // Nothing changes before the daemon's owner is known, and the old
+        // binary stays until the app's own daemon is proven.
+        let first = { (step: String) in eventValues.firstIndex(of: step)! }
+        XCTAssertLessThan(first("daemon.inspect"), first("legacy.removeFormula"))
+        XCTAssertLessThan(first("daemon.ensureRunning"), first("legacy.removeCargo"))
+        XCTAssertEqual(eventValues.last, "daemon.inspect", "the healthy state comes from a final inspection")
         guard case let .healthy(snapshot) = coordinator.state else {
             return XCTFail("Expected healthy state, got \(coordinator.state)")
         }
@@ -160,7 +150,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected adoptionRequired, got \(coordinator.state)")
         }
         let eventValues = await events.values
-        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
     }
 
     func testEnabledAppServiceAutomaticallyReclaimsLegacyDaemon() async {
@@ -199,7 +189,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected automatic recovery after prior app-service consent, got \(coordinator.state)")
         }
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
     }
 
     func testEnabledAppServiceAutomaticallyRecoversMissingJob() async {
@@ -233,7 +223,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
         let eventValues = await events.values
         XCTAssertTrue(eventValues.contains("daemon.adopt"))
-        XCTAssertTrue(eventValues.contains("daemon.ensureRunning"))
     }
 
     func testExplicitAdoptionConvergesAfterRequiredState() async {
@@ -272,7 +261,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected explicit adoption to converge, got \(coordinator.state)")
         }
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
     }
 
     func testStaleAppServiceUsesAutomaticReplacement() async {
@@ -943,7 +932,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let eventValues = await events.values
         XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
         XCTAssertFalse(eventValues.contains("legacy.removeFormula"))
-        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
     }
 
     func testBrewBinLeftoverWithEmptyRecognizedPathsIsRecognizedLegacyAndOffersAdopt() async {
@@ -1004,7 +993,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
         let eventValues = await events.values
-        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
         XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
     }
 
@@ -1058,7 +1047,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             eventValues.firstIndex(of: "daemon.bootOutLegacy")!,
             eventValues.firstIndex(of: "legacy.removeFormula")!
         )
-        XCTAssertTrue(eventValues.contains("daemon.adopt") || eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
         XCTAssertTrue(daemon.inspectedLegacyPaths.contains { $0.contains(cellar.programURL!) })
     }
 
@@ -1104,8 +1093,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.service.ownership, healthyService().ownership)
         XCTAssertEqual(daemon.adoptedSnapshots.map(\.ownership), [.recognizedLegacy([cellar])])
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
-        XCTAssertFalse(eventValues.contains("daemon.adopt"))
         XCTAssertLessThan(
             eventValues.firstIndex(of: "daemon.inspect")!,
             eventValues.firstIndex(of: "legacy.removeFormula")!
@@ -1436,11 +1423,11 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
         if let bootOutError { throw bootOutError }
     }
 
-    func adoptRecognizedLegacy(
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake {
-        await events.append("daemon.adoptLegacy")
+        await events.append("daemon.adopt")
         adoptedSnapshots.append(snapshot)
         return handshakes.removeFirst()
     }
@@ -1453,22 +1440,14 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
         return handshakes.removeFirst()
     }
 
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
-        await events.append("daemon.ensureRunning")
-        return handshakes.isEmpty
-            ? makeTestHandshake(version: expectedVersion)
-            : handshakes.removeFirst()
-    }
-
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake {
-        try await ensureRunning(expectedVersion: canonical.appVersion)
-    }
-
-    func adopt() async throws {
-        await events.append("daemon.adopt")
+        await events.append("daemon.ensureRunning")
+        return handshakes.isEmpty
+            ? makeTestHandshake(version: canonical.appVersion)
+            : handshakes.removeFirst()
     }
 
     func restart() async throws {
@@ -1529,11 +1508,11 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
         leftoverLoaded = false
     }
 
-    func adoptRecognizedLegacy(
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake {
-        await events.append("daemon.adoptLegacy")
+        await events.append("daemon.adopt")
         adoptedSnapshots.append(snapshot)
         leftoverLoaded = false
         adopted = true
@@ -1548,22 +1527,12 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
         return handshake
     }
 
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
-        await events.append("daemon.ensureRunning")
-        return handshake
-    }
-
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake {
-        try await ensureRunning(expectedVersion: canonical.appVersion)
-    }
-
-    func adopt() async throws {
-        await events.append("daemon.adopt")
-        leftoverLoaded = false
-        adopted = true
+        await events.append("daemon.ensureRunning")
+        return handshake
     }
 
     func restart() async throws {

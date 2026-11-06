@@ -36,7 +36,7 @@ struct ClientsView: View {
     private func roster(of apps: [LinkableApp]) -> AppRoster {
         let names = self.names
         return AppRoster(apps: apps, sessions: sessions) {
-            names.knownTarget(named: names.name(forKey: names.key(of: $0)))
+            names.knownTarget(named: names.name(forKey: $0.clientKey))
         }
     }
     /// Kept by the model and built once per snapshot. Every row asks it
@@ -64,13 +64,13 @@ struct ClientsView: View {
         var result = Unclaimed()
         var index: [String: Int] = [:]
         for session in roster.other {
-            if let key = names.key(of: session), grantKeys.contains(key) {
+            if let key = session.clientKey, grantKeys.contains(key) {
                 result.byGrant[key, default: []].append(session)
                 continue
             }
             // A session whose key is shared with other clients stays a row of
             // its own.
-            let id = "session:\(accessKey(of: session) ?? session.sessionId)"
+            let id = "session:\(session.ownAccessKey ?? session.sessionId)"
             if let at = index[id] {
                 result.clients[at].sessions.append(session)
             } else {
@@ -118,21 +118,13 @@ struct ClientsView: View {
     private func access(to app: LinkableApp, sessions: [LiveSession]) -> ClientAccess? {
         guard app.linked || !sessions.isEmpty else { return nil }
         let overNetwork = app.transport?.lowercased() == "http"
-            || sessions.contains { accessKey(of: $0) != app.target }
+            || sessions.contains { $0.ownAccessKey != app.target }
         guard !overNetwork else { return nil }
         return access(key: app.target, name: names.name(forKey: app.target) ?? app.name)
     }
 
     private static func isRemote(_ session: LiveSession) -> Bool {
-        ["http", "streamable_http", "sse"].contains(session.transport.lowercased())
-    }
-
-    /// The key a session's requests carry, when it is one a block can be
-    /// stored under. A remote session with no grant shares its key with every
-    /// other such session, so it is not offered server choices of its own.
-    private func accessKey(of session: LiveSession) -> String? {
-        guard let key = names.key(of: session) else { return nil }
-        return Self.isRemote(session) && !key.hasPrefix("oauth:") ? nil : key
+        ["http", "sse"].contains(session.transport)
     }
 
     var body: some View {
@@ -288,7 +280,7 @@ struct ClientsView: View {
             .map { appEntry($0, sessions: []) }
         let granted = grants.map { grant in
             let target = AppIcons.target(forClientType: grant.clientName)
-            var own = sessions.filter { names.key(of: $0) == grant.clientKey }
+            var own = sessions.filter { $0.clientKey == grant.clientKey }
             // A uniquely identified grant can show its still-open local
             // sessions too. Multiple grants remain separate identities.
             if represented.contains(target), model.snapshot.downstreamClients.filter({
@@ -302,7 +294,7 @@ struct ClientsView: View {
         // its own above. Its last call puts it here.
         let shown = Set((apps + idle + others + granted).flatMap { [$0.renameKey, $0.placeKey].compactMap { $0 } })
             .union(allApps.map(\.target))
-            .union(sessions.compactMap(names.key(of:)))
+            .union(sessions.compactMap(\.clientKey))
         let recent = RecentCallers.latest(model.activities, excluding: shown)
             .map(recentEntry)
             .filter { matches($0.name) }
@@ -366,12 +358,12 @@ struct ClientsView: View {
     private func sessionEntry(id: String, sessions: [LiveSession]) -> ClientEntry {
         let first = sessions[0]
         let name = displayName(first)
-        let choices = accessKey(of: first).map { access(key: $0, name: name) }
+        let choices = first.ownAccessKey.map { access(key: $0, name: name) }
         return ClientEntry(
             id: id,
             group: Self.isRemote(first) ? .network : .onThisMac,
             place: ClientPlaces.place(
-                owners: names.place(forKey: names.key(of: first)),
+                owners: names.place(forKey: first.clientKey),
                 group: Self.isRemote(first) ? .network : .onThisMac
             ),
             name: name,
@@ -389,8 +381,8 @@ struct ClientsView: View {
             setOn: { _ in },
             about: "Plug does not recognize this client, so it has no switch. It shows here while it is connected.",
             access: choices,
-            renameKey: names.key(of: first),
-            placeKey: names.key(of: first),
+            renameKey: first.clientKey,
+            placeKey: first.clientKey,
             disambiguator: String(first.sessionId.prefix(4))
         )
     }

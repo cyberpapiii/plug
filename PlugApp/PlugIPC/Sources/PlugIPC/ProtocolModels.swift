@@ -81,6 +81,13 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     /// The program that started a local connector. The daemon reads it from
     /// the process table, so the client cannot choose it.
     public let host: ClientHost?
+    /// What the client's settings are stored under, when the daemon can tell
+    /// one such client from another.
+    public let clientKey: String?
+    /// The key the session's requests carry, which blocks are read under. It
+    /// differs from `clientKey` only for a remote session with no grant,
+    /// which shares one key with every other such session.
+    public let accessKey: String?
     public var connectedSecs: UInt64
     public var lastActivitySecs: UInt64?
 }
@@ -97,9 +104,6 @@ public struct ClientVisibility: Codable, Equatable, Sendable {
     public let sessionId: String
     public let clientType: String
     public let visibleToolCount: Int
-    /// What this client's settings are stored under, when the daemon can tell
-    /// one such client from another.
-    public let clientKey: String?
 }
 
 /// A name the owner gave a client.
@@ -163,8 +167,10 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public var isUnfinished: Bool { signedIn == false && lastUsedAt == nil && createdAt != nil }
 
     /// What this client's settings are stored under. Matches the daemon's
-    /// `grant_client_key`.
-    public var clientKey: String { "oauth:\(clientId)" }
+    /// `grant_client_key`; the snapshot does not carry it.
+    public var clientKey: String { Self.clientKey(id: clientId) }
+
+    public static func clientKey(id: String) -> String { "oauth:\(id)" }
 }
 
 /// One event a client can subscribe to, and how it is doing.

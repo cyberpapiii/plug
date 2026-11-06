@@ -8,25 +8,19 @@ final class ClientRepairServiceTests: XCTestCase {
     )
 
     func testInspectReportsDriftFromReadOnlyRepairContract() async throws {
-        let runner = RecordingRepairRunner(result: .success(.report(dispositions: ["recognized_legacy"])))
+        let runner = StubProcessRunner(result: .report(dispositions: ["recognized_legacy"]))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
 
         XCTAssertTrue(needsRepair)
         let calls = await runner.calls
-        XCTAssertEqual(calls, [
-            .init(
-                executable: canonicalExecutable,
-                arguments: ["repair", "--all", "--dry-run", "--output", "json"]
-            ),
-        ])
+        XCTAssertEqual(calls.map(\.arguments), [["repair", "--all", "--dry-run", "--output", "json"]])
+        XCTAssertEqual(calls.first?.executable, canonicalExecutable)
     }
 
     func testInspectReportsNoDriftFromRepairContract() async throws {
-        let runner = RecordingRepairRunner(
-            result: .success(.report(dispositions: ["canonical", "http", "missing"]))
-        )
+        let runner = StubProcessRunner(result: .report(dispositions: ["canonical", "http", "missing"]))
         let service = ClientRepairService(runner: runner)
 
         let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
@@ -37,9 +31,7 @@ final class ClientRepairServiceTests: XCTestCase {
     }
 
     func testInspectRejectsNonzeroRepairStatus() async {
-        let runner = RecordingRepairRunner(
-            result: .success(.report(dispositions: ["canonical"], status: 1))
-        )
+        let runner = StubProcessRunner(result: .report(dispositions: ["canonical"], status: 1))
         let service = ClientRepairService(runner: runner)
 
         do {
@@ -53,9 +45,7 @@ final class ClientRepairServiceTests: XCTestCase {
     }
 
     func testRepairAllInvokesVerifiedCanonicalExecutableAndDecodesStableReport() async throws {
-        let runner = RecordingRepairRunner(
-            result: .success(.report(changed: [true, false, false]))
-        )
+        let runner = StubProcessRunner(result: .report(changed: [true, false, false]))
         let service = ClientRepairService(runner: runner)
 
         try await service.repairAll(canonicalExecutable: canonicalExecutable)
@@ -68,15 +58,7 @@ final class ClientRepairServiceTests: XCTestCase {
     }
 
     func testNonzeroStatusPropagatesStderr() async {
-        let runner = RecordingRepairRunner(
-            result: .success(
-                ProcessResult(
-                    status: 23,
-                    stdout: Data(),
-                    stderr: Data("permission denied".utf8)
-                )
-            )
-        )
+        let runner = StubProcessRunner(result: .exited(23, stderr: "permission denied"))
         let service = ClientRepairService(runner: runner)
 
         do {
@@ -97,9 +79,7 @@ final class ClientRepairServiceTests: XCTestCase {
         ]
 
         for fixture in fixtures {
-            let runner = RecordingRepairRunner(
-                result: .success(ProcessResult(status: 0, stdout: fixture, stderr: Data()))
-            )
+            let runner = StubProcessRunner(result: ProcessResult(status: 0, stdout: fixture, stderr: Data()))
             let service = ClientRepairService(runner: runner)
 
             do {
@@ -113,45 +93,14 @@ final class ClientRepairServiceTests: XCTestCase {
         }
     }
 
-    func testInspectRunsOnlyTheDryRun() async throws {
-        let runner = RecordingRepairRunner(result: .success(.report(dispositions: ["recognized_legacy"])))
-        let service = ClientRepairService(runner: runner)
-
-        let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
-        XCTAssertTrue(needsRepair)
-        let calls = await runner.calls
-        XCTAssertEqual(calls.map(\.arguments), [["repair", "--all", "--dry-run", "--output", "json"]])
-    }
-
     func testInspectFailsClosedForUnknownUnreadableAndFutureDispositions() async throws {
         for disposition in ["unknown_command", "unreadable", "unrelated", "future_value"] {
-            let runner = RecordingRepairRunner(
-                result: .success(.report(dispositions: [disposition]))
-            )
+            let runner = StubProcessRunner(result: .report(dispositions: [disposition]))
             let service = ClientRepairService(runner: runner)
 
             let needsRepair = try await service.inspect(canonicalExecutable: canonicalExecutable)
             XCTAssertTrue(needsRepair)
         }
-    }
-}
-
-private actor RecordingRepairRunner: ProcessRunning {
-    struct Call: Equatable, Sendable {
-        let executable: URL
-        let arguments: [String]
-    }
-
-    private(set) var calls: [Call] = []
-    private let result: Result<ProcessResult, Error>
-
-    init(result: Result<ProcessResult, Error>) {
-        self.result = result
-    }
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        calls.append(Call(executable: executable, arguments: arguments))
-        return try result.get()
     }
 }
 

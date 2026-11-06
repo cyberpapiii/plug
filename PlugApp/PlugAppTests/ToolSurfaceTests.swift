@@ -432,7 +432,7 @@ final class AppRosterTests: XCTestCase {
         """#.utf8))
         XCTAssertEqual(ClientNames(snapshot: snapshot).place(forKey: "claude-code"), "Work laptop")
 
-        let names = ClientNames(visibility: [], names: [], places: places)
+        let names = ClientNames(names: [], places: places)
         XCTAssertEqual(names.place(forKey: "oauth:abc"), "Work laptop")
         XCTAssertNil(names.place(forKey: "oauth:zzz"))
         XCTAssertEqual(names.ownerPlaces, ["Cloud", "Work laptop"])
@@ -473,26 +473,19 @@ final class AppRosterTests: XCTestCase {
     func testAClientNamedAsOnePlugKnowsTakesThatClientsIcon() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let visibility = try decoder.decode(
-            [ClientVisibility].self,
-            from: Data(
-                """
-                [{"session_id":"g1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:abc"},
-                 {"session_id":"c1","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"},
-                 {"session_id":"m1","client_type":"Cursor","visible_tool_count":3,"client_key":"custom:my-tool"}]
-                """.utf8
-            )
-        )
         let stored = try decoder.decode(
             [ClientName].self,
             from: Data(#"[{"key":"oauth:abc","name":"GrokBot"},{"key":"oauth:def","name":"Work laptop"}]"#.utf8)
         )
-        let names = ClientNames(visibility: visibility, names: stored)
+        let names = ClientNames(names: stored)
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1},
-             {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1}]
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
+              "client_key":"oauth:abc","access_key":"oauth:abc"},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
+              "client_key":"oauth:def","access_key":"oauth:def"},
+             {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
+              "client_key":"custom:my-tool","access_key":"custom:my-tool"}]
             """
         )
         // One the owner made up keeps its own icon, whatever it reports.
@@ -509,34 +502,24 @@ final class AppRosterTests: XCTestCase {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let key = "host:/opt/hermes_agent/bin/python3"
-        let visibility = try decoder.decode(
-            [ClientVisibility].self,
-            from: Data(
-                """
-                [{"session_id":"h1","client_type":"Unknown","visible_tool_count":3,"client_key":"\(key)"},
-                 {"session_id":"h2","client_type":"Unknown","visible_tool_count":3,"client_key":"\(key)"},
-                 {"session_id":"h3","client_type":"Unknown","visible_tool_count":3}]
-                """.utf8
-            )
-        )
         let stored = try decoder.decode(
             [ClientName].self,
             from: Data(#"[{"key":"\#(key)","name":"Hermes"},{"key":"oauth:abc","name":"Phone"}]"#.utf8)
         )
-        let names = ClientNames(visibility: visibility, names: stored)
+        let names = ClientNames(names: stored)
         let live = try sessions(
             """
             [{"transport":"daemon_proxy","session_id":"h1","client_type":"Unknown","client_info":"mcp","connected_secs":1,
-              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"}},
+              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"},
+              "client_key":"\(key)","access_key":"\(key)"},
              {"transport":"daemon_proxy","session_id":"h2","client_type":"Unknown","client_info":"mcp","connected_secs":1,
-              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"}},
+              "host":{"name":"python3","executable":"/opt/hermes_agent/bin/python3"},
+              "client_key":"\(key)","access_key":"\(key)"},
              {"transport":"daemon_proxy","session_id":"h3","client_type":"Unknown","client_info":"mcp","connected_secs":1}]
             """
         )
 
         XCTAssertEqual(live.map(names.displayName), ["Hermes", "Hermes", "Unknown client h3"])
-        XCTAssertEqual(names.key(of: live[0]), key)
-        XCTAssertNil(names.key(of: live[2]), "a session with nothing to store a name under cannot be renamed")
         XCTAssertEqual(names.name(forKey: "oauth:abc"), "Phone")
         XCTAssertNil(names.name(forKey: "oauth:other"))
     }
@@ -647,16 +630,6 @@ final class AppRosterTests: XCTestCase {
     func testARemoteSessionIsNamedAfterItsGrantUnlessPlugKnowsTheProduct() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let visibility = try decoder.decode(
-            [ClientVisibility].self,
-            from: Data(
-                #"""
-                [{"session_id":"r1","client_type":"Unknown","visible_tool_count":3,"client_key":"oauth:abc"},
-                 {"session_id":"r2","client_type":"Cursor","visible_tool_count":3,"client_key":"oauth:def"},
-                 {"session_id":"r3","client_type":"Unknown","visible_tool_count":3,"client_key":"oauth:gone"}]
-                """#.utf8
-            )
-        )
         let grants = try decoder.decode(
             [DownstreamClient].self,
             from: Data(
@@ -668,18 +641,20 @@ final class AppRosterTests: XCTestCase {
         )
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"r1","client_type":"Unknown","connected_secs":1},
-             {"transport":"http","session_id":"r2","client_type":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"r3","client_type":"Unknown","connected_secs":1}]
+            [{"transport":"http","session_id":"r1","client_type":"Unknown","connected_secs":1,
+              "client_key":"oauth:abc","access_key":"oauth:abc"},
+             {"transport":"http","session_id":"r2","client_type":"Cursor","connected_secs":1,
+              "client_key":"oauth:def","access_key":"oauth:def"},
+             {"transport":"http","session_id":"r3","client_type":"Unknown","connected_secs":1,
+              "client_key":"oauth:gone","access_key":"oauth:gone"}]
             """
         )
 
-        let names = ClientNames(visibility: visibility, names: [], grants: grants)
+        let names = ClientNames(names: [], grants: grants)
         XCTAssertEqual(
             live.map(names.displayName),
             ["Perplexity", "Cursor", "Unknown client r3"]
         )
-        XCTAssertEqual(names.key(of: live[0]), "oauth:abc", "a remote session is renamed through its grant")
         // The menu bar panel shows the same clients under the same names.
         XCTAssertEqual(
             names.connectedClients(live + live).map(\.name),
@@ -691,11 +666,24 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(names.connectedClients(live)[0].target, "perplexity")
 
         let renamed = ClientNames(
-            visibility: visibility,
             names: try decoder.decode([ClientName].self, from: Data(#"[{"key":"oauth:def","name":"Work laptop"}]"#.utf8)),
             grants: grants
         )
         XCTAssertEqual(renamed.displayName(live[1]), "Work laptop")
+    }
+
+    func testOnlyASessionWhoseRequestsCarryItsOwnKeyHasChoicesOfItsOwn() throws {
+        let live = try sessions(
+            """
+            [{"transport":"daemon_proxy","session_id":"l1","client_type":"Cursor","connected_secs":1,
+              "client_key":"cursor","access_key":"cursor"},
+             {"transport":"http","session_id":"r1","client_type":"Cursor","connected_secs":1,
+              "client_key":"cursor","access_key":"remote:shared"},
+             {"transport":"http","session_id":"r2","client_type":"Unknown","connected_secs":1,
+              "access_key":"remote:shared"}]
+            """
+        )
+        XCTAssertEqual(live.map(\.ownAccessKey), ["cursor", nil, nil])
     }
 
     func testStaleAppScanCannotInventAConnectedSession() throws {

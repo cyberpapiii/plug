@@ -88,11 +88,19 @@ final class DaemonServiceManager {
         }
     }
 
-    func adoptRecognizedLegacy(
+    /// Takes over a daemon this app does not own, with the owner's consent:
+    /// a leftover install's job, or a socket with no registration behind it.
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake {
-        guard case let .recognizedLegacy(records) = snapshot.ownership, !records.isEmpty else {
+        let records: [LaunchdJobRecord]
+        switch snapshot.ownership {
+        case let .recognizedLegacy(found) where !found.isEmpty:
+            records = found
+        case .unmanaged:
+            records = []
+        default:
             throw DaemonServiceError.adoptionRequired
         }
         let canonical = try await verifiedApp(expectedVersion: expectedVersion)
@@ -108,10 +116,9 @@ final class DaemonServiceManager {
             // the leftover job. Register from the inspect-time snapshot.
             bootOutLoadedJobs = false
         case .recognizedLegacy:
+            guard !records.isEmpty else { throw DaemonServiceError.evidenceChanged }
             bootOutLoadedJobs = true
-        case .unknown:
-            throw DaemonServiceError.unknownOwnership
-        case .appManagedCurrent, .appManagedStale:
+        case .unknown, .appManagedCurrent, .appManagedStale:
             throw DaemonServiceError.unknownOwnership
         }
         return try await replace(
@@ -140,18 +147,13 @@ final class DaemonServiceManager {
         )
     }
 
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
-        let canonical = try await verifiedApp(expectedVersion: expectedVersion)
-        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
-    }
-
-    /// For a caller that verified the app and read launchd moments ago in the
-    /// same pass. Verifying the app signs and runs the bundled binary, and a
-    /// launchd read runs `launchctl` once per job, so repeating both right
-    /// after the caller did was most of what a healthy launch spent. When the
-    /// inspected job is ours, one fresh handshake proves the daemon; anything
-    /// short of exact proof falls through to the full path, which reads
-    /// launchd again before it changes anything.
+    /// Proves this app's own daemon is running, starting or replacing it
+    /// when it is not. `inspected` is the caller's launchd read from moments
+    /// ago in the same pass: verifying the app signs and runs the bundled
+    /// binary, and a launchd read runs `launchctl` once per job, so repeating
+    /// both was most of what a healthy launch spent. When the inspected job is
+    /// ours, one fresh handshake proves the daemon; anything short of exact
+    /// proof reads launchd again before it changes anything.
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
@@ -169,13 +171,7 @@ final class DaemonServiceManager {
         {
             return handshake
         }
-        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
-    }
 
-    private func ensureRunning(
-        canonical: VerifiedAppInstallation,
-        expectedVersion: String
-    ) async throws -> OperatorHandshake {
         let inspection = try await inspectWithHandshake(
             canonical: canonical,
             legacyPaths: legacyPaths
@@ -215,32 +211,6 @@ final class DaemonServiceManager {
             )
         case .recognizedLegacy, .unmanaged:
             throw DaemonServiceError.adoptionRequired
-        case .unknown:
-            throw DaemonServiceError.unknownOwnership
-        }
-    }
-
-    /// Takes over whatever daemon is running, with the owner's consent.
-    func adopt() async throws {
-        let canonical = try await appInspector.inspectCurrentApp()
-        let snapshot = try await inspect(canonical: canonical, legacyPaths: legacyPaths)
-        switch snapshot.ownership {
-        case .recognizedLegacy:
-            _ = try await adoptRecognizedLegacy(
-                snapshot: snapshot,
-                expectedVersion: canonical.appVersion
-            )
-        case .unmanaged:
-            _ = try await replace(
-                verifiedRecords: [],
-                canonical: canonical,
-                expectedVersion: canonical.appVersion,
-                replacingAppRegistration: false,
-                inspectionPaths: inspectionPaths(including: snapshot),
-                bootOutLoadedJobs: true
-            )
-        case .appManagedCurrent, .appManagedStale:
-            _ = try await ensureRunning(expectedVersion: canonical.appVersion)
         case .unknown:
             throw DaemonServiceError.unknownOwnership
         }
