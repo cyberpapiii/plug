@@ -52,10 +52,10 @@ pub(crate) async fn cmd_connect(
 ) -> anyhow::Result<()> {
     use rmcp::ServiceExt as _;
 
-    crate::client_host::set_link_target(link_target);
     let serve = async {
         let client_id = uuid::Uuid::new_v4().to_string();
-        let session = DaemonProxySession::establish(config_path, client_id, None).await?;
+        let session =
+            DaemonProxySession::establish(config_path, client_id, None, link_target).await?;
         let proxy = IpcProxyHandler::new(session, config_path.cloned());
         let transport = stdio_bridge::stdio_transport(proxy.modern_gate_reader());
         let service = proxy
@@ -125,6 +125,8 @@ struct SharedConnection {
     /// Kept out of `conn` so a cancellation never waits behind a reconnect.
     identity: std::sync::RwLock<SessionIdentity>,
     config_path: Option<PathBuf>,
+    /// `plug connect --client`, sent again on every reconnect.
+    link_target: Option<String>,
     capabilities: std::sync::RwLock<ServerCapabilities>,
     /// Downstream peer — set during initialize, used to forward logging
     /// notifications pushed by the daemon over IPC.
@@ -744,6 +746,7 @@ impl IpcProxyHandler {
                     modern_downstream_enabled: std::sync::atomic::AtomicBool::new(
                         session.modern_downstream_enabled,
                     ),
+                    link_target: session.link_target.clone(),
                     conn: Mutex::new(ProxyConnection::start(session, self_ref.clone())),
                     self_ref: self_ref.clone(),
                     identity: std::sync::RwLock::new(identity),
@@ -1001,6 +1004,7 @@ impl IpcProxyHandler {
             shared.config_path.as_ref(),
             shared.client_id.clone(),
             conn.client_info.clone(),
+            shared.link_target.clone(),
         )
         .await
         .map_err(reconnect_error)?;
@@ -1875,6 +1879,7 @@ mod tests {
             Some(&config_path),
             "client-continuity".to_string(),
             None,
+            None,
         )
         .await
         .expect("establish daemon proxy session");
@@ -2014,10 +2019,14 @@ mod tests {
 
         let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
 
-        let session =
-            DaemonProxySession::establish(Some(&config_path), "client-tasks".to_string(), None)
-                .await
-                .expect("establish daemon proxy session");
+        let session = DaemonProxySession::establish(
+            Some(&config_path),
+            "client-tasks".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
@@ -2169,10 +2178,14 @@ mod tests {
 
         let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
 
-        let session =
-            DaemonProxySession::establish(Some(&config_path), "client-resources".to_string(), None)
-                .await
-                .expect("establish daemon proxy session");
+        let session = DaemonProxySession::establish(
+            Some(&config_path),
+            "client-resources".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
@@ -2276,9 +2289,10 @@ mod tests {
         let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
 
         let client_id = "client-task-continuity".to_string();
-        let session_a = DaemonProxySession::establish(Some(&config_path), client_id.clone(), None)
-            .await
-            .expect("establish first daemon proxy session");
+        let session_a =
+            DaemonProxySession::establish(Some(&config_path), client_id.clone(), None, None)
+                .await
+                .expect("establish first daemon proxy session");
         let proxy_a = IpcProxyHandler::new(session_a, Some(config_path.clone()));
 
         let (server_transport_a, client_transport_a) = tokio::io::duplex(4096);
@@ -2316,7 +2330,7 @@ mod tests {
             other => panic!("unexpected create task response: {other:?}"),
         };
 
-        let session_b = DaemonProxySession::establish(Some(&config_path), client_id, None)
+        let session_b = DaemonProxySession::establish(Some(&config_path), client_id, None, None)
             .await
             .expect("establish replacement daemon proxy session");
         let proxy_b = IpcProxyHandler::new(session_b, Some(config_path.clone()));
@@ -2418,6 +2432,7 @@ mod tests {
             Some(&config_path),
             "client-protocol-version".to_string(),
             None,
+            None,
         )
         .await
         .expect("establish daemon proxy session");
@@ -2510,10 +2525,14 @@ mod tests {
 
         let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
 
-        let session =
-            DaemonProxySession::establish(Some(&config_path), "client-chunked".to_string(), None)
-                .await
-                .expect("establish daemon proxy session");
+        let session = DaemonProxySession::establish(
+            Some(&config_path),
+            "client-chunked".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
@@ -2580,10 +2599,14 @@ mod tests {
 
         let (engine, daemon) = spawn_test_daemon(config, config_path.clone()).await;
 
-        let session =
-            DaemonProxySession::establish(Some(&config_path), "client-artifact".to_string(), None)
-                .await
-                .expect("establish daemon proxy session");
+        let session = DaemonProxySession::establish(
+            Some(&config_path),
+            "client-artifact".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, Some(config_path.clone()));
 
         let (server_transport, client_transport) = tokio::io::duplex(4096);
@@ -2656,6 +2679,7 @@ mod tests {
         let session = DaemonProxySession::establish(
             Some(&config_path),
             "client-task-artifact".to_string(),
+            None,
             None,
         )
         .await
@@ -2767,6 +2791,7 @@ mod tests {
             Some(&config_path),
             "client-rehydrate-a".to_string(),
             None,
+            None,
         )
         .await
         .expect("establish daemon proxy session");
@@ -2809,6 +2834,7 @@ mod tests {
         let session_b = DaemonProxySession::establish(
             Some(&config_path),
             "client-rehydrate-b".to_string(),
+            None,
             None,
         )
         .await
@@ -3000,13 +3026,17 @@ mod tests {
             .expect("send Registered");
         });
 
-        let error =
-            match DaemonProxySession::establish(None, "client-register-mismatch".to_string(), None)
-                .await
-            {
-                Ok(_) => panic!("a registration for another client must fail setup"),
-                Err(error) => error,
-            };
+        let error = match DaemonProxySession::establish(
+            None,
+            "client-register-mismatch".to_string(),
+            None,
+            None,
+        )
+        .await
+        {
+            Ok(_) => panic!("a registration for another client must fail setup"),
+            Err(error) => error,
+        };
         assert!(
             error.to_string().contains("registration mismatch"),
             "unexpected error: {error}"
@@ -3073,9 +3103,10 @@ mod tests {
             .expect("send Capabilities");
         });
 
-        let session = DaemonProxySession::establish(None, "client-setup-push".to_string(), None)
-            .await
-            .expect("a push during setup must not fail it");
+        let session =
+            DaemonProxySession::establish(None, "client-setup-push".to_string(), None, None)
+                .await
+                .expect("a push during setup must not fail it");
         assert!(matches!(
             session.pending_notifications.as_slice(),
             [IpcResponse::ResourceUpdatedNotification { params }]
@@ -3326,7 +3357,7 @@ mod tests {
             }
         });
 
-        let session = DaemonProxySession::establish(None, "modern-client".to_string(), None)
+        let session = DaemonProxySession::establish(None, "modern-client".to_string(), None, None)
             .await
             .expect("establish modern daemon session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -3422,7 +3453,7 @@ mod tests {
                 .expect("ack cancellation");
         });
 
-        let session = DaemonProxySession::establish(None, "stable-client".to_string(), None)
+        let session = DaemonProxySession::establish(None, "stable-client".to_string(), None, None)
             .await
             .expect("establish primary session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -3474,7 +3505,7 @@ mod tests {
                 .expect("send pong");
         });
 
-        let session = DaemonProxySession::establish(None, "gate-client".to_string(), None)
+        let session = DaemonProxySession::establish(None, "gate-client".to_string(), None, None)
             .await
             .expect("establish gated session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -3520,7 +3551,7 @@ mod tests {
         });
 
         let session =
-            DaemonProxySession::establish(None, "reconnect-gate-client".to_string(), None)
+            DaemonProxySession::establish(None, "reconnect-gate-client".to_string(), None, None)
                 .await
                 .expect("establish enabled session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -3640,7 +3671,7 @@ mod tests {
                 .expect("send pong");
         });
 
-        let session = DaemonProxySession::establish(None, "client-caps".to_string(), None)
+        let session = DaemonProxySession::establish(None, "client-caps".to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let initial_session_id = session.session_id.clone();
@@ -3722,7 +3753,7 @@ mod tests {
                 .expect("send pong");
         });
 
-        let session = DaemonProxySession::establish(None, "client-subs".to_string(), None)
+        let session = DaemonProxySession::establish(None, "client-subs".to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -3817,9 +3848,10 @@ mod tests {
             .expect("send tools/list response");
         });
 
-        let session = DaemonProxySession::establish(None, "client-replay-fail".to_string(), None)
-            .await
-            .expect("establish daemon proxy session");
+        let session =
+            DaemonProxySession::establish(None, "client-replay-fail".to_string(), None, None)
+                .await
+                .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
@@ -3954,7 +3986,7 @@ mod tests {
             .expect("send tools/list response");
         });
 
-        let session = DaemonProxySession::establish(None, "client-unsub".to_string(), None)
+        let session = DaemonProxySession::establish(None, "client-unsub".to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -4042,9 +4074,10 @@ mod tests {
                 .expect("send pong");
         });
 
-        let session = DaemonProxySession::establish(None, "client-retry-safe".to_string(), None)
-            .await
-            .expect("establish daemon proxy session");
+        let session =
+            DaemonProxySession::establish(None, "client-retry-safe".to_string(), None, None)
+                .await
+                .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
@@ -4088,7 +4121,7 @@ mod tests {
         });
 
         let session =
-            DaemonProxySession::establish(None, "client-retry-never-sent".to_string(), None)
+            DaemonProxySession::establish(None, "client-retry-never-sent".to_string(), None, None)
                 .await
                 .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -4141,9 +4174,10 @@ mod tests {
             drop(writer2);
         });
 
-        let session = DaemonProxySession::establish(None, "client-retry-unsafe".to_string(), None)
-            .await
-            .expect("establish daemon proxy session");
+        let session =
+            DaemonProxySession::establish(None, "client-retry-unsafe".to_string(), None, None)
+                .await
+                .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
@@ -4225,9 +4259,10 @@ mod tests {
             .expect("send tools/call response");
         });
 
-        let session = DaemonProxySession::establish(None, "client-interleave".to_string(), None)
-            .await
-            .expect("establish daemon proxy session");
+        let session =
+            DaemonProxySession::establish(None, "client-interleave".to_string(), None, None)
+                .await
+                .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
@@ -4311,7 +4346,7 @@ mod tests {
             .expect("send chunked response");
         });
 
-        let session = DaemonProxySession::establish(None, "client-chunked".to_string(), None)
+        let session = DaemonProxySession::establish(None, "client-chunked".to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -4443,9 +4478,10 @@ mod tests {
             .expect("send second tools/call response");
         });
 
-        let session = DaemonProxySession::establish(None, "client-malformed".to_string(), None)
-            .await
-            .expect("establish daemon proxy session");
+        let session =
+            DaemonProxySession::establish(None, "client-malformed".to_string(), None, None)
+                .await
+                .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
@@ -4638,7 +4674,7 @@ mod tests {
             drop(reader1);
         });
 
-        let session = DaemonProxySession::establish(None, "client-stall".to_string(), None)
+        let session = DaemonProxySession::establish(None, "client-stall".to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -4755,7 +4791,7 @@ mod tests {
         });
 
         let session =
-            DaemonProxySession::establish(None, "client-watchdog-reset".to_string(), None)
+            DaemonProxySession::establish(None, "client-watchdog-reset".to_string(), None, None)
                 .await
                 .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -4834,7 +4870,7 @@ mod tests {
                 .expect("send scripted reply");
         });
 
-        let session = DaemonProxySession::establish(None, client_id.to_string(), None)
+        let session = DaemonProxySession::establish(None, client_id.to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -4960,7 +4996,7 @@ mod tests {
                 .expect("send pong");
         });
 
-        let session = DaemonProxySession::establish(None, "client-roots".to_string(), None)
+        let session = DaemonProxySession::establish(None, "client-roots".to_string(), None, None)
             .await
             .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
@@ -5131,9 +5167,10 @@ mod tests {
             let _ = fake_read_frame(&mut reader).await;
         });
 
-        let session = DaemonProxySession::establish(None, "client-concurrent".to_string(), None)
-            .await
-            .expect("establish daemon proxy session");
+        let session =
+            DaemonProxySession::establish(None, "client-concurrent".to_string(), None, None)
+                .await
+                .expect("establish daemon proxy session");
         let proxy = IpcProxyHandler::new(session, None);
         proxy.heartbeat.abort();
 
@@ -5216,10 +5253,14 @@ mod tests {
             let _ = fake_read_frame(&mut reader).await;
         });
 
-        let session =
-            DaemonProxySession::establish(None, "client-concurrent-chunked".to_string(), None)
-                .await
-                .expect("establish daemon proxy session");
+        let session = DaemonProxySession::establish(
+            None,
+            "client-concurrent-chunked".to_string(),
+            None,
+            None,
+        )
+        .await
+        .expect("establish daemon proxy session");
         let proxy = Arc::new(IpcProxyHandler::new(session, None));
         proxy.heartbeat.abort();
 
@@ -5280,7 +5321,7 @@ mod tests {
         });
 
         let session =
-            DaemonProxySession::establish(None, "client-concurrent-drop".to_string(), None)
+            DaemonProxySession::establish(None, "client-concurrent-drop".to_string(), None, None)
                 .await
                 .expect("establish daemon proxy session");
         let proxy = Arc::new(IpcProxyHandler::new(session, None));
@@ -5358,7 +5399,7 @@ mod tests {
         });
 
         let session =
-            DaemonProxySession::establish(None, "client-request-ceiling".to_string(), None)
+            DaemonProxySession::establish(None, "client-request-ceiling".to_string(), None, None)
                 .await
                 .expect("establish daemon proxy session");
         // The heartbeat stays on: its pongs are what used to keep the
