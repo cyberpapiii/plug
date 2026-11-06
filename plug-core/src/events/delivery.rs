@@ -21,8 +21,8 @@ pub struct DeliveryResponse {
 )]
 #[async_trait::async_trait]
 pub trait EventDelivery: Send + Sync {
-    /// Production implementation validates/pins DNS per connection, preserves TLS
-    /// hostname verification, forbids proxies/redirects, and bounds response bytes.
+    /// POST `body` with `headers` to the subscriber's `url` once, and say
+    /// how it answered. An `Err` names why nothing was delivered.
     async fn post(
         &self,
         url: &str,
@@ -31,6 +31,8 @@ pub trait EventDelivery: Send + Sync {
     ) -> Result<DeliveryResponse, &'static str>;
 }
 
+/// Pins DNS per connection, keeps TLS hostname verification, follows no
+/// proxy or redirect, and bounds the response it reads.
 pub struct HttpsDelivery;
 
 pub(crate) fn validate_url(value: &str) -> Result<Url, &'static str> {

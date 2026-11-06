@@ -1,6 +1,7 @@
 //! IPC types for CLI ↔ daemon communication.
 //!
-//! Shared between `plug-core` (types) and `plug` (socket listener).
+//! Shared between `plug-core` (types) and `plug` (socket listener), and
+//! copied by the app in `PlugApp/PlugIPC`; `testdata/ipc` pins the two.
 //! Wire format: 4-byte big-endian u32 length prefix + JSON payload.
 
 use base64::Engine as _;
@@ -687,7 +688,7 @@ pub struct IpcAuthServerInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum IpcResponse {
-    /// Daemon version, compatibility range, ownership, and operator features.
+    /// The daemon's version and who owns it.
     OperatorHandshake {
         handshake: OperatorHandshake,
     },
@@ -723,9 +724,6 @@ pub enum IpcResponse {
         #[serde(default)]
         runtime_version: String,
         /// Resource URIs with at least one downstream subscriber.
-        ///
-        /// Defaulted so a newer CLI still reads an older daemon's response,
-        /// where the count reads as zero rather than failing the whole query.
         #[serde(default)]
         resource_subscriptions: usize,
     },
@@ -1675,7 +1673,6 @@ mod tests {
 
     #[test]
     fn daemon_to_proxy_message_reverse_request_has_envelope_tag() {
-        // Build a CreateMessage request via JSON to avoid needing constructors
         let create_msg_json = serde_json::json!({
             "type": "CreateMessage",
             "params": {
@@ -1691,7 +1688,6 @@ mod tests {
         let json = serde_json::to_string(&msg).unwrap();
         assert!(json.contains("\"envelope\":\"ReverseRequest\""));
         assert!(json.contains("\"id\":42"));
-        // Verify it round-trips
         let deserialized: DaemonToProxyMessage = serde_json::from_str(&json).unwrap();
         let json2 = serde_json::to_string(&deserialized).unwrap();
         assert_eq!(json, json2);

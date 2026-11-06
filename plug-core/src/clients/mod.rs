@@ -323,7 +323,6 @@ static REGISTRY: [ClientInfo; 30] = [
         detect: Detect::Markers(&[&[Marker::Home(".cline")]]),
         ..row(ClientTarget::ClineCli, "cline-cli", "Cline CLI")
     },
-    // Left out of `plug clients` since 0.8.11.
     ClientInfo {
         user_path: ".roo/mcp.json",
         project_path: Some(".roo/mcp.json"),

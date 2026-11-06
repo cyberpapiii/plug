@@ -34,12 +34,12 @@ pub struct Config {
     /// buys wall-clock time on a cold start; the knob stays for machines that
     /// cannot afford the spawn burst.
     pub startup_concurrency: usize,
-    /// Enable client-aware tool filtering (default: true).
+    /// Enable client-aware tool filtering.
     pub tool_filter_enabled: bool,
     /// Max chars for tool descriptions (None = no truncation).
     #[serde(default)]
     pub tool_description_max_chars: Option<usize>,
-    /// Tool count threshold to activate search_tools meta-tool (default: 50).
+    /// Tool count threshold to activate search_tools meta-tool.
     pub tool_search_threshold: usize,
     /// Expose only plug meta-tools instead of the full merged tool catalog.
     /// Deprecated compatibility input; `lazy_tools` is the controlling policy model.
@@ -409,13 +409,13 @@ pub struct ServerConfig {
     pub oauth_scopes: Option<Vec<String>>,
     /// Startup timeout in seconds.
     pub timeout_secs: u64,
-    /// Tool call timeout in seconds (default: 300). Set higher for slow tools.
+    /// Tool call timeout in seconds. Set higher for slow tools.
     pub call_timeout_secs: u64,
-    /// Max concurrent requests to this server (default: 1).
+    /// Max concurrent requests to this server.
     pub max_concurrent: usize,
-    /// Health check interval in seconds (default: 60).
+    /// Health check interval in seconds.
     pub health_check_interval_secs: u64,
-    /// Enable circuit breaker for this server (default: true).
+    /// Enable circuit breaker for this server.
     pub circuit_breaker_enabled: bool,
     /// Does nothing: every tool's hints and title are Plug's own. A config
     /// that still sets it loads.
