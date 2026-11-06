@@ -55,9 +55,18 @@ pub const SHARED_REMOTE_CLIENT_KEY: &str = "remote:shared";
 /// starts with. The app writes it into the command it hands that client.
 pub const CUSTOM_CLIENT_PREFIX: &str = "custom:";
 
+/// What the settings key of a remote client that holds a grant starts with.
+const GRANT_CLIENT_KEY_PREFIX: &str = "oauth:";
+
 /// The settings key of a remote client that holds a grant.
 pub fn grant_client_key(client_id: &str) -> String {
-    format!("oauth:{client_id}")
+    format!("{GRANT_CLIENT_KEY_PREFIX}{client_id}")
+}
+
+/// The grant a settings key names, when it is a grant's key: the inverse of
+/// [`grant_client_key`].
+pub fn grant_of_client_key(key: &str) -> Option<&str> {
+    key.strip_prefix(GRANT_CLIENT_KEY_PREFIX)
 }
 
 /// The key a remote request carries, which per-client blocks are read under:

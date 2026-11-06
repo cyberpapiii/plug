@@ -315,7 +315,7 @@ async fn cmd_downstream_oauth_clients(
     if config_path.is_none() {
         return cmd_downstream_oauth_clients_via_daemon(command, output).await;
     }
-    let operator = local_operator_client(config_path, "/_plug/oauth/clients")?;
+    let operator = local_operator_client(config_path, crate::runtime::OPERATOR_OAUTH_CLIENTS_PATH)?;
 
     match command {
         crate::DownstreamOauthClientCommands::List => {
@@ -542,7 +542,8 @@ async fn cmd_downstream_oauth_owner(
 ) -> anyhow::Result<()> {
     match command {
         crate::OwnerCommands::Enroll { no_browser } => {
-            let operator = local_operator_client(config_path, "/_plug/oauth/owner/bootstrap")?;
+            let operator =
+                local_operator_client(config_path, crate::runtime::OPERATOR_OWNER_BOOTSTRAP_PATH)?;
             let response = operator
                 .send_authenticated(reqwest::Method::POST, None, false)
                 .await?;
@@ -596,7 +597,10 @@ async fn cmd_downstream_oauth_owner(
             }
         }
         crate::OwnerCommands::List => {
-            let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
+            let operator = local_operator_client(
+                config_path,
+                crate::runtime::OPERATOR_OWNER_CREDENTIALS_PATH,
+            )?;
             let credentials = fetch_owner_credentials(&operator).await?;
             match output {
                 OutputFormat::Json => println!("{}", serde_json::to_string_pretty(&credentials)?),
@@ -618,7 +622,10 @@ async fn cmd_downstream_oauth_owner(
             }
         }
         crate::OwnerCommands::Remove { credential_id, yes } => {
-            let operator = local_operator_client(config_path, "/_plug/oauth/owner/credentials")?;
+            let operator = local_operator_client(
+                config_path,
+                crate::runtime::OPERATOR_OWNER_CREDENTIALS_PATH,
+            )?;
             let credentials = fetch_owner_credentials(&operator).await?;
             let Some(credential) = credentials
                 .iter()
@@ -1789,7 +1796,7 @@ mod tests {
         let protected_route_state = protected_route_hit.clone();
         let app = axum::Router::new()
             .route(
-                "/_plug/operator/proof",
+                crate::runtime::OPERATOR_PROOF_PATH,
                 axum::routing::post(|headers: axum::http::HeaderMap| async move {
                     assert!(!headers.contains_key("x-plug-operator-token"));
                     axum::Json(serde_json::json!({
@@ -1799,7 +1806,7 @@ mod tests {
                 }),
             )
             .route(
-                "/_plug/oauth/owner/credentials",
+                crate::runtime::OPERATOR_OWNER_CREDENTIALS_PATH,
                 axum::routing::get(move |headers: axum::http::HeaderMap| {
                     let protected_route_state = protected_route_state.clone();
                     async move {

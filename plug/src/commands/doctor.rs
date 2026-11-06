@@ -107,17 +107,14 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
                 .eq(suffix.iter().map(std::ffi::OsStr::new))
     };
 
+    // A client may also run the app's binary or a development build directly.
     let home = dirs::home_dir();
-    let is_home_legacy = home
-        .as_ref()
-        .is_some_and(|home| path == home.join(".local/bin/plug"));
     let is_old_app = path == Path::new("/Applications/Plug.app/Contents/Resources/plug")
         || home
             .as_ref()
             .is_some_and(|home| path == home.join("Applications/Plug.app/Contents/Resources/plug"));
 
-    is_home_legacy
-        || is_old_app
+    is_old_app
         || has_suffix(&["target", "debug", "plug"])
         || has_suffix(&["target", "release", "plug"])
 }
@@ -720,7 +717,9 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
                 .clients
                 .iter()
                 .filter(|(_, settings)| settings.name.is_some())
-                .filter_map(|(key, _)| key.strip_prefix("oauth:").map(str::to_owned))
+                .filter_map(|(key, _)| {
+                    plug_core::downstream_identity::grant_of_client_key(key).map(str::to_owned)
+                })
                 .collect();
             checks.extend(duplicate_downstream_client_check(
                 &snapshot.downstream_clients,

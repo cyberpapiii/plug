@@ -297,7 +297,7 @@ pub(crate) async fn cmd_client_block(
 
     let settings = client_settings(config_path, &key);
     print_info_line(client_blocks_line(&key, &settings));
-    if !key.starts_with("oauth:") {
+    if plug_core::downstream_identity::grant_of_client_key(&key).is_none() {
         print_info_line(
             style("This keeps the tool list tidy. It is not a security boundary: only a remote client's grant is verified.").dim(),
         );
@@ -352,7 +352,7 @@ pub(crate) async fn cmd_client_only(
     if !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty() {
         print_info_line(client_blocks_line(&key, &settings));
     }
-    if !key.starts_with("oauth:") {
+    if plug_core::downstream_identity::grant_of_client_key(&key).is_none() {
         print_info_line(
             style("This keeps the tool list tidy. It is not a security boundary: only a remote client's grant is verified.").dim(),
         );

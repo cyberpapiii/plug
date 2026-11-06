@@ -37,6 +37,8 @@ pub const APP_EXECUTABLE: &str = "Contents/MacOS/Plug";
 pub const DAEMON_ARGS: [&str; 2] = ["serve", "--daemon"];
 /// The Keychain service every item Plug stores is under.
 pub const KEYCHAIN_SERVICE: &str = "plug";
+/// Under the home folder: the `plug` command Plug.app links to its binary.
+pub const COMMAND_LINK: &str = ".local/bin/plug";
 
 /// `PLUG_DEV=1` marks a source-development run: it may use another socket
 /// and need not be the copy inside Plug.app.
@@ -50,6 +52,11 @@ pub fn is_development() -> bool {
 
 fn home() -> PathBuf {
     dirs::home_dir().unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// `~/.local/bin/plug`, the command a shell and every local client run.
+pub fn command_link() -> PathBuf {
+    home().join(COMMAND_LINK)
 }
 
 /// `~/Library/Application Support/plug`: the config, the socket, the PID
@@ -213,6 +220,7 @@ mod tests {
         app_executable: String,
         daemon_args: Vec<String>,
         keychain_service: String,
+        command_link: String,
     }
 
     #[test]
@@ -235,6 +243,7 @@ mod tests {
         assert_eq!(fixture.app_executable, APP_EXECUTABLE);
         assert_eq!(fixture.daemon_args, DAEMON_ARGS);
         assert_eq!(fixture.keychain_service, KEYCHAIN_SERVICE);
+        assert_eq!(fixture.command_link, COMMAND_LINK);
     }
 
     #[test]

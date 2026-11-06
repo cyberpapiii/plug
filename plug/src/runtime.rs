@@ -15,10 +15,10 @@ use axum::{Json, Router};
 use plug_core::http::server::ClientRevocation;
 use tokio_util::sync::CancellationToken;
 
-const OPERATOR_OAUTH_CLIENTS_PATH: &str = "/_plug/oauth/clients";
-const OPERATOR_OWNER_BOOTSTRAP_PATH: &str = "/_plug/oauth/owner/bootstrap";
-const OPERATOR_OWNER_CREDENTIALS_PATH: &str = "/_plug/oauth/owner/credentials";
-const OPERATOR_PROOF_PATH: &str = "/_plug/operator/proof";
+pub(crate) const OPERATOR_OAUTH_CLIENTS_PATH: &str = "/_plug/oauth/clients";
+pub(crate) const OPERATOR_OWNER_BOOTSTRAP_PATH: &str = "/_plug/oauth/owner/bootstrap";
+pub(crate) const OPERATOR_OWNER_CREDENTIALS_PATH: &str = "/_plug/oauth/owner/credentials";
+pub(crate) const OPERATOR_PROOF_PATH: &str = "/_plug/operator/proof";
 const OPERATOR_CLIENT_NONCE_HEADER: &str = "x-plug-operator-client-nonce";
 const OPERATOR_SERVER_NONCE_HEADER: &str = "x-plug-operator-server-nonce";
 const OPERATOR_PROOF_HEADER: &str = "x-plug-operator-proof";

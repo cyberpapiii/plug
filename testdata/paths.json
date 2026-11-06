@@ -14,5 +14,6 @@
   "bundled_binary": "Contents/Resources/plug",
   "app_executable": "Contents/MacOS/Plug",
   "daemon_args": ["serve", "--daemon"],
-  "keychain_service": "plug"
+  "keychain_service": "plug",
+  "command_link": ".local/bin/plug"
 }

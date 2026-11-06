@@ -113,8 +113,32 @@ const LEGACY_EXACT_PROGRAMS: [&str; 4] = [
     "/opt/homebrew/opt/plug/bin/plug",
     "/usr/local/opt/plug/bin/plug",
 ];
-const LEGACY_HOME_RELATIVE_PROGRAMS: [&str; 2] = [".cargo/bin/plug", ".local/bin/plug"];
+const LEGACY_HOME_RELATIVE_PROGRAMS: [&str; 2] =
+    [".cargo/bin/plug", plug_core::paths::COMMAND_LINK];
 const LEGACY_CELLAR_ROOTS: [&str; 2] = ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"];
+
+/// Every place a recognized older Plug could be installed, each Cellar
+/// version included, whether or not anything is there.
+pub(crate) fn legacy_program_candidates() -> Vec<PathBuf> {
+    let mut candidates: Vec<PathBuf> = LEGACY_EXACT_PROGRAMS.iter().map(PathBuf::from).collect();
+    if let Some(home) = dirs::home_dir() {
+        candidates.extend(
+            LEGACY_HOME_RELATIVE_PROGRAMS
+                .iter()
+                .map(|suffix| home.join(suffix)),
+        );
+    }
+    for root in LEGACY_CELLAR_ROOTS {
+        if let Ok(versions) = std::fs::read_dir(root) {
+            candidates.extend(
+                versions
+                    .flatten()
+                    .map(|version| version.path().join("bin/plug")),
+            );
+        }
+    }
+    candidates
+}
 
 /// Keep in lockstep with `LegacyPlugProgram.isRecognized` in Plug.app.
 pub(crate) fn is_recognized_legacy_program(program: &Path) -> bool {

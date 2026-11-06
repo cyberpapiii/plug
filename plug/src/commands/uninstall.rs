@@ -67,9 +67,7 @@ fn uninstall_cleanup() -> anyhow::Result<UninstallCleanupReport> {
             None
         }
     };
-    let command_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/bin/plug");
+    let command_path = plug_core::paths::command_link();
     items.push(cleanup_command_link(&command_path, app.as_ref())?);
 
     let jobs = match crate::service::discover_launchd_jobs(

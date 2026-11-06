@@ -281,22 +281,14 @@ fn verify_shadow_identity(path: &Path) -> bool {
 pub fn discover_shadow_installations(
     app: Option<&VerifiedAppInstallation>,
 ) -> Vec<ShadowInstallation> {
-    let mut candidates = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(("cargo", home.join(".cargo/bin/plug")));
-    }
-    candidates.push(("homebrew", PathBuf::from("/opt/homebrew/bin/plug")));
-    candidates.push(("homebrew", PathBuf::from("/usr/local/bin/plug")));
-    for cellar in ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"] {
-        if let Ok(versions) = std::fs::read_dir(cellar) {
-            for version in versions.flatten() {
-                candidates.push(("homebrew_formula", version.path().join("bin/plug")));
-            }
-        }
-    }
-
+    let mut candidates: Vec<(&str, PathBuf)> = crate::service::legacy_program_candidates()
+        .into_iter()
+        .map(|path| (shadow_kind(&path), path))
+        .collect();
     candidates.sort_by(|left, right| left.1.cmp(&right.1));
-    candidates.dedup_by(|left, right| left.1 == right.1);
+    // `opt/plug/bin/plug` links into the Cellar; report each file once.
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|(_, path)| seen.insert(std::fs::canonicalize(path).unwrap_or(path.clone())));
     candidates
         .into_iter()
         .filter(|(_, path)| path.exists())
@@ -307,6 +299,20 @@ pub fn discover_shadow_installations(
             path,
         })
         .collect()
+}
+
+/// How an older Plug at `path` was installed, by where it is.
+fn shadow_kind(path: &Path) -> &'static str {
+    let text = path.to_string_lossy();
+    if text.contains("/Cellar/") {
+        "homebrew_formula"
+    } else if text.contains("/.cargo/") {
+        "cargo"
+    } else if text.starts_with("/opt/homebrew/") || text.starts_with("/usr/local/") {
+        "homebrew"
+    } else {
+        "local"
+    }
 }
 
 fn verify_candidate(bundle_version: &str, executable_version: &str) -> Result<()> {
