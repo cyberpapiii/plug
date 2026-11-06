@@ -1659,9 +1659,7 @@ mod tests {
     use plug_core::config::{Config, ServerConfig};
     use plug_core::engine::Engine;
     use plug_core::legacy_tasks::TaskMetadata;
-    use plug_core::paths::test::{
-        clear as clear_test_runtime_paths, set as set_test_runtime_paths,
-    };
+    use plug_core::paths::test::set as set_test_runtime_paths;
     use plug_core::test_helpers::mock_server;
     use rmcp::handler::client::ClientHandler;
     use rmcp::model::{
@@ -1725,22 +1723,6 @@ mod tests {
         fn drop(&mut self) {
             READ_WATCHDOG_TEST_OVERRIDE_MS.store(0, std::sync::atomic::Ordering::SeqCst);
         }
-    }
-
-    fn artifact_base_dir() -> PathBuf {
-        directories::ProjectDirs::from("", "", "plug")
-            .map(|dirs| dirs.cache_dir().join("artifacts"))
-            .unwrap_or_else(|| std::env::temp_dir().join("plug-artifacts"))
-    }
-
-    fn cleanup_artifact_uri(uri: &str) {
-        let Some(rest) = uri.strip_prefix("plug://artifact/") else {
-            return;
-        };
-        let Some((id, _)) = rest.split_once('/') else {
-            return;
-        };
-        let _ = std::fs::remove_dir_all(artifact_base_dir().join(id));
     }
 
     #[derive(Clone)]
@@ -1860,7 +1842,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -1987,8 +1969,6 @@ mod tests {
             .await
             .expect("restarted daemon task join")
             .expect("restarted daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2004,7 +1984,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2146,8 +2126,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2163,7 +2141,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2256,8 +2234,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2273,7 +2249,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2396,8 +2372,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2413,7 +2387,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2471,8 +2445,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2510,7 +2482,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2567,8 +2539,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2584,7 +2554,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2644,8 +2614,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2661,7 +2629,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2755,8 +2723,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2772,7 +2738,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2862,14 +2828,11 @@ mod tests {
             .expect("read rehydrated manifest");
         assert_eq!(manifest.contents.len(), 1);
 
-        cleanup_artifact_uri(&manifest_uri);
         engine_b.shutdown().await;
         daemon_b
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -2987,7 +2950,7 @@ mod tests {
     async fn session_setup_rejects_a_registration_for_another_client() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("register-mismatch");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3032,7 +2995,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -3043,7 +3005,7 @@ mod tests {
     async fn a_resource_update_during_setup_is_kept_for_the_host() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("setup-push");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3103,7 +3065,6 @@ mod tests {
         ));
 
         daemon_task.await.expect("daemon task join");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -3253,7 +3214,7 @@ mod tests {
     async fn modern_daemon_proxy_starts_with_discover_without_initialize() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("modern-discover");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let mut delegated_capabilities = ServerCapabilities::builder()
             .enable_tools()
@@ -3396,7 +3357,6 @@ mod tests {
             .await
             .expect("fake daemon completes")
             .expect("daemon task");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(temp);
     }
 
@@ -3404,7 +3364,7 @@ mod tests {
     async fn cancellation_uses_auxiliary_socket_while_primary_request_is_locked() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("oob-cancel");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let request_id =
@@ -3462,7 +3422,6 @@ mod tests {
         .expect("daemon accepts cancellation");
 
         daemon_task.await.expect("daemon task");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(temp);
     }
 
@@ -3470,7 +3429,7 @@ mod tests {
     async fn daemon_gate_push_disables_modern_on_existing_proxy() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("gate-push");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3519,7 +3478,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(temp);
     }
 
@@ -3527,7 +3485,7 @@ mod tests {
     async fn reconnect_publishes_disabled_gate_before_new_session() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("reconnect-gate");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3564,7 +3522,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(temp);
     }
 
@@ -3594,7 +3551,7 @@ mod tests {
     async fn reconnect_replays_client_capabilities() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("reconnect-caps");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         // A non-default capabilities value so the "replayed == negotiated"
         // assertion below can't trivially pass by matching two empty structs.
@@ -3690,8 +3647,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -3699,7 +3654,7 @@ mod tests {
     async fn reconnect_replays_subscriptions() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("reconnect-subs");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3765,8 +3720,6 @@ mod tests {
         assert!(matches!(response, IpcResponse::Pong));
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -3774,7 +3727,7 @@ mod tests {
     async fn reconnect_replay_failure_does_not_fail_session() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("reconnect-replay-fail");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -3865,8 +3818,6 @@ mod tests {
         assert!(matches!(response, IpcResponse::McpResponse { .. }));
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -3874,7 +3825,7 @@ mod tests {
     async fn unsubscribe_removes_from_replay_set() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("unsub-replay");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4024,8 +3975,6 @@ mod tests {
             .expect("list_all_tools should succeed after reconnect");
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4033,7 +3982,7 @@ mod tests {
     async fn retry_policy_safe_rebuilds_against_new_session() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("retry-safe");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4079,8 +4028,6 @@ mod tests {
         assert!(matches!(response, IpcResponse::Pong));
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4088,7 +4035,7 @@ mod tests {
     async fn a_call_that_was_never_sent_is_sent_after_the_reconnect() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("retry-never-sent");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4133,8 +4080,6 @@ mod tests {
         assert!(matches!(response, IpcResponse::Pong));
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4142,7 +4087,7 @@ mod tests {
     async fn retry_policy_unsafe_surfaces_retry_error() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("retry-unsafe");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4191,8 +4136,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4200,7 +4143,7 @@ mod tests {
     async fn notifications_interleaved_before_response_are_forwarded() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("interleave");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4291,8 +4234,6 @@ mod tests {
         assert!(captured[0].contains("hello from daemon"));
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4300,7 +4241,7 @@ mod tests {
     async fn chunked_response_reassembly() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("chunked");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4370,8 +4311,6 @@ mod tests {
         assert_eq!(text.text.len(), 6 * 1024 * 1024);
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4379,7 +4318,7 @@ mod tests {
     async fn malformed_frame_is_reconnectable_failure() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("malformed");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4521,8 +4460,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4586,7 +4523,7 @@ mod tests {
         // use the test-only override instead of paused time.
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
         let temp = unique_temp_dir("stall");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4722,8 +4659,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4732,7 +4667,7 @@ mod tests {
         let _guard = daemon_test_lock().lock().await;
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
         let temp = unique_temp_dir("watchdog-reset");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -4824,8 +4759,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4884,7 +4817,7 @@ mod tests {
     async fn tool_result_with_an_envelope_key_is_not_mistaken_for_an_envelope() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("envelope-key");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let payload = serde_json::to_value(CallToolResult::structured(
             serde_json::json!({ "envelope": "sealed" }),
@@ -4906,7 +4839,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4914,7 +4846,7 @@ mod tests {
     async fn upstream_error_for_resources_read_reaches_the_client_as_that_error() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("read-error");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let payload = serde_json::to_value(McpError::resource_not_found(
             "no such resource: file:///missing",
@@ -4938,7 +4870,6 @@ mod tests {
         assert!(error.message.contains("no such resource"), "{error:?}");
 
         daemon_task.await.expect("daemon task join");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -4946,7 +4877,7 @@ mod tests {
     async fn update_roots_consumes_its_reply_past_a_gate_push() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("roots-gate");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5011,7 +4942,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -5125,7 +5055,7 @@ mod tests {
     async fn concurrent_calls_complete_out_of_order_and_notifications_still_arrive() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("concurrent-calls");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let (release_slow, slow_released) = tokio::sync::oneshot::channel::<()>();
@@ -5215,7 +5145,6 @@ mod tests {
 
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -5223,7 +5152,7 @@ mod tests {
     async fn chunked_reply_and_small_reply_route_to_their_own_requests() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("concurrent-chunked");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5277,7 +5206,6 @@ mod tests {
 
         drop(proxy);
         let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -5285,7 +5213,7 @@ mod tests {
     async fn connection_drop_resolves_every_in_flight_request_with_one_reconnect() {
         let _guard = daemon_test_lock().lock().await;
         let temp = unique_temp_dir("concurrent-drop");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5340,7 +5268,6 @@ mod tests {
             .await
             .expect("daemon task timeout")
             .expect("daemon task join");
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 
@@ -5370,7 +5297,7 @@ mod tests {
         let _guard = daemon_test_lock().lock().await;
         let _ceiling = RequestCeilingTestOverride::install(Duration::from_millis(500));
         let temp = unique_temp_dir("request-ceiling");
-        set_test_runtime_paths(temp.join("r"), temp.join("s"));
+        let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5418,7 +5345,6 @@ mod tests {
 
         drop(proxy);
         let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
-        clear_test_runtime_paths();
         let _ = std::fs::remove_dir_all(&temp);
     }
 }

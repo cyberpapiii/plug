@@ -30,8 +30,7 @@ use framing::FrameReader;
 
 #[cfg(test)]
 pub(crate) use plug_core::paths::test::{
-    clear as clear_test_runtime_paths, lock as runtime_paths_test_lock,
-    set as set_test_runtime_paths,
+    lock as runtime_paths_test_lock, set as set_test_runtime_paths,
 };
 use plug_core::paths::{log_dir, pid_path, socket_path, token_path};
 
@@ -1954,28 +1953,31 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
 /// room for upstream shutdown after the drain.
 const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Wait for SIGTERM or SIGINT (for daemon mode), then let running tool calls
-/// finish before cancelling. Clients and transports stay up while the calls
-/// drain, so an update or a stop does not fail a call an agent is waiting on.
-///
-/// Systemd sends SIGTERM for graceful shutdown, not SIGINT.
-#[cfg(unix)]
-pub async fn shutdown_signal(cancel: CancellationToken, router: Arc<ToolRouter>) {
+/// When `stop` resolves, let running tool calls finish, then cancel. Clients
+/// and transports stay up while the calls drain, so an update or a stop does
+/// not fail a call an agent is waiting on. Returns at once when something else
+/// cancels first.
+pub(crate) async fn shutdown_on(
+    stop: impl Future<Output = ()>,
+    cancel: CancellationToken,
+    router: Arc<ToolRouter>,
+) {
+    tokio::select! {
+        () = stop => drain_calls(&router).await,
+        () = cancel.cancelled() => {}
+    }
+    cancel.cancel();
+}
+
+/// SIGTERM, which launchd sends to stop the daemon, or SIGINT.
+pub(crate) async fn termination_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     tokio::select! {
-        _ = sigterm.recv() => {
-            tracing::info!("received SIGTERM");
-            drain_calls(&router).await;
-        }
-        _ = sigint.recv() => {
-            tracing::info!("received SIGINT");
-            drain_calls(&router).await;
-        }
-        _ = cancel.cancelled() => {}
+        _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+        _ = sigint.recv() => tracing::info!("received SIGINT"),
     }
-    cancel.cancel();
 }
 
 async fn drain_calls(router: &ToolRouter) {
@@ -1987,18 +1989,6 @@ async fn drain_calls(router: &ToolRouter) {
     } else {
         tracing::warn!(waited_ms, remaining, "tool calls still running at shutdown");
     }
-}
-
-/// Fallback for non-Unix platforms.
-#[cfg(not(unix))]
-pub async fn shutdown_signal(cancel: CancellationToken, _router: Arc<ToolRouter>) {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C");
-        }
-        _ = cancel.cancelled() => {}
-    }
-    cancel.cancel();
 }
 
 // ──────────────────────── File logging setup ─────────────────────────────────
@@ -2721,7 +2711,7 @@ allowed_servers = ["slack"]
         ));
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
@@ -2762,7 +2752,6 @@ allowed_servers = ["slack"]
         );
 
         drop(winning_lock);
-        clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
@@ -2782,7 +2771,7 @@ allowed_servers = ["slack"]
         let state_root = std::env::temp_dir().join(format!("plug-ebs-{}", &suffix[..8]));
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
         // flight until the upstream timeout expires.
@@ -2829,7 +2818,6 @@ allowed_servers = ["slack"]
         engine.cancel_token().cancel();
         startup.abort();
         daemon.abort();
-        clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).ok();
         std::fs::remove_dir_all(state_root).ok();
     }
@@ -2851,7 +2839,7 @@ allowed_servers = ["slack"]
         ));
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2872,7 +2860,6 @@ allowed_servers = ["slack"]
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
-        clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
@@ -2892,7 +2879,7 @@ allowed_servers = ["slack"]
         ));
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2914,8 +2901,6 @@ allowed_servers = ["slack"]
         let token_after =
             std::fs::read_to_string(&token_file).expect("read token after failed startup");
         assert_eq!(token_after, "stable-token");
-
-        clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }

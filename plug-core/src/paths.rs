@@ -123,6 +123,10 @@ pub fn slack_events_dir() -> PathBuf {
 
 /// Large tool results kept for a client to read in parts.
 pub fn artifacts_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-helpers"))]
+    if let Some((dir, _)) = test::paths() {
+        return dir.join("artifacts");
+    }
     home().join("Library/Caches/plug/artifacts")
 }
 
@@ -166,14 +170,21 @@ pub mod test {
         paths().is_some()
     }
 
-    /// Put Plug's folder under `runtime` and its logs under `state`.
-    pub fn set(runtime: PathBuf, state: PathBuf) {
+    /// Put Plug's folder under `runtime` and its logs under `state` until the
+    /// returned guard drops, which it also does when the test panics.
+    pub fn set(runtime: PathBuf, state: PathBuf) -> Set {
         *slot().lock().unwrap_or_else(PoisonError::into_inner) =
             Some((runtime.join("plug"), state.join("plug/logs")));
+        Set(())
     }
 
-    pub fn clear() {
-        *slot().lock().unwrap_or_else(PoisonError::into_inner) = None;
+    #[must_use = "the paths are cleared when this guard drops"]
+    pub struct Set(());
+
+    impl Drop for Set {
+        fn drop(&mut self) {
+            *slot().lock().unwrap_or_else(PoisonError::into_inner) = None;
+        }
     }
 
     /// Held by every test that sets the paths, for as long as they are set,

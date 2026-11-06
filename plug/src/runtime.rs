@@ -780,9 +780,18 @@ pub(crate) async fn cmd_start(
 
 pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     require_canonical_daemon_owner()?;
+    serve_until(config_path, daemon::termination_signal()).await
+}
+
+/// Run the daemon until `stop` resolves or an operator asks it to shut down.
+/// Either way it lets running calls drain, then the socket, the PID file and
+/// the token are removed and HTTP shuts down gracefully before this returns.
+async fn serve_until(
+    config_path: Option<&std::path::PathBuf>,
+    stop: impl std::future::Future<Output = ()>,
+) -> anyhow::Result<()> {
     // Claim daemon ownership before Engine::start() can read Keychain entries
-    // or spawn upstream processes. Concurrent `plug connect` auto-starts lose
-    // here and simply retry the winning daemon's socket.
+    // or spawn upstream processes.
     let runtime_lock = daemon::acquire_runtime_lock()?;
     let config_path = config_path
         .cloned()
@@ -791,17 +800,9 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
     preflight_http_bind(&config.http)?;
     let engine = plug_core::engine::Engine::new(config);
 
-    // Upstream startup no longer gates the IPC socket. `Engine::start` waits on
-    // third-party server processes, so it can run for tens of seconds, and
-    // binding the socket after it made a healthy cold start indistinguishable
-    // from an absent daemon for that whole window: `plug connect` retried, gave
-    // up, or force-kickstarted the very start it was waiting on. Local clients
-    // now reach a socket immediately and see servers appear through the
-    // `list_changed` notifications the router already sends.
-    //
-    // Downstream HTTP keeps the old ordering below. Remote clients cannot be
-    // told the catalog grew, so for them a bound port must continue to mean a
-    // complete catalog.
+    // The IPC socket binds at once; local clients see servers arrive through
+    // `list_changed`. Remote clients cannot be told the catalog grew, so HTTP
+    // binds only after the whole catalog has started.
     let (started_tx, started_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
     let startup = {
         let engine = engine.clone();
@@ -824,43 +825,50 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         engine.tracker(),
     ));
     let http_config = engine.config().http.clone();
-    let http_cancel = engine.cancel_token().clone();
     let http_router = http_runtime.router;
-    let http_future = async move {
-        match started_rx.await {
+    let http = async {
+        let started = tokio::select! {
+            started = started_rx => started,
+            () = cancel.cancelled() => return Ok(()),
+        };
+        match started {
             Ok(result) => result?,
             Err(_) => anyhow::bail!("daemon startup ended without reporting a result"),
         }
-        serve_router(http_router, &http_config, http_cancel).await
+        serve_router(http_router, &http_config, cancel.clone()).await
     };
-    tokio::pin!(http_future);
     // launchd's record of who started this process does not change while
     // it runs, and reading it runs `launchctl`.
     let ownership = tokio::task::spawn_blocking(crate::service::ipc_ownership)
         .await
         .unwrap_or(plug_core::ipc::DaemonOwnershipMode::Unknown);
-    let daemon_future = daemon::run_daemon_with_lock(
+    let ipc = daemon::run_daemon_with_lock(
         engine.clone(),
         config_path,
         http_runtime.state,
         runtime_lock,
         ownership,
     );
-    tokio::pin!(daemon_future);
-    tokio::select! {
-        result = &mut http_future => {
-            result?;
-        }
-        result = &mut daemon_future => {
-            result?;
-        }
-        _ = daemon::shutdown_signal(cancel, engine.tool_router().clone()) => {}
-    }
+    // Whichever side ends first ends the other through the cancel token, and
+    // both are awaited, so each runs its own teardown.
+    let (http_result, ipc_result, ()) = tokio::join!(
+        async {
+            let result = http.await;
+            cancel.cancel();
+            result
+        },
+        async {
+            let result = ipc.await;
+            cancel.cancel();
+            result
+        },
+        daemon::shutdown_on(stop, cancel.clone(), engine.tool_router().clone()),
+    );
     // A cold start still in flight owns upstreams that shutdown has to retire,
     // so give it a bounded chance to finish before anything is torn down.
     let _ = tokio::time::timeout(std::time::Duration::from_secs(5), startup).await;
     engine.shutdown().await;
-    Ok(())
+    ipc_result.and(http_result)
 }
 
 #[cfg(any(target_os = "macos", test))]
@@ -938,10 +946,6 @@ fn restart_advice_for(app_installed: bool) -> &'static str {
     }
 }
 
-pub(crate) async fn cmd_serve(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    cmd_daemon(config_path).await
-}
-
 fn resolve_downstream_bearer_token(
     http: &plug_core::config::HttpConfig,
 ) -> anyhow::Result<Option<Arc<str>>> {
@@ -999,7 +1003,7 @@ async fn serve_router(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::{clear_test_runtime_paths, run_daemon, set_test_runtime_paths};
+    use crate::daemon::{run_daemon, set_test_runtime_paths};
     use std::path::PathBuf;
     use std::sync::Arc;
 
@@ -1421,7 +1425,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
@@ -1457,10 +1461,91 @@ mod tests {
             .expect("daemon join timed out")
             .expect("daemon task join");
         assert!(daemon_result.is_ok(), "daemon should shut down cleanly");
-
-        clear_test_runtime_paths();
         std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
         std::fs::remove_dir_all(state_root).expect("cleanup state root");
+    }
+
+    /// A stop signal and an operator `Shutdown` end in the same teardown: when
+    /// the daemon returns, its socket, PID file and token are gone and its
+    /// HTTP port no longer accepts connections.
+    #[tokio::test]
+    async fn every_way_of_stopping_the_daemon_cleans_up() {
+        let _guard = runtime_path_test_lock().lock().await;
+        for via_operator in [false, true] {
+            let temp = std::env::temp_dir().join(format!(
+                "pst-{}",
+                &uuid::Uuid::new_v4().simple().to_string()[..8]
+            ));
+            let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
+            std::fs::create_dir_all(plug_core::paths::dir()).expect("create runtime dir");
+            let mut config = plug_core::config::Config::default();
+            let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
+            let port = probe.local_addr().expect("HTTP address").port();
+            drop(probe);
+            config.http.port = port;
+            let config_path = plug_core::paths::dir().join("config.toml");
+            std::fs::write(
+                &config_path,
+                toml::to_string(&config).expect("serialize config"),
+            )
+            .expect("write config");
+
+            let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let daemon = tokio::spawn(async move {
+                serve_until(Some(&config_path), async {
+                    let _ = stop_rx.await;
+                })
+                .await
+            });
+            tokio::time::timeout(Duration::from_secs(5), crate::ipc_client::wait_for_daemon())
+                .await
+                .expect("daemon socket never came up");
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err()
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("HTTP never came up");
+
+            if via_operator {
+                let response =
+                    crate::ipc_client::operator(plug_core::ipc::OperatorRequest::Shutdown)
+                        .await
+                        .expect("send Shutdown");
+                assert!(matches!(response, plug_core::ipc::IpcResponse::Ok));
+            } else {
+                stop_tx.send(()).expect("daemon is listening for the stop");
+            }
+            tokio::time::timeout(Duration::from_secs(15), daemon)
+                .await
+                .expect("daemon did not stop")
+                .expect("daemon task join")
+                .expect("daemon stops cleanly");
+
+            assert!(
+                !plug_core::paths::socket_path().exists(),
+                "socket left behind"
+            );
+            assert!(
+                !plug_core::paths::pid_path().exists(),
+                "PID file left behind"
+            );
+            assert!(
+                !plug_core::paths::token_path().exists(),
+                "token left behind"
+            );
+            assert!(
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .is_err(),
+                "HTTP still accepts connections"
+            );
+            let _ = std::fs::remove_dir_all(&temp);
+        }
     }
 
     async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {

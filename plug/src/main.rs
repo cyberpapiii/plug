@@ -3,16 +3,16 @@
 // retains them while MCP 2025-11-25 remains the default negotiated revision.
 #![allow(deprecated)]
 
-/// Load `.env` file vars into the process environment.
-///
-/// SAFETY: Called before tokio runtime starts (single-threaded at this point).
-/// `set_var` is unsafe in Rust 2024 because it's not thread-safe, but we're
-/// guaranteed single-threaded here since this runs before `#[tokio::main]`.
+/// Load `.env` file vars into the process environment, so config expansion
+/// and every upstream process Plug starts see them.
 #[allow(unsafe_code)]
 fn apply_dotenv() {
     for (key, value) in
         plug_core::config::env::dotenv_to_apply(&plug_core::paths::default_config_path())
     {
+        // SAFETY: `main` calls this before it builds the tokio runtime, while
+        // the process has only its main thread, so nothing reads or writes the
+        // environment concurrently.
         unsafe {
             std::env::set_var(&key, &value);
         }
@@ -537,10 +537,16 @@ pub(crate) enum OwnerCommands {
     },
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
     install::maybe_delegate_to_app()?;
     apply_dotenv();
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> anyhow::Result<()> {
     plug_core::tls::ensure_rustls_provider_installed();
 
     let cli = Cli::parse();
@@ -565,18 +571,16 @@ async fn main() -> anyhow::Result<()> {
             ipc_proxy::cmd_connect(cli.config.as_ref(), client).await?
         }
         Some(Commands::Serve { daemon }) => {
-            if daemon {
-                // Stderr is the only place this error would otherwise land, and
-                // the app-owned LaunchAgent redirects stderr nowhere. Record the
-                // reason in the daemon log so a restart loop can be diagnosed.
-                runtime::cmd_daemon(cli.config.as_ref())
-                    .await
-                    .inspect_err(|error| {
+            // Stderr is the only place this error would otherwise land, and
+            // the app-owned LaunchAgent redirects stderr nowhere. Record the
+            // reason in the daemon log so a restart loop can be diagnosed.
+            runtime::cmd_daemon(cli.config.as_ref())
+                .await
+                .inspect_err(|error| {
+                    if daemon {
                         tracing::error!(error = %error, "daemon exited with a fatal error");
-                    })?;
-            } else {
-                runtime::cmd_serve(cli.config.as_ref()).await?;
-            }
+                    }
+                })?;
         }
         Some(Commands::Status { show_token }) => {
             views::overview::cmd_status(
