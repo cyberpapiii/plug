@@ -26,7 +26,7 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
 
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
+use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 
 use crate::config::HttpConfig;
 
@@ -55,7 +55,6 @@ const MAX_PENDING_CONSENTS_PER_CLIENT: usize = 5;
 const MAX_ACCESS_TOKENS_PER_CLIENT: usize = 10;
 const MAX_REGISTRATION_RATE_KEYS: usize = 10_000;
 const MAX_METADATA_DOCUMENT_BYTES: usize = 64 * 1024;
-const PARENT_DIR_SYNC_ATTEMPTS: usize = 3;
 /// Attempts to take the issuer state lock, spread over
 /// [`STATE_LOCK_RETRY_INTERVAL`]. Long enough to outlast a departing writer's
 /// close, short enough that a genuinely occupied lock still fails startup fast.
@@ -119,7 +118,6 @@ pub(crate) fn inspect_owner_enrollment_in_dir(
         Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
     };
     {
-        use std::os::unix::fs::PermissionsExt as _;
         let Ok(metadata) = file.metadata() else {
             return OwnerEnrollmentStatus::StateUnavailable;
         };
@@ -731,7 +729,7 @@ impl DownstreamOauthManager {
         let state_dir = state_path
             .parent()
             .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
-        sync_parent_dir_with_retry(state_dir).map_err(|error| {
+        crate::fs_perm::sync_dir(state_dir).map_err(|error| {
             DownstreamOauthError::Persistence(format!(
                 "downstream OAuth startup directory sync failed for {}: {error}",
                 state_dir.display()
@@ -775,7 +773,7 @@ impl DownstreamOauthManager {
             && self
                 .state_path
                 .parent()
-                .is_some_and(|dir| sync_parent_dir(dir).is_ok())
+                .is_some_and(|dir| run_blocking_io(|| crate::fs_perm::sync_dir(dir)).is_ok())
         {
             self.durability_degraded.store(false, Ordering::SeqCst);
             tracing::info!("downstream OAuth state is durable again");
@@ -799,8 +797,8 @@ impl DownstreamOauthManager {
         let outcome = persist_state(&self.state_path, &next)?;
         *live = next;
         match outcome {
-            PersistOutcome::Durable => Ok(()),
-            PersistOutcome::CommittedDurabilityUncertain(error) => {
+            crate::fs_perm::Durability::Durable => Ok(()),
+            crate::fs_perm::Durability::Uncertain(error) => {
                 self.durability_degraded.store(true, Ordering::SeqCst);
                 tracing::error!(
                     state_path = %self.state_path.display(),
@@ -808,7 +806,8 @@ impl DownstreamOauthManager {
                     "downstream OAuth entered fail-closed durability-degraded state"
                 );
                 Err(DownstreamOauthError::Persistence(format!(
-                    "state rename committed but parent directory durability remains uncertain after {PARENT_DIR_SYNC_ATTEMPTS} attempts: {error}"
+                    "state rename committed but parent directory durability remains uncertain after {} attempts: {error}",
+                    crate::fs_perm::DIR_SYNC_ATTEMPTS
                 )))
             }
         }
@@ -1976,8 +1975,12 @@ fn registered_redirect_matches(registered: &str, requested: &str) -> bool {
     // Only the port may vary; token exchange still requires the actual callback.
     if registered.scheme() != "http"
         || requested.scheme() != "http"
-        || !registered.host_str().is_some_and(is_loopback_host)
-        || !requested.host_str().is_some_and(is_loopback_host)
+        || !registered
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
+        || !requested
+            .host_str()
+            .is_some_and(crate::config::is_loopback_host)
     {
         return false;
     }
@@ -2006,17 +2009,9 @@ fn valid_redirect_uri(value: &str) -> bool {
     }
     match uri.scheme() {
         "https" => true,
-        "http" => uri.host_str().is_some_and(is_loopback_host),
+        "http" => uri.host_str().is_some_and(crate::config::is_loopback_host),
         _ => false,
     }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    host.eq_ignore_ascii_case("localhost")
-        || host
-            .trim_matches(['[', ']'])
-            .parse::<IpAddr>()
-            .is_ok_and(|ip| ip.is_loopback())
 }
 
 fn validate_metadata_document(
@@ -2435,19 +2430,14 @@ fn load_persisted_state(
     Ok(state)
 }
 
-#[derive(Debug)]
-enum PersistOutcome {
-    Durable,
-    CommittedDurabilityUncertain(std::io::Error),
-}
-
 fn persist_state(
     path: &std::path::Path,
     state: &DownstreamOauthState,
-) -> Result<PersistOutcome, DownstreamOauthError> {
+) -> Result<crate::fs_perm::Durability, DownstreamOauthError> {
     let json = serde_json::to_vec(state)
         .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    run_blocking_io(|| persist_bytes(path, &json))
+    run_blocking_io(|| crate::fs_perm::write_private(path, &json))
+        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))
 }
 
 /// Run a blocking state write without stalling the other tasks scheduled on
@@ -2467,76 +2457,6 @@ fn run_blocking_io<T>(write: impl FnOnce() -> T) -> T {
         }
         _ => write(),
     }
-}
-
-fn persist_bytes(
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> Result<PersistOutcome, DownstreamOauthError> {
-    let dir = path
-        .parent()
-        .ok_or_else(|| DownstreamOauthError::Persistence("invalid state path".to_string()))?;
-    crate::fs_perm::ensure_dir_0700(dir)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-    let tmp = temporary_state_path(path);
-    let mut options = std::fs::OpenOptions::new();
-    options.create_new(true).write(true);
-    options.mode(0o600);
-    {
-        use std::io::Write as _;
-        let mut file = options
-            .open(&tmp)
-            .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
-        let write_result = file.write_all(bytes).and_then(|_| file.sync_all());
-        drop(file);
-        if let Err(error) = write_result {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(DownstreamOauthError::Persistence(error.to_string()));
-        }
-    }
-    if let Err(error) = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600)) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(error.to_string()));
-    }
-    #[cfg(test)]
-    if FAIL_NEXT_STATE_RENAME.replace(false) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(
-            "injected state rename failure".to_string(),
-        ));
-    }
-    if let Err(error) = std::fs::rename(&tmp, path) {
-        let _ = std::fs::remove_file(&tmp);
-        return Err(DownstreamOauthError::Persistence(error.to_string()));
-    }
-    Ok(match sync_parent_dir_with_retry(dir) {
-        Ok(()) => PersistOutcome::Durable,
-        Err(error) => PersistOutcome::CommittedDurabilityUncertain(error),
-    })
-}
-
-#[cfg(test)]
-std::thread_local! {
-    static FAIL_PARENT_DIR_SYNC_ATTEMPTS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    static FAIL_NEXT_STATE_RENAME: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-#[cfg(test)]
-fn fail_next_parent_dir_sync_attempts_for_tests(attempts: usize) {
-    FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(attempts);
-}
-
-#[cfg(test)]
-fn fail_next_state_rename_for_tests() {
-    FAIL_NEXT_STATE_RENAME.set(true);
-}
-
-fn temporary_state_path(path: &std::path::Path) -> PathBuf {
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("state.json");
-    path.with_file_name(format!(".{file_name}.{}.tmp", uuid::Uuid::new_v4()))
 }
 
 fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, DownstreamOauthError> {
@@ -2559,22 +2479,21 @@ fn acquire_state_lock(path: &std::path::Path) -> Result<std::fs::File, Downstrea
     // and refusing there turns an ordinary daemon restart into a startup failure
     // that only a second restart clears. A live writer still holds the lock well
     // past this window, so the guard keeps its meaning.
-    for attempt in 0..STATE_LOCK_ATTEMPTS {
+    let mut attempt = 1;
+    loop {
         match fs4::FileExt::try_lock(&file) {
             Ok(()) => return Ok(file),
             // An I/O error will not resolve itself by waiting.
             Err(error @ fs4::TryLockError::Error(_)) => {
                 return Err(lock_held_error(path, &error));
             }
-            Err(error @ fs4::TryLockError::WouldBlock) => {
-                if attempt + 1 == STATE_LOCK_ATTEMPTS {
-                    return Err(lock_held_error(path, &error));
-                }
+            Err(error @ fs4::TryLockError::WouldBlock) if attempt == STATE_LOCK_ATTEMPTS => {
+                return Err(lock_held_error(path, &error));
             }
+            Err(fs4::TryLockError::WouldBlock) => attempt += 1,
         }
         std::thread::sleep(STATE_LOCK_RETRY_INTERVAL);
     }
-    Err(lock_held_error(path, &fs4::TryLockError::WouldBlock))
 }
 
 fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> DownstreamOauthError {
@@ -2582,35 +2501,6 @@ fn lock_held_error(path: &std::path::Path, error: &fs4::TryLockError) -> Downstr
         "downstream OAuth issuer state writer is already active for {}: {error}",
         path.display()
     ))
-}
-
-fn sync_parent_dir_with_retry(dir: &std::path::Path) -> std::io::Result<()> {
-    let mut last_error = None;
-    for attempt in 0..PARENT_DIR_SYNC_ATTEMPTS {
-        match sync_parent_dir(dir) {
-            Ok(()) => return Ok(()),
-            Err(error) => last_error = Some(error),
-        }
-        if attempt + 1 < PARENT_DIR_SYNC_ATTEMPTS {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-    }
-    Err(last_error.unwrap_or_else(|| std::io::Error::other("directory sync was not attempted")))
-}
-
-fn sync_parent_dir(dir: &std::path::Path) -> std::io::Result<()> {
-    #[cfg(test)]
-    {
-        let remaining = FAIL_PARENT_DIR_SYNC_ATTEMPTS.get();
-        if remaining > 0 {
-            FAIL_PARENT_DIR_SYNC_ATTEMPTS.set(remaining - 1);
-            return Err(std::io::Error::other(
-                "injected parent directory sync failure",
-            ));
-        }
-    }
-
-    std::fs::File::open(dir)?.sync_all()
 }
 
 #[cfg(test)]
@@ -3276,7 +3166,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
         assert!(matches!(
             manager
                 .finish_owner_registration(&challenge.ceremony_id, response)
@@ -3323,7 +3213,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         assert!(matches!(
             manager
                 .finish_owner_approval(&challenge.ceremony_id, response)
@@ -3617,7 +3507,7 @@ mod tests {
             "https://plug.example.com",
             true,
         );
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
         assert!(matches!(
             manager
                 .finish_owner_approval(&challenge.ceremony_id, response)
@@ -4202,7 +4092,7 @@ mod tests {
     async fn authorization_start_sync_failure_fails_closed_with_aligned_recovery() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager
             .begin_authorization(AuthorizationRequest {
@@ -4552,7 +4442,7 @@ mod tests {
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
         let original = issue_tokens(&manager, &client).await;
         let original_refresh = original.refresh_token.expect("original refresh token");
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager
             .exchange_refresh_token(
@@ -4584,7 +4474,7 @@ mod tests {
             None
         );
         // While the directory still cannot be synced, nothing new is issued.
-        fail_next_parent_dir_sync_attempts_for_tests(1);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         assert!(matches!(
             manager
                 .exchange_refresh_token(
@@ -4636,7 +4526,7 @@ mod tests {
             Some(claims) => claims.principal_lifecycle,
             other => panic!("expected valid token before revoke, got {other:?}"),
         };
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
 
         let result = manager.revoke_client(&client.client_id).await;
 
@@ -4653,7 +4543,7 @@ mod tests {
         assert!(disk.revoked_client_ids.contains(&client.client_id));
         drop(manager);
 
-        fail_next_parent_dir_sync_attempts_for_tests(PARENT_DIR_SYNC_ATTEMPTS);
+        crate::fs_perm::faults::fail_next_dir_syncs(crate::fs_perm::DIR_SYNC_ATTEMPTS);
         let restart_error =
             DownstreamOauthManager::new_with_state_path(test_config(), path.clone()).expect_err(
                 "restart must refuse service while directory durability remains uncertain",
@@ -4682,7 +4572,7 @@ mod tests {
     async fn pre_rename_failure_publishes_nothing_and_restart_matches() {
         let (manager, path) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_state_rename_for_tests();
+        crate::fs_perm::faults::fail_next_rename();
 
         let result = manager
             .begin_authorization(AuthorizationRequest {
@@ -4716,7 +4606,7 @@ mod tests {
     async fn parent_directory_sync_retry_can_recover_without_degrading() {
         let (manager, _) = test_manager();
         let client = register(&manager, "Cursor", "http://localhost:8787/callback").await;
-        fail_next_parent_dir_sync_attempts_for_tests(1);
+        crate::fs_perm::faults::fail_next_dir_syncs(1);
 
         let consent = manager
             .begin_authorization(AuthorizationRequest {
@@ -4741,19 +4631,6 @@ mod tests {
                 .pending_consents
                 .contains_key(&consent.consent_id)
         );
-    }
-
-    #[test]
-    fn persistence_temp_paths_are_unique_per_writer() {
-        let path = temp_state_path();
-        let first = temporary_state_path(&path);
-        let second = temporary_state_path(&path);
-
-        assert_eq!(first.parent(), path.parent());
-        assert_eq!(second.parent(), path.parent());
-        assert_ne!(first, second);
-        assert_ne!(first, path.with_extension("json.tmp"));
-        assert_ne!(second, path.with_extension("json.tmp"));
     }
 
     #[test]
