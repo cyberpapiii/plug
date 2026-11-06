@@ -104,8 +104,7 @@ pub fn inspect_owner_enrollment(config: &DownstreamOauthConfig) -> OwnerEnrollme
     inspect_owner_enrollment_in_dir(config, &state_dir)
 }
 
-#[doc(hidden)]
-pub fn inspect_owner_enrollment_in_dir(
+pub(crate) fn inspect_owner_enrollment_in_dir(
     config: &DownstreamOauthConfig,
     state_dir: &std::path::Path,
 ) -> OwnerEnrollmentStatus {
@@ -717,7 +716,7 @@ impl DownstreamOauthManager {
         Self::new_with_state_path_and_lock(config, path, state_lock)
     }
 
-    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-helpers"))]
     pub fn new_with_state_path(
         config: DownstreamOauthConfig,
         state_path: PathBuf,
@@ -2417,8 +2416,7 @@ fn state_file_path_in_dir(
     ))
 }
 
-#[doc(hidden)]
-pub fn owner_enrollment_state_path_in_dir(
+pub(crate) fn owner_enrollment_state_path_in_dir(
     config: &DownstreamOauthConfig,
     state_dir: &std::path::Path,
 ) -> PathBuf {

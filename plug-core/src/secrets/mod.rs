@@ -347,16 +347,22 @@ impl Stores {
     /// is a map in memory and the file is a temporary one, so no test reads
     /// or writes the secrets of the person running it.
     pub fn builtin() -> Self {
-        let (keychain, file): (Arc<dyn SecretStore>, _) = if crate::oauth::uses_test_credentials() {
+        #[cfg(any(test, feature = "test-helpers"))]
+        if crate::oauth::uses_test_credentials() {
             let path =
                 std::env::temp_dir().join(format!("plug-test-secrets-{}", std::process::id()));
-            (memory::keychain(), file::File::new(path.join(".env")))
-        } else {
-            (
-                Arc::new(Keychain),
-                file::File::new(crate::dotenv::env_file_path()),
-            )
-        };
+            return Self::with_keychain_and_file(
+                memory::keychain(),
+                file::File::new(path.join(".env")),
+            );
+        }
+        Self::with_keychain_and_file(
+            Arc::new(Keychain),
+            file::File::new(crate::dotenv::env_file_path()),
+        )
+    }
+
+    fn with_keychain_and_file(keychain: Arc<dyn SecretStore>, file: file::File) -> Self {
         Self::default()
             .with(KEYCHAIN, keychain)
             .with(FILE, Arc::new(file))
@@ -677,6 +683,7 @@ impl Stores {
 }
 
 /// The stand-in for the Keychain under test.
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) mod memory {
     use super::*;
     use std::collections::HashMap;

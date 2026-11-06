@@ -48,6 +48,7 @@ const SHORT_LIVED_THRESHOLD: u64 = 600;
 
 /// Seconds added to every wall-clock read in the token-expiry and
 /// refresh-scheduling paths. Always zero outside a test that opts in.
+#[cfg(any(test, feature = "test-helpers"))]
 static TEST_CLOCK_SKEW_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Seconds since the Unix epoch, as every OAuth expiry and refresh-scheduling
@@ -55,27 +56,30 @@ static TEST_CLOCK_SKEW_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 ///
 /// Token lifetimes are measured against the wall clock, which
 /// `tokio::time::pause()` does not touch, so a test that only advances Tokio's
-/// timer sits forever at a token that never expires. This is the one seam that
-/// lets such a test move token expiry forward.
-///
-/// The skew is deliberately additive and forward-only: it can only make a token
-/// look *older* than it is, so the worst a stuck or malicious value could do is
-/// refresh earlier than necessary. Nothing can use it to make an expired token
-/// look fresh.
+/// timer sits forever at a token that never expires. Test builds add
+/// `advance_test_clock`'s skew, which can only make a token look older.
 fn unix_now() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now.saturating_add(TEST_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed))
+    now.saturating_add(test_clock_skew_secs())
 }
 
-/// Move the OAuth clock forward by `secs` for the rest of this process.
-///
-/// Public only so workspace integration tests can drive a background token
-/// refresh without sleeping through a real token lifetime. Forward-only by
-/// construction — see [`unix_now`].
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-helpers"))]
+fn test_clock_skew_secs() -> u64 {
+    TEST_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(any(test, feature = "test-helpers")))]
+const fn test_clock_skew_secs() -> u64 {
+    0
+}
+
+/// Move the OAuth clock forward by `secs` for the rest of this process, so a
+/// test can drive a background token refresh without sleeping through a real
+/// token lifetime.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn advance_test_clock(secs: u64) {
     TEST_CLOCK_SKEW_SECS.fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
 }
@@ -131,6 +135,7 @@ static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
 /// OAuth tests must never touch the operator's login Keychain or production
 /// token directory. Integration-test binaries opt in explicitly; this crate's
 /// unit tests install it lazily on first credential access.
+#[cfg(any(test, feature = "test-helpers"))]
 struct TestCredentialEnvironment {
     tokens_dir: PathBuf,
     keyring: std::sync::Mutex<std::collections::HashMap<String, String>>,
@@ -138,13 +143,11 @@ struct TestCredentialEnvironment {
     failing_keyring_writes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
 static TEST_CREDENTIAL_ENVIRONMENT: OnceLock<TestCredentialEnvironment> = OnceLock::new();
 
 /// Isolate OAuth credentials for the current test process.
-///
-/// This is public only so workspace integration-test binaries can install the
-/// isolated backend before exercising production credential-store code.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn install_test_credential_environment(tokens_dir: PathBuf) {
     let environment = TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
         tokens_dir: tokens_dir.clone(),
@@ -159,11 +162,8 @@ pub fn install_test_credential_environment(tokens_dir: PathBuf) {
 }
 
 /// Seed only the isolated test keyring, without creating a token-file mirror.
-///
-/// This is public only for workspace integration tests that verify runtime
-/// paths do not probe the operator Keychain. It panics outside an explicitly
-/// installed test credential environment.
-#[doc(hidden)]
+/// Panics unless `install_test_credential_environment` ran first.
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn seed_test_keyring_credentials(server_name: &str, credentials: &StoredCredentials) {
     let environment = TEST_CREDENTIAL_ENVIRONMENT
         .get()
@@ -188,10 +188,12 @@ fn ensure_unit_test_credential_environment() {
 
 /// Whether credentials go to the isolated test backend instead of the
 /// operator's Keychain.
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn uses_test_credentials() -> bool {
     test_credential_environment().is_some()
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
 fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
     #[cfg(test)]
     ensure_unit_test_credential_environment();
@@ -217,6 +219,7 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
 
 /// Return the `~/.config/plug/tokens/` directory path.
 pub fn tokens_dir() -> PathBuf {
+    #[cfg(any(test, feature = "test-helpers"))]
     if let Some(environment) = test_credential_environment() {
         return environment.tokens_dir.clone();
     }
@@ -626,6 +629,7 @@ impl CompositeCredentialStore {
     }
 
     fn raw_keyring_json(&self) -> Option<String> {
+        #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
             *environment
                 .keyring_reads
@@ -849,12 +853,7 @@ impl CompositeCredentialStore {
 
     fn keyring_load(&self) -> Option<StoredCredentials> {
         let json = self.raw_keyring_json()?;
-        let source = if test_credential_environment().is_some() {
-            "test keyring"
-        } else {
-            "keyring"
-        };
-        self.decode_credentials(&json, source)
+        self.decode_credentials(&json, "keyring")
     }
 
     fn keyring_save(&self, creds: &StoredCredentials) -> bool {
@@ -866,6 +865,7 @@ impl CompositeCredentialStore {
         creds: &StoredCredentials,
         generation: Option<&str>,
     ) -> Result<(), AuthError> {
+        #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
             if environment
                 .failing_keyring_writes
@@ -905,6 +905,7 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_clear(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
             environment
                 .keyring

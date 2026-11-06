@@ -56,13 +56,10 @@ const HTTP_PROTOCOL_VERSION_HEADER: &str = "MCP-Protocol-Version";
 const HTTP_PROTOCOL_VERSION: &str = "2025-11-25";
 
 fn oauth_integration_test_lock() -> &'static tokio::sync::Mutex<()> {
-    static ENVIRONMENT: OnceLock<()> = OnceLock::new();
-    ENVIRONMENT.get_or_init(|| {
-        oauth::install_test_credential_environment(std::env::temp_dir().join(format!(
-            "plug-oauth-integration-tests-{}",
-            std::process::id()
-        )));
-    });
+    oauth::install_test_credential_environment(std::env::temp_dir().join(format!(
+        "plug-oauth-integration-tests-{}",
+        std::process::id()
+    )));
 
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))

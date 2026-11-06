@@ -31,12 +31,9 @@ fn apply_dotenv() {
 
 #[cfg(test)]
 pub(crate) fn install_test_credential_environment() {
-    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-    INIT.get_or_init(|| {
-        plug_core::oauth::install_test_credential_environment(
-            std::env::temp_dir().join(format!("plug-oauth-binary-tests-{}", std::process::id())),
-        );
-    });
+    plug_core::oauth::install_test_credential_environment(
+        std::env::temp_dir().join(format!("plug-oauth-binary-tests-{}", std::process::id())),
+    );
 }
 
 mod client_host;
