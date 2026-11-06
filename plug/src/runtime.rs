@@ -81,14 +81,6 @@ pub(crate) fn live_inventory_availability(
             partial: false,
             unavailable_sources: Vec::new(),
         },
-        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => LiveInventoryAvailability {
-            partial: true,
-            unavailable_sources: vec!["http"],
-        },
-        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => LiveInventoryAvailability {
-            partial: true,
-            unavailable_sources: vec!["daemon_proxy"],
-        },
         plug_core::ipc::LiveSessionInventoryScope::Unavailable => LiveInventoryAvailability {
             partial: true,
             unavailable_sources: vec!["daemon_proxy", "http"],
@@ -121,7 +113,6 @@ pub(crate) fn live_inventory_metadata(
         http_sessions_included: matches!(
             scope,
             plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-                | plug_core::ipc::LiveSessionInventoryScope::HttpOnly
         ),
         scope,
     }
@@ -844,11 +835,17 @@ pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyh
         serve_router(http_router, &http_config, http_cancel).await
     };
     tokio::pin!(http_future);
+    // launchd's record of who started this process does not change while
+    // it runs, and reading it runs `launchctl`.
+    let ownership = tokio::task::spawn_blocking(crate::service::ipc_ownership)
+        .await
+        .unwrap_or(plug_core::ipc::DaemonOwnershipMode::Unknown);
     let daemon_future = daemon::run_daemon_with_lock(
         engine.clone(),
         config_path,
         http_runtime.state,
         runtime_lock,
+        ownership,
     );
     tokio::pin!(daemon_future);
     tokio::select! {
@@ -1357,16 +1354,6 @@ mod tests {
         assert!(!complete.partial);
         assert!(complete.unavailable_sources.is_empty());
 
-        let daemon_only =
-            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
-        assert!(daemon_only.partial);
-        assert_eq!(daemon_only.unavailable_sources, vec!["http"]);
-
-        let http_only =
-            live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
-        assert!(http_only.partial);
-        assert_eq!(http_only.unavailable_sources, vec!["daemon_proxy"]);
-
         let unavailable =
             live_inventory_availability(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
         assert!(unavailable.partial);
@@ -1391,6 +1378,7 @@ mod tests {
                 link_target: None,
                 client_key: None,
                 access_key: None,
+                target: None,
                 connected_secs: 10,
                 last_activity_secs: None,
             },
@@ -1406,6 +1394,7 @@ mod tests {
                 link_target: None,
                 client_key: None,
                 access_key: None,
+                target: None,
                 connected_secs: 5,
                 last_activity_secs: Some(1),
             },

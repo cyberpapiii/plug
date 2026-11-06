@@ -150,17 +150,6 @@ impl Default for RetiredHandshakeFields {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OperatorClientVisibility {
-    pub session_id: String,
-    pub client_type: crate::types::ClientType,
-    pub visible_tool_count: usize,
-    /// What the client's settings are stored under, when Plug can tell one
-    /// such client from another.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub client_key: Option<String>,
-}
-
 /// A name the owner gave a client.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ClientName {
@@ -191,9 +180,23 @@ pub struct ClientBlocks {
     /// Single tools on the allow list, by the name each is listed under now.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub allowed_tools: Vec<String>,
-    /// The servers those single tools belong to.
+    /// The configured servers the client gets nothing of, as the daemon
+    /// enforces the lists above.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub partly_allowed_servers: Vec<String>,
+    pub off_servers: Vec<String>,
+    /// The listed tools of every other server that the client is kept from.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub off_tools: Vec<OffTool>,
+}
+
+/// A listed tool a client is kept from.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OffTool {
+    pub name: String,
+    /// The entry of [`ClientBlocks::tools`] with a `*` in it that covers this
+    /// tool, when one does. Turning the tool back on means changing the rule.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rule: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -212,7 +215,6 @@ pub struct OperatorSnapshot {
     pub configured_servers: Vec<crate::operator::OperatorServerSummary>,
     pub servers: Vec<ServerStatus>,
     pub live_sessions: Vec<IpcLiveSessionInfo>,
-    pub client_visibility: Vec<OperatorClientVisibility>,
     pub upstream_auth: Vec<IpcAuthServerInfo>,
     pub downstream_clients: Vec<crate::downstream_oauth::RegisteredClientSummary>,
     /// Names the owner gave clients. A list, not a map, because the keys hold
@@ -229,10 +231,6 @@ pub struct OperatorSnapshot {
     /// The watches in the config and how each is doing.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub events: Vec<crate::events::EventStatus>,
-    /// Why config.toml could not be read, when it could not. The daemon keeps
-    /// running its last good config, and `configured_servers` then lists that.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub config_error: Option<String>,
     /// The address a client that is not on the list of known ones is given to
     /// reach Plug: the public one when there is one, else this Mac's own.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -637,8 +635,6 @@ pub enum LiveSessionTransport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveSessionInventoryScope {
-    DaemonProxyOnly,
-    HttpOnly,
     TransportComplete,
     Unavailable,
 }
@@ -676,6 +672,10 @@ pub struct IpcLiveSessionInfo {
     /// after what it reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub access_key: Option<String>,
+    /// The client Plug takes this one for, by its link target. See
+    /// [`crate::downstream_identity::client_target`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
     pub connected_secs: u64,
     pub last_activity_secs: Option<u64>,
 }

@@ -79,6 +79,9 @@ public struct LiveSession: Codable, Identifiable, Equatable, Sendable {
     /// differs from `clientKey` only for a remote session with no grant,
     /// which shares one key with every other such session.
     public let accessKey: String?
+    /// The client Plug takes this one for, by its link target: the one its
+    /// link names, else the one its reported name is.
+    public let target: String?
     public var connectedSecs: UInt64
     public var lastActivitySecs: UInt64?
 }
@@ -89,12 +92,6 @@ public struct ClientHost: Codable, Equatable, Sendable {
     public let executable: String
     /// The app bundle the executable runs from, when it runs from one.
     public let app: String?
-}
-
-public struct ClientVisibility: Codable, Equatable, Sendable {
-    public let sessionId: String
-    public let clientType: String
-    public let visibleToolCount: Int
 }
 
 /// A name the owner gave a client.
@@ -118,8 +115,18 @@ public struct ClientBlocks: Codable, Equatable, Sendable {
     public var onlyAllowed: Bool?
     public var allowedServers: [String]?
     public var allowedTools: [String]?
-    /// The servers those single tools belong to.
-    public var partlyAllowedServers: [String]?
+    /// The configured servers the client gets nothing of, as the daemon
+    /// enforces the lists above.
+    public var offServers: [String]?
+    /// The listed tools of every other server that the client is kept from.
+    public var offTools: [OffTool]?
+}
+
+/// A listed tool a client is kept from.
+public struct OffTool: Codable, Equatable, Sendable {
+    public let name: String
+    /// The `*` rule among the client's blocks that covers this tool, when one does.
+    public let rule: String?
 }
 
 public struct AuthServer: Codable, Identifiable, Equatable, Sendable {
@@ -148,6 +155,10 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public var lastUsedAt: UInt64?
     /// When Plug forgets it unless it signs in again before then.
     public var expiresAt: UInt64?
+    /// What this client's settings are stored under.
+    public let clientKey: String
+    /// The client Plug takes this one for by the name it registered.
+    public let target: String?
 
     /// Its sign-in ran out or was revoked, and only the client can start
     /// another.
@@ -156,10 +167,6 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     /// It asked to be let in and nobody finished the sign-in. Plug forgets
     /// it at `expiresAt`.
     public var isUnfinished: Bool { signedIn == false && lastUsedAt == nil && createdAt != nil }
-
-    /// What this client's settings are stored under. Matches the daemon's
-    /// `grant_client_key`; the snapshot does not carry it.
-    public var clientKey: String { Self.clientKey(id: clientId) }
 
     public static func clientKey(id: String) -> String { "oauth:\(id)" }
 }
@@ -315,7 +322,6 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
     public let configuredServers: [ConfiguredServer]
     public let servers: [ServerStatus]
     public var liveSessions: [LiveSession]
-    public let clientVisibility: [ClientVisibility]
     public var upstreamAuth: [AuthServer]
     public let downstreamClients: [DownstreamClient]
     /// Names the owner gave clients. Absent when there are none.
@@ -331,7 +337,7 @@ public struct OperatorSnapshot: Codable, Equatable, Sendable {
 
     public static let empty = OperatorSnapshot(
         runtimeVersion: "", uptimeSecs: 0, ownership: "unmanaged",
-        configuredServers: [], servers: [], liveSessions: [], clientVisibility: [],
+        configuredServers: [], servers: [], liveSessions: [],
         upstreamAuth: [], downstreamClients: []
     )
 }
@@ -359,6 +365,9 @@ public extension OperatorSnapshot {
 }
 
 public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
+    /// The key every remote caller without a sign-in of its own shares.
+    public static let sharedRemoteKey = "remote:shared"
+
     public var id: UInt64 { sequence }
     public let sequence: UInt64
     public let occurredAtMs: UInt64
@@ -373,6 +382,10 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
     /// The key the client's name is kept under. Absent from a daemon older
     /// than this field.
     public let clientKey: String?
+    /// The client Plug took the caller for, by its link target.
+    public let target: String?
+    /// The call came over the network rather than from this Mac.
+    public let remote: Bool
     public let latencyMs: UInt64
     public let outcome: String
     /// Why a failed call failed, in the error's own words. Absent for a call
@@ -389,6 +402,8 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         clientType: String? = nil,
         clientLabel: String? = nil,
         clientKey: String? = nil,
+        target: String? = nil,
+        remote: Bool = false,
         latencyMs: UInt64,
         outcome: String,
         reason: String? = nil
@@ -402,6 +417,8 @@ public struct ActivityEvent: Codable, Identifiable, Equatable, Sendable {
         self.clientType = clientType
         self.clientLabel = clientLabel
         self.clientKey = clientKey
+        self.target = target
+        self.remote = remote
         self.latencyMs = latencyMs
         self.outcome = outcome
         self.reason = reason
@@ -772,43 +789,6 @@ public enum ClientBlockKind: String, Encodable, Sendable {
     case allowList = "allow_list"
 }
 
-/// What reloading the configuration from disk changed.
-public struct ReloadSummary: Decodable, Equatable, Sendable {
-    public let added: [String]
-    public let removed: [String]
-    public let changed: [String]
-    public let errors: [String]
-
-    public init(added: [String] = [], removed: [String] = [], changed: [String] = [], errors: [String] = []) {
-        self.added = added
-        self.removed = removed
-        self.changed = changed
-        self.errors = errors
-    }
-
-    private enum CodingKeys: String, CodingKey {
-        case added, removed, changed, errors
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.container(keyedBy: CodingKeys.self)
-        added = try container.decodeIfPresent([String].self, forKey: .added) ?? []
-        removed = try container.decodeIfPresent([String].self, forKey: .removed) ?? []
-        changed = try container.decodeIfPresent([String].self, forKey: .changed) ?? []
-        errors = try container.decodeIfPresent([String].self, forKey: .errors) ?? []
-    }
-
-    /// One line a person can read, naming what actually moved.
-    public var summary: String {
-        var parts: [String] = []
-        if !added.isEmpty { parts.append("\(added.count) added") }
-        if !removed.isEmpty { parts.append("\(removed.count) removed") }
-        if !changed.isEmpty { parts.append("\(changed.count) changed") }
-        if parts.isEmpty { return "Nothing changed" }
-        return parts.joined(separator: ", ")
-    }
-}
-
 public enum IPCResponse: Decodable, Sendable {
     case handshake(OperatorHandshake)
     case snapshot(OperatorSnapshot)
@@ -820,13 +800,12 @@ public enum IPCResponse: Decodable, Sendable {
     case apiDescribed(APISummary)
     case mutation
     case revoked(String)
-    /// What a reload changed. The app does not show it yet.
-    case reloaded(ReloadSummary)
+    case reloaded
     case ok
     case error(code: String, message: String)
 
     private enum CodingKeys: String, CodingKey {
-        case type, handshake, snapshot, events, tools, clientId, code, message, report, name, server
+        case type, handshake, snapshot, events, tools, clientId, code, message, name, server
         case api, servers
     }
 
@@ -847,7 +826,7 @@ public enum IPCResponse: Decodable, Sendable {
         case "ApiDescribed": self = .apiDescribed(try c.decode(APISummary.self, forKey: .api))
         case "OperatorMutation": self = .mutation
         case "DownstreamClientRevoked": self = .revoked(try c.decode(String.self, forKey: .clientId))
-        case "Reloaded": self = .reloaded(try c.decode(ReloadSummary.self, forKey: .report))
+        case "Reloaded": self = .reloaded
         case "Ok": self = .ok
         case "Error": self = .error(code: try c.decode(String.self, forKey: .code), message: try c.decode(String.self, forKey: .message))
         default: throw PlugIPCError.unexpectedResponse(type)

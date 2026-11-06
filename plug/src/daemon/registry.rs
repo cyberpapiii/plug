@@ -235,6 +235,10 @@ impl ClientRegistry {
                 link_target: entry.link_target.clone(),
                 client_key: entry.client_key(),
                 access_key: entry.client_key(),
+                target: plug_core::downstream_identity::client_target(
+                    entry.link_target.as_deref(),
+                    entry.client_type(),
+                ),
                 connected_secs: entry.connected_at.elapsed().as_secs(),
                 last_activity_secs: None,
             })

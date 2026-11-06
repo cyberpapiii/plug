@@ -102,10 +102,11 @@ struct ClientsView: View {
         let name: String
     }
 
-    private func access(key: String, name: String) -> ClientAccess {
+    private func access(key: String, name: String, isRemote: Bool = false) -> ClientAccess {
         ClientAccess(
             key: key,
             name: name,
+            isRemote: isRemote,
             servers: model.snapshot.configuredServers,
             blocks: model.snapshot.clientBlocks ?? []
         )
@@ -358,7 +359,7 @@ struct ClientsView: View {
     private func sessionEntry(id: String, sessions: [LiveSession]) -> ClientEntry {
         let first = sessions[0]
         let name = displayName(first)
-        let choices = first.ownAccessKey.map { access(key: $0, name: name) }
+        let choices = first.ownAccessKey.map { access(key: $0, name: name, isRemote: Self.isRemote(first)) }
         return ClientEntry(
             id: id,
             group: Self.isRemote(first) ? .network : .onThisMac,
@@ -392,10 +393,12 @@ struct ClientsView: View {
     private func recentEntry(_ event: ActivityEvent) -> ClientEntry {
         let call = model.call(event)
         let key = event.clientKey ?? ""
-        let group: ClientEntry.Group = RecentCallers.isRemote(key: key) ? .network : .onThisMac
+        let group: ClientEntry.Group = event.remote ? .network : .onThisMac
         // Every remote client without a sign-in of its own shares one key,
         // so there are no choices to offer for one of them.
-        let choices = key.hasPrefix("remote:") ? nil : access(key: key, name: call.caller)
+        let choices = key == ActivityEvent.sharedRemoteKey
+            ? nil
+            : access(key: key, name: call.caller, isRemote: event.remote)
         return ClientEntry(
             id: "recent:\(key)",
             group: group,
@@ -427,7 +430,7 @@ struct ClientsView: View {
         let owned = names.name(forKey: grant.clientKey)
         let name = owned ?? grant.clientName
         if grant.isUnfinished { return unfinishedEntry(grant, name: name) }
-        let access = access(key: grant.clientKey, name: name)
+        let access = access(key: grant.clientKey, name: name, isRemote: true)
         let host = URL(string: grant.clientId)?.host()
         let since = grant.createdAt.map { SignInFacts.day($0) }
         // A client with a connection open is plainly signed in.

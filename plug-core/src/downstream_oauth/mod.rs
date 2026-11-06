@@ -198,6 +198,11 @@ pub struct RegisteredClientSummary {
     /// reader older than this field sees every client as signed in.
     #[serde(default = "signed_in_when_unsaid")]
     pub signed_in: bool,
+    /// What this client's settings are stored under.
+    pub client_key: String,
+    /// The client Plug takes this one for by the name it registered.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
 }
 
 fn signed_in_when_unsaid() -> bool {
@@ -455,6 +460,11 @@ impl From<&RegisteredClient> for RegisteredClientSummary {
             last_used_at: value.last_used_at,
             expires_at: value.expires_at,
             signed_in: true,
+            client_key: crate::downstream_identity::grant_client_key(&value.client_id),
+            target: crate::downstream_identity::client_target(
+                None,
+                crate::client_detect::detect_client(&value.client_name),
+            ),
         }
     }
 }

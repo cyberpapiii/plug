@@ -226,12 +226,12 @@ final class LinkableAppTests: XCTestCase {
         let decoder = JSONDecoder()
         let old = try decoder.decode(
             DownstreamClient.self,
-            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test"}"#.utf8)
+            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a"}"#.utf8)
         )
         XCTAssertFalse(old.needsSignIn)
         let lapsed = try decoder.decode(
             DownstreamClient.self,
-            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","signedIn":false}"#.utf8)
+            from: Data(#"{"clientId":"a","clientName":"A","redirectUris":[],"source":"test","clientKey":"oauth:a","signedIn":false}"#.utf8)
         )
         XCTAssertTrue(lapsed.needsSignIn)
     }
@@ -536,25 +536,28 @@ final class AppRosterTests: XCTestCase {
                 """.utf8
             )
         )
+        // What the daemon enforces of each client's lists.
         let blocks = try decoder.decode(
             [ClientBlocks].self,
             from: Data(
                 """
-                [{"key":"cursor","servers":["git","gone"],"tools":["slack__post"]},
-                 {"key":"oauth:abc","servers":["slack"]},
-                 {"key":"pi","tools":["git__*","slack__dm"]}]
+                [{"key":"cursor","servers":["git","gone"],"tools":["slack__post"],
+                  "off_servers":["git"],"off_tools":[{"name":"slack__post"}]},
+                 {"key":"oauth:abc","servers":["slack"],"off_servers":["slack"]},
+                 {"key":"pi","tools":["git__*","slack__dm"],
+                  "off_tools":[{"name":"git__commit","rule":"git__*"},{"name":"git__log","rule":"git__*"},
+                               {"name":"slack__dm"}]}]
                 """.utf8
             )
         )
-        let access = { ClientAccess(key: $0, name: "Client", servers: servers, blocks: blocks) }
+        let access = { ClientAccess(key: $0, name: "Client", isRemote: $0.hasPrefix("oauth"), servers: servers, blocks: blocks) }
 
-        // A block on a server that is gone is not counted.
-        XCTAssertEqual(access("cursor").blockedServers, ["git"])
+        XCTAssertEqual(access("cursor").offServers, ["git"])
         XCTAssertEqual(access("cursor").summary, "1 server and 1 tool off")
-        XCTAssertFalse(access("cursor").isRemote)
+        XCTAssertFalse(access("cursor").isOn(server: "git"))
         XCTAssertEqual(access("oauth:abc").summary, "1 server off")
-        XCTAssertTrue(access("oauth:abc").isRemote)
-        XCTAssertEqual(access("pi").summary, "2 tools off")
+        // Every tool a rule covers counts.
+        XCTAssertEqual(access("pi").summary, "3 tools off")
         XCTAssertNil(access("claude-code").summary)
         XCTAssertFalse(access("claude-code").isLimited)
 
@@ -570,7 +573,7 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(access("claude-code").offCount(among: tools), 0)
     }
 
-    func testAClientWithAnAllowListGetsOnlyWhatIsOnIt() throws {
+    func testAClientWithAnAllowListSwitchesToolsOnTheList() throws {
         let decoder = JSONDecoder()
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         let servers = try decoder.decode(
@@ -588,20 +591,18 @@ final class AppRosterTests: XCTestCase {
             from: Data(
                 """
                 [{"key":"radar","only_allowed":true,"allowed_servers":["slack"],
-                  "allowed_tools":["Git__commit"],"partly_allowed_servers":["git"],
-                  "tools":["slack__dm"]},
-                 {"key":"empty","only_allowed":true}]
+                  "allowed_tools":["Git__commit"],"tools":["slack__dm"],
+                  "off_servers":["notion"],"off_tools":[{"name":"slack__dm"},{"name":"git__push"}]}]
                 """.utf8
             )
         )
         let radar = ClientAccess(key: "radar", name: "Radar", servers: servers, blocks: blocks)
-        XCTAssertTrue(radar.isOn(server: "slack"))
         XCTAssertTrue(radar.isOn(server: "git"))
         XCTAssertFalse(radar.isOn(server: "notion"))
-        XCTAssertEqual(radar.summary, "1 server and 1 tool off")
+        XCTAssertEqual(radar.summary, "1 server and 2 tools off")
 
-        // On a server that is on the list whole, a tool is off only by a
-        // block. On one that is not, a tool is on only if it is listed.
+        // On a server that is on the list whole, a tool's switch is a block.
+        // On one that is not, it puts the tool on the list or takes it off.
         let tool = { ToolFacts(name: $0, server: $1) }
         XCTAssertEqual(radar.state(of: tool("slack__post", "slack")), .on)
         XCTAssertEqual(radar.state(of: tool("slack__dm", "slack")), .off)
@@ -609,22 +610,6 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(radar.state(of: tool("git__commit", "git")), .on)
         XCTAssertEqual(radar.state(of: tool("git__push", "git")), .off)
         XCTAssertTrue(radar.isListedSingly(tool("git__push", "git")))
-
-        // An empty list is still a list.
-        let empty = ClientAccess(key: "empty", name: "Empty", servers: servers, blocks: blocks)
-        XCTAssertEqual(empty.offServers, ["git", "slack", "notion"])
-        XCTAssertEqual(empty.summary, "3 servers off")
-    }
-
-    func testARuleFitsTheWayTheDaemonReadsIt() {
-        XCTAssertTrue(ClientAccess.rule("*", fits: "anything"))
-        XCTAssertTrue(ClientAccess.rule("git__*", fits: "git__log"))
-        XCTAssertTrue(ClientAccess.rule("*__delete", fits: "git__delete"))
-        XCTAssertTrue(ClientAccess.rule("git__*_all", fits: "git__push_all"))
-        XCTAssertTrue(ClientAccess.rule("*delete*", fits: "git__delete_branch"))
-        XCTAssertFalse(ClientAccess.rule("git__*", fits: "slack__git__log"))
-        XCTAssertFalse(ClientAccess.rule("*__delete", fits: "git__delete_branch"))
-        XCTAssertFalse(ClientAccess.rule("git__log", fits: "git__logs"))
     }
 
     func testARemoteSessionIsNamedAfterItsGrantUnlessPlugKnowsTheProduct() throws {
@@ -634,8 +619,8 @@ final class AppRosterTests: XCTestCase {
             [DownstreamClient].self,
             from: Data(
                 #"""
-                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic"},
-                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic"}]
+                [{"client_id":"abc","client_name":"Perplexity","redirect_uris":[],"source":"dynamic","client_key":"oauth:abc"},
+                 {"client_id":"def","client_name":"Something Else","redirect_uris":[],"source":"dynamic","client_key":"oauth:def"}]
                 """#.utf8
             )
         )
@@ -785,8 +770,6 @@ final class PopoverRecentTests: XCTestCase {
         // One row a client, by its newest call; a client already shown and a
         // call nobody can be told apart by add none.
         XCTAssertEqual(RecentCallers.latest(events, excluding: ["cursor"]).map(\.sequence), [2, 3])
-        XCTAssertFalse(RecentCallers.isRemote(key: "host:python#radar.py"))
-        XCTAssertTrue(RecentCallers.isRemote(key: "oauth:abc"))
 
         var calendar = Calendar(identifier: .gregorian)
         calendar.timeZone = .gmt
@@ -907,7 +890,7 @@ final class PopoverRecentTests: XCTestCase {
     func testANewSignInAsksAboutEarlierOnesWithItsName() {
         let now = Date(timeIntervalSince1970: 2_000_000)
         func grant(_ id: String, _ name: String, at created: UInt64, used: UInt64? = 1) -> DownstreamClient {
-            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"signed_in":true}"#
+            let json = #"{"client_id":"\#(id)","client_name":"\#(name)","redirect_uris":[],"source":"dynamic","created_at":\#(created),"signed_in":true,"client_key":"oauth:\#(id)"}"#
             let decoder = JSONDecoder()
             decoder.keyDecodingStrategy = .convertFromSnakeCase
             var client = try! decoder.decode(DownstreamClient.self, from: Data(json.utf8))

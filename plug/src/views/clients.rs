@@ -13,12 +13,6 @@ use plug_core::clients::ClientTarget;
 
 fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
     match scope {
-        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => {
-            "Live session inventory currently reflects daemon proxy clients only; downstream HTTP sessions are not yet surfaced here."
-        }
-        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => {
-            "Live session inventory currently reflects downstream HTTP sessions only; daemon proxy sessions are not available."
-        }
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => {
             "Live session inventory includes both daemon proxy and downstream HTTP sessions."
         }
@@ -30,8 +24,6 @@ fn live_inventory_scope_text(scope: plug_core::ipc::LiveSessionInventoryScope) -
 
 fn live_inventory_scope_label(scope: plug_core::ipc::LiveSessionInventoryScope) -> &'static str {
     match scope {
-        plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly => "daemon-proxy-only",
-        plug_core::ipc::LiveSessionInventoryScope::HttpOnly => "http-only",
         plug_core::ipc::LiveSessionInventoryScope::TransportComplete => "transport-complete",
         plug_core::ipc::LiveSessionInventoryScope::Unavailable => "unavailable",
     }
@@ -586,12 +578,12 @@ mod tests {
                 http: 1,
                 sse: 0,
             },
-            scope: plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
+            scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             availability: LiveInventoryAvailability {
                 partial: true,
-                unavailable_sources: vec!["daemon_proxy"],
+                unavailable_sources: vec!["daemon_proxy", "http"],
             },
-            http_sessions_included: true,
+            http_sessions_included: false,
         };
 
         let json = client_list_json(
@@ -599,17 +591,17 @@ mod tests {
             &live_sessions,
             &inventory,
             crate::runtime::LiveClientSupport::Supported,
-            plug_core::ipc::LiveSessionInventoryScope::HttpOnly,
+            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             Some("daemon unavailable"),
             Some("invalid lazy config"),
         );
 
         assert_eq!(json["live_session_count"], 1);
         assert_eq!(json["live_session_transports"]["http"], 1);
-        assert_eq!(json["live_inventory_scope"], "http_only");
+        assert_eq!(json["live_inventory_scope"], "unavailable");
         assert_eq!(json["inventory_partial"], true);
         assert_eq!(json["inventory_unavailable_sources"][0], "daemon_proxy");
-        assert_eq!(json["http_sessions_included"], true);
+        assert_eq!(json["http_sessions_included"], false);
         assert_eq!(json["daemon_error"], "daemon unavailable");
         assert_eq!(json["config_error"], "invalid lazy config");
         assert_eq!(json["lazy_tool_policy_scope"], "configured");
@@ -618,14 +610,6 @@ mod tests {
 
     #[test]
     fn live_inventory_scope_label_uses_stable_short_states() {
-        assert_eq!(
-            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly),
-            "daemon-proxy-only"
-        );
-        assert_eq!(
-            live_inventory_scope_label(plug_core::ipc::LiveSessionInventoryScope::HttpOnly),
-            "http-only"
-        );
         assert_eq!(
             live_inventory_scope_label(
                 plug_core::ipc::LiveSessionInventoryScope::TransportComplete
@@ -639,19 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn live_inventory_scope_text_mentions_daemon_and_http_gap() {
-        let text =
-            live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly);
-        assert!(text.contains("daemon proxy clients"));
-        assert!(text.contains("HTTP sessions"));
-    }
-
-    #[test]
-    fn live_inventory_scope_text_covers_http_only_and_unavailable() {
-        let http_only =
-            live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::HttpOnly);
-        assert!(http_only.contains("HTTP sessions only"));
-
+    fn live_inventory_scope_text_says_when_nothing_could_be_read() {
         let unavailable =
             live_inventory_scope_text(plug_core::ipc::LiveSessionInventoryScope::Unavailable);
         assert!(unavailable.contains("unavailable"));
@@ -731,17 +703,17 @@ mod tests {
         let inventory = LiveInventoryMetadata {
             session_count: 0,
             session_transports: LiveSessionTransportCounts::default(),
-            scope: plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly,
+            scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             availability: LiveInventoryAvailability {
                 partial: true,
-                unavailable_sources: vec!["http"],
+                unavailable_sources: vec!["daemon_proxy", "http"],
             },
             http_sessions_included: false,
         };
 
         assert_eq!(
             live_inventory_summary(&inventory),
-            "daemon-proxy-only (missing: http)"
+            "unavailable (missing: daemon_proxy, http)"
         );
     }
 

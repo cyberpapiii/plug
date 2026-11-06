@@ -72,25 +72,6 @@ fn load_editable_config(path: &std::path::Path) -> Result<plug_core::config::Con
     })
 }
 
-/// A config parse error without the quoted source lines. The TOML parser
-/// echoes the offending line, and in config.toml that line can hold a token;
-/// the snapshot is polled constantly and the app may show this text.
-fn config_error_summary(message: &str) -> String {
-    message
-        .lines()
-        .filter(|line| {
-            let line = line.trim_start();
-            !line
-                .trim_start_matches(|c: char| c.is_ascii_digit())
-                .trim_start()
-                .starts_with('|')
-        })
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(target_os = "macos")]
 mod menu_bar;
 mod notify;
@@ -226,7 +207,14 @@ pub async fn run_daemon(engine: Arc<Engine>, config_path: PathBuf) -> anyhow::Re
         Arc::new(plug_core::session::SessionStore::new(1800, 100)),
         engine.cancel_token().clone(),
     ));
-    run_daemon_with_lock(engine, config_path, http, runtime_lock).await
+    run_daemon_with_lock(
+        engine,
+        config_path,
+        http,
+        runtime_lock,
+        ipc::DaemonOwnershipMode::Unknown,
+    )
+    .await
 }
 
 /// Serve local connectors on the daemon socket. `http` is the downstream
@@ -237,6 +225,7 @@ pub(crate) async fn run_daemon_with_lock(
     config_path: PathBuf,
     http: Arc<HttpState>,
     runtime_lock: DaemonRuntimeLock,
+    ownership: ipc::DaemonOwnershipMode,
 ) -> anyhow::Result<()> {
     let rt_dir = plug_core::paths::dir();
     let log_directory = log_dir();
@@ -337,6 +326,7 @@ pub(crate) async fn run_daemon_with_lock(
                                 started_at,
                                 client_registry: registry,
                                 http,
+                                ownership,
                                 session_id: None,
                                 reverse_request_rx: None,
                             };
@@ -481,6 +471,8 @@ struct ConnectionContext {
     started_at: Instant,
     client_registry: Arc<ClientRegistry>,
     http: Arc<HttpState>,
+    /// Who started this daemon, read once when it started.
+    ownership: ipc::DaemonOwnershipMode,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
     /// Receiver for reverse requests from the daemon bridge. Created during
@@ -508,6 +500,7 @@ impl ConnectionContext {
             started_at: self.started_at,
             client_registry: Arc::clone(&self.client_registry),
             http: Arc::clone(&self.http),
+            ownership: self.ownership,
             session_id: self.session_id.clone(),
             reverse_request_rx: None,
         }
@@ -596,18 +589,6 @@ async fn end_ipc_session(ctx: &ConnectionContext, session_id: &str) {
 
 /// Key a live session's lazy working set the way its transport stores it:
 /// bridge sessions under `ipc:`, HTTP and SSE sessions under `http:`.
-fn live_session_lazy_key(session: &plug_core::ipc::IpcLiveSessionInfo) -> String {
-    let transport = match session.transport {
-        plug_core::ipc::LiveSessionTransport::DaemonProxy => {
-            plug_core::downstream_identity::DownstreamTransport::Ipc
-        }
-        plug_core::ipc::LiveSessionTransport::Http | plug_core::ipc::LiveSessionTransport::Sse => {
-            plug_core::downstream_identity::DownstreamTransport::Http
-        }
-    };
-    transport.lazy_session_key(&session.session_id)
-}
-
 /// Resolves when the modern downstream gate may have changed. Never resolves
 /// once the sender is gone, so a closed channel cannot spin a select loop.
 async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -1233,6 +1214,94 @@ fn tool_catalog_revision(ctx: &ConnectionContext) -> u64 {
     hasher.finish()
 }
 
+/// What each client is kept from: the owner's lists, by the names the app and
+/// the command line show, and what the daemon enforces of them.
+fn client_blocks(
+    config: &plug_core::config::Config,
+    configured: &[plug_core::operator::OperatorServerSummary],
+    router: &ToolRouter,
+) -> Vec<plug_core::ipc::ClientBlocks> {
+    let limited: Vec<_> = config
+        .clients
+        .iter()
+        .filter(|(_, settings)| {
+            !settings.blocked_servers.is_empty()
+                || !settings.blocked_tools.is_empty()
+                || settings.has_allow_list()
+        })
+        .collect();
+    if limited.is_empty() {
+        return Vec::new();
+    }
+    let listed: Vec<(String, String)> = router
+        .list_all_tools_with_risk()
+        .into_iter()
+        .map(|(server, tool, _)| (tool.name.to_string(), server))
+        .collect();
+    limited
+        .into_iter()
+        .map(|(key, settings)| {
+            let key_ref = Some(key.as_str());
+            // By the name each tool is listed under now, which is how the
+            // app and the command line know a tool.
+            let tools: Vec<String> = settings
+                .blocked_tools
+                .iter()
+                .map(|block| match block {
+                    plug_core::config::ToolBlock::Of { server, tool } => router
+                        .listed_name(server, tool)
+                        .unwrap_or_else(|| block.to_string()),
+                    plug_core::config::ToolBlock::Named(name) => name.clone(),
+                })
+                .collect();
+            let off_servers: Vec<String> = configured
+                .iter()
+                .map(|server| &server.name)
+                .filter(|server| !router.client_may_use_server(key_ref, server))
+                .cloned()
+                .collect();
+            let off_tools = listed
+                .iter()
+                .filter(|(_, server)| !off_servers.contains(server))
+                .filter(|(name, _)| !router.client_may_use_tool(key_ref, name))
+                .map(|(name, _)| plug_core::ipc::OffTool {
+                    name: name.clone(),
+                    rule: tools
+                        .iter()
+                        .filter(|rule| rule.contains('*'))
+                        .find(|rule| {
+                            plug_core::tool_patterns::is_disabled_tool(
+                                std::slice::from_ref(*rule),
+                                name,
+                            )
+                        })
+                        .cloned(),
+                })
+                .collect();
+            plug_core::ipc::ClientBlocks {
+                key: key.clone(),
+                servers: settings.blocked_servers.clone(),
+                tools,
+                only_allowed: settings.has_allow_list(),
+                allowed_servers: settings.allowed_servers.clone(),
+                allowed_tools: settings
+                    .allowed_tools
+                    .iter()
+                    .map(|allowed| {
+                        router
+                            .listed_name(&allowed.server, &allowed.tool)
+                            // The form `plug clients only --remove` takes for
+                            // a tool Plug no longer lists.
+                            .unwrap_or_else(|| format!("{}/{}", allowed.server, allowed.tool))
+                    })
+                    .collect(),
+                off_servers,
+                off_tools,
+            }
+        })
+        .collect()
+}
+
 /// Answer a request that came with the daemon token.
 async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContext) -> IpcResponse {
     match request {
@@ -1253,16 +1322,11 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             // The configured servers come from the file, so the app can see a
             // server the daemon has not loaded. A file that does not parse,
             // often one saved mid-edit, must not blank the app while the
-            // daemon keeps serving its last good config: report the error and
-            // list the running config instead.
-            let (config, config_error) =
-                match plug_core::config::load_editable_config(&ctx.config_path) {
-                    Ok(config) => (std::sync::Arc::new(config), None),
-                    Err(error) => (
-                        std::sync::Arc::clone(&ctx.engine.config()),
-                        Some(config_error_summary(&error.to_string())),
-                    ),
-                };
+            // daemon keeps serving its last good config: list that instead.
+            let config = match plug_core::config::load_editable_config(&ctx.config_path) {
+                Ok(config) => std::sync::Arc::new(config),
+                Err(_) => std::sync::Arc::clone(&ctx.engine.config()),
+            };
             let mut configured_servers = config
                 .servers
                 .iter()
@@ -1275,23 +1339,6 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
                 ctx.client_registry.list_live_sessions(),
                 &ctx.http.sessions,
             );
-            let client_visibility = live_sessions
-                .iter()
-                .map(|session| plug_core::ipc::OperatorClientVisibility {
-                    session_id: session.session_id.clone(),
-                    client_type: session.client_type,
-                    visible_tool_count: ctx
-                        .engine
-                        .tool_router()
-                        .list_tools_for_client_session(
-                            session.client_type,
-                            Some(live_session_lazy_key(session).as_str()),
-                            session.access_key.as_deref(),
-                        )
-                        .len(),
-                    client_key: session.client_key.clone(),
-                })
-                .collect();
             let client_names = config
                 .clients
                 .iter()
@@ -1312,57 +1359,8 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
                     })
                 })
                 .collect();
-            let client_blocks = config
-                .clients
-                .iter()
-                .filter(|(_, settings)| {
-                    !settings.blocked_servers.is_empty()
-                        || !settings.blocked_tools.is_empty()
-                        || settings.has_allow_list()
-                })
-                .map(|(key, settings)| plug_core::ipc::ClientBlocks {
-                    key: key.clone(),
-                    servers: settings.blocked_servers.clone(),
-                    only_allowed: settings.has_allow_list(),
-                    partly_allowed_servers: {
-                        let mut servers: Vec<String> = settings
-                            .allowed_tools
-                            .iter()
-                            .map(|allowed| allowed.server.clone())
-                            .collect();
-                        servers.sort();
-                        servers.dedup();
-                        servers
-                    },
-                    allowed_servers: settings.allowed_servers.clone(),
-                    allowed_tools: settings
-                        .allowed_tools
-                        .iter()
-                        .map(|allowed| {
-                            ctx.engine
-                                .tool_router()
-                                .listed_name(&allowed.server, &allowed.tool)
-                                // The form `plug clients only --remove`
-                                // takes for a tool Plug no longer lists.
-                                .unwrap_or_else(|| format!("{}/{}", allowed.server, allowed.tool))
-                        })
-                        .collect(),
-                    // By the name each tool is listed under now, which is
-                    // how the app and the command line know a tool.
-                    tools: settings
-                        .blocked_tools
-                        .iter()
-                        .map(|block| match block {
-                            plug_core::config::ToolBlock::Of { server, tool } => ctx
-                                .engine
-                                .tool_router()
-                                .listed_name(server, tool)
-                                .unwrap_or_else(|| block.to_string()),
-                            plug_core::config::ToolBlock::Named(name) => name.clone(),
-                        })
-                        .collect(),
-                })
-                .collect();
+            let client_blocks =
+                client_blocks(&config, &configured_servers, ctx.engine.tool_router());
             let events = ctx.engine.event_statuses(&config).await;
             let mut server_statuses = ctx.server_manager.server_statuses();
             strip_upstream_icons(&mut server_statuses);
@@ -1376,18 +1374,16 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
                     runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                     uptime_secs: ctx.started_at.elapsed().as_secs(),
                     tool_catalog_revision: tool_catalog_revision(ctx),
-                    ownership: crate::service::ipc_ownership(),
+                    ownership: ctx.ownership,
                     configured_servers,
                     servers: server_statuses,
                     live_sessions,
-                    client_visibility,
                     upstream_auth,
                     downstream_clients,
                     client_names,
                     client_places,
                     client_blocks,
                     events,
-                    config_error,
                     client_address: Some(config.http.mcp_url()),
                 }),
             }
@@ -1529,7 +1525,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             handshake: plug_core::ipc::OperatorHandshake::new(
                 env!("CARGO_PKG_VERSION").to_string(),
                 current_daemon_executable(),
-                crate::service::ipc_ownership(),
+                ctx.ownership,
             ),
         },
         IpcRequest::Operator { request, .. } => dispatch_operator(request, ctx).await,
@@ -2395,6 +2391,7 @@ mod tests {
             config_path: config_path.into(),
             started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
+            ownership: ipc::DaemonOwnershipMode::Unknown,
             http: Arc::new(HttpState::new(
                 Arc::clone(engine.tool_router()),
                 Arc::new(plug_core::session::SessionStore::new(1800, 100)),
@@ -2403,6 +2400,59 @@ mod tests {
             session_id: None,
             reverse_request_rx: None,
         }
+    }
+
+    /// The snapshot says which servers each limited client gets nothing of,
+    /// as the router enforces its lists, so the app need not work it out.
+    #[tokio::test]
+    async fn operator_snapshot_says_what_each_client_is_kept_from() {
+        let config_path = temp_config_path("snapshot-client-blocks");
+        std::fs::write(
+            &config_path,
+            r#"
+[servers.git]
+command = "git-mcp"
+[servers.slack]
+command = "slack-mcp"
+[servers.notes]
+command = "notes-mcp"
+
+[clients.cursor]
+blocked_servers = ["git"]
+
+[clients.pi]
+allowed_servers = ["slack"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = auth_status_test_context(config_path);
+
+        let response = dispatch_request(
+            &IpcRequest::Operator {
+                auth_token: "test-token".to_string().into(),
+                request: OperatorRequest::Snapshot,
+            },
+            &mut ctx,
+        )
+        .await;
+        let IpcResponse::OperatorSnapshot { snapshot } = response else {
+            panic!("expected a snapshot, got {response:?}");
+        };
+
+        let off: Vec<(&str, Vec<&str>)> = snapshot
+            .client_blocks
+            .iter()
+            .map(|blocks| {
+                (
+                    blocks.key.as_str(),
+                    blocks.off_servers.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            off,
+            vec![("cursor", vec!["git"]), ("pi", vec!["git", "notes"])]
+        );
     }
 
     /// The app polls this snapshot every few seconds. A config.toml saved
@@ -2433,12 +2483,6 @@ mod tests {
             panic!("expected a snapshot, got {response:?}");
         };
 
-        let config_error = snapshot.config_error.as_deref().expect("config_error");
-        assert!(config_error.contains("line 2"), "{config_error}");
-        assert!(
-            !config_error.contains("sk-secret-value"),
-            "the error must not quote the config: {config_error}"
-        );
         let configured: Vec<_> = snapshot
             .configured_servers
             .iter()
@@ -3475,43 +3519,6 @@ mod tests {
         let _ = server_task.await;
         engine.shutdown().await;
         let _ = std::fs::remove_file(&socket_path);
-    }
-
-    /// The operator snapshot counts visible tools from the same working-set
-    /// key each transport writes, not the raw session id.
-    #[test]
-    fn live_session_lazy_key_matches_the_transport_key() {
-        let session = |transport| plug_core::ipc::IpcLiveSessionInfo {
-            transport,
-            client_id: None,
-            session_id: "sess-1".to_string(),
-            client_type: plug_core::types::ClientType::Unknown,
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            grant: None,
-            link_target: None,
-            client_key: None,
-            access_key: None,
-            connected_secs: 0,
-            last_activity_secs: None,
-        };
-        let ipc =
-            plug_core::downstream_identity::DownstreamTransport::Ipc.lazy_session_key("sess-1");
-        let http =
-            plug_core::downstream_identity::DownstreamTransport::Http.lazy_session_key("sess-1");
-        assert_eq!(
-            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::DaemonProxy)),
-            ipc
-        );
-        assert_eq!(
-            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Http)),
-            http
-        );
-        assert_eq!(
-            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Sse)),
-            http
-        );
     }
 
     /// A registered connection hears about a modern downstream gate change

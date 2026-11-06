@@ -1056,7 +1056,7 @@ final class AppModelTests: XCTestCase {
         let payload = """
         {
           "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "ownership": "app_managed",
-          "configuredServers": [], "servers": [], "liveSessions": [], "clientVisibility": [],
+          "configuredServers": [], "servers": [], "liveSessions": [], 
           "upstreamAuth": [\(twice), \(twice)], "downstreamClients": []
         }
         """
@@ -1075,7 +1075,7 @@ final class AppModelTests: XCTestCase {
         clientSignedIn: Bool = true
     ) -> OperatorSnapshot {
         let clientJSON = includeClient
-            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn)}]"#
+            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn),"clientKey":"oauth:client-1"}]"#
             : "[]"
         let payload = """
         {
@@ -1085,7 +1085,7 @@ final class AppModelTests: XCTestCase {
           "configuredServers": [],
           "servers": [],
           "liveSessions": [],
-          "clientVisibility": [],
+          
           "upstreamAuth": [{
             "name": "alpha",
             "url": null,

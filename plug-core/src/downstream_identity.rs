@@ -79,6 +79,15 @@ pub fn remote_client_key(grant: Option<&str>, client_type: ClientType) -> Option
     }
 }
 
+/// The client Plug takes this one for, as a link target: the one `named` (a
+/// link target or a settings key) stands for, a client Plug knows or one the
+/// owner made up, else the one Plug knows by the client's reported type.
+pub fn client_target(named: Option<&str>, client_type: ClientType) -> Option<String> {
+    named
+        .and_then(link_target_key)
+        .or_else(|| client_type.target_slug().map(str::to_string))
+}
+
 /// The settings key a link target stands for: a client Plug knows, or one
 /// the owner named in the app. Anything else is dropped, so a key is never
 /// made from free text.
@@ -258,6 +267,26 @@ fn stable_instance_uuid(namespace: &str, value: &str) -> Uuid {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_client_is_pictured_as_its_link_target_before_its_reported_name() {
+        assert_eq!(
+            client_target(Some("codex"), ClientType::Cursor).as_deref(),
+            Some("codex-cli")
+        );
+        assert_eq!(
+            client_target(Some("custom:radar"), ClientType::Cursor).as_deref(),
+            Some("custom:radar")
+        );
+        // A key that is no link target falls back to the reported name.
+        for key in [Some("oauth:abc"), Some(SHARED_REMOTE_CLIENT_KEY), None] {
+            assert_eq!(
+                client_target(key, ClientType::Cursor).as_deref(),
+                Some("cursor")
+            );
+        }
+        assert_eq!(client_target(None, ClientType::Unknown), None);
+    }
 
     #[test]
     fn a_client_the_owner_named_keeps_its_own_key() {

@@ -226,11 +226,6 @@ enum RecentCallers {
         return last.values.sorted { $0.occurredAtMs > $1.occurredAtMs }
     }
 
-    /// Whether a key belongs to a client that reaches Plug over the network.
-    static func isRemote(key: String) -> Bool {
-        key.hasPrefix("oauth:") || key.hasPrefix("remote:")
-    }
-
     /// "Last used 11:15 AM" today, and with the day before that.
     static func lastUsed(_ date: Date, now: Date = Date(), calendar: Calendar = .current) -> String {
         let time = date.formatted(date: .omitted, time: .shortened)

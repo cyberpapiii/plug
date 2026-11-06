@@ -8,7 +8,7 @@ final class SteadiedSnapshotTests: XCTestCase {
         snapshot.liveSessions = [
             LiveSession(
                 transport: "ipc", clientId: nil, sessionId: "one", clientType: "claude-code",
-                clientInfo: nil, host: nil, clientKey: nil, accessKey: nil, connectedSecs: connected, lastActivitySecs: connected
+                clientInfo: nil, host: nil, clientKey: nil, accessKey: nil, target: nil, connectedSecs: connected, lastActivitySecs: connected
             ),
         ]
         snapshot.upstreamAuth = [

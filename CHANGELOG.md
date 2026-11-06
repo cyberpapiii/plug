@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- A client's servers and tools in the app show what the daemon enforces for it, as the daemon reports it, where the app used to work it out again from the client's lists. A client's summary now counts every tool it is kept from: a rule such as `git__*` counts each tool it covers, and an allow list counts each tool of a partly listed server that is not on it.
 - A client connected through `plug connect` gets the JSON-RPC error codes an HTTP client gets. Bad parameters, an unknown method and a protocol version Plug does not serve now arrive as invalid params (`-32602`), method not found (`-32601`) and unsupported protocol version, where they used to arrive as an internal error (`-32603`) whose message began with a code such as `INVALID_PARAMS:`.
 - A remote client whose grant leaves out `tasks:use` is no longer told at `initialize` that Plug runs tasks, the way it is not told about other families its grant cannot use.
 - `$NAME` now means the same thing in `config.toml` as in the environment servers get: a variable already set in Plug's environment wins, and `.env` fills in the rest. A name set in both used to take the `.env` value in the config and the environment's value in servers.

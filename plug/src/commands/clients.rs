@@ -30,7 +30,7 @@ pub(crate) struct LiveSessionView {
     pub(crate) client_type: String,
     /// The link target of the client Plug recognised.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) target: Option<&'static str>,
+    pub(crate) target: Option<String>,
     pub(crate) client_info: Option<String>,
     /// The program that started a local connector, read from the process
     /// table rather than from what the client says about itself.
@@ -459,7 +459,7 @@ pub(crate) fn client_views(
         .map(|target| {
             let sessions: Vec<_> = live
                 .iter()
-                .filter(|session| session.client_type.target() == Some(target))
+                .filter(|session| session.target.as_deref() == Some(target.slug()))
                 .collect();
             let live_transports: std::collections::BTreeSet<&str> = sessions
                 .iter()
@@ -524,9 +524,7 @@ pub(crate) fn live_session_views(
             grant_name: key.as_ref().and_then(|key| {
                 grants
                     .iter()
-                    .find(|grant| {
-                        plug_core::downstream_identity::grant_client_key(&grant.client_id) == *key
-                    })
+                    .find(|grant| grant.client_key == *key)
                     .map(|grant| grant.client_name.trim().to_string())
                     .filter(|name| !name.is_empty())
             }),
@@ -535,7 +533,7 @@ pub(crate) fn live_session_views(
             client_id: session.client_id.clone(),
             session_id: session.session_id.clone(),
             client_type: session.client_type.to_string(),
-            target: session.client_type.target_slug(),
+            target: session.target.clone(),
             client_info: session.client_info.clone(),
             host: session.host.clone(),
             connected_secs: session.connected_secs,

@@ -42,6 +42,13 @@ pub struct ActivityEvent {
     /// here, so this is what tells them apart afterwards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_key: Option<String>,
+    /// The client Plug took the caller for, by its link target. See
+    /// [`crate::downstream_identity::client_target`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The call came over the network rather than from this Mac.
+    #[serde(default)]
+    pub remote: bool,
     pub latency_ms: u64,
     pub outcome: ActivityOutcome,
     /// Why a call failed, in the error's own words, cut to
@@ -145,6 +152,8 @@ mod tests {
             client_type: Some("codex-cli".into()),
             client_label: Some("codex 1.0".into()),
             client_key: None,
+            target: None,
+            remote: false,
             latency_ms: 1,
             outcome: ActivityOutcome::Success,
             reason: None,

@@ -434,6 +434,9 @@ async fn tools_call(
         .as_ref()
         .map(crate::protocol::ClientMetadata::display_label);
     let activity_client_key = call.client_key.as_deref().map(str::to_string);
+    let target =
+        crate::downstream_identity::client_target(call.client_key.as_deref(), call.client_type);
+    let remote = call.transport == crate::downstream_identity::DownstreamTransport::Http;
     let tool = params.name.to_string();
     let server = router.server_for_tool(&tool);
     let result = tools_call_inner(router, ctx, call, params, modern_task || legacy_task).await;
@@ -447,6 +450,8 @@ async fn tools_call(
         client_type: Some(client_type),
         client_label,
         client_key: activity_client_key,
+        target,
+        remote,
         latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         outcome: if result.is_ok() {
             crate::activity::ActivityOutcome::Success

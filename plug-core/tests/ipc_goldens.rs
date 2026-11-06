@@ -17,13 +17,13 @@ use std::path::PathBuf;
 
 use plug_core::activity::{ActivityEvent, ActivityOutcome};
 use plug_core::config::{ServerConfig, StdioSandboxConfig, ToolGroupRule, TransportType};
-use plug_core::downstream_identity::ClientHost;
+use plug_core::downstream_identity::{ClientHost, SHARED_REMOTE_CLIENT_KEY};
 use plug_core::downstream_oauth::{ClientSource, RegisteredClientSummary};
 use plug_core::events::{EventStatus, WatchConfig, WatchHealth};
 use plug_core::ipc::{
     ClientBlocks, ClientName, ClientPlace, DaemonOwnershipMode, IpcAuthServerInfo,
     IpcLiveSessionInfo, IpcRequest, IpcResponse, IpcToolInfo, IpcToolRiskInfo, IpcTrustInfo,
-    LiveSessionTransport, OperatorHandshake, OperatorRequest, OperatorSnapshot,
+    LiveSessionTransport, OffTool, OperatorHandshake, OperatorRequest, OperatorSnapshot,
 };
 use plug_core::operator::{
     ClientBlockKind, OperatorMutation, OperatorMutationResult, OperatorServerSummary,
@@ -378,6 +378,7 @@ fn snapshot() -> OperatorSnapshot {
                 link_target: Some("claude-code".to_string()),
                 client_key: Some("claude-code".to_string()),
                 access_key: Some("claude-code".to_string()),
+                target: Some("claude-code".to_string()),
                 connected_secs: 3_700,
                 last_activity_secs: Some(2),
             },
@@ -393,11 +394,11 @@ fn snapshot() -> OperatorSnapshot {
                 link_target: None,
                 client_key: Some("oauth:abc".to_string()),
                 access_key: Some("oauth:abc".to_string()),
+                target: None,
                 connected_secs: 61,
                 last_activity_secs: None,
             },
         ],
-        client_visibility: Vec::new(),
         upstream_auth: vec![IpcAuthServerInfo {
             name: "auth-required".to_string(),
             url: Some("https://example.com/mcp".to_string()),
@@ -416,6 +417,8 @@ fn snapshot() -> OperatorSnapshot {
             last_used_at: Some(1_700_000_500),
             expires_at: 1_800_000_000,
             signed_in: true,
+            client_key: "oauth:abc".to_string(),
+            target: None,
         }],
         client_names: vec![ClientName {
             key: "oauth:abc".to_string(),
@@ -433,7 +436,17 @@ fn snapshot() -> OperatorSnapshot {
                 only_allowed: false,
                 allowed_servers: Vec::new(),
                 allowed_tools: Vec::new(),
-                partly_allowed_servers: Vec::new(),
+                off_servers: vec!["degraded".to_string()],
+                off_tools: vec![
+                    OffTool {
+                        name: "healthy__send".to_string(),
+                        rule: None,
+                    },
+                    OffTool {
+                        name: "failed__read".to_string(),
+                        rule: Some("failed__*".to_string()),
+                    },
+                ],
             },
             ClientBlocks {
                 key: "oauth:abc".to_string(),
@@ -442,7 +455,11 @@ fn snapshot() -> OperatorSnapshot {
                 only_allowed: true,
                 allowed_servers: vec!["healthy".to_string()],
                 allowed_tools: vec!["failed__read".to_string()],
-                partly_allowed_servers: vec!["failed".to_string()],
+                off_servers: vec!["degraded".to_string(), "notes".to_string()],
+                off_tools: vec![OffTool {
+                    name: "failed__write".to_string(),
+                    rule: None,
+                }],
             },
         ],
         events: every_watch_state()
@@ -469,7 +486,6 @@ fn snapshot() -> OperatorSnapshot {
                 subscribers: 1,
             }])
             .collect(),
-        config_error: Some("config.toml line 2: expected `=`".to_string()),
         client_address: Some("https://plug.example.com/mcp".to_string()),
     }
 }
@@ -577,6 +593,8 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
                         client_type: Some("claude-code".to_string()),
                         client_label: Some("claude-code 2.0".to_string()),
                         client_key: Some("claude-code".to_string()),
+                        target: Some("claude-code".to_string()),
+                        remote: false,
                         latency_ms: 120,
                         outcome: ActivityOutcome::Success,
                         reason: None,
@@ -591,6 +609,8 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
                         client_type: None,
                         client_label: None,
                         client_key: Some("oauth:abc".to_string()),
+                        target: None,
+                        remote: true,
                         latency_ms: 30_000,
                         outcome: ActivityOutcome::Error,
                         reason: Some("upstream timed out".to_string()),
@@ -604,7 +624,9 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
                         tool: None,
                         client_type: None,
                         client_label: None,
-                        client_key: None,
+                        client_key: Some(SHARED_REMOTE_CLIENT_KEY.to_string()),
+                        target: None,
+                        remote: true,
                         latency_ms: 3,
                         outcome: ActivityOutcome::Cancelled,
                         reason: None,

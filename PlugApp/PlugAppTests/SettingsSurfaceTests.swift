@@ -181,25 +181,6 @@ final class AppIconTests: XCTestCase {
     }
 }
 
-/// Reloading says what moved. These pin the sentence.
-final class ReloadSummaryTests: XCTestCase {
-    func testNamesWhatChanged() {
-        let summary = ReloadSummary(added: ["figma"], removed: [], changed: ["notion", "exa"])
-        XCTAssertEqual(summary.summary, "1 added, 2 changed")
-    }
-
-    func testAReloadThatChangedNothingSaysSo() {
-        XCTAssertEqual(ReloadSummary().summary, "Nothing changed")
-    }
-
-    func testDecodesAReportWithFieldsMissing() throws {
-        let summary = try JSONDecoder().decode(ReloadSummary.self, from: Data(#"{"added":["a"]}"#.utf8))
-        XCTAssertEqual(summary.added, ["a"])
-        XCTAssertTrue(summary.removed.isEmpty)
-        XCTAssertEqual(summary.summary, "1 added")
-    }
-}
-
 /// A server says where it runs in words.
 final class ServerPlaceTests: XCTestCase {
     private func server(transport: String) -> ServerFacts {

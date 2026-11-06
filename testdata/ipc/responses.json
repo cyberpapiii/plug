@@ -12,6 +12,8 @@
         "client_type": "claude-code",
         "client_label": "claude-code 2.0",
         "client_key": "claude-code",
+        "target": "claude-code",
+        "remote": false,
         "latency_ms": 120,
         "outcome": "success"
       },
@@ -23,6 +25,7 @@
         "method": "tools/call",
         "tool": "failed__read",
         "client_key": "oauth:abc",
+        "remote": true,
         "latency_ms": 30000,
         "outcome": "error",
         "reason": "upstream timed out"
@@ -33,6 +36,8 @@
         "client": null,
         "server": null,
         "method": "tools/list",
+        "client_key": "remote:shared",
+        "remote": true,
         "latency_ms": 3,
         "outcome": "cancelled"
       }
@@ -350,6 +355,7 @@
           "link_target": "claude-code",
           "client_key": "claude-code",
           "access_key": "claude-code",
+          "target": "claude-code",
           "connected_secs": 3700,
           "last_activity_secs": 2
         },
@@ -367,7 +373,6 @@
           "last_activity_secs": null
         }
       ],
-      "client_visibility": [],
       "upstream_auth": [
         {
           "name": "auth-required",
@@ -394,7 +399,8 @@
           "created_at": 1700000000,
           "last_used_at": 1700000500,
           "expires_at": 1800000000,
-          "signed_in": true
+          "signed_in": true,
+          "client_key": "oauth:abc"
         }
       ],
       "client_names": [
@@ -418,6 +424,18 @@
           "tools": [
             "healthy__send",
             "failed__*"
+          ],
+          "off_servers": [
+            "degraded"
+          ],
+          "off_tools": [
+            {
+              "name": "healthy__send"
+            },
+            {
+              "name": "failed__read",
+              "rule": "failed__*"
+            }
           ]
         },
         {
@@ -429,8 +447,14 @@
           "allowed_tools": [
             "failed__read"
           ],
-          "partly_allowed_servers": [
-            "failed"
+          "off_servers": [
+            "degraded",
+            "notes"
+          ],
+          "off_tools": [
+            {
+              "name": "failed__write"
+            }
           ]
         }
       ],
@@ -499,7 +523,6 @@
           "subscribers": 1
         }
       ],
-      "config_error": "config.toml line 2: expected `=`",
       "client_address": "https://plug.example.com/mcp"
     }
   },

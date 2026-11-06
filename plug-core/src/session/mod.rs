@@ -175,6 +175,7 @@ impl From<DownstreamSessionSnapshot> for crate::ipc::IpcLiveSessionInfo {
             access_key: Some(crate::downstream_identity::remote_access_key(
                 snapshot.grant.as_deref(),
             )),
+            target: crate::downstream_identity::client_target(None, snapshot.client_type),
             grant: snapshot.grant,
             connected_secs: snapshot.connected_seconds,
             last_activity_secs: Some(snapshot.idle_seconds),

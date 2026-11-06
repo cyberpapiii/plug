@@ -429,6 +429,7 @@ async fn dispatch_tools_call_task_param_with_task_support_creates_task() {
         activity[0].outcome,
         crate::activity::ActivityOutcome::Success
     );
+    assert!(!activity[0].remote, "a connector call comes from this Mac");
 }
 
 #[tokio::test]
@@ -453,6 +454,7 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
     let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
     assert_eq!(activity.len(), 1);
     assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
+    assert!(activity[0].remote, "an HTTP call comes over the network");
 }
 
 fn assert_plug_icons_sequence(icons: &[rmcp::model::Icon]) {

@@ -178,10 +178,12 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(local.host?.executable, "/opt/homebrew/bin/claude")
         XCTAssertEqual(local.clientKey, "claude-code")
         XCTAssertEqual(local.accessKey, "claude-code")
+        XCTAssertEqual(local.target, "claude-code")
         XCTAssertEqual(local.connectedSecs, 3_700)
         let remote = snapshot.liveSessions[1]
         XCTAssertEqual(remote.transport, "http")
         XCTAssertEqual(remote.clientKey, "oauth:abc")
+        XCTAssertNil(remote.target)
         XCTAssertNil(remote.lastActivitySecs)
 
         XCTAssertEqual(snapshot.upstreamAuth.first?.tokenExpiresInSecs, 7_300)
@@ -190,6 +192,8 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(grant.clientName, "ChatGPT")
         XCTAssertEqual(grant.signedIn, true)
         XCTAssertEqual(grant.lastUsedAt, 1_700_000_500)
+        XCTAssertEqual(grant.clientKey, "oauth:abc")
+        XCTAssertNil(grant.target)
         XCTAssertEqual(snapshot.clientNames, [ClientName(key: "oauth:abc", name: "Work laptop")])
         XCTAssertEqual(snapshot.clientPlaces, [ClientPlace(key: "oauth:abc", place: "Studio Mac")])
 
@@ -199,7 +203,12 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(blocks[1].onlyAllowed, true)
         XCTAssertEqual(blocks[1].allowedServers, ["healthy"])
         XCTAssertEqual(blocks[1].allowedTools, ["failed__read"])
-        XCTAssertEqual(blocks[1].partlyAllowedServers, ["failed"])
+        XCTAssertEqual(blocks[0].offServers, ["degraded"])
+        XCTAssertEqual(blocks[0].offTools, [
+            OffTool(name: "healthy__send", rule: nil), OffTool(name: "failed__read", rule: "failed__*"),
+        ])
+        XCTAssertEqual(blocks[1].offServers, ["degraded", "notes"])
+        XCTAssertEqual(blocks[1].offTools?.map(\.name), ["failed__write"])
 
         let events = try XCTUnwrap(snapshot.events)
         XCTAssertEqual(
@@ -234,8 +243,11 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(events[0].clientKey, "claude-code")
         XCTAssertEqual(events[0].clientLabel, "claude-code 2.0")
         XCTAssertEqual(events[0].tool, "healthy__send")
+        XCTAssertEqual(events[0].target, "claude-code")
+        XCTAssertEqual(events.map(\.remote), [false, true, true])
         XCTAssertEqual(events[1].reason, "upstream timed out")
         XCTAssertNil(events[2].server)
+        XCTAssertEqual(events[2].clientKey, ActivityEvent.sharedRemoteKey)
     }
 
     func testTools() throws {
@@ -262,8 +274,7 @@ final class GoldenPayloadTests: XCTestCase {
         guard case .mutation = try response("mutation") else { return XCTFail() }
         guard case let .revoked(id) = try response("revoked") else { return XCTFail() }
         XCTAssertEqual(id, "abc")
-        guard case let .reloaded(report) = try response("reloaded") else { return XCTFail() }
-        XCTAssertEqual(report.added, ["notes"])
+        guard case .reloaded = try response("reloaded") else { return XCTFail() }
         guard case .ok = try response("ok") else { return XCTFail() }
         guard case let .error(code, message) = try response("error") else { return XCTFail() }
         XCTAssertEqual(code, "OPERATOR_MUTATION_FAILED")

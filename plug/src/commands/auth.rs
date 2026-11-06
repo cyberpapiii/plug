@@ -1533,6 +1533,8 @@ mod tests {
             last_used_at: Some(100 * day - 19 * day),
             expires_at: 100 * day + 71 * day,
             signed_in: true,
+            client_key: "oauth:client".to_string(),
+            target: Some("cursor".to_string()),
         };
         assert_eq!(
             registered_client_timeline(&registered, 100 * day),
