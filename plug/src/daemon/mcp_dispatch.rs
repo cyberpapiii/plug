@@ -33,11 +33,7 @@ pub(super) fn ipc_context(
         });
     let mut context = IpcContext::new(session_id, request_id);
     context.registry_client_id = registry_client_id.map(Arc::<str>::from);
-    context.client_type = ctx
-        .client_registry
-        .client_info(session_id)
-        .map(|info| plug_core::client_detect::detect_client(&info))
-        .unwrap_or(plug_core::types::ClientType::Unknown);
+    context.client_type = ctx.client_registry.client_type(session_id);
     context.client_key = ctx
         .client_registry
         .client_key(session_id)

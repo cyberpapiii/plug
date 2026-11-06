@@ -7,7 +7,8 @@ use super::ConnectionContext;
 /// Handle `AuthStatus` — return per-server OAuth state from config + credential stores.
 pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
     IpcResponse::AuthStatus {
-        servers: auth_status_from_statuses(ctx, &ctx.server_manager.server_statuses()).await,
+        servers: auth_status_from_statuses(ctx, &ctx.engine.server_manager().server_statuses())
+            .await,
     }
 }
 
@@ -211,7 +212,7 @@ mod tests {
         store.save(seeded_credentials()).await.unwrap();
 
         let ctx = auth_status_test_context(config_path);
-        ctx.server_manager.mark_auth_required(&server_name);
+        ctx.engine.server_manager().mark_auth_required(&server_name);
 
         let response = dispatch_auth_status(&ctx).await;
         let IpcResponse::AuthStatus { servers } = response else {

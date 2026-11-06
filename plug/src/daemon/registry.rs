@@ -167,11 +167,12 @@ impl ClientRegistry {
         }
     }
 
-    /// Get the client_info string for a session (for client type detection).
-    pub(super) fn client_info(&self, session_id: &str) -> Option<String> {
+    /// Which client a session is, from what it declared; `Unknown` for a
+    /// session that is not registered.
+    pub(super) fn client_type(&self, session_id: &str) -> plug_core::types::ClientType {
         self.sessions
             .get(session_id)
-            .and_then(|s| s.client_info.clone())
+            .map_or(plug_core::types::ClientType::Unknown, |s| s.client_type())
     }
 
     /// Get the stable client_id for a session.

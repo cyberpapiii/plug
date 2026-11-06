@@ -198,8 +198,13 @@ impl Engine {
         EngineSnapshot {
             servers: self.server_manager.server_statuses(),
             tool_count: self.tool_router.tool_count(),
-            uptime: self.started_at.elapsed(),
+            uptime: self.uptime(),
         }
+    }
+
+    /// How long this engine has been running.
+    pub fn uptime(&self) -> Duration {
+        self.started_at.elapsed()
     }
 
     /// Return status information for all upstream servers.

@@ -1,7 +1,5 @@
-//! Daemon mode — headless Engine with Unix socket IPC.
-//!
-//! Provides `plug serve --daemon` functionality: starts the Engine without TUI,
-//! listens on a Unix socket for CLI queries, and logs to file.
+//! The daemon's Unix socket: local connectors, the app and the CLI send
+//! length-prefixed JSON requests here and receive replies and pushes.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -107,9 +105,6 @@ fn restore_token_file(
 
 // ──────────────────────────── PID file locking ───────────────────────────────
 
-/// Acquire an exclusive lock on the PID file, returning the locked file handle.
-///
-/// The file handle MUST be held for the daemon's lifetime — dropping it releases the lock.
 /// How long to keep retrying a contended PID-file lock before concluding that
 /// another daemon owns it.
 ///
@@ -151,6 +146,9 @@ fn lock_with_retry(
     }
 }
 
+/// Acquire an exclusive lock on the PID file, returning the locked file handle.
+///
+/// The file handle MUST be held for the daemon's lifetime — dropping it releases the lock.
 fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -180,11 +178,8 @@ pub(crate) struct DaemonRuntimeLock {
     pid_file_path: PathBuf,
 }
 
-/// Claim singleton daemon ownership before any upstream initialization.
-///
-/// `plug connect` clients can all notice a missing socket at once. The winner
-/// must own this lock before loading OAuth credentials or spawning upstreams;
-/// every loser exits without touching either.
+/// Claim singleton daemon ownership before any upstream initialization:
+/// only the holder of this lock loads OAuth credentials or spawns upstreams.
 pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
     ensure_dir(&plug_core::paths::dir())?;
     let pid_file_path = pid_path();
@@ -304,32 +299,18 @@ pub(crate) async fn run_daemon_with_lock(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _addr)) => {
-                        let engine_cancel = engine.cancel_token().clone();
-                        let server_manager = engine.server_manager().clone();
-                        let snapshot = engine.snapshot();
-                        let auth = auth_token.clone();
-                        let engine_clone = engine.clone();
-                        let registry = client_registry.clone();
-                        let config_path = config_path.clone();
-                        let http = Arc::clone(&http);
-
+                        let ctx = ConnectionContext {
+                            cancel: cancel.clone(),
+                            auth_token: Arc::clone(&auth_token),
+                            engine: Arc::clone(&engine),
+                            config_path: config_path.clone(),
+                            client_registry: Arc::clone(&client_registry),
+                            http: Arc::clone(&http),
+                            ownership,
+                            session_id: None,
+                            reverse_request_rx: None,
+                        };
                         tokio::spawn(async move {
-                            let started_at = Instant::now()
-                                .checked_sub(snapshot.uptime)
-                                .unwrap_or_else(Instant::now);
-                            let ctx = ConnectionContext {
-                                cancel: engine_cancel,
-                                auth_token: auth,
-                                server_manager,
-                                engine: engine_clone,
-                                config_path: config_path.clone(),
-                                started_at,
-                                client_registry: registry,
-                                http,
-                                ownership,
-                                session_id: None,
-                                reverse_request_rx: None,
-                            };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
                             }
@@ -460,15 +441,12 @@ impl DownstreamBridge for DaemonBridge {
 
 // ──────────────────────── Connection Context ──────────────────────────────────
 
-/// Per-connection context — everything needed to handle IPC requests without
-/// holding a reference to Engine.
+/// What one IPC connection's requests are answered from.
 struct ConnectionContext {
     cancel: CancellationToken,
     auth_token: Arc<str>,
-    server_manager: Arc<plug_core::server::ServerManager>,
     engine: Arc<Engine>,
     config_path: PathBuf,
-    started_at: Instant,
     client_registry: Arc<ClientRegistry>,
     http: Arc<HttpState>,
     /// Who started this daemon, read once when it started.
@@ -478,12 +456,7 @@ struct ConnectionContext {
     /// Receiver for reverse requests from the daemon bridge. Created during
     /// Register, consumed by the IPC loop to forward reverse requests to the
     /// proxy client. See `DaemonBridge` for the sender side.
-    reverse_request_rx: Option<
-        tokio::sync::mpsc::Receiver<(
-            IpcClientRequest,
-            tokio::sync::oneshot::Sender<IpcClientResponse>,
-        )>,
-    >,
+    reverse_request_rx: Option<ReverseRequestRx>,
 }
 
 impl ConnectionContext {
@@ -494,10 +467,8 @@ impl ConnectionContext {
         Self {
             cancel: self.cancel.clone(),
             auth_token: Arc::clone(&self.auth_token),
-            server_manager: Arc::clone(&self.server_manager),
             engine: Arc::clone(&self.engine),
             config_path: self.config_path.clone(),
-            started_at: self.started_at,
             client_registry: Arc::clone(&self.client_registry),
             http: Arc::clone(&self.http),
             ownership: self.ownership,
@@ -587,8 +558,6 @@ async fn end_ipc_session(ctx: &ConnectionContext, session_id: &str) {
         .await;
 }
 
-/// Key a live session's lazy working set the way its transport stores it:
-/// bridge sessions under `ipc:`, HTTP and SSE sessions under `http:`.
 /// Resolves when the modern downstream gate may have changed. Never resolves
 /// once the sender is gone, so a closed channel cannot spin a select loop.
 async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
@@ -618,7 +587,7 @@ async fn push_modern_gate_change(
 
 /// Inner loop for IPC connection handling.
 ///
-/// Untagged requests run one at a time, as they always have: the loop
+/// Untagged requests run one at a time: the loop
 /// dispatches each inline and writes its reply before taking the next. On a
 /// registered connection, a request tagged with `ipc_id` dispatches on its own
 /// task (see `InFlight`) and the loop keeps reading, so one slow call does not
@@ -635,8 +604,8 @@ async fn handle_ipc_loop(
     // Logging subscription — activated after Register so the daemon can push
     // logging notifications to this IPC client in real time.
     let mut log_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    // Protocol notification subscription — activated after Register so the daemon
-    // can push list_changed, progress, and cancelled notifications to this IPC client.
+    // Control notifications (list changes, progress, cancellation, resource
+    // updates, auth state), likewise activated after Register.
     let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
     // Modern downstream gate changes are pushed as they happen. The router
     // outlives this connection, so the sender never closes under it.
@@ -682,13 +651,7 @@ async fn handle_ipc_loop(
                             send_ipc_logging_notification(writer, recv).await?;
                         }
                     }
-                    recv = async {
-                        if let Some(ref mut crx) = ctrl_rx {
-                            crx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
+                    recv = recv_if_subscribed(&mut ctrl_rx) => {
                         if may_tell(ctx.listener(), &recv) {
                             send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                         }
@@ -696,13 +659,7 @@ async fn handle_ipc_loop(
                     _ = modern_gate_changed(&mut gate_rx) => {
                         push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
                     }
-                    reverse = async {
-                        if let Some(ref mut rx) = ctx.reverse_request_rx {
-                            rx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
+                    reverse = recv_reverse(&mut ctx.reverse_request_rx) => {
                         if let Some((reverse_req, resp_tx)) = reverse {
                             send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
                         } else {
@@ -798,23 +755,12 @@ async fn handle_ipc_loop(
             continue;
         }
 
-        // Dispatch request. During a tools/call, the upstream MCP server may
-        // issue reverse requests (elicitation, sampling) via the DaemonBridge
-        // channel. We service those concurrently with the dispatch future.
-        //
-        // We temporarily take `reverse_request_rx` out of `ctx` to avoid
-        // borrow conflicts — `dispatch_request` borrows `ctx` mutably.
+        // Dispatch inline. A tools/call may make the upstream send reverse
+        // requests (elicitation, sampling) through the DaemonBridge, which
+        // are serviced while it runs, so the receiver comes out of `ctx`,
+        // which `dispatch_request` borrows mutably.
         let mut reverse_rx = ctx.reverse_request_rx.take();
-        // Capture session_id before dispatch borrows ctx mutably.
         let dispatch_session_id = ctx.session_id.clone();
-        // Capture whether this request is a Deregister before dispatch — a
-        // SUCCESSFUL Deregister drops the bridge channel's sender, closing
-        // it, so the taken-out `reverse_rx` above must not be restored below.
-        // The restore site additionally gates on the response being Ok: a
-        // Deregister that fails validation (SESSION_MISMATCH /
-        // SESSION_REPLACED) early-returns without touching the bridge, and
-        // the still-live channel must be restored as usual.
-        let request_was_deregister = is_deregister_request(&request);
         // Keep reading while this request dispatches, once reads are
         // cancellation-safe: replies to reverse requests are routed at once,
         // everything else waits in `deferred` for its turn. Without this an
@@ -837,15 +783,7 @@ async fn handle_ipc_loop(
                         result = Some(resp);
                         done = true;
                     }
-                    // Service reverse requests from DaemonBridge while tool call is in-flight
-                    reverse = async {
-                        if let Some(ref mut rx) = reverse_rx {
-                            rx.recv().await
-                        } else {
-                            // No bridge registered — pend forever
-                            std::future::pending().await
-                        }
-                    } => {
+                    reverse = recv_reverse(&mut reverse_rx) => {
                         if let Some((reverse_req, resp_tx)) = reverse {
                             send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
                         } else {
@@ -856,26 +794,12 @@ async fn handle_ipc_loop(
                     Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
                         write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
                     }
-                    // Also forward logging notifications while waiting
-                    recv = async {
-                        if let Some(ref mut rx) = log_rx {
-                            rx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
+                    recv = recv_if_subscribed(&mut log_rx) => {
                         if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
                             send_ipc_logging_notification(writer, recv).await?;
                         }
                     }
-                    // Forward control notifications (list_changed, progress, cancelled)
-                    recv = async {
-                        if let Some(ref mut crx) = ctrl_rx {
-                            crx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
+                    recv = recv_if_subscribed(&mut ctrl_rx) => {
                         if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
                             send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
                         }
@@ -902,18 +826,10 @@ async fn handle_ipc_loop(
             result.unwrap()
         };
 
-        // Restore reverse_request_rx (dispatch_request may have replaced it
-        // during a Register call, in which case ctx already has the new one).
-        // Skip the restore only after a SUCCESSFUL Deregister — its handler
-        // intentionally cleared ctx.reverse_request_rx and dropped the
-        // bridge's sender, so the channel we took out above is now closed;
-        // restoring it would resurrect a dead channel that busy-spins
-        // Ready(None) on selects. A FAILED Deregister (SESSION_MISMATCH /
-        // SESSION_REPLACED) early-returns without touching the bridge, so
-        // the taken-out channel is still live and must be restored, or every
-        // future reverse request for this still-active session would fail.
-        let deregister_succeeded = request_was_deregister && matches!(response, IpcResponse::Ok);
-        if ctx.reverse_request_rx.is_none() && !deregister_succeeded {
+        // The receiver belongs to the session it was taken out with. A
+        // Register made a new one, already in `ctx`; a Deregister ended the
+        // session and its bridge, so the old one is dropped.
+        if ctx.reverse_request_rx.is_none() && ctx.session_id == dispatch_session_id {
             ctx.reverse_request_rx = reverse_rx;
         }
 
@@ -931,56 +847,18 @@ async fn handle_ipc_loop(
             break;
         }
 
-        // Drain any notifications that queued during request dispatch
-        if let Some(ref mut rx) = log_rx {
-            use tokio::sync::broadcast::error::TryRecvError;
-            loop {
-                match rx.try_recv() {
-                    Ok(notif) => {
-                        let recv = Ok(notif);
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_logging_notification(writer, recv).await?;
-                        }
-                    }
-                    Err(TryRecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "IPC logging notification lagged");
-                        let synthetic = IpcResponse::LoggingNotification {
-                            params: serde_json::to_value(
-                                plug_core::notifications::ProtocolNotification::lagged_logging_params(skipped),
-                            )
-                            .unwrap_or_default(),
-                        };
-                        ipc::send_response(writer, &synthetic).await.ok();
-                    }
-                    Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
+        // Send what queued while the request dispatched.
+        if let Some(rx) = log_rx.as_mut() {
+            while let Some(recv) = queued(rx) {
+                if may_tell(ctx.listener(), &recv) {
+                    send_ipc_logging_notification(writer, recv).await?;
                 }
             }
         }
-        if let Some(ref mut crx) = ctrl_rx {
-            use tokio::sync::broadcast::error::TryRecvError;
-            loop {
-                match crx.try_recv() {
-                    Ok(notif) => {
-                        let recv = Ok(notif);
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_control_notification(writer, recv, ctx.session_id.as_deref())
-                                .await?;
-                        }
-                    }
-                    Err(TryRecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "IPC control notification lagged");
-                        let notif = IpcResponse::LoggingNotification {
-                            params: serde_json::to_value(
-                                plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
-                                    skipped,
-                                    "ipc",
-                                ),
-                            )
-                            .unwrap_or_default(),
-                        };
-                        ipc::send_response(writer, &notif).await.ok();
-                    }
-                    Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
+        if let Some(rx) = ctrl_rx.as_mut() {
+            while let Some(recv) = queued(rx) {
+                if may_tell(ctx.listener(), &recv) {
+                    send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
                 }
             }
         }
@@ -993,9 +871,6 @@ async fn handle_ipc_loop(
 /// queues, and macOS caps socket buffers at 8 MB.
 const IPC_SEND_BUFFER: usize = 4 * 1024 * 1024;
 
-/// Write the reply of a request that dispatched on its own task, tagged with
-/// the `ipc_id` it arrived with. A task that panicked answers with an error,
-/// so the proxy's waiter never hangs on it.
 /// How long a cancelled connection waits for request tasks to finish and
 /// their replies to be written.
 const REPLY_FLUSH_WINDOW: Duration = Duration::from_millis(250);
@@ -1017,6 +892,9 @@ async fn flush_finished_replies(
     .await;
 }
 
+/// Write the reply of a request that dispatched on its own task, tagged with
+/// the `ipc_id` it arrived with. A task that panicked answers with an error,
+/// so the proxy's waiter never hangs on it.
 async fn write_in_flight_reply(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ids: &mut std::collections::HashMap<tokio::task::Id, u64>,
@@ -1041,17 +919,46 @@ async fn write_in_flight_reply(
     ipc::send_chunked_response_with_id(writer, Some(ipc_id), &response).await
 }
 
-/// True when `request` is an `IpcRequest::Deregister`. On SUCCESS, the
-/// Deregister handler in `dispatch_request` clears `ctx.reverse_request_rx`
-/// and drops the bridge channel's sender (closing it), so `handle_ipc_loop`'s
-/// post-dispatch restore step must skip putting the (now-closed) taken-out
-/// channel back — otherwise the next request's select loop busy-spins on
-/// `Ready(None)`. This predicate alone is NOT sufficient to skip the restore:
-/// a Deregister that fails validation early-returns without touching the
-/// bridge, leaving the taken-out channel live, so the call site additionally
-/// gates the skip on the response being `IpcResponse::Ok`.
-fn is_deregister_request(request: &IpcRequest) -> bool {
-    matches!(request, IpcRequest::Deregister { .. })
+type ReverseRequestRx = tokio::sync::mpsc::Receiver<(
+    IpcClientRequest,
+    tokio::sync::oneshot::Sender<IpcClientResponse>,
+)>;
+
+/// The next notification once subscribed; pends forever before then.
+async fn recv_if_subscribed<T: Clone>(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<T>>,
+) -> Result<T, tokio::sync::broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next reverse request once the session has a bridge; pends forever
+/// without one. `None` means the bridge is gone.
+async fn recv_reverse(
+    rx: &mut Option<ReverseRequestRx>,
+) -> Option<(
+    IpcClientRequest,
+    tokio::sync::oneshot::Sender<IpcClientResponse>,
+)> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A notification already queued, as `recv` would have returned it, or
+/// `None` when nothing is.
+fn queued<T: Clone>(
+    rx: &mut tokio::sync::broadcast::Receiver<T>,
+) -> Option<Result<T, tokio::sync::broadcast::error::RecvError>> {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    match rx.try_recv() {
+        Ok(value) => Some(Ok(value)),
+        Err(TryRecvError::Lagged(skipped)) => Some(Err(RecvError::Lagged(skipped))),
+        Err(TryRecvError::Empty | TryRecvError::Closed) => None,
+    }
 }
 
 /// Whether this connection's client may be sent what `recv` holds. See
@@ -1083,7 +990,8 @@ impl ConnectionContext {
     }
 }
 
-/// Send a logging notification to the IPC client, handling broadcast errors.
+/// Send a logging notification to the IPC client, handling broadcast
+/// errors. A failed write is returned, so a dead connection ends at once.
 async fn send_ipc_logging_notification(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     recv: Result<
@@ -1094,24 +1002,19 @@ async fn send_ipc_logging_notification(
     use plug_core::notifications::ProtocolNotification;
     use tokio::sync::broadcast::error::RecvError;
 
-    match recv {
-        Ok(ProtocolNotification::LoggingMessage { params }) => {
-            let notif = IpcResponse::LoggingNotification {
-                params: serde_json::to_value(params).unwrap_or_default(),
-            };
-            ipc::send_response(writer, &notif).await.ok();
-        }
-        Ok(_) => {} // non-logging notification on wrong channel
+    let params = match recv {
+        Ok(ProtocolNotification::LoggingMessage { params }) => serde_json::to_value(params),
+        // Only logging is sent on this channel.
+        Ok(_) | Err(RecvError::Closed) => return Ok(()),
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC logging notification lagged");
-            let synthetic = IpcResponse::LoggingNotification {
-                params: serde_json::to_value(ProtocolNotification::lagged_logging_params(skipped))
-                    .unwrap_or_default(),
-            };
-            ipc::send_response(writer, &synthetic).await.ok();
+            serde_json::to_value(ProtocolNotification::lagged_logging_params(skipped))
         }
-        Err(RecvError::Closed) => {}
-    }
+    };
+    let notification = IpcResponse::LoggingNotification {
+        params: params.unwrap_or_default(),
+    };
+    ipc::send_response(writer, &notification).await?;
     Ok(())
 }
 
@@ -1358,7 +1261,7 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             let client_blocks =
                 client_blocks(&config, &configured_servers, ctx.engine.tool_router());
             let events = ctx.engine.event_statuses(&config).await;
-            let mut server_statuses = ctx.server_manager.server_statuses();
+            let mut server_statuses = ctx.engine.server_manager().server_statuses();
             strip_upstream_icons(&mut server_statuses);
             let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
             let downstream_clients = match ctx.http.downstream_oauth() {
@@ -1368,7 +1271,7 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             IpcResponse::OperatorSnapshot {
                 snapshot: Box::new(plug_core::ipc::OperatorSnapshot {
                     runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-                    uptime_secs: ctx.started_at.elapsed().as_secs(),
+                    uptime_secs: ctx.engine.uptime().as_secs(),
                     tool_catalog_revision: tool_catalog_revision(ctx),
                     ownership: ctx.ownership,
                     configured_servers,
@@ -1508,11 +1411,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
     }
     match request {
         IpcRequest::Status => {
-            let servers = ctx.server_manager.server_statuses();
+            let servers = ctx.engine.server_manager().server_statuses();
             IpcResponse::Status {
                 servers,
                 clients: ctx.client_registry.count(),
-                uptime_secs: ctx.started_at.elapsed().as_secs(),
+                uptime_secs: ctx.engine.uptime().as_secs(),
                 runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                 resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
             }
@@ -1613,7 +1516,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         IpcRequest::Deregister { session_id } => {
             end_ipc_session(ctx, session_id).await;
             ctx.session_id = None;
-            ctx.reverse_request_rx = None;
             IpcResponse::Ok
         }
 
@@ -1857,16 +1759,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 return response;
             }
 
-            let client_type = ctx
-                .client_registry
-                .client_info(session_id)
-                .as_deref()
-                .map(plug_core::client_detect::detect_client)
-                .unwrap_or(plug_core::types::ClientType::Unknown);
             let downstream = plug_core::proxy::DownstreamCallContext::ipc(
                 session_id.as_str(),
                 request_id.clone(),
-                client_type,
+                ctx.client_registry.client_type(session_id),
                 Some(client_id),
             )
             .with_client_key(ctx.client_registry.client_key(session_id));
@@ -2371,10 +2267,8 @@ mod tests {
         ConnectionContext {
             cancel,
             auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
             engine: Arc::clone(engine),
             config_path: config_path.into(),
-            started_at: Instant::now(),
             client_registry: Arc::new(client_registry),
             ownership: ipc::DaemonOwnershipMode::Unknown,
             http: Arc::new(HttpState::new(
@@ -2930,30 +2824,6 @@ allowed_servers = ["slack"]
         assert!(json.contains("\"session_id\":\"session-123\""));
     }
 
-    #[test]
-    fn is_deregister_request_detects_only_deregister() {
-        // Regression guard for the restore-skip predicate in
-        // `handle_ipc_loop`: only a Deregister request should suppress
-        // restoring `reverse_request_rx`, since only Deregister's handler
-        // closes the channel out from under the dispatch loop.
-        assert!(is_deregister_request(&IpcRequest::Deregister {
-            session_id: "session-123".to_string(),
-        }));
-
-        assert!(!is_deregister_request(&IpcRequest::Status));
-        assert!(!is_deregister_request(&IpcRequest::Ping {
-            session_id: "session-123".to_string(),
-        }));
-        assert!(!is_deregister_request(&IpcRequest::Register {
-            protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
-            client_id: "client-123".to_string(),
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            link_target: None,
-        }));
-    }
-
     #[tokio::test]
     async fn daemon_bridge_rejects_elicitation_without_capability() {
         use plug_core::proxy::DownstreamBridge;
@@ -3091,7 +2961,7 @@ allowed_servers = ["slack"]
         );
     }
 
-    // ── IPC end-to-end test harness (U5) ─────────────────────────────────────
+    // ── IPC end-to-end test harness ─────────────────────────────────────
     //
     // Boots a daemon-backed engine with a stdio mock upstream over a TEMPORARY
     // Unix socket and drives real `tools/call` round-trips through the actual
@@ -3333,57 +3203,10 @@ allowed_servers = ["slack"]
         );
     }
 
-    /// After a `Deregister`, the bridge channel's sender is dropped (closed)
-    /// and `ctx.reverse_request_rx` is cleared. Sending another request on
-    /// the same connection must not resurrect that closed channel — the
-    /// direct regression guard for the restore-skip predicate is
-    /// `is_deregister_request_detects_only_deregister`; this test documents
-    /// the end-to-end sequence still completing normally afterward, matching
-    /// the plan's minimum bar (pre-fix this also passes functionally, since
-    /// a busy-spun `Ready(None)` arm still lets the dispatch future resolve —
-    /// it just burns CPU doing so).
-    #[tokio::test]
-    async fn deregister_then_status_request_completes_normally() {
-        let mut harness = IpcTestHarness::start("echo").await;
-
-        write_ipc(
-            &mut harness.stream,
-            &IpcRequest::Deregister {
-                session_id: harness.session_id.clone(),
-            },
-        )
-        .await;
-        let deregister_resp = read_ipc_response(&mut harness.stream).await;
-        assert!(
-            matches!(deregister_resp, IpcResponse::Ok),
-            "expected Ok, got {deregister_resp:?}"
-        );
-
-        write_ipc(&mut harness.stream, &IpcRequest::Status).await;
-        let status_resp = read_ipc_response(&mut harness.stream).await;
-
-        harness.shutdown().await;
-
-        assert!(
-            matches!(status_resp, IpcResponse::Status { .. }),
-            "expected Status, got {status_resp:?}"
-        );
-    }
-
-    /// Bug 4 regression: an elicitation/sampling request arriving on
-    /// `ctx.reverse_request_rx` while a registered connection is idle (no
-    /// request currently being dispatched) must reach the client without the
-    /// client sending another frame first — pre-fix, the registered-idle
-    /// `select!` had no arm for `reverse_request_rx`, so the request would
-    /// hang until the next client-initiated request happened to service it.
-    ///
-    /// This injects directly into a hand-built reverse-request channel
-    /// (mirroring `daemon_bridge_rejects_elicitation_without_capability`)
-    /// rather than driving it through a real task-wrapped tool call: the
-    /// background-task dispatch path (`execute_tool_task` in
-    /// `plug-core/src/proxy/tasks.rs`) doesn't register into `active_calls`,
-    /// so upstream-triggered reverse-request routing for it is a separate
-    /// concern from the idle-select servicing arm this test targets.
+    /// An elicitation or sampling request arriving while a registered
+    /// connection is idle reaches the client without the client sending
+    /// another frame first. The request goes straight into the connection's
+    /// reverse-request channel, so the test covers only the idle loop's arm.
     #[tokio::test]
     async fn idle_registered_connection_services_reverse_request_without_new_client_frame() {
         let config = plug_core::config::Config::default();
@@ -3709,11 +3532,8 @@ allowed_servers = ["slack"]
     /// desyncing the length-prefixed protocol and killing the connection with
     /// a spurious frame error. After the fix, frame reads go through a
     /// dedicated reader task feeding an `mpsc` channel, whose `recv()` is
-    /// cancellation-safe, so this should round-trip cleanly.
-    ///
-    /// Confirmed to reproduce pre-fix: reverting the `FrameReader` change and
-    /// running this test fails with `frame too large: N bytes (max
-    /// 4194304)` — the exact desync symptom this fix prevents.
+    /// cancellation-safe, so this should round-trip cleanly. Without it the
+    /// test fails with `frame too large`.
     #[tokio::test]
     async fn ipc_registered_client_survives_notification_flood_during_fragmented_frame() {
         let mut harness = IpcTestHarness::start("echo").await;
@@ -3828,18 +3648,19 @@ allowed_servers = ["slack"]
     }
 
     /// A `tools/call` result JSON is either a `CallToolResult` ({content, isError})
-    /// or a serialized `McpError` ({code, message}). Normalize either to a
-    /// ParityOutcome.
+    /// or a serialized `McpError`, decoded the way the proxy decodes it.
     fn parity_from_result_json(payload: &serde_json::Value) -> ParityOutcome {
-        if let Some(code) = payload.get("code").and_then(|c| c.as_i64()) {
-            return ParityOutcome::Error { code };
-        }
-        ParityOutcome::Success {
-            text: payload["content"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            is_error: payload["isError"].as_bool().unwrap_or(false),
+        match plug_core::ipc::mcp_result(payload.clone()) {
+            Err(error) => ParityOutcome::Error {
+                code: i64::from(error.code.0),
+            },
+            Ok(result) => ParityOutcome::Success {
+                text: result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                is_error: result["isError"].as_bool().unwrap_or(false),
+            },
         }
     }
 
@@ -3972,51 +3793,25 @@ allowed_servers = ["slack"]
     // generic drivers extend the matrix to every other method family: each takes
     // a JSON-RPC `method` + `params`, drives it through the real transport against
     // the shared full-capability mock upstream, and normalizes to a transport-
-    // agnostic `MethodOutcome` (a canonicalized result JSON, or an error code).
+    // agnostic `MethodOutcome` (a result JSON, or an error code).
 
-    /// Normalized cross-transport outcome for any MCP method: either a
-    /// canonicalized result object or an error code. Result JSON is key-sorted so
-    /// structural equality is independent of each transport's serialization order.
+    /// Normalized cross-transport outcome for any MCP method: either a result
+    /// object or an error code. JSON object equality ignores key order.
     #[derive(Debug, Clone, PartialEq)]
     enum MethodOutcome {
         Result(serde_json::Value),
         Error { code: i64 },
     }
 
-    /// Recursively sort object keys so two structurally-equal results with
-    /// different key order compare equal.
-    fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let mut sorted = serde_json::Map::new();
-                for k in keys {
-                    sorted.insert(k.clone(), canonicalize_json(&map[k]));
-                }
-                serde_json::Value::Object(sorted)
-            }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
-            }
-            other => other.clone(),
-        }
-    }
-
-    /// Normalize a bare result payload (IPC carries success and a serialized
-    /// `McpError` over the same channel) to a `MethodOutcome`. A top-level integer
-    /// `code` marks an error; none of the routed result types carry one.
+    /// Normalize a bare result payload, which IPC uses for both a result and
+    /// a serialized `McpError`, the way the proxy decodes it.
     fn method_outcome_from_payload(payload: &serde_json::Value) -> MethodOutcome {
-        // A serialized McpError carries BOTH a top-level integer `code` and a
-        // string `message`. Requiring both (not `code` alone) keeps a future
-        // result type that happens to expose a top-level integer `code` from
-        // being misclassified as an error.
-        let code = payload.get("code").and_then(|c| c.as_i64());
-        let has_message = payload.get("message").and_then(|m| m.as_str()).is_some();
-        if let (Some(code), true) = (code, has_message) {
-            return MethodOutcome::Error { code };
+        match plug_core::ipc::mcp_result(payload.clone()) {
+            Ok(result) => MethodOutcome::Result(result),
+            Err(error) => MethodOutcome::Error {
+                code: i64::from(error.code.0),
+            },
         }
-        MethodOutcome::Result(canonicalize_json(payload))
     }
 
     /// HTTP: drive an arbitrary method through the real axum router and normalize.
@@ -4027,7 +3822,7 @@ allowed_servers = ["slack"]
                 code: err["code"].as_i64().unwrap_or(0),
             }
         } else {
-            MethodOutcome::Result(canonicalize_json(&json["result"]))
+            MethodOutcome::Result(json["result"].clone())
         }
     }
 
@@ -4339,7 +4134,7 @@ allowed_servers = ["slack"]
         assert_empty_ok(outcome, "unsubscribe");
     }
 
-    /// Send `request` tagged with `ipc_id`, as a v4 proxy does.
+    /// Send `request` tagged with `ipc_id`, as the proxy does.
     async fn write_tagged_ipc(stream: &mut tokio::net::UnixStream, ipc_id: u64, req: &IpcRequest) {
         let payload = plug_core::ipc::encode_tagged(Some(ipc_id), req).expect("encode request");
         plug_core::ipc::write_frame(stream, &payload)
@@ -4383,6 +4178,16 @@ allowed_servers = ["slack"]
         ]
     }
 
+    async fn wait_for_a_running_call(router: &ToolRouter) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while router.calls_running() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the call never started");
+    }
+
     fn tool_call_request(session_id: &str, name: &str) -> IpcRequest {
         IpcRequest::McpRequest {
             session_id: session_id.to_string(),
@@ -4404,8 +4209,8 @@ allowed_servers = ["slack"]
             &tool_call_request(&session_id, "Slow__echo"),
         )
         .await;
-        // Let the call reach the upstream, then shut down as the daemon does.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Once the call is running, shut down as the daemon does.
+        wait_for_a_running_call(harness.engine.tool_router()).await;
         let remaining = harness
             .engine
             .tool_router()
@@ -4441,7 +4246,7 @@ allowed_servers = ["slack"]
             })),
         };
         write_tagged_ipc(&mut harness.stream, 1, &request).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_for_a_running_call(harness.engine.tool_router()).await;
         let remaining = harness
             .engine
             .tool_router()

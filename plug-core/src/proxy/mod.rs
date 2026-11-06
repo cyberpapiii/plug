@@ -2000,6 +2000,12 @@ impl ToolRouter {
         }
     }
 
+    /// How many tool calls are running, as [`Self::drain_calls`] counts them.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn calls_running(&self) -> usize {
+        self.calls_in_flight.load(Ordering::Acquire)
+    }
+
     #[cfg(test)]
     pub(crate) fn active_call_count(&self) -> usize {
         self.active_calls.len()

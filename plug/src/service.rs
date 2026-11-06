@@ -356,7 +356,10 @@ fn map_service_ownership(ownership: ServiceOwnership) -> plug_core::ipc::DaemonO
 
 pub fn ipc_ownership() -> plug_core::ipc::DaemonOwnershipMode {
     match inspect() {
-        Err(_) => plug_core::ipc::DaemonOwnershipMode::Unknown,
+        Err(error) => {
+            tracing::warn!(%error, "could not read who runs the daemon");
+            plug_core::ipc::DaemonOwnershipMode::Unknown
+        }
         Ok(state) => map_service_ownership(state.ownership),
     }
 }
@@ -692,18 +695,6 @@ mod tests {
     }
 
     #[test]
-    fn inspect_error_maps_to_unknown_not_unmanaged() {
-        let ownership = match Result::<ServiceState, anyhow::Error>::Err(anyhow::anyhow!(
-            "launchctl unavailable"
-        )) {
-            Err(_) => plug_core::ipc::DaemonOwnershipMode::Unknown,
-            Ok(state) => map_service_ownership(state.ownership),
-        };
-        assert_eq!(ownership, plug_core::ipc::DaemonOwnershipMode::Unknown);
-        assert_ne!(ownership, plug_core::ipc::DaemonOwnershipMode::Unmanaged);
-    }
-
-    #[test]
     fn recognized_legacy_programs_match_shared_fixture() {
         #[derive(serde::Deserialize)]
         struct Fixture {
@@ -943,6 +934,28 @@ arguments = {
             "app plist lost its exit timeout"
         );
         assert!(app.contains(FILE_LIMIT), "app plist lost its file limit");
+    }
+
+    /// The app registers the job that `app_managed_launchd_evidence` must
+    /// recognize as its own; a label, path or argument that differs makes the
+    /// app's daemon read as one the CLI started.
+    #[test]
+    fn app_plist_runs_the_job_service_recognizes() {
+        let app_plist = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../PlugApp/PlugApp/Resources/com.plug.daemon.plist");
+        let app = std::fs::read_to_string(&app_plist)
+            .unwrap_or_else(|error| panic!("read {}: {error}", app_plist.display()));
+        let arguments: String = std::iter::once(BUNDLED_BINARY)
+            .chain(DAEMON_ARGS)
+            .map(|argument| format!("<string>{argument}</string>"))
+            .collect();
+        for expected in [
+            format!("<key>Label</key><string>{DAEMON_LABEL}</string>"),
+            format!("<key>BundleProgram</key><string>{BUNDLED_BINARY}</string>"),
+            arguments,
+        ] {
+            assert!(app.contains(&expected), "app plist lacks {expected}");
+        }
     }
 
     /// A daemon that claimed the runtime lock and then exited without binding a
