@@ -965,7 +965,7 @@ final class AppModelTests: XCTestCase {
         await model.start()
 
         let config = try await model.serverConfig(name: "workspace")
-        XCTAssertEqual(config.command, "npx")
+        XCTAssertEqual(config.command, "uvx")
         XCTAssertTrue(events.values.contains("ipc.getServerConfig"))
     }
 
@@ -1194,6 +1194,9 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     private let listener: Int32
     private let events: LockedEvents
     private let daemonVersion: String
+    /// What the daemon answers, from its goldens. The fixture changes only
+    /// what a test varies.
+    private let replies: [String: [String: Any]]
     private let lock = NSLock()
     private let serveStopped = DispatchSemaphore(value: 0)
     private(set) var clientVersion: String?
@@ -1221,6 +1224,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     ) throws {
         self.events = events
         self.daemonVersion = daemonVersion
+        replies = try ipcResponseGoldens()
         self.socketURL = providedSocketURL ?? TestSocket.uniquePath("plug-app-model")
         listener = try TestSocket.listen(at: self.socketURL.path)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.serve() }
@@ -1275,47 +1279,31 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                 case "OperatorHandshake":
                     clientVersion = object["client_version"] as? String
                     events.append("ipc.handshake")
-                    send(response: [
-                        "type": "OperatorHandshake",
-                        "handshake": ["daemon_version": daemonVersion, "ownership": "app_managed"],
-                    ], to: accepted)
+                    send(response: reply("handshake", in: "handshake", ["daemon_version": daemonVersion]), to: accepted)
                 case "GetServerConfig":
                     events.append("ipc.getServerConfig")
-                    send(response: [
-                        "type": "ServerConfig",
-                        "name": object["name"] as? String ?? "",
-                        "server": [
-                            "command": "npx",
-                            "args": ["-y", "linear-mcp"],
-                            "transport": "stdio",
-                        ],
-                    ], to: accepted)
+                    var config = replies["server_config"] ?? [:]
+                    config["name"] = object["name"] as? String ?? ""
+                    send(response: config, to: accepted)
                 case "Snapshot":
                     events.append("ipc.snapshot")
                     _ = snapshotGate?.wait(timeout: .now() + 5)
-                    send(response: [
-                        "type": "OperatorSnapshot",
-                        "snapshot": [
-                            "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app_managed", "prefix_delimiter": "__",
-                            "tool_catalog_revision": catalogRevision,
-                            "configured_servers": [], "servers": [], "live_sessions": [],
-                            "upstream_auth": [], "downstream_clients": [],
-                        ],
-                    ], to: accepted)
+                    send(response: reply("snapshot", in: "snapshot", [
+                        "runtime_version": currentTestAppVersion, "uptime_secs": 1,
+                        "tool_catalog_revision": catalogRevision,
+                    ]), to: accepted)
                 case "ListTools":
                     events.append("ipc.listTools")
-                    send(response: [
-                        "type": "Tools",
-                        "tools": [[
-                            "name": "demo__echo", "server_id": "demo", "description": "Echo.",
-                            "title": "Echo", "disabled": false,
-                        ]],
-                    ], to: accepted)
+                    send(response: replies["tools"] ?? [:], to: accepted)
                 case "Activity":
                     events.append("ipc.activity")
-                    send(response: ["type": "ActivitySnapshot", "events": []], to: accepted)
+                    send(response: replies["activity"] ?? [:], to: accepted)
+                case "Mutate":
+                    send(response: replies["mutation"] ?? [:], to: accepted)
+                case "Reload":
+                    send(response: replies["reloaded"] ?? [:], to: accepted)
                 default:
-                    send(response: ["type": "Ok"], to: accepted)
+                    send(response: replies["ok"] ?? [:], to: accepted)
                 }
             }
             lock.lock()
@@ -1324,6 +1312,15 @@ private final class OperatorFixtureServer: @unchecked Sendable {
             lock.unlock()
             if ownsConnection { Darwin.close(accepted) }
         }
+    }
+
+    /// The golden reply `name` with `changes` made to its `field` object.
+    private func reply(_ name: String, in field: String, _ changes: [String: Any]) -> [String: Any] {
+        var reply = replies[name] ?? [:]
+        var inner = reply[field] as? [String: Any] ?? [:]
+        inner.merge(changes) { $1 }
+        reply[field] = inner
+        return reply
     }
 
     private func wakeAccept() {
