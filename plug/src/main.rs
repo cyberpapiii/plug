@@ -2,18 +2,6 @@
 // RMCP 3.1 deprecates some APIs toward future SEP-2577. Plug intentionally
 // retains them while MCP 2025-11-25 remains the default negotiated revision.
 #![allow(deprecated)]
-#![allow(
-    clippy::items_after_test_module,
-    clippy::large_enum_variant,
-    clippy::manual_map,
-    clippy::manual_unwrap_or,
-    clippy::manual_unwrap_or_default,
-    clippy::needless_borrow,
-    clippy::suspicious_open_options,
-    clippy::too_many_arguments,
-    clippy::unnecessary_cast,
-    clippy::unnecessary_min_or_max
-)]
 
 /// Load `.env` file vars into the process environment.
 ///
@@ -111,6 +99,7 @@ pub(crate) enum ClientLinkTransport {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // parsed once per process
 enum Commands {
     #[command(display_order = 1)]
     /// Start Plug in the background
@@ -173,7 +162,7 @@ enum Commands {
         #[command(subcommand)]
         command: Option<commands::events::EventCommands>,
     },
-    #[command(display_order = 10)]
+    #[command(display_order = 10, alias = "export")]
     /// Connect a client to Plug
     Link {
         /// Client targets to link, such as `cursor` or `claude-code`
@@ -247,17 +236,6 @@ enum Commands {
         /// Import every server found without asking
         #[arg(long)]
         yes: bool,
-    },
-    #[command(display_order = 18, hide = true)]
-    /// Compatibility alias for `plug link`
-    Export {
-        targets: Vec<String>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        yes: bool,
-        #[arg(long, value_enum)]
-        transport: Option<ClientLinkTransport>,
     },
     #[command(display_order = 19)]
     /// Sign in to a server, and see who is signed in
@@ -567,24 +545,14 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // `plug status -v`, `plug clients -v`, and `plug tools -v` spend the
-    // first -v on showing more, so their debug logs start at -vv.
-    let log_verbosity = match &cli.command {
-        Some(Commands::Status { .. })
-        | Some(Commands::Clients { .. })
-        | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
-        _ => cli.verbose,
-    };
-    let log_level = match log_verbosity {
-        0 => default_log_level(cli.command.as_ref()),
-        1 => "debug",
-        _ => "trace",
-    };
-
+    let log_level = log_level(&cli);
     let daemon_mode = matches!(&cli.command, Some(Commands::Serve { daemon: true, .. }));
 
     let _log_guard = if daemon_mode {
-        Some(daemon::setup_file_logging(&plug_core::paths::log_dir())?)
+        Some(daemon::setup_file_logging(
+            &plug_core::paths::log_dir(),
+            log_filter(log_level),
+        )?)
     } else {
         init_stderr_tracing(log_level);
         None
@@ -770,19 +738,6 @@ async fn main() -> anyhow::Result<()> {
         Some(Commands::Config { path, command }) => {
             commands::config::cmd_config(cli.config.as_ref(), path, command, &cli.output)?
         }
-        Some(Commands::Export {
-            targets,
-            all,
-            yes,
-            transport,
-        }) => commands::clients::cmd_link(
-            cli.config.as_ref(),
-            targets,
-            all,
-            yes,
-            transport.map(Into::into),
-            &cli.output,
-        )?,
         Some(Commands::Auth { command }) => {
             commands::auth::cmd_auth(cli.config.as_ref(), command, &cli.output).await?
         }
@@ -806,6 +761,23 @@ impl From<ClientLinkTransport> for plug_core::clients::LinkTransport {
     }
 }
 
+/// The log level `-v` asks for, for stderr and the daemon log alike.
+fn log_level(cli: &Cli) -> &'static str {
+    // `plug status -v`, `plug clients -v`, and `plug tools -v` spend the
+    // first -v on showing more, so their debug logs start at -vv.
+    let verbosity = match &cli.command {
+        Some(Commands::Status { .. })
+        | Some(Commands::Clients { .. })
+        | Some(Commands::Tools { .. }) => cli.verbose.saturating_sub(1),
+        _ => cli.verbose,
+    };
+    match verbosity {
+        0 => default_log_level(cli.command.as_ref()),
+        1 => "debug",
+        _ => "trace",
+    }
+}
+
 /// The stderr log level when `-v` is not given. The long-running processes
 /// treat stderr as a log. For every other command stderr sits next to the
 /// output the user is reading, so only errors belong there.
@@ -820,10 +792,17 @@ fn default_log_level(command: Option<&Commands>) -> &'static str {
     }
 }
 
-/// The filter used when `PLUG_LOG` is not set, for stderr and the daemon log
-/// alike. Each directive quiets an RMCP module whose lines are not faults, or
-/// restate a failure Plug already reports in its own words.
-pub(crate) fn default_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+/// `PLUG_LOG` when set, else the default filter at `level`, for stderr and
+/// the daemon log alike.
+fn log_filter(level: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
+        .unwrap_or_else(|_| default_log_filter(level))
+}
+
+/// The filter used when `PLUG_LOG` is not set. Each directive quiets an RMCP
+/// module whose lines are not faults, or restate a failure Plug already
+/// reports in its own words.
+fn default_log_filter(level: &str) -> tracing_subscriber::EnvFilter {
     // Version negotiation: RMCP warns whenever a client asks for a protocol
     // version Plug does not speak and falls back, which is ordinary.
     // Transport worker: RMCP logs every failed upstream connection as a fatal
@@ -843,11 +822,8 @@ fn init_stderr_tracing(level: &str) {
         return;
     }
 
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| default_log_filter(level));
-
     tracing_subscriber::fmt()
-        .with_env_filter(filter)
+        .with_env_filter(log_filter(level))
         .with_writer(std::io::stderr)
         .compact()
         .init();
@@ -973,6 +949,23 @@ mod tests {
     fn serve_command_rejects_stdio_flag() {
         let result = Cli::try_parse_from(["plug", "serve", "--stdio"]);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn daemon_log_level_follows_verbose() {
+        let quiet = Cli::try_parse_from(["plug", "serve", "--daemon"]).unwrap();
+        assert_eq!(log_level(&quiet), "info");
+        let verbose = Cli::try_parse_from(["plug", "serve", "--daemon", "-v"]).unwrap();
+        assert_eq!(log_level(&verbose), "debug");
+    }
+
+    #[test]
+    fn export_is_an_alias_for_link() {
+        let cli = Cli::try_parse_from(["plug", "export", "cursor", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Link { ref targets, yes: true, .. }) if targets == &["cursor"]
+        ));
     }
 
     #[test]
