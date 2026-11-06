@@ -212,20 +212,6 @@ pub fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         "disabled_tools changed",
     );
 
-    let enriched = |config: &Config| -> std::collections::BTreeSet<String> {
-        config
-            .servers
-            .iter()
-            .filter(|(_, server)| server.enrichment)
-            .map(|(name, _)| name.clone())
-            .collect()
-    };
-    note_restart_required(
-        &mut restart_required,
-        enriched(old) != enriched(new),
-        "servers.*.enrichment changed",
-    );
-
     let settings_changed = !restart_required.is_empty()
         || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled
         || old.modern_upstream_enabled != new.modern_upstream_enabled;

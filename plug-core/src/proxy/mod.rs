@@ -294,8 +294,6 @@ pub struct RouterConfig {
     pub meta_tool_mode: bool,
     pub lazy_tools: LazyToolsConfig,
     pub tool_filter_enabled: bool,
-    /// Servers with enrichment enabled (annotation inference + title normalization).
-    pub enrichment_servers: std::collections::HashSet<String>,
 }
 
 fn merge_call_extension_meta(params: &mut CallToolRequestParams, meta: MetaObject) {
@@ -321,12 +319,6 @@ impl From<&Config> for RouterConfig {
             meta_tool_mode: config.meta_tool_mode,
             lazy_tools: config.lazy_tools.clone(),
             tool_filter_enabled: config.tool_filter_enabled,
-            enrichment_servers: config
-                .servers
-                .iter()
-                .filter(|(_, sc)| sc.enrichment)
-                .map(|(name, _)| name.clone())
-                .collect(),
         }
     }
 }
@@ -2424,7 +2416,7 @@ impl ToolRouter {
 
         for (server_name, mut tool) in upstream_tools {
             // Peer metadata is admitted before the descriptor enters any
-            // cache, enrichment, fingerprint, or operator-observable path.
+            // cache, fingerprint, or operator-observable path.
             catalog_metadata_budget.admit(&server_name, &mut tool.meta, "tool");
             let mut exposed_name = tool.name.to_string();
 
@@ -2622,12 +2614,6 @@ impl ToolRouter {
                 crate::enrichment::normalize_annotations(&mut inferred, &final_name);
                 inferred.annotations
             };
-
-            // Enrich BEFORE setting wire name (so get_* patterns match)
-            if self.config.enrichment_servers.contains(&c.server_name) {
-                prefixed_tool.name = Cow::Owned(final_name.clone());
-                crate::enrichment::enrich_tool(&mut prefixed_tool);
-            }
 
             crate::enrichment::normalize_annotations(&mut prefixed_tool, &final_name);
 

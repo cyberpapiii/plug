@@ -416,7 +416,8 @@ pub struct ServerConfig {
     pub health_check_interval_secs: u64,
     /// Enable circuit breaker for this server (default: true).
     pub circuit_breaker_enabled: bool,
-    /// Enable tool enrichment (annotation inference + title normalization).
+    /// Does nothing: every tool's hints and title are Plug's own. A config
+    /// that still sets it loads.
     pub enrichment: bool,
     /// Manual tool renames (original_name -> new_name).
     #[serde(serialize_with = "in_name_order")]

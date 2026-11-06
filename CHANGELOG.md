@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- A server's `enrichment` setting is ignored, and changing it no longer says Plug must restart. It had stopped doing anything: Plug reads every tool's safety hints from its name and gives every tool its own title.
 - `plug doctor` and the app no longer list a "Tool names" check. It always passed and only said whether tool prefixing was on.
 - A client's servers and tools in the app show what the daemon enforces for it, as the daemon reports it, where the app used to work it out again from the client's lists. A client's summary now counts every tool it is kept from: a rule such as `git__*` counts each tool it covers, and an allow list counts each tool of a partly listed server that is not on it.
 - A client connected through `plug connect` gets the JSON-RPC error codes an HTTP client gets. Bad parameters, an unknown method and a protocol version Plug does not serve now arrive as invalid params (`-32602`), method not found (`-32601`) and unsupported protocol version, where they used to arrive as an internal error (`-32603`) whose message began with a code such as `INVALID_PARAMS:`.
