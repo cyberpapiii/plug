@@ -80,7 +80,9 @@ struct DaemonClient {
     /// this asks over a connection of its own.
     func describeAPI(_ spec: String) async throws -> APISummary {
         let token = try token()
-        let patient = PlugIPCClient(clientVersion: clientVersion, requestTimeout: 15)
+        let patient = PlugIPCClient(
+            socketURL: ipc.socketURL, clientVersion: clientVersion, requestTimeout: 15
+        )
         guard case let .apiDescribed(api) = try await patient.request(
             .operator(token: token, .describeAPI(spec: spec))
         ) else {

@@ -67,6 +67,7 @@ final class InstallationCoordinator {
     static let defaultLogURL = PlugPaths.logs.appending(path: "installation-reconciliation.log")
 
     init(
+        serviceDisabled: ServiceDisabledMarker,
         appInspector: any AppInstallationInspecting = AppInstallationInspector(),
         legacyMigrator: any LegacyInstallMigrating = LegacyInstallMigrator(),
         clientRepairer: any ClientRepairing = ClientRepairService(),
@@ -78,8 +79,7 @@ final class InstallationCoordinator {
         transientRetryLimit: Int = 6,
         laterRetryDelay: Duration? = nil,
         sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
-        logWriter: @escaping (URL, String) -> Void = ReconciliationLog.append,
-        serviceDisabled: ServiceDisabledMarker = .standard
+        logWriter: @escaping (URL, String) -> Void = ReconciliationLog.append
     ) {
         self.serviceDisabled = serviceDisabled
         self.appInspector = appInspector

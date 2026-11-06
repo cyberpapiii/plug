@@ -10,7 +10,7 @@ public actor PlugIPCClient {
     /// which clears this, so a re-handshake happens exactly when the connection
     /// is new and never on a poll that had one already.
     private var negotiated: OperatorHandshake?
-    private let socketURL: URL
+    public nonisolated let socketURL: URL
     private let clientVersion: String
     private let requestTimeout: TimeInterval
     private let encoder: JSONEncoder

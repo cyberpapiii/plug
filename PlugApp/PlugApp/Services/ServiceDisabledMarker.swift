@@ -5,11 +5,11 @@ import PlugIPC
 /// The app writes it before stopping the daemon, so neither a relaunch of the
 /// app nor reconciliation starts Plug again until the owner turns it on.
 struct ServiceDisabledMarker: Sendable {
-    static let standard = ServiceDisabledMarker(
-        url: PlugPaths.marker(PlugPaths.serviceDisabledMarker)
-    )
-
     let url: URL
+
+    init(home: PlugHome) {
+        url = home.marker(PlugPaths.serviceDisabledMarker)
+    }
 
     var isSet: Bool { FileManager.default.fileExists(atPath: url.path) }
 

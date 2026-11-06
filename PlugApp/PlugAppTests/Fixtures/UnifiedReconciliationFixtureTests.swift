@@ -305,6 +305,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             retryLimit: 1
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: fixture.inspector,
             legacyMigrator: migrator,
             clientRepairer: ClientRepairService(runner: runner),

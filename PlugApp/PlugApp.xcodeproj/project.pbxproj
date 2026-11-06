@@ -86,6 +86,7 @@
 		D0E6D2C5CE02C83CA2608F7D /* ServerDraftParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F1BAA0269A40F909C070A029 /* ServerDraftParserTests.swift */; };
 		D33BBD44B162E7AA659C57D8 /* LegacyInstallMigratorTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 1EFBBCB813501EC0D82FCE7E /* LegacyInstallMigratorTests.swift */; };
 		D449F2C43FA789DEC8DEDE70 /* com.plug.daemon.plist in Resources */ = {isa = PBXBuildFile; fileRef = FF1629FBEB812E2CEDA0A767 /* com.plug.daemon.plist */; };
+		DA977D5A585A7F5874F62500 /* TestHome.swift in Sources */ = {isa = PBXBuildFile; fileRef = A23AD7DAA7A354D4BD19C47A /* TestHome.swift */; };
 		DC62E8AA069FD0F3FFFFDC8C /* PlugApplication.swift in Sources */ = {isa = PBXBuildFile; fileRef = 36FB89E2C8814400C0F38A5D /* PlugApplication.swift */; };
 		DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = E18BD1F89D4B52267BCB639D /* SettingsSurfaceTests.swift */; };
 		DE0DE8E045D314CA6649390C /* CallFacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = 0993B719DCBE5C267E5CD50D /* CallFacts.swift */; };
@@ -182,6 +183,7 @@
 		9506B593C3A1BAAECD5ACB83 /* SettingsView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsView.swift; sourceTree = "<group>"; };
 		9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientRepairServiceTests.swift; sourceTree = "<group>"; };
 		A1015D7CD55CB6A482B63AD2 /* AppInstallationInspector.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppInstallationInspector.swift; sourceTree = "<group>"; };
+		A23AD7DAA7A354D4BD19C47A /* TestHome.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestHome.swift; sourceTree = "<group>"; };
 		A2C36A3839A7A2602D332E38 /* ActivityLog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ActivityLog.swift; sourceTree = "<group>"; };
 		A2C5D4B75905A4E4ED1C5B9A /* ReconciliationGate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReconciliationGate.swift; sourceTree = "<group>"; };
 		A34C1AB285D41564D4440EEB /* InstallationCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationCoordinator.swift; sourceTree = "<group>"; };
@@ -245,6 +247,7 @@
 			children = (
 				CA3BDFE60BC89789EB5D2355 /* StubProcessRunner.swift */,
 				7F64E19345D5556D14BBD5F8 /* TestDaemon.swift */,
+				A23AD7DAA7A354D4BD19C47A /* TestHome.swift */,
 			);
 			path = Support;
 			sourceTree = "<group>";
@@ -691,6 +694,7 @@
 				DCE7535453E0855475BC6C21 /* SettingsSurfaceTests.swift in Sources */,
 				01F4E2FCFF1D85672E93BA32 /* StubProcessRunner.swift in Sources */,
 				B9D65DB6A627F583DDDF0BBA /* TestDaemon.swift in Sources */,
+				DA977D5A585A7F5874F62500 /* TestHome.swift in Sources */,
 				0E0E50BCA75537CC5F4CCD99 /* TestSocket.swift in Sources */,
 				C5B0CCC1229F822317F64843 /* ToolSurfaceTests.swift in Sources */,
 				17D83615A424704B1CC1366D /* UnifiedReconciliationFixtureTests.swift in Sources */,

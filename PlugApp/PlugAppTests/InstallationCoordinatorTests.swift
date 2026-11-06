@@ -44,6 +44,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             handshakes: [handshake(version: canonical.appVersion)]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
@@ -82,6 +83,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let events = EventLog()
         let service = healthyService()
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -136,6 +138,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let clients = RecordingClientRepairer(events: events, values: [false])
         let daemon = RecordingDaemonManager(events: events, inspections: [service])
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
@@ -167,6 +170,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonExecutable: legacyRecord.programURL
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -200,6 +204,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonExecutable: nil
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -239,6 +244,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonExecutable: legacyRecord.programURL
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -278,6 +284,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonExecutable: canonical.executableURL
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -306,6 +313,7 @@ final class InstallationCoordinatorTests: XCTestCase {
     func testWrongHandshakeStopsBeforeFinalHealthyPublication() async {
         let events = EventLog()
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -334,6 +342,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let events = EventLog()
         let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -374,6 +383,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let events = EventLog()
         let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -417,6 +427,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [healthyService(), healthyService()]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -461,6 +472,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
         var phases: [InstallationState] = []
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -507,6 +519,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             value: canonical
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -537,6 +550,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: logURL.deletingLastPathComponent()) }
         let app = FailingAppInspector(events: events, error: ProcessRunnerError.timedOut)
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -577,6 +591,7 @@ final class InstallationCoordinatorTests: XCTestCase {
     func testOperationalFailureDetailUsesTheErrorDescription() async {
         let events = EventLog()
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: FailingAppInspector(
                 events: events,
                 error: DescribedFailure()
@@ -600,6 +615,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let events = EventLog()
         let app = FailingAppInspector(events: events, error: TestFailure.operational)
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -637,6 +653,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
         let daemon = RecordingDaemonManager(events: events)
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -681,6 +698,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             handshakes: [handshake(version: canonical.appVersion)]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
@@ -719,6 +737,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             handshakes: [handshake(version: canonical.appVersion)]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
@@ -758,6 +777,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             handshakes: [handshake(version: canonical.appVersion)]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
@@ -802,6 +822,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             handshakes: [handshake(version: canonical.appVersion)]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
@@ -839,6 +860,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonExecutable: wrongExecutable
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [true, false]),
@@ -862,6 +884,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -915,6 +938,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [leftover, leftover]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -951,6 +975,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [leftover, leftover]
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -978,6 +1003,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonExecutable: unknown.programURL
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -1015,6 +1041,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             unknownPaths: []
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -1074,6 +1101,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             appServiceEnabled: true
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -1114,6 +1142,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             unknownPaths: []
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -1152,6 +1181,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             bootOutError: DaemonServiceError.commandFailed("bootout denied")
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
@@ -1177,6 +1207,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let opened = OpenedURL()
         let logURL = URL(fileURLWithPath: "/tmp/plug-reconciliation.log")
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: FailingAppInspector(events: events, error: TestFailure.operational),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),

@@ -23,8 +23,6 @@ struct SettingsView: View {
     /// does not undo it.
     @State private var loginItemEdits = 0
     @State private var notificationsDenied = false
-    // This page is made when the app opens, and reading this is what starts
-    // the updater then. Keep it here.
     @State private var automaticUpdates = UpdateService.shared.checksAutomatically
     @State private var keepsInMenuBar = MenuBarPresence.standard.keeps
     @State private var notifications = SystemAllowance.notAsked
