@@ -3,7 +3,7 @@ import Foundation
 import PlugIPC
 import ServiceManagement
 
-enum DaemonServiceError: LocalizedError, Equatable {
+enum DaemonServiceError: LocalizedError, AdvisedError, Equatable {
     case adoptionRequired
     case unknownOwnership
     case evidenceChanged
@@ -34,6 +34,11 @@ enum DaemonServiceError: LocalizedError, Equatable {
         case let .commandFailed(detail):
             detail.isEmpty ? "macOS did not change Plug's service. Try again." : detail
         }
+    }
+
+    var advice: String {
+        if case let .commandFailed(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
     }
 }
 
@@ -68,7 +73,7 @@ final class DaemonServiceManager {
         launchdInspector: any LaunchdJobInspecting = LaunchdJobInspector(),
         backend: any DaemonServiceBackend = SystemDaemonServiceBackend(),
         legacyPaths: Set<URL> = DaemonServiceManager.defaultLegacyPaths,
-        retryLimit: Int = 180
+        retryLimit: Int = DaemonServiceManager.startupRetries
     ) {
         self.appInspector = appInspector
         self.launchdInspector = launchdInspector
@@ -76,6 +81,12 @@ final class DaemonServiceManager {
         self.legacyPaths = legacyPaths
         self.retryLimit = max(1, retryLimit)
     }
+
+    /// The wait between two checks of a starting daemon.
+    nonisolated static let retryInterval: Duration = .milliseconds(500)
+    /// Checks of a daemon that just started, enough to wait out the startup
+    /// budget the CLI waits too.
+    nonisolated static let startupRetries = Int(PlugPaths.startupBudget / retryInterval)
 
     /// The name the daemon's LaunchAgent is registered under, which is also
     /// its launchd label with `.plist` added.
@@ -537,7 +548,7 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func waitBeforeRetry() async {
-        try? await Task.sleep(for: .milliseconds(500))
+        try? await Task.sleep(for: DaemonServiceManager.retryInterval)
     }
 
     func openLoginItemSettings() {

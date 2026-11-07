@@ -38,7 +38,7 @@ extension LinkableApp: Decodable {
     }
 }
 
-enum AppLinkError: LocalizedError, Equatable {
+enum AppLinkError: LocalizedError, AdvisedError, Equatable {
     case serviceMissing
     case commandFailed(String)
     case malformedOutput
@@ -49,6 +49,11 @@ enum AppLinkError: LocalizedError, Equatable {
         case let .commandFailed(detail): detail
         case .malformedOutput: "Plug gave an answer it could not read. Try again."
         }
+    }
+
+    var advice: String {
+        if case let .commandFailed(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
     }
 }
 

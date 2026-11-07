@@ -40,6 +40,13 @@ pub const KEYCHAIN_SERVICE: &str = "plug";
 /// Under the home folder: the `plug` command Plug.app links to its binary.
 pub const COMMAND_LINK: &str = ".local/bin/plug";
 
+/// How long a cold start of the daemon may take before it is treated as
+/// failed, by the CLI and by Plug.app alike. Starting every configured
+/// upstream takes tens of seconds, and each one can involve a Keychain read
+/// or a network round trip. Both drive one daemon, so a shorter wait on one
+/// side kills what the other is still waiting for.
+pub const STARTUP_BUDGET: std::time::Duration = std::time::Duration::from_secs(90);
+
 /// `PLUG_DEV=1` marks a source-development run: it may use another socket
 /// and need not be the copy inside Plug.app.
 pub const DEV_ENV: &str = "PLUG_DEV";
@@ -240,6 +247,7 @@ mod tests {
         daemon_args: Vec<String>,
         keychain_service: String,
         command_link: String,
+        startup_budget_secs: u64,
     }
 
     #[test]
@@ -263,6 +271,7 @@ mod tests {
         assert_eq!(fixture.daemon_args, DAEMON_ARGS);
         assert_eq!(fixture.keychain_service, KEYCHAIN_SERVICE);
         assert_eq!(fixture.command_link, COMMAND_LINK);
+        assert_eq!(fixture.startup_budget_secs, STARTUP_BUDGET.as_secs());
     }
 
     #[test]

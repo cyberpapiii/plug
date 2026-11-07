@@ -88,6 +88,22 @@ fn is_plug(name: &str) -> bool {
     name.eq_ignore_ascii_case("plug")
 }
 
+/// Whether an entry is Plug itself, which importing would point Plug at:
+/// one named as Plug's entry is, or one under any name that runs
+/// `plug connect` or `plug serve`. The app's paste reader holds to the same
+/// rule; `testdata/server_entries.json` pins both.
+fn is_plug_itself(name: &str, entry: &ServerEntry) -> bool {
+    let runs_plug = entry.command.as_deref().is_some_and(|command| {
+        std::path::Path::new(command).file_name() == Some("plug".as_ref())
+            && entry
+                .args
+                .iter()
+                .flatten()
+                .any(|arg| arg == "connect" || arg == "serve")
+    });
+    is_plug(name) || runs_plug
+}
+
 impl Layout {
     /// Plug's entry, in this client's shape.
     pub fn entry(&self, link: &PlugLink) -> Value {
@@ -215,7 +231,7 @@ impl Layout {
             .and_then(|(_, entry)| read_entry(entry))
     }
 
-    /// Every server in the file but Plug's own.
+    /// Every server in the file but Plug itself.
     pub fn read_servers(&self, content: &str) -> Result<Vec<(String, ServerEntry)>, String> {
         // A file Plug was linked into twice has two `[mcp_servers.plug]`
         // tables, which no TOML parser accepts.
@@ -227,8 +243,8 @@ impl Layout {
             .servers(&content)?
             .unwrap_or_default()
             .into_iter()
-            .filter(|(name, _)| !is_plug(name))
             .filter_map(|(name, entry)| Some((name, read_entry(&entry)?)))
+            .filter(|(name, entry)| !is_plug_itself(name, entry))
             .collect())
     }
 
@@ -824,6 +840,14 @@ mod tests {
                     .replace("plug:", "github:")
                     .replace("\"plug\"", "\"github\"")
                     .replace(".plug]", ".github]");
+                // Under another name, a link that runs Plug is still Plug.
+                let runs_plug = transport == LinkTransport::Stdio;
+                assert_eq!(
+                    layout.read_servers(&renamed).unwrap().is_empty(),
+                    runs_plug,
+                    "{target:?}: {renamed}"
+                );
+                let renamed = renamed.replace("/usr/local/bin/plug", "/usr/local/bin/github-mcp");
                 let imported = layout.read_servers(&renamed).unwrap();
                 assert_eq!(
                     imported.len(),
@@ -831,7 +855,14 @@ mod tests {
                     "{target:?} import found nothing: {renamed}"
                 );
                 assert_eq!(imported[0].0, "github");
-                assert_eq!(imported[0].1, plug, "{target:?}");
+                let expected = ServerEntry {
+                    command: plug
+                        .command
+                        .as_ref()
+                        .map(|_| "/usr/local/bin/github-mcp".to_string()),
+                    ..plug.clone()
+                };
+                assert_eq!(imported[0].1, expected, "{target:?}");
 
                 let relinked = layout.link(&written, &entry).unwrap();
                 assert_eq!(layout.plug_entry_count(&relinked), 1, "{target:?}");

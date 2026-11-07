@@ -38,6 +38,49 @@ final class CLIReportTests: XCTestCase {
         XCTAssertEqual(scan.unreadable, ["Zed"])
     }
 
+    /// Every command line the app runs is one of `commands.json`, which the
+    /// CLI's own parser reads, so a flag renamed there fails one side.
+    func testTheAppRunsTheCommandsTheCLIParses() async throws {
+        let runner = StubProcessRunner { _, arguments in
+            switch arguments.first {
+            case "clients": try .golden("clients.json")
+            case "doctor": try .golden("doctor.json", status: 1)
+            case "import": try .golden("import.json")
+            case "repair": try .golden("repair_clean.json")
+            case "--version": .exited(stdout: "plug 0.9.0")
+            default: .exited()
+            }
+        }
+        let links = AppLinkService(runner: runner, executable: executable)
+        _ = try await links.apps()
+        try await links.link(target: "cursor", overNetwork: false)
+        try await links.link(target: "cursor", overNetwork: true)
+        try await links.unlink(target: "cursor")
+        let auth = AuthFlowService(runner: runner, executable: executable)
+        try await auth.signIn(server: "notion")
+        try await auth.signOut(server: "notion")
+        let checkup = CheckupService(runner: runner, executable: executable)
+        _ = try await checkup.run()
+        _ = await checkup.configPath()
+        _ = try await ImportService(runner: runner, executable: executable).scan()
+        let repair = ClientRepairService(runner: runner)
+        _ = try await repair.inspect(canonicalExecutable: executable)
+        try await repair.repairAll(canonicalExecutable: executable)
+        _ = try await AppInstallationInspector.readEmbeddedVersion(
+            at: URL(fileURLWithPath: "/bin/sh"), runner: runner
+        )
+
+        let commands = try cliCommands()
+        let ran = await runner.arguments
+        XCTAssertEqual(ran, try [
+            "clients", "link", "link_over_network", "unlink", "sign_in", "sign_out",
+            "doctor", "config_path", "import", "repair_dry_run", "repair", "version",
+        ].map { try XCTUnwrap(commands[$0], $0) })
+        // What the app writes into a client's settings for it to run.
+        XCTAssertEqual(AddClient.arguments(target: nil), commands["connect"])
+        XCTAssertEqual(AddClient.arguments(target: "custom:my-bot"), commands["connect_as_client"])
+    }
+
     func testTheCheckupIsReadAsPrinted() async throws {
         let runner = StubProcessRunner(result: try .golden("doctor.json", status: 1))
         let checkup = try await CheckupService(runner: runner, executable: executable).run()

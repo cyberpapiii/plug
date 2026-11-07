@@ -1,0 +1,16 @@
+{
+  "clients": ["clients", "--output", "json"],
+  "config_path": ["config", "path"],
+  "connect": ["connect"],
+  "connect_as_client": ["connect", "--client", "custom:my-bot"],
+  "doctor": ["doctor", "--output", "json"],
+  "import": ["import", "--output", "json"],
+  "link": ["link", "cursor", "--yes", "--transport", "stdio", "--output", "json"],
+  "link_over_network": ["link", "cursor", "--yes", "--transport", "http", "--output", "json"],
+  "repair": ["repair", "--all", "--output", "json"],
+  "repair_dry_run": ["repair", "--all", "--dry-run", "--output", "json"],
+  "sign_in": ["auth", "login", "--server", "notion"],
+  "sign_out": ["auth", "logout", "--server", "notion"],
+  "unlink": ["unlink", "cursor", "--yes", "--output", "json"],
+  "version": ["--version"]
+}

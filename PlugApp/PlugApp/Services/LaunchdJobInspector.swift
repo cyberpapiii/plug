@@ -9,7 +9,7 @@ protocol LaunchdJobInspecting: Sendable {
     ) async throws -> DaemonOwnershipState
 }
 
-enum LaunchdJobInspectionError: LocalizedError, Equatable {
+enum LaunchdJobInspectionError: LocalizedError, AdvisedError, Equatable {
     case listFailed(status: Int32, detail: String)
     case printFailed(label: String, status: Int32, detail: String)
 
@@ -21,6 +21,12 @@ enum LaunchdJobInspectionError: LocalizedError, Equatable {
         case let .printFailed(label, status, detail):
             "Plug could not read the launchd job \(label) (launchctl exit status \(status)). \(detail)"
                 .trimmingCharacters(in: .whitespaces)
+        }
+    }
+
+    var advice: String {
+        switch self {
+        case let .listFailed(_, detail), let .printFailed(_, _, detail): Explain.advice(forOutside: detail)
         }
     }
 }

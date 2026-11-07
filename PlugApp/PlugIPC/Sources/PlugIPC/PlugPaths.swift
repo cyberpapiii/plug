@@ -27,6 +27,10 @@ public enum PlugPaths {
     public static let daemonArguments = ["serve", "--daemon"]
     /// Under the home folder: the `plug` command Plug.app links to its binary.
     public static let commandLink = ".local/bin/plug"
+    /// How long a cold start of the daemon may take before it is treated as
+    /// failed. The CLI waits as long, so neither gives up on a start the
+    /// other is still waiting for.
+    public static let startupBudget: Duration = .seconds(90)
 
     public static var directoryURL: URL { PlugHome.standard.directory }
 

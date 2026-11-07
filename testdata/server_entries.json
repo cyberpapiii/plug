@@ -68,5 +68,35 @@
     "name": "nothing-to-run",
     "entry": { "args": ["--port", "1"] },
     "server": null
+  },
+  {
+    "name": "Plug",
+    "entry": { "url": "https://plug.example.com/mcp" },
+    "server": null
+  },
+  {
+    "name": "plug-local",
+    "entry": { "command": "/Applications/Plug.app/Contents/Resources/plug", "args": ["connect", "--client", "cursor"] },
+    "server": null
+  },
+  {
+    "name": "plug-serve",
+    "entry": { "command": "plug", "args": ["serve", "--stdio"] },
+    "server": null
+  },
+  {
+    "name": "plug-in-a-list",
+    "entry": { "command": ["/usr/local/bin/plug", "connect"] },
+    "server": null
+  },
+  {
+    "name": "plugger",
+    "entry": { "command": "plugger", "args": ["connect"] },
+    "server": { "transport": "stdio", "command": "plugger", "args": ["connect"], "url": null, "env": {}, "enabled": true }
+  },
+  {
+    "name": "plug-tools",
+    "entry": { "command": "plug", "args": ["tools"] },
+    "server": { "transport": "stdio", "command": "plug", "args": ["tools"], "url": null, "env": {}, "enabled": true }
   }
 ]

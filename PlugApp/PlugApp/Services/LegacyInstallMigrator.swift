@@ -34,7 +34,7 @@ struct LegacyInstallSnapshot: Equatable, Sendable {
     }
 }
 
-enum LegacyInstallError: LocalizedError, Equatable {
+enum LegacyInstallError: LocalizedError, AdvisedError, Equatable {
     case unrelatedShellCommand(URL)
     case formulaStillInstalled
     case brewUnavailable
@@ -53,6 +53,13 @@ enum LegacyInstallError: LocalizedError, Equatable {
             "Homebrew could not remove the old copy of Plug: \(detail)"
         case let .fileOperation(message):
             message
+        }
+    }
+
+    var advice: String {
+        switch self {
+        case let .brewFailed(detail), let .fileOperation(detail): Explain.advice(forOutside: detail)
+        default: Explain.fallback
         }
     }
 }
