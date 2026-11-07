@@ -974,9 +974,11 @@ mod tests {
         ));
     }
 
+    /// What launchd runs the app's daemon with starts the daemon.
     #[test]
-    fn serve_command_accepts_daemon_flag() {
-        let cli = Cli::try_parse_from(["plug", "serve", "--daemon"]).unwrap();
+    fn the_daemon_launch_arguments_start_the_daemon() {
+        let argv = std::iter::once("plug").chain(plug_core::paths::DAEMON_ARGS);
+        let cli = Cli::try_parse_from(argv).unwrap();
         assert!(matches!(
             cli.command,
             Some(Commands::Serve { daemon: true })
