@@ -555,8 +555,7 @@ impl super::ToolRouter {
             // The upstream ran the tool itself, so its result is sanitized
             // here as `call_tool_inner` sanitizes a call's.
             if let Ok(mut result) = serde_json::from_value::<CallToolResult>(payload.clone()) {
-                admit_tool_result_meta(&mut result);
-                skills::outward_tool_result(&server_id, &mut result);
+                super::outward_tool_result(&server_id, &mut result);
                 payload = serde_json::to_value(result)
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
             }

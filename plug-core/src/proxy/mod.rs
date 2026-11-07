@@ -41,6 +41,13 @@ const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
+/// Make a tool result from `server_id` fit to leave Plug. A call's answer
+/// and a task's stored result both come through here.
+fn outward_tool_result(server_id: &str, result: &mut CallToolResult) {
+    admit_tool_result_meta(result);
+    skills::outward_tool_result(server_id, result);
+}
+
 /// Atomically-swapped catalog, built once at `refresh_tools()` time, so a
 /// listing reads it without rebuilding.
 #[derive(Clone)]
@@ -3802,8 +3809,7 @@ impl ToolRouter {
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
-                    admit_tool_result_meta(&mut response);
-                    skills::outward_tool_result(&server_id, &mut response);
+                    outward_tool_result(&server_id, &mut response);
                     finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
