@@ -128,7 +128,7 @@ impl LegacySseClientTransport {
     /// first open fails here with its status, where a failure inside the
     /// worker would reach the caller only as a closed channel.
     pub async fn connect(config: LegacySseTransportConfig) -> anyhow::Result<Self> {
-        let client = crate::upstream_http::client(reqwest::redirect::Policy::none())?;
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never)?;
         let stream = open_sse_stream(
             client.clone(),
             config.uri.clone(),
@@ -816,7 +816,7 @@ mod tests {
 
         let config = LegacySseTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
             .post_timeout(Duration::from_millis(200));
-        let client = crate::upstream_http::client(reqwest::redirect::Policy::none()).unwrap();
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never).unwrap();
         let message = ClientJsonRpcMessage::notification(
             rmcp::model::ClientNotification::InitializedNotification(Default::default()),
         );
@@ -1091,5 +1091,74 @@ mod tests {
         publish_endpoint(&endpoint_tx, Arc::from("http://host/b"), None);
 
         assert_eq!(endpoint_tx.borrow().as_deref(), Some("http://host/b"));
+    }
+
+    #[tokio::test]
+    async fn a_redial_the_server_refuses_ends_the_stream_instead_of_redialing() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let opens = Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new().route(
+            "/mcp",
+            axum::routing::get({
+                let opens = Arc::clone(&opens);
+                move || {
+                    let first = opens.fetch_add(1, Ordering::SeqCst) == 0;
+                    async move {
+                        let response = axum::response::Response::builder();
+                        if first {
+                            // The stream ends at once, so the transport redials.
+                            response
+                                .header(header::CONTENT_TYPE, "text/event-stream")
+                                .body(axum::body::Body::from(
+                                    "event: endpoint\ndata: /messages\n\n",
+                                ))
+                        } else {
+                            response
+                                .status(StatusCode::UNAUTHORIZED)
+                                .body(axum::body::Body::empty())
+                        }
+                        .unwrap()
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+
+        let uri: Arc<str> = format!("http://127.0.0.1:{port}/mcp").into();
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never).unwrap();
+        let token: Option<Arc<str>> = Some("token".into());
+        let first = open_sse_stream(client.clone(), uri.clone(), token.clone(), None)
+            .await
+            .unwrap();
+        let (endpoint_tx, _endpoint_rx) = tokio::sync::watch::channel(None);
+        let (response_tx, _response_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let (notification_tx, _notification_rx) = tokio::sync::mpsc::channel(CHANNEL_CAPACITY);
+        let mut config = LegacySseTransportConfig::with_uri(uri);
+        config.auth_token = token;
+        let quit = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_sse_loop(
+                client,
+                config,
+                first,
+                endpoint_tx,
+                response_tx,
+                notification_tx,
+                tokio_util::sync::CancellationToken::new(),
+            ),
+        )
+        .await
+        .expect("a refused redial ends the loop");
+
+        match quit {
+            Err(WorkerQuitReason::Fatal { error, .. }) => {
+                assert!(error.refuses_credentials(), "{error}");
+            }
+            other => panic!("expected the refusal to end the stream, got {other:?}"),
+        }
+        assert_eq!(opens.load(Ordering::SeqCst), 2);
     }
 }

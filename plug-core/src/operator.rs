@@ -157,6 +157,35 @@ pub fn apply_operator_mutation(
     apply_operator_mutation_knowing(path, mutation, &Offline)
 }
 
+/// A server by this name is in the config already.
+#[derive(Debug, thiserror::Error)]
+#[error("server `{0}` already exists")]
+pub struct NameTaken(pub String);
+
+impl NameTaken {
+    /// The IPC error code the daemon refuses a taken name with, so the app
+    /// can tell it apart without reading the message.
+    pub const CODE: &'static str = "SERVER_NAME_TAKEN";
+
+    /// Refuse `name` when `config` already has a server by it.
+    pub fn check(config: &Config, name: &str) -> Result<(), Self> {
+        if config.servers.contains_key(name) {
+            Err(Self(name.to_string()))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// [`Self::CODE`] when `error` is a taken name, else `otherwise`.
+    pub fn code_or<'a>(error: &anyhow::Error, otherwise: &'a str) -> &'a str {
+        if error.chain().any(|cause| cause.is::<Self>()) {
+            Self::CODE
+        } else {
+            otherwise
+        }
+    }
+}
+
 /// What the running servers tell a change to the config.
 pub trait Live {
     /// The server and the server's own name behind a name Plug lists a tool
@@ -191,9 +220,7 @@ pub fn apply_operator_mutation_knowing(
     pin_tool_blocks(&mut config, live);
     let result = match mutation {
         OperatorMutation::AddServer { name, mut server } => {
-            if config.servers.contains_key(&name) {
-                anyhow::bail!("server `{name}` already exists");
-            }
+            NameTaken::check(&config, &name)?;
             // A new server has nothing stored behind a placeholder, so this only
             // drops one that came back from a redacted read of another server.
             server.restore_redacted_secrets(None);
@@ -360,9 +387,7 @@ fn account_copy(
         );
     }
     let name = format!("{server}-{label}");
-    if config.servers.contains_key(&name) {
-        anyhow::bail!("server `{name}` already exists");
-    }
+    NameTaken::check(config, &name)?;
 
     let mut copy = source.clone();
     let mut groups = crate::tool_naming::group_rules(server, source, reported).unwrap_or_default();
@@ -811,6 +836,29 @@ API_KEY = "sk-live-123"
         assert!(rename(&path, "cursor", "two\nlines").is_err());
         assert!(rename(&path, "  ", "Name").is_err());
         assert!(!path.exists(), "a refused rename must not write the config");
+    }
+
+    #[test]
+    fn a_taken_name_is_refused_with_its_own_code() {
+        let path = fixture_path();
+        let add = || {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::AddServer {
+                    name: "workspace".into(),
+                    server: server_with_secrets(),
+                },
+            )
+        };
+        add().unwrap();
+        let error = add().unwrap_err().context("mutation failed");
+        assert_eq!(
+            error.root_cause().to_string(),
+            "server `workspace` already exists"
+        );
+        assert_eq!(NameTaken::code_or(&error, "OTHER"), NameTaken::CODE);
+        let other = anyhow::anyhow!("server `workspace` already exists");
+        assert_eq!(NameTaken::code_or(&other, "OTHER"), "OTHER");
     }
 
     #[test]

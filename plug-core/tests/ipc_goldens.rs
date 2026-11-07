@@ -987,9 +987,57 @@ fn the_every_field_server_sets_every_field() {
     for (key, value) in default.as_object().unwrap() {
         assert_ne!(every.get(key), Some(value), "{key} is left at its default");
     }
-    for key in ["spec", "operations", "token_in"] {
-        assert!(every.contains_key(key), "{key} is not written");
+    // A name serde reads as a second spelling of a field already written is
+    // refused as a duplicate.
+    let is_alias = |key: &str| {
+        let mut twice = every.clone();
+        twice.insert(key.to_string(), serde_json::Value::Null);
+        serde_json::from_value::<ServerConfig>(twice.into())
+            .is_err_and(|error| error.to_string().contains("duplicate field"))
+    };
+    for key in field_names::<ServerConfig>() {
+        assert!(
+            every.contains_key(*key) || is_alias(key),
+            "{key} is not written"
+        );
     }
+}
+
+/// Every field of `T` by every name its derived `Deserialize` reads, so
+/// including those left out of what `T` writes when unset.
+fn field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    struct Fields<'a>(&'a mut &'static [&'static str]);
+    impl<'de> serde::Deserializer<'de> for Fields<'_> {
+        type Error = serde::de::value::Error;
+        fn deserialize_any<V: serde::de::Visitor<'de>>(
+            self,
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            Err(serde::de::Error::custom("not a struct"))
+        }
+        fn deserialize_struct<V: serde::de::Visitor<'de>>(
+            self,
+            _: &'static str,
+            fields: &'static [&'static str],
+            _: V,
+        ) -> Result<V::Value, Self::Error> {
+            *self.0 = fields;
+            Err(serde::de::Error::custom("only the field names were wanted"))
+        }
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+    let mut fields: &'static [&'static str] = &[];
+    let _ = T::deserialize(Fields(&mut fields));
+    assert!(
+        !fields.is_empty(),
+        "{} is not a struct",
+        std::any::type_name::<T>()
+    );
+    fields
 }
 
 /// A reply added to the wire without a golden in `responses.json` fails

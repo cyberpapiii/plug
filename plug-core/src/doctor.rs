@@ -148,7 +148,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         check_server_binaries(config),
         check_server_connectivity(config),
         check_pid_staleness(),
-        check_client_configs(),
+        check_client_configs(&config.http),
         check_http_auth(config),
         check_downstream_oauth_owner(config),
         check_oauth_config(config),
@@ -163,7 +163,7 @@ pub async fn run_doctor(config: &Config, config_path: &Path) -> DoctorReport {
         port,
         env_vars,
         binaries,
-        check_client_limits(),
+        check_client_limits(&config.http),
         pid,
         clients,
         connectivity,
@@ -561,10 +561,13 @@ fn client_files(target: crate::clients::ClientTarget) -> Vec<(std::path::PathBuf
 }
 
 /// Whether `target`'s own config points at plug, globally or per project.
-fn client_is_linked_to_plug(target: crate::clients::ClientTarget) -> bool {
+fn client_is_linked_to_plug(
+    target: crate::clients::ClientTarget,
+    plug: &crate::config::HttpConfig,
+) -> bool {
     client_files(target)
         .iter()
-        .any(|(_, content)| target.layout().plug_entry_count(content) > 0)
+        .any(|(_, content)| target.layout().plug_entry_count(content, plug) > 0)
 }
 
 /// Published tool ceilings of the clients actually using plug.
@@ -576,10 +579,14 @@ fn client_is_linked_to_plug(target: crate::clients::ClientTarget) -> bool {
 /// large ones hid a real 600. The one thing doctor can read from disk is which
 /// clients are pointed at plug, so that is what it reports. The real total is
 /// `plug status`, which counts tools the servers actually returned.
-fn check_client_limits() -> CheckResult {
+fn check_client_limits(plug: &crate::config::HttpConfig) -> CheckResult {
     let linked = crate::clients::TOOL_LIMITS
         .iter()
-        .filter(|entry| entry.linked_by.is_some_and(client_is_linked_to_plug))
+        .filter(|entry| {
+            entry
+                .linked_by
+                .is_some_and(|target| client_is_linked_to_plug(target, plug))
+        })
         .collect();
     client_limits_result(check::CLIENT_LIMITS.to_string(), linked)
 }
@@ -810,14 +817,14 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
 }
 
 /// Duplicate or unreadable plug entries in client configs.
-async fn check_client_configs() -> CheckResult {
+async fn check_client_configs(plug: &crate::config::HttpConfig) -> CheckResult {
     let name = check::CLIENT_CONFIGS.to_string();
     let mut issues = Vec::new();
 
     for target in crate::clients::ClientTarget::all() {
         let layout = target.layout();
         for (path, content) in client_files(target) {
-            if layout.plug_entry_count(&content) > 1 {
+            if layout.plug_entry_count(&content, plug) > 1 {
                 issues.push(format!(
                     "{} (duplicate entries in {})",
                     target.slug(),

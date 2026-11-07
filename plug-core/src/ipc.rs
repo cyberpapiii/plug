@@ -624,13 +624,6 @@ pub enum LiveSessionTransport {
     Http,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveSessionInventoryScope {
-    TransportComplete,
-    Unavailable,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IpcLiveSessionInfo {
     pub transport: LiveSessionTransport,
@@ -731,10 +724,9 @@ pub enum IpcResponse {
     Tools {
         tools: Vec<IpcToolInfo>,
     },
-    /// List of live downstream sessions with explicit transport/scope.
+    /// Every live downstream session, local and HTTP.
     LiveSessions {
         sessions: Vec<IpcLiveSessionInfo>,
-        scope: LiveSessionInventoryScope,
     },
     /// Synthesized MCP capabilities for the daemon-backed shared runtime.
     Capabilities {

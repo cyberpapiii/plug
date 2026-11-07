@@ -8,7 +8,7 @@ use crate::ui::{
     print_reason, print_warning_line, status_label, status_marker, summarize_server_auth,
     summarize_server_target, summarize_server_transport,
 };
-use crate::views::live::{self, LiveClientSupport, fetch_live_sessions};
+use crate::views::live::{self, fetch_live_sessions};
 
 /// Each linked client's slug and the transport its link uses.
 fn linked_topology() -> Vec<(String, String)> {
@@ -151,7 +151,6 @@ fn overview_json(
     server_count: usize,
     linked_clients: &[String],
     inventory: &live::LiveInventory,
-    live_client_support: LiveClientSupport,
     owner_approval: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
     next_actions: &[(&str, &str)],
 ) -> serde_json::Value {
@@ -165,8 +164,6 @@ fn overview_json(
         "linked_clients": linked_clients,
         "live_session_count": inventory.session_count,
         "live_session_transports": inventory.session_transports,
-        "live_client_support": live_client_support,
-        "live_client_scope": inventory.scope,
         "owner_approval": owner_approval_json(owner_approval),
         "next_actions": next_actions.iter().map(|(command, _)| command).collect::<Vec<_>>(),
     })
@@ -178,7 +175,6 @@ fn status_json(
     daemon_proxy_client_count: usize,
     inventory: &live::LiveInventory,
     servers: &[plug_core::types::ServerStatus],
-    live_client_support: LiveClientSupport,
     runtime_available: bool,
     status_source: &str,
     daemon_running: bool,
@@ -194,8 +190,6 @@ fn status_json(
         "runtime_available": runtime_available,
         "status_source": status_source,
         "daemon_running": daemon_running,
-        "live_client_support": live_client_support,
-        "live_client_scope": inventory.scope,
         "resource_subscriptions": resource_subscriptions
     })
 }
@@ -210,9 +204,9 @@ pub(crate) async fn cmd_overview(
     let config_exists = config_path.exists();
     let linked = linked_topology();
     let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();
-    let (live_clients, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
+    let live_clients = fetch_live_sessions().await;
     let live_client_count = live_clients.len();
-    let inventory = live::inventory(&live_clients, live_inventory_scope);
+    let inventory = live::inventory(&live_clients);
 
     if matches!(output, OutputFormat::Json) {
         let daemon_running = crate::ipc_client::daemon_running().await;
@@ -238,7 +232,6 @@ pub(crate) async fn cmd_overview(
                 server_count,
                 &linked_clients,
                 &inventory,
-                live_client_support,
                 owner_approval,
                 &next_actions,
             ))?
@@ -299,16 +292,8 @@ pub(crate) async fn cmd_overview(
         ),
     );
     print_label_value("Linked Clients", style(linked_clients.len()).bold());
-    match live_client_support {
-        LiveClientSupport::Supported => {
-            print_label_value("Live", style(live_client_count).bold());
-            print_label_value("Live Inventory", live::scope_summary(live_inventory_scope));
-            print_label_value("Live Transports", inventory.session_transports.summary());
-        }
-        LiveClientSupport::DaemonRestartRequired => {
-            print_label_value("Live", style("restart required").yellow().bold());
-        }
-    }
+    print_label_value("Live", style(live_client_count).bold());
+    print_label_value("Live Transports", inventory.session_transports.summary());
     print_label_value(
         "Service",
         if daemon_running {
@@ -357,16 +342,6 @@ pub(crate) async fn cmd_overview(
             .collect::<Vec<_>>();
         print_label_value("Linked Topology", linked_client_transport_summary(&linked));
         print_label_value("Linked Clients", linked_descriptions.join(", "));
-    }
-
-    if matches!(
-        live_client_support,
-        LiveClientSupport::DaemonRestartRequired
-    ) {
-        println!();
-        print_warning_line(
-            "Live client inspection requires restarting the background daemon after this upgrade.",
-        );
     }
 
     println!();
@@ -452,9 +427,8 @@ pub(crate) async fn cmd_status(
     if let Some((servers, clients, uptime_secs, runtime_version, resource_subscriptions)) =
         live_status
     {
-        let (live_sessions, live_inventory_scope, live_client_support) =
-            fetch_live_sessions().await;
-        let inventory = live::inventory(&live_sessions, live_inventory_scope);
+        let live_sessions = fetch_live_sessions().await;
+        let inventory = live::inventory(&live_sessions);
         if matches!(output, OutputFormat::Text) {
             print_banner("◆", "Plug", "Plug is running");
             print_heading("Plug");
@@ -467,13 +441,13 @@ pub(crate) async fn cmd_status(
                 .green()
                 .bold(),
             );
-            let connected = match live_client_support {
-                LiveClientSupport::Supported => inventory.session_count,
-                LiveClientSupport::DaemonRestartRequired => clients,
-            };
             print_label_value(
                 "Clients",
-                format!("{connected} connected now, {} set up", linked_clients.len()),
+                format!(
+                    "{} connected now, {} set up",
+                    inventory.session_count,
+                    linked_clients.len()
+                ),
             );
             if let Some((_, _, Some(public_base_url), _)) = &downstream_auth_info {
                 print_label_value("Remote address", public_base_url);
@@ -481,33 +455,11 @@ pub(crate) async fn cmd_status(
             if verbose {
                 println!();
                 print_heading("Detail");
-                match live_client_support {
-                    LiveClientSupport::Supported => {
-                        print_label_value(
-                            "Live Sessions",
-                            style(inventory.session_count.to_string()).bold(),
-                        );
-                        print_label_value(
-                            "Live Transports",
-                            inventory.session_transports.summary(),
-                        );
-                        print_label_value(
-                            "Live Inventory",
-                            live::scope_summary(live_inventory_scope),
-                        );
-                    }
-                    LiveClientSupport::DaemonRestartRequired => {
-                        print_label_value(
-                            "Live Sessions",
-                            style("restart required").yellow().bold(),
-                        );
-                        print_label_value(
-                            "Inventory Scope",
-                            "Restart the background daemon to enable transport-aware live session inventory.",
-                        );
-                        print_label_value("Local Clients", style(clients.to_string()).bold());
-                    }
-                }
+                print_label_value(
+                    "Live Sessions",
+                    style(inventory.session_count.to_string()).bold(),
+                );
+                print_label_value("Live Transports", inventory.session_transports.summary());
                 // Resource subscriptions are held by the runtime on behalf of
                 // downstream clients and are otherwise invisible from the CLI, so
                 // there is no way to tell a client that subscribed and went quiet
@@ -634,7 +586,6 @@ pub(crate) async fn cmd_status(
                 clients,
                 &inventory,
                 &servers,
-                live_client_support,
                 true,
                 crate::ipc_client::DaemonQueryAvailability::Available.status_source(),
                 daemon_running,
@@ -767,7 +718,6 @@ mod tests {
                 daemon_proxy: 1,
                 http: 1,
             },
-            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
         };
         let linked = vec!["claude".to_string()];
         let json = overview_json(
@@ -777,7 +727,6 @@ mod tests {
             3,
             &linked,
             &inventory,
-            crate::views::live::LiveClientSupport::Supported,
             Some(
                 plug_core::downstream_oauth::OwnerEnrollmentStatus::Enrolled {
                     credential_count: 2,
@@ -787,7 +736,6 @@ mod tests {
         );
         assert_eq!(json["live_session_count"], 2);
         assert_eq!(json["live_session_transports"]["daemon_proxy"], 1);
-        assert_eq!(json["live_client_scope"], "transport_complete");
         assert_eq!(json["owner_approval"]["status"], "enrolled");
         assert_eq!(json["owner_approval"]["credential_count"], 2);
     }
@@ -847,7 +795,6 @@ mod tests {
                 daemon_proxy: 0,
                 http: 1,
             },
-            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
         };
         let servers = vec![plug_core::types::ServerStatus {
             server_id: "notion".to_string(),
@@ -862,24 +809,13 @@ mod tests {
             error: None,
             last_seen: None,
         }];
-        let json = status_json(
-            42,
-            3,
-            &inventory,
-            &servers,
-            crate::views::live::LiveClientSupport::Supported,
-            true,
-            "live_daemon",
-            true,
-            4,
-        );
+        let json = status_json(42, 3, &inventory, &servers, true, "live_daemon", true, 4);
 
         assert_eq!(json["clients"], 3);
         assert_eq!(json["resource_subscriptions"], 4);
         assert_eq!(json["daemon_proxy_client_count"], 3);
         assert_eq!(json["live_session_count"], 1);
         assert_eq!(json["live_session_transports"]["http"], 1);
-        assert_eq!(json["live_client_scope"], "transport_complete");
         assert_eq!(json["runtime_available"], true);
         assert_eq!(json["status_source"], "live_daemon");
     }
@@ -892,7 +828,6 @@ mod tests {
                 daemon_proxy: 0,
                 http: 0,
             },
-            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
         };
         let servers = vec![plug_core::types::ServerStatus {
             server_id: "imessage".to_string(),
@@ -915,17 +850,7 @@ mod tests {
             error: None,
             last_seen: None,
         }];
-        let json = status_json(
-            10,
-            1,
-            &inventory,
-            &servers,
-            crate::views::live::LiveClientSupport::Supported,
-            true,
-            "live_daemon",
-            true,
-            0,
-        );
+        let json = status_json(10, 1, &inventory, &servers, true, "live_daemon", true, 0);
 
         let m = &json["servers"][0]["metrics"];
         assert_eq!(m["call_count"], 100);

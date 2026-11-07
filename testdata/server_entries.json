@@ -98,5 +98,22 @@
     "name": "plug-tools",
     "entry": { "command": "plug", "args": ["tools"] },
     "server": { "transport": "stdio", "command": "plug", "args": ["tools"], "url": null, "env": {}, "enabled": true }
+  },
+  {
+    "name": "plug-remote",
+    "entry": { "url": "http://localhost:3282/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "http://localhost:3282/mcp", "env": {}, "enabled": true },
+    "plug_address": true
+  },
+  {
+    "name": "plug-remote-by-ip",
+    "entry": { "type": "http", "url": "http://127.0.0.1:3282/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "http://127.0.0.1:3282/mcp", "env": {}, "enabled": true },
+    "plug_address": true
+  },
+  {
+    "name": "next-door",
+    "entry": { "url": "http://localhost:3283/mcp" },
+    "server": { "transport": "http", "command": null, "args": [], "url": "http://localhost:3283/mcp", "env": {}, "enabled": true }
   }
 ]

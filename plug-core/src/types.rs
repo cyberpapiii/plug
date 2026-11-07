@@ -155,7 +155,7 @@ fn is_non_forwarded_meta_key(key: &str) -> bool {
             | "traceparent"
             | "tracestate"
             | "baggage"
-            | "io.modelcontextprotocol/protocolVersion"
+            | crate::protocol::PROTOCOL_VERSION_META_KEY
             | "io.modelcontextprotocol/clientInfo"
             | "io.modelcontextprotocol/clientCapabilities"
             | "io.modelcontextprotocol/logLevel"
@@ -957,7 +957,7 @@ pub enum ClientType {
     Devin,
     VSCodeCopilot,
     /// GitHub's terminal agent. It shares a config file with VS Code but
-    /// not VS Code's 128-tool ceiling.
+    /// not VS Code's tool ceiling in `clients::TOOL_LIMITS`.
     CopilotCli,
     GeminiCli,
     CodexCli,

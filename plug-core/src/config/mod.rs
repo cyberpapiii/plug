@@ -374,6 +374,27 @@ impl HttpConfig {
         });
         format!("{}/mcp", base.trim_end_matches('/'))
     }
+
+    /// Whether `url` reaches Plug itself: the address clients are given, or
+    /// this Mac's listener under any loopback name or the address it binds.
+    pub fn is_own_mcp_url(&self, url: &str) -> bool {
+        let Ok(url) = url::Url::parse(url) else {
+            return false;
+        };
+        let path = |url: &url::Url| url.path().trim_end_matches('/').to_string();
+        let is_given = url::Url::parse(&self.mcp_url()).is_ok_and(|given| {
+            given.scheme() == url.scheme()
+                && given.host_str() == url.host_str()
+                && given.port_or_known_default() == url.port_or_known_default()
+                && path(&given) == path(&url)
+        });
+        let is_listener = url.port_or_known_default() == Some(self.port)
+            && path(&url) == "/mcp"
+            && url
+                .host_str()
+                .is_some_and(|host| is_loopback_host(host) || host == self.bind_address);
+        is_given || is_listener
+    }
 }
 
 /// Configuration for a single upstream MCP server.
@@ -1862,6 +1883,29 @@ LOG_LEVEL = "debug"
         assert_eq!(cfg.http.mcp_url(), "https://localhost:4411/mcp");
         cfg.http.bind_address = "192.168.1.5".to_string();
         assert_eq!(cfg.http.mcp_url(), "https://192.168.1.5:4411/mcp");
+    }
+
+    #[test]
+    fn plug_knows_its_own_addresses() {
+        let mut cfg = Config::default();
+        cfg.http.public_base_url = Some("https://plug.example.com/base/".to_string());
+        for own in [
+            "https://plug.example.com/base/mcp",
+            "http://localhost:3282/mcp",
+            "http://127.0.0.1:3282/mcp/",
+            "http://[::1]:3282/mcp",
+        ] {
+            assert!(cfg.http.is_own_mcp_url(own), "{own}");
+        }
+        for other in [
+            "https://plug.example.com/mcp",
+            "http://localhost:3283/mcp",
+            "http://localhost:3282/other",
+            "http://192.168.1.5:3282/mcp",
+            "not a url",
+        ] {
+            assert!(!cfg.http.is_own_mcp_url(other), "{other}");
+        }
     }
 
     #[test]

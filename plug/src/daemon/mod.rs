@@ -1347,7 +1347,8 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             match ctx.engine.validate_server_draft(name, server) {
                 Ok(server) => IpcResponse::ServerValidated { server },
                 Err(error) => IpcResponse::Error {
-                    code: "INVALID_SERVER".to_string(),
+                    code: plug_core::operator::NameTaken::code_or(&error, "INVALID_SERVER")
+                        .to_string(),
                     message: error.to_string(),
                 },
             }
@@ -1384,7 +1385,11 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             {
                 Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
                 Err(error) => IpcResponse::Error {
-                    code: "OPERATOR_MUTATION_FAILED".to_string(),
+                    code: plug_core::operator::NameTaken::code_or(
+                        &error,
+                        "OPERATOR_MUTATION_FAILED",
+                    )
+                    .to_string(),
                     message: error.to_string(),
                 },
             }
@@ -1606,7 +1611,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 ctx.client_registry.list_live_sessions(),
                 &ctx.http.sessions,
             ),
-            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
         },
         IpcRequest::Capabilities { session_id } => {
             // Capabilities are negotiated once per session and never
@@ -2399,14 +2403,10 @@ allowed_servers = ["slack"]
             .expect("set client type");
 
         let response = dispatch_request(&IpcRequest::ListLiveSessions, &mut ctx).await;
-        let IpcResponse::LiveSessions { sessions, scope } = response else {
+        let IpcResponse::LiveSessions { sessions } = response else {
             panic!("expected live sessions response");
         };
 
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].transport,

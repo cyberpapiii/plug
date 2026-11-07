@@ -1097,10 +1097,7 @@ impl CompositeCredentialStore {
         use oauth2::TokenResponse;
 
         let token_response = creds.token_response.as_ref()?;
-        let effective = token_response
-            .expires_in()
-            .map(|d| d.as_secs())
-            .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+        let effective = effective_expires_in(token_response.expires_in().map(|d| d.as_secs()));
         let now = unix_now();
         let received_at = creds.token_received_at.unwrap_or(now);
 
@@ -1761,6 +1758,22 @@ mod tests {
         assert!(!time_until_refresh_window(now - 100, None).is_zero());
         // Received 3400s ago → due (3400 >= 3300).
         assert!(time_until_refresh_window(now - 3400, None).is_zero());
+    }
+
+    #[test]
+    fn reported_lifetime_follows_the_refresh_rule() {
+        let lifetime = |expires_in| {
+            CompositeCredentialStore::remaining_token_lifetime_secs(&make_test_token(
+                "a", None, expires_in,
+            ))
+            .unwrap()
+        };
+        // A second may pass between saving the token and reading it.
+        let about = |expected: u64| expected - 1..=expected;
+        assert!(about(MAX_EXPIRES_IN).contains(&lifetime(Some(10 * 365 * 86_400))));
+        assert!(about(MIN_EXPIRES_IN).contains(&lifetime(Some(5))));
+        assert!(about(DEFAULT_TOKEN_LIFETIME_SECS).contains(&lifetime(Some(0))));
+        assert!(about(DEFAULT_TOKEN_LIFETIME_SECS).contains(&lifetime(None)));
     }
 
     /// Short-lived token (expires_in < 600) uses the 50% rule.
