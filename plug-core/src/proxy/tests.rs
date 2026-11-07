@@ -2951,8 +2951,7 @@ async fn native_continuation_rejects_route_replacement_before_second_invocation(
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let error = router
         .call_tool_round_with_context(params, None, Some(context))
         .await
@@ -3029,8 +3028,7 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let error = router
         .call_tool_round_with_context(params, None, Some(context))
         .await
@@ -3076,8 +3074,7 @@ async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation(
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let error = router
         .call_tool_round_with_context(
             CallToolRequestParams::new("Modern__tool"),
@@ -3116,8 +3113,7 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
 
     let response = router
         .call_tool_round_with_context(
@@ -3159,8 +3155,7 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let first = router
         .call_tool_round_with_context(
             CallToolRequestParams::new("Modern__tool"),
@@ -3202,6 +3197,94 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
     );
 }
 
+/// A modern client that declares the tasks extension, calling over IPC.
+struct TaskCapableModernCaller {
+    call: DownstreamCallContext,
+    client: ClientCapabilities,
+}
+
+impl crate::dispatch::DownstreamContext for TaskCapableModernCaller {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        self.call.clone()
+    }
+
+    fn session_bound(&self) -> bool {
+        false
+    }
+
+    fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
+        Ok(crate::downstream_identity::principal_task_owner(
+            self.call.principal().expect("principal"),
+        ))
+    }
+
+    fn modern_task_client(&self) -> Option<&ClientCapabilities> {
+        Some(&self.client)
+    }
+}
+
+/// A task cannot carry a modern upstream's rounds, so a task-capable client
+/// calling such a tool runs a plain call and finishes it in two rounds.
+#[tokio::test]
+async fn a_task_capable_client_calls_a_modern_upstream_as_a_plain_call() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    router.set_modern_downstream_enabled(true);
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot_with_metadata(&router, "Modern__tool", "modern", "Tool");
+    assert!(router.supports_tasks_for_client(ClientType::Unknown));
+
+    let caller = TaskCapableModernCaller {
+        call: DownstreamCallContext::ipc(
+            "modern-client",
+            RequestId::from(NumberOrString::Number(6)),
+            ClientType::Unknown,
+            None,
+        )
+        .with_local_principal(crate::types::PrincipalId::daemon_ipc(
+            uuid::Uuid::from_u128(104),
+        ))
+        .with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::MODERN_PROTOCOL_VERSION,
+        ),
+        client: ClientCapabilities::builder().enable_tasks().build(),
+    };
+    let first = crate::dispatch::handle(
+        &router,
+        &caller,
+        "tools/call",
+        Some(serde_json::json!({"name": "Modern__tool"})),
+    )
+    .await
+    .expect("the first round runs as a plain call");
+    assert_eq!(first["resultType"], "input_required", "{first}");
+
+    let second = crate::dispatch::handle(
+        &router,
+        &caller,
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "Modern__tool",
+            "requestState": first["requestState"],
+            "inputResponses": {"answer": {"action": "accept"}},
+        })),
+    )
+    .await
+    .expect("the continuation round runs as a plain call");
+    assert_ne!(second["resultType"], "task", "{second}");
+    assert!(second.get("content").is_some(), "{second}");
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
+}
+
 #[tokio::test]
 async fn continuation_keeps_max_byte_reservation_across_larger_second_input_required() {
     let sm = Arc::new(ServerManager::new());
@@ -3228,8 +3311,7 @@ async fn continuation_keeps_max_byte_reservation_across_larger_second_input_requ
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
 
     let first = router
         .call_tool_round_with_context(
@@ -3315,8 +3397,7 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let request_router = Arc::clone(&router);
     let request = tokio::spawn(async move {
         request_router
@@ -3379,8 +3460,7 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let request_router = Arc::clone(&router);
     let request = tokio::spawn(async move {
         request_router
@@ -3447,8 +3527,7 @@ async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state(
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let request_router = Arc::clone(&router);
     let request = tokio::spawn(async move {
         request_router
@@ -3566,8 +3645,7 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
         crate::protocol::MODERN_PROTOCOL_VERSION,
-    )
-    .with_modern_direction_enabled(true);
+    );
     let arguments = serde_json::Map::from_iter([
         ("tool_name".to_string(), serde_json::json!("Modern__tool")),
         ("arguments".to_string(), serde_json::json!({})),

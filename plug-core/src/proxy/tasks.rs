@@ -1687,12 +1687,10 @@ mod tests {
         principal: crate::types::PrincipalId,
         request_id: i64,
     ) -> DownstreamCallContext {
-        authorized_task_context(principal, request_id)
-            .with_protocol(
-                crate::protocol::ProtocolEra::Modern,
-                crate::protocol::MODERN_PROTOCOL_VERSION,
-            )
-            .with_modern_direction_enabled(true)
+        authorized_task_context(principal, request_id).with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::MODERN_PROTOCOL_VERSION,
+        )
     }
 
     #[tokio::test]

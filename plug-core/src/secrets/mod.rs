@@ -16,7 +16,7 @@ pub mod file;
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::platform_keyring;
@@ -26,13 +26,13 @@ use crate::types::SecretString;
 
 pub use crate::config::{CommandStoreConfig, FILE, KEYCHAIN, OP, SecretsConfig};
 
+/// The stores Plug can put a value in. A command store only reads: its own
+/// tool is where a value is put.
+pub const WRITABLE: [&str; 2] = [KEYCHAIN, FILE];
+
 /// How long one read may take unless the store says otherwise. A store that
 /// asks a person for approval can wait forever; a server start cannot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The stores the running service follows references with. Set from the
-/// config when it loads; the built-in ones until then.
-static CURRENT: RwLock<Option<Stores>> = RwLock::new(None);
 
 /// The last value each reference gave, so a store that locks after the
 /// service started does not take down a server that restarts. Memory only.
@@ -56,7 +56,9 @@ fn remember(reference: &str, value: Option<&SecretString>) {
 fn set_hint(store: &str, name: &str) -> String {
     match store {
         KEYCHAIN => format!("; run `plug secret set {name}`"),
-        FILE => format!("; run `plug secret set --store file {name}`"),
+        store if WRITABLE.contains(&store) => {
+            format!("; run `plug secret set --store {store} {name}`")
+        }
         _ => String::new(),
     }
 }
@@ -101,6 +103,21 @@ pub trait SecretStore: Send + Sync {
     fn accepts(&self, name: &str) -> bool {
         valid_name(name)
     }
+}
+
+/// The values of `server` that may be a reference.
+fn reference_values(server: &ServerConfig) -> impl Iterator<Item = &str> {
+    server
+        .auth_token
+        .iter()
+        .map(|token| token.as_str())
+        .chain(server.env.values().map(String::as_str))
+}
+
+/// Whether a value of `server` names `store` as its store, whether or not
+/// that store exists.
+pub fn names_store(server: &ServerConfig, store: &str) -> bool {
+    reference_values(server).any(|value| value.split_once(':').is_some_and(|(id, _)| id == store))
 }
 
 /// A secret name is safe to print, to pass to a command, and to use as a
@@ -322,31 +339,10 @@ impl Stores {
             })
     }
 
-    /// Make `config`'s stores the ones the service follows references with.
-    pub fn configure(config: &SecretsConfig) {
-        if let Ok(mut current) = CURRENT.write() {
-            *current = Some(Self::from_config(config));
-        }
-    }
-
-    /// The stores the service follows references with.
-    pub fn current() -> Self {
-        CURRENT
-            .read()
-            .ok()
-            .and_then(|current| current.clone())
-            .unwrap_or_else(Self::builtin)
-    }
-
     /// Whether `server` refers to any store, so the caller can prepare what
     /// a store needs before the first read.
     pub fn refers(&self, server: &ServerConfig) -> bool {
-        server
-            .auth_token
-            .iter()
-            .map(|token| token.as_str())
-            .chain(server.env.values().map(String::as_str))
-            .any(|value| self.parse(value).is_some())
+        reference_values(server).any(|value| self.parse(value).is_some())
     }
 
     pub fn with(mut self, id: &str, store: Arc<dyn SecretStore>) -> Self {
@@ -517,7 +513,7 @@ impl Stores {
                 continue;
             }
             if let Some((id, name)) = self.parse(value)
-                && (id == KEYCHAIN || id == FILE)
+                && WRITABLE.contains(&id)
                 && owners
                     .iter()
                     .flatten()

@@ -76,7 +76,6 @@ pub struct IpcContext {
     /// The revision the downstream client negotiated with `plug connect`.
     pub protocol_version: Arc<str>,
     pub client_metadata: Option<crate::protocol::ClientMetadata>,
-    pub modern_enabled: bool,
     pub owner_liveness: Option<OwnerLivenessProbe>,
 }
 
@@ -91,7 +90,6 @@ impl IpcContext {
             client_key: None,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
             client_metadata: None,
-            modern_enabled: false,
             owner_liveness: None,
         }
     }
@@ -107,8 +105,7 @@ impl DownstreamContext for IpcContext {
             self.registry_client_id.as_deref(),
         )
         .with_client_key(self.client_key.clone())
-        .with_protocol(era, Arc::clone(&self.protocol_version))
-        .with_modern_direction_enabled(self.modern_enabled && era == ProtocolEra::Modern);
+        .with_protocol(era, Arc::clone(&self.protocol_version));
         match &self.client_metadata {
             Some(metadata) => context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version)),
@@ -413,6 +410,25 @@ pub(crate) fn admit_modern_task(
     ctx.task_owner()
 }
 
+/// Whether a modern `tools/call` runs as a task. Every call from a client
+/// that declares the tasks extension does, unless it cannot be one: the
+/// caller may not use tasks, the tool is a plug meta-tool, or the tool's
+/// upstream speaks the modern era, whose rounds a task cannot carry. Such a
+/// call runs as a plain call.
+fn can_be_task(
+    router: &ToolRouter,
+    ctx: &dyn DownstreamContext,
+    call: &DownstreamCallContext,
+    tool: &str,
+) -> bool {
+    ctx.modern_task_client()
+        .is_some_and(ClientCapabilities::supports_tasks)
+        && router.supports_tasks_for_client(call.client_type)
+        && call.policy_decision(MethodFamily::Tasks) == crate::admission::PolicyDecision::Allow
+        && crate::proxy::PlugTool::named(tool).is_none()
+        && router.tool_upstream_era(tool) != Some(ProtocolEra::Modern)
+}
+
 async fn tools_call(
     router: &Arc<ToolRouter>,
     ctx: &dyn DownstreamContext,
@@ -427,21 +443,15 @@ async fn tools_call(
     }
     let params: CallToolRequestParams = serde_json::from_value(params)
         .map_err(|error| McpError::invalid_params(format!("tools/call: {error}"), None))?;
-    // A modern client asks for a task by declaring the tasks extension; a
-    // legacy one by the SEP-1686 `task` parameter, carried under
-    // `LEGACY_TASK_REQUEST_KEY` once rewritten. A modern call that cannot be a
-    // task (no `tasks:use`, or a plug meta-tool) runs as a plain call.
-    let modern_task = era == ProtocolEra::Modern
-        && ctx
-            .modern_task_client()
-            .is_some_and(ClientCapabilities::supports_tasks)
-        && router.supports_tasks_for_client(call.client_type)
-        && crate::proxy::PlugTool::named(params.name.as_ref()).is_none()
-        && call.policy_decision(MethodFamily::Tasks) == crate::admission::PolicyDecision::Allow;
-    let legacy_task = params
-        .meta
-        .as_ref()
-        .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY));
+    // A legacy client asks for a task by the SEP-1686 `task` parameter,
+    // carried under `LEGACY_TASK_REQUEST_KEY` once rewritten.
+    let task_requested = match era {
+        ProtocolEra::Modern => can_be_task(router, ctx, &call, params.name.as_ref()),
+        ProtocolEra::Legacy => params
+            .meta
+            .as_ref()
+            .is_some_and(|meta| meta.contains_key(crate::protocol::LEGACY_TASK_REQUEST_KEY)),
+    };
 
     let started = std::time::Instant::now();
     let client = call.client_id.to_string();
@@ -457,7 +467,7 @@ async fn tools_call(
     let tool = params.name.to_string();
     let server = router.server_for_tool(&tool);
     let cancellation = call.cancellation.clone();
-    let result = tools_call_inner(router, ctx, call, params, modern_task || legacy_task).await;
+    let result = tools_call_inner(router, ctx, call, params, task_requested).await;
     router.record_activity(crate::activity::ActivityEvent {
         sequence: 0,
         occurred_at_ms: 0,
@@ -487,7 +497,7 @@ async fn tools_call(
     match result? {
         ToolCallOutcome::Called(result) => to_value(result),
         ToolCallOutcome::InputRequired(result) => to_value(result),
-        ToolCallOutcome::TaskCreated(result) if modern_task => {
+        ToolCallOutcome::TaskCreated(result) if era == ProtocolEra::Modern => {
             to_value(rmcp::model::CreateTaskResult::new((&result.task).into()))
         }
         ToolCallOutcome::TaskCreated(result) => to_value(result),

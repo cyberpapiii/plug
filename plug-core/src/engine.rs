@@ -484,8 +484,11 @@ impl Engine {
         secret_store: Option<&str>,
     ) -> anyhow::Result<(crate::operator::OperatorMutationResult, ReloadReport)> {
         let store = secret_store.unwrap_or(crate::secrets::KEYCHAIN);
-        if ![crate::secrets::KEYCHAIN, crate::secrets::FILE].contains(&store) {
-            anyhow::bail!("Plug cannot write keys to `{store}`; choose `keychain` or `file`");
+        if !crate::secrets::WRITABLE.contains(&store) {
+            anyhow::bail!(
+                "Plug cannot write keys to `{store}`; choose `{}`",
+                crate::secrets::WRITABLE.join("` or `")
+            );
         }
         // One change at a time, from the first key stored to the last one
         // removed: two changes side by side could undo each other's keys.
@@ -510,18 +513,18 @@ impl Engine {
                     // Nothing was saved, so the stores go back to what they
                     // held: a refused change must not replace a working key.
                     let store = store.to_string();
-                    let failed = match tokio::task::spawn_blocking(move || {
-                        crate::secrets::Stores::current().put_back(&store, staged)
-                    })
-                    .await
-                    {
-                        Ok(failed) => failed,
-                        Err(join) => {
-                            return Err(error.context(format!(
-                                "the stored keys could not be put back: {join}"
-                            )));
-                        }
-                    };
+                    let stores = self.server_manager.secret_stores();
+                    let failed =
+                        match tokio::task::spawn_blocking(move || stores.put_back(&store, staged))
+                            .await
+                        {
+                            Ok(failed) => failed,
+                            Err(join) => {
+                                return Err(error.context(format!(
+                                    "the stored keys could not be put back: {join}"
+                                )));
+                            }
+                        };
                     if failed.is_empty() {
                         return Err(error);
                     }
@@ -537,12 +540,9 @@ impl Engine {
             let report = self.apply_reload(config).await;
             if let Some((name, server)) = before {
                 let config = self.config.load_full();
+                let stores = self.server_manager.secret_stores();
                 let forgotten = tokio::task::spawn_blocking(move || {
-                    crate::secrets::Stores::current().forget(
-                        &name,
-                        &server,
-                        config.servers.values(),
-                    );
+                    stores.forget(&name, &server, config.servers.values());
                 })
                 .await;
                 if let Err(error) = forgotten {
@@ -613,11 +613,11 @@ impl Engine {
         use crate::operator::OperatorMutation;
         let keep = |name: String, mut server: ServerConfig| {
             let store = store.clone();
+            let stores = self.server_manager.secret_stores();
             async move {
                 let owner = name.clone();
                 tokio::task::spawn_blocking(move || {
-                    let kept =
-                        crate::secrets::Stores::current().keep_staged(&store, &owner, &mut server);
+                    let kept = stores.keep_staged(&store, &owner, &mut server);
                     (server, kept)
                 })
                 .await
@@ -1076,7 +1076,7 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
 
 /// The settings a server start reads that apply without a restart.
 fn apply_start_settings(servers: &ServerManager, config: &Config) {
-    crate::secrets::Stores::configure(&config.secrets);
+    servers.set_secret_stores(crate::secrets::Stores::from_config(&config.secrets));
     servers.set_modern_upstream_enabled(config.modern_upstream_enabled);
 }
 
@@ -1176,6 +1176,38 @@ mod tests {
             read.exists(),
             "the start followed the reference through the new store"
         );
+        engine.shutdown().await;
+    }
+
+    /// A server started before its store existed holds the reference as
+    /// text; the reload that adds the store restarts it.
+    #[tokio::test]
+    async fn a_reload_restarts_a_running_server_whose_store_it_adds() {
+        let mut config = Config::default();
+        let mut server = mock_stdio_server_config("echo", 1);
+        server.env.insert("TOKEN".into(), "vault:token".into());
+        config.servers.insert("vaulted".into(), server);
+        let engine = Engine::new(config.clone());
+        engine.start().await;
+        assert!(engine.server_manager().get_upstream("vaulted").is_some());
+
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("read");
+        config.secrets.stores.insert(
+            "vault".into(),
+            crate::config::CommandStoreConfig {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("touch '{}'; printf value", read.display()),
+                ],
+                timeout_secs: 5,
+            },
+        );
+        let report = engine.reload_config(config).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert_eq!(report.changed, vec!["vaulted"]);
+        assert!(read.exists(), "the restart followed the reference");
         engine.shutdown().await;
     }
 
@@ -1862,7 +1894,7 @@ FROM_ENV = "$HOME"
             saved.servers["filed"].env["API_TOKEN"],
             "file:filed.API_TOKEN"
         );
-        let stores = crate::secrets::Stores::current();
+        let stores = engine.server_manager().secret_stores();
         let file = stores.get(crate::secrets::FILE).unwrap();
         assert_eq!(
             file.get("filed.API_TOKEN").unwrap().unwrap().as_str(),

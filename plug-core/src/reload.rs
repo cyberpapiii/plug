@@ -114,6 +114,7 @@ pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     let mut changed = Vec::new();
     let mut unchanged = Vec::new();
     let mut updated = Vec::new();
+    let changed_stores = changed_stores(old, new);
 
     for name in old_names.intersection(&new_names) {
         let old_cfg = &old.servers[*name];
@@ -122,8 +123,13 @@ pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
             != new.modern_upstream_enabled
             && (old_cfg.protocol_mode != UpstreamProtocolMode::Legacy
                 || new_cfg.protocol_mode != UpstreamProtocolMode::Legacy);
+        // A running server holds the value its store gave when it started,
+        // or the reference as text when that store did not exist yet.
+        let store_changed = changed_stores
+            .iter()
+            .any(|store| crate::secrets::names_store(new_cfg, store));
         let change = server_change(old_cfg, new_cfg);
-        if change == ServerChange::Restart || gate_change_requires_renegotiation {
+        if change == ServerChange::Restart || gate_change_requires_renegotiation || store_changed {
             changed.push(((*name).clone(), new_cfg.clone()));
         } else {
             unchanged.push((*name).clone());
@@ -145,6 +151,16 @@ pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         settings_changed,
         restart_required,
     }
+}
+
+/// The `[secrets.stores]` ids added, removed or edited.
+fn changed_stores<'a>(old: &'a Config, new: &'a Config) -> Vec<&'a str> {
+    let (old, new) = (&old.secrets.stores, &new.secrets.stores);
+    old.keys()
+        .chain(new.keys().filter(|id| !old.contains_key(*id)))
+        .filter(|id| old.get(*id) != new.get(*id))
+        .map(String::as_str)
+        .collect()
 }
 
 /// The settings outside `servers` that changed: by name, those read only
@@ -364,6 +380,52 @@ mod tests {
         let diff = diff_configs(&old, &forced_modern);
         assert_eq!(diff.changed.len(), 1);
         assert_eq!(diff.changed[0].0, "legacy");
+    }
+
+    #[test]
+    fn a_store_change_restarts_only_the_servers_that_name_it() {
+        let store = |command: &str| crate::config::CommandStoreConfig {
+            command: vec![command.into(), "{name}".into()],
+            timeout_secs: 5,
+        };
+        let mut old = Config::default();
+        let mut vaulted = make_server("vaulted");
+        vaulted.env.insert("TOKEN".into(), "vault:token".into());
+        old.servers.insert("vaulted".into(), vaulted);
+        let mut tokened = make_server("tokened");
+        tokened.auth_token = Some("vault:bearer".to_string().into());
+        old.servers.insert("tokened".into(), tokened);
+        old.servers.insert("plain".into(), make_server("plain"));
+        old.secrets.stores.insert("other".into(), store("other"));
+
+        let changed = |new: &Config| {
+            let mut names: Vec<_> = diff_configs(&old, new)
+                .changed
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            names.sort();
+            names
+        };
+        let mut added = old.clone();
+        added.secrets.stores.insert("vault".into(), store("get"));
+        assert_eq!(changed(&added), ["tokened", "vaulted"]);
+
+        let mut edited = added.clone();
+        edited.secrets.stores.insert("vault".into(), store("fetch"));
+        let restarted = diff_configs(&added, &edited);
+        assert_eq!(restarted.changed.len(), 2);
+        assert_eq!(restarted.unchanged, vec!["plain"]);
+
+        let removed = diff_configs(&added, &old);
+        assert_eq!(removed.changed.len(), 2);
+
+        let mut unrelated = old.clone();
+        unrelated
+            .secrets
+            .stores
+            .insert("other".into(), store("else"));
+        assert!(changed(&unrelated).is_empty());
     }
 
     #[test]

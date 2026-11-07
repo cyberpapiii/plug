@@ -1136,6 +1136,9 @@ pub struct ServerManager {
     /// Live, reloadable safety gate for modern upstream negotiation.
     /// A [`ProtocolGate`], stored as its bits.
     modern_upstream_gate: AtomicU64,
+    /// The stores a server start follows secret references with. Set from
+    /// the config when it loads; the built-in ones until then.
+    secret_stores: ArcSwap<crate::secrets::Stores>,
     /// Wakes every health task and every waiting recovery at once. Signalled
     /// when a server's process stops and when the Mac wakes or its network
     /// changes, the moments a wait until the next tick is wasted time.
@@ -1218,7 +1221,16 @@ impl ServerManager {
             shutdown_signal,
             check_now: Arc::new(tokio::sync::Notify::new()),
             modern_upstream_gate: AtomicU64::new(ProtocolGate::default().0),
+            secret_stores: ArcSwap::from_pointee(crate::secrets::Stores::builtin()),
         }
+    }
+
+    pub fn set_secret_stores(&self, stores: crate::secrets::Stores) {
+        self.secret_stores.store(Arc::new(stores));
+    }
+
+    pub fn secret_stores(&self) -> Arc<crate::secrets::Stores> {
+        self.secret_stores.load_full()
     }
 
     pub fn set_modern_upstream_enabled(&self, enabled: bool) {
@@ -1457,9 +1469,11 @@ impl ServerManager {
             let sc = server_config.clone();
             let reporting = self.reporting();
             let protocol_gate = self.protocol_gate();
+            let stores = self.secret_stores();
             join_set.spawn(async move {
                 let _permit = permits.acquire_owned().await;
-                let result = Self::connect(&name_clone, &sc, reporting, protocol_gate).await;
+                let result =
+                    Self::connect(&name_clone, &sc, &stores, reporting, protocol_gate).await;
                 (name_clone, result)
             });
         }
@@ -1501,7 +1515,14 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        let result = Self::connect(name, config, self.reporting(), self.protocol_gate()).await;
+        let result = Self::connect(
+            name,
+            config,
+            &self.secret_stores(),
+            self.reporting(),
+            self.protocol_gate(),
+        )
+        .await;
         if let Err(error) = &result {
             self.record_error(name, config, error);
         }
@@ -1524,10 +1545,10 @@ impl ServerManager {
     async fn connect(
         name: &str,
         config: &ServerConfig,
+        stores: &crate::secrets::Stores,
         reporting: Reporting,
         protocol_gate: ProtocolGate,
     ) -> Result<UpstreamServer, anyhow::Error> {
-        let stores = crate::secrets::Stores::current();
         // A store that is a command finds its tool on the PATH a terminal
         // would have.
         let path = if stores.refers(config) {
