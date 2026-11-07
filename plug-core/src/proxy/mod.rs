@@ -1440,13 +1440,6 @@ impl ToolRouter {
             .map(|(server_id, _)| server_id.clone());
         drop(cache);
         let Some(server_id) = server_id else {
-            // Legacy task wrappers intentionally create their durable record
-            // before resolving a missing route, so teardown can still own a
-            // create racing session deletion. Only a resolved modern route
-            // needs the new pre-create pair rejection below.
-            if task_requested && downstream.protocol_era == crate::protocol::ProtocolEra::Legacy {
-                return Ok(());
-            }
             return Err(McpError::from(ProtocolError::ToolNotFound {
                 tool_name: tool_name.to_string(),
             }));
