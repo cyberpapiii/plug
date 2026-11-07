@@ -1,6 +1,7 @@
 import Foundation
 import PlugIPC
 import XCTest
+@testable import Plug
 
 extension XCTestCase {
     /// A Plug folder of this test's own, holding a daemon token, removed when
@@ -15,12 +16,12 @@ extension XCTestCase {
         addTeardownBlock { try? FileManager.default.removeItem(at: directory) }
         return home
     }
+}
 
-    /// Preferences of this test's own, never the host app's.
-    func makeTestDefaults() -> UserDefaults {
-        let suite = "PlugTests-\(UUID().uuidString)"
-        let defaults = UserDefaults(suiteName: suite)!
-        addTeardownBlock { UserDefaults().removePersistentDomain(forName: suite) }
-        return defaults
-    }
+/// Preferences of one test's own, kept in memory.
+final class TestPreferences: PreferenceStore {
+    private var values: [String: Any] = [:]
+
+    func object(forKey key: String) -> Any? { values[key] }
+    func set(_ value: Any?, forKey key: String) { values[key] = value }
 }

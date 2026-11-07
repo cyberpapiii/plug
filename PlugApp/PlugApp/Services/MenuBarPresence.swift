@@ -10,18 +10,18 @@ struct MenuBarPresence {
     static var standard: MenuBarPresence {
         MenuBarPresence(
             marker: PlugPaths.marker(PlugPaths.menuBarHiddenMarker),
-            defaults: .standard
+            preferences: UserDefaults.standard
         )
     }
 
     let marker: URL
-    let defaults: UserDefaults
+    let preferences: any PreferenceStore
 
     /// On unless the person turned it off.
     var keeps: Bool {
-        get { defaults.object(forKey: Self.preferenceKey) as? Bool ?? true }
+        get { preferences.object(forKey: Self.preferenceKey) as? Bool ?? true }
         nonmutating set {
-            defaults.set(newValue, forKey: Self.preferenceKey)
+            preferences.set(newValue, forKey: Self.preferenceKey)
             appDidOpen()
         }
     }

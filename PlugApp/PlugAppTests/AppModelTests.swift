@@ -602,6 +602,7 @@ final class AppModelTests: XCTestCase {
         let events = LockedEvents()
         let socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-swap-\(UUID().uuidString).sock")
         let oldServer = try OperatorFixtureServer(events: events, socketURL: socketURL)
+        defer { oldServer.stop() }
         let coordinator = RecordingInstallationCoordinator(
             state: .healthy(makeInstallationSnapshot()),
             events: events
@@ -633,6 +634,7 @@ final class AppModelTests: XCTestCase {
         ] {
             let events = LockedEvents()
             let server = try OperatorFixtureServer(events: events)
+            defer { server.stop() }
             let model = AppModel(
                 home: makeTestHome(),
                 ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
@@ -731,10 +733,10 @@ final class AppModelTests: XCTestCase {
 
     @MainActor
     func testNotificationsStaySilentInitiallyAndDeduplicateTransitions() {
-        let defaults = makeTestDefaults()
-        defaults.set(true, forKey: NotificationService.preferenceKey)
+        let preferences = TestPreferences()
+        preferences.set(true, forKey: NotificationService.preferenceKey)
         var postedIDs: [String] = []
-        let service = NotificationService(sink: { postedIDs.append($0.id) }, defaults: defaults)
+        let service = NotificationService(sink: { postedIDs.append($0.id) }, preferences: preferences)
         let empty = makeNotificationSnapshot()
         let authenticated = makeNotificationSnapshot(authenticated: true)
         let unauthenticated = makeNotificationSnapshot(authenticated: false)
@@ -891,10 +893,10 @@ final class AppModelTests: XCTestCase {
             .revealClient(id: "client-1")
         )
 
-        let defaults = makeTestDefaults()
-        defaults.set(true, forKey: NotificationService.preferenceKey)
+        let preferences = TestPreferences()
+        preferences.set(true, forKey: NotificationService.preferenceKey)
         var notes: [NotificationService.Note] = []
-        let service = NotificationService(sink: { notes.append($0) }, defaults: defaults)
+        let service = NotificationService(sink: { notes.append($0) }, preferences: preferences)
         service.observe(makeNotificationSnapshot(authenticated: true))
         service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
         XCTAssertEqual(notes.map(\.server), ["alpha", nil], "only the server notification is clickable")
@@ -960,10 +962,10 @@ final class AppModelTests: XCTestCase {
 
     @MainActor
     func testNotificationsRequireExplicitOptIn() {
-        let defaults = makeTestDefaults()
+        let preferences = TestPreferences()
 
         var postedIDs: [String] = []
-        let service = NotificationService(sink: { postedIDs.append($0.id) }, defaults: defaults)
+        let service = NotificationService(sink: { postedIDs.append($0.id) }, preferences: preferences)
         service.observe(makeNotificationSnapshot(authenticated: true))
         service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
 
@@ -1071,10 +1073,10 @@ final class AppModelTests: XCTestCase {
             """
             return try JSONDecoder().decode(OperatorSnapshot.self, from: Data(payload.utf8))
         }
-        let defaults = makeTestDefaults()
-        defaults.set(true, forKey: NotificationService.preferenceKey)
+        let preferences = TestPreferences()
+        preferences.set(true, forKey: NotificationService.preferenceKey)
         var posted: [String] = []
-        let service = NotificationService(sink: { posted.append($0.id) }, defaults: defaults)
+        let service = NotificationService(sink: { posted.append($0.id) }, preferences: preferences)
         service.observe(try snapshot([true, false]))
         service.observe(try snapshot([false]))
         XCTAssertEqual(posted, ["upstream-reauth-alpha"], "the first of the two is the one read")

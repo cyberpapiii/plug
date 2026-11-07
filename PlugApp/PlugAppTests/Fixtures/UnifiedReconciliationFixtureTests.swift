@@ -516,9 +516,14 @@ private struct SignedReconciliationFixture {
             parentBundleVersion: "1"
         )
 
-        try createBundle(from: signedHost)
-        try createProtectedFixtures()
-        if mode == .legacy { try createLegacyFixtures() }
+        do {
+            try createBundle(from: signedHost)
+            try createProtectedFixtures()
+            if mode == .legacy { try createLegacyFixtures() }
+        } catch {
+            try? FileManager.default.removeItem(at: rootURL)
+            throw error
+        }
     }
 
     /// The app's own readers, on the fixture bundle. Only the version run

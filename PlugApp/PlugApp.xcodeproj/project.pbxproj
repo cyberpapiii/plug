@@ -26,6 +26,7 @@
 		17D83615A424704B1CC1366D /* UnifiedReconciliationFixtureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 32DABE7B3A070D7DE0195A25 /* UnifiedReconciliationFixtureTests.swift */; };
 		1E190A68A93C4EC68E3E786A /* AccountDraftTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 852F847CA1FC250E52673A1C /* AccountDraftTests.swift */; };
 		2089DA66D395D3CB66FC5A26 /* Assets.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 0D96A945383702097BA4CCEA /* Assets.xcassets */; };
+		20E8C6CFC38BFBC48EA1D52B /* PreferenceStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = CF8A59E95B1BAE0B2AEFFA66 /* PreferenceStore.swift */; };
 		2262A73184055B0A85EBE4EE /* ToolRow.swift in Sources */ = {isa = PBXBuildFile; fileRef = E5046B427725A1A125529AF2 /* ToolRow.swift */; };
 		22845982C468452F82B72E18 /* IconStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = 12395D0198EBE342D4747A7B /* IconStore.swift */; };
 		273D19A50B88F699E124420F /* ProcessRunnerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 28E1C65673D42038754E140C /* ProcessRunnerTests.swift */; };
@@ -206,6 +207,7 @@
 		CA3BDFE60BC89789EB5D2355 /* StubProcessRunner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StubProcessRunner.swift; sourceTree = "<group>"; };
 		CC541E7062C47E08EF5F5B4B /* PlugAppTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = PlugAppTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		CF100219E986FE6F9888C003 /* AddClientView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AddClientView.swift; sourceTree = "<group>"; };
+		CF8A59E95B1BAE0B2AEFFA66 /* PreferenceStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PreferenceStore.swift; sourceTree = "<group>"; };
 		CFB5F14F3555D871E8C3F254 /* TestSocket.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TestSocket.swift; sourceTree = "<group>"; };
 		D3386E4BD7635FC4E33D53AA /* agent-setup.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "agent-setup.md"; sourceTree = "<group>"; };
 		D594C9C8A9E633E346F46C33 /* ClientDetail.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ClientDetail.swift; sourceTree = "<group>"; };
@@ -482,6 +484,7 @@
 				46BA1893EFAEE2F0A561DFB7 /* LoginItems.swift */,
 				042518A40467835489C2D2CD /* MenuBarPresence.swift */,
 				6F5B09AFBCFD315B1AD3534C /* NotificationService.swift */,
+				CF8A59E95B1BAE0B2AEFFA66 /* PreferenceStore.swift */,
 				B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */,
 				922FACE8E1C7C4E492962647 /* ServiceDisabledMarker.swift */,
 				2D1B09D36EE0E0D152888537 /* UpdateService.swift */,
@@ -777,6 +780,7 @@
 				12A35C74598F87BEC6396C64 /* PlugPaths.swift in Sources */,
 				F762470FA24AB181FB13685B /* PlugPopover.swift in Sources */,
 				2BDB05EE41EE0B5B2AD98F97 /* PlugStatus.swift in Sources */,
+				20E8C6CFC38BFBC48EA1D52B /* PreferenceStore.swift in Sources */,
 				75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */,
 				F852530409D8C43702EBBBD6 /* ReconciliationGate.swift in Sources */,
 				6C3A2ACAD67159A496C5DC58 /* RootView.swift in Sources */,
