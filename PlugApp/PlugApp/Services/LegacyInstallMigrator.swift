@@ -34,12 +34,27 @@ struct LegacyInstallSnapshot: Equatable, Sendable {
     }
 }
 
-enum LegacyInstallError: Error, Equatable {
+enum LegacyInstallError: LocalizedError, Equatable {
     case unrelatedShellCommand(URL)
     case formulaStillInstalled
     case brewUnavailable
     case brewFailed(String)
     case fileOperation(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .unrelatedShellCommand(path):
+            "Another file is in the way at \(path.path). Move it, then try again."
+        case .formulaStillInstalled:
+            "The old Homebrew copy of Plug is still installed. Run brew uninstall \(LegacyPlugProgram.formula), then try again."
+        case .brewUnavailable:
+            "Plug could not run Homebrew, so the old Homebrew copy of Plug stays."
+        case let .brewFailed(detail):
+            "Homebrew could not remove the old copy of Plug: \(detail)"
+        case let .fileOperation(message):
+            message
+        }
+    }
 }
 
 protocol LegacyInstallMigrating: Sendable {

@@ -1,8 +1,19 @@
 import Foundation
 
-enum ClientRepairError: Error, Equatable {
+enum ClientRepairError: LocalizedError, Equatable {
     case commandFailed(status: Int32, stderr: String)
     case malformedOutput
+
+    var errorDescription: String? {
+        switch self {
+        case let .commandFailed(status, stderr):
+            stderr.isEmpty
+                ? "Plug could not update your clients' settings (exit status \(status))."
+                : "Plug could not update your clients' settings: \(stderr)"
+        case .malformedOutput:
+            "Plug gave an answer it could not read. Try again."
+        }
+    }
 }
 
 protocol ClientRepairing: Sendable {

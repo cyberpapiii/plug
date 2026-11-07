@@ -6,7 +6,7 @@ struct ClientStatus: Equatable, Sendable {
     let text: String
 
     static func hasNetworkRepresentation(_ app: LinkableApp, grantTargets: [String]) -> Bool {
-        app.linked && app.transport?.lowercased() == "http" && grantTargets.contains(app.target)
+        app.linked && app.overNetwork && grantTargets.contains(app.target)
     }
 
     /// A state, followed by what is off for the client when something is.
@@ -42,7 +42,7 @@ struct ClientStatus: Equatable, Sendable {
         } else if !app.linked {
             state = "No local Plug configuration"
         } else {
-            state = app.transport?.lowercased() == "http" ? "Uses Plug over the network" : "Not open"
+            state = app.overNetwork ? "Uses Plug over the network" : "Not open"
         }
         return ClientStatus(state: state, limit: limit)
     }

@@ -134,32 +134,40 @@ enum ServerDraftParser {
         let url = urlKeys.lazy
             .compactMap { (body[$0] as? String)?.trimmingCharacters(in: .whitespaces) }
             .first { !$0.isEmpty }
+        var config: ServerConfig
         if let url {
-            var config = ServerConfig.remote(url)
+            config = ServerConfig.remote(url)
             if let declared = declaredTransport(in: body), declared == "sse" {
                 config.transport = "sse"
             }
             if let token = bearerToken(in: body) {
                 config.authToken = token
             }
-            return ServerDraft(name: name, config: config, facts: facts(for: config))
-        }
-
-        // OpenCode keeps the command and its arguments in one list.
-        var words = (body["command"] as? [Any])?.compactMap { $0 as? String }
-            ?? [(body["command"] as? String) ?? ""]
-        let command = words.removeFirst().trimmingCharacters(in: .whitespaces)
-        guard !command.isEmpty else { return nil }
-
-        let args = words + ((body["args"] as? [Any])?.compactMap { $0 as? String } ?? [])
-        var config = ServerConfig.command(command, args: args)
-        if let env = (body["env"] ?? body["environment"]) as? [String: Any] {
-            config.env = env.compactMapValues { $0 as? String }
+        } else {
+            guard let words = commandWords(in: body),
+                  let command = words.first?.trimmingCharacters(in: .whitespaces),
+                  !command.isEmpty
+            else { return nil }
+            let args = Array(words.dropFirst()) + ((body["args"] as? [Any])?.compactMap { $0 as? String } ?? [])
+            config = ServerConfig.command(command, args: args)
+            if let env = (body["env"] ?? body["environment"]) as? [String: Any] {
+                config.env = env.compactMapValues { $0 as? String }
+            }
         }
         if let enabled = body["enabled"] as? Bool {
             config.enabled = enabled
         }
         return ServerDraft(name: name, config: config, facts: facts(for: config))
+    }
+
+    /// The command and the words after it. OpenCode keeps both in one list,
+    /// which must hold only text, as `read_entry` requires.
+    private static func commandWords(in body: [String: Any]) -> [String]? {
+        switch body["command"] {
+        case let text as String: [text]
+        case let list as [Any]: list as? [String]
+        default: nil
+        }
     }
 
     private static func declaredTransport(in body: [String: Any]) -> String? {

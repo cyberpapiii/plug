@@ -789,6 +789,9 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     private let process: Process?
     private let executableURL: URL?
     private let daemonVersion: String?
+    /// The daemon's `handshake` reply from `testdata/ipc/responses.json`,
+    /// which `plug connect` validates.
+    private let handshakeReply: [String: Any]?
     private let input: FileHandle?
     private let outputWrite: FileHandle?
     private let errorWrite: FileHandle?
@@ -825,6 +828,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             process = nil
             self.executableURL = nil
             self.daemonVersion = nil
+            handshakeReply = nil
             input = nil
             outputWrite = nil
             errorWrite = nil
@@ -840,6 +844,10 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         self.socketURL = socketURL.standardizedFileURL
         self.executableURL = executableURL.standardizedFileURL
         self.daemonVersion = daemonVersion
+        guard let handshakeReply = try ipcResponseGoldens()["handshake"] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.handshakeReply = handshakeReply
         let listener = try TestSocket.listen(at: socketURL.path, backlog: 4)
         self.listener = listener
         socketOwned = true
@@ -1249,15 +1257,13 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             lock.unlock()
             switch type {
             case "OperatorHandshake":
-                guard let executableURL, let daemonVersion else { break }
-                reply([
-                    "type": "OperatorHandshake",
-                    "handshake": [
-                        "daemon_version": daemonVersion,
-                        "daemon_executable": executableURL.path,
-                        "ownership": "app_managed",
-                    ],
-                ])
+                guard let executableURL, let daemonVersion, var response = handshakeReply,
+                      var handshake = response["handshake"] as? [String: Any]
+                else { break }
+                handshake["daemon_version"] = daemonVersion
+                handshake["daemon_executable"] = executableURL.path
+                response["handshake"] = handshake
+                reply(response)
             case "Register":
                 lock.lock()
                 registerStorage += 1

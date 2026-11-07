@@ -40,6 +40,57 @@ final class DaemonServiceManagerTests: XCTestCase {
         XCTAssertTrue(launchd.events.isEmpty)
     }
 
+    /// Before the formula is uninstalled, its jobs go, and only its jobs: a
+    /// Cargo leftover keeps running until the app's own daemon is proven.
+    func testOnlyHomebrewLeftoversAreBootedOutBeforeTheFormulaGoes() async throws {
+        let cargo = record(label: "local.claude-rc.plug", path: "/Users/me/.cargo/bin/plug", build: nil)
+        let brewBin = record(label: "homebrew.mxcl.plug", path: "/opt/homebrew/bin/plug", build: nil)
+        let leftovers = DaemonOwnershipState.recognizedLegacy([cellar, cargo, brewBin])
+        let launchd = world(leftovers)
+
+        try await manager(launchd).bootOutRecognizedLegacy(snapshot(leftovers, version: nil, executable: nil))
+
+        XCTAssertEqual(launchd.events, [
+            .bootOut(label: cellar.label, path: cellar.programURL!),
+            .bootOut(label: brewBin.label, path: brewBin.programURL!),
+        ])
+    }
+
+    func testNothingIsBootedOutWithoutAHomebrewLeftover() async throws {
+        let cargo = record(label: "local.claude-rc.plug", path: "/Users/me/.cargo/bin/plug", build: nil)
+        let unread = LaunchdJobRecord(
+            label: "com.plug.serve", programURL: nil, parentBundleIdentifier: nil, parentBundleVersion: nil
+        )
+        for ownership in [
+            DaemonOwnershipState.recognizedLegacy([cargo, unread]), .appManagedCurrent(current),
+            .appManagedStale(stale), .unmanaged, .unknown([cellar]),
+        ] {
+            let launchd = world(ownership)
+            try await manager(launchd).bootOutRecognizedLegacy(snapshot(ownership, version: nil, executable: nil))
+            XCTAssertTrue(launchd.events.isEmpty, "\(ownership)")
+        }
+    }
+
+    /// A failed press shows these as they are.
+    func testEveryServiceFailureReadsAsASentence() {
+        let errors: [DaemonServiceError] = [
+            .adoptionRequired, .unknownOwnership, .evidenceChanged,
+            .invalidAppVersion(expected: "0.9.1", actual: "0.9.0"), .invalidJobEvidence, .registrationDisabled,
+            .verificationFailed(expectedVersion: "0.9.1", actualVersion: nil),
+            .verificationFailed(expectedVersion: "0.9.1", actualVersion: "0.9.0"),
+            .commandFailed(""), .commandFailed("Plug could not turn off. Try again."),
+        ]
+        for error in errors {
+            let text = (error as Error).localizedDescription
+            XCTAssertEqual(text, error.errorDescription, "\(error)")
+            XCTAssertTrue(text.hasSuffix("."), text)
+        }
+        XCTAssertEqual(
+            (DaemonServiceError.commandFailed("Plug could not turn off. Try again.") as Error).localizedDescription,
+            "Plug could not turn off. Try again."
+        )
+    }
+
     func testAdoptingALeftoverReadsLaunchdWithTheProgramItFound() async throws {
         let launchd = world(.recognizedLegacy([cellar]), answering: makeTestHandshake(version: "0.6.3"))
         let manager = manager(launchd)

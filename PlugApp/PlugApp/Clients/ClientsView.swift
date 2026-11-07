@@ -40,33 +40,22 @@ struct ClientsView: View {
         }
     }
 
-    /// The open sessions no app claimed, sorted into the clients they belong
-    /// to, so one client is one row however many connections it has open.
-    private struct Unclaimed {
-        /// Sessions of a client allowed in over the network, by its key.
-        var byGrant: [String: [LiveSession]] = [:]
-        /// Every other client, with all of its sessions.
-        var clients: [(id: String, sessions: [LiveSession])] = []
-    }
-
-    private func unclaimed(in roster: AppRoster) -> Unclaimed {
+    /// The open sessions no app or sign-in claimed, sorted into the clients
+    /// they belong to, so one client is one row however many connections it
+    /// has open.
+    private func unclaimed(in roster: AppRoster) -> [(id: String, sessions: [LiveSession])] {
         let names = self.names
         let grantKeys = Set(model.snapshot.downstreamClients.map(\.clientKey))
-        var result = Unclaimed()
+        var result: [(id: String, sessions: [LiveSession])] = []
         var index: [String: Int] = [:]
         for session in roster.other {
-            if let key = session.clientKey, grantKeys.contains(key) {
-                result.byGrant[key, default: []].append(session)
-                continue
-            }
-            // A session whose key is shared with other clients stays a row of
-            // its own.
-            let id = "session:\(session.ownAccessKey ?? session.sessionId)"
+            if let key = session.clientKey, grantKeys.contains(key) { continue }
+            let id = "session:\(names.client(of: session))"
             if let at = index[id] {
-                result.clients[at].sessions.append(session)
+                result[at].sessions.append(session)
             } else {
-                index[id] = result.clients.count
-                result.clients.append((id: id, sessions: [session]))
+                index[id] = result.count
+                result.append((id: id, sessions: [session]))
             }
         }
         return result
@@ -109,14 +98,10 @@ struct ClientsView: View {
     /// Over the Network; a choice made here would not reach it.
     private func access(to app: LinkableApp, sessions: [LiveSession]) -> ClientAccess? {
         guard app.linked || !sessions.isEmpty else { return nil }
-        let overNetwork = app.transport?.lowercased() == "http"
+        let overNetwork = app.overNetwork
             || sessions.contains { $0.ownAccessKey != app.target }
         guard !overNetwork else { return nil }
         return access(key: app.target, name: names.name(forKey: app.target) ?? app.name)
-    }
-
-    private static func isRemote(_ session: LiveSession) -> Bool {
-        ["http", "sse"].contains(session.transport)
     }
 
     var body: some View {
@@ -183,7 +168,7 @@ struct ClientsView: View {
                 }
             }
         }
-        .pageSubtitle(connectionSummary(roster: roster, unclaimed: unclaimed))
+        .pageSubtitle(connectionSummary)
         .toolbar {
             // The window draws a section once per column; the button sits
             // beside search. Above the list it did not fit once the sidebar
@@ -249,10 +234,10 @@ struct ClientsView: View {
 
     /// Every client the list shows, in the order it shows them. The list and
     /// the detail beside it both read from here, so they cannot disagree.
-    private func entries(apps allApps: [LinkableApp], roster: AppRoster, unclaimed: Unclaimed) -> [ClientEntry] {
+    private func entries(apps allApps: [LinkableApp], roster: AppRoster, unclaimed: [(id: String, sessions: [LiveSession])]) -> [ClientEntry] {
         let names = self.names
         let sessions = self.sessions
-        let others = unclaimed.clients
+        let others = unclaimed
             .filter { client in
                 client.sessions.contains {
                     matches(displayName($0)) || matches($0.transport) || matches($0.sessionId)
@@ -280,7 +265,7 @@ struct ClientsView: View {
             if represented.contains(target), model.snapshot.downstreamClients.filter({
                 names.target(ofGrant: $0) == target
             }).count == 1 {
-                own += sessions.filter { !Self.isRemote($0) && AppRoster.targets(of: $0).contains(target) }
+                own += sessions.filter { !$0.isRemote && AppRoster.targets(of: $0).contains(target) }
             }
             return grantEntry(grant, sessions: own)
         }
@@ -352,13 +337,13 @@ struct ClientsView: View {
     private func sessionEntry(id: String, sessions: [LiveSession]) -> ClientEntry {
         let first = sessions[0]
         let name = displayName(first)
-        let choices = first.ownAccessKey.map { access(key: $0, name: name, isRemote: Self.isRemote(first)) }
+        let choices = first.ownAccessKey.map { access(key: $0, name: name, isRemote: first.isRemote) }
         return ClientEntry(
             id: id,
-            group: Self.isRemote(first) ? .network : .onThisMac,
+            group: first.isRemote ? .network : .onThisMac,
             place: ClientPlaces.place(
                 owners: names.place(forKey: first.clientKey),
-                group: Self.isRemote(first) ? .network : .onThisMac
+                group: first.isRemote ? .network : .onThisMac
             ),
             name: name,
             originalName: names.originalName(first),
@@ -515,9 +500,10 @@ struct ClientsView: View {
         return query.isEmpty || value.localizedCaseInsensitiveContains(query)
     }
 
-    private func connectionSummary(roster: AppRoster, unclaimed: Unclaimed) -> String? {
+    /// Counted as the menu bar panel counts them.
+    private var connectionSummary: String? {
         guard model.hasLoadedSnapshot else { return nil }
-        let count = roster.connected.count + unclaimed.clients.count + unclaimed.byGrant.count
+        let count = model.situation.connectedClients.count
         let summary = count == 0 ? "None connected" : "\(count) connected"
         return lastKnown(summary, stale: model.dataIsStale)
     }

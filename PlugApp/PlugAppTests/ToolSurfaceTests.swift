@@ -313,16 +313,51 @@ final class AppRosterTests: XCTestCase {
     func testASessionItsOwnerNamedIsNotTheClientItReports() throws {
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"g1","client_type":"Cursor","connected_secs":1},
-             {"transport":"http","session_id":"c1","client_type":"Cursor","connected_secs":1}]
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"},
+             {"transport":"http","session_id":"c1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"}]
             """
         )
         let roster = AppRoster(
-            apps: try apps(#"[{"target":"cursor","linked":true,"detected":true}]"#),
+            apps: try apps(#"[{"target":"cursor","linked":true,"detected":true,"linked_transport":"http"}]"#),
             sessions: live
         ) { $0.sessionId == "g1" ? "grok-bot" : nil }
         XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["c1"])
         XCTAssertEqual(roster.other.map(\.sessionId), ["g1"])
+    }
+
+    /// Cursor linked on this Mac, and a Cursor on another Mac signed in over
+    /// the network. The daemon gives both the target `cursor`, so only how
+    /// each reaches Plug tells them apart.
+    func testASessionOverTheNetworkIsNotTheLocalAppsThoughItHasItsTarget() throws {
+        let live = try sessions(
+            """
+            [{"transport":"daemon_proxy","session_id":"l1","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"cursor"},
+             {"transport":"http","session_id":"r1","client_type":"Cursor","target":"cursor",
+              "client_key":"oauth:abc","access_key":"oauth:abc"},
+             {"transport":"http","session_id":"r2","client_type":"Cursor","target":"cursor",
+              "client_key":"cursor","access_key":"remote:shared"}]
+            """
+        )
+        let local = try apps(#"[{"target":"cursor","linked":true,"detected":true,"linked_transport":"stdio"}]"#)
+        let roster = AppRoster(apps: local, sessions: live)
+        XCTAssertEqual(roster.connected.map(\.app.target), ["cursor"])
+        XCTAssertEqual(roster.connected[0].sessions.map(\.sessionId), ["l1"])
+        XCTAssertEqual(roster.other.map(\.sessionId), ["r1", "r2"])
+
+        // Linked over the network, the app holds the session with no sign-in
+        // of its own. The signed-in one is still its sign-in's.
+        let remote = try apps(#"[{"target":"cursor","linked":true,"detected":true,"linked_transport":"http"}]"#)
+        let overNetwork = AppRoster(apps: remote, sessions: live)
+        XCTAssertEqual(overNetwork.connected[0].sessions.map(\.sessionId), ["l1", "r2"])
+        XCTAssertEqual(overNetwork.other.map(\.sessionId), ["r1"])
+
+        // The window and the menu bar count the same three clients.
+        let names = ClientNames(names: [])
+        XCTAssertEqual(live.map(names.client(of:)), ["cursor", "oauth:abc", "remote:cursor"])
+        XCTAssertEqual(names.connectedClients(live + live).count, 3)
     }
 
     func testASessionFromNoKnownAppIsKeptApart() throws {
@@ -345,7 +380,7 @@ final class AppRosterTests: XCTestCase {
               "host":{"name":"python3","executable":"/usr/bin/python3"}},
              {"transport":"daemon_proxy","session_id":"h3","client_type":"Unknown","client_info":"mcp","connected_secs":1,
               "host":{"name":"python3","executable":"/usr/bin/python3"}},
-             {"transport":"daemon_proxy","session_id":"h4","client_type":"Cursor","client_info":"cursor-vscode","connected_secs":1,
+             {"transport":"daemon_proxy","session_id":"h4","client_type":"Cursor","client_info":"cursor-vscode","target":"cursor","connected_secs":1,
               "host":{"name":"Terminal","executable":"/x/Terminal.app/Contents/MacOS/Terminal","app":"/x/Terminal.app"}},
              {"transport":"daemon_proxy","session_id":"abcd9","client_type":"Unknown","client_info":"mcp","connected_secs":1}]
             """
@@ -447,9 +482,9 @@ final class AppRosterTests: XCTestCase {
         let names = ClientNames(names: stored)
         let live = try sessions(
             """
-            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
+            [{"transport":"http","session_id":"g1","client_type":"Cursor","client_info":"Cursor","target":"cursor",
               "client_key":"oauth:abc","access_key":"oauth:abc"},
-             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
+             {"transport":"http","session_id":"c1","client_type":"Cursor","client_info":"Cursor","target":"cursor",
               "client_key":"oauth:def","access_key":"oauth:def"},
              {"transport":"daemon_proxy","session_id":"m1","client_type":"Cursor","client_info":"Cursor","connected_secs":1,
               "client_key":"custom:my-tool","access_key":"custom:my-tool","target":"custom:my-tool"}]
@@ -595,7 +630,7 @@ final class AppRosterTests: XCTestCase {
             """
             [{"transport":"http","session_id":"r1","client_type":"Unknown","connected_secs":1,
               "client_key":"oauth:abc","access_key":"oauth:abc"},
-             {"transport":"http","session_id":"r2","client_type":"Cursor","connected_secs":1,
+             {"transport":"http","session_id":"r2","client_type":"Cursor","target":"cursor",
               "client_key":"oauth:def","access_key":"oauth:def"},
              {"transport":"http","session_id":"r3","client_type":"Unknown","connected_secs":1,
               "client_key":"oauth:gone","access_key":"oauth:gone"}]
@@ -627,9 +662,9 @@ final class AppRosterTests: XCTestCase {
     func testOnlyASessionWhoseRequestsCarryItsOwnKeyHasChoicesOfItsOwn() throws {
         let live = try sessions(
             """
-            [{"transport":"daemon_proxy","session_id":"l1","client_type":"Cursor","connected_secs":1,
+            [{"transport":"daemon_proxy","session_id":"l1","client_type":"Cursor","target":"cursor",
               "client_key":"cursor","access_key":"cursor"},
-             {"transport":"http","session_id":"r1","client_type":"Cursor","connected_secs":1,
+             {"transport":"http","session_id":"r1","client_type":"Cursor","target":"cursor",
               "client_key":"cursor","access_key":"remote:shared"},
              {"transport":"http","session_id":"r2","client_type":"Unknown","connected_secs":1,
               "access_key":"remote:shared"}]
@@ -702,7 +737,7 @@ final class PopoverRecentTests: XCTestCase {
         let reported = ActivityEvent(
             sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
             tool: "IMessage__get_messages", clientType: "Cursor", clientLabel: "Cursor 1.0",
-            clientKey: "oauth:abc", latencyMs: 1, outcome: .success
+            clientKey: "oauth:abc", target: "cursor", latencyMs: 1, outcome: .success
         )
         let named = CallFacts(reported, ownerName: "GrokBot")
         XCTAssertEqual(named.caller, "GrokBot")
@@ -717,6 +752,26 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertEqual(other.caller, "Work laptop")
         XCTAssertEqual(other.callerTarget, "cursor")
         XCTAssertEqual(CallFacts(reported).caller, "Cursor")
+    }
+
+    /// Activity's search finds a call by the names its row shows, not only
+    /// by what the client reported.
+    func testASearchFindsACallByTheNameOnItsRow() {
+        let reported = ActivityEvent(
+            sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "workspace",
+            tool: "Gmail__send_message", clientType: "Claude Desktop", clientLabel: "claude-ai",
+            clientKey: "claude-desktop", target: "claude-desktop", latencyMs: 1, outcome: .success
+        )
+        let call = CallFacts(reported, delimiter: "__")
+        XCTAssertEqual(call.caller, "Claude Desktop")
+        XCTAssertTrue(call.matches("claude desktop"))
+        XCTAssertTrue(call.matches("claude-ai"))
+        XCTAssertTrue(call.matches("workspace"))
+        XCTAssertTrue(call.matches("gmail"))
+        XCTAssertFalse(call.matches("figma"))
+        let named = CallFacts(reported, delimiter: "__", ownerName: "Desk", place: "Studio")
+        XCTAssertTrue(named.matches("desk"))
+        XCTAssertTrue(named.matches("studio"))
     }
 
     func testAClientThatCameAndWentIsListedByItsLastCall() {
@@ -747,34 +802,46 @@ final class PopoverRecentTests: XCTestCase {
     }
 
     func testACallFromANetworkClientIsPicturedByItsSignIn() {
-        func call(_ type: String, grant: String?) -> CallFacts {
+        func call(_ type: String, target: String? = nil, grant: String?) -> CallFacts {
             CallFacts(ActivityEvent(
                 sequence: 1, occurredAtMs: 0, client: "s1", method: "tools/call", server: "imessage",
                 tool: "IMessage__get_messages", clientType: type, clientKey: "oauth:abc",
-                latencyMs: 1, outcome: .success
+                target: target, latencyMs: 1, outcome: .success
             ), grantName: grant)
         }
         // A client that says nothing useful about itself takes its sign-in's name.
         let hermes = call("Unknown", grant: "Hermes Agent")
         XCTAssertEqual(hermes.caller, "Hermes Agent")
         XCTAssertEqual(hermes.callerTarget, "hermes")
-        let script = call("mcp", grant: "Ditto email-manager")
+        let script = call("Unknown", grant: "Ditto email-manager")
         XCTAssertEqual(script.caller, "Ditto email-manager")
         // What a known client reports still outranks its sign-in.
-        XCTAssertEqual(call("Cursor", grant: "Something").callerTarget, "cursor")
+        XCTAssertEqual(call("Cursor", target: "cursor", grant: "Something").callerTarget, "cursor")
         XCTAssertEqual(call("Unknown", grant: nil).caller, "Unknown client")
     }
 
     func testCallFactsSplitTheServerPrefix() {
         let call = CallFacts(event(1, tool: "Figma__get_file", server: "figma"), delimiter: "__")
-        XCTAssertEqual(call.server, "Figma")
+        XCTAssertEqual(call.server, "figma")
         XCTAssertEqual(call.tool, "get_file")
+    }
+
+    /// A group rule files a server's tools under other names. The call is
+    /// the server's that the daemon routed it to, and the tool keeps the
+    /// name the tool list gives it.
+    func testACallToAGroupsToolBelongsToTheServerThatAnswered() {
+        let call = CallFacts(event(1, tool: "Gmail__send_message", server: "workspace"), delimiter: "__")
+        XCTAssertEqual(call.server, "workspace")
+        XCTAssertEqual(call.tool, "Gmail__send_message")
+        XCTAssertEqual(
+            call.tool, ToolFacts(delimiter: "__", name: "Gmail__send_message", server: "workspace").shortName
+        )
     }
 
     /// The delimiter is the daemon's, whatever the config sets it to.
     func testCallFactsSplitOnTheDaemonsDelimiter() {
         let dotted = CallFacts(event(1, tool: "Figma.get_file", server: "figma"), delimiter: ".")
-        XCTAssertEqual(dotted.server, "Figma")
+        XCTAssertEqual(dotted.server, "figma")
         XCTAssertEqual(dotted.tool, "get_file")
         let whole = CallFacts(event(1, tool: "Figma__get_file", server: "figma"), delimiter: ".")
         XCTAssertEqual(whole.tool, "Figma__get_file")

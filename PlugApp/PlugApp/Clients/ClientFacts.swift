@@ -20,6 +20,12 @@ struct AppRoster: Equatable {
     /// `named` is the client a session's owner named it as, when that is a
     /// client Plug knows. It outranks what the session reports: a sign-in
     /// named Grok Bot is not Cursor's, though it says Cursor.
+    ///
+    /// A session reaches its app's row only the way the app is linked. One
+    /// from over the network that holds a sign-in is that sign-in's, and one
+    /// without a sign-in is the app's only when the app is linked over the
+    /// network: the daemon takes a remote session's target from what it
+    /// reports, so a Cursor on another Mac says the same as this one.
     init(
         apps: [LinkableApp],
         sessions: [LiveSession],
@@ -30,6 +36,7 @@ struct AppRoster: Equatable {
         var idle: [LinkableApp] = []
         for app in apps {
             let own = sessions.filter { session in
+                guard !session.isRemote || (app.overNetwork && session.ownAccessKey == nil) else { return false }
                 if let target = named(session) { return target == app.target }
                 return Self.targets(of: session).contains(app.target)
             }
@@ -55,6 +62,9 @@ struct AppRoster: Equatable {
 }
 
 extension LiveSession {
+    /// The session reached Plug over the network rather than from this Mac.
+    var isRemote: Bool { transport == "http" }
+
     /// The key server choices for this session are stored under: the one its
     /// requests carry, when that key is the client's own. A remote session
     /// with no grant shares its key with every other such session, so it has
@@ -133,6 +143,20 @@ struct ClientNames: Equatable {
 
     func name(forKey key: String?) -> String? { key.flatMap { names[$0] } }
 
+    /// The name a remote client registered its sign-in under.
+    func grantName(forKey key: String?) -> String? { key.flatMap { grantNames[$0] } }
+
+    /// A call under the names the owner and the client's sign-in gave it.
+    func call(_ event: ActivityEvent, delimiter: String) -> CallFacts {
+        CallFacts(
+            event,
+            delimiter: delimiter,
+            ownerName: name(forKey: event.clientKey),
+            grantName: grantName(forKey: event.clientKey),
+            place: place(forKey: event.clientKey)
+        )
+    }
+
     /// Where the owner says the client runs.
     func place(forKey key: String?) -> String? { key.flatMap { places[$0] } }
 
@@ -151,7 +175,7 @@ struct ClientNames: Equatable {
     /// What a session is called before the owner names it.
     func originalName(_ session: LiveSession) -> String {
         session.knownName
-            ?? session.clientKey.flatMap { grantNames[$0] }
+            ?? grantName(forKey: session.clientKey)
             ?? session.displayName
     }
 
@@ -173,8 +197,22 @@ struct ClientNames: Equatable {
         let key = session.clientKey
         return ClientIdentity.resolve(
             ownerName: name(forKey: key), daemonTarget: session.target,
-            reported: session.clientType, grantName: key.flatMap { grantNames[$0] }
+            reported: session.clientType, grantName: grantName(forKey: key)
         )
+    }
+
+    /// The client a session is a connection of. Every count of connected
+    /// clients counts these. A sign-in over the network is a client of its
+    /// own, whatever it reports. A client Plug knows is one client on this
+    /// Mac and one over the network, however it is keyed. Any other is told
+    /// apart by its key.
+    func client(of session: LiveSession) -> String {
+        if session.isRemote, let own = session.ownAccessKey { return own }
+        let target = target(of: session)
+        if ClientIdentity.displayName(forTarget: target) != nil {
+            return session.isRemote ? "remote:\(target)" : target
+        }
+        return session.ownAccessKey ?? session.sessionId
     }
 
     /// The distinct clients behind a set of open sessions, first seen first,
@@ -182,14 +220,9 @@ struct ClientNames: Equatable {
     func connectedClients(_ sessions: [LiveSession]) -> [ConnectedClient] {
         var seen = Set<String>()
         return sessions.compactMap { session in
-            let target = target(of: session)
-            let known = ClientIdentity.displayName(forTarget: target) != nil
-            // A client Plug knows is one client however it is keyed. Any
-            // other is told apart by its key.
-            let identity = known ? target : (session.clientKey ?? target)
-            guard seen.insert(identity).inserted else { return nil }
+            guard seen.insert(client(of: session)).inserted else { return nil }
             return ConnectedClient(
-                target: target,
+                target: target(of: session),
                 name: displayName(session),
                 appPath: session.host?.app
             )

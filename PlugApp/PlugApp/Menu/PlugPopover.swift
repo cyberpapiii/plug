@@ -142,11 +142,11 @@ struct PanelView<Power: View>: View {
     // MARK: - Header
 
     /// The character is always Plug blue. Its face says how Plug is, and the
-    /// small mark beside it takes the colour of the trouble.
+    /// small mark beside it takes the verdict's colour, as in the window.
     private func header(_ trouble: PanelTrouble?) -> some View {
         let verdict = facts.verdict
         return HStack(spacing: Metric.panelGap) {
-            PlugCharacter(mood: verdict.mood, mark: trouble?.wash?.color ?? StatusColor.needsYou)
+            PlugCharacter(mood: verdict.mood, mark: verdict.markColor)
                 .foregroundStyle(.tint)
                 .frame(width: characterSize, height: characterSize)
             VStack(alignment: .leading, spacing: Metric.hairline) {

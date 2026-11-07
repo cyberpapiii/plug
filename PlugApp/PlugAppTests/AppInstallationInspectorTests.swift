@@ -29,6 +29,39 @@ final class AppInstallationInspectorTests: XCTestCase {
         }
     }
 
+    func testRejectsASignatureThatDoesNotHold() async {
+        await assertThrows(.invalidSignature) {
+            _ = try await fixture(valid: false).inspectCurrentApp()
+        }
+    }
+
+    func testRejectsAnotherAppSignedByTheSameTeam() async {
+        await assertThrows(.wrongBundleIdentifier("com.example.other")) {
+            _ = try await fixture(bundleIdentifier: "com.example.other").inspectCurrentApp()
+        }
+    }
+
+    func testRejectsABundleWithoutItsVersions() async {
+        for info in [[:], ["CFBundleShortVersionString": "0.7.0"], ["CFBundleShortVersionString": "", "CFBundleVersion": "20"]] {
+            await assertThrows(.missingMetadata) {
+                _ = try await fixture(info: info).inspectCurrentApp()
+            }
+        }
+    }
+
+    /// The reconcile panel and a failed press show these as they are.
+    func testEveryFailureReadsAsASentence() {
+        let errors: [AppInstallationError] = [
+            .invalidSignature, .wrongBundleIdentifier("x"), .untrustedTeam("y"), .missingMetadata,
+            .missingEmbeddedExecutable(URL(fileURLWithPath: "/x")), .embeddedVersionFailure("z"),
+            .versionMismatch(app: "1", embedded: "2"),
+        ]
+        for error in errors {
+            XCTAssertEqual(error.localizedDescription, error.errorDescription, "\(error)")
+            XCTAssertTrue(error.localizedDescription.hasPrefix("This") || error.localizedDescription.hasPrefix("Plug"))
+        }
+    }
+
     func testRejectsAppAndEmbeddedBinaryVersionMismatch() async {
         let inspector = fixture(embeddedVersion: "0.6.4")
 
@@ -102,21 +135,18 @@ final class AppInstallationInspectorTests: XCTestCase {
 
     private func fixture(
         bundleURL: URL = URL(fileURLWithPath: "/Applications/Plug.app"),
-        teamID: String = "HJF7LN64XX",
+        valid: Bool = true,
+        bundleIdentifier: String = AppInstallationInspector.bundleIdentifier,
+        teamID: String = AppInstallationInspector.teamID,
+        info: [String: String] = ["CFBundleShortVersionString": "0.7.0", "CFBundleVersion": "20"],
         embeddedVersion: String = "0.7.0"
     ) -> AppInstallationInspector {
         AppInstallationInspector(
             bundleURL: { bundleURL },
             signatureReader: { _ in
-                AppSignatureEvidence(
-                    valid: true,
-                    bundleIdentifier: "com.cyberpapiii.plug",
-                    teamID: teamID
-                )
+                AppSignatureEvidence(valid: valid, bundleIdentifier: bundleIdentifier, teamID: teamID)
             },
-            infoReader: { _ in
-                ["CFBundleShortVersionString": "0.7.0", "CFBundleVersion": "20"]
-            },
+            infoReader: { _ in info },
             embeddedVersionReader: { _ in embeddedVersion }
         )
     }

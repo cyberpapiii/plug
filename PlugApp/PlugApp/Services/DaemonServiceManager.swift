@@ -3,7 +3,7 @@ import Foundation
 import PlugIPC
 import ServiceManagement
 
-enum DaemonServiceError: Error, Equatable {
+enum DaemonServiceError: LocalizedError, Equatable {
     case adoptionRequired
     case unknownOwnership
     case evidenceChanged
@@ -12,6 +12,29 @@ enum DaemonServiceError: Error, Equatable {
     case registrationDisabled
     case verificationFailed(expectedVersion: String, actualVersion: String?)
     case commandFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .adoptionRequired:
+            "An older copy of Plug is running. Open Plug and let it replace that copy."
+        case .unknownOwnership:
+            "Something other than this app runs Plug's service, so Plug left it alone."
+        case .evidenceChanged:
+            "Plug's service changed while Plug was checking it. Try again."
+        case let .invalidAppVersion(expected, actual):
+            "This copy of Plug is version \(actual), and \(expected) was asked for. Quit Plug and open it again."
+        case .invalidJobEvidence:
+            "Plug could not tell which program a launchd job runs, so it left the job alone."
+        case .registrationDisabled:
+            "macOS has turned off Plug's service. Turn Plug on in System Settings, under General, Login Items."
+        case let .verificationFailed(expected, actual?):
+            "Plug's service answered as version \(actual) instead of \(expected). Try again."
+        case .verificationFailed:
+            "Plug's service did not answer after it started. Try again."
+        case let .commandFailed(detail):
+            detail.isEmpty ? "macOS did not change Plug's service. Try again." : detail
+        }
+    }
 }
 
 @MainActor
@@ -78,10 +101,6 @@ final class DaemonServiceManager {
         guard case let .recognizedLegacy(records) = snapshot.ownership else { return }
         let homebrew = records.filter { record in
             record.programURL.map(LegacyPlugProgram.isHomebrew) == true
-        }
-        guard !homebrew.isEmpty else { return }
-        guard homebrew.allSatisfy({ $0.programURL != nil }) else {
-            throw DaemonServiceError.invalidJobEvidence
         }
         for record in homebrew {
             try await backend.bootOut(record)
