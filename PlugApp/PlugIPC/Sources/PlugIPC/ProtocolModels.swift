@@ -196,7 +196,8 @@ public struct DownstreamClient: Codable, Identifiable, Equatable, Sendable {
     public var needsSignIn: Bool { !signedIn }
 
     /// It asked to be let in and nobody finished the sign-in. Plug forgets
-    /// it at `expiresAt`.
+    /// it at `expiresAt`. The daemon's `is_unactivated`, as
+    /// `testdata/ipc/registered_clients.json` pins it.
     public var isUnfinished: Bool { !signedIn && lastUsedAt == nil }
 }
 

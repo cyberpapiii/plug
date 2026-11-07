@@ -247,6 +247,19 @@ final class GoldenPayloadTests: XCTestCase {
         XCTAssertEqual(snapshot.clientAddress, "https://plug.example.com/mcp")
     }
 
+    /// `registered_clients.json` holds what the daemon's `is_unactivated`
+    /// says of a client in each sign-in state.
+    func testAnUnfinishedClientIsTheOneTheDaemonCallsUnactivated() throws {
+        let cases = try goldens("registered_clients.json")
+        XCTAssertEqual(cases.count, 3)
+        for (name, value) in cases {
+            let golden = try XCTUnwrap(value as? [String: Any], name)
+            let summary = try JSONSerialization.data(withJSONObject: XCTUnwrap(golden["summary"], name))
+            let client = try decoder.decode(DownstreamClient.self, from: summary)
+            XCTAssertEqual(client.isUnfinished, golden["unfinished"] as? Bool, name)
+        }
+    }
+
     func testStatus() throws {
         guard case let .status(servers) = try response("status") else { return XCTFail() }
         XCTAssertEqual(servers.map(\.serverId), ["healthy"])
