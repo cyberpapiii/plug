@@ -165,7 +165,7 @@ fn settings_changes(old: &Config, new: &Config) -> (Vec<String>, bool) {
         meta_tool_mode,
         lazy_tools,
         priority_tools,
-        // Applied by `Engine::store_config`.
+        // Applied by `Engine::reload_config`.
         disabled_tools,
         clients,
         secrets,
@@ -179,7 +179,7 @@ fn settings_changes(old: &Config, new: &Config) -> (Vec<String>, bool) {
     } = new;
     let HttpConfig {
         slack_events,
-        // Applied by `Engine::store_config`.
+        // Applied by `Engine::reload_config`.
         modern_downstream_enabled,
         auth_mode,
         public_base_url,

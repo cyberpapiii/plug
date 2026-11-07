@@ -61,6 +61,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A reload that adds a `[secrets.stores.<id>]` store together with a server that uses it starts that server with the secret. The server used to start before the store existed and got the reference text, such as `vault:token`, in place of the value.
 - A remote client that declares task support but whose grant leaves out `tasks:use`, or that calls one of Plug's own tools such as `plug__search_tools`, gets its tool call run as a plain call. It used to be refused. This only applies with `http.modern_downstream_enabled` on.
 - A remote session that Plug could not reopen because it was full stays tied to the sign-in it was opened under. Reopening it later used to work for any client that held its id.
 - Saving an edited server in the app works again. The daemon checked every edit as a new server under a name already taken, so it refused each one and the sheet said "Choose another name." for a name you cannot change.
