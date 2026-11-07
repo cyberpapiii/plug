@@ -1054,18 +1054,38 @@ mod tests {
     fn link_unlink_and_repair_stop_on_a_config_that_does_not_load() {
         // Plug's own address decides which entry in a client's file is Plug,
         // so guessing it from the defaults could write a second Plug entry.
+        // Link and unlink name a client that does not exist and repair is a
+        // dry run, so a regression fails here without touching a real file.
         let path = std::env::temp_dir().join(format!("plug-broken-{}.toml", uuid::Uuid::new_v4()));
         std::fs::write(&path, "[http]\nport = \"not a port\"\n").unwrap();
         let config = Some(&path);
-        let codex = || vec!["codex".to_string()];
+        let nobody = || vec!["not-a-client".to_string()];
         let json = OutputFormat::Json;
-        assert!(cmd_link(config, codex(), false, true, None, &json).is_err());
-        assert!(cmd_unlink(config, codex(), false, true, &json).is_err());
-        assert!(crate::commands::repair::cmd_repair(config, codex(), false, true, &json).is_err());
-        assert!(crate::commands::import::scan(config, &[ClientTarget::CodexCli]).is_err());
+        let errors = [
+            cmd_link(config, nobody(), false, true, None, &json).unwrap_err(),
+            cmd_unlink(config, nobody(), false, true, &json).unwrap_err(),
+            crate::commands::repair::cmd_repair(
+                config,
+                vec!["codex".to_string()],
+                false,
+                true,
+                &json,
+            )
+            .unwrap_err(),
+            crate::commands::import::scan(config, &[ClientTarget::CodexCli]).unwrap_err(),
+        ]
+        .map(|error| format!("{error:#}"));
+        let load_error = format!("{:#}", plug_core::config::load_config(config).unwrap_err());
         std::fs::remove_file(&path).unwrap();
-        // With no config file at all, Plug is at its default address.
-        let plug = plug_core::config::load_config(config).unwrap().http;
+        for error in errors {
+            assert_eq!(error, load_error);
+        }
+    }
+
+    #[test]
+    fn with_no_config_file_plug_is_at_its_default_address() {
+        let path = std::env::temp_dir().join(format!("plug-absent-{}.toml", uuid::Uuid::new_v4()));
+        let plug = plug_core::config::load_config(Some(&path)).unwrap().http;
         assert_eq!(plug.mcp_url(), "http://localhost:3282/mcp");
     }
 
