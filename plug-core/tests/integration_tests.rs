@@ -2941,7 +2941,7 @@ where
     let result = AssertUnwindSafe(async {
         let (received_at, expires_in) = store.cached_expiry().expect("saved token expiry");
         assert!(
-            !oauth::token_needs_refresh(received_at, expires_in),
+            !oauth::time_until_refresh_window(received_at, expires_in).is_zero(),
             "the saved token must not be due for refresh"
         );
 

@@ -991,10 +991,9 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
         let Some((received_at, expires_in)) = store.cached_expiry() else {
             continue;
         };
-        if !oauth::token_needs_refresh(received_at, expires_in) {
-            next_check = oauth::time_until_refresh_window(received_at, expires_in)
-                .min(REFRESH_POLL)
-                .max(Duration::from_secs(5));
+        let wait = oauth::time_until_refresh_window(received_at, expires_in);
+        if !wait.is_zero() {
+            next_check = wait.min(REFRESH_POLL).max(Duration::from_secs(5));
             continue;
         }
 

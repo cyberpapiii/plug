@@ -218,28 +218,14 @@ fn effective_expires_in(expires_in: Option<u64>) -> u64 {
     }
 }
 
-/// Determine whether a token should be refreshed now.
+/// How long until a token received at `received_at` should be refreshed;
+/// [`Duration::ZERO`] once it should.
 ///
 /// Rules:
 /// - If `expires_in` is `None`, `0`: use [`DEFAULT_TOKEN_LIFETIME_SECS`].
 /// - Clamp to `[60, 86400]`.
 /// - If `expires_in < 600`: refresh at 50% of lifetime.
 /// - Otherwise: refresh at `expires_in - TOKEN_REFRESH_WINDOW_SECS`.
-pub fn token_needs_refresh(received_at: u64, expires_in: Option<u64>) -> bool {
-    let effective = effective_expires_in(expires_in);
-    let refresh_at = if effective < SHORT_LIVED_THRESHOLD {
-        effective / 2
-    } else {
-        effective.saturating_sub(TOKEN_REFRESH_WINDOW_SECS)
-    };
-
-    let elapsed = unix_now().saturating_sub(received_at);
-    elapsed >= refresh_at
-}
-
-/// Compute the [`Duration`] until the refresh window opens.
-///
-/// Returns [`Duration::ZERO`] if the window is already open.
 pub fn time_until_refresh_window(received_at: u64, expires_in: Option<u64>) -> Duration {
     let effective = effective_expires_in(expires_in);
     let refresh_at = if effective < SHORT_LIVED_THRESHOLD {
@@ -1745,48 +1731,48 @@ mod tests {
     }
 
     #[test]
-    fn test_token_needs_refresh_not_due() {
+    fn refresh_window_not_due() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        assert!(!token_needs_refresh(now, Some(3600)));
+        assert!(!time_until_refresh_window(now, Some(3600)).is_zero());
     }
 
     #[test]
-    fn test_token_needs_refresh_due() {
+    fn refresh_window_due() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         // Received 3500 seconds ago with expires_in = 3600.
         // Refresh window is 3600 - 300 = 3300 seconds. 3500 >= 3300 → true.
-        assert!(token_needs_refresh(now - 3500, Some(3600)));
+        assert!(time_until_refresh_window(now - 3500, Some(3600)).is_zero());
     }
 
     #[test]
-    fn test_token_needs_refresh_none_expires_in() {
+    fn refresh_window_none_expires_in() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         // Default lifetime is 3600, refresh at 3300.
         // Received 100s ago → not due.
-        assert!(!token_needs_refresh(now - 100, None));
+        assert!(!time_until_refresh_window(now - 100, None).is_zero());
         // Received 3400s ago → due (3400 >= 3300).
-        assert!(token_needs_refresh(now - 3400, None));
+        assert!(time_until_refresh_window(now - 3400, None).is_zero());
     }
 
     /// Short-lived token (expires_in < 600) uses the 50% rule.
     #[test]
-    fn test_token_needs_refresh_short_lived() {
+    fn refresh_window_short_lived() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         // expires_in = 120, clamped to 120 (>= 60). Short-lived: refresh at 60s.
-        assert!(!token_needs_refresh(now - 30, Some(120))); // 30 < 60
-        assert!(token_needs_refresh(now - 70, Some(120))); // 70 >= 60
+        assert!(!time_until_refresh_window(now - 30, Some(120)).is_zero()); // 30 < 60
+        assert!(time_until_refresh_window(now - 70, Some(120)).is_zero()); // 70 >= 60
     }
 
     #[test]
