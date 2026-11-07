@@ -541,6 +541,36 @@ async fn a_call_the_client_cancels_while_it_runs_is_recorded_as_cancelled() {
     );
 }
 
+/// A tool that answers with `isError: true` failed, though the call itself
+/// went through.
+#[tokio::test]
+async fn a_tool_error_result_is_recorded_as_an_error() {
+    let mut config = crate::config::Config::default();
+    config.servers.insert(
+        "mock".into(),
+        crate::test_helpers::mock_server("tool_error"),
+    );
+    let engine = crate::engine::Engine::new(config);
+    engine.start().await;
+    let router = engine.tool_router();
+    let tool = router
+        .list_tools_for_client(ClientType::Unknown)
+        .iter()
+        .map(|tool| tool.name.to_string())
+        .find(|name| name.ends_with("tool_error"))
+        .expect("tool_error is listed");
+
+    let result = dispatch_call(router, &local_caller(), CallToolRequestParams::new(tool))
+        .await
+        .expect("the call goes through");
+
+    assert_eq!(result["isError"], true);
+    let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
+    assert_eq!(activity.len(), 1);
+    assert_eq!(activity[0].outcome, crate::activity::ActivityOutcome::Error);
+    engine.shutdown().await;
+}
+
 fn assert_plug_icons_sequence(icons: &[rmcp::model::Icon]) {
     let expected_sizes = ["16x16", "32x32", "64x64", "128x128", "256x256", "512x512"];
     assert_eq!(icons.len(), expected_sizes.len() + 1);

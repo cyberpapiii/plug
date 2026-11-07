@@ -514,7 +514,6 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public var maxConcurrent: Int?
     public var healthCheckIntervalSecs: Int?
     public var circuitBreakerEnabled: Bool?
-    public var enrichment: Bool?
     public var toolRenames: [String: String] = [:]
     public var toolGroups: [ToolGroupRule] = []
     public var sandbox: StdioSandboxConfig?
@@ -546,7 +545,7 @@ extension ServerConfig {
         // As the snake-case decoder spells `oauth_client_id`; `oauthClientID`
         // never matched it, so a read lost the field and a save dropped it.
         case auth, oauthClientID = "oauthClientId", oauthScopes, timeoutSecs, callTimeoutSecs, maxConcurrent
-        case healthCheckIntervalSecs, circuitBreakerEnabled, enrichment, toolRenames, toolGroups
+        case healthCheckIntervalSecs, circuitBreakerEnabled, toolRenames, toolGroups
         case sandbox, spec, operations, tokenIn
     }
 
@@ -568,7 +567,6 @@ extension ServerConfig {
         maxConcurrent = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent)
         healthCheckIntervalSecs = try c.decodeIfPresent(Int.self, forKey: .healthCheckIntervalSecs)
         circuitBreakerEnabled = try c.decodeIfPresent(Bool.self, forKey: .circuitBreakerEnabled)
-        enrichment = try c.decodeIfPresent(Bool.self, forKey: .enrichment)
         toolRenames = try c.decodeIfPresent([String: String].self, forKey: .toolRenames) ?? [:]
         toolGroups = try c.decodeIfPresent([ToolGroupRule].self, forKey: .toolGroups) ?? []
         sandbox = try c.decodeIfPresent(StdioSandboxConfig.self, forKey: .sandbox)
@@ -596,7 +594,6 @@ extension ServerConfig {
         try c.encodeIfPresent(maxConcurrent, forKey: .maxConcurrent)
         try c.encodeIfPresent(healthCheckIntervalSecs, forKey: .healthCheckIntervalSecs)
         try c.encodeIfPresent(circuitBreakerEnabled, forKey: .circuitBreakerEnabled)
-        try c.encodeIfPresent(enrichment, forKey: .enrichment)
         try c.encode(toolRenames, forKey: .toolRenames)
         try c.encode(toolGroups, forKey: .toolGroups)
         try c.encodeIfPresent(sandbox, forKey: .sandbox)

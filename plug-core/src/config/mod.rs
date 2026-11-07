@@ -417,9 +417,6 @@ pub struct ServerConfig {
     pub health_check_interval_secs: u64,
     /// Enable circuit breaker for this server.
     pub circuit_breaker_enabled: bool,
-    /// Does nothing: every tool's hints and title are Plug's own. A config
-    /// that still sets it loads.
-    pub enrichment: bool,
     /// Manual tool renames (original_name -> new_name).
     #[serde(serialize_with = "in_name_order")]
     pub tool_renames: HashMap<String, String>,
@@ -462,7 +459,6 @@ impl Default for ServerConfig {
             max_concurrent: 1,
             health_check_interval_secs: 60,
             circuit_breaker_enabled: true,
-            enrichment: false,
             tool_renames: HashMap::new(),
             tool_groups: Vec::new(),
             sandbox: None,
@@ -1360,6 +1356,20 @@ LOG_LEVEL = "debug"
         );
         assert!(load_config(Some(&config_path)).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A server's `enrichment` setting is gone; a file that still sets it
+    /// loads.
+    #[test]
+    fn a_server_setting_the_retired_enrichment_still_loads() {
+        let config = config_from_toml(
+            r#"
+            [servers.github]
+            command = "github-mcp"
+            enrichment = true
+            "#,
+        );
+        assert!(config.servers.contains_key("github"));
     }
 
     /// The idle self-shutdown knob is gone; a file that still sets it loads.

@@ -466,6 +466,9 @@ async fn tools_call(
         remote,
         latency_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
         outcome: match &result {
+            Ok(ToolCallOutcome::Called(called)) if called.is_error == Some(true) => {
+                crate::activity::ActivityOutcome::Error
+            }
             Ok(_) => crate::activity::ActivityOutcome::Success,
             Err(_) if cancellation.is_cancelled() => crate::activity::ActivityOutcome::Cancelled,
             Err(_) => crate::activity::ActivityOutcome::Error,

@@ -25,10 +25,6 @@ const POST_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum LegacySseError {
     #[error("reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("sse parse error: {0}")]
-    Sse(#[from] sse_stream::Error),
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
     #[error("stream closed before endpoint event")]
     MissingEndpoint,
     #[error("invalid endpoint event payload: {0}")]
@@ -41,6 +37,17 @@ pub enum LegacySseError {
     TransportChannelClosed,
     #[error("join error: {0}")]
     Join(#[from] tokio::task::JoinError),
+}
+
+impl LegacySseError {
+    /// The server refused Plug's credentials when it opened the stream.
+    pub fn refuses_credentials(&self) -> bool {
+        matches!(
+            self,
+            Self::UnexpectedStatus { status, .. }
+                if *status == StatusCode::UNAUTHORIZED || *status == StatusCode::FORBIDDEN
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -112,11 +119,22 @@ impl LegacySseTransportConfig {
 pub struct LegacySseClientTransport(WorkerTransport<LegacySseWorker>);
 
 impl LegacySseClientTransport {
-    pub fn from_config(config: LegacySseTransportConfig) -> anyhow::Result<Self> {
+    /// Open the stream, then hand it to the worker. A server that refuses the
+    /// first open fails here with its status, where a failure inside the
+    /// worker would reach the caller only as a closed channel.
+    pub async fn connect(config: LegacySseTransportConfig) -> anyhow::Result<Self> {
         let client = crate::upstream_http::client(reqwest::redirect::Policy::none())?;
+        let stream = open_sse_stream(
+            client.clone(),
+            config.uri.clone(),
+            config.auth_token.clone(),
+            None,
+        )
+        .await?;
         Ok(Self(WorkerTransport::spawn(LegacySseWorker {
             client,
             config,
+            stream,
         })))
     }
 }
@@ -142,10 +160,10 @@ impl Transport<RoleClient> for LegacySseClientTransport {
     }
 }
 
-#[derive(Clone, Debug)]
 struct LegacySseWorker {
     client: reqwest::Client,
     config: LegacySseTransportConfig,
+    stream: BoxedSseStream,
 }
 
 impl Worker for LegacySseWorker {
@@ -180,6 +198,7 @@ impl Worker for LegacySseWorker {
         let mut stream_task = tokio::spawn(run_sse_loop(
             self.client.clone(),
             self.config.clone(),
+            self.stream,
             endpoint_tx,
             response_tx,
             notification_tx,
@@ -334,6 +353,7 @@ fn publish_endpoint(
 async fn run_sse_loop(
     client: reqwest::Client,
     config: LegacySseTransportConfig,
+    first_stream: BoxedSseStream,
     endpoint_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
     response_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
     notification_tx: tokio::sync::mpsc::Sender<ServerJsonRpcMessage>,
@@ -341,19 +361,31 @@ async fn run_sse_loop(
 ) -> Result<(), WorkerQuitReason<LegacySseError>> {
     let mut last_event_id: Option<String> = None;
     let mut retry_count = 0u32;
+    let mut first_stream = Some(first_stream);
 
     loop {
-        let mut stream = match open_sse_stream(
-            client.clone(),
-            config.uri.clone(),
-            config.auth_token.clone(),
-            last_event_id.clone(),
-        )
-        .await
-        {
+        let opened = match first_stream.take() {
+            Some(stream) => Ok(stream),
+            None => {
+                open_sse_stream(
+                    client.clone(),
+                    config.uri.clone(),
+                    config.auth_token.clone(),
+                    last_event_id.clone(),
+                )
+                .await
+            }
+        };
+        let mut stream = match opened {
             Ok(stream) => {
                 retry_count = 0;
                 stream
+            }
+            // Redialing with credentials the server refuses never succeeds.
+            // Ending the session lets recovery reconnect, and that first open
+            // reports the refusal.
+            Err(error) if error.refuses_credentials() => {
+                return Err(WorkerQuitReason::fatal(error, "reopen legacy SSE stream"));
             }
             Err(error) => {
                 tracing::debug!(error = %error, "could not open legacy SSE stream; redialing");
@@ -833,11 +865,12 @@ mod tests {
             notification_delay: Duration::ZERO,
         });
 
-        let transport = LegacySseClientTransport::from_config(
+        let transport = LegacySseClientTransport::connect(
             LegacySseTransportConfig::with_uri(server_url)
                 .endpoint_wait_timeout(Duration::from_secs(1)),
         )
-        .expect("build the transport");
+        .await
+        .expect("open the stream");
 
         let _client = handler
             .serve(transport)
@@ -861,11 +894,12 @@ mod tests {
             payloads: Arc::new(Mutex::new(Vec::new())),
             notification_delay: Duration::from_millis(50),
         });
-        let transport = LegacySseClientTransport::from_config(
+        let transport = LegacySseClientTransport::connect(
             LegacySseTransportConfig::with_uri(server_url)
                 .endpoint_wait_timeout(Duration::from_secs(1)),
         )
-        .expect("build the transport");
+        .await
+        .expect("open the stream");
         let client = handler
             .serve(transport)
             .await

@@ -1257,11 +1257,8 @@ async fn bridge_session_rejects_invoke_wrapper_as_unknown_tool() {
 #[tokio::test]
 async fn disabled_bridge_search_tool_is_not_visible_or_callable() {
     let sm = Arc::new(ServerManager::new());
-    let config = RouterConfig::from(&Config {
-        disabled_tools: vec!["plug__search_tools".to_string()],
-        ..Default::default()
-    });
-    let router = ToolRouter::new(sm, config);
+    let router = ToolRouter::new(sm, RouterConfig::default());
+    router.set_disabled_tools(&["plug__search_tools".to_string()]);
 
     assert!(
         router

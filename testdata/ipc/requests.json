@@ -48,7 +48,6 @@
           "max_concurrent": 1,
           "health_check_interval_secs": 60,
           "circuit_breaker_enabled": true,
-          "enrichment": false,
           "tool_renames": {},
           "tool_groups": [],
           "sandbox": null
@@ -86,7 +85,6 @@
           "max_concurrent": 2,
           "health_check_interval_secs": 120,
           "circuit_breaker_enabled": false,
-          "enrichment": false,
           "tool_renames": {
             "search": "find"
           },
@@ -376,7 +374,6 @@
           "max_concurrent": 4,
           "health_check_interval_secs": 60,
           "circuit_breaker_enabled": true,
-          "enrichment": false,
           "tool_renames": {},
           "tool_groups": [],
           "sandbox": null,
@@ -417,7 +414,6 @@
         "max_concurrent": 2,
         "health_check_interval_secs": 120,
         "circuit_breaker_enabled": false,
-        "enrichment": false,
         "tool_renames": {
           "search": "find"
         },

@@ -176,7 +176,7 @@ enum LegacyPlugProgram {
     /// Where `cargo install` put it.
     static let cargoBinary = ".cargo/bin/plug"
     /// The command on the shell's path. Plug now links it to the app's binary.
-    static let shellLink = ".local/bin/plug"
+    static let shellLink = PlugPaths.commandLink
     /// The Homebrew formula's own links, one per Homebrew prefix.
     static let formulaLinks = ["/opt/homebrew/opt/plug/bin/plug", "/usr/local/opt/plug/bin/plug"]
     /// The Homebrew formula, by name.
