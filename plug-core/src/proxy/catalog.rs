@@ -767,17 +767,19 @@ impl super::ToolRouter {
     }
 
     fn filter_meta_tools(&self, tools: &[Tool]) -> Vec<Tool> {
+        let disabled_tools = self.disabled_tools.load();
         tools
             .iter()
-            .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
+            .filter(|tool| !is_disabled_tool(&disabled_tools, tool.name.as_ref()))
             .cloned()
             .collect()
     }
 
     fn filtered_legacy_meta_tools(&self) -> Vec<Tool> {
+        let disabled_tools = self.disabled_tools.load();
         build_legacy_meta_tools()
             .into_iter()
-            .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
+            .filter(|tool| !is_disabled_tool(&disabled_tools, tool.name.as_ref()))
             .collect()
     }
 

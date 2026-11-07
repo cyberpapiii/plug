@@ -137,6 +137,7 @@ pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
 
     let restart_required = settings_needing_restart(old, new);
     let settings_changed = !restart_required.is_empty()
+        || old.disabled_tools != new.disabled_tools
         || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled
         || old.modern_upstream_enabled != new.modern_upstream_enabled;
 
@@ -168,8 +169,8 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
         meta_tool_mode,
         lazy_tools,
         priority_tools,
-        disabled_tools,
         // Applied by `Engine::store_config`.
+        disabled_tools: _,
         clients: _,
         secrets: _,
         modern_upstream_enabled: _,
@@ -247,7 +248,6 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
         ("meta_tool_mode", *meta_tool_mode != old.meta_tool_mode),
         ("lazy_tools", *lazy_tools != old.lazy_tools),
         ("priority_tools", *priority_tools != old.priority_tools),
-        ("disabled_tools", *disabled_tools != old.disabled_tools),
     ]
     .into_iter()
     .filter(|(_, changed)| *changed)
@@ -415,8 +415,9 @@ mod tests {
             assert!(diff.settings_changed, "{setting}");
         }
 
-        let live: [Edit; 3] = [
+        let live: [Edit; 4] = [
             |c| c.startup_concurrency = 1,
+            |c| c.disabled_tools = vec!["figma__get_file".into()],
             |c| c.supervision.enabled = !c.supervision.enabled,
             |c| c.http.modern_downstream_enabled = true,
         ];

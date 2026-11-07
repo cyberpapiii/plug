@@ -285,7 +285,6 @@ pub struct RouterConfig {
     pub enable_prefix: bool,
     pub prefix_delimiter: String,
     pub priority_tools: Vec<String>,
-    pub disabled_tools: Vec<String>,
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
     pub meta_tool_mode: bool,
@@ -306,11 +305,6 @@ impl From<&Config> for RouterConfig {
             enable_prefix: config.enable_prefix,
             prefix_delimiter: config.prefix_delimiter.clone(),
             priority_tools: config.priority_tools.clone(),
-            disabled_tools: config
-                .disabled_tools
-                .iter()
-                .map(|pattern| pattern.to_ascii_lowercase())
-                .collect(),
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
             meta_tool_mode: config.meta_tool_mode,
@@ -429,6 +423,9 @@ pub struct ToolRouter {
     /// changes it while clients are connected. A client with no entry gets
     /// everything.
     client_access: ArcSwap<HashMap<String, ClientAccess>>,
+    /// The `disabled_tools` patterns, lowercased. Reloadable like
+    /// `client_access`.
+    disabled_tools: ArcSwap<Vec<String>>,
     /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
     task_store: Mutex<TaskStore>,
     /// One process-wide admission ledger shared by every downstream transport.
@@ -1094,6 +1091,7 @@ impl ToolRouter {
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
             client_access: ArcSwap::from_pointee(HashMap::new()),
+            disabled_tools: ArcSwap::from_pointee(Vec::new()),
             task_store: Mutex::new(TaskStore::new()),
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
@@ -1199,6 +1197,17 @@ impl ToolRouter {
             self.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
             self.publish_protocol_notification(ProtocolNotification::PromptListChanged);
         }
+    }
+
+    /// Take the owner's `disabled_tools`. The catalog they filter changes at
+    /// the next `refresh_tools`.
+    pub fn set_disabled_tools(&self, patterns: &[String]) {
+        self.disabled_tools.store(Arc::new(
+            patterns
+                .iter()
+                .map(|pattern| pattern.to_ascii_lowercase())
+                .collect(),
+        ));
     }
 
     /// Whether the client behind `client_key` is kept from any server, so the
@@ -2567,6 +2576,8 @@ impl ToolRouter {
             }
         }
 
+        let disabled_tools = self.disabled_tools.load_full();
+
         // ── Pass 2: detect collisions in stripped wire names ──
         // Count how many tools map to each (prefix, stripped_name) pair.
         let mut wire_name_counts: HashMap<String, usize> = HashMap::new();
@@ -2620,15 +2631,15 @@ impl ToolRouter {
 
             // A tool switched off stays off when a second account changes
             // its name, or when the account that changed it is removed.
-            if !self.config.disabled_tools.is_empty()
-                && (is_disabled_tool(&self.config.disabled_tools, &prefixed_name)
+            if !disabled_tools.is_empty()
+                && (is_disabled_tool(&disabled_tools, &prefixed_name)
                     || crate::tool_naming::other_names(
                         &prefixed_name,
                         &c.server_name,
                         &self.config.prefix_delimiter,
                     )
                     .iter()
-                    .any(|name| is_disabled_tool(&self.config.disabled_tools, name)))
+                    .any(|name| is_disabled_tool(&disabled_tools, name)))
             {
                 continue;
             }
@@ -2689,7 +2700,7 @@ impl ToolRouter {
 
         // Add search_tools meta-tool if tool count exceeds threshold
         if tools.len() >= self.config.tool_search_threshold
-            && !is_disabled_tool(&self.config.disabled_tools, "plug__search_tools")
+            && !is_disabled_tool(&disabled_tools, "plug__search_tools")
         {
             let meta_tool = build_search_tools_meta_tool();
             routes.insert(
@@ -4010,7 +4021,7 @@ impl ToolRouter {
         meta_tool_name: &str,
         downstream: Option<&DownstreamCallContext>,
     ) -> bool {
-        if is_disabled_tool(&self.config.disabled_tools, meta_tool_name) {
+        if is_disabled_tool(&self.disabled_tools.load(), meta_tool_name) {
             return false;
         }
 

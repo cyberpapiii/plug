@@ -56,6 +56,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Turning a tool off or on, with its switch in the app or with `plug tools`, applies to connected clients at once, and they are told their tool list changed. The daemon used to keep listing a tool turned off, and keep it callable, until it restarted.
 - `plug doctor` reports an older Plug installed under `/opt/homebrew/opt/plug` or `/usr/local/opt/plug`, or as a binary at `~/.local/bin/plug`, as it already did for the other places Homebrew and Cargo put one, and lists a Homebrew copy reached by two paths once.
 - Stopping the daemon removes its socket, PID file and token every time. When launchd stopped it with SIGTERM, the daemon could exit before that cleanup ran and before HTTP finished shutting down.
 - A client whose connection died is noticed when the daemon next pushes it a notification. The daemon used to ignore the failed write and keep the connection until the client's next request.

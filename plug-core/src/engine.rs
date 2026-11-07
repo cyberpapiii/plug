@@ -15,6 +15,7 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, ServerConfig};
 use crate::health::{Monitor, Reconnect, Recovery};
+use crate::notifications::ProtocolNotification;
 use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::{ReloadReport, ServerChange, server_change};
 use crate::server::{ServerManager, UpstreamEvents, UpstreamServer, retire_upstream_owned};
@@ -81,6 +82,7 @@ impl Engine {
             });
             tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
             tool_router.set_client_access(&config.clients);
+            tool_router.set_disabled_tools(&config.disabled_tools);
             let server_manager = Arc::clone(tool_router.server_manager());
             let config = Arc::new(ArcSwap::from_pointee(config));
             let supervision = Arc::new(Supervision::default());
@@ -268,6 +270,7 @@ impl Engine {
         self.tool_router
             .set_modern_downstream_enabled(config.http.modern_downstream_enabled);
         self.tool_router.set_client_access(&config.clients);
+        self.tool_router.set_disabled_tools(&config.disabled_tools);
         self.server_manager
             .set_modern_upstream_enabled(config.modern_upstream_enabled);
         crate::secrets::Stores::configure(&config.secrets);
@@ -772,7 +775,9 @@ impl Engine {
             }
         }
 
-        let catalog_dirty = !diff.added.is_empty()
+        let tools_toggled = old_config.disabled_tools != new_config.disabled_tools;
+        let catalog_dirty = tools_toggled
+            || !diff.added.is_empty()
             || !diff.changed.is_empty()
             || !diff.removed.is_empty()
             || !diff.updated.is_empty();
@@ -797,6 +802,10 @@ impl Engine {
 
         if catalog_dirty {
             self.tool_router.refresh_tools().await;
+        }
+        if tools_toggled {
+            self.tool_router
+                .publish_protocol_notification(ProtocolNotification::ToolListChanged);
         }
 
         for warning in &diff.restart_required {
@@ -1464,6 +1473,64 @@ mod tests {
         let after = refresh_tasks.current("oauth-mock");
         assert!(after.is_some() && after != before);
 
+        engine.shutdown().await;
+    }
+
+    /// The app's per-tool switch and `plug tools disable` write
+    /// `disabled_tools` through `SetToolEnabled`; the running daemon lists
+    /// and stops listing the tool without a restart.
+    #[tokio::test]
+    async fn turning_a_tool_off_and_on_applies_without_a_restart() {
+        let config = mock_stdio_config("foo", "echo,add");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        crate::operator::persist_config_atomic(&path, &config).unwrap();
+        let engine = Engine::new(config);
+        engine.start().await;
+        let listed = || -> Vec<String> {
+            engine
+                .tool_router()
+                .list_tools_for_client(crate::types::ClientType::Unknown)
+                .iter()
+                .map(|tool| tool.name.to_string())
+                .collect()
+        };
+        let echo = listed()
+            .into_iter()
+            .find(|name| name.ends_with("echo"))
+            .expect("echo is listed");
+        let mut notifications = engine.tool_router().subscribe_notifications();
+
+        let (_, report) = engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::SetToolEnabled {
+                    tool: echo.clone(),
+                    enabled: false,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(report.restart_required.is_empty(), "{report:?}");
+        let names = listed();
+        assert!(!names.contains(&echo), "{names:?}");
+        assert!(names.iter().any(|name| name.ends_with("add")), "{names:?}");
+        assert!(matches!(
+            notifications.try_recv(),
+            Ok(ProtocolNotification::ToolListChanged)
+        ));
+
+        engine
+            .apply_operator_mutation(
+                &path,
+                crate::operator::OperatorMutation::SetToolEnabled {
+                    tool: echo.clone(),
+                    enabled: true,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(listed().contains(&echo));
         engine.shutdown().await;
     }
 
