@@ -1056,7 +1056,7 @@ mod tests {
         // so guessing it from the defaults could write a second Plug entry.
         // Every command names no real client, so a regression fails here
         // without reading or writing a client's file.
-        let path = std::env::temp_dir().join(format!("plug-broken-{}.toml", uuid::Uuid::new_v4()));
+        let path = plug_core::paths::test::scratch("broken").join("config.toml");
         std::fs::write(&path, "[http]\nport = \"not a port\"\n").unwrap();
         let config = Some(&path);
         let nobody = || vec!["not-a-client".to_string()];
@@ -1069,7 +1069,6 @@ mod tests {
         ]
         .map(|error| format!("{error:#}"));
         let load_error = format!("{:#}", plug_core::config::load_config(config).unwrap_err());
-        std::fs::remove_file(&path).unwrap();
         for error in errors {
             assert_eq!(error, load_error);
         }
@@ -1077,7 +1076,7 @@ mod tests {
 
     #[test]
     fn with_no_config_file_plug_is_at_its_default_address() {
-        let path = std::env::temp_dir().join(format!("plug-absent-{}.toml", uuid::Uuid::new_v4()));
+        let path = plug_core::paths::test::scratch("absent").join("config.toml");
         let plug = plug_core::config::load_config(Some(&path)).unwrap().http;
         assert_eq!(plug.mcp_url(), "http://localhost:3282/mcp");
     }

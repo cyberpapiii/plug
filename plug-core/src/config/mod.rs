@@ -1284,14 +1284,7 @@ LOG_LEVEL = "debug"
     }
 
     fn unique_temp_dir(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "plug-config-{}-{}-{}",
-            label,
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        path
+        crate::paths::test::scratch(&format!("config-{label}"))
     }
 
     // ---- TOML loading ----
@@ -1402,7 +1395,6 @@ LOG_LEVEL = "debug"
             Vec::<String>::new()
         );
         assert!(load_config(Some(&config_path)).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     /// A server's `enrichment` setting is gone; a file that still sets it
@@ -1426,7 +1418,6 @@ LOG_LEVEL = "debug"
         let config_path = dir.join("config.toml");
         std::fs::write(&config_path, "daemon_grace_period_secs = 30\n").unwrap();
         assert!(load_config(Some(&config_path)).is_ok());
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -1757,8 +1748,6 @@ LOG_LEVEL = "debug"
                 message.contains("http.public_base_url") && message.contains("domain hostname"),
                 "invalid setting must be named for {label}: {message}"
             );
-
-            std::fs::remove_dir_all(temp).expect("remove config fixture");
         }
     }
 
@@ -1853,8 +1842,7 @@ LOG_LEVEL = "debug"
 
     #[test]
     fn validate_public_oauth_on_non_loopback_is_allowed_with_tls() {
-        let key_path =
-            std::env::temp_dir().join(format!("plug-config-key-{}", uuid::Uuid::new_v4()));
+        let key_path = unique_temp_dir("key").join("key.pem");
         std::fs::write(&key_path, "test key").expect("write test key");
         #[cfg(unix)]
         {
@@ -1870,7 +1858,6 @@ LOG_LEVEL = "debug"
         cfg.http.tls_cert_path = Some(key_path.clone());
         cfg.http.tls_key_path = Some(key_path.clone());
         let errors = validate_config(&cfg);
-        let _ = std::fs::remove_file(key_path);
         assert!(
             errors.is_empty(),
             "public registered clients with PKCE should be valid, got {errors:?}"
@@ -2006,11 +1993,7 @@ LOG_LEVEL = "debug"
     fn validate_tls_key_must_not_be_world_readable() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = std::env::temp_dir().join(format!(
-            "plug-key-perms-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = unique_temp_dir("key-perms");
         let cert = temp.join("cert.pem");
         let key = temp.join("key.pem");
         std::fs::write(&cert, "cert").expect("write cert");

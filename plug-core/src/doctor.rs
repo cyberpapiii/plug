@@ -1117,7 +1117,7 @@ async fn check_oauth_tokens(config: &Config) -> CheckResult {
     // file is the runtime's required mirror, so its presence is expected and
     // not worth a warning; the only problem worth flagging is one other users
     // can read.
-    let tokens_dir = crate::oauth::tokens_dir();
+    let tokens_dir = crate::paths::tokens_dir();
     let mut signed_in = 0usize;
     let mut exposed = Vec::new();
     for (server_name, _) in &oauth_servers {
@@ -1643,11 +1643,7 @@ auth_token = "keychain:b.token"
 
     #[tokio::test]
     async fn oauth_without_owner_credential_is_blocking() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-missing-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-missing");
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1660,16 +1656,11 @@ auth_token = "keychain:b.token"
             result.message,
             "Downstream OAuth owner credential missing. Run `plug auth owner enroll`."
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn owner_credential_is_not_required_when_downstream_oauth_is_disabled() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-disabled-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-disabled");
         let config = test_config();
 
         let result = check_downstream_oauth_owner_with_state_dir(&config, &state_dir).await;
@@ -1679,16 +1670,11 @@ auth_token = "keychain:b.token"
             result.message,
             "Downstream OAuth owner approval is not required"
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn corrupt_owner_state_fails_without_disclosing_state_contents() {
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-corrupt-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-corrupt");
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1723,7 +1709,6 @@ auth_token = "keychain:b.token"
                 .as_deref()
                 .is_some_and(|suggestion| suggestion.contains("plug auth owner list"))
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[cfg(unix)]
@@ -1731,11 +1716,7 @@ auth_token = "keychain:b.token"
     async fn owner_state_permissions_have_an_exact_safe_repair() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-doctor-owner-permissions-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("doctor-owner-permissions");
         let mut config = test_config();
         config.http.auth_mode = crate::config::DownstreamAuthMode::Oauth;
         config.http.public_base_url = Some("https://plug.example.com".to_string());
@@ -1754,7 +1735,6 @@ auth_token = "keychain:b.token"
             result.fix_suggestion,
             Some(format!("Run: chmod 600 {}", path.display()))
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     // -- check_oauth_tokens --
@@ -1768,7 +1748,7 @@ auth_token = "keychain:b.token"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::paths::tokens_dir().join(format!("{server_name}.json"));
         let _ = std::fs::remove_file(&token_file);
 
         let result = check_oauth_tokens(&config).await;
@@ -1791,7 +1771,7 @@ auth_token = "keychain:b.token"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::paths::tokens_dir().join(format!("{server_name}.json"));
         if let Some(parent) = token_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }
@@ -1821,7 +1801,7 @@ auth_token = "keychain:b.token"
             oauth_http_server("https://example.com/mcp"),
         );
 
-        let token_file = crate::oauth::tokens_dir().join(format!("{server_name}.json"));
+        let token_file = crate::paths::tokens_dir().join(format!("{server_name}.json"));
         if let Some(parent) = token_file.parent() {
             std::fs::create_dir_all(parent).unwrap();
         }

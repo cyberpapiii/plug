@@ -126,13 +126,13 @@ static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
 
 /// Process-local credential backend used by tests.
 ///
-/// OAuth tests must never touch the operator's login Keychain or production
-/// token directory. Any build with `cfg(test)` or the dev-only `test-helpers`
-/// feature installs it on first credential access, so no test has to remember
-/// to.
+/// OAuth tests must never touch the operator's login Keychain. Any build with
+/// `cfg(test)` or the dev-only `test-helpers` feature installs it on first
+/// credential access, so no test has to remember to. Token files need no
+/// stand-in: a test build's `paths::tokens_dir()` is under the thread's own
+/// temporary root.
 #[cfg(any(test, feature = "test-helpers"))]
 struct TestCredentialEnvironment {
-    tokens_dir: PathBuf,
     keyring: std::sync::Mutex<std::collections::HashMap<String, String>>,
     keyring_reads: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     failing_keyring_writes: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -141,17 +141,18 @@ struct TestCredentialEnvironment {
 #[cfg(any(test, feature = "test-helpers"))]
 static TEST_CREDENTIAL_ENVIRONMENT: OnceLock<TestCredentialEnvironment> = OnceLock::new();
 
-/// Isolate OAuth credentials for the current test process under
-/// `tokens_dir`. The first install wins: a later call, or the automatic one on
-/// first credential access, keeps the directory already chosen.
+/// The isolated test backend, installed on first use. Always `Some`; the
+/// `Option` lets callers fall through to the real stores without the
+/// fall-through becoming unreachable code in test builds.
 #[cfg(any(test, feature = "test-helpers"))]
-pub fn install_test_credential_environment(tokens_dir: PathBuf) {
-    TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
-        tokens_dir,
-        keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
-        keyring_reads: std::sync::Mutex::new(std::collections::HashMap::new()),
-        failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
-    });
+fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
+    Some(
+        TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
+            keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
+            keyring_reads: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }),
+    )
 }
 
 /// Seed only the isolated test keyring, without creating a token-file mirror.
@@ -173,17 +174,6 @@ pub(crate) fn uses_test_credentials() -> bool {
     test_credential_environment().is_some()
 }
 
-/// The isolated test backend, installed on first use. Always `Some`; the
-/// `Option` lets callers fall through to the real stores without the
-/// fall-through becoming unreachable code in test builds.
-#[cfg(any(test, feature = "test-helpers"))]
-fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
-    install_test_credential_environment(
-        std::env::temp_dir().join(format!("plug-oauth-tests-{}", std::process::id())),
-    );
-    TEST_CREDENTIAL_ENVIRONMENT.get()
-}
-
 /// Get or create a per-server [`CompositeCredentialStore`].
 ///
 /// Callers may share the returned `Arc` freely; stores are lazily
@@ -198,16 +188,7 @@ pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
 /// The file a server's sign-in is mirrored to.
 pub(crate) fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
     let safe = config::sanitize_server_name_for_path(server_name)?;
-    Ok(tokens_dir().join(format!("{safe}.json")))
-}
-
-/// The `tokens` directory in Plug's config directory.
-pub fn tokens_dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some(environment) = test_credential_environment() {
-        return environment.tokens_dir.clone();
-    }
-    crate::paths::tokens_dir()
+    Ok(crate::paths::tokens_dir().join(format!("{safe}.json")))
 }
 
 /// Normalize an `expires_in` value: apply defaults and clamping.
@@ -743,7 +724,7 @@ impl CompositeCredentialStore {
         let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|error| {
             AuthError::InternalError(format!("invalid server name for lock path: {error}"))
         })?;
-        Ok(tokens_dir().join(format!("{safe}.credentials.lock")))
+        Ok(crate::paths::tokens_dir().join(format!("{safe}.credentials.lock")))
     }
 
     fn with_credential_write_lock<T>(
@@ -922,7 +903,7 @@ impl CompositeCredentialStore {
         let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
             AuthError::InternalError(format!("invalid server name for registration path: {e}"))
         })?;
-        Ok(tokens_dir().join(format!("{safe}.registration.json")))
+        Ok(crate::paths::tokens_dir().join(format!("{safe}.registration.json")))
     }
 
     fn load_json_file<T: DeserializeOwned>(
@@ -1404,7 +1385,7 @@ impl CompositeStateStore {
                 }
             })
             .collect();
-        Ok(tokens_dir().join(format!("{safe_server}_state_{safe_csrf}.json")))
+        Ok(crate::paths::tokens_dir().join(format!("{safe_server}_state_{safe_csrf}.json")))
     }
 }
 
@@ -2008,7 +1989,7 @@ mod tests {
         let store = CompositeCredentialStore::new("my-server".to_string());
         let path = store.token_file_path().unwrap();
         assert!(path.ends_with("my-server.json"));
-        assert!(path.starts_with(tokens_dir()));
+        assert!(path.starts_with(crate::paths::tokens_dir()));
 
         // Invalid name (path separator) returns an error.
         let store = CompositeCredentialStore::new("../evil".to_string());
@@ -2572,22 +2553,6 @@ mod tests {
 
         assert_eq!(chosen.0.token_received_at, Some(200));
         assert_eq!(chosen.1, CredentialSource::Keyring);
-    }
-
-    #[test]
-    fn unit_tests_do_not_use_the_real_plug_token_directory() {
-        let production = crate::paths::tokens_dir();
-        let actual = tokens_dir();
-
-        assert_ne!(
-            actual, production,
-            "tests must not write production OAuth files"
-        );
-        assert!(
-            actual.starts_with(std::env::temp_dir()),
-            "test OAuth files must stay under the system temp directory: {}",
-            actual.display()
-        );
     }
 
     #[test]

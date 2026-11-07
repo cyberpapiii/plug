@@ -499,9 +499,7 @@ mod tests {
 
     #[test]
     fn intentional_off_blocks_connector_start_until_marker_is_removed() {
-        let directory = std::env::temp_dir().join(uuid::Uuid::new_v4().to_string());
-        std::fs::create_dir(&directory).unwrap();
-        let marker = directory.join(SERVICE_DISABLED_MARKER);
+        let marker = plug_core::paths::test::scratch("service-off").join(SERVICE_DISABLED_MARKER);
         assert!(ensure_service_enabled(&marker).is_ok());
         std::fs::write(&marker, "").unwrap();
         assert_eq!(
@@ -510,7 +508,6 @@ mod tests {
         );
         std::fs::remove_file(&marker).unwrap();
         assert!(ensure_service_enabled(&marker).is_ok());
-        std::fs::remove_dir(directory).unwrap();
     }
 
     #[test]
@@ -962,19 +959,10 @@ arguments = {
     /// than after the full cold-start budget.
     #[tokio::test]
     async fn wait_reports_a_daemon_that_died_during_startup() {
-        let root = std::env::temp_dir().join(format!(
-            "plug-service-startup-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&root).expect("create runtime root");
-        let _paths = plug_core::paths::test::isolate(&root);
-
         let started = std::time::Instant::now();
         let error = wait_for_daemon_socket(false, true)
             .await
             .expect_err("a vanished startup lock must not be reported as success");
-        let _ = std::fs::remove_dir_all(&root);
 
         assert!(
             error.to_string().contains("exited during startup"),
@@ -990,14 +978,6 @@ arguments = {
     /// cold start eventually produces.
     #[tokio::test]
     async fn wait_succeeds_once_the_socket_appears() {
-        // Short and directly under /tmp: a Unix socket path has to fit in
-        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
-        let root = std::path::PathBuf::from(format!(
-            "/tmp/plug-s{}{:x}",
-            std::process::id(),
-            uuid::Uuid::new_v4().as_fields().0
-        ));
-        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
             .expect("create runtime dir");
@@ -1006,7 +986,6 @@ arguments = {
         let started = wait_for_daemon_socket(true, false).await;
 
         drop(listener);
-        let _ = std::fs::remove_dir_all(&root);
 
         assert!(started.expect("socket present means started"));
     }

@@ -187,6 +187,9 @@ pub mod test {
         }
     }
 
+    // The one place a test names the system temp folder: a test writes only
+    // under a root made here, or in a `tempfile::TempDir`.
+    #[allow(clippy::disallowed_methods)]
     fn fresh() -> PathBuf {
         static NEXT: AtomicU64 = AtomicU64::new(0);
         std::env::temp_dir().join(format!(
@@ -206,6 +209,16 @@ pub mod test {
             .with_borrow(Clone::clone)
             .or_else(|| OWN.try_with(|own| own.0.clone()).ok())
             .unwrap_or_else(fresh)
+    }
+
+    /// A new empty folder for a test, under this thread's root, so it goes
+    /// when the thread ends, also when the test panics. Each call gets a
+    /// folder of its own; `label` only keeps the name readable.
+    pub fn scratch(label: &str) -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let dir = root().join(format!("{label}-{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+        std::fs::create_dir_all(&dir).expect("create a test folder");
+        dir
     }
 
     /// The root chosen with [`isolate`], until this drops, which it also
@@ -334,7 +347,7 @@ mod tests {
     #[test]
     fn isolate_moves_this_thread_only_until_it_drops() {
         let own = dir();
-        let root = std::env::temp_dir().join("plug-isolate-check");
+        let root = test::scratch("isolate-check");
         {
             let _paths = test::isolate(&root);
             assert_eq!(dir(), root.join("r/plug"));

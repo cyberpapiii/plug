@@ -61,10 +61,7 @@ use tower::ServiceExt;
 pub(crate) fn isolated_oauth_manager(
     scopes: Vec<String>,
 ) -> crate::downstream_oauth::DownstreamOauthManager {
-    let path = std::env::temp_dir().join(format!(
-        "plug-oauth-http-test-{}.json",
-        uuid::Uuid::new_v4()
-    ));
+    let path = crate::paths::test::scratch("oauth-http-test").join("state.json");
     crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
         crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),

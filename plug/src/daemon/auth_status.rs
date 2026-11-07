@@ -80,8 +80,8 @@ pub(super) async fn auth_status_from_statuses(
 mod tests {
     use super::*;
     use crate::daemon::tests::{
-        auth_status_test_context, cleanup_temp_config, clear_store, seeded_credentials,
-        temp_config_path, write_oauth_config, write_oauth_config_with_enabled,
+        auth_status_test_context, clear_store, seeded_credentials, temp_config_path,
+        write_oauth_config, write_oauth_config_with_enabled,
     };
     use rmcp::transport::auth::CredentialStore;
 
@@ -110,7 +110,6 @@ mod tests {
         assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -137,7 +136,6 @@ mod tests {
         assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -169,7 +167,6 @@ mod tests {
         assert_eq!(recovery.source, Some("keyring"));
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     /// A disabled OAuth server never gets a runtime status entry, so before
@@ -198,7 +195,6 @@ mod tests {
         );
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -229,6 +225,5 @@ mod tests {
         assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 }

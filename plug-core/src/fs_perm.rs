@@ -197,19 +197,10 @@ pub(crate) mod faults {
 mod tests {
     use super::*;
 
-    fn scratch_dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "plug-fs-perm-{label}-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     #[test]
     fn a_shared_file_keeps_its_mode_and_the_link_to_it() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch_dir("keep-mode");
+        let dir = crate::paths::test::scratch("keep-mode");
         let target = dir.join("settings.json");
         let link = dir.join("link.json");
         std::fs::write(&target, "old").unwrap();
@@ -227,22 +218,20 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "new");
         let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o7777;
         assert_eq!(mode, 0o640);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_shared_file_that_did_not_exist_is_created() {
-        let dir = scratch_dir("keep-mode-new");
+        let dir = crate::paths::test::scratch("keep-mode-new");
         let path = dir.join("nested/settings.json");
         write_atomic_keeping_mode(&path, b"{}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_private_write_replaces_the_file_with_an_owner_only_one() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = scratch_dir("write");
+        let dir = crate::paths::test::scratch("write");
         let path = dir.join("token");
         std::fs::write(&path, "old").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -253,12 +242,11 @@ mod tests {
         let mode = std::fs::metadata(&path).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o600);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1, "no temp left");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn a_private_write_replaces_a_link_instead_of_writing_through_it() {
-        let dir = scratch_dir("link");
+        let dir = crate::paths::test::scratch("link");
         let target = dir.join("elsewhere");
         std::fs::write(&target, "keep").unwrap();
         let path = dir.join("token");
@@ -274,20 +262,13 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn creates_nested_dir_with_0700_and_is_idempotent() {
-        let base = std::env::temp_dir().join(format!(
-            "plug-fs-perm-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        let leaf = base.join("nested").join("secrets");
+        let leaf = crate::paths::test::scratch("fs-perm")
+            .join("nested")
+            .join("secrets");
 
         ensure_dir_0700(&leaf).expect("first create succeeds");
         assert!(leaf.is_dir());
@@ -298,7 +279,5 @@ mod tests {
 
         // A second call on the already-existing dir is an Ok no-op.
         ensure_dir_0700(&leaf).expect("second create is Ok");
-
-        let _ = std::fs::remove_dir_all(&base);
     }
 }

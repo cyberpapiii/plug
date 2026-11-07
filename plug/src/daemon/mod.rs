@@ -2016,7 +2016,7 @@ mod tests {
     #[test]
     fn the_log_starts_a_new_file_when_its_folder_is_emptied() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("plug-log-reopen-{}", uuid::Uuid::new_v4()));
+        let dir = plug_core::paths::test::scratch("log-reopen").join("logs");
         let mut log = ReopeningLog::open(&dir, Duration::ZERO).expect("open the log");
         log.write_all(b"before\n").expect("write");
         log.flush().expect("flush");
@@ -2032,7 +2032,6 @@ mod tests {
             .expect("a new log file");
         let text = std::fs::read_to_string(file.path()).expect("read the new file");
         assert_eq!(text, "after\n");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One server advertising a large icon can outweigh every other server in
@@ -2077,18 +2076,11 @@ mod tests {
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
     use std::collections::HashMap;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     pub(super) fn temp_config_path(name: &str) -> std::path::PathBuf {
-        crate::install_test_credential_environment();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("plug-daemon-{name}-{unique}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("config.toml")
+        plug_core::paths::test::scratch(name).join("config.toml")
     }
 
     pub(super) async fn clear_store(server_name: &str) {
@@ -2096,21 +2088,11 @@ mod tests {
         store.clear().await.unwrap();
     }
 
-    pub(super) fn cleanup_temp_config(config_path: &std::path::Path) {
-        if let Some(dir) = config_path.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
     /// Daily logs used to be kept forever. Pruning must keep the file names
     /// `scripts/perf.sh` globs and leave other files in the directory alone.
     #[test]
     fn daily_log_appender_prunes_old_logs_and_keeps_names() {
-        let dir = std::env::temp_dir().join(format!(
-            "plug-log-retention-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = plug_core::paths::test::scratch("log-retention");
         let old: Vec<String> = (1..=20)
             .map(|day| format!("plug.log.2000-01-{day:02}"))
             .collect();
@@ -2125,7 +2107,6 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        let _ = std::fs::remove_dir_all(&dir);
         let logs: Vec<&String> = names
             .iter()
             .filter(|name| name.starts_with("plug.log."))
@@ -2201,17 +2182,6 @@ mod tests {
             forged,
             IpcResponse::Error { ref code, .. } if code == "INVALID_CANCELLATION_CAPABILITY"
         ));
-    }
-
-    #[test]
-    fn daemon_tests_do_not_use_the_real_plug_token_directory() {
-        let config_path = temp_config_path("credential-isolation");
-        let production = plug_core::paths::dir().join("tokens");
-        let actual = plug_core::oauth::tokens_dir();
-
-        assert_ne!(actual, production);
-        assert!(actual.starts_with(std::env::temp_dir()));
-        cleanup_temp_config(&config_path);
     }
 
     pub(super) fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
@@ -2390,17 +2360,11 @@ allowed_servers = ["slack"]
         assert_eq!(snapshot.upstream_auth[0].name, server_name);
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
     async fn list_live_sessions_includes_http_sessions_when_daemon_owns_http() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-test");
         let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let mut ctx = auth_status_test_context(config_path);
@@ -2424,7 +2388,6 @@ allowed_servers = ["slack"]
             sessions[0].client_type,
             plug_core::types::ClientType::ClaudeDesktop
         );
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     /// The app and `plug auth clients revoke` revoke over the socket. That
@@ -2437,8 +2400,7 @@ allowed_servers = ["slack"]
             .insert("mock".to_string(), mock_server("echo"));
         let engine = Engine::new(config);
         engine.start().await;
-        let oauth_path =
-            std::env::temp_dir().join(format!("plug-daemon-revoke-{}.json", uuid::Uuid::new_v4()));
+        let oauth_path = plug_core::paths::test::scratch("daemon-revoke").join("state.json");
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             plug_core::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
@@ -2465,7 +2427,7 @@ allowed_servers = ["slack"]
             &engine,
             CancellationToken::new(),
             ClientRegistry::new(),
-            "/tmp/plug-daemon-revoke-config.toml",
+            plug_core::paths::default_config_path(),
         );
         ctx.http = Arc::new(
             HttpState::new(
@@ -2520,7 +2482,6 @@ allowed_servers = ["slack"]
         assert!(ctx.http.sessions.validate(&session_id).is_err());
         assert_eq!(router.task_count_for_owner(&owner).await, 0);
         engine.shutdown().await;
-        let _ = std::fs::remove_file(oauth_path);
     }
 
     #[test]
@@ -2529,12 +2490,7 @@ allowed_servers = ["slack"]
         // status surface calls it. A start that collided with one used to fail
         // outright. The window is passed explicitly so the assertion is about
         // retrying at all, not about how a loaded machine schedules threads.
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-pid-lock-probe-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-pid-lock-probe");
         let pid_file = temp.join("plug.pid");
 
         let held = acquire_pid_lock(&pid_file).expect("probe holds the lock");
@@ -2559,17 +2515,11 @@ allowed_servers = ["slack"]
         );
 
         drop(claiming);
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
     fn pid_lock_still_refuses_a_second_daemon_that_keeps_holding_it() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-pid-lock-held-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-pid-lock-held");
         let pid_file = temp.join("plug.pid");
 
         let _held = acquire_pid_lock(&pid_file).expect("first pid lock");
@@ -2578,18 +2528,11 @@ allowed_servers = ["slack"]
             error.to_string().contains("already running"),
             "unexpected error: {error}"
         );
-
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
     fn acquire_pid_lock_does_not_truncate_existing_file_on_failed_relock() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-pid-lock-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-pid-lock");
         let pid_file = temp.join("plug.pid");
 
         let first_lock = acquire_pid_lock(&pid_file).expect("first pid lock");
@@ -2610,26 +2553,17 @@ allowed_servers = ["slack"]
         );
 
         drop(first_lock);
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
     async fn losing_daemon_start_does_not_boot_upstream_servers() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-d-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("plug-d");
 
         std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
 
-        let marker = state_root.join("upstream-started");
-        let config_path = state_root.join("config.toml");
+        let marker = temp.join("upstream-started");
+        let config_path = temp.join("config.toml");
         let mut config = plug_core::config::Config::default();
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
         config.http.port = probe.local_addr().expect("HTTP address").port();
@@ -2664,7 +2598,6 @@ allowed_servers = ["slack"]
         );
 
         drop(winning_lock);
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     /// `run_daemon` must bind and serve without a started engine, which is what
@@ -2674,17 +2607,7 @@ allowed_servers = ["slack"]
     /// upstream takes.
     #[tokio::test]
     async fn ipc_socket_is_bound_while_upstream_startup_is_still_running() {
-        // The bound socket lives under this root, and a Unix socket path has to
-        // fit in SUN_LEN, so keep the directory names short.
-        let temp = std::env::temp_dir().join(format!(
-            "plug-d-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("plug-d");
 
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
         // flight until the upstream timeout expires.
@@ -2695,7 +2618,7 @@ allowed_servers = ["slack"]
         let mut config = plug_core::config::Config::default();
         config.servers.insert("slow".to_string(), server);
 
-        let config_path = runtime_root.join("config.toml");
+        let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let engine = Engine::new(config);
 
@@ -2731,20 +2654,11 @@ allowed_servers = ["slack"]
         engine.cancel_token().cancel();
         startup.abort();
         daemon.abort();
-        std::fs::remove_dir_all(temp).ok();
     }
 
     #[tokio::test]
     async fn run_daemon_losing_start_does_not_rotate_existing_token() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-d-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("plug-d");
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2753,7 +2667,7 @@ allowed_servers = ["slack"]
         let pid_file = pid_path();
         let winning_lock = acquire_pid_lock(&pid_file).expect("winning pid lock");
 
-        let config_path = runtime_root.join("config.toml");
+        let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let engine = Engine::new(plug_core::config::Config::default());
 
@@ -2765,20 +2679,11 @@ allowed_servers = ["slack"]
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
     async fn run_daemon_restores_existing_token_when_startup_fails_after_token_write() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-d-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("plug-d");
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2787,7 +2692,7 @@ allowed_servers = ["slack"]
         let sock_path = socket_path();
         std::fs::create_dir_all(&sock_path).expect("create blocking socket directory");
 
-        let config_path = runtime_root.join("config.toml");
+        let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let engine = Engine::new(plug_core::config::Config::default());
 
@@ -2800,7 +2705,6 @@ allowed_servers = ["slack"]
         let token_after =
             std::fs::read_to_string(&token_file).expect("read token after failed startup");
         assert_eq!(token_after, "stable-token");
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -2996,7 +2900,6 @@ allowed_servers = ["slack"]
         server_task: Option<tokio::task::JoinHandle<()>>,
         stream: tokio::net::UnixStream,
         session_id: String,
-        socket_path: std::path::PathBuf,
     }
 
     impl IpcTestHarness {
@@ -3030,13 +2933,7 @@ allowed_servers = ["slack"]
             let engine = Engine::new(config);
             engine.start().await;
 
-            // Short unique socket path in /tmp — a Unix socket path must fit in
-            // SUN_LEN (~104 bytes), and the platform temp dir is already long.
-            let socket_path = std::path::PathBuf::from(format!(
-                "/tmp/plug-ipc-{}.sock",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            ));
-            let _ = std::fs::remove_file(&socket_path);
+            let socket_path = plug_core::paths::test::scratch("ipc").join("s.sock");
 
             let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
             let cancel = CancellationToken::new();
@@ -3047,7 +2944,7 @@ allowed_servers = ["slack"]
                 &engine,
                 cancel.clone(),
                 client_registry,
-                "/tmp/plug-ipc-test-config.toml",
+                plug_core::paths::default_config_path(),
             );
             let server_task = tokio::spawn(async move {
                 if let Ok((stream, _addr)) = listener.accept().await {
@@ -3089,7 +2986,6 @@ allowed_servers = ["slack"]
                 server_task: Some(server_task),
                 stream,
                 session_id,
-                socket_path,
             }
         }
 
@@ -3132,8 +3028,8 @@ allowed_servers = ["slack"]
         }
 
         /// Graceful async teardown: cancel the connection loop, join the server
-        /// task, shut the engine down (killing the mock subprocess), and remove the
-        /// socket. Idempotent with `Drop` so a test that asserts before calling this
+        /// task, and shut the engine down (killing the mock subprocess).
+        /// Idempotent with `Drop` so a test that asserts before calling this
         /// still cleans up on panic (via `Drop`), just without the async engine
         /// shutdown.
         async fn shutdown(&mut self) {
@@ -3142,7 +3038,6 @@ allowed_servers = ["slack"]
                 let _ = task.await;
             }
             self.engine.shutdown().await;
-            let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
@@ -3150,14 +3045,13 @@ allowed_servers = ["slack"]
         fn drop(&mut self) {
             // Best-effort synchronous cleanup so a panicking test (e.g. a parity
             // assertion that fires before `shutdown().await`) does not orphan the
-            // server task or leak the temp socket. The engine's async shutdown can
-            // only run in `shutdown()`; here we cancel + abort to release the task's
-            // engine handle and remove the socket file.
+            // server task. The engine's async shutdown can only run in
+            // `shutdown()`; here we cancel + abort to release the task's engine
+            // handle.
             self.cancel.cancel();
             if let Some(task) = self.server_task.take() {
                 task.abort();
             }
-            let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
@@ -3218,11 +3112,7 @@ allowed_servers = ["slack"]
         let engine = Engine::new(config);
         engine.start().await;
 
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-idle-reverse-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let socket_path = plug_core::paths::test::scratch("idle-reverse").join("s.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
 
@@ -3237,7 +3127,7 @@ allowed_servers = ["slack"]
             &engine,
             cancel.clone(),
             client_registry,
-            "/tmp/plug-ipc-idle-reverse-config.toml",
+            plug_core::paths::default_config_path(),
         );
         ctx.session_id = Some(session_id.clone());
         ctx.reverse_request_rx = Some(reverse_rx);
@@ -3327,7 +3217,6 @@ allowed_servers = ["slack"]
         drop(stream);
         let _ = server_task.await;
         engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     /// A registered connection hears about a modern downstream gate change
@@ -3337,11 +3226,7 @@ allowed_servers = ["slack"]
         let engine = Engine::new(plug_core::config::Config::default());
         engine.start().await;
 
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-gate-push-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let socket_path = plug_core::paths::test::scratch("gate-push").join("s.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
         let client_registry = ClientRegistry::new();
@@ -3349,7 +3234,7 @@ allowed_servers = ["slack"]
             &engine,
             cancel.clone(),
             client_registry,
-            "/tmp/plug-ipc-gate-push-config.toml",
+            plug_core::paths::default_config_path(),
         );
         ctx.session_id = Some("gate-push-session".to_string());
         let server_task = tokio::spawn(async move {
@@ -3389,7 +3274,6 @@ allowed_servers = ["slack"]
         drop(stream);
         let _ = server_task.await;
         engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     /// An operator connection reads one reply per request, so a gate push
@@ -4275,7 +4159,7 @@ allowed_servers = ["slack"]
                 &engine,
                 CancellationToken::new(),
                 client_registry,
-                "/tmp/plug-ipc-test-config.toml",
+                plug_core::paths::default_config_path(),
             );
             let response = dispatch_request(
                 &IpcRequest::Register {

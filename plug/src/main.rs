@@ -20,13 +20,6 @@ fn apply_dotenv() {
 }
 
 #[cfg(test)]
-pub(crate) fn install_test_credential_environment() {
-    plug_core::oauth::install_test_credential_environment(
-        std::env::temp_dir().join(format!("plug-oauth-binary-tests-{}", std::process::id())),
-    );
-}
-
-#[cfg(test)]
 mod cli_goldens;
 mod client_host;
 mod commands;

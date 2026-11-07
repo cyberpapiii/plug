@@ -118,9 +118,8 @@ fn login_shell_probe() -> (
 }
 
 /// Tests answer with the test runner's PATH and save nothing: a real login
-/// shell runs the developer's dotfiles and would write the live daemon's saved
-/// PATH, and its wait can outlive a paused Tokio clock and use up a test's
-/// virtual retry window.
+/// shell runs the developer's dotfiles, and its wait can outlive a paused
+/// Tokio clock and use up a test's virtual retry window.
 #[cfg(all(target_os = "macos", any(test, feature = "test-helpers")))]
 fn login_shell_probe() -> (
     impl Future<Output = Option<OsString>> + Send + 'static,

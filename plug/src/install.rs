@@ -572,11 +572,7 @@ mod tests {
     fn embedded_version_probe_does_not_reenter_app_delegation() {
         use std::os::unix::fs::PermissionsExt;
 
-        let probe = std::env::temp_dir().join(format!(
-            "plug-version-probe-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let probe = plug_core::paths::test::scratch("version-probe").join("plug");
         std::fs::write(
             &probe,
             "#!/bin/sh\nif [ \"${PLUG_DEV:-}\" = 1 ]; then echo 'plug 0.7.1'; exit 0; fi\nexec \"$0\"\n",
@@ -585,7 +581,6 @@ mod tests {
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(super::executable_version(&probe).unwrap(), "0.7.1");
-        std::fs::remove_file(probe).unwrap();
     }
 
     #[test]

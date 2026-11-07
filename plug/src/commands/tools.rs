@@ -463,12 +463,7 @@ mod tests {
     }
 
     fn config_file(label: &str, config: &plug_core::config::Config) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "plug-tools-{label}-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let path = dir.join("config.toml");
+        let path = plug_core::paths::test::scratch(&format!("tools-{label}")).join("config.toml");
         plug_core::operator::persist_config_atomic(&path, config).expect("write config");
         path
     }
@@ -544,7 +539,6 @@ mod tests {
         }
         let unknown = patterns("github").await.expect_err("unknown server");
         assert!(unknown.to_string().contains("github"), "{unknown}");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// Turning a server off and on again leaves the other servers' tools as
@@ -584,7 +578,6 @@ mod tests {
             .expect("on");
         let (_, written) = load_editable_config(Some(&path)).expect("reload");
         assert_eq!(written.disabled_tools, ["Slack__post"]);
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// With `--config`, the edit lands in that file through the operator
@@ -608,6 +601,5 @@ mod tests {
             .await
             .expect_err("a wider pattern keeps the tool off");
         assert!(error.to_string().contains("slack__*"), "{error}");
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 }

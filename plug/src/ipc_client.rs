@@ -260,21 +260,10 @@ pub(crate) async fn wait_for_daemon() -> UnixStream {
 mod tests {
     use super::*;
 
-    /// Short and directly under /tmp: a Unix socket path has to fit in
-    /// SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
-    fn temp_root(name: &str) -> PathBuf {
-        PathBuf::from(format!(
-            "/tmp/plug-{name}{:x}",
-            uuid::Uuid::new_v4().as_fields().0
-        ))
-    }
-
     /// A reply bigger than one frame arrives as chunks; a one-shot request
     /// reads all of them.
     #[tokio::test]
     async fn a_reply_over_one_frame_is_reassembled() {
-        let root = temp_root("chunked");
-        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -297,15 +286,12 @@ mod tests {
         };
         assert_eq!(payload["text"].as_str().map(str::len), Some(text.len()));
         daemon.await.unwrap();
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// An operator request gets the token from the token file without the
     /// caller reading it.
     #[tokio::test]
     async fn the_token_is_attached_to_operator_requests() {
-        let root = temp_root("token");
-        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         std::fs::write(plug_core::paths::token_path(), "the-token").unwrap();
@@ -325,7 +311,6 @@ mod tests {
         assert!(matches!(response, IpcResponse::Ok));
         let sent = daemon.await.unwrap();
         assert_eq!(sent.auth_token(), Some("the-token"));
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A daemon whose engine is stuck still accepts connections, so an
@@ -333,8 +318,6 @@ mod tests {
     /// into a spinner with nothing to report. The wait has to end.
     #[tokio::test]
     async fn a_request_gives_up_on_a_daemon_that_never_answers() {
-        let root = temp_root("silent");
-        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -350,7 +333,6 @@ mod tests {
             .expect_err("a silent daemon must not be waited on forever");
 
         silent.abort();
-        let _ = std::fs::remove_dir_all(&root);
         assert!(
             matches!(error, IpcClientError::Timeout(_)),
             "unexpected error: {error}"
@@ -359,8 +341,6 @@ mod tests {
 
     #[tokio::test]
     async fn no_daemon_reads_as_unreachable() {
-        let root = temp_root("absent");
-        let _paths = plug_core::paths::test::isolate(&root);
         let (availability, value) = query(IpcRequest::Status, Some).await;
         assert_eq!(availability, DaemonQueryAvailability::Unreachable);
         assert!(value.is_none());

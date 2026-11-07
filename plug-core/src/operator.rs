@@ -755,7 +755,7 @@ mod tests {
     }
 
     fn fixture_path() -> PathBuf {
-        tempfile::tempdir().unwrap().keep().join("config.toml")
+        crate::paths::test::scratch("operator").join("config.toml")
     }
 
     fn server_with_secrets() -> ServerConfig {

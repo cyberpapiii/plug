@@ -51,16 +51,6 @@ fn oauth_integration_test_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-#[test]
-fn oauth_integration_credentials_are_isolated_from_the_user_profile() {
-    let _ = oauth_integration_test_lock();
-    let production = plug_core::paths::tokens_dir();
-    let actual = oauth::tokens_dir();
-
-    assert_ne!(actual, production);
-    assert!(actual.starts_with(std::env::temp_dir()));
-}
-
 fn oauth_test_credentials(access: &str, refresh: &str) -> StoredCredentials {
     let mut token = oauth2::StandardTokenResponse::<VendorExtraTokenFields, BasicTokenType>::new(
         AccessToken::new(access.to_string()),
@@ -118,7 +108,7 @@ fn oauth_state_file_path(server_name: &str, state: &str) -> std::path::PathBuf {
             }
         })
         .collect();
-    oauth::tokens_dir().join(format!("{safe_server}_state_{safe_state}.json"))
+    plug_core::paths::tokens_dir().join(format!("{safe_server}_state_{safe_state}.json"))
 }
 
 #[derive(Clone)]
@@ -631,14 +621,7 @@ fn lifecycle_server_config(
 }
 
 fn unique_lifecycle_log(label: &str) -> std::path::PathBuf {
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock after epoch")
-        .as_nanos();
-    std::env::temp_dir().join(format!(
-        "plug-integration-{label}-{}-{nonce}.log",
-        std::process::id()
-    ))
+    plug_core::paths::test::scratch(label).join("requests.log")
 }
 
 fn lifecycle_sequence(path: &std::path::Path) -> Vec<String> {
@@ -681,7 +664,6 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
             .any(|method| method == "server/discover")
     );
     gated_engine.shutdown().await;
-    let _ = std::fs::remove_file(&gated_log);
 
     // Auto uses RMCP's exact method-not-found fallback on the same transport.
     let auto_log = unique_lifecycle_log("auto");
@@ -715,7 +697,6 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
         Some("2025-11-25")
     );
     auto_engine.shutdown().await;
-    let _ = std::fs::remove_file(&auto_log);
 
     // Forced modern selects discovery, records live truth, and routes an
     // ordinary tool call through the existing shared router.
@@ -801,7 +782,6 @@ async fn upstream_lifecycle_modes_negotiate_independently_with_live_truth() {
     );
     assert!(!modern_sequence.iter().any(|method| method == "initialize"));
     modern_engine.shutdown().await;
-    let _ = std::fs::remove_file(&modern_log);
 }
 
 #[tokio::test]
@@ -820,7 +800,6 @@ async fn forced_modern_rejects_a_legacy_only_upstream_without_fallback() {
         "unexpected forced-modern error: {error:#}"
     );
     assert_eq!(lifecycle_sequence(&log), vec!["server/discover"]);
-    let _ = std::fs::remove_file(log);
 }
 
 #[tokio::test]
@@ -983,13 +962,10 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
     use plug_core::notifications::NotificationTarget;
     use plug_core::types::Availability;
 
-    let tmp = std::env::temp_dir();
-    let pid = std::process::id();
-    let fail_flag = tmp.join(format!("plug-degraded-fail-{pid}.flag"));
-    let empty_flag = tmp.join(format!("plug-degraded-empty-{pid}.flag"));
+    let tmp = plug_core::paths::test::scratch("degraded");
     // Neither flag exists initially → the mock lists its resource normally.
-    let _ = std::fs::remove_file(&fail_flag);
-    let _ = std::fs::remove_file(&empty_flag);
+    let fail_flag = tmp.join("fail.flag");
+    let empty_flag = tmp.join("empty.flag");
 
     let mut config = Config::default();
     let mut server = mock_server("echo");
@@ -1097,7 +1073,6 @@ async fn degraded_listing_carries_last_known_good_and_keeps_subscription() {
         "a genuine removal must still prune the subscription"
     );
 
-    let _ = std::fs::remove_file(&empty_flag);
     engine.shutdown().await;
 }
 
@@ -1122,8 +1097,7 @@ fn write_mock_wrapper(temp: &std::path::Path, first_args: &str) -> std::path::Pa
 
 #[tokio::test]
 async fn test_stdio_timeout_reconnects_cleanly() {
-    let temp = std::env::temp_dir().join(format!("plug-timeout-test-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temp).expect("create temp dir");
+    let temp = plug_core::paths::test::scratch("timeout-test");
     let marker = temp.join("first-run.marker");
     let script = write_mock_wrapper(&temp, "--tools echo --delay-ms 1500");
 
@@ -1173,13 +1147,11 @@ async fn test_stdio_timeout_reconnects_cleanly() {
     assert!(second.is_ok(), "second call should succeed after reconnect");
 
     engine.shutdown().await;
-    let _ = std::fs::remove_dir_all(&temp);
 }
 
 #[tokio::test]
 async fn test_stdio_crash_restart_recovers_cleanly() {
-    let temp = std::env::temp_dir().join(format!("plug-crash-test-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temp).expect("create temp dir");
+    let temp = plug_core::paths::test::scratch("crash-test");
     let marker = temp.join("first-run.marker");
     let script = write_mock_wrapper(&temp, "--tools echo --fail-mode crash");
 
@@ -1246,7 +1218,6 @@ async fn test_stdio_crash_restart_recovers_cleanly() {
     );
 
     engine.shutdown().await;
-    let _ = std::fs::remove_dir_all(&temp);
 }
 
 // HTTP upstream crash-restart supervision. `MockRestartableHttpUpstream`
@@ -3137,7 +3108,7 @@ async fn test_downstream_oauth_protected_discovery_card_end_to_end() {
     };
     let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
         oauth_config,
-        std::env::temp_dir().join(format!("plug-oauth-e2e-{}.json", uuid::Uuid::new_v4())),
+        plug_core::paths::test::scratch("oauth-e2e").join("state.json"),
     )
     .expect("isolated OAuth manager");
     let approval_manager = manager.clone();

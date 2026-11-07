@@ -169,10 +169,7 @@ mod tests {
     /// mutation, a taken name renamed and nothing written over.
     #[tokio::test]
     async fn an_offline_import_goes_through_the_mutation() {
-        let dir =
-            std::env::temp_dir().join(format!("plug-import-{}", uuid::Uuid::new_v4().simple()));
-        std::fs::create_dir_all(&dir).expect("create dir");
-        let path = dir.join("config.toml");
+        let path = plug_core::paths::test::scratch("import").join("config.toml");
         let mut config = plug_core::config::Config::default();
         let github = plug_core::config::ServerConfig {
             command: Some("gh-mcp".to_string()),
@@ -201,6 +198,5 @@ mod tests {
             written.servers["github-cursor"].command.as_deref(),
             Some("npx")
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

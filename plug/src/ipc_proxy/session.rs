@@ -280,13 +280,7 @@ mod tests {
     /// and no error is ever reported.
     #[tokio::test]
     async fn session_setup_gives_up_on_a_daemon_that_never_replies() {
-        // Short and directly under /tmp: a Unix socket path has to fit in
-        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
-        let socket = std::path::PathBuf::from(format!(
-            "/tmp/plug-h{}{:x}.sock",
-            std::process::id(),
-            uuid::Uuid::new_v4().as_fields().0
-        ));
+        let socket = plug_core::paths::test::scratch("silent").join("s.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind socket");
         let accepting = tokio::spawn(async move {
             let accepted = listener.accept().await;
@@ -309,7 +303,6 @@ mod tests {
             .expect_err("a silent daemon must not stall session setup forever");
 
         accepting.abort();
-        let _ = std::fs::remove_file(&socket);
 
         assert!(
             error.to_string().contains("did not complete session setup"),
