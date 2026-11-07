@@ -1596,10 +1596,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_approval_challenge_survives_manager_restart() {
-        let state_path = std::env::temp_dir().join(format!(
-            "plug-oauth-public-restart-test-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let state_path =
+            crate::paths::test::scratch("oauth-public-restart-test").join("state.json");
         let config = crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
@@ -1661,7 +1659,6 @@ mod tests {
                 .as_str()
                 .is_some_and(|uri| uri.starts_with("https://client.example.com/callback?code="))
         );
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
@@ -1956,10 +1953,8 @@ mod tests {
 
     #[tokio::test]
     async fn public_consent_persistence_failure_is_hardened_and_nondisclosing() {
-        let state_path = std::env::temp_dir().join(format!(
-            "plug-oauth-http-persistence-test-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let state_path =
+            crate::paths::test::scratch("oauth-http-persistence-test").join("state.json");
         let manager = crate::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             crate::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
@@ -2041,8 +2036,6 @@ mod tests {
                 .contains(state_path.to_string_lossy().as_ref())
         );
         assert!(!body.to_string().contains("OAuth state persistence failed"));
-        std::fs::remove_dir(&state_path).expect("remove state blocker");
-        let _ = std::fs::remove_file(state_path.with_extension("json.tmp"));
     }
 
     #[tokio::test]
@@ -2251,10 +2244,7 @@ mod tests {
 
     #[tokio::test]
     async fn dcr_oauth_lifecycle_acceptance_matrix() {
-        let state_path = std::env::temp_dir().join(format!(
-            "plug-oauth-lifecycle-matrix-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = crate::paths::test::scratch("oauth-lifecycle-matrix").join("state.json");
         let oauth_config = crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
@@ -2629,10 +2619,7 @@ mod tests {
     /// restart to be worth anything.
     #[tokio::test]
     async fn replayed_refresh_token_returns_invalid_grant_and_kills_the_family() {
-        let state_path = std::env::temp_dir().join(format!(
-            "plug-oauth-refresh-replay-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let state_path = crate::paths::test::scratch("oauth-refresh-replay").join("state.json");
         let oauth_config = crate::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],

@@ -1655,7 +1655,6 @@ async fn push_roots_to_daemon(shared: &SharedConnection, roots_json: serde_json:
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::path::PathBuf;
 
     use crate::daemon::run_daemon;
     use plug_core::config::{Config, ServerConfig};
@@ -1791,15 +1790,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_backed_proxy_recovers_after_daemon_restart() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdc-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdc");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -1926,20 +1917,11 @@ mod tests {
             .await
             .expect("restarted daemon task join")
             .expect("restarted daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_supports_task_wrapped_tool_calls() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdt-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdt");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2081,20 +2063,11 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_forwards_resource_subscribe_updates() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdr-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdr");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2187,20 +2160,11 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_tasks_survive_session_replacement_for_same_client() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdu-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdu");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2323,20 +2287,11 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_advertises_latest_protocol_version() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdc-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdc");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2394,7 +2349,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     fn assert_ipc_plug_icons_sequence(icons: &[Icon]) {
@@ -2421,15 +2375,7 @@ mod tests {
 
     #[tokio::test]
     async fn daemon_backed_proxy_reassembles_chunked_tool_response() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdchunk-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdchunk");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2486,20 +2432,11 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_spills_large_tool_result_to_artifact_link() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdartifact-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdartifact");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2559,20 +2496,11 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_task_result_spills_to_artifact_link() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdtartifact-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdtartifact");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2666,20 +2594,11 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn daemon_backed_proxy_artifact_manifest_survives_daemon_restart() {
-        let temp = std::env::temp_dir().join(format!(
-            "pdrehydrate-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ));
-        let runtime_root = temp.join("r");
-        let state_root = temp.join("s");
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp);
+        let temp = plug_core::paths::test::scratch("pdrehydrate");
 
         let config_path = temp.join("plug.toml");
         let mut config = Config::default();
@@ -2774,7 +2693,6 @@ mod tests {
             .await
             .expect("daemon task join")
             .expect("daemon shutdown cleanly");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     // Fake-daemon harness: hand-rolled UnixListener speaking plug_core::ipc
@@ -2841,13 +2759,6 @@ mod tests {
         FAKE_REQUEST_CEILING.get()
     }
 
-    fn unique_temp_dir(prefix: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "{prefix}-{}",
-            &uuid::Uuid::new_v4().simple().to_string()[..8]
-        ))
-    }
-
     fn is_mcp_request(request: &IpcRequest, expected_method: &str) -> bool {
         match request {
             IpcRequest::McpRequest { method, .. } => method == expected_method,
@@ -2893,9 +2804,6 @@ mod tests {
 
     #[tokio::test]
     async fn session_setup_rejects_a_registration_for_another_client() {
-        let temp = unique_temp_dir("register-mismatch");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -2939,7 +2847,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// A subscribed resource can change while the connector is still
@@ -2947,9 +2854,6 @@ mod tests {
     /// to Register.
     #[tokio::test]
     async fn a_resource_update_during_setup_is_kept_for_the_host() {
-        let temp = unique_temp_dir("setup-push");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -3008,7 +2912,6 @@ mod tests {
         ));
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// Perform the OperatorHandshake + Register + Capabilities handshake that
@@ -3154,9 +3057,6 @@ mod tests {
 
     #[tokio::test]
     async fn modern_daemon_proxy_starts_with_discover_without_initialize() {
-        let temp = unique_temp_dir("modern-discover");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let mut delegated_capabilities = ServerCapabilities::builder()
             .enable_tools()
             .enable_resources()
@@ -3299,14 +3199,10 @@ mod tests {
             .await
             .expect("fake daemon completes")
             .expect("daemon task");
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
     async fn cancellation_uses_auxiliary_socket_while_primary_request_is_locked() {
-        let temp = unique_temp_dir("oob-cancel");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let request_id =
             RequestId::from(rmcp::model::NumberOrString::String(Arc::from("cancel-me")));
@@ -3363,14 +3259,10 @@ mod tests {
         .expect("daemon accepts cancellation");
 
         daemon_task.await.expect("daemon task");
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
     async fn daemon_gate_push_disables_modern_on_existing_proxy() {
-        let temp = unique_temp_dir("gate-push");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept proxy");
@@ -3418,14 +3310,10 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task");
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
     async fn reconnect_publishes_disabled_gate_before_new_session() {
-        let temp = unique_temp_dir("reconnect-gate");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (first, _) = listener.accept().await.expect("accept first session");
@@ -3461,7 +3349,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task");
-        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[derive(Clone)]
@@ -3488,9 +3375,6 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_replays_client_capabilities() {
-        let temp = unique_temp_dir("reconnect-caps");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         // A non-default capabilities value so the "replayed == negotiated"
         // assertion below can't trivially pass by matching two empty structs.
         let negotiated_capabilities = ClientCapabilities::builder()
@@ -3585,14 +3469,10 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn reconnect_replays_subscriptions() {
-        let temp = unique_temp_dir("reconnect-subs");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             // Connection 1: handshake only, then drop — simulates the daemon
@@ -3657,14 +3537,10 @@ mod tests {
         assert!(matches!(response, IpcResponse::Pong));
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn reconnect_replay_failure_does_not_fail_session() {
-        let temp = unique_temp_dir("reconnect-replay-fail");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             // Connection 1: handshake only, then drop — simulates the daemon
@@ -3755,14 +3631,10 @@ mod tests {
         assert!(matches!(response, IpcResponse::McpResponse { .. }));
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn unsubscribe_removes_from_replay_set() {
-        let temp = unique_temp_dir("unsub-replay");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             // Connection 1: full initialize handshake — the downstream
@@ -3910,14 +3782,10 @@ mod tests {
             .expect("list_all_tools should succeed after reconnect");
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn retry_policy_safe_rebuilds_against_new_session() {
-        let temp = unique_temp_dir("retry-safe");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream1, _) = listener.accept().await.expect("accept 1");
@@ -3962,14 +3830,10 @@ mod tests {
         assert!(matches!(response, IpcResponse::Pong));
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn a_call_that_was_never_sent_is_sent_after_the_reconnect() {
-        let temp = unique_temp_dir("retry-never-sent");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream1, _) = listener.accept().await.expect("accept 1");
@@ -4013,14 +3877,10 @@ mod tests {
         assert!(matches!(response, IpcResponse::Pong));
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn retry_policy_unsafe_surfaces_retry_error() {
-        let temp = unique_temp_dir("retry-unsafe");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream1, _) = listener.accept().await.expect("accept 1");
@@ -4068,14 +3928,10 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn notifications_interleaved_before_response_are_forwarded() {
-        let temp = unique_temp_dir("interleave");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -4165,14 +4021,10 @@ mod tests {
         assert!(captured[0].contains("hello from daemon"));
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn chunked_response_reassembly() {
-        let temp = unique_temp_dir("chunked");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -4241,14 +4093,10 @@ mod tests {
         assert_eq!(text.text.len(), 6 * 1024 * 1024);
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn malformed_frame_is_reconnectable_failure() {
-        let temp = unique_temp_dir("malformed");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream1, _) = listener.accept().await.expect("accept 1");
@@ -4389,7 +4237,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// A connector paused across a daemon swap resumes with the old daemon's
@@ -4449,8 +4296,6 @@ mod tests {
     async fn silent_daemon_stall_triggers_reconnect() {
         // Real Unix socket reads don't complete under tokio::time::pause, so
         // use the test-only override instead of paused time.
-        let temp = unique_temp_dir("stall");
-        let _paths = plug_core::paths::test::isolate(&temp);
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
 
         let listener = bind_fake_daemon_socket();
@@ -4587,13 +4432,10 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn watchdog_resets_on_interleaved_frames() {
-        let temp = unique_temp_dir("watchdog-reset");
-        let _paths = plug_core::paths::test::isolate(&temp);
         let _watchdog = ReadWatchdogTestOverride::install(Duration::from_millis(150));
 
         let listener = bind_fake_daemon_socket();
@@ -4686,7 +4528,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// Start a proxy against a fake daemon that answers one `expected_method`
@@ -4743,9 +4584,6 @@ mod tests {
 
     #[tokio::test]
     async fn tool_result_with_an_envelope_key_is_not_mistaken_for_an_envelope() {
-        let temp = unique_temp_dir("envelope-key");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let payload = serde_json::to_value(CallToolResult::structured(
             serde_json::json!({ "envelope": "sealed" }),
         ))
@@ -4766,16 +4604,12 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// A client's progress token reaches the daemon with its `tools/call`,
     /// or progress never comes back on the `plug connect` path.
     #[tokio::test]
     async fn a_tool_call_carries_the_progress_token_to_the_daemon() {
-        let temp = unique_temp_dir("progress-token");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let payload = serde_json::to_value(CallToolResult::success(Vec::new()))
             .expect("serialize call result");
         let (client, daemon_task) =
@@ -4801,14 +4635,10 @@ mod tests {
                 .is_some_and(|p| p["_meta"]["progressToken"].is_number()),
             "{params:?}"
         );
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn upstream_error_for_resources_read_reaches_the_client_as_that_error() {
-        let temp = unique_temp_dir("read-error");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let payload = serde_json::to_value(McpError::resource_not_found(
             "no such resource: file:///missing",
             None,
@@ -4831,14 +4661,10 @@ mod tests {
         assert!(error.message.contains("no such resource"), "{error:?}");
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn update_roots_consumes_its_reply_past_a_gate_push() {
-        let temp = unique_temp_dir("roots-gate");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -4902,7 +4728,6 @@ mod tests {
         );
 
         daemon_task.await.expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[test]
@@ -5013,9 +4838,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_calls_complete_out_of_order_and_notifications_still_arrive() {
-        let temp = unique_temp_dir("concurrent-calls");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let (release_slow, slow_released) = tokio::sync::oneshot::channel::<()>();
         let daemon_task = tokio::spawn(async move {
@@ -5104,14 +4926,10 @@ mod tests {
 
         drop(client);
         let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn chunked_reply_and_small_reply_route_to_their_own_requests() {
-        let temp = unique_temp_dir("concurrent-chunked");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept");
@@ -5164,14 +4982,10 @@ mod tests {
 
         drop(proxy);
         let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     #[tokio::test]
     async fn connection_drop_resolves_every_in_flight_request_with_one_reconnect() {
-        let temp = unique_temp_dir("concurrent-drop");
-        let _paths = plug_core::paths::test::isolate(&temp);
-
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept 1");
@@ -5225,7 +5039,6 @@ mod tests {
             .await
             .expect("daemon task timeout")
             .expect("daemon task join");
-        let _ = std::fs::remove_dir_all(&temp);
     }
 
     /// Sets the per-request ceiling for one test, cleared on drop.
@@ -5249,8 +5062,6 @@ mod tests {
     #[tokio::test]
     async fn a_request_the_daemon_never_answers_fails_at_the_ceiling() {
         let _ceiling = RequestCeilingTestOverride::install(Duration::from_millis(500));
-        let temp = unique_temp_dir("request-ceiling");
-        let _paths = plug_core::paths::test::isolate(&temp);
 
         let listener = bind_fake_daemon_socket();
         let daemon_task = tokio::spawn(async move {
@@ -5298,6 +5109,5 @@ mod tests {
 
         drop(proxy);
         let _ = tokio::time::timeout(Duration::from_secs(5), daemon_task).await;
-        let _ = std::fs::remove_dir_all(&temp);
     }
 }

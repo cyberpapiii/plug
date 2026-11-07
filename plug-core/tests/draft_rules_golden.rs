@@ -44,7 +44,7 @@ fn an_api_server_takes_the_shared_number_of_operations() {
 #[test]
 fn an_account_is_named_by_the_shared_rule() {
     for case in rules().accounts {
-        let path = tempfile::tempdir().unwrap().keep().join("config.toml");
+        let path = plug_core::paths::test::scratch("draft-rules").join("config.toml");
         let server: ServerConfig =
             toml::from_str("transport = \"http\"\nurl = \"https://example.test/mcp\"\n").unwrap();
         apply_operator_mutation(

@@ -117,16 +117,13 @@ mod tests {
     #[test]
     fn a_token_that_cannot_be_read_is_not_replaced() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir =
-            std::env::temp_dir().join(format!("plug-auth-unreadable-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::paths::test::scratch("auth-unreadable");
         let path = dir.join("token");
         let token = generate_auth_token();
         write_token_file(&path, &token).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
         if std::fs::read(&path).is_ok() {
             // Root reads through permissions, so there is no read error to test.
-            let _ = std::fs::remove_dir_all(&dir);
             return;
         }
 
@@ -138,14 +135,11 @@ mod tests {
             "an unreadable token is an error, not a reason to replace it"
         );
         assert_eq!(std::fs::read_to_string(&path).unwrap(), token);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn load_or_generate_creates_new_token() {
-        let dir = std::env::temp_dir().join(format!("plug_test_{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("test_token");
+        let path = crate::paths::test::scratch("auth-token").join("test_token");
 
         let token = load_or_generate_token(&path).unwrap();
         assert_eq!(token.len(), 64);
@@ -153,7 +147,5 @@ mod tests {
         // Second call reuses the same token
         let token2 = load_or_generate_token(&path).unwrap();
         assert_eq!(token, token2);
-
-        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

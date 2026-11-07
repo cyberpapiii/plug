@@ -223,11 +223,7 @@ mod tests {
     fn uninstall_cleanup_removes_only_symlink_to_verified_app() {
         use std::os::unix::fs::symlink;
 
-        let root = std::env::temp_dir().join(format!(
-            "plug-uninstall-cleanup-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let root = plug_core::paths::test::scratch("uninstall-cleanup");
         let app = app(root.join("Plug.app"));
         std::fs::create_dir_all(app.executable_path.parent().unwrap()).unwrap();
         std::fs::write(&app.executable_path, "plug").unwrap();
@@ -238,14 +234,11 @@ mod tests {
         let outcome = cleanup_command_link(&link, Some(&app)).unwrap();
         assert!(outcome.changed);
         assert!(!link.exists());
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
     fn uninstall_cleanup_reports_unknown_file_and_leaves_it_untouched() {
-        let root =
-            std::env::temp_dir().join(format!("plug-uninstall-unknown-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
+        let root = plug_core::paths::test::scratch("uninstall-unknown");
         let path = root.join("plug");
         std::fs::write(&path, "unrelated").unwrap();
 
@@ -253,7 +246,6 @@ mod tests {
         assert!(!outcome.changed);
         assert!(outcome.message.contains("left untouched"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "unrelated");
-        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

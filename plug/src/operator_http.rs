@@ -501,20 +501,10 @@ pub(crate) async fn send_authenticated_operator_request(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     use axum::body::{Body, to_bytes};
     use axum::http::Request;
     use tower::util::ServiceExt;
-
-    fn unique_temp_dir(label: &str) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "plug-operator-{label}-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&path).expect("create temp dir");
-        path
-    }
 
     #[test]
     fn local_operator_authority_matches_loopback_listener_family() {
@@ -538,17 +528,16 @@ mod tests {
             "[2001:db8::10]:3282"
         );
     }
-    async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> (Router, PathBuf) {
+    async fn owner_operator_test_router_with_authority(authority: Arc<str>) -> Router {
         let engine = plug_core::engine::Engine::new(plug_core::config::Config::default());
         engine.start().await;
         let sessions = Arc::new(plug_core::session::SessionStore::new(1800, 100));
-        let state_path = unique_temp_dir("owner-operator").join("oauth.json");
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             plug_core::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
                 oauth_scopes: vec!["tools:read".to_string()],
             },
-            state_path.clone(),
+            plug_core::paths::test::scratch("owner-operator").join("oauth.json"),
         )
         .expect("OAuth manager");
         let state = Arc::new(
@@ -559,13 +548,10 @@ mod tests {
             )
             .with_auth(plug_core::http::server::HttpAuth::Oauth(manager)),
         );
-        (
-            build_runtime_router(state, Arc::from("operator-secret"), authority),
-            state_path,
-        )
+        build_runtime_router(state, Arc::from("operator-secret"), authority)
     }
 
-    async fn owner_operator_test_router() -> (Router, PathBuf) {
+    async fn owner_operator_test_router() -> Router {
         owner_operator_test_router_with_authority(Arc::from("127.0.0.1:3282")).await
     }
 
@@ -631,7 +617,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_bootstrap_rejects_public_forwarded_request() {
-        let (app, state_path) = owner_operator_test_router().await;
+        let app = owner_operator_test_router().await;
         for forwarded_header in ["forwarded", "x-forwarded-for", "cf-connecting-ip"] {
             let response = app
                 .clone()
@@ -648,12 +634,11 @@ mod tests {
                 .expect("response");
             assert_eq!(response.status(), StatusCode::FORBIDDEN);
         }
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
     async fn operator_request_proof_is_bound_to_nonce_intent_and_single_use() {
-        let (app, state_path) = owner_operator_test_router().await;
+        let app = owner_operator_test_router().await;
         let client_nonce = "11".repeat(32);
         let method = "POST";
         let path = OPERATOR_OWNER_BOOTSTRAP_PATH;
@@ -721,12 +706,11 @@ mod tests {
         assert_eq!(first.status(), StatusCode::OK);
         let replay = app.oneshot(authenticated()).await.expect("response");
         assert_eq!(replay.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
     async fn operator_final_removal_intent_is_bound_into_request_proof() {
-        let (app, state_path) = owner_operator_test_router().await;
+        let app = owner_operator_test_router().await;
         let client_nonce = "33".repeat(32);
         let method = "DELETE";
         let path = format!("{OPERATOR_OWNER_CREDENTIALS_PATH}/missing");
@@ -778,7 +762,6 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
@@ -789,8 +772,7 @@ mod tests {
             .expect("bind test listener");
         let addr = listener.local_addr().expect("listener address");
         let authority = addr.to_string();
-        let (app, state_path) =
-            owner_operator_test_router_with_authority(Arc::from(authority.as_str())).await;
+        let app = owner_operator_test_router_with_authority(Arc::from(authority.as_str())).await;
         let server = tokio::spawn(async move {
             axum::serve(listener, app)
                 .await
@@ -839,13 +821,12 @@ mod tests {
         );
 
         server.abort();
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
     async fn operator_http_e2e_revokes_url_valued_metadata_client_and_its_token() {
         plug_core::tls::ensure_rustls_provider_installed();
-        let state_path = unique_temp_dir("operator-cimd-revoke").join("oauth.json");
+        let state_path = plug_core::paths::test::scratch("operator-cimd-revoke").join("oauth.json");
         let oauth_config = plug_core::downstream_oauth::DownstreamOauthConfig {
             public_base_url: "https://plug.example.com".to_string(),
             oauth_scopes: vec!["tools:read".to_string()],
@@ -967,12 +948,11 @@ mod tests {
 
         server.abort();
         engine.shutdown().await;
-        let _ = std::fs::remove_dir_all(state_path.parent().unwrap());
     }
 
     #[tokio::test]
     async fn operator_owner_boundary_rejects_a_missing_or_wrong_proof_and_non_loopback_host() {
-        let (app, state_path) = owner_operator_test_router().await;
+        let app = owner_operator_test_router().await;
         let missing = app
             .clone()
             .oneshot(
@@ -1024,12 +1004,11 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(duplicate_host.status(), StatusCode::FORBIDDEN);
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
     async fn operator_owner_bootstrap_list_and_remove() {
-        let (app, state_path) = owner_operator_test_router().await;
+        let app = owner_operator_test_router().await;
         let bootstrap = proof_authenticated_request(
             &app,
             "POST",
@@ -1075,7 +1054,6 @@ mod tests {
             proof_authenticated_request(&app, "DELETE", &remove_path, "operator-secret", false)
                 .await;
         assert_eq!(remove.status(), StatusCode::NOT_FOUND);
-        let _ = std::fs::remove_file(state_path);
     }
 
     #[tokio::test]
@@ -1089,10 +1067,7 @@ mod tests {
         engine.start().await;
         let tool_router = engine.tool_router().clone();
 
-        let oauth_path = std::env::temp_dir().join(format!(
-            "plug-runtime-revoke-race-{}.json",
-            uuid::Uuid::new_v4()
-        ));
+        let oauth_path = plug_core::paths::test::scratch("revoke-race").join("state.json");
         let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
             plug_core::downstream_oauth::DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
@@ -1199,6 +1174,5 @@ mod tests {
         assert_eq!(tool_router.task_count_for_owner(&owner).await, 0);
 
         engine.shutdown().await;
-        let _ = std::fs::remove_file(oauth_path);
     }
 }

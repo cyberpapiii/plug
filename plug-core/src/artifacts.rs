@@ -786,13 +786,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "plug-artifacts-test-{}-{}",
-            name,
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::paths::test::scratch(&format!("artifacts-{name}"))
     }
 
     fn test_store(base_dir: PathBuf) -> ArtifactStore {
@@ -842,7 +836,6 @@ mod tests {
 
         assert!(store.records.is_empty());
         assert!(!artifact_dir.exists());
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -891,7 +884,6 @@ mod tests {
             !store.records.contains_key("expired-read-id"),
             "expired record should be evicted after a read"
         );
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -933,8 +925,6 @@ mod tests {
             read_chunk_text(&record, record.chunk_count).is_err(),
             "an out-of-range chunk index must error"
         );
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -953,7 +943,6 @@ mod tests {
 
         assert!(!old_dir.exists(), "oldest artifact should be evicted first");
         assert!(new_dir.exists(), "newest artifact should remain");
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -979,8 +968,6 @@ mod tests {
         rehydrated.rehydrate_from_disk();
         let manifest = rehydrated.read(&uri).expect("read rehydrated manifest");
         assert_eq!(manifest.contents.len(), 1);
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -1022,8 +1009,6 @@ mod tests {
             kept(spilled),
             (None, None, "task_result:task_2".to_string())
         );
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -1054,8 +1039,6 @@ mod tests {
             Some("artifact-too-large")
         );
         assert!(store.records.is_empty());
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -1102,8 +1085,6 @@ mod tests {
             record.payload_path.exists(),
             "payload file must be written to disk"
         );
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     /// The attachment is an extra. A name that would land on the artifact's
@@ -1160,7 +1141,5 @@ mod tests {
                 "the payload is the result, not the attachment"
             );
         }
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 }

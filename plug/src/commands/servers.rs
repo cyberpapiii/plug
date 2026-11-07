@@ -1070,10 +1070,7 @@ mod tests {
     use super::*;
 
     fn test_config_path(prefix: &str) -> std::path::PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("plug-servers-{prefix}-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
-        dir.join("config.toml")
+        plug_core::paths::test::scratch(prefix).join("config.toml")
     }
 
     fn stdio_server(command: &str) -> plug_core::config::ServerConfig {

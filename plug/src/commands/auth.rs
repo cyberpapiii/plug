@@ -1553,7 +1553,6 @@ mod tests {
 
     #[test]
     fn reusable_dynamic_registration_skips_configured_clients() {
-        crate::install_test_credential_environment();
         let server = plug_core::config::ServerConfig {
             transport: plug_core::config::TransportType::Http,
             url: Some("https://example.com/mcp".to_string()),
@@ -1571,7 +1570,6 @@ mod tests {
 
     #[tokio::test]
     async fn reusable_dynamic_registration_loads_persisted_registration() {
-        crate::install_test_credential_environment();
         let server_name = format!("auth-registration-{}", std::process::id());
         let server = plug_core::config::ServerConfig {
             transport: plug_core::config::TransportType::Http,
@@ -1920,7 +1918,6 @@ mod tests {
     /// AuthRequired.
     #[tokio::test]
     async fn inject_on_an_empty_store_is_usable_by_the_runtime() {
-        crate::install_test_credential_environment();
         plug_core::tls::ensure_rustls_provider_installed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();

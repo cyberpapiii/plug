@@ -2513,10 +2513,7 @@ mod tests {
     use serde_json::json;
 
     fn temp_state_path() -> PathBuf {
-        std::env::temp_dir().join(format!(
-            "plug-downstream-oauth-{}.json",
-            uuid::Uuid::new_v4()
-        ))
+        crate::paths::test::scratch("downstream-oauth").join("state.json")
     }
 
     /// Serve one HTTP response with a chunked body that never ends, and
@@ -3820,9 +3817,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_enrollment_probe_counts_only_valid_persisted_credentials() {
-        let state_dir =
-            std::env::temp_dir().join(format!("plug-owner-probe-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("owner-probe");
         let manager = DownstreamOauthManager::try_new_with_state_dir(test_config(), &state_dir)
             .expect("manager");
         let authenticator = BrowserAuthenticator::new();
@@ -3835,14 +3830,11 @@ mod tests {
                 credential_count: 1
             }
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn owner_enrollment_probe_does_not_claim_readiness_for_corrupt_issuer_state() {
-        let state_dir =
-            std::env::temp_dir().join(format!("plug-owner-probe-corrupt-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("owner-probe-corrupt");
         let config = test_config();
         let manager = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
             .expect("manager");
@@ -3864,18 +3856,13 @@ mod tests {
             inspect_owner_enrollment_in_dir(&config, &state_dir),
             OwnerEnrollmentStatus::StateUnavailable
         );
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]
     async fn owner_enrollment_probe_rejects_state_visible_to_other_users() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let state_dir = std::env::temp_dir().join(format!(
-            "plug-owner-probe-permissions-{}",
-            uuid::Uuid::new_v4()
-        ));
-        std::fs::create_dir_all(&state_dir).expect("create state directory");
+        let state_dir = crate::paths::test::scratch("owner-probe-permissions");
         let config = test_config();
         let manager = DownstreamOauthManager::try_new_with_state_dir(config.clone(), &state_dir)
             .expect("manager");
@@ -3895,7 +3882,6 @@ mod tests {
             DownstreamOauthManager::try_new_with_state_dir(config, &state_dir),
             Err(DownstreamOauthError::Persistence(message)) if message.contains("chmod 600")
         ));
-        let _ = std::fs::remove_dir_all(state_dir);
     }
 
     #[tokio::test]

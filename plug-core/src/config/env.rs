@@ -190,8 +190,7 @@ mod tests {
 
     #[test]
     fn the_process_environment_wins_over_dotenv() {
-        let dir = std::env::temp_dir().join(format!("plug-env-source-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = crate::paths::test::scratch("env-source");
         std::fs::write(
             dir.join(".env"),
             "HOME=/from/dotenv\nPLUG_ENV_SOURCE_ONLY_IN_FILE=file\n",
@@ -206,7 +205,6 @@ mod tests {
         let apply = dotenv_to_apply(&config);
         assert!(!apply.contains_key("HOME"));
         assert_eq!(apply["PLUG_ENV_SOURCE_ONLY_IN_FILE"], "file");
-        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
