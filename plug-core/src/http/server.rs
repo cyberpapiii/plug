@@ -901,8 +901,8 @@ mod tests {
             "revocation lifecycle is preserved"
         );
         for family in [
-            crate::protocol::MethodFamily::ToolsList,
-            crate::protocol::MethodFamily::ToolsCall,
+            crate::admission::MethodFamily::ToolsList,
+            crate::admission::MethodFamily::ToolsCall,
         ] {
             assert!(
                 context.policy_decision(family).is_allowed(),
@@ -910,17 +910,17 @@ mod tests {
             );
         }
         for family in [
-            crate::protocol::MethodFamily::ResourcesList,
-            crate::protocol::MethodFamily::ResourcesRead,
-            crate::protocol::MethodFamily::ResourcesSubscribe,
-            crate::protocol::MethodFamily::PromptsList,
-            crate::protocol::MethodFamily::PromptsGet,
-            crate::protocol::MethodFamily::Completion,
-            crate::protocol::MethodFamily::Tasks,
+            crate::admission::MethodFamily::ResourcesList,
+            crate::admission::MethodFamily::ResourcesRead,
+            crate::admission::MethodFamily::ResourcesSubscribe,
+            crate::admission::MethodFamily::PromptsList,
+            crate::admission::MethodFamily::PromptsGet,
+            crate::admission::MethodFamily::Completion,
+            crate::admission::MethodFamily::Tasks,
         ] {
             assert_eq!(
                 context.policy_decision(family),
-                crate::protocol::PolicyDecision::Deny(
+                crate::admission::PolicyDecision::Deny(
                     crate::protocol::ProtocolOutcome::PermissionDenied
                 ),
                 "ungranted {family:?} must deny with PermissionDenied in the legacy era"
@@ -989,7 +989,7 @@ mod tests {
 
     #[tokio::test]
     async fn legacy_default_grant_token_reaches_resources_and_prompts_over_http() {
-        let default_scopes: Vec<String> = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+        let default_scopes: Vec<String> = crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -1099,12 +1099,12 @@ mod tests {
 
         // The full default grant sees the whole union, so this is not a
         // behavior change for a client that consented to everything.
-        let full = advertised(&crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES);
+        let full = advertised(&crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES);
         assert_eq!(full, every_legacy_capability());
 
         // The live deployment pins the six families that predate
         // `logging:configure`; those clients keep everything they use.
-        let six: Vec<&str> = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+        let six: Vec<&str> = crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
             .iter()
             .copied()
             .filter(|scope| *scope != "logging:configure")
@@ -1183,7 +1183,7 @@ mod tests {
         );
 
         // The default grant carries the scope, so no ordinary client regresses.
-        let default_scopes: Vec<String> = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+        let default_scopes: Vec<String> = crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
             .iter()
             .map(ToString::to_string)
             .collect();
@@ -1543,7 +1543,7 @@ mod tests {
 
         // With every scope the families come through, still without logging,
         // legacy extras, subscriptions or extensions Plug cannot serve.
-        let all_scopes = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES;
+        let all_scopes = crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES;
         let full = crate::dispatch::project_capabilities(everything, &context(&all_scopes), true);
         assert!(full.tools.is_some() && full.prompts.is_some() && full.completions.is_some());
         assert!(

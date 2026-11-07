@@ -21,11 +21,11 @@ use plug_core::doctor::{CheckResult, CheckStatus, DoctorReport};
 use plug_core::import::{DiscoveredServer, ImportReport, ScanResult};
 use plug_core::ipc::LiveSessionTransport;
 
-use crate::commands::clients::{ClientView, LiveSessionView};
 use crate::commands::doctor::{
     ClientRepairItem, ClientRepairReport, PlugLinkDisposition, UnifiedInstallSnapshot,
     doctor_json_value,
 };
+use crate::views::clients::{ClientView, LiveSessionView};
 use crate::views::live::{LiveInventory, LiveSessionTransportCounts};
 
 fn dir() -> PathBuf {

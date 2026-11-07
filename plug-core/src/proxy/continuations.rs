@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::protocol::{AdmissionQuotas, ProtocolOutcome, QuotaLease, QuotaResource};
+use crate::admission::{AdmissionQuotas, QuotaLease, QuotaResource};
+use crate::protocol::ProtocolOutcome;
 use crate::types::PrincipalId;
 
 const ASSOCIATED_DATA_DOMAIN: &[u8] = b"plug/mrtr/continuation-binding/v1\0";
@@ -501,7 +502,7 @@ impl<T> ContinuationRegistry<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::AdmissionQuotaConfig;
+    use crate::admission::AdmissionQuotaConfig;
 
     fn principal(value: u128) -> PrincipalId {
         PrincipalId::daemon_ipc(Uuid::from_u128(value))

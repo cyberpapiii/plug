@@ -1,17 +1,14 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use dialoguer::console::style;
 
-use crate::OutputFormat;
-use crate::commands::config::load_editable_config;
-use crate::commands::tools::prompt_tool_actions;
-use crate::ipc_client;
+use crate::ipc_client::DaemonQueryAvailability;
 use crate::ui::{
-    can_prompt_interactively, print_banner, print_heading, print_info_line, print_label_value,
-    print_wrapped_rows, terminal_width,
+    print_banner, print_heading, print_info_line, print_label_value, print_wrapped_rows,
+    terminal_width,
 };
 
-type ToolInventoryGroup = Vec<(
+pub(crate) type ToolInventoryGroup = Vec<(
     String,
     String,
     Option<String>,
@@ -55,12 +52,6 @@ fn classify_empty_tool_inventory(
         return ToolInventoryEmptyState::AllServersUnavailable;
     }
     ToolInventoryEmptyState::EmptyMergedSet
-}
-
-/// `plug tools workspace` matches the server id; `plug tools gmail` matches
-/// one of the tool groups a server exposes under its own prefix.
-fn group_matches(prefix: &str, server_id: &str, filter: &str) -> bool {
-    server_id.eq_ignore_ascii_case(filter) || prefix.eq_ignore_ascii_case(filter)
 }
 
 /// One row per server for the default `plug tools` view.
@@ -126,275 +117,161 @@ fn print_server_summaries(summaries: &[ServerToolSummary<'_>], width: usize) {
     }
 }
 
-pub(crate) async fn cmd_tool_list(
-    config_path: Option<&std::path::PathBuf>,
-    output: &OutputFormat,
-    verbose: u8,
-    server: Option<&str>,
-) -> anyhow::Result<()> {
-    let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-
-    loop {
-        let (status_availability, runtime_status) = ipc_client::query(
-            plug_core::ipc::IpcRequest::Status,
-            |response| match response {
-                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(
-                    servers
-                        .into_iter()
-                        .filter(|server| {
-                            server.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID
+/// `plug tools` as JSON.
+pub(crate) fn tools_json(
+    tools_by_prefix: &BTreeMap<String, ToolInventoryGroup>,
+    inventory_availability: DaemonQueryAvailability,
+    tool_count: usize,
+    server_count: usize,
+) -> serde_json::Value {
+    let json_groups: BTreeMap<String, Vec<serde_json::Value>> = tools_by_prefix
+        .iter()
+        .map(|(prefix, tools)| {
+            let entries: Vec<serde_json::Value> = tools
+                .iter()
+                .map(
+                    |(name, server_id, title, desc, icons, risk, source, upstream, trust)| {
+                        serde_json::json!({
+                            "name": name,
+                            "server_id": server_id,
+                            "title": title,
+                            "description": desc,
+                            "icons": icons,
+                            "risk": risk,
+                            "source": source,
+                            "upstream": upstream,
+                            "trust": trust,
                         })
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            },
-        )
-        .await;
-        let config = load_editable_config(config_path)
-            .ok()
-            .map(|(_, config)| config);
-        let configured_server_count = config
-            .as_ref()
-            .map(|config| config.servers.len())
-            .unwrap_or(0);
-        let runtime_available = status_availability.runtime_available();
-        let runtime_servers = runtime_status.unwrap_or_default();
-        let (tools_availability, tools_result) = ipc_client::query(
-            plug_core::ipc::IpcRequest::ListTools,
-            |response| match response {
-                plug_core::ipc::IpcResponse::Tools { tools } => Some(
-                    tools
-                        .into_iter()
-                        .filter(|tool| tool.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
-                        .collect::<Vec<_>>(),
-                ),
-                _ => None,
-            },
-        )
-        .await;
-        let all_tools = tools_result.unwrap_or_default();
-        let inventory_availability = if runtime_available {
-            tools_availability
-        } else {
-            status_availability
-        };
-        let inventory_available = inventory_availability.runtime_available();
+                    },
+                )
+                .collect();
+            (prefix.clone(), entries)
+        })
+        .collect();
+    serde_json::json!({
+        "runtime_available": inventory_availability.runtime_available(),
+        "status_source": inventory_availability.status_source(),
+        "tool_count": tool_count,
+        "server_count": server_count,
+        "groups": json_groups,
+    })
+}
 
-        let delimiter = config.as_ref().map_or_else(
-            || plug_core::config::Config::default().prefix_delimiter,
-            |config| config.prefix_delimiter.clone(),
-        );
-        let mut tools_by_prefix: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
-        for t in &all_tools {
-            let (prefix, tool_name) =
-                if let Some((prefix, tool_name)) = t.name.split_once(delimiter.as_str()) {
-                    (prefix.to_string(), tool_name.to_string())
-                } else {
-                    (t.server_id.clone(), t.name.clone())
-                };
-            tools_by_prefix.entry(prefix).or_default().push((
-                tool_name,
-                t.server_id.clone(),
-                t.title.clone(),
-                t.description.clone(),
-                t.icons.clone(),
-                t.risk.clone(),
-                t.source.clone(),
-                t.upstream.clone(),
-                t.trust.clone(),
-            ));
+/// Why `plug tools` has nothing to list, and what to run about it.
+pub(crate) fn print_empty_tool_inventory(
+    inventory_available: bool,
+    daemon_reachable: bool,
+    configured_server_count: usize,
+    runtime_servers: &[plug_core::types::ServerStatus],
+) {
+    match classify_empty_tool_inventory(
+        inventory_available,
+        daemon_reachable,
+        configured_server_count,
+        runtime_servers,
+    ) {
+        ToolInventoryEmptyState::NoConfiguredServers => {
+            println!(
+                "No servers are configured. Use {} or {} to add upstreams.",
+                style("plug setup").cyan(),
+                style("plug servers").cyan()
+            );
         }
-
-        if let Some(filter) = server {
-            tools_by_prefix.retain(|prefix, tools| group_matches(prefix, &tools[0].1, filter));
-            if tools_by_prefix.is_empty() && inventory_available {
-                anyhow::bail!(
-                    "no server or tool group named `{filter}`; run `plug tools` to see them"
-                );
-            }
+        ToolInventoryEmptyState::RuntimeUnavailable => {
+            println!(
+                "Runtime is unavailable. Start the shared service with {} or inspect config with {}.",
+                style("plug start").cyan(),
+                style("plug servers").cyan()
+            );
         }
-        let tool_count: usize = tools_by_prefix.values().map(Vec::len).sum();
-        let server_count = tools_by_prefix
-            .values()
-            .flat_map(|tools| tools.iter().map(|tool| tool.1.as_str()))
-            .collect::<BTreeSet<_>>()
-            .len();
-
-        match output {
-            OutputFormat::Json => {
-                let json_groups: BTreeMap<String, Vec<serde_json::Value>> = tools_by_prefix
-                    .iter()
-                    .map(|(prefix, tools)| {
-                        let entries: Vec<serde_json::Value> = tools
-                            .iter()
-                            .map(
-                                |(
-                                    name,
-                                    server_id,
-                                    title,
-                                    desc,
-                                    icons,
-                                    risk,
-                                    source,
-                                    upstream,
-                                    trust,
-                                )| {
-                                    serde_json::json!({
-                                        "name": name,
-                                        "server_id": server_id,
-                                        "title": title,
-                                        "description": desc,
-                                        "icons": icons,
-                                        "risk": risk,
-                                        "source": source,
-                                        "upstream": upstream,
-                                        "trust": trust,
-                                    })
-                                },
-                            )
-                            .collect();
-                        (prefix.clone(), entries)
-                    })
-                    .collect();
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&serde_json::json!({
-                        "runtime_available": inventory_available,
-                        "status_source": inventory_availability.status_source(),
-                        "tool_count": tool_count,
-                        "server_count": server_count,
-                        "groups": json_groups,
-                    }))?
-                );
-                return Ok(());
-            }
-            OutputFormat::Text => {
-                if tools_by_prefix.is_empty() {
-                    match classify_empty_tool_inventory(
-                        inventory_available,
-                        inventory_availability.daemon_reachable(),
-                        configured_server_count,
-                        &runtime_servers,
-                    ) {
-                        ToolInventoryEmptyState::NoConfiguredServers => {
-                            println!(
-                                "No servers are configured. Use {} or {} to add upstreams.",
-                                style("plug setup").cyan(),
-                                style("plug servers").cyan()
-                            );
-                        }
-                        ToolInventoryEmptyState::RuntimeUnavailable => {
-                            println!(
-                                "Runtime is unavailable. Start the shared service with {} or inspect config with {}.",
-                                style("plug start").cyan(),
-                                style("plug servers").cyan()
-                            );
-                        }
-                        ToolInventoryEmptyState::RuntimeInspectionFailed => {
-                            println!(
-                                "Runtime inspection failed even though the daemon is reachable. Use {} or {} to diagnose the IPC/runtime failure.",
-                                style("plug doctor").cyan(),
-                                style("plug status").cyan()
-                            );
-                        }
-                        ToolInventoryEmptyState::AllServersUnavailable => {
-                            println!(
-                                "All configured servers are currently unavailable or auth-required. Check {} and {} for details.",
-                                style("plug status").cyan(),
-                                style("plug auth status").cyan()
-                            );
-                        }
-                        ToolInventoryEmptyState::EmptyMergedSet => {
-                            println!(
-                                "No tools are currently exposed even though the runtime is available. Check {} for enabled servers and {} for hidden or disabled tools.",
-                                style("plug servers").cyan(),
-                                style("plug config check").cyan()
-                            );
-                        }
-                    }
-                    return Ok(());
-                }
-                let term_width = terminal_width();
-                let available_width = term_width.saturating_sub(40);
-                let disabled_count = config
-                    .as_ref()
-                    .map(|config| config.disabled_tools.len())
-                    .unwrap_or(0);
-                print_banner(
-                    "◆",
-                    "Tools",
-                    &format!("{tool_count} tools across {server_count} server(s)"),
-                );
-                print_heading("Summary");
-                print_label_value("Tools", style(tool_count).bold());
-                print_label_value("Servers", style(server_count).bold());
-                // `disabled_tools` applies to every server, so it only belongs
-                // in the whole inventory.
-                if server.is_none() && disabled_count > 0 {
-                    print_label_value("Disabled", style(disabled_count).yellow().bold());
-                }
-                println!();
-                if server.is_none() && verbose == 0 {
-                    print_server_summaries(&server_tool_summaries(&tools_by_prefix), term_width);
-                    println!();
-                    print_info_line(
-                        "Run `plug tools <server>` to list one server's tools, or `plug tools -v` to list them all.",
-                    );
-                } else {
-                    print_heading("Inventory");
-                    for (prefix, mut tools) in tools_by_prefix {
-                        tools.sort_by(|a, b| a.0.cmp(&b.0));
-                        let server_id = &tools[0].1;
-                        let annotation = if !server_id.eq_ignore_ascii_case(&prefix) {
-                            format!(" {}", style(format!("[{}]", server_id)).dim())
-                        } else {
-                            String::new()
-                        };
-                        println!(
-                            "{} {} {}{}",
-                            style("▸").cyan().bold(),
-                            style(&prefix).bold(),
-                            style(format!("{} tools", tools.len())).dim(),
-                            annotation
-                        );
-                        for (
-                            name,
-                            _server_id,
-                            title,
-                            desc,
-                            _icons,
-                            _risk,
-                            _source,
-                            _upstream,
-                            _trust,
-                        ) in &tools
-                        {
-                            let name_styled = style(format!("  │ {:<28}", name)).cyan();
-                            let display_text = title.as_deref().or(desc.as_deref());
-                            if let Some(text) = display_text {
-                                let cleaned = text.replace('\n', " ").replace('\r', "");
-                                let short = crate::ui::truncate_tail(&cleaned, available_width);
-                                println!("{}  {}", name_styled, style(short).dim());
-                            } else {
-                                println!("{}", name_styled);
-                            }
-                        }
-                        println!();
-                    }
-                }
-            }
+        ToolInventoryEmptyState::RuntimeInspectionFailed => {
+            println!(
+                "Runtime inspection failed even though the daemon is reachable. Use {} or {} to diagnose the IPC/runtime failure.",
+                style("plug doctor").cyan(),
+                style("plug status").cyan()
+            );
         }
-
-        if !interactive {
-            break;
+        ToolInventoryEmptyState::AllServersUnavailable => {
+            println!(
+                "All configured servers are currently unavailable or auth-required. Check {} and {} for details.",
+                style("plug status").cyan(),
+                style("plug auth status").cyan()
+            );
         }
-        println!();
-        if !prompt_tool_actions(config_path).await? {
-            break;
+        ToolInventoryEmptyState::EmptyMergedSet => {
+            println!(
+                "No tools are currently exposed even though the runtime is available. Check {} for enabled servers and {} for hidden or disabled tools.",
+                style("plug servers").cyan(),
+                style("plug config check").cyan()
+            );
         }
-        println!();
     }
-    Ok(())
+}
+
+/// `plug tools` as text. `whole_inventory` is false when one server or
+/// group was asked for.
+pub(crate) fn print_tool_inventory(
+    tools_by_prefix: BTreeMap<String, ToolInventoryGroup>,
+    tool_count: usize,
+    server_count: usize,
+    disabled_count: usize,
+    whole_inventory: bool,
+    verbose: u8,
+) {
+    let term_width = terminal_width();
+    let available_width = term_width.saturating_sub(40);
+    print_banner(
+        "◆",
+        "Tools",
+        &format!("{tool_count} tools across {server_count} server(s)"),
+    );
+    print_heading("Summary");
+    print_label_value("Tools", style(tool_count).bold());
+    print_label_value("Servers", style(server_count).bold());
+    // `disabled_tools` applies to every server, so it only belongs
+    // in the whole inventory.
+    if whole_inventory && disabled_count > 0 {
+        print_label_value("Disabled", style(disabled_count).yellow().bold());
+    }
+    println!();
+    if whole_inventory && verbose == 0 {
+        print_server_summaries(&server_tool_summaries(&tools_by_prefix), term_width);
+        println!();
+        print_info_line(
+            "Run `plug tools <server>` to list one server's tools, or `plug tools -v` to list them all.",
+        );
+    } else {
+        print_heading("Inventory");
+        for (prefix, mut tools) in tools_by_prefix {
+            tools.sort_by(|a, b| a.0.cmp(&b.0));
+            let server_id = &tools[0].1;
+            let annotation = if !server_id.eq_ignore_ascii_case(&prefix) {
+                format!(" {}", style(format!("[{}]", server_id)).dim())
+            } else {
+                String::new()
+            };
+            println!(
+                "{} {} {}{}",
+                style("▸").cyan().bold(),
+                style(&prefix).bold(),
+                style(format!("{} tools", tools.len())).dim(),
+                annotation
+            );
+            for (name, _server_id, title, desc, _icons, _risk, _source, _upstream, _trust) in &tools
+            {
+                let name_styled = style(format!("  │ {:<28}", name)).cyan();
+                let display_text = title.as_deref().or(desc.as_deref());
+                if let Some(text) = display_text {
+                    let cleaned = text.replace('\n', " ").replace('\r', "");
+                    let short = crate::ui::truncate_tail(&cleaned, available_width);
+                    println!("{}  {}", name_styled, style(short).dim());
+                } else {
+                    println!("{}", name_styled);
+                }
+            }
+            println!();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -505,12 +382,5 @@ mod tests {
                 },
             ]
         );
-    }
-
-    #[test]
-    fn tool_filter_matches_server_or_group_ignoring_case() {
-        assert!(group_matches("Gmail", "workspace", "workspace"));
-        assert!(group_matches("Gmail", "workspace", "gmail"));
-        assert!(!group_matches("Gmail", "workspace", "slack"));
     }
 }

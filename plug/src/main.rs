@@ -569,7 +569,7 @@ async fn run() -> anyhow::Result<()> {
     };
 
     match cli.command {
-        None => views::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
+        None => commands::overview::cmd_overview(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Start) => runtime::cmd_start(cli.config.as_ref(), &cli.output).await?,
         Some(Commands::Connect { client }) => {
             ipc_proxy::cmd_connect(cli.config.as_ref(), client).await?
@@ -587,7 +587,7 @@ async fn run() -> anyhow::Result<()> {
                 })?;
         }
         Some(Commands::Status { show_token }) => {
-            views::overview::cmd_status(
+            commands::overview::cmd_status(
                 cli.config.as_ref(),
                 &cli.output,
                 show_token,
@@ -597,10 +597,10 @@ async fn run() -> anyhow::Result<()> {
         }
         Some(Commands::Stop) => runtime::cmd_daemon_stop().await?,
         Some(Commands::Servers) => {
-            views::servers::cmd_server_list(cli.config.as_ref(), &cli.output).await?
+            commands::servers::cmd_server_list(cli.config.as_ref(), &cli.output).await?
         }
         Some(Commands::Clients { command: None }) => {
-            views::clients::cmd_client_list(cli.config.as_ref(), &cli.output, cli.verbose > 0)
+            commands::clients::cmd_client_list(cli.config.as_ref(), &cli.output, cli.verbose > 0)
                 .await?
         }
         Some(Commands::Clients {
@@ -683,7 +683,7 @@ async fn run() -> anyhow::Result<()> {
             command: None,
             server,
         }) => {
-            views::tools::cmd_tool_list(
+            commands::tools::cmd_tool_list(
                 cli.config.as_ref(),
                 &cli.output,
                 cli.verbose,

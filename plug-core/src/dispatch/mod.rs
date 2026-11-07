@@ -22,7 +22,8 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
-use crate::protocol::{MethodFamily, ProtocolEra};
+use crate::admission::MethodFamily;
+use crate::protocol::ProtocolEra;
 use crate::proxy::continuations::exceeds_continuation_limits;
 use crate::proxy::{DownstreamCallContext, ToolRouter};
 use crate::tasks::{OwnerLivenessProbe, TaskOwner};

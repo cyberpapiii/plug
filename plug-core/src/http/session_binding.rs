@@ -15,7 +15,7 @@ pub(super) fn broadcast_audience_for(
     session_id: &str,
     auth_status: &AuthStatus,
 ) -> BroadcastAudience {
-    use crate::protocol::MethodFamily;
+    use crate::admission::MethodFamily;
     let issuer = state.downstream_oauth().map(|manager| manager.base_url());
     let context = apply_http_auth(
         crate::proxy::DownstreamCallContext::http(

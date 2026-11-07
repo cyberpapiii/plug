@@ -4,9 +4,14 @@ use dialoguer::{MultiSelect, Select};
 use crate::commands::config::load_editable_config;
 use crate::runtime::ensure_daemon_with_feedback;
 use crate::ui::{
-    cli_prompt_theme, print_banner, print_info_line, print_label_value, print_success_line,
+    can_prompt_interactively, cli_prompt_theme, print_banner, print_info_line, print_label_value,
+    print_success_line,
+};
+use crate::views::tools::{
+    ToolInventoryGroup, print_empty_tool_inventory, print_tool_inventory, tools_json,
 };
 use crate::{OutputFormat, ToolCommands};
+use std::collections::{BTreeMap, BTreeSet};
 
 pub(crate) async fn cmd_tool_command(
     config_path: Option<&std::path::PathBuf>,
@@ -301,9 +306,168 @@ pub(crate) async fn cmd_tool_enable(
     Ok(())
 }
 
+pub(crate) async fn cmd_tool_list(
+    config_path: Option<&std::path::PathBuf>,
+    output: &OutputFormat,
+    verbose: u8,
+    server: Option<&str>,
+) -> anyhow::Result<()> {
+    let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
+
+    loop {
+        let (status_availability, runtime_status) = crate::ipc_client::query(
+            plug_core::ipc::IpcRequest::Status,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(
+                    servers
+                        .into_iter()
+                        .filter(|server| {
+                            server.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            },
+        )
+        .await;
+        let config = load_editable_config(config_path)
+            .ok()
+            .map(|(_, config)| config);
+        let configured_server_count = config
+            .as_ref()
+            .map(|config| config.servers.len())
+            .unwrap_or(0);
+        let runtime_available = status_availability.runtime_available();
+        let runtime_servers = runtime_status.unwrap_or_default();
+        let (tools_availability, tools_result) =
+            crate::ipc_client::query(plug_core::ipc::IpcRequest::ListTools, |response| {
+                match response {
+                    plug_core::ipc::IpcResponse::Tools { tools } => Some(
+                        tools
+                            .into_iter()
+                            .filter(|tool| {
+                                tool.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
+                    _ => None,
+                }
+            })
+            .await;
+        let all_tools = tools_result.unwrap_or_default();
+        let inventory_availability = if runtime_available {
+            tools_availability
+        } else {
+            status_availability
+        };
+        let inventory_available = inventory_availability.runtime_available();
+
+        let delimiter = config.as_ref().map_or_else(
+            || plug_core::config::Config::default().prefix_delimiter,
+            |config| config.prefix_delimiter.clone(),
+        );
+        let mut tools_by_prefix: BTreeMap<String, ToolInventoryGroup> = BTreeMap::new();
+        for t in &all_tools {
+            let (prefix, tool_name) =
+                if let Some((prefix, tool_name)) = t.name.split_once(delimiter.as_str()) {
+                    (prefix.to_string(), tool_name.to_string())
+                } else {
+                    (t.server_id.clone(), t.name.clone())
+                };
+            tools_by_prefix.entry(prefix).or_default().push((
+                tool_name,
+                t.server_id.clone(),
+                t.title.clone(),
+                t.description.clone(),
+                t.icons.clone(),
+                t.risk.clone(),
+                t.source.clone(),
+                t.upstream.clone(),
+                t.trust.clone(),
+            ));
+        }
+
+        if let Some(filter) = server {
+            tools_by_prefix.retain(|prefix, tools| group_matches(prefix, &tools[0].1, filter));
+            if tools_by_prefix.is_empty() && inventory_available {
+                anyhow::bail!(
+                    "no server or tool group named `{filter}`; run `plug tools` to see them"
+                );
+            }
+        }
+        let tool_count: usize = tools_by_prefix.values().map(Vec::len).sum();
+        let server_count = tools_by_prefix
+            .values()
+            .flat_map(|tools| tools.iter().map(|tool| tool.1.as_str()))
+            .collect::<BTreeSet<_>>()
+            .len();
+
+        match output {
+            OutputFormat::Json => {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&tools_json(
+                        &tools_by_prefix,
+                        inventory_availability,
+                        tool_count,
+                        server_count,
+                    ))?
+                );
+                return Ok(());
+            }
+            OutputFormat::Text => {
+                if tools_by_prefix.is_empty() {
+                    print_empty_tool_inventory(
+                        inventory_available,
+                        inventory_availability.daemon_reachable(),
+                        configured_server_count,
+                        &runtime_servers,
+                    );
+                    return Ok(());
+                }
+                let disabled_count = config
+                    .as_ref()
+                    .map(|config| config.disabled_tools.len())
+                    .unwrap_or(0);
+                print_tool_inventory(
+                    tools_by_prefix,
+                    tool_count,
+                    server_count,
+                    disabled_count,
+                    server.is_none(),
+                    verbose,
+                );
+            }
+        }
+
+        if !interactive {
+            break;
+        }
+        println!();
+        if !prompt_tool_actions(config_path).await? {
+            break;
+        }
+        println!();
+    }
+    Ok(())
+}
+
+/// `plug tools workspace` matches the server id; `plug tools gmail` matches
+/// one of the tool groups a server exposes under its own prefix.
+fn group_matches(prefix: &str, server_id: &str, filter: &str) -> bool {
+    server_id.eq_ignore_ascii_case(filter) || prefix.eq_ignore_ascii_case(filter)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_filter_matches_server_or_group_ignoring_case() {
+        assert!(group_matches("Gmail", "workspace", "workspace"));
+        assert!(group_matches("Gmail", "workspace", "gmail"));
+        assert!(!group_matches("Gmail", "workspace", "slack"));
+    }
 
     fn config_file(label: &str, config: &plug_core::config::Config) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!(

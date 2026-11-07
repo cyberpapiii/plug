@@ -466,7 +466,7 @@ pub struct ToolRouter {
     /// records each operation finds expired.
     task_store: Mutex<TaskStore>,
     /// One process-wide admission ledger shared by every downstream transport.
-    admission_quotas: crate::protocol::AdmissionQuotas,
+    admission_quotas: crate::admission::AdmissionQuotas,
     /// Process-wide, reloadable gate for the modern downstream lifecycle.
     /// It defaults off and is captured into each downstream call context.
     modern_downstream_enabled: AtomicBool,
@@ -714,8 +714,8 @@ impl DownstreamCallContext {
 
     pub fn policy_decision(
         &self,
-        family: crate::protocol::MethodFamily,
-    ) -> crate::protocol::PolicyDecision {
+        family: crate::admission::MethodFamily,
+    ) -> crate::admission::PolicyDecision {
         self.decide(family, false)
     }
 
@@ -723,11 +723,11 @@ impl DownstreamCallContext {
     /// multi-round tool call, the one bridge that exists.
     fn decide(
         &self,
-        family: crate::protocol::MethodFamily,
+        family: crate::admission::MethodFamily,
         bridge_implemented: bool,
-    ) -> crate::protocol::PolicyDecision {
-        crate::protocol::decide_method(
-            &crate::protocol::CapabilityPolicyInput {
+    ) -> crate::admission::PolicyDecision {
+        crate::admission::decide_method(
+            &crate::admission::CapabilityPolicyInput {
                 era: self.protocol_era,
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
@@ -739,21 +739,21 @@ impl DownstreamCallContext {
         )
     }
 
-    fn admit(&self, decision: crate::protocol::PolicyDecision) -> Result<(), rmcp::ErrorData> {
+    fn admit(&self, decision: crate::admission::PolicyDecision) -> Result<(), rmcp::ErrorData> {
         match decision {
-            crate::protocol::PolicyDecision::Allow => Ok(()),
-            crate::protocol::PolicyDecision::Deny(outcome) => {
+            crate::admission::PolicyDecision::Allow => Ok(()),
+            crate::admission::PolicyDecision::Deny(outcome) => {
                 Err(outcome.into_error(self.protocol_era))
             }
         }
     }
 
-    pub fn authorize(&self, family: crate::protocol::MethodFamily) -> Result<(), rmcp::ErrorData> {
+    pub fn authorize(&self, family: crate::admission::MethodFamily) -> Result<(), rmcp::ErrorData> {
         self.admit(self.decide(family, false))
     }
 
     fn authorize_continuation(&self) -> Result<(), rmcp::ErrorData> {
-        self.admit(self.decide(crate::protocol::MethodFamily::Continuations, true))
+        self.admit(self.decide(crate::admission::MethodFamily::Continuations, true))
     }
 
     pub(crate) fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
@@ -970,7 +970,7 @@ impl ToolRouter {
         Self::build(
             server_manager,
             config,
-            crate::protocol::AdmissionQuotas::new(Default::default()),
+            crate::admission::AdmissionQuotas::new(Default::default()),
             tracker,
             recovery,
         )
@@ -982,7 +982,7 @@ impl ToolRouter {
         Self::new_with_quotas(
             server_manager,
             config,
-            crate::protocol::AdmissionQuotas::new(Default::default()),
+            crate::admission::AdmissionQuotas::new(Default::default()),
         )
     }
 
@@ -997,7 +997,7 @@ impl ToolRouter {
     pub(crate) fn new_with_quotas(
         server_manager: Arc<ServerManager>,
         config: RouterConfig,
-        admission_quotas: crate::protocol::AdmissionQuotas,
+        admission_quotas: crate::admission::AdmissionQuotas,
     ) -> Self {
         Self::build(
             server_manager,
@@ -1011,7 +1011,7 @@ impl ToolRouter {
     fn build(
         server_manager: Arc<ServerManager>,
         config: RouterConfig,
-        admission_quotas: crate::protocol::AdmissionQuotas,
+        admission_quotas: crate::admission::AdmissionQuotas,
         tracker: tokio_util::task::TaskTracker,
         recovery: Weak<dyn Recovery>,
     ) -> Self {
@@ -1612,14 +1612,14 @@ impl ToolRouter {
     pub fn admit_modern_request(
         &self,
         context: &DownstreamCallContext,
-    ) -> Result<crate::protocol::QuotaLease, McpError> {
+    ) -> Result<crate::admission::QuotaLease, McpError> {
         let principal = context.principal.clone().unwrap_or_else(|| {
             crate::downstream_identity::quota_principal_for_anonymous(context.client_id.as_ref())
         });
         self.admission_quotas
             .try_acquire(
                 &principal,
-                crate::protocol::QuotaResource::ConcurrentModernRequests,
+                crate::admission::QuotaResource::ConcurrentModernRequests,
                 1,
             )
             .map_err(|outcome| outcome.into_error(context.protocol_era))

@@ -8,8 +8,8 @@ use serde_json::Value;
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 
+use crate::admission::QuotaLease;
 use crate::legacy_tasks::{GetTaskPayloadResult, GetTaskResult, Task, TaskStatus};
-use crate::protocol::QuotaLease;
 
 pub const DEFAULT_TASK_TTL_MS: u64 = 60 * 60 * 1000;
 pub const DEFAULT_TASK_POLL_INTERVAL_MS: u64 = 1000;

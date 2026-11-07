@@ -4,6 +4,7 @@ pub(crate) mod config;
 pub(crate) mod doctor;
 pub(crate) mod events;
 pub(crate) mod import;
+pub(crate) mod overview;
 pub(crate) mod reload;
 pub(crate) mod repair;
 pub(crate) mod secrets;

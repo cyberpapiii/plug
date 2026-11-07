@@ -1,6 +1,6 @@
 //! What the daemon says about the downstream sessions connected now.
 
-use plug_core::ipc::{IpcLiveSessionInfo, IpcRequest, IpcResponse, LiveSessionTransport};
+use plug_core::ipc::{IpcLiveSessionInfo, LiveSessionTransport};
 
 #[derive(Debug, Clone, Copy, serde::Serialize, Default)]
 pub(crate) struct LiveSessionTransportCounts {
@@ -36,15 +36,6 @@ fn transport_counts(sessions: &[IpcLiveSessionInfo]) -> LiveSessionTransportCoun
         }
     }
     counts
-}
-
-/// Every live downstream session, as the daemon reports them; none when it
-/// does not answer.
-pub(crate) async fn fetch_live_sessions() -> Vec<IpcLiveSessionInfo> {
-    match crate::ipc_client::request(IpcRequest::ListLiveSessions).await {
-        Ok(IpcResponse::LiveSessions { sessions }) => sessions,
-        _ => Vec::new(),
-    }
 }
 
 #[cfg(test)]

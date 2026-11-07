@@ -31,7 +31,7 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
         );
         assert!(
             context
-                .authorize(crate::protocol::MethodFamily::ToolsList)
+                .authorize(crate::admission::MethodFamily::ToolsList)
                 .is_err(),
             "an unopted HTTP context must be denied, not allowed"
         );
@@ -50,12 +50,12 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     assert!(!bearer.local_trust);
     assert!(
         bearer
-            .authorize(crate::protocol::MethodFamily::ToolsList)
+            .authorize(crate::admission::MethodFamily::ToolsList)
             .is_ok()
     );
     assert!(
         bearer
-            .authorize(crate::protocol::MethodFamily::PromptsGet)
+            .authorize(crate::admission::MethodFamily::PromptsGet)
             .is_err(),
         "an authorized context is still bounded by its scopes"
     );
@@ -72,7 +72,7 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     assert!(loopback.local_trust);
     assert!(
         loopback
-            .authorize(crate::protocol::MethodFamily::PromptsGet)
+            .authorize(crate::admission::MethodFamily::PromptsGet)
             .is_ok(),
         "a loopback listener that requires no auth keeps full local access"
     );
@@ -87,7 +87,7 @@ fn http_call_contexts_are_untrusted_until_an_adapter_opts_in() {
     assert!(context.local_trust, "local transports keep local trust");
     assert!(
         context
-            .authorize(crate::protocol::MethodFamily::ToolsCall)
+            .authorize(crate::admission::MethodFamily::ToolsCall)
             .is_ok()
     );
 }
@@ -3045,7 +3045,7 @@ async fn native_continuation_rejects_same_upstream_arc_tool_remap_before_invocat
 #[tokio::test]
 async fn full_continuation_count_and_byte_capacity_prevents_upstream_invocation() {
     let sm = Arc::new(ServerManager::new());
-    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+    let quotas = crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
         continuations: 1,
         continuation_bytes: MRTR_MAX_BYTES,
         per_principal_divisor: 1,
@@ -3111,7 +3111,7 @@ async fn default_oauth_grant_allows_plain_tool_call_to_modern_upstream() {
     )
     .with_authorization(
         principal,
-        crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES.map(str::to_string),
+        crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES.map(str::to_string),
     )
     .with_protocol(
         crate::protocol::ProtocolEra::Modern,
@@ -3345,7 +3345,7 @@ async fn oauth_revocation_while_upstream_response_is_paused_cannot_park_state() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
     let sm = Arc::new(ServerManager::new());
-    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+    let quotas = crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
         continuations: 1,
         continuation_bytes: MRTR_MAX_BYTES,
         per_principal_divisor: 1,
@@ -3413,7 +3413,7 @@ async fn snapshot_refresh_after_final_precheck_cannot_publish_parked_state() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn ipc_principal_cleanup_after_final_precheck_cannot_publish_parked_state() {
     let sm = Arc::new(ServerManager::new());
-    let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
+    let quotas = crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
         continuations: 1,
         continuation_bytes: MRTR_MAX_BYTES,
         per_principal_divisor: 1,

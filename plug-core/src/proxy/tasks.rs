@@ -213,7 +213,7 @@ impl super::ToolRouter {
         // Authorize and reserve both queue + durable-record capacity before
         // touching the lifecycle ledger, task store, or any upstream.
         let (_queued_task_lease, task_quota_lease) = if let Some(context) = downstream.as_ref() {
-            context.authorize(crate::protocol::MethodFamily::Tasks)?;
+            context.authorize(crate::admission::MethodFamily::Tasks)?;
             let principal = context.principal.as_ref().ok_or_else(|| {
                 crate::protocol::ProtocolOutcome::AuthorizationRequired
                     .into_error(context.protocol_era)
@@ -222,13 +222,13 @@ impl super::ToolRouter {
                 .admission_quotas
                 .try_acquire(
                     principal,
-                    crate::protocol::QuotaResource::QueuedTaskCreations,
+                    crate::admission::QuotaResource::QueuedTaskCreations,
                     1,
                 )
                 .map_err(|outcome| outcome.into_error(context.protocol_era))?;
             let task = self
                 .admission_quotas
-                .try_acquire(principal, crate::protocol::QuotaResource::Tasks, 1)
+                .try_acquire(principal, crate::admission::QuotaResource::Tasks, 1)
                 .map_err(|outcome| outcome.into_error(context.protocol_era))?;
             (Some(queued), Some(task))
         } else {
@@ -1801,12 +1801,13 @@ mod tests {
 
     #[tokio::test]
     async fn durable_task_quota_is_principal_isolated_and_released_on_cleanup() {
-        let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
-            tasks: 2,
-            queued_task_creations: 8,
-            per_principal_divisor: 2,
-            ..Default::default()
-        });
+        let quotas =
+            crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
+                tasks: 2,
+                queued_task_creations: 8,
+                per_principal_divisor: 2,
+                ..Default::default()
+            });
         let sm = Arc::new(ServerManager::new());
         let router = Arc::new(ToolRouter::new_with_quotas(
             sm,
@@ -1845,12 +1846,13 @@ mod tests {
 
     #[tokio::test]
     async fn durable_task_quota_enforces_global_limit_and_releases_on_cleanup() {
-        let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
-            tasks: 1,
-            queued_task_creations: 8,
-            per_principal_divisor: 1,
-            ..Default::default()
-        });
+        let quotas =
+            crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
+                tasks: 1,
+                queued_task_creations: 8,
+                per_principal_divisor: 1,
+                ..Default::default()
+            });
         let sm = Arc::new(ServerManager::new());
         let router = Arc::new(ToolRouter::new_with_quotas(
             sm,

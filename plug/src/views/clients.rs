@@ -1,17 +1,89 @@
-use dialoguer::Select;
 use dialoguer::console::style;
+use plug_core::clients::{ClientTarget, LinkTransport};
 
-use crate::OutputFormat;
-use crate::commands::clients::{client_views, cmd_link, cmd_unlink, live_session_views};
-use crate::ipc_client::daemon_running;
 use crate::ui::{
-    can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
-    print_label_value, print_success_line, print_warning_line,
+    print_banner, print_heading, print_info_line, print_label_value, print_warning_line,
 };
-use crate::views::live::{self, fetch_live_sessions};
-use plug_core::clients::ClientTarget;
+use crate::views::live;
 
-fn configured_client_state_text(client: &crate::commands::clients::ClientView) -> String {
+/// One client in `plug clients --output json`. The app reads these fields.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct ClientView {
+    pub(crate) name: String,
+    pub(crate) target: String,
+    pub(crate) linked: bool,
+    pub(crate) linked_transport: Option<LinkTransport>,
+    pub(crate) linked_endpoint: Option<String>,
+    pub(crate) detected: bool,
+    pub(crate) live: bool,
+    pub(crate) live_sessions: usize,
+    pub(crate) live_transports: Vec<plug_core::ipc::LiveSessionTransport>,
+    pub(crate) lazy_tool_mode: String,
+    pub(crate) lazy_tool_mode_origin: String,
+    pub(crate) lazy_tool_mode_reason: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct LiveSessionView {
+    pub(crate) transport: plug_core::ipc::LiveSessionTransport,
+    pub(crate) client_id: Option<String>,
+    pub(crate) session_id: String,
+    pub(crate) client_type: String,
+    /// The link target of the client Plug recognised.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) target: Option<String>,
+    pub(crate) client_info: Option<String>,
+    /// The program that started a local connector, read from the process
+    /// table rather than from what the client says about itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) host: Option<plug_core::downstream_identity::ClientHost>,
+    /// What `plug clients rename` takes to name this client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) key: Option<String>,
+    /// The name the owner gave this client.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) name: Option<String>,
+    /// Where the owner says this client runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) place: Option<String>,
+    /// The name a remote client signed in under.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) grant_name: Option<String>,
+    /// The key this session's requests carry, which blocks are stored under.
+    /// It is `key` for every session but a remote one with no grant.
+    #[serde(skip)]
+    pub(crate) access_key: Option<String>,
+    pub(crate) connected_secs: u64,
+    pub(crate) last_activity_secs: Option<u64>,
+}
+
+impl LiveSessionView {
+    /// What to call the session: the name the owner gave it, else the client
+    /// Plug recognised, else the client its link was written for, else the
+    /// name a remote client signed in under, else the program that started
+    /// it.
+    pub(crate) fn label(&self) -> &str {
+        if let Some(name) = &self.name {
+            return name;
+        }
+        if self.client_type != plug_core::types::ClientType::Unknown.to_string() {
+            return &self.client_type;
+        }
+        let linked = self
+            .key
+            .as_deref()
+            .and_then(ClientTarget::from_slug)
+            .map(ClientTarget::display_name);
+        match (linked, &self.grant_name, &self.host) {
+            (Some(name), _, _) => name,
+            (None, Some(name), _) => name,
+            (None, None, Some(host)) => &host.name,
+            (None, None, None) => &self.client_type,
+        }
+    }
+}
+
+fn configured_client_state_text(client: &ClientView) -> String {
     match client.live_sessions {
         _ if !client.live => "not connected now".to_string(),
         1 => "connected now".to_string(),
@@ -19,7 +91,7 @@ fn configured_client_state_text(client: &crate::commands::clients::ClientView) -
     }
 }
 
-fn configured_client_link_text(client: &crate::commands::clients::ClientView) -> Option<String> {
+fn configured_client_link_text(client: &ClientView) -> Option<String> {
     let transport = client.linked_transport?;
     let mut detail = format!("linked via {transport}");
     if let Some(endpoint) = client.linked_endpoint.as_deref() {
@@ -29,7 +101,7 @@ fn configured_client_link_text(client: &crate::commands::clients::ClientView) ->
     Some(detail)
 }
 
-fn configured_client_lazy_tool_text(client: &crate::commands::clients::ClientView) -> String {
+fn configured_client_lazy_tool_text(client: &ClientView) -> String {
     format!(
         "lazy tools: {} ({}) - {}",
         client.lazy_tool_mode, client.lazy_tool_mode_origin, client.lazy_tool_mode_reason
@@ -37,8 +109,8 @@ fn configured_client_lazy_tool_text(client: &crate::commands::clients::ClientVie
 }
 
 pub(crate) fn client_list_json(
-    clients: &[crate::commands::clients::ClientView],
-    live_sessions: &[crate::commands::clients::LiveSessionView],
+    clients: &[ClientView],
+    live_sessions: &[LiveSessionView],
     inventory: &live::LiveInventory,
     daemon_error: Option<&str>,
     config_error: Option<&str>,
@@ -54,120 +126,6 @@ pub(crate) fn client_list_json(
         "lazy_tool_live_policy_note": "clients[].lazy_tool_* fields reflect config/default resolution; live sessions keep their daemon-start policy until restart after lazy_tools edits",
         "restart_required_for_lazy_tool_config_changes": inventory.session_count > 0,
     })
-}
-
-async fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    use plug_core::types::LazyToolSetting;
-
-    let (_, config) = crate::commands::config::load_editable_config(config_path)?;
-    let targets: Vec<ClientTarget> = ClientTarget::listed().collect();
-    let labels = targets
-        .iter()
-        .map(|target| {
-            let policy = plug_core::clients::lazy_tool_policy(
-                config.meta_tool_mode,
-                &config.lazy_tools,
-                target.slug(),
-            );
-            format!(
-                "{:<20} {} ({})",
-                target.display_name(),
-                policy.mode.label(),
-                policy.origin.label()
-            )
-        })
-        .collect::<Vec<_>>();
-
-    let target_selection = Select::with_theme(&cli_prompt_theme())
-        .with_prompt("Choose client")
-        .items(&labels)
-        .default(0)
-        .interact_opt()?;
-    let Some(target_index) = target_selection else {
-        return Ok(());
-    };
-    let target = targets[target_index];
-    let slug = target.slug();
-
-    let settings = [
-        LazyToolSetting::Auto,
-        LazyToolSetting::Standard,
-        LazyToolSetting::Native,
-        LazyToolSetting::Bridge,
-    ];
-    let current = config
-        .lazy_tools
-        .clients
-        .get(slug)
-        .copied()
-        .unwrap_or_default();
-    let mode_selection = Select::with_theme(&cli_prompt_theme())
-        .with_prompt("Lazy tool mode")
-        .items(settings.map(|setting| setting.label()))
-        .default(settings.iter().position(|s| *s == current).unwrap_or(0))
-        .interact_opt()?;
-    let Some(mode_index) = mode_selection else {
-        return Ok(());
-    };
-
-    crate::commands::servers::apply_server_mutation(
-        config_path,
-        plug_core::operator::OperatorMutation::SetLazyTools {
-            client: slug.to_string(),
-            setting: settings[mode_index],
-        },
-    )
-    .await?;
-    let (_, config) = crate::commands::config::load_editable_config(config_path)?;
-    let policy =
-        plug_core::clients::lazy_tool_policy(config.meta_tool_mode, &config.lazy_tools, slug);
-    print_success_line(format!(
-        "{} lazy tools: {} ({})",
-        target,
-        policy.mode.label(),
-        policy.origin.label()
-    ));
-    print_warning_line(
-        "Restart the plug daemon before relying on this lazy tool mode in live client sessions.",
-    );
-    Ok(())
-}
-
-async fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<bool> {
-    let options = [
-        "Done",
-        "Link clients",
-        "Unlink clients",
-        "Configure lazy tools",
-    ];
-    let selection = Select::with_theme(&cli_prompt_theme())
-        .with_prompt("Choose action")
-        .items(options)
-        .default(0)
-        .interact_opt()?;
-
-    match selection {
-        Some(1) => {
-            cmd_link(
-                config_path,
-                Vec::new(),
-                false,
-                false,
-                None,
-                &OutputFormat::Text,
-            )?;
-            Ok(true)
-        }
-        Some(2) => {
-            cmd_unlink(config_path, Vec::new(), false, false, &OutputFormat::Text)?;
-            Ok(true)
-        }
-        Some(3) => {
-            prompt_lazy_tool_mode(config_path).await?;
-            Ok(true)
-        }
-        _ => Ok(false),
-    }
 }
 
 /// Live sessions for one client, so `plug clients` shows `Claude Code  12`
@@ -198,9 +156,7 @@ fn transport_label(transport: plug_core::ipc::LiveSessionTransport) -> &'static 
 }
 
 /// Busiest client first, then by name.
-fn live_session_groups(
-    sessions: &[crate::commands::clients::LiveSessionView],
-) -> Vec<LiveSessionGroup<'_>> {
+fn live_session_groups(sessions: &[LiveSessionView]) -> Vec<LiveSessionGroup<'_>> {
     let mut groups: Vec<LiveSessionGroup<'_>> = Vec::new();
     for session in sessions {
         let transport = transport_label(session.transport);
@@ -228,7 +184,7 @@ fn live_session_groups(
     groups
 }
 
-fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView]) {
+fn print_live_session_rows(sessions: &[LiveSessionView]) {
     println!(
         "  {:<18} {:<14} {:<12} {:<10} {:<10} {}",
         style("SESSION").dim(),
@@ -261,7 +217,7 @@ fn print_live_session_rows(sessions: &[crate::commands::clients::LiveSessionView
 
 /// One line for every client Plug knows about but has not linked, noting the
 /// ones that are installed or connected anyway.
-fn unlinked_clients_text(clients: &[crate::commands::clients::ClientView]) -> Option<String> {
+fn unlinked_clients_text(clients: &[ClientView]) -> Option<String> {
     let names = clients
         .iter()
         .filter(|client| !client.linked)
@@ -278,186 +234,219 @@ fn unlinked_clients_text(clients: &[crate::commands::clients::ClientView]) -> Op
     (!names.is_empty()).then(|| names.join(", "))
 }
 
-pub(crate) async fn cmd_client_list(
-    config_path: Option<&std::path::PathBuf>,
-    output: &OutputFormat,
+pub(crate) fn client_allow_line(key: &str, settings: &plug_core::config::ClientSettings) -> String {
+    let mut parts = Vec::new();
+    if !settings.allowed_servers.is_empty() {
+        parts.push(format!("servers {}", settings.allowed_servers.join(", ")));
+    }
+    if !settings.allowed_tools.is_empty() {
+        let tools: Vec<String> = settings
+            .allowed_tools
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        parts.push(format!("tools {}", tools.join(", ")));
+    }
+    if parts.is_empty() && settings.has_allow_list() {
+        format!("{key} gets nothing: its list is empty.")
+    } else if parts.is_empty() {
+        format!("{key} gets every server, and each one added later.")
+    } else {
+        format!("{key} gets only {}.", parts.join("; "))
+    }
+}
+
+pub(crate) fn client_blocks_line(
+    key: &str,
+    settings: &plug_core::config::ClientSettings,
+) -> String {
+    let mut parts = Vec::new();
+    if !settings.blocked_servers.is_empty() {
+        parts.push(format!("servers {}", settings.blocked_servers.join(", ")));
+    }
+    if !settings.blocked_tools.is_empty() {
+        let tools: Vec<String> = settings
+            .blocked_tools
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        parts.push(format!("tools {}", tools.join(", ")));
+    }
+    if parts.is_empty() {
+        format!("{key} is kept from nothing.")
+    } else {
+        format!("{key} is kept from {}.", parts.join("; "))
+    }
+}
+
+/// `plug clients` as text.
+pub(crate) fn print_client_list(
+    clients: &[ClientView],
+    live_sessions: &[LiveSessionView],
+    inventory: &live::LiveInventory,
+    daemon_error: Option<&str>,
+    config_error: Option<&str>,
+    config: Option<&plug_core::config::Config>,
     verbose: bool,
-) -> anyhow::Result<()> {
-    let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
-
-    loop {
-        let daemon_error = if daemon_running().await {
-            None
-        } else if crate::ipc_client::daemon_starting() {
-            Some("daemon is starting".to_string())
-        } else {
-            Some("daemon not running".to_string())
-        };
-        let live = fetch_live_sessions().await;
-        let inventory = live::inventory(&live);
-        let config_result = plug_core::config::load_config(config_path);
-        let config_error = config_result.as_ref().err().map(|error| error.to_string());
-        let config = config_result.ok();
-        let clients = client_views(&live, config.as_ref());
-        let grants = crate::commands::clients::downstream_grants().await;
-        let live_sessions = live_session_views(&live, config.as_ref(), &grants);
-
-        if matches!(output, OutputFormat::Json) {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&client_list_json(
-                    &clients,
-                    &live_sessions,
-                    &inventory,
-                    daemon_error.as_deref(),
-                    config_error.as_deref(),
-                ))?
-            );
-            return Ok(());
-        }
-
-        print_banner("◆", "Clients", "The clients that use Plug");
-        if let Some(error) = &daemon_error {
-            print_warning_line(format!(
-                "Plug is not answering ({error}), so it cannot say who is connected now."
-            ));
-            println!();
-        }
-        if let Some(error) = &config_error {
-            print_warning_line(format!(
-                "The settings file has a problem: {error}. Run `plug config check`."
-            ));
-            println!();
-        }
-        let linked_count = clients.iter().filter(|client| client.linked).count();
-        let detected_count = clients.iter().filter(|client| client.detected).count();
-        print_heading("Summary");
-        print_label_value("Set up", style(linked_count).green().bold());
-        print_label_value("On this Mac", style(detected_count).cyan().bold());
-        if daemon_error.is_some() {
-            print_label_value("Connected now", style("unknown").yellow().bold());
-        } else {
-            print_label_value("Connected now", style(inventory.session_count).bold());
-        }
-        if verbose && daemon_error.is_none() {
-            print_label_value("Live Transports", inventory.session_transports.summary());
-            if inventory.session_count > 0 {
-                print_info_line(
-                    "Lazy tool modes below are configured values; live sessions keep their daemon-start policy until restart after lazy_tools edits.",
-                );
-            }
-        }
-        println!();
-        print_heading("Connected now");
-        if live_sessions.is_empty() {
-            print_info_line("No client is connected right now.");
-        } else {
-            println!(
-                "  {:<24} {:<12} {:<14} {}",
-                style("CLIENT").dim(),
-                style("CONNECTIONS").dim(),
-                style("FROM").dim(),
-                style("LONGEST").dim()
-            );
-            println!(
-                "  {}",
-                style("----------------------------------------------------------------").dim()
-            );
-            for group in live_session_groups(&live_sessions) {
-                println!(
-                    "  {:<24} {:<12} {:<14} {}",
-                    client_and_place(group.client, group.place),
-                    group.sessions,
-                    group.transports.join("+"),
-                    crate::ui::format_duration(group.longest_connected_secs),
-                );
-            }
-            if verbose {
-                println!();
-                print_live_session_rows(&live_sessions);
-            } else {
-                print_info_line(style("`plug clients -v` lists each connection.").dim());
-            }
-        }
-
-        let blocks = config
-            .iter()
-            .flat_map(|config| config.clients.iter())
-            .filter(|(_, settings)| {
-                !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
-            })
-            .collect::<Vec<_>>();
-        if !blocks.is_empty() {
-            println!();
-            print_heading("Switched off for a client");
-            for (key, settings) in blocks {
-                print_info_line(crate::commands::clients::client_blocks_line(key, settings));
-            }
-        }
-
-        let allow_lists = config
-            .iter()
-            .flat_map(|config| config.clients.iter())
-            .filter(|(_, settings)| settings.has_allow_list())
-            .collect::<Vec<_>>();
-        if !allow_lists.is_empty() {
-            println!();
-            print_heading("Given only what is named");
-            for (key, settings) in allow_lists {
-                print_info_line(crate::commands::clients::client_allow_line(key, settings));
-            }
-        }
-
-        println!();
-        print_heading("Set up to use Plug");
-        let linked_clients = clients.iter().filter(|client| client.linked);
-        if linked_count == 0 {
-            print_info_line("No client is set up yet. Run `plug link` to connect one.");
-        } else {
-            println!("  {:<24} {}", style("CLIENT").dim(), style("STATE").dim());
-            println!(
-                "  {}",
-                style("----------------------------------------------------------------").dim()
-            );
-        }
-        for client in linked_clients {
-            println!(
-                "  {:<24} {}",
-                client.name,
-                style(configured_client_state_text(client)).dim()
-            );
-            if verbose {
-                if let Some(link_text) = configured_client_link_text(client) {
-                    print_info_line(style(link_text).dim());
-                }
-                print_info_line(style(configured_client_lazy_tool_text(client)).dim());
-            }
-        }
-        if let Some(unlinked) = unlinked_clients_text(&clients) {
-            println!();
-            print_label_value("Not set up", style(unlinked).dim());
-        }
-
-        if !interactive {
-            break;
-        }
-        println!();
-        if !prompt_client_actions(config_path).await? {
-            break;
-        }
+) {
+    print_banner("◆", "Clients", "The clients that use Plug");
+    if let Some(error) = daemon_error {
+        print_warning_line(format!(
+            "Plug is not answering ({error}), so it cannot say who is connected now."
+        ));
         println!();
     }
-    Ok(())
+    if let Some(error) = config_error {
+        print_warning_line(format!(
+            "The settings file has a problem: {error}. Run `plug config check`."
+        ));
+        println!();
+    }
+    let linked_count = clients.iter().filter(|client| client.linked).count();
+    let detected_count = clients.iter().filter(|client| client.detected).count();
+    print_heading("Summary");
+    print_label_value("Set up", style(linked_count).green().bold());
+    print_label_value("On this Mac", style(detected_count).cyan().bold());
+    if daemon_error.is_some() {
+        print_label_value("Connected now", style("unknown").yellow().bold());
+    } else {
+        print_label_value("Connected now", style(inventory.session_count).bold());
+    }
+    if verbose && daemon_error.is_none() {
+        print_label_value("Live Transports", inventory.session_transports.summary());
+        if inventory.session_count > 0 {
+            print_info_line(
+                "Lazy tool modes below are configured values; live sessions keep their daemon-start policy until restart after lazy_tools edits.",
+            );
+        }
+    }
+    println!();
+    print_heading("Connected now");
+    if live_sessions.is_empty() {
+        print_info_line("No client is connected right now.");
+    } else {
+        println!(
+            "  {:<24} {:<12} {:<14} {}",
+            style("CLIENT").dim(),
+            style("CONNECTIONS").dim(),
+            style("FROM").dim(),
+            style("LONGEST").dim()
+        );
+        println!(
+            "  {}",
+            style("----------------------------------------------------------------").dim()
+        );
+        for group in live_session_groups(live_sessions) {
+            println!(
+                "  {:<24} {:<12} {:<14} {}",
+                client_and_place(group.client, group.place),
+                group.sessions,
+                group.transports.join("+"),
+                crate::ui::format_duration(group.longest_connected_secs),
+            );
+        }
+        if verbose {
+            println!();
+            print_live_session_rows(live_sessions);
+        } else {
+            print_info_line(style("`plug clients -v` lists each connection.").dim());
+        }
+    }
+
+    let blocks = config
+        .iter()
+        .flat_map(|config| config.clients.iter())
+        .filter(|(_, settings)| {
+            !settings.blocked_servers.is_empty() || !settings.blocked_tools.is_empty()
+        })
+        .collect::<Vec<_>>();
+    if !blocks.is_empty() {
+        println!();
+        print_heading("Switched off for a client");
+        for (key, settings) in blocks {
+            print_info_line(client_blocks_line(key, settings));
+        }
+    }
+
+    let allow_lists = config
+        .iter()
+        .flat_map(|config| config.clients.iter())
+        .filter(|(_, settings)| settings.has_allow_list())
+        .collect::<Vec<_>>();
+    if !allow_lists.is_empty() {
+        println!();
+        print_heading("Given only what is named");
+        for (key, settings) in allow_lists {
+            print_info_line(client_allow_line(key, settings));
+        }
+    }
+
+    println!();
+    print_heading("Set up to use Plug");
+    let linked_clients = clients.iter().filter(|client| client.linked);
+    if linked_count == 0 {
+        print_info_line("No client is set up yet. Run `plug link` to connect one.");
+    } else {
+        println!("  {:<24} {}", style("CLIENT").dim(), style("STATE").dim());
+        println!(
+            "  {}",
+            style("----------------------------------------------------------------").dim()
+        );
+    }
+    for client in linked_clients {
+        println!(
+            "  {:<24} {}",
+            client.name,
+            style(configured_client_state_text(client)).dim()
+        );
+        if verbose {
+            if let Some(link_text) = configured_client_link_text(client) {
+                print_info_line(style(link_text).dim());
+            }
+            print_info_line(style(configured_client_lazy_tool_text(client)).dim());
+        }
+    }
+    if let Some(unlinked) = unlinked_clients_text(clients) {
+        println!();
+        print_label_value("Not set up", style(unlinked).dim());
+    }
+}
+
+#[cfg(test)]
+impl LiveSessionView {
+    /// A session with nothing known about it but its client, transport and age.
+    pub(crate) fn sample(
+        client_type: &str,
+        transport: plug_core::ipc::LiveSessionTransport,
+        connected_secs: u64,
+    ) -> Self {
+        Self {
+            session_id: format!("{client_type}-{connected_secs}"),
+            client_type: client_type.to_string(),
+            target: None,
+            transport,
+            client_id: None,
+            client_info: None,
+            host: None,
+            key: None,
+            name: None,
+            place: None,
+            grant_name: None,
+            access_key: None,
+            connected_secs,
+            last_activity_secs: None,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{ClientView, LiveSessionView};
     use super::{
         LiveSessionGroup, client_list_json, configured_client_lazy_tool_text,
         configured_client_link_text, configured_client_state_text, live_session_groups,
         unlinked_clients_text,
     };
-    use crate::commands::clients::{ClientView, LiveSessionView};
     use crate::views::live::{LiveInventory, LiveSessionTransportCounts};
 
     #[test]
@@ -595,22 +584,7 @@ mod tests {
         transport: plug_core::ipc::LiveSessionTransport,
         connected_secs: u64,
     ) -> LiveSessionView {
-        LiveSessionView {
-            session_id: format!("{client_type}-{connected_secs}"),
-            client_type: client_type.to_string(),
-            target: None,
-            transport,
-            client_id: None,
-            client_info: None,
-            host: None,
-            key: None,
-            name: None,
-            place: None,
-            grant_name: None,
-            access_key: None,
-            connected_secs,
-            last_activity_secs: None,
-        }
+        LiveSessionView::sample(client_type, transport, connected_secs)
     }
 
     #[test]
@@ -665,80 +639,6 @@ mod tests {
         assert_eq!(linked.label(), "Pi");
         linked.name = Some("Work Pi".to_string());
         assert_eq!(linked.label(), "Work Pi");
-    }
-
-    #[test]
-    fn a_block_goes_under_the_key_the_requests_carry() {
-        use crate::commands::clients::{resolve_client_access_key, resolve_client_key};
-
-        // A remote session on the shared token shows under what it reports,
-        // but its requests are the shared key's.
-        let mut shared = session("Cursor", HTTP, 30);
-        shared.key = Some("cursor".to_string());
-        shared.access_key = Some("remote:shared".to_string());
-        let mut local = session("Unknown", LOCAL, 10);
-        local.key = Some("pi".to_string());
-        local.access_key = Some("pi".to_string());
-        let sessions = [shared, local];
-
-        assert_eq!(resolve_client_key("Cursor", &sessions).unwrap(), "cursor");
-        assert_eq!(
-            resolve_client_access_key("Cursor", &sessions).unwrap(),
-            "remote:shared"
-        );
-        assert_eq!(
-            resolve_client_access_key("remote:shared", &sessions).unwrap(),
-            "remote:shared"
-        );
-        assert_eq!(resolve_client_access_key("Pi", &sessions).unwrap(), "pi");
-        // Not connected: a key or a target is taken as written.
-        assert_eq!(
-            resolve_client_access_key("oauth:abc", &sessions).unwrap(),
-            "oauth:abc"
-        );
-        assert_eq!(
-            resolve_client_access_key("warp", &sessions).unwrap(),
-            "warp"
-        );
-        assert!(resolve_client_access_key("nobody", &sessions).is_err());
-    }
-
-    #[test]
-    fn a_client_to_rename_is_found_by_the_name_it_shows_under() {
-        use crate::commands::clients::resolve_client_key;
-        let mut hermes = session("Unknown", LOCAL, 30);
-        hermes.host = Some(plug_core::downstream_identity::ClientHost {
-            name: "python3".to_string(),
-            executable: "/opt/hermes/bin/python3".to_string(),
-            app: None,
-            script: None,
-        });
-        hermes.key = Some("host:/opt/hermes/bin/python3".to_string());
-        let mut renamed = hermes.clone();
-        renamed.name = Some("Hermes".to_string());
-        let nameless = session("Unknown", LOCAL, 5);
-
-        let key = |wanted, sessions: &[LiveSessionView]| {
-            resolve_client_key(wanted, sessions).map_err(|error| error.to_string())
-        };
-        assert_eq!(
-            key("PYTHON3", &[hermes.clone()]).unwrap(),
-            "host:/opt/hermes/bin/python3"
-        );
-        assert_eq!(renamed.label(), "Hermes");
-        assert_eq!(
-            key("hermes", &[renamed]).unwrap(),
-            "host:/opt/hermes/bin/python3"
-        );
-        // Not connected: a key or a known client is taken as given.
-        assert_eq!(key("cursor", &[]).unwrap(), "cursor");
-        assert_eq!(key("oauth:abc", &[]).unwrap(), "oauth:abc");
-        assert!(key("nobody", &[]).unwrap_err().contains("plug clients -v"));
-        assert!(
-            key("Unknown", &[nameless])
-                .unwrap_err()
-                .contains("cannot tell")
-        );
     }
 
     fn client(name: &str, linked: bool, detected: bool, live: bool) -> ClientView {
