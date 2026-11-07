@@ -1274,7 +1274,8 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 lock.unlock()
                 reply([
                     "type": "Registered",
-                    "protocol_version": object["protocol_version"] as? Int ?? 3,
+                    // The version the client asked for, which `plug connect` always sends.
+                    "protocol_version": object["protocol_version"] ?? NSNull(),
                     "client_id": clientID,
                     "session_id": session,
                     "modern_downstream_enabled": false,
@@ -1294,7 +1295,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 reply(["type": "Pong"])
             case "ModernDownstreamGate":
                 reply(["type": "ModernDownstreamGate", "enabled": false])
-            case "McpRequest", "McpRequestWithContext":
+            case "McpRequest":
                 let method = object["method"] as? String ?? ""
                 switch method {
                 case "tools/list":

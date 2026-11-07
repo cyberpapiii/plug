@@ -60,6 +60,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- Saving an edited server in the app works again. The daemon checked every edit as a new server under a name already taken, so it refused each one and the sheet said "Choose another name." for a name you cannot change.
 - Signing in to a server with OAuth refuses a registration, token or other sign-in address on a cloud metadata endpoint, such as `169.254.169.254`, even when the server's own sign-in details name it. Only a redirect to one used to be refused.
 - A server that signs in with OAuth and refuses Plug while it starts over legacy SSE, or when Plug first lists its tools, is judged by the refusal's status there too: a plain 403 is retried, whatever its message says, where it used to ask you to sign in again.
 - `plug reload --output json` says `settings_changed` is true when only `clients`, `secrets`, `events`, `supervision` or `startup_concurrency` changed.

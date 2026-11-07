@@ -19,8 +19,14 @@ public enum PlugIPCError: LocalizedError, Equatable {
     case timedOut
     case disconnected
     case systemCall(String, Int32)
+    /// The daemon refused with a code and a message.
     case daemon(String, String)
     case unexpectedResponse(String)
+
+    /// The code the daemon refuses a name already in use with
+    /// (`NameTaken::CODE` in `plug-core/src/operator.rs`). The response
+    /// golden `server_name_taken` holds the two to the same value.
+    public static let serverNameTaken = "SERVER_NAME_TAKEN"
 
     public var errorDescription: String? {
         switch self {

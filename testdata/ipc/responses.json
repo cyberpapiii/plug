@@ -297,6 +297,11 @@
       }
     }
   },
+  "server_name_taken": {
+    "type": "Error",
+    "code": "SERVER_NAME_TAKEN",
+    "message": "server `github` already exists"
+  },
   "server_validated": {
     "type": "ServerValidated",
     "server": {

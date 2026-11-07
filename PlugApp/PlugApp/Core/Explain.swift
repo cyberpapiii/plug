@@ -86,7 +86,7 @@ enum Explain {
 extension PlugIPCError: AdvisedError {
     var advice: String {
         switch self {
-        case let .daemon(code, _) where code == "SERVER_NAME_TAKEN": "Choose another name."
+        case let .daemon(code, _) where code == PlugIPCError.serverNameTaken: "Choose another name."
         case let .daemon(_, message): Explain.advice(forOutside: message)
         case .disconnected: Explain.starting
         default: Explain.fallback

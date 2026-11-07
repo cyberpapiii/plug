@@ -947,7 +947,7 @@ final class PopoverRecentTests: XCTestCase {
     /// A taken name is told apart by the daemon's code, whatever its message says.
     func testATakenNameIsKnownByItsCode() {
         XCTAssertEqual(
-            Explain.advice(for: PlugIPCError.daemon("SERVER_NAME_TAKEN", "nope")),
+            Explain.advice(for: PlugIPCError.daemon(PlugIPCError.serverNameTaken, "nope")),
             "Choose another name."
         )
         XCTAssertNotEqual(
