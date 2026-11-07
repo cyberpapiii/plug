@@ -16,31 +16,117 @@ pub(crate) async fn cmd_tool_command(
     match command {
         ToolCommands::Disabled => cmd_tool_disabled(config_path, output),
         ToolCommands::Disable { server, patterns } => {
-            let patterns = tool_patterns_for_server(config_path, server, patterns)?;
+            let patterns = tool_patterns_for_server(config_path, server, patterns, false).await?;
             cmd_tool_disable(config_path, patterns).await
         }
         ToolCommands::Enable { server, patterns } => {
-            let patterns = tool_patterns_for_server(config_path, server, patterns)?;
+            let patterns = tool_patterns_for_server(config_path, server, patterns, true).await?;
             cmd_tool_enable(config_path, patterns).await
         }
     }
 }
 
-/// The patterns to change: those given, or every tool of `server`, named
-/// with the configured delimiter.
-fn tool_patterns_for_server(
+/// The patterns to change: those given, or every tool of `server`.
+///
+/// The daemon knows which server each tool it lists came from, so the live
+/// config gets patterns from that. An offline `--config` file has no tool
+/// list; it gets a wildcard for each prefix the server's tools are named
+/// under. Turning a server back on also takes off each of its tools that
+/// was turned off by name.
+async fn tool_patterns_for_server(
     config_path: Option<&std::path::PathBuf>,
     server: Option<String>,
-    mut patterns: Vec<String>,
+    patterns: Vec<String>,
+    enabling: bool,
 ) -> anyhow::Result<Vec<String>> {
-    if let Some(server) = server {
-        if !patterns.is_empty() {
-            anyhow::bail!("pass either patterns or `--server`, not both");
-        }
-        let (_, config) = load_editable_config(config_path)?;
-        patterns.push(format!("{server}{}*", config.prefix_delimiter));
+    let Some(server) = server else {
+        return Ok(patterns);
+    };
+    if !patterns.is_empty() {
+        anyhow::bail!("pass either patterns or `--server`, not both");
+    }
+    let (_, config) = load_editable_config(config_path)?;
+    let Some(server_config) = config.servers.get(&server) else {
+        anyhow::bail!("unknown server `{server}`");
+    };
+    let mut patterns = if config_path.is_some() {
+        offline_server_patterns(&config, &server, server_config)?
+    } else {
+        ensure_daemon_with_feedback(None, false).await?;
+        let tools = match crate::ipc_client::request(plug_core::ipc::IpcRequest::ListTools).await? {
+            plug_core::ipc::IpcResponse::Tools { tools } => tools,
+            plug_core::ipc::IpcResponse::Error { message, .. } => anyhow::bail!(message),
+            other => anyhow::bail!("unexpected daemon response: {other:?}"),
+        };
+        live_server_patterns(&tools, &server, &config.prefix_delimiter)
+    };
+    if patterns.is_empty() {
+        anyhow::bail!("`{server}` lists no tools right now; name the tools instead");
+    }
+    if enabling {
+        let named: Vec<String> = config
+            .disabled_tools
+            .iter()
+            .filter(|entry| {
+                !entry.contains('*') && plug_core::tool_patterns::is_disabled_tool(&patterns, entry)
+            })
+            .cloned()
+            .collect();
+        patterns.extend(named);
+        patterns.dedup();
+        // A tool cannot be turned on while a wildcard still covers it.
+        patterns.sort_by_key(|pattern| !pattern.contains('*'));
     }
     Ok(patterns)
+}
+
+/// `server`'s listed tools as patterns: a wildcard for a prefix only its
+/// tools are listed under, so a tool it adds later is covered too, and the
+/// tool's own name under a prefix another server's tools share.
+fn live_server_patterns(
+    tools: &[plug_core::ipc::IpcToolInfo],
+    server: &str,
+    delimiter: &str,
+) -> Vec<String> {
+    // Patterns match without regard to case.
+    let prefix_of = |name: &str| {
+        name.split_once(delimiter)
+            .map(|(prefix, _)| prefix.to_ascii_lowercase())
+    };
+    let shared: std::collections::HashSet<String> = tools
+        .iter()
+        .filter(|tool| tool.server_id != server)
+        .filter_map(|tool| prefix_of(&tool.name))
+        .collect();
+    let mut patterns: Vec<String> = tools
+        .iter()
+        .filter(|tool| tool.server_id == server)
+        .map(|tool| match tool.name.split_once(delimiter) {
+            Some((prefix, _)) if !shared.contains(&prefix.to_ascii_lowercase()) => {
+                format!("{prefix}{delimiter}*")
+            }
+            _ => tool.name.clone(),
+        })
+        .collect();
+    patterns.sort();
+    patterns.dedup();
+    patterns
+}
+
+fn offline_server_patterns(
+    config: &plug_core::config::Config,
+    server: &str,
+    server_config: &plug_core::config::ServerConfig,
+) -> anyhow::Result<Vec<String>> {
+    if !config.enable_prefix {
+        anyhow::bail!("tool names carry no server prefix in this config; name the tools instead");
+    }
+    Ok(
+        plug_core::tool_naming::server_prefixes(server, server_config, None)
+            .into_iter()
+            .map(|prefix| format!("{prefix}{}*", config.prefix_delimiter))
+            .collect(),
+    )
 }
 
 /// Turn each pattern on or off through the mutation every config edit
@@ -230,16 +316,117 @@ mod tests {
         path
     }
 
+    fn tool(name: &str, server_id: &str) -> plug_core::ipc::IpcToolInfo {
+        serde_json::from_value(serde_json::json!({
+            "name": name,
+            "server_id": server_id,
+            "description": null,
+            "title": null,
+        }))
+        .expect("tool info")
+    }
+
+    /// A server's tools are the ones the router routes to it, whatever
+    /// prefix they are listed under: a group's, or one with a second
+    /// account's name added. A prefix another server's tools also carry is
+    /// not taken whole.
     #[test]
-    fn a_server_pattern_uses_the_configured_delimiter() {
-        let config = plug_core::config::Config {
+    fn a_servers_tools_are_the_ones_routed_to_it() {
+        let tools = [
+            tool("GmailWorkspace__search_messages", "workspace"),
+            tool("GmailWorkspace__send_message", "workspace"),
+            tool("GoogleDrive__list_items", "workspace"),
+            tool("Workspace__render_page_to_image", "workspace"),
+            tool("GmailGoogleWork__search_messages", "google-work"),
+            tool("GoogleDrive__empty_trash", "drive-extras"),
+            tool("Slack__search_messages", "slack"),
+            tool("SlackWork__search_messages", "slack-work"),
+        ];
+        assert_eq!(
+            live_server_patterns(&tools, "workspace", "__"),
+            [
+                "GmailWorkspace__*",
+                "GoogleDrive__list_items",
+                "Workspace__*",
+            ]
+        );
+        assert_eq!(live_server_patterns(&tools, "slack", "__"), ["Slack__*"]);
+        assert!(live_server_patterns(&tools, "github", "__").is_empty());
+    }
+
+    /// Offline there is no tool list, so a server's patterns are the
+    /// prefixes the router names its tools under, group rules included,
+    /// with the configured delimiter.
+    #[tokio::test]
+    async fn offline_server_patterns_follow_the_routers_naming() {
+        let mut config = plug_core::config::Config {
             prefix_delimiter: "::".to_string(),
             ..Default::default()
         };
+        for name in ["workspace", "slack"] {
+            config.servers.insert(
+                name.to_string(),
+                plug_core::config::ServerConfig {
+                    command: Some("true".to_string()),
+                    ..Default::default()
+                },
+            );
+        }
         let path = config_file("delimiter", &config);
-        let patterns = tool_patterns_for_server(Some(&path), Some("slack".to_string()), Vec::new())
-            .expect("patterns");
-        assert_eq!(patterns, ["slack::*"]);
+        let patterns = |server: &str| {
+            tool_patterns_for_server(Some(&path), Some(server.to_string()), Vec::new(), false)
+        };
+
+        assert_eq!(patterns("slack").await.expect("slack"), ["Slack::*"]);
+        let workspace = patterns("workspace").await.expect("workspace");
+        for expected in ["Gmail::*", "GoogleDrive::*", "Workspace::*"] {
+            assert!(
+                workspace.iter().any(|pattern| pattern == expected),
+                "{workspace:?}"
+            );
+        }
+        let unknown = patterns("github").await.expect_err("unknown server");
+        assert!(unknown.to_string().contains("github"), "{unknown}");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// Turning a server off and on again leaves the other servers' tools as
+    /// they were, and takes off its tools that were off by name too.
+    #[tokio::test]
+    async fn a_server_goes_off_and_on_whole() {
+        let mut config = plug_core::config::Config {
+            disabled_tools: vec!["Gmail__send_message".to_string(), "Slack__post".to_string()],
+            ..Default::default()
+        };
+        config.servers.insert(
+            "workspace".to_string(),
+            plug_core::config::ServerConfig {
+                command: Some("true".to_string()),
+                ..Default::default()
+            },
+        );
+        let path = config_file("whole", &config);
+        let server = || Some("workspace".to_string());
+
+        let off = ToolCommands::Disable {
+            server: server(),
+            patterns: Vec::new(),
+        };
+        cmd_tool_command(Some(&path), off, &OutputFormat::Text)
+            .await
+            .expect("off");
+        let (_, written) = load_editable_config(Some(&path)).expect("reload");
+        assert!(written.disabled_tools.contains(&"Gmail__*".to_string()));
+
+        let on = ToolCommands::Enable {
+            server: server(),
+            patterns: Vec::new(),
+        };
+        cmd_tool_command(Some(&path), on, &OutputFormat::Text)
+            .await
+            .expect("on");
+        let (_, written) = load_editable_config(Some(&path)).expect("reload");
+        assert_eq!(written.disabled_tools, ["Slack__post"]);
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 

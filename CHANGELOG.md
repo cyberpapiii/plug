@@ -56,6 +56,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- `plug tools off --server <name>` switches off every tool the server lists, whatever name Plug lists it under: Google Workspace's `Gmail__…` and `GoogleDrive__…` tools, or a second account's, which it used to miss because it wrote `<name>__*`. A prefix another server's tools share is not switched off whole. `plug tools on --server <name>` also turns back on the server's tools that were switched off one by one.
 - A request from the app that turns the modern protocol on or off, such as a reload, gets its own reply. The daemon could send the app the "modern protocol changed" notice first, meant for connected clients, and the app took it for the reply and failed.
 - `plug doctor` reports an older Plug installed under `/opt/homebrew/opt/plug` or `/usr/local/opt/plug`, or as a binary at `~/.local/bin/plug`, as it already did for the other places Homebrew and Cargo put one, and lists a Homebrew copy reached by two paths once.
 - Stopping the daemon removes its socket, PID file and token every time. When launchd stopped it with SIGTERM, the daemon could exit before that cleanup ran and before HTTP finished shutting down.

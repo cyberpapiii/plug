@@ -330,10 +330,7 @@ fn account_copy(
     }
 
     let mut copy = source.clone();
-    let mut groups = source.tool_groups.clone();
-    if groups.is_empty() {
-        groups = crate::tool_naming::builtin_group_rules(server, reported).unwrap_or_default();
-    }
+    let mut groups = crate::tool_naming::group_rules(server, source, reported).unwrap_or_default();
     let suffix = crate::tool_naming::format_server_prefix(label);
     for group in &mut groups {
         group.prefix.push_str(&suffix);
