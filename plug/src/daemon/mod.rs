@@ -26,10 +26,6 @@ use plug_core::proxy::{DownstreamBridge, ReverseRequest, ToolRouter};
 mod framing;
 use framing::FrameReader;
 
-#[cfg(test)]
-pub(crate) use plug_core::paths::test::{
-    lock as runtime_paths_test_lock, set as set_test_runtime_paths,
-};
 use plug_core::paths::{log_dir, pid_path, socket_path, token_path};
 
 /// Create a directory, and any missing parents, readable by this user only.
@@ -2611,20 +2607,15 @@ allowed_servers = ["slack"]
 
     #[tokio::test]
     async fn losing_daemon_start_does_not_boot_upstream_servers() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-early-lock-runtime-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-early-lock-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
@@ -2665,8 +2656,7 @@ allowed_servers = ["slack"]
         );
 
         drop(winning_lock);
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     /// `run_daemon` must bind and serve without a started engine, which is what
@@ -2676,15 +2666,17 @@ allowed_servers = ["slack"]
     /// upstream takes.
     #[tokio::test]
     async fn ipc_socket_is_bound_while_upstream_startup_is_still_running() {
-        let _guard = runtime_paths_test_lock().lock().await;
         // The bound socket lives under this root, and a Unix socket path has to
         // fit in SUN_LEN, so keep the directory names short.
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let runtime_root = std::env::temp_dir().join(format!("plug-eb-{}", &suffix[..8]));
-        let state_root = std::env::temp_dir().join(format!("plug-ebs-{}", &suffix[..8]));
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
+        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
         // flight until the upstream timeout expires.
@@ -2731,28 +2723,20 @@ allowed_servers = ["slack"]
         engine.cancel_token().cancel();
         startup.abort();
         daemon.abort();
-        std::fs::remove_dir_all(runtime_root).ok();
-        std::fs::remove_dir_all(state_root).ok();
+        std::fs::remove_dir_all(temp).ok();
     }
 
     #[tokio::test]
     async fn run_daemon_losing_start_does_not_rotate_existing_token() {
-        // Hold the shared lock for the whole window the global paths are set, so
-        // this test is safe to run alongside other global-paths tests in parallel.
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-runtime-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2773,26 +2757,20 @@ allowed_servers = ["slack"]
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[tokio::test]
     async fn run_daemon_restores_existing_token_when_startup_fails_after_token_write() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-runtime-post-token-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
+        let temp = std::env::temp_dir().join(format!(
+            "plug-d-{}",
+            &uuid::Uuid::new_v4().simple().to_string()[..8]
         ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-state-post-token-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
+        let runtime_root = temp.join("r");
+        let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2814,8 +2792,7 @@ allowed_servers = ["slack"]
         let token_after =
             std::fs::read_to_string(&token_file).expect("read token after failed startup");
         assert_eq!(token_after, "stable-token");
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]
