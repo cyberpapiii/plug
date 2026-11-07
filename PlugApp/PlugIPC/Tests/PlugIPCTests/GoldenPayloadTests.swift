@@ -252,7 +252,7 @@ final class GoldenPayloadTests: XCTestCase {
     /// says of a client in each sign-in state.
     func testAnUnfinishedClientIsTheOneTheDaemonCallsUnactivated() throws {
         let cases = try goldens("registered_clients.json")
-        XCTAssertEqual(cases.count, 3)
+        XCTAssertEqual(cases.count, 4)
         for (name, value) in cases {
             let golden = try XCTUnwrap(value as? [String: Any], name)
             let summary = try JSONSerialization.data(withJSONObject: XCTUnwrap(golden["summary"], name))

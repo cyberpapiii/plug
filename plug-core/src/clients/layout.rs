@@ -5,6 +5,8 @@
 //! servers for import. JSON is parsed and written back whole; TOML and YAML
 //! are edited as text, so the person's comments and key order survive.
 
+use std::borrow::Cow;
+
 use serde_json::{Map, Value, json};
 
 use crate::config::{HttpConfig, TransportType};
@@ -277,19 +279,25 @@ impl Layout {
 
     /// Every readable entry in the file but those named as Plug's own is.
     fn entries(&self, content: &str) -> Result<Vec<(String, ServerEntry)>, String> {
-        // A file Plug was linked into twice has two `[mcp_servers.plug]`
-        // tables, which no TOML parser accepts.
-        let content = match self.format {
-            FileFormat::Toml => self.unlink_toml(content, &is_plug),
-            _ => content.to_string(),
-        };
         Ok(self
-            .servers(&content)?
+            .servers(&self.without_plug_entries(content))?
             .unwrap_or_default()
             .into_iter()
             .filter(|(name, _)| !is_plug(name))
             .filter_map(|(name, entry)| Some((name, read_entry(&entry)?)))
             .collect())
+    }
+
+    /// `content` without the entries named as Plug's entry is. A TOML or
+    /// YAML file Plug was linked into twice has two `[mcp_servers.plug]`
+    /// tables or two `plug:` keys, which no parser accepts; JSON parsers
+    /// keep one, so a JSON file is left as it is.
+    pub fn without_plug_entries<'a>(&self, content: &'a str) -> Cow<'a, str> {
+        match self.format {
+            FileFormat::Json => Cow::Borrowed(content),
+            FileFormat::Toml => Cow::Owned(self.unlink_toml(content, &is_plug)),
+            FileFormat::Yaml => Cow::Owned(unlink_yaml(content, self.yaml_key(), &is_plug)),
+        }
     }
 
     /// How many entries for Plug, which serves at `plug`, the file has.
@@ -1285,6 +1293,13 @@ mod tests {
             assert_eq!(layout.plug_entry_count(content, &plug), 2, "{target:?}");
             let entry = layout.read_plug(content, &plug).unwrap();
             assert_eq!(entry.command.as_deref(), Some("/old/plug"), "{target:?}");
+            let others: Vec<String> = layout
+                .read_servers(content, &plug)
+                .unwrap()
+                .into_iter()
+                .map(|(name, _)| name)
+                .collect();
+            assert_eq!(others, ["other"], "{target:?}");
             let repaired = layout
                 .set_plug_command(content, &plug, "/new/plug", &target.connect_args())
                 .unwrap();

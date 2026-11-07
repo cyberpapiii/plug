@@ -823,32 +823,56 @@ async fn check_http_reachable(url: &str) -> Result<(), String> {
 
 /// Duplicate or unreadable plug entries in client configs.
 async fn check_client_configs(plug: &crate::config::HttpConfig) -> CheckResult {
-    let name = check::CLIENT_CONFIGS.to_string();
     let mut issues = Vec::new();
-
     for target in crate::clients::ClientTarget::all() {
         for (scope, path, content) in client_files(target) {
             issues.extend(client_file_issues(target, scope, &path, &content, plug));
         }
     }
+    client_configs_result(&issues)
+}
 
+/// One thing wrong with a client's settings file.
+#[derive(Debug, PartialEq, Eq)]
+enum ClientFileIssue {
+    /// More than one Plug entry, which `plug link` leaves as one.
+    Duplicates(String),
+    /// A file that does not parse, which only a person can fix.
+    Unreadable(String),
+}
+
+impl ClientFileIssue {
+    fn text(&self) -> &str {
+        match self {
+            Self::Duplicates(text) | Self::Unreadable(text) => text,
+        }
+    }
+}
+
+fn client_configs_result(issues: &[ClientFileIssue]) -> CheckResult {
+    let name = check::CLIENT_CONFIGS.to_string();
     if issues.is_empty() {
-        CheckResult {
+        return CheckResult {
             name,
             status: CheckStatus::Pass,
             message: "All detected client configurations are healthy".to_string(),
             fix_suggestion: None,
-        }
+        };
+    }
+    let texts: Vec<&str> = issues.iter().map(ClientFileIssue::text).collect();
+    let fix = if issues
+        .iter()
+        .any(|issue| matches!(issue, ClientFileIssue::Unreadable(_)))
+    {
+        "Fix a file that does not parse, then run `plug link <client>` again to leave one Plug entry"
     } else {
-        CheckResult {
-            name,
-            status: CheckStatus::Warn,
-            message: format!("Issues found in client configs: {}", issues.join(", ")),
-            fix_suggestion: Some(
-                "Fix a file that does not parse, then run `plug link <client>` again to leave one Plug entry"
-                    .to_string(),
-            ),
-        }
+        "Run `plug link <client>` again to leave one Plug entry"
+    };
+    CheckResult {
+        name,
+        status: CheckStatus::Warn,
+        message: format!("Issues found in client configs: {}", texts.join(", ")),
+        fix_suggestion: Some(fix.to_string()),
     }
 }
 
@@ -861,20 +885,31 @@ fn client_file_issues(
     path: &std::path::Path,
     content: &str,
     plug: &crate::config::HttpConfig,
-) -> Vec<String> {
+) -> Vec<ClientFileIssue> {
     let layout = target.layout();
     let mut issues = Vec::new();
-    if scope == crate::clients::Scope::User && layout.plug_entry_count(content, plug) > 1 {
-        issues.push(format!(
+    let duplicates =
+        scope == crate::clients::Scope::User && layout.plug_entry_count(content, plug) > 1;
+    if duplicates {
+        issues.push(ClientFileIssue::Duplicates(format!(
             "{} (duplicate entries in {})",
             target.slug(),
             path.display()
-        ));
+        )));
     }
-    // A file plug cannot parse is worth reporting on its own: a duplicate
-    // hiding inside it would go uncounted above.
-    if let Err(error) = layout.check_syntax(content) {
-        issues.push(format!("{} ({error} in {})", target.slug(), path.display()));
+    // Two of Plug's entries make a TOML or YAML file unparseable. Where
+    // `plug link` clears them, the rest of the file is what is checked.
+    let checked = if duplicates {
+        layout.without_plug_entries(content)
+    } else {
+        content.into()
+    };
+    if let Err(error) = layout.check_syntax(&checked) {
+        issues.push(ClientFileIssue::Unreadable(format!(
+            "{} ({error} in {})",
+            target.slug(),
+            path.display()
+        )));
     }
     issues
 }
@@ -1233,9 +1268,65 @@ mod tests {
         };
         assert_eq!(
             issues(Scope::User),
-            ["vscode (duplicate entries in mcp.json)"]
+            [super::ClientFileIssue::Duplicates(
+                "vscode (duplicate entries in mcp.json)".to_string()
+            )]
         );
         assert!(issues(Scope::Project).is_empty());
+    }
+
+    /// A TOML or YAML file linked twice does not parse, but `plug link`
+    /// fixes it, so doctor says so once and does not call it unreadable.
+    #[test]
+    fn a_file_linked_twice_is_reported_once_with_plug_link_as_the_fix() {
+        use super::ClientFileIssue::{Duplicates, Unreadable};
+        use crate::clients::{ClientTarget, Scope};
+        let plug = crate::config::HttpConfig::default();
+        for (target, twice, broken) in [
+            (
+                ClientTarget::CodexCli,
+                "[mcp_servers.plug]\ncommand = \"a\"\n\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.plug]\ncommand = \"b\"\n",
+                "[mcp_servers.plug]\ncommand = \"a\"\n\n[mcp_servers.plug]\ncommand = \"b\"\n\n[broken\n",
+            ),
+            (
+                ClientTarget::Hermes,
+                "mcp_servers:\n  plug:\n    command: a\n  other:\n    command: x\n  plug:\n    command: b\n",
+                "mcp_servers:\n  plug:\n    command: a\n  plug:\n    command: b\nother: [\n",
+            ),
+        ] {
+            let path = std::path::Path::new("settings");
+            let issues =
+                |scope, content| super::client_file_issues(target, scope, path, content, &plug);
+            let user = issues(Scope::User, twice);
+            assert!(
+                matches!(user.as_slice(), [Duplicates(_)]),
+                "{target:?}: {user:?}"
+            );
+            assert_eq!(
+                super::client_configs_result(&user)
+                    .fix_suggestion
+                    .as_deref(),
+                Some("Run `plug link <client>` again to leave one Plug entry")
+            );
+            // `plug link` does not write a project file, so a person fixes it.
+            let project = issues(Scope::Project, twice);
+            assert!(
+                matches!(project.as_slice(), [Unreadable(_)]),
+                "{target:?}: {project:?}"
+            );
+            // Broken apart from Plug's entries, the file is still unreadable.
+            let both = issues(Scope::User, broken);
+            assert!(
+                matches!(both.as_slice(), [Duplicates(_), Unreadable(_)]),
+                "{target:?}: {both:?}"
+            );
+            assert!(
+                super::client_configs_result(&both)
+                    .fix_suggestion
+                    .unwrap()
+                    .starts_with("Fix a file that does not parse")
+            );
+        }
     }
 
     use std::collections::HashMap;
