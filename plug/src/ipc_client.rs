@@ -274,7 +274,7 @@ mod tests {
     #[tokio::test]
     async fn a_reply_over_one_frame_is_reassembled() {
         let root = temp_root("chunked");
-        let _paths = plug_core::paths::test::isolate(&root).await;
+        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -305,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn the_token_is_attached_to_operator_requests() {
         let root = temp_root("token");
-        let _paths = plug_core::paths::test::isolate(&root).await;
+        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         std::fs::write(plug_core::paths::token_path(), "the-token").unwrap();
@@ -334,7 +334,7 @@ mod tests {
     #[tokio::test]
     async fn a_request_gives_up_on_a_daemon_that_never_answers() {
         let root = temp_root("silent");
-        let _paths = plug_core::paths::test::isolate(&root).await;
+        let _paths = plug_core::paths::test::isolate(&root);
         let socket = plug_core::paths::socket_path();
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = tokio::net::UnixListener::bind(&socket).unwrap();
@@ -360,7 +360,7 @@ mod tests {
     #[tokio::test]
     async fn no_daemon_reads_as_unreachable() {
         let root = temp_root("absent");
-        let _paths = plug_core::paths::test::isolate(&root).await;
+        let _paths = plug_core::paths::test::isolate(&root);
         let (availability, value) = query(IpcRequest::Status, Some).await;
         assert_eq!(availability, DaemonQueryAvailability::Unreachable);
         assert!(value.is_none());

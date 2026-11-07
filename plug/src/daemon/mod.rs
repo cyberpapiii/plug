@@ -2623,7 +2623,7 @@ allowed_servers = ["slack"]
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
@@ -2684,7 +2684,7 @@ allowed_servers = ["slack"]
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
         // flight until the upstream timeout expires.
@@ -2744,7 +2744,7 @@ allowed_servers = ["slack"]
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2778,7 +2778,7 @@ allowed_servers = ["slack"]
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = plug_core::paths::test::isolate(&temp).await;
+        let _paths = plug_core::paths::test::isolate(&temp);
 
         let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
@@ -2974,8 +2974,8 @@ allowed_servers = ["slack"]
     // so it (and the cross-transport parity matrix that builds on it) must live
     // here rather than in plug-core's integration tests.
     //
-    // Each harness binds a unique temp socket and touches no global runtime path,
-    // so it is safe under the parallel test suite without the runtime-paths lock.
+    // Each harness binds a unique temp socket. The engine keeps its other files
+    // under the test thread's own Plug folder (`plug_core::paths::test`).
 
     /// `mock_server` with extra mock-server flags appended (e.g. to enable
     /// the resources / prompts / completions capability fixtures).
@@ -3031,8 +3031,7 @@ allowed_servers = ["slack"]
             engine.start().await;
 
             // Short unique socket path in /tmp — a Unix socket path must fit in
-            // SUN_LEN (~104 bytes), and the platform temp dir is already long. No
-            // global runtime path is touched, so this is safe under parallel tests.
+            // SUN_LEN (~104 bytes), and the platform temp dir is already long.
             let socket_path = std::path::PathBuf::from(format!(
                 "/tmp/plug-ipc-{}.sock",
                 &uuid::Uuid::new_v4().simple().to_string()[..12]

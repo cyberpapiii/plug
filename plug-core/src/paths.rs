@@ -69,19 +69,23 @@ pub fn command_link() -> PathBuf {
 /// `~/Library/Application Support/plug`: the config, the socket, the PID
 /// file, the IPC token, and the state Plug keeps between runs.
 pub fn dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some((dir, _)) = test::paths() {
-        return dir;
-    }
-    home().join(DIR)
+    folder(DIR, "r/plug")
 }
 
 pub fn log_dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some((_, logs)) = test::paths() {
-        return logs;
-    }
-    home().join(LOG_DIR)
+    folder(LOG_DIR, "s/plug/logs")
+}
+
+/// `shipped` under the home folder. A test build has no home folder: it puts
+/// `in_test` under the test thread's own root (see [`test`]).
+#[cfg(not(any(test, feature = "test-helpers")))]
+fn folder(shipped: &str, _in_test: &str) -> PathBuf {
+    home().join(shipped)
+}
+
+#[cfg(any(test, feature = "test-helpers"))]
+fn folder(_shipped: &str, in_test: &str) -> PathBuf {
+    test::root().join(in_test)
 }
 
 pub fn default_config_path() -> PathBuf {
@@ -137,11 +141,7 @@ pub fn slack_events_dir() -> PathBuf {
 
 /// Large tool results kept for a client to read in parts.
 pub fn artifacts_dir() -> PathBuf {
-    #[cfg(any(test, feature = "test-helpers"))]
-    if let Some((dir, _)) = test::paths() {
-        return dir.join("artifacts");
-    }
-    home().join("Library/Caches/plug/artifacts")
+    folder("Library/Caches/plug/artifacts", "r/plug/artifacts")
 }
 
 /// The bundled `plug` binary of the app at `bundle`.
@@ -161,64 +161,75 @@ pub fn app_bundle_of(binary: &Path) -> Option<PathBuf> {
     inside.then(|| bundle.to_path_buf())
 }
 
-/// A process-wide stand-in for the home folders, for tests that run a
-/// daemon.
+/// Where a test build keeps Plug's files: never under the home folder.
+///
+/// Each thread has its own root, so tests running in parallel never share
+/// one. A thread's root is a fresh temporary folder, removed when the thread
+/// ends, unless [`isolate`] names another. libtest runs each test on its own
+/// thread, and a current-thread Tokio runtime polls every task on it.
+/// Another thread, such as a `spawn_blocking` one or a worker of a
+/// multi-thread runtime, has a root of its own, so a path a test shares with
+/// such a thread is resolved before it is handed over.
 #[cfg(any(test, feature = "test-helpers"))]
 pub mod test {
-    use std::path::PathBuf;
-    use std::sync::{Mutex, OnceLock, PoisonError};
+    use std::cell::RefCell;
+    use std::marker::PhantomData;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn slot() -> &'static Mutex<Option<(PathBuf, PathBuf)>> {
-        static SLOT: OnceLock<Mutex<Option<(PathBuf, PathBuf)>>> = OnceLock::new();
-        SLOT.get_or_init(|| Mutex::new(None))
-    }
+    /// The root a thread starts with. Nothing is created until a test writes
+    /// there.
+    struct Own(PathBuf);
 
-    pub(super) fn paths() -> Option<(PathBuf, PathBuf)> {
-        slot()
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-    }
-
-    pub fn active() -> bool {
-        paths().is_some()
-    }
-
-    fn set(runtime: PathBuf, state: PathBuf) -> Set {
-        *slot().lock().unwrap_or_else(PoisonError::into_inner) =
-            Some((runtime.join("plug"), state.join("plug/logs")));
-        Set(())
-    }
-
-    struct Set(());
-
-    impl Drop for Set {
+    impl Drop for Own {
         fn drop(&mut self) {
-            *slot().lock().unwrap_or_else(PoisonError::into_inner) = None;
+            let _ = std::fs::remove_dir_all(&self.0);
         }
     }
 
-    /// Plug's folders under `root`, for one test at a time, until this drops,
-    /// which it also does when the test panics. The paths clear before the
-    /// lock lets go.
-    #[must_use = "the paths are cleared when this guard drops"]
-    pub struct Isolated {
-        _paths: Set,
-        _lock: tokio::sync::MutexGuard<'static, ()>,
+    fn fresh() -> PathBuf {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "plug-test-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ))
     }
 
-    /// Wait for any other test that set the paths, then put Plug's folder
-    /// under `root`. The folder names stay short: a Unix socket path has to
-    /// fit in SUN_LEN, and the macOS per-user temp directory nearly fills it.
-    pub async fn isolate(root: &std::path::Path) -> Isolated {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        let lock = LOCK
-            .get_or_init(|| tokio::sync::Mutex::new(()))
-            .lock()
-            .await;
+    thread_local! {
+        static OWN: Own = Own(fresh());
+        static CHOSEN: RefCell<Option<PathBuf>> = const { RefCell::new(None) };
+    }
+
+    pub(super) fn root() -> PathBuf {
+        CHOSEN
+            .with_borrow(Clone::clone)
+            .or_else(|| OWN.try_with(|own| own.0.clone()).ok())
+            .unwrap_or_else(fresh)
+    }
+
+    /// The root chosen with [`isolate`], until this drops, which it also
+    /// does when the test panics. It belongs to the thread that made it.
+    #[must_use = "the root is restored when this guard drops"]
+    pub struct Isolated {
+        previous: Option<PathBuf>,
+        _thread: PhantomData<*const ()>,
+    }
+
+    impl Drop for Isolated {
+        fn drop(&mut self) {
+            CHOSEN.set(self.previous.take());
+        }
+    }
+
+    /// Put this thread's Plug folders under `root`, for a test that wants to
+    /// know where they are. The folder names stay short: a Unix socket path
+    /// has to fit in SUN_LEN, and the macOS per-user temp directory nearly
+    /// fills it.
+    pub fn isolate(root: &Path) -> Isolated {
         Isolated {
-            _paths: set(root.join("r"), root.join("s")),
-            _lock: lock,
+            previous: CHOSEN.replace(Some(root.to_path_buf())),
+            _thread: PhantomData,
         }
     }
 }
@@ -301,5 +312,35 @@ mod tests {
             app_bundle_of(Path::new("/Applications/Plug.app/Contents/Resources/other")),
             None
         );
+    }
+
+    #[test]
+    fn a_test_thread_keeps_its_own_files_and_they_go_when_it_ends() {
+        let home = dirs::home_dir().expect("home folder");
+        let ours = [dir(), log_dir(), artifacts_dir(), socket_path(), pid_path()];
+        assert!(ours.iter().all(|path| !path.starts_with(&home)), "{ours:?}");
+
+        let theirs = std::thread::spawn(|| {
+            let theirs = dir();
+            std::fs::create_dir_all(&theirs).unwrap();
+            theirs
+        })
+        .join()
+        .unwrap();
+        assert_ne!(theirs, dir());
+        assert!(!theirs.exists(), "{theirs:?} outlived its thread");
+    }
+
+    #[test]
+    fn isolate_moves_this_thread_only_until_it_drops() {
+        let own = dir();
+        let root = std::env::temp_dir().join("plug-isolate-check");
+        {
+            let _paths = test::isolate(&root);
+            assert_eq!(dir(), root.join("r/plug"));
+            assert_eq!(log_dir(), root.join("s/plug/logs"));
+            assert_ne!(std::thread::spawn(dir).join().unwrap(), dir());
+        }
+        assert_eq!(dir(), own);
     }
 }
