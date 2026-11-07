@@ -1509,13 +1509,24 @@ async fn run_http_upstream_crash_restart_scenario(
     // (one fresh connect, commit and `refresh_tools`) against the restarted
     // upstream — the same entry point
     // health-monitor proactive recovery and call-path reactive recovery use.
-    assert_eq!(
-        engine
+    // The phase 4 failures may have started a recovery that is still
+    // finishing, and a reconnect then answers AlreadyRunning until it ends.
+    let deadline = tokio::time::Instant::now() + recovery_deadline;
+    loop {
+        match engine
             .reconnect_server("httpcrash")
             .await
-            .expect("explicit reconnect against restarted upstream"),
-        plug_core::health::Reconnect::Reconnected
-    );
+            .expect("explicit reconnect against restarted upstream")
+        {
+            plug_core::health::Reconnect::Reconnected => break,
+            plug_core::health::Reconnect::AlreadyRunning
+                if tokio::time::Instant::now() < deadline =>
+            {
+                tokio::time::sleep(recovery_poll).await;
+            }
+            other => panic!("explicit reconnect answered {other:?}"),
+        }
+    }
     let result = engine
         .tool_router()
         .call_tool(
