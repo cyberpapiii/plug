@@ -7,6 +7,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
 
+use anyhow::Context as _;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use futures::future::join_all;
@@ -141,8 +142,23 @@ fn http_refusal_needs_sign_in(error: &StreamableHttpError<reqwest::Error>) -> Op
 /// HTTP status it was refused with; `None` for any other cause.
 fn status_refusal_needs_sign_in(cause: &(dyn std::error::Error + 'static)) -> Option<bool> {
     use crate::transport::sse_client::LegacySseError;
-    if let Some(error) = cause.downcast_ref::<rmcp::service::ClientInitializeError>() {
-        return initialize_http_error(error).and_then(http_refusal_needs_sign_in);
+    use rmcp::service::{ClientInitializeError, ServiceError};
+    // rmcp names neither error's transport error as its source, so the
+    // chain stops at them.
+    let transport = match (
+        cause.downcast_ref::<ClientInitializeError>(),
+        cause.downcast_ref::<ServiceError>(),
+    ) {
+        (Some(ClientInitializeError::TransportError { error, .. }), _)
+        | (_, Some(ServiceError::TransportSend(error))) => Some(&*error.error),
+        _ => None,
+    };
+    let cause: &(dyn std::error::Error + 'static) = match transport {
+        Some(error) => error,
+        None => cause,
+    };
+    if let Some(error) = cause.downcast_ref::<StreamableHttpError<reqwest::Error>>() {
+        return http_refusal_needs_sign_in(error);
     }
     match cause.downcast_ref::<LegacySseError>()? {
         error @ LegacySseError::UnexpectedStatus { .. } => Some(error.refuses_credentials()),
@@ -1875,7 +1891,7 @@ impl ServerManager {
         let client: McpClient = handler
             .serve(transport)
             .await
-            .map_err(|e| anyhow::anyhow!("failed to connect to legacy SSE upstream: {e}"))?;
+            .context("failed to connect to legacy SSE upstream")?;
 
         Self::finish_upstream_connection(
             name,
@@ -1952,8 +1968,7 @@ impl ServerManager {
                     .await;
             }
         });
-        let tools_result =
-            tools_result.map_err(|e| anyhow::anyhow!("failed to list tools: {e}"))?;
+        let tools_result = tools_result.context("failed to list tools")?;
         tools.store(Arc::new(tools_result));
 
         Ok(UpstreamServer {
@@ -2996,6 +3011,49 @@ mod tests {
         )
         .context("failed to connect to legacy SSE upstream");
         assert!(!start_needs_sign_in(&oauth, &sse), "{sse:#}");
+        let forbidden = || crate::transport::sse_client::LegacySseError::UnexpectedStatus {
+            status: reqwest::StatusCode::FORBIDDEN,
+            challenge: None,
+            body: "Unauthorized".into(),
+        };
+        let sse_initialize =
+            anyhow::Error::new(rmcp::service::ClientInitializeError::TransportError {
+                error: rmcp::transport::DynamicTransportError::from_parts(
+                    "legacy-sse",
+                    std::any::TypeId::of::<()>(),
+                    Box::new(forbidden()),
+                ),
+                context: "send initialize request".into(),
+            })
+            .context("failed to connect to legacy SSE upstream");
+        assert!(
+            !start_needs_sign_in(&oauth, &sse_initialize),
+            "{sse_initialize:#}"
+        );
+        let list_tools = |error: Box<dyn std::error::Error + Send + Sync>| {
+            anyhow::Error::new(rmcp::service::ServiceError::TransportSend(
+                rmcp::transport::DynamicTransportError::from_parts(
+                    "test",
+                    std::any::TypeId::of::<()>(),
+                    error,
+                ),
+            ))
+            .context("failed to list tools")
+        };
+        let http_list = list_tools(Box::new(
+            StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+                "HTTP 403 Forbidden: Unauthorized (401)".into(),
+            ),
+        ));
+        assert!(!start_needs_sign_in(&oauth, &http_list), "{http_list:#}");
+        let sse_list = list_tools(Box::new(forbidden()));
+        assert!(!start_needs_sign_in(&oauth, &sse_list), "{sse_list:#}");
+        let refused = list_tools(Box::new(
+            StreamableHttpError::<reqwest::Error>::UnexpectedServerResponse(
+                "HTTP 401 Unauthorized: expired".into(),
+            ),
+        ));
+        assert!(start_needs_sign_in(&oauth, &refused), "{refused:#}");
         // rmcp reports its OAuth failures only as text.
         let text = anyhow::anyhow!("OAuth authorization required");
         assert!(start_needs_sign_in(&oauth, &text));

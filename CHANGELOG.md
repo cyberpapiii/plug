@@ -61,6 +61,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 ### Fixed
 
 - Signing in to a server with OAuth refuses a registration, token or other sign-in address on a cloud metadata endpoint, such as `169.254.169.254`, even when the server's own sign-in details name it. Only a redirect to one used to be refused.
+- A server that signs in with OAuth and refuses Plug while it starts over legacy SSE, or when Plug first lists its tools, is judged by the refusal's status there too: a plain 403 is retried, whatever its message says, where it used to ask you to sign in again.
 - A remote client whose sign-in has ended, because it ran out or because Plug ended it after a stolen token was replayed, no longer shows as signed in on the Clients page and no longer counts as a listener for an event. Only its requests used to be refused.
 - Plug reads a server's refusal the same way over HTTP and legacy SSE, as the MCP spec does: a 401, or a 403 asking for more scope, means you need to sign in again; any other 403 is an error that is retried. A 403 asking for more scope over HTTP used to show as an error, and a plain 403 over SSE, or one over HTTP whose message said "Unauthorized", used to ask for sign-in.
 - A server that signs in with OAuth and refuses its token when Plug reconnects it now asks you to sign in again. It used to show as down and be redialled every minute, forever, with no sign-in prompt.
