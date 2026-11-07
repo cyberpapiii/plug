@@ -15,10 +15,11 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use plug_core::clients::ClientTarget;
+use plug_core::clients::{ClientTarget, LinkTransport};
 use plug_core::config::{ServerConfig, TransportType};
 use plug_core::doctor::{CheckResult, CheckStatus, DoctorReport};
 use plug_core::import::{DiscoveredServer, ImportReport, ScanResult};
+use plug_core::ipc::LiveSessionTransport;
 
 use crate::commands::clients::{ClientView, LiveSessionView};
 use crate::commands::doctor::{
@@ -50,19 +51,19 @@ fn check(name: &str, value: serde_json::Value) {
     );
 }
 
-fn client(target: ClientTarget, linked: Option<&str>, live_sessions: usize) -> ClientView {
+fn client(target: ClientTarget, linked: Option<LinkTransport>, live_sessions: usize) -> ClientView {
     ClientView {
         name: target.display_name().to_string(),
         target: target.slug().to_string(),
         linked: linked.is_some(),
-        linked_transport: linked.map(str::to_string),
-        linked_endpoint: (linked == Some("http"))
+        linked_transport: linked,
+        linked_endpoint: (linked == Some(LinkTransport::Http))
             .then(|| "https://plug.example.com/mcp".to_string()),
         detected: true,
         live: live_sessions > 0,
         live_sessions,
         live_transports: if live_sessions > 0 {
-            vec!["daemon_proxy".to_string()]
+            vec![LiveSessionTransport::DaemonProxy]
         } else {
             Vec::new()
         },
@@ -74,12 +75,12 @@ fn client(target: ClientTarget, linked: Option<&str>, live_sessions: usize) -> C
 
 fn clients() -> serde_json::Value {
     let clients = [
-        client(ClientTarget::ClaudeCode, Some("stdio"), 2),
-        client(ClientTarget::Cursor, Some("http"), 0),
+        client(ClientTarget::ClaudeCode, Some(LinkTransport::Stdio), 2),
+        client(ClientTarget::Cursor, Some(LinkTransport::Http), 0),
         client(ClientTarget::Zed, None, 0),
     ];
     let sessions = [LiveSessionView {
-        transport: "daemon_proxy".to_string(),
+        transport: LiveSessionTransport::DaemonProxy,
         client_id: Some("connector-1".to_string()),
         session_id: "session-1".to_string(),
         client_type: "Claude Code".to_string(),

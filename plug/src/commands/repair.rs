@@ -59,12 +59,16 @@ fn repair_text_summary(report: &ClientRepairReport) -> String {
 }
 
 pub(crate) fn cmd_repair(
+    config_path: Option<&std::path::PathBuf>,
     targets: Vec<String>,
     all: bool,
     dry_run: bool,
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let targets = repair_targets(targets, all)?;
+    let plug = crate::commands::clients::own_http(
+        plug_core::config::load_config(config_path).ok().as_ref(),
+    );
     // A dry run inspects against this binary, so it needs no Plug.app.
     let canonical_command = if dry_run {
         std::env::current_exe()?
@@ -85,31 +89,31 @@ pub(crate) fn cmd_repair(
         );
     }
 
-    let items = targets
-        .into_iter()
-        .map(|target| {
-            let item = inspect_link(target, &canonical_command, !dry_run).unwrap_or_else(|| {
-                ClientRepairItem {
-                    target: target.slug().to_string(),
-                    path: target
-                        .config_path(plug_core::clients::Scope::User)
-                        .unwrap_or_default(),
-                    disposition: PlugLinkDisposition::Missing,
-                    changed: false,
-                    message: "Client config file does not exist.".to_string(),
+    let items =
+        targets
+            .into_iter()
+            .map(|target| {
+                let item = inspect_link(target, &canonical_command, !dry_run, &plug)
+                    .unwrap_or_else(|| ClientRepairItem {
+                        target: target.slug().to_string(),
+                        path: target
+                            .config_path(plug_core::clients::Scope::User)
+                            .unwrap_or_default(),
+                        disposition: PlugLinkDisposition::Missing,
+                        changed: false,
+                        message: "Client config file does not exist.".to_string(),
+                    });
+                if item.changed && matches!(output, OutputFormat::Text) {
+                    println!(
+                        "  {} Refreshing {}... {}",
+                        style("›").cyan().bold(),
+                        item.target,
+                        style("done").green()
+                    );
                 }
-            });
-            if item.changed && matches!(output, OutputFormat::Text) {
-                println!(
-                    "  {} Refreshing {}... {}",
-                    style("›").cyan().bold(),
-                    item.target,
-                    style("done").green()
-                );
-            }
-            item
-        })
-        .collect();
+                item
+            })
+            .collect();
     let report = ClientRepairReport::new(canonical_command, items);
 
     match output {

@@ -5,7 +5,8 @@
 use std::time::Duration;
 
 use rmcp::transport::auth::{
-    OAuthHttpClient, OAuthHttpClientFuture, OAuthHttpRedirectPolicy, OAuthHttpRequest,
+    OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy,
+    OAuthHttpRequest,
 };
 
 /// How long an upstream HTTP connect may take before it is abandoned.
@@ -87,41 +88,53 @@ struct OAuthClient {
 
 impl OAuthHttpClient for OAuthClient {
     fn execute(&self, request: OAuthHttpRequest) -> OAuthHttpClientFuture<'_> {
-        Box::pin(async move {
-            use futures::StreamExt as _;
-            let OAuthHttpRequest {
-                request,
-                redirect_policy,
-                timeout,
-                ..
-            } = request;
-            let client = match redirect_policy {
-                OAuthHttpRedirectPolicy::Stop => &self.stop,
-                _ => &self.follow,
-            };
-            let mut request = reqwest::Request::try_from(request)?;
-            *request.timeout_mut() = timeout;
-            let response = client.execute(request).await?;
-            let mut builder = http::Response::builder()
-                .status(response.status())
-                .version(response.version());
-            for (name, value) in response.headers() {
-                builder = builder.header(name, value);
+        let OAuthHttpRequest {
+            request,
+            redirect_policy,
+            timeout,
+            ..
+        } = request;
+        Box::pin(self.send(request, redirect_policy, timeout))
+    }
+}
+
+impl OAuthClient {
+    async fn send(
+        &self,
+        request: http::Request<Vec<u8>>,
+        redirect_policy: OAuthHttpRedirectPolicy,
+        timeout: Option<Duration>,
+    ) -> Result<http::Response<Vec<u8>>, OAuthHttpClientError> {
+        use futures::StreamExt as _;
+        let client = match redirect_policy {
+            OAuthHttpRedirectPolicy::Stop => &self.stop,
+            _ => &self.follow,
+        };
+        let mut request = reqwest::Request::try_from(request)?;
+        // rmcp 3.1.0 checks only the authorization server's metadata address.
+        // The registration, token and other endpoints that metadata names
+        // arrive here unchecked.
+        refuse_blocked(request.url())?;
+        *request.timeout_mut() = timeout;
+        let response = client.execute(request).await?;
+        let mut builder = http::Response::builder()
+            .status(response.status())
+            .version(response.version());
+        for (name, value) in response.headers() {
+            builder = builder.header(name, value);
+        }
+        let mut body = Vec::new();
+        let mut chunks = response.bytes_stream();
+        while let Some(chunk) = chunks.next().await {
+            let chunk = chunk?;
+            if chunk.len() > MAX_OAUTH_BODY_BYTES - body.len() {
+                return Err(
+                    format!("OAuth response body exceeds {MAX_OAUTH_BODY_BYTES} bytes").into(),
+                );
             }
-            let mut body = Vec::new();
-            let mut chunks = response.bytes_stream();
-            while let Some(chunk) = chunks.next().await {
-                let chunk = chunk?;
-                if chunk.len() > MAX_OAUTH_BODY_BYTES - body.len() {
-                    return Err(format!(
-                        "OAuth response body exceeds {MAX_OAUTH_BODY_BYTES} bytes"
-                    )
-                    .into());
-                }
-                body.extend_from_slice(&chunk);
-            }
-            Ok(builder.body(body)?)
-        })
+            body.extend_from_slice(&chunk);
+        }
+        Ok(builder.body(body)?)
     }
 }
 
@@ -224,6 +237,32 @@ mod tests {
                     "{location}: {error:?}"
                 );
             }
+        }
+    }
+
+    /// Metadata can name any registration or token endpoint, and the OAuth
+    /// client is the only place those addresses are checked.
+    #[tokio::test]
+    async fn the_oauth_client_refuses_a_cloud_metadata_endpoint_it_is_sent_to() {
+        let oauth = OAuthClient {
+            follow: client(Redirects::AnyHost).unwrap(),
+            stop: client(Redirects::Never).unwrap(),
+        };
+        for policy in [
+            OAuthHttpRedirectPolicy::Follow,
+            OAuthHttpRedirectPolicy::Stop,
+        ] {
+            let request = http::Request::post("http://169.254.169.254/register")
+                .body(b"{}".to_vec())
+                .unwrap();
+            let error = oauth
+                .send(request, policy, Some(Duration::from_secs(5)))
+                .await
+                .expect_err("the request is refused before it is sent");
+            assert!(
+                error.to_string().contains("cloud metadata endpoint"),
+                "{error}"
+            );
         }
     }
 

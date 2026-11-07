@@ -1,7 +1,8 @@
 use dialoguer::console::style;
+use plug_core::clients::LinkTransport;
 
 use crate::OutputFormat;
-use crate::commands::clients::{link_transport, linked_clients};
+use crate::commands::clients::{link_transport, linked_clients, own_http};
 use crate::ipc_client::{self, daemon_running};
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
@@ -11,36 +12,25 @@ use crate::ui::{
 use crate::views::live::{self, fetch_live_sessions};
 
 /// Each linked client's slug and the transport its link uses.
-fn linked_topology() -> Vec<(String, String)> {
-    linked_clients()
+fn linked_topology(config: Option<&plug_core::config::Config>) -> Vec<(String, LinkTransport)> {
+    linked_clients(&own_http(config))
         .into_iter()
-        .map(|(target, entry)| {
-            (
-                target.slug().to_string(),
-                link_transport(&entry).as_str().to_string(),
-            )
-        })
+        .map(|(target, entry)| (target.slug().to_string(), link_transport(&entry)))
         .collect()
 }
 
-fn linked_client_transport_summary(linked_clients: &[(String, String)]) -> String {
-    let mut stdio = 0usize;
-    let mut http = 0usize;
-    let mut other = 0usize;
-
-    for (_, transport) in linked_clients {
-        match transport.as_str() {
-            "stdio" => stdio += 1,
-            "http" => http += 1,
-            _ => other += 1,
-        }
-    }
-
-    if other > 0 {
-        format!("stdio={stdio} http={http} other={other}")
-    } else {
-        format!("stdio={stdio} http={http}")
-    }
+fn linked_client_transport_summary(linked_clients: &[(String, LinkTransport)]) -> String {
+    let count = |kind: LinkTransport| {
+        linked_clients
+            .iter()
+            .filter(|(_, transport)| *transport == kind)
+            .count()
+    };
+    format!(
+        "stdio={} http={}",
+        count(LinkTransport::Stdio),
+        count(LinkTransport::Http)
+    )
 }
 
 fn owner_approval_state(
@@ -202,7 +192,12 @@ pub(crate) async fn cmd_overview(
         .cloned()
         .unwrap_or_else(plug_core::paths::default_config_path);
     let config_exists = config_path.exists();
-    let linked = linked_topology();
+    let loaded = if config_exists {
+        plug_core::config::load_config(Some(&config_path)).ok()
+    } else {
+        None
+    };
+    let linked = linked_topology(loaded.as_ref());
     let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();
     let live_clients = fetch_live_sessions().await;
     let live_client_count = live_clients.len();
@@ -210,11 +205,7 @@ pub(crate) async fn cmd_overview(
 
     if matches!(output, OutputFormat::Json) {
         let daemon_running = crate::ipc_client::daemon_running().await;
-        let config = if config_exists {
-            plug_core::config::load_config(Some(&config_path)).ok()
-        } else {
-            None
-        };
+        let config = loaded;
         let server_count = config.as_ref().map(|c| c.servers.len()).unwrap_or(0);
         let owner_approval = config.as_ref().and_then(owner_approval_state);
         let next_actions = overview_next_actions(
@@ -364,7 +355,7 @@ pub(crate) async fn cmd_status(
     let daemon_running = daemon_running().await;
 
     let config = plug_core::config::load_config(config_path).ok();
-    let linked_clients = linked_topology();
+    let linked_clients = linked_topology(config.as_ref());
     let downstream_auth_info = config.as_ref().map(|c| {
         let mode = c.http.auth_mode.label();
         let summary = match c.http.auth_mode {

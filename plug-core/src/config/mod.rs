@@ -395,6 +395,22 @@ impl HttpConfig {
                 .is_some_and(|host| is_loopback_host(host) || host == self.bind_address);
         is_given || is_listener
     }
+
+    /// Whether a server that runs `command` with `args`, or reaches `url`, is
+    /// Plug itself: it runs `plug connect` or `plug serve`, or it names
+    /// Plug's own address.
+    pub fn is_plug_itself(
+        &self,
+        command: Option<&str>,
+        args: &[String],
+        url: Option<&str>,
+    ) -> bool {
+        let runs_plug = command.is_some_and(|command| {
+            std::path::Path::new(command).file_name() == Some("plug".as_ref())
+                && args.iter().any(|arg| arg == "connect" || arg == "serve")
+        });
+        runs_plug || url.is_some_and(|url| self.is_own_mcp_url(url))
+    }
 }
 
 /// Configuration for a single upstream MCP server.
@@ -819,6 +835,16 @@ pub fn validate_config(config: &Config) -> Vec<String> {
 
         if let Err(e) = sanitize_server_name_for_path(name) {
             errors.push(format!("server '{name}': {e}"));
+        }
+
+        if config.http.is_plug_itself(
+            server.command.as_deref(),
+            &server.args,
+            server.url.as_deref(),
+        ) {
+            errors.push(format!(
+                "server '{name}': this is Plug itself, which would connect Plug to itself"
+            ));
         }
 
         if server.is_oauth() {
@@ -1905,6 +1931,36 @@ LOG_LEVEL = "debug"
             "not a url",
         ] {
             assert!(!cfg.http.is_own_mcp_url(other), "{other}");
+        }
+    }
+
+    #[test]
+    fn a_server_that_is_plug_itself_is_refused() {
+        let plug_itself = [
+            r#"{ "transport": "http", "url": "http://localhost:3282/mcp" }"#,
+            r#"{ "transport": "sse", "url": "http://127.0.0.1:3282/mcp/" }"#,
+            r#"{ "command": "/Applications/Plug.app/Contents/Resources/plug", "args": ["connect"] }"#,
+            r#"{ "command": "plug", "args": ["serve"] }"#,
+        ];
+        for server in plug_itself {
+            let mut cfg = Config::default();
+            cfg.servers
+                .insert("loop".to_string(), serde_json::from_str(server).unwrap());
+            let errors = validate_config(&cfg);
+            assert!(
+                errors.iter().any(|error| error.contains("Plug itself")),
+                "{server}: {errors:?}"
+            );
+        }
+        for server in [
+            r#"{ "transport": "http", "url": "http://localhost:3283/mcp" }"#,
+            r#"{ "command": "plug-mcp", "args": ["connect"] }"#,
+            r#"{ "command": "plug", "args": ["status"] }"#,
+        ] {
+            let mut cfg = Config::default();
+            cfg.servers
+                .insert("other".to_string(), serde_json::from_str(server).unwrap());
+            assert!(validate_config(&cfg).is_empty(), "{server}");
         }
     }
 

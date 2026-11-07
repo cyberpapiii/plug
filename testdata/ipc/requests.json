@@ -477,7 +477,63 @@
           "allow_write": [],
           "profile_path": null
         }
-      }
+      },
+      "replacing": false
+    }
+  },
+  "validate_server_edit": {
+    "type": "Operator",
+    "auth_token": "golden-auth-token",
+    "request": {
+      "type": "ValidateServer",
+      "name": "workspace",
+      "server": {
+        "command": "uvx",
+        "args": [
+          "workspace-mcp",
+          "--single-user"
+        ],
+        "env": {
+          "WORKSPACE_TOKEN": "$WORKSPACE_TOKEN"
+        },
+        "enabled": false,
+        "transport": "stdio",
+        "protocol": "legacy",
+        "url": null,
+        "auth_token": null,
+        "auth": null,
+        "oauth_client_id": null,
+        "oauth_scopes": null,
+        "timeout_secs": 45,
+        "call_timeout_secs": 600,
+        "max_concurrent": 2,
+        "health_check_interval_secs": 120,
+        "circuit_breaker_enabled": false,
+        "tool_renames": {
+          "search": "find"
+        },
+        "tool_groups": [
+          {
+            "prefix": "Gmail",
+            "contains": [
+              "gmail"
+            ],
+            "strip": [
+              "gmail"
+            ]
+          }
+        ],
+        "sandbox": {
+          "enabled": true,
+          "allow_network": true,
+          "allow_read": [
+            "/Users/me/notes"
+          ],
+          "allow_write": [],
+          "profile_path": null
+        }
+      },
+      "replacing": true
     }
   }
 }

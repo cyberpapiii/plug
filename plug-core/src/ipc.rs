@@ -369,10 +369,13 @@ pub enum OperatorRequest {
     RevokeDownstreamClient {
         client_id: String,
     },
-    /// Check a server that is not in the config yet.
+    /// Check a server before it is added, or before it replaces the server
+    /// of that name when `replacing`.
     ValidateServer {
         name: String,
         server: Box<crate::config::ServerConfig>,
+        #[serde(default)]
+        replacing: bool,
     },
     /// List the operations of the OpenAPI document at `spec`, so a person
     /// can choose among them before adding the server.
@@ -617,7 +620,7 @@ impl IpcTrustInfo {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LiveSessionTransport {
     DaemonProxy,

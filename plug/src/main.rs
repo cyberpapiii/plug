@@ -708,7 +708,7 @@ async fn run() -> anyhow::Result<()> {
             &cli.output,
         )?,
         Some(Commands::Unlink { targets, all, yes }) => {
-            commands::clients::cmd_unlink(targets, all, yes, &cli.output)?
+            commands::clients::cmd_unlink(cli.config.as_ref(), targets, all, yes, &cli.output)?
         }
         Some(Commands::Server { command }) => {
             commands::servers::cmd_server_command(cli.config.as_ref(), command, &cli.output).await?
@@ -736,7 +736,9 @@ async fn run() -> anyhow::Result<()> {
             targets,
             all,
             dry_run,
-        }) => commands::repair::cmd_repair(targets, all, dry_run, &cli.output)?,
+        }) => {
+            commands::repair::cmd_repair(cli.config.as_ref(), targets, all, dry_run, &cli.output)?
+        }
         Some(Commands::Setup { yes, transport }) => {
             commands::setup::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into)).await?
         }

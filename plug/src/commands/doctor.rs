@@ -136,9 +136,10 @@ fn repair_content(
     target: ClientTarget,
     content: &str,
     canonical: &Path,
+    own: &plug_core::config::HttpConfig,
 ) -> anyhow::Result<(PlugLinkDisposition, Option<String>, &'static str)> {
     let layout = target.layout();
-    let Some(plug) = layout.read_plug(content) else {
+    let Some(plug) = layout.read_plug(content, own) else {
         return Ok((
             PlugLinkDisposition::Missing,
             None,
@@ -161,6 +162,7 @@ fn repair_content(
             disposition,
             Some(layout.set_plug_command(
                 content,
+                own,
                 &canonical.to_string_lossy(),
                 &target.connect_args(),
             )?),
@@ -185,6 +187,7 @@ pub(crate) fn inspect_link(
     target: ClientTarget,
     canonical: &Path,
     write: bool,
+    plug: &plug_core::config::HttpConfig,
 ) -> Option<ClientRepairItem> {
     let path = target.config_path(Scope::User)?;
     let item = |disposition, message: String| ClientRepairItem {
@@ -204,7 +207,7 @@ pub(crate) fn inspect_link(
             ));
         }
     };
-    let (disposition, updated, message) = match repair_content(target, &content, canonical) {
+    let (disposition, updated, message) = match repair_content(target, &content, canonical, plug) {
         Ok(repair) => repair,
         Err(error) => {
             return Some(item(
@@ -244,7 +247,7 @@ pub(crate) async fn cmd_doctor(
     let mut report = plug_core::doctor::run_doctor(&config, &resolved).await;
     report.checks.extend(runtime_doctor_checks(&config).await);
     fold_daemon_liveness_checks(&mut report.checks);
-    let unified_snapshot = unified_install_snapshot().await;
+    let unified_snapshot = unified_install_snapshot(&config.http).await;
     report
         .checks
         .push(unified_install_check_from_snapshot(&unified_snapshot));
@@ -517,7 +520,7 @@ where
         .map_err(|_| anyhow::anyhow!("{name} timed out after {}ms", timeout.as_millis()))??)
 }
 
-async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
+async fn unified_install_snapshot(plug: &plug_core::config::HttpConfig) -> UnifiedInstallSnapshot {
     use plug_core::ipc::{DaemonOwnershipMode, IpcRequest, IpcResponse};
 
     let mut inspection_errors = Vec::new();
@@ -591,7 +594,7 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
             )
         })
         .collect();
-    let linked_clients = inspect_linked_clients(app.as_ref());
+    let linked_clients = inspect_linked_clients(app.as_ref(), plug);
     let app_program = app.as_ref().map(|app| app.executable_path.clone());
     let launchd = tokio::task::spawn_blocking(move || {
         crate::service::discover_launchd_jobs(
@@ -660,12 +663,13 @@ async fn unified_install_snapshot() -> UnifiedInstallSnapshot {
 
 fn inspect_linked_clients(
     app: Option<&crate::install::VerifiedAppInstallation>,
+    plug: &plug_core::config::HttpConfig,
 ) -> Vec<ClientRepairItem> {
     let Some(app) = app else {
         return Vec::new();
     };
     ClientTarget::listed()
-        .filter_map(|target| inspect_link(target, &app.executable_path, false))
+        .filter_map(|target| inspect_link(target, &app.executable_path, false, plug))
         .collect()
 }
 
@@ -743,18 +747,17 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
 }
 
 /// Remote apps that sign in through dynamic registration make a new client
-/// each time, and every old one keeps its grants until it expires 90 days
-/// after its last use. Several registrations under one name are usually
-/// leftovers worth revoking. One the owner gave a name of its own is not a
-/// leftover, and one whose sign-in never finished goes by itself in an hour.
+/// each time, and every old one keeps its grants until its registration
+/// runs out. Several registrations under one name are usually leftovers
+/// worth revoking. One the owner gave a name of its own is not a leftover,
+/// and one whose sign-in never finished goes by itself.
 fn duplicate_downstream_client_check(
     clients: &[plug_core::downstream_oauth::RegisteredClientSummary],
     named: &std::collections::BTreeSet<String>,
 ) -> Option<CheckResult> {
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     for client in clients {
-        let unfinished = !client.signed_in && client.last_used_at.is_none();
-        if unfinished || named.contains(&client.client_id) {
+        if client.is_unactivated() || named.contains(&client.client_id) {
             continue;
         }
         *counts.entry(client.client_name.as_str()).or_default() += 1;
@@ -771,8 +774,9 @@ fn duplicate_downstream_client_check(
         name: check::DOWNSTREAM_OAUTH_CLIENTS.to_string(),
         status: CheckStatus::Warn,
         message: format!(
-            "Clients signed in more than once: {}. Each old sign-in keeps its access until 90 days after its last use",
-            duplicates.join(", ")
+            "Clients signed in more than once: {}. Each old sign-in keeps its access until {} days after its last use",
+            duplicates.join(", "),
+            plug_core::downstream_oauth::REGISTRATION_LIFETIME_SECS / (24 * 3600)
         ),
         fix_suggestion: Some(
             "Open Clients in Plug and turn off the ones you no longer use, or give each one you keep a name of its own. From a terminal: `plug auth clients list`, then `plug auth clients revoke <client_id>`".to_string(),
@@ -1430,10 +1434,15 @@ mod tests {
 
         // A recognized legacy client entry migrates to the canonical command.
         let legacy = r#"{"mcpServers":{"plug":{"command":"/opt/homebrew/bin/plug","args":["connect"]},"unrelated":{"command":"other","custom":true}},"unknown":{"preserved":true}}"#;
-        let migrated = repair_content(ClientTarget::Cursor, legacy, &app.executable_path)
-            .unwrap()
-            .1
-            .expect("recognized legacy entry must migrate");
+        let migrated = repair_content(
+            ClientTarget::Cursor,
+            legacy,
+            &app.executable_path,
+            &Default::default(),
+        )
+        .unwrap()
+        .1
+        .expect("recognized legacy entry must migrate");
         let migrated: serde_json::Value = serde_json::from_str(&migrated).unwrap();
         assert_eq!(
             migrated["mcpServers"]["plug"]["command"],
@@ -1444,8 +1453,13 @@ mod tests {
 
         // Unknown commands are represented exactly and never receive a rewrite.
         let unknown_source = r#"{"mcpServers":{"plug":{"command":"/tmp/not-plug","args":["connect"]}},"unknown":{"preserved":true}}"#;
-        let (disposition, updated, _) =
-            repair_content(ClientTarget::Cursor, unknown_source, &app.executable_path).unwrap();
+        let (disposition, updated, _) = repair_content(
+            ClientTarget::Cursor,
+            unknown_source,
+            &app.executable_path,
+            &Default::default(),
+        )
+        .unwrap();
         assert_eq!(updated, None);
         assert_eq!(
             serde_json::from_str::<serde_json::Value>(unknown_source).unwrap()["unknown"],
@@ -1980,14 +1994,24 @@ mod tests {
             r#"{{"mcpServers":{{"plug":{{"command":"{}","args":["connect"],"custom":true}},"other":{{"command":"other"}}}},"unknown":{{"preserved":true}}}}"#,
             canonical.display()
         );
-        let canonical_repair = repair_content(ClientTarget::Cursor, &canonical_content, canonical)
-            .expect("canonical config should parse");
+        let canonical_repair = repair_content(
+            ClientTarget::Cursor,
+            &canonical_content,
+            canonical,
+            &Default::default(),
+        )
+        .expect("canonical config should parse");
         assert_eq!(canonical_repair.0, PlugLinkDisposition::Canonical);
         assert_eq!(canonical_repair.1, None);
 
         let unknown_content = r#"{"mcpServers":{"plug":{"command":"/tmp/other","args":["connect"]},"other":{"command":"other"}},"unknown":{"preserved":true}}"#;
-        let unknown_repair = repair_content(ClientTarget::Cursor, unknown_content, canonical)
-            .expect("unknown config should parse");
+        let unknown_repair = repair_content(
+            ClientTarget::Cursor,
+            unknown_content,
+            canonical,
+            &Default::default(),
+        )
+        .expect("unknown config should parse");
         assert_eq!(unknown_repair.0, PlugLinkDisposition::UnknownCommand);
         assert_eq!(unknown_repair.1, None);
     }
@@ -2016,8 +2040,8 @@ mod tests {
         ];
 
         for (target, content) in &fixtures {
-            let repair =
-                repair_content(*target, content, canonical).expect("legacy config should parse");
+            let repair = repair_content(*target, content, canonical, &Default::default())
+                .expect("legacy config should parse");
             assert_eq!(repair.0, PlugLinkDisposition::RecognizedLegacy);
             let updated = repair.1.expect("legacy entry should update");
             assert!(updated.contains(canonical.to_str().unwrap()));
@@ -2040,19 +2064,34 @@ mod tests {
         let valid_args = format!(
             r#"{{"mcpServers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}}}}}}"#
         );
-        let recognized = repair_content(ClientTarget::Cursor, &valid_args, canonical)
-            .expect("recognized Cargo path should be repairable with valid args");
+        let recognized = repair_content(
+            ClientTarget::Cursor,
+            &valid_args,
+            canonical,
+            &Default::default(),
+        )
+        .expect("recognized Cargo path should be repairable with valid args");
         assert_eq!(recognized.0, PlugLinkDisposition::RecognizedLegacy);
-        let invalid = repair_content(ClientTarget::Cursor, &invalid_args, canonical)
-            .expect("invalid args are reported, not repaired");
+        let invalid = repair_content(
+            ClientTarget::Cursor,
+            &invalid_args,
+            canonical,
+            &Default::default(),
+        )
+        .expect("invalid args are reported, not repaired");
         assert_eq!(invalid.0, PlugLinkDisposition::UnknownCommand);
         assert_eq!(invalid.1, None);
 
         let dual_container = format!(
             r#"{{"mcpServers":{{"other":{{"command":"other"}}}},"context_servers":{{"plug":{{"command":"{cargo_command}","args":["connect"]}}}}}}"#
         );
-        let repaired = repair_content(ClientTarget::Zed, &dual_container, canonical)
-            .expect("dual container config should repair");
+        let repaired = repair_content(
+            ClientTarget::Zed,
+            &dual_container,
+            canonical,
+            &Default::default(),
+        )
+        .expect("dual container config should repair");
         let updated = repaired
             .1
             .expect("context_servers Plug entry should update");
@@ -2088,7 +2127,7 @@ mod tests {
             ),
         ];
         for (target, content, retained_comment) in fixtures {
-            let repair = repair_content(target, &content, canonical).unwrap();
+            let repair = repair_content(target, &content, canonical, &Default::default()).unwrap();
             let updated = repair.1.expect("legacy entry should update");
             assert!(updated.contains("# keep this document comment"));
             assert!(updated.contains(retained_comment));
@@ -2117,7 +2156,7 @@ mod tests {
             ),
         ];
         for (target, content) in fixtures {
-            let repair = repair_content(target, &content, canonical).unwrap();
+            let repair = repair_content(target, &content, canonical, &Default::default()).unwrap();
             let updated = repair.1.expect("legacy entry should update");
             assert!(updated.contains("# retain this unrelated comment"));
             assert!(

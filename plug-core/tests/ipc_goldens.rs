@@ -190,6 +190,15 @@ fn requests() -> BTreeMap<&'static str, IpcRequest> {
             operator(OperatorRequest::ValidateServer {
                 name: "workspace".to_string(),
                 server: Box::new(stdio_server()),
+                replacing: false,
+            }),
+        ),
+        (
+            "validate_server_edit",
+            operator(OperatorRequest::ValidateServer {
+                name: "workspace".to_string(),
+                server: Box::new(stdio_server()),
+                replacing: true,
             }),
         ),
         (
@@ -770,6 +779,13 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
             IpcResponse::Error {
                 code: "OPERATOR_MUTATION_FAILED".to_string(),
                 message: "unknown server `gone`".to_string(),
+            },
+        ),
+        (
+            "server_name_taken",
+            IpcResponse::Error {
+                code: plug_core::operator::NameTaken::CODE.to_string(),
+                message: plug_core::operator::NameTaken("github".to_string()).to_string(),
             },
         ),
     ])

@@ -75,7 +75,8 @@ final class GoldenPayloadTests: XCTestCase {
             "snapshot": op(.snapshot),
             "activity": op(.activity(afterSequence: 41, limit: 200, failuresOnly: false)),
             "get_server_config": op(.serverConfig(name: "workspace")),
-            "validate_server": op(.validateServer(name: "workspace", server: stdioServer)),
+            "validate_server": op(.validateServer(name: "workspace", server: stdioServer, replacing: false)),
+            "validate_server_edit": op(.validateServer(name: "workspace", server: stdioServer, replacing: true)),
             "describe_api": op(.describeAPI(spec: "https://example.com/openapi.json")),
             "add_server": op(.mutate(.addServer(name: "workspace", server: stdioServer), secretStore: "file")),
             "add_remote_server": mutate(.addServer(name: "notes", server: remoteServer)),
@@ -332,6 +333,8 @@ final class GoldenPayloadTests: XCTestCase {
         guard case let .error(code, message) = try response("error") else { return XCTFail() }
         XCTAssertEqual(code, "OPERATOR_MUTATION_FAILED")
         XCTAssertEqual(message, "unknown server `gone`")
+        guard case let .error(taken, _) = try response("server_name_taken") else { return XCTFail() }
+        XCTAssertEqual(taken, PlugIPCError.serverNameTaken)
     }
 
     // MARK: Chunked

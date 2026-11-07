@@ -56,14 +56,14 @@ final class PlugActions {
     /// cannot start is refused with the daemon's reason.
     func addServer(_ name: String, _ config: ServerConfig, secretStore: String?) async throws {
         try await change { daemon in
-            _ = try await daemon.send(.validateServer(name: name, server: config))
+            _ = try await daemon.send(.validateServer(name: name, server: config, replacing: false))
             _ = try await daemon.send(.mutate(.addServer(name: name, server: config), secretStore: secretStore))
         }
     }
 
     func updateServer(_ name: String, _ config: ServerConfig, secretStore: String?) async throws {
         try await change { daemon in
-            _ = try await daemon.send(.validateServer(name: name, server: config))
+            _ = try await daemon.send(.validateServer(name: name, server: config, replacing: true))
             _ = try await daemon.send(.mutate(.updateServer(name: name, server: config), secretStore: secretStore))
         }
     }

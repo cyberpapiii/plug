@@ -699,13 +699,18 @@ impl Engine {
         }
     }
 
+    /// Check `server` as it would go in under `name`: added, or in place of
+    /// the server of that name when `replacing`.
     pub fn validate_server_draft(
         &self,
         name: &str,
         server: &crate::config::ServerConfig,
+        replacing: bool,
     ) -> anyhow::Result<crate::operator::OperatorServerSummary> {
         let mut config = (**self.config.load()).clone();
-        crate::operator::NameTaken::check(&config, name)?;
+        if !replacing {
+            crate::operator::NameTaken::check(&config, name)?;
+        }
         config.servers.insert(name.to_string(), server.clone());
         let errors = crate::config::validate_config(&config);
         if !errors.is_empty() {
@@ -1600,6 +1605,35 @@ mod tests {
                 .servers
                 .contains_key("fixture")
         );
+    }
+
+    #[test]
+    fn a_server_edit_validates_under_its_own_name_and_an_add_does_not() {
+        let mut config = mock_stdio_config("echo", "a");
+        config
+            .servers
+            .insert("other".to_string(), mock_stdio_server_config("b", 1));
+        let engine = Engine::new(config);
+        let edited = mock_stdio_server_config("c", 2);
+
+        let summary = engine
+            .validate_server_draft("echo", &edited, true)
+            .expect("an edit keeps its own name");
+        assert_eq!(summary.name, "echo");
+
+        for taken in ["echo", "other"] {
+            let error = engine
+                .validate_server_draft(taken, &edited, false)
+                .unwrap_err();
+            assert_eq!(
+                crate::operator::NameTaken::code_or(&error, "OTHER"),
+                crate::operator::NameTaken::CODE,
+                "{taken}"
+            );
+        }
+        engine
+            .validate_server_draft("new", &edited, false)
+            .expect("a free name is added");
     }
 
     #[tokio::test]

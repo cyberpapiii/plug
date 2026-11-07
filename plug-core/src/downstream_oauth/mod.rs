@@ -47,8 +47,10 @@ const REFRESH_TOKEN_LIFETIME_SECS: u64 = 30 * 24 * 3600;
 /// the whole sign-in is revoked for every process. As long as a spent token
 /// is remembered at all, so a process idle for weeks does not end it either.
 const REFRESH_REUSE_LEEWAY_SECS: u64 = REFRESH_TOKEN_LIFETIME_SECS;
-const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
-const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
+/// How long a registration lasts after it was last used.
+pub const REGISTRATION_LIFETIME_SECS: u64 = 90 * 24 * 3600;
+/// How long a registration whose sign-in never finished lasts.
+pub const UNACTIVATED_REGISTRATION_LIFETIME_SECS: u64 = 3600;
 const MAX_REGISTRATIONS: usize = 100;
 const REGISTRATION_RATE_WINDOW_SECS: u64 = 3600;
 const MAX_REGISTRATIONS_PER_WINDOW: usize = 10;
@@ -205,6 +207,15 @@ pub struct RegisteredClientSummary {
 
 fn signed_in_when_unsaid() -> bool {
     true
+}
+
+impl RegisteredClientSummary {
+    /// Whether the client's sign-in never finished, so its registration
+    /// goes by itself [`UNACTIVATED_REGISTRATION_LIFETIME_SECS`] after it
+    /// was made.
+    pub fn is_unactivated(&self) -> bool {
+        !self.signed_in && self.last_used_at.is_none()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

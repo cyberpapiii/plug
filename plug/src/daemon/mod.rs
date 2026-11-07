@@ -1343,16 +1343,17 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
                 },
             }
         }
-        OperatorRequest::ValidateServer { name, server } => {
-            match ctx.engine.validate_server_draft(name, server) {
-                Ok(server) => IpcResponse::ServerValidated { server },
-                Err(error) => IpcResponse::Error {
-                    code: plug_core::operator::NameTaken::code_or(&error, "INVALID_SERVER")
-                        .to_string(),
-                    message: error.to_string(),
-                },
-            }
-        }
+        OperatorRequest::ValidateServer {
+            name,
+            server,
+            replacing,
+        } => match ctx.engine.validate_server_draft(name, server, *replacing) {
+            Ok(server) => IpcResponse::ServerValidated { server },
+            Err(error) => IpcResponse::Error {
+                code: plug_core::operator::NameTaken::code_or(&error, "INVALID_SERVER").to_string(),
+                message: error.to_string(),
+            },
+        },
         OperatorRequest::DescribeApi { spec } => {
             match plug_core::openapi::describe(spec, API_DESCRIBE_TIMEOUT).await {
                 Ok(api) => IpcResponse::ApiDescribed { api },

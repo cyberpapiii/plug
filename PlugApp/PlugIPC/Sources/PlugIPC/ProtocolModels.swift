@@ -684,7 +684,9 @@ public enum OperatorRequest: Encodable, Equatable, Sendable {
     case snapshot
     case activity(afterSequence: UInt64, limit: Int, failuresOnly: Bool)
     case serverConfig(name: String)
-    case validateServer(name: String, server: ServerConfig)
+    /// `replacing` checks the server in place of the one named `name`; else
+    /// it is checked as a new server, whose name must be free.
+    case validateServer(name: String, server: ServerConfig, replacing: Bool)
     /// List the operations of an OpenAPI document before its server exists.
     case describeAPI(spec: String)
     /// `secretStore` names where the keys typed into a server are kept: the
@@ -696,7 +698,7 @@ public enum OperatorRequest: Encodable, Equatable, Sendable {
     case shutdown
 
     private enum CodingKeys: String, CodingKey {
-        case type, afterSequence, limit, failuresOnly, name, server, spec, mutation, secretStore
+        case type, afterSequence, limit, failuresOnly, name, server, replacing, spec, mutation, secretStore
         case serverID, clientID
     }
 
@@ -711,9 +713,10 @@ public enum OperatorRequest: Encodable, Equatable, Sendable {
             try c.encode(failures, forKey: .failuresOnly)
         case let .serverConfig(name):
             try c.encode("GetServerConfig", forKey: .type); try c.encode(name, forKey: .name)
-        case let .validateServer(name, server):
+        case let .validateServer(name, server, replacing):
             try c.encode("ValidateServer", forKey: .type)
             try c.encode(name, forKey: .name); try c.encode(server, forKey: .server)
+            try c.encode(replacing, forKey: .replacing)
         case let .describeAPI(spec):
             try c.encode("DescribeApi", forKey: .type); try c.encode(spec, forKey: .spec)
         case let .mutate(mutation, store):

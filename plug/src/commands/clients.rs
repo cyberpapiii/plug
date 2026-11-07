@@ -1,5 +1,6 @@
 use dialoguer::console::style;
 use plug_core::clients::{ClientTarget, LinkTransport, Scope, ServerEntry};
+use plug_core::config::HttpConfig;
 use std::path::{Path, PathBuf};
 
 use crate::OutputFormat;
@@ -11,12 +12,12 @@ pub(crate) struct ClientView {
     pub(crate) name: String,
     pub(crate) target: String,
     pub(crate) linked: bool,
-    pub(crate) linked_transport: Option<String>,
+    pub(crate) linked_transport: Option<LinkTransport>,
     pub(crate) linked_endpoint: Option<String>,
     pub(crate) detected: bool,
     pub(crate) live: bool,
     pub(crate) live_sessions: usize,
-    pub(crate) live_transports: Vec<String>,
+    pub(crate) live_transports: Vec<plug_core::ipc::LiveSessionTransport>,
     pub(crate) lazy_tool_mode: String,
     pub(crate) lazy_tool_mode_origin: String,
     pub(crate) lazy_tool_mode_reason: String,
@@ -24,7 +25,7 @@ pub(crate) struct ClientView {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub(crate) struct LiveSessionView {
-    pub(crate) transport: String,
+    pub(crate) transport: plug_core::ipc::LiveSessionTransport,
     pub(crate) client_id: Option<String>,
     pub(crate) session_id: String,
     pub(crate) client_type: String,
@@ -405,11 +406,17 @@ pub(crate) fn client_blocks_line(
     }
 }
 
+/// Plug's own HTTP settings, which say which entries in a client's file
+/// are Plug: from the config when it loads, else the defaults.
+pub(crate) fn own_http(config: Option<&plug_core::config::Config>) -> HttpConfig {
+    config.map(|config| config.http.clone()).unwrap_or_default()
+}
+
 /// Plug's entry in `target`'s user settings file, if it has one.
-pub(crate) fn linked(target: ClientTarget) -> Option<ServerEntry> {
+pub(crate) fn linked(target: ClientTarget, plug: &HttpConfig) -> Option<ServerEntry> {
     let path = target.config_path(Scope::User)?;
     let content = std::fs::read_to_string(path).ok()?;
-    target.layout().read_plug(&content)
+    target.layout().read_plug(&content, plug)
 }
 
 pub(crate) fn link_transport(entry: &ServerEntry) -> LinkTransport {
@@ -421,9 +428,9 @@ pub(crate) fn link_transport(entry: &ServerEntry) -> LinkTransport {
 }
 
 /// The listed clients that have a link to Plug, each with its link.
-pub(crate) fn linked_clients() -> Vec<(ClientTarget, ServerEntry)> {
+pub(crate) fn linked_clients(plug: &HttpConfig) -> Vec<(ClientTarget, ServerEntry)> {
     ClientTarget::listed()
-        .filter_map(|target| Some((target, linked(target)?)))
+        .filter_map(|target| Some((target, linked(target, plug)?)))
         .collect()
 }
 
@@ -441,13 +448,6 @@ fn lazy_tool_policy_summary(config: &plug_core::config::Config, target: ClientTa
     )
 }
 
-pub(crate) fn live_transport_name(transport: plug_core::ipc::LiveSessionTransport) -> &'static str {
-    match transport {
-        plug_core::ipc::LiveSessionTransport::DaemonProxy => "daemon_proxy",
-        plug_core::ipc::LiveSessionTransport::Http => "http",
-    }
-}
-
 pub(crate) fn client_views(
     live: &[plug_core::ipc::IpcLiveSessionInfo],
     config: Option<&plug_core::config::Config>,
@@ -460,11 +460,9 @@ pub(crate) fn client_views(
                 .iter()
                 .filter(|session| session.target.as_deref() == Some(target.slug()))
                 .collect();
-            let live_transports: std::collections::BTreeSet<&str> = sessions
-                .iter()
-                .map(|session| live_transport_name(session.transport))
-                .collect();
-            let link = linked(target);
+            let live_transports: std::collections::BTreeSet<_> =
+                sessions.iter().map(|session| session.transport).collect();
+            let link = linked(target, &config.http);
             let lazy_policy = plug_core::clients::lazy_tool_policy(
                 config.meta_tool_mode,
                 &config.lazy_tools,
@@ -474,14 +472,12 @@ pub(crate) fn client_views(
                 name: target.display_name().to_string(),
                 target: target.slug().to_string(),
                 linked: link.is_some(),
-                linked_transport: link
-                    .as_ref()
-                    .map(|entry| link_transport(entry).as_str().to_string()),
+                linked_transport: link.as_ref().map(link_transport),
                 linked_endpoint: link.and_then(|entry| entry.url),
                 detected: target.is_installed(),
                 live: !sessions.is_empty(),
                 live_sessions: sessions.len(),
-                live_transports: live_transports.into_iter().map(str::to_string).collect(),
+                live_transports: live_transports.into_iter().collect(),
                 lazy_tool_mode: lazy_policy.mode.label().to_string(),
                 lazy_tool_mode_origin: lazy_policy.origin.label().to_string(),
                 lazy_tool_mode_reason: lazy_policy.reason,
@@ -528,7 +524,7 @@ pub(crate) fn live_session_views(
                     .filter(|name| !name.is_empty())
             }),
             key,
-            transport: live_transport_name(session.transport).to_string(),
+            transport: session.transport,
             client_id: session.client_id.clone(),
             session_id: session.session_id.clone(),
             client_type: session.client_type.to_string(),
@@ -550,18 +546,11 @@ pub(crate) fn live_session_views(
 
 /// The listed clients that are installed or already linked, and whether each
 /// is linked.
-fn detected_or_linked_clients() -> Vec<(ClientTarget, bool)> {
+fn detected_or_linked_clients(plug: &HttpConfig) -> Vec<(ClientTarget, bool)> {
     ClientTarget::listed()
-        .map(|target| (target, linked(target).is_some()))
+        .map(|target| (target, linked(target, plug).is_some()))
         .filter(|(target, linked)| *linked || target.is_installed())
         .collect()
-}
-
-/// The address an HTTP link points at, from the config when it loads.
-fn link_http_url(config: Option<&plug_core::config::Config>) -> String {
-    config
-        .map(|config| config.http.mcp_url())
-        .unwrap_or_else(|| plug_core::config::HttpConfig::default().mcp_url())
 }
 
 fn prompt_link_transport(http_url: &str, prompt_label: &str) -> anyhow::Result<LinkTransport> {
@@ -587,7 +576,7 @@ pub(crate) struct LinkChange {
     pub(crate) name: &'static str,
     pub(crate) path: PathBuf,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) transport: Option<&'static str>,
+    pub(crate) transport: Option<LinkTransport>,
 }
 
 fn print_link_changes(
@@ -632,7 +621,9 @@ pub(crate) fn cmd_link(
     use dialoguer::{Confirm, MultiSelect};
 
     let config = plug_core::config::load_config(config_path).ok();
-    let http_url = link_http_url(config.as_ref());
+    let plug = own_http(config.as_ref());
+    // The address an HTTP link points at.
+    let http_url = plug.mcp_url();
     // `--yes` takes stdio unless a transport was asked for.
     let requested = transport.or(yes.then_some(LinkTransport::Stdio));
     let transport_for = |label: &str| match requested {
@@ -643,7 +634,7 @@ pub(crate) fn cmd_link(
 
     if !targets.is_empty() || all {
         let targets: Vec<ClientTarget> = if all {
-            let detected = detected_or_linked_clients();
+            let detected = detected_or_linked_clients(&plug);
             if detected.is_empty() {
                 anyhow::bail!(
                     "no detected clients found; pass explicit targets or run `plug link` interactively"
@@ -658,7 +649,7 @@ pub(crate) fn cmd_link(
         };
         let transport = transport_for("How should selected clients connect to plug?")?;
         for target in targets {
-            changes.push(write_link(target, transport, &http_url)?);
+            changes.push(write_link(target, transport, &plug)?);
         }
         return print_link_changes(output, "linked", &changes, config.as_ref());
     }
@@ -674,7 +665,7 @@ pub(crate) fn cmd_link(
         (false, true) => format!("{target}  {}", style("[detected]").cyan().dim()),
         (false, false) => target.to_string(),
     };
-    let mut items = detected_or_linked_clients()
+    let mut items = detected_or_linked_clients(&plug)
         .into_iter()
         .map(|(target, linked)| (label(target, linked, true), target, linked))
         .collect::<Vec<_>>();
@@ -703,7 +694,7 @@ pub(crate) fn cmd_link(
     if show_all {
         items = ClientTarget::listed()
             .map(|target| {
-                let linked = linked(target).is_some();
+                let linked = linked(target, &plug).is_some();
                 (label(target, linked, false), target, linked)
             })
             .collect();
@@ -725,9 +716,9 @@ pub(crate) fn cmd_link(
         let selected = selections.contains(&index);
         if selected && !was_linked {
             let transport = transport_for(&format!("How should {target} connect to plug?"))?;
-            changes.push(write_link(*target, transport, &http_url)?);
+            changes.push(write_link(*target, transport, &plug)?);
         } else if !selected && *was_linked {
-            remove_link(*target)?;
+            remove_link(*target, &plug)?;
         }
     }
     print_link_changes(output, "linked", &changes, config.as_ref())?;
@@ -744,7 +735,7 @@ pub(crate) fn cmd_link(
     {
         link_custom_client(
             transport_for("How should this client connect to plug?")?,
-            &http_url,
+            &plug,
         )?;
     }
     Ok(())
@@ -770,7 +761,7 @@ fn custom_layouts() -> [(&'static str, plug_core::clients::Layout); 4] {
     ]
 }
 
-fn link_custom_client(transport: LinkTransport, http_url: &str) -> anyhow::Result<()> {
+fn link_custom_client(transport: LinkTransport, plug: &HttpConfig) -> anyhow::Result<()> {
     use dialoguer::{Input, Select};
 
     let path: String = Input::with_theme(&cli_prompt_theme())
@@ -789,6 +780,7 @@ fn link_custom_client(transport: LinkTransport, http_url: &str) -> anyhow::Resul
         .default(0)
         .interact()?;
     let layout = layouts[format].1;
+    let http_url = plug.mcp_url();
     let command = match transport {
         LinkTransport::Stdio => crate::install::canonical_client_command()?
             .to_string_lossy()
@@ -800,9 +792,9 @@ fn link_custom_client(transport: LinkTransport, http_url: &str) -> anyhow::Resul
             command: &command,
             args: &["connect"],
         },
-        LinkTransport::Http => plug_core::clients::PlugLink::Http { url: http_url },
+        LinkTransport::Http => plug_core::clients::PlugLink::Http { url: &http_url },
     });
-    edit_file(&path, |existing| layout.link(existing, &entry))
+    edit_file(&path, |existing| layout.link(existing, &entry, plug))
 }
 
 /// Write `edit` of the file's contents back, whole or not at all. A missing
@@ -820,7 +812,7 @@ fn edit_file(path: &Path, edit: impl FnOnce(&str) -> anyhow::Result<String>) -> 
 fn write_link(
     target: ClientTarget,
     transport: LinkTransport,
-    http_url: &str,
+    plug: &HttpConfig,
 ) -> anyhow::Result<LinkChange> {
     let command = match transport {
         LinkTransport::Stdio => crate::install::canonical_client_command()?
@@ -828,28 +820,30 @@ fn write_link(
             .into_owned(),
         LinkTransport::Http => String::new(),
     };
-    let entry = target.plug_entry(transport, &command, http_url);
+    let entry = target.plug_entry(transport, &command, &plug.mcp_url());
     let path = target
         .config_path(Scope::User)
         .ok_or_else(|| anyhow::anyhow!("cannot find your home folder"))?;
-    edit_file(&path, |existing| target.layout().link(existing, &entry))?;
+    edit_file(&path, |existing| {
+        target.layout().link(existing, &entry, plug)
+    })?;
     Ok(LinkChange {
         target: target.slug(),
         name: target.display_name(),
         path,
-        transport: Some(transport.as_str()),
+        transport: Some(transport),
     })
 }
 
 /// Take Plug out of `target`'s settings file. `None` when there is no file.
-fn remove_link(target: ClientTarget) -> anyhow::Result<Option<LinkChange>> {
+fn remove_link(target: ClientTarget, plug: &HttpConfig) -> anyhow::Result<Option<LinkChange>> {
     let Some(path) = target.config_path(Scope::User) else {
         return Ok(None);
     };
     if !path.exists() {
         return Ok(None);
     }
-    edit_file(&path, |existing| target.layout().unlink(existing))?;
+    edit_file(&path, |existing| target.layout().unlink(existing, plug))?;
     Ok(Some(LinkChange {
         target: target.slug(),
         name: target.display_name(),
@@ -859,6 +853,7 @@ fn remove_link(target: ClientTarget) -> anyhow::Result<Option<LinkChange>> {
 }
 
 pub(crate) fn cmd_unlink(
+    config_path: Option<&PathBuf>,
     targets: Vec<String>,
     all: bool,
     yes: bool,
@@ -866,18 +861,19 @@ pub(crate) fn cmd_unlink(
 ) -> anyhow::Result<()> {
     use dialoguer::{Confirm, MultiSelect};
 
+    let plug = own_http(plug_core::config::load_config(config_path).ok().as_ref());
     let mut changes = Vec::new();
     if !targets.is_empty() {
         for name in &targets {
             let target: ClientTarget = name
                 .parse()
                 .map_err(|error: String| anyhow::anyhow!(error))?;
-            changes.extend(remove_link(target)?);
+            changes.extend(remove_link(target, &plug)?);
         }
         return print_link_changes(output, "unlinked", &changes, None);
     }
 
-    let items: Vec<ClientTarget> = linked_clients()
+    let items: Vec<ClientTarget> = linked_clients(&plug)
         .into_iter()
         .map(|(target, _)| target)
         .collect();
@@ -891,7 +887,7 @@ pub(crate) fn cmd_unlink(
 
     if all || yes {
         for target in items {
-            changes.extend(remove_link(target)?);
+            changes.extend(remove_link(target, &plug)?);
         }
         return print_link_changes(output, "unlinked", &changes, None);
     }
@@ -915,7 +911,7 @@ pub(crate) fn cmd_unlink(
         .defaults(&vec![true; labels.len()])
         .interact()?;
     for index in selections {
-        changes.extend(remove_link(items[index])?);
+        changes.extend(remove_link(items[index], &plug)?);
     }
     print_link_changes(output, "unlinked", &changes, None)
 }
@@ -926,11 +922,11 @@ mod tests {
 
     #[test]
     fn link_http_url_falls_back_to_the_default_listener() {
-        assert_eq!(link_http_url(None), "http://localhost:3282/mcp");
+        assert_eq!(own_http(None).mcp_url(), "http://localhost:3282/mcp");
         let mut config = plug_core::config::Config::default();
         config.http.public_base_url = Some("https://plug.example.com/base".to_string());
         assert_eq!(
-            link_http_url(Some(&config)),
+            own_http(Some(&config)).mcp_url(),
             "https://plug.example.com/base/mcp"
         );
     }
