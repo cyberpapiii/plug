@@ -491,8 +491,10 @@ private struct SignedReconciliationFixture {
         ipcSocketURL = URL(
             fileURLWithPath: "/tmp/plug-app-task7-\(UUID().uuidString.prefix(8)).sock"
         )
-        configURL = rootURL.appending(path: "Library/Application Support/Plug/config.toml")
-        credentialURL = rootURL.appending(path: "Library/Keychains/plug-credential")
+        // The files a migration or repair must never touch sit where they
+        // really live, under the home the migrator and connector are given.
+        configURL = homeURL.appending(path: PlugPaths.directory).appending(path: "config.toml")
+        credentialURL = homeURL.appending(path: "Library/Keychains/plug-credential")
         unknownDecoyURL = rootURL.appending(path: "decoys/plug-not-owned")
         logURL = rootURL.appending(path: "reconciliation.log")
         legacyJob = LaunchdJobRecord(
