@@ -4,4 +4,8 @@ disallowed-methods = [
     { path = "reqwest::Client::builder", reason = "use plug_core::tls::http_client_builder" },
     { path = "reqwest::Client::new", reason = "use plug_core::tls::http_client_builder().build()" },
     { path = "rmcp::transport::auth::AuthorizationManager::new", reason = "use plug_core::upstream_http::authorization_manager" },
+    # A test that names files in the temp folder itself leaves them behind
+    # when it fails or forgets to clean up.
+    { path = "std::env::temp_dir", reason = "in a test use plug_core::paths::test::scratch or tempfile::tempdir, which remove the folder when the test ends" },
+    { path = "tempfile::TempDir::keep", reason = "a kept folder is never removed; hold the TempDir instead" },
 ]
