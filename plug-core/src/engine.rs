@@ -334,10 +334,19 @@ impl Engine {
         let Some(_starting) = self.supervision.starting.claim(server_id) else {
             return Ok(Reconnect::AlreadyRunning);
         };
-        let upstream = self
+        let upstream = match self
             .server_manager
             .start_server(server_id, server_config)
-            .await?;
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                if crate::server::start_needs_sign_in(server_config, &error) {
+                    mark_auth_required(self, server_id).await;
+                }
+                return Err(error);
+            }
+        };
         let outcome = self
             .commit_replacement(server_id, server_config, upstream)
             .await;
@@ -1056,12 +1065,11 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
 
         match engine.reconnect_server(server_name).await {
             Ok(_) => {}
-            Err(e) if crate::oauth::is_auth_rejection(&e) => {
+            Err(e) if crate::server::start_needs_sign_in(&server_config, &e) => {
                 tracing::warn!(
                     server = %server_name,
-                    "reconnect with fresh token failed (auth error), marking AuthRequired"
+                    "reconnect with fresh token failed (auth error), marked AuthRequired"
                 );
-                mark_auth_required(engine, server_name).await;
                 break;
             }
             Err(e) => {
