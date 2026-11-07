@@ -128,7 +128,7 @@ impl LegacySseClientTransport {
     /// first open fails here with its status, where a failure inside the
     /// worker would reach the caller only as a closed channel.
     pub async fn connect(config: LegacySseTransportConfig) -> anyhow::Result<Self> {
-        let client = crate::upstream_http::client(reqwest::redirect::Policy::none())?;
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never)?;
         let stream = open_sse_stream(
             client.clone(),
             config.uri.clone(),
@@ -816,7 +816,7 @@ mod tests {
 
         let config = LegacySseTransportConfig::with_uri(format!("http://127.0.0.1:{port}/mcp"))
             .post_timeout(Duration::from_millis(200));
-        let client = crate::upstream_http::client(reqwest::redirect::Policy::none()).unwrap();
+        let client = crate::upstream_http::client(crate::upstream_http::Redirects::Never).unwrap();
         let message = ClientJsonRpcMessage::notification(
             rmcp::model::ClientNotification::InitializedNotification(Default::default()),
         );

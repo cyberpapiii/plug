@@ -253,20 +253,7 @@ fn expand_home(path: &str) -> std::path::PathBuf {
 }
 
 fn http_client() -> anyhow::Result<reqwest::Client> {
-    // A redirect may not carry a request, and its credential, anywhere but
-    // the address the server is configured for: not another port on the
-    // host, and not the same address without TLS.
-    crate::upstream_http::client(reqwest::redirect::Policy::custom(|attempt| {
-        let same_host = attempt
-            .previous()
-            .last()
-            .is_some_and(|previous| crate::upstream_http::same_origin(previous, attempt.url()));
-        if same_host && attempt.previous().len() < 5 {
-            attempt.follow()
-        } else {
-            attempt.stop()
-        }
-    }))
+    crate::upstream_http::client(crate::upstream_http::Redirects::SameOrigin)
 }
 
 /// Parse an OpenAPI 3 document, JSON or YAML.

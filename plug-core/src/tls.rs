@@ -21,11 +21,12 @@ pub fn http_client_builder() -> reqwest::ClientBuilder {
     reqwest::Client::builder()
 }
 
-/// rmcp's OAuth manager for `url`. It builds its own reqwest client inside.
-#[allow(clippy::disallowed_methods)]
+/// rmcp's OAuth manager for `url`, sending its requests through Plug's
+/// upstream clients so they follow the same redirect rules.
 pub async fn authorization_manager<U: reqwest::IntoUrl>(
     url: U,
 ) -> Result<AuthorizationManager, AuthError> {
-    ensure_rustls_provider_installed();
-    AuthorizationManager::new(url).await
+    let client = crate::upstream_http::oauth_client()
+        .map_err(|error| AuthError::InternalError(error.to_string()))?;
+    AuthorizationManager::new_with_oauth_http_client(url, client).await
 }

@@ -212,7 +212,7 @@ impl InitializedNotificationCompatHttpClient {
         events: Weak<dyn UpstreamEvents>,
     ) -> anyhow::Result<Self> {
         Ok(Self {
-            inner: crate::upstream_http::client(reqwest::redirect::Policy::default())?,
+            inner: crate::upstream_http::client(crate::upstream_http::Redirects::AnyHost)?,
             server_name,
             connection,
             events,
