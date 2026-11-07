@@ -548,31 +548,133 @@ async fn end_ipc_session(ctx: &ConnectionContext, session_id: &str) {
         .await;
 }
 
-/// Resolves when the modern downstream gate may have changed. Never resolves
-/// once the sender is gone, so a closed channel cannot spin a select loop.
-async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
-    if gate_rx.changed().await.is_err() {
-        std::future::pending::<()>().await;
-    }
+type BroadcastRecv = Result<
+    plug_core::notifications::ProtocolNotification,
+    tokio::sync::broadcast::error::RecvError,
+>;
+
+/// Something a connection writes without the proxy asking for it.
+enum Push {
+    /// The reply of a request that dispatched on its own task.
+    Reply(Result<(tokio::task::Id, IpcResponse), tokio::task::JoinError>),
+    Logging(BroadcastRecv),
+    Control(BroadcastRecv),
+    /// The modern downstream gate may have changed.
+    ModernGate,
+    Reverse(
+        IpcClientRequest,
+        tokio::sync::oneshot::Sender<IpcClientResponse>,
+    ),
 }
 
-/// Push `ModernDownstreamGateChanged` when the gate differs from the value
-/// this connection last reported.
-async fn push_modern_gate_change(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    gate_rx: &mut tokio::sync::watch::Receiver<bool>,
-    last_modern_gate: &mut bool,
-) -> anyhow::Result<()> {
-    let enabled = *gate_rx.borrow_and_update();
-    if enabled != *last_modern_gate {
-        ipc::send_response(
-            writer,
-            &IpcResponse::ModernDownstreamGateChanged { enabled },
-        )
-        .await?;
-        *last_modern_gate = enabled;
+type NotificationRx =
+    tokio::sync::broadcast::Receiver<plug_core::notifications::ProtocolNotification>;
+
+/// Every source of [`Push`]es on one connection. Notifications and gate
+/// changes start once the connection registers; a connection that never
+/// registers is sent only its replies.
+struct Pushes {
+    log_rx: Option<NotificationRx>,
+    ctrl_rx: Option<NotificationRx>,
+    /// The router outlives the connection, so the sender never closes under it.
+    gate_rx: tokio::sync::watch::Receiver<bool>,
+    last_modern_gate: bool,
+    pending_reverse: PendingReverse,
+}
+
+impl Pushes {
+    fn new(router: &ToolRouter) -> Self {
+        let mut gate_rx = router.watch_modern_downstream();
+        let last_modern_gate = *gate_rx.borrow_and_update();
+        Self {
+            log_rx: None,
+            ctrl_rx: None,
+            gate_rx,
+            last_modern_gate,
+            pending_reverse: PendingReverse::new(),
+        }
     }
-    Ok(())
+
+    fn subscribed(&self) -> bool {
+        self.log_rx.is_some()
+    }
+
+    fn subscribe(&mut self, router: &ToolRouter) {
+        self.log_rx = Some(router.subscribe_logging());
+        self.ctrl_rx = Some(router.subscribe_notifications());
+    }
+
+    /// The next push. Cancellation-safe, so it can sit in a `select!` beside
+    /// the frame reader. A reverse-request channel that closes is set to
+    /// `None`: its bridge is gone.
+    async fn next(
+        &mut self,
+        in_flight: &mut InFlight,
+        reverse_rx: &mut Option<ReverseRequestRx>,
+    ) -> Push {
+        let mut gate_open = self.subscribed();
+        loop {
+            tokio::select! {
+                biased;
+                reverse = recv_reverse(reverse_rx) => match reverse {
+                    Some((request, reply)) => return Push::Reverse(request, reply),
+                    None => *reverse_rx = None,
+                },
+                Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
+                    return Push::Reply(joined);
+                }
+                recv = recv_if_subscribed(&mut self.log_rx) => return Push::Logging(recv),
+                recv = recv_if_subscribed(&mut self.ctrl_rx) => return Push::Control(recv),
+                changed = self.gate_rx.changed(), if gate_open => match changed {
+                    Ok(()) => return Push::ModernGate,
+                    Err(_) => gate_open = false,
+                },
+            }
+        }
+    }
+
+    /// A notification already queued, logging first, or `None` when nothing is.
+    fn queued(&mut self) -> Option<Push> {
+        if let Some(recv) = self.log_rx.as_mut().and_then(queued) {
+            return Some(Push::Logging(recv));
+        }
+        self.ctrl_rx.as_mut().and_then(queued).map(Push::Control)
+    }
+
+    /// Write `push`, unless it is a notification `listener` may not be told.
+    async fn deliver(
+        &mut self,
+        push: Push,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        in_flight_ids: &mut std::collections::HashMap<tokio::task::Id, u64>,
+        listener: (&Engine, &ClientRegistry, Option<&str>),
+    ) -> anyhow::Result<()> {
+        match push {
+            Push::Reply(joined) => write_in_flight_reply(writer, in_flight_ids, joined).await,
+            Push::Logging(recv) if may_tell(listener, &recv) => {
+                send_ipc_logging_notification(writer, recv).await
+            }
+            Push::Control(recv) if may_tell(listener, &recv) => {
+                send_ipc_control_notification(writer, recv, listener.2).await
+            }
+            Push::Logging(_) | Push::Control(_) => Ok(()),
+            Push::ModernGate => {
+                let enabled = *self.gate_rx.borrow_and_update();
+                if enabled != self.last_modern_gate {
+                    ipc::send_response(
+                        writer,
+                        &IpcResponse::ModernDownstreamGateChanged { enabled },
+                    )
+                    .await?;
+                    self.last_modern_gate = enabled;
+                }
+                Ok(())
+            }
+            Push::Reverse(request, reply) => {
+                send_reverse_request(writer, &mut self.pending_reverse, request, reply).await
+            }
+        }
+    }
 }
 
 /// Inner loop for IPC connection handling.
@@ -589,19 +691,7 @@ async fn handle_ipc_loop(
     ctx: &mut ConnectionContext,
     in_flight: &mut InFlight,
 ) -> anyhow::Result<()> {
-    use plug_core::notifications::ProtocolNotification;
-
-    // Logging subscription — activated after Register so the daemon can push
-    // logging notifications to this IPC client in real time.
-    let mut log_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    // Control notifications (list changes, progress, cancellation, resource
-    // updates, auth state), likewise activated after Register.
-    let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    // Modern downstream gate changes are pushed as they happen. The router
-    // outlives this connection, so the sender never closes under it.
-    let mut gate_rx = ctx.engine.tool_router().watch_modern_downstream();
-    let mut last_modern_gate = *gate_rx.borrow_and_update();
-    let mut pending_reverse = PendingReverse::new();
+    let mut pushes = Pushes::new(ctx.engine.tool_router());
     // Frames read while an inline request was dispatching, in arrival order.
     let mut deferred: std::collections::VecDeque<anyhow::Result<Option<Vec<u8>>>> =
         std::collections::VecDeque::new();
@@ -612,9 +702,8 @@ async fn handle_ipc_loop(
     loop {
         // After registration, subscribe to notification channels for push
         // delivery and move frame reads onto the cancellation-safe reader.
-        if ctx.session_id.is_some() && log_rx.is_none() {
-            log_rx = Some(ctx.engine.tool_router().subscribe_logging());
-            ctrl_rx = Some(ctx.engine.tool_router().subscribe_notifications());
+        if ctx.session_id.is_some() && !pushes.subscribed() {
+            pushes.subscribe(ctx.engine.tool_router());
             reader.ensure_multiplexed();
         }
 
@@ -623,9 +712,7 @@ async fn handle_ipc_loop(
         // the timeout to reclaim resources.
         let frame = if let Some(deferred_frame) = deferred.pop_front() {
             deferred_frame
-        } else if let Some(ref mut rx) = log_rx {
-            // Registered with notifications — multiplex request reads, push
-            // notifications, and replies from requests dispatching on tasks.
+        } else if pushes.subscribed() {
             'select: loop {
                 tokio::select! {
                     biased;
@@ -633,28 +720,8 @@ async fn handle_ipc_loop(
                         flush_finished_replies(writer, in_flight).await;
                         return Ok(());
                     }
-                    Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
-                        write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
-                    }
-                    recv = rx.recv() => {
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_logging_notification(writer, recv).await?;
-                        }
-                    }
-                    recv = recv_if_subscribed(&mut ctrl_rx) => {
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
-                        }
-                    }
-                    _ = modern_gate_changed(&mut gate_rx) => {
-                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
-                    }
-                    reverse = recv_reverse(&mut ctx.reverse_request_rx) => {
-                        if let Some((reverse_req, resp_tx)) = reverse {
-                            send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
-                        } else {
-                            ctx.reverse_request_rx = None;
-                        }
+                    push = pushes.next(in_flight, &mut ctx.reverse_request_rx) => {
+                        pushes.deliver(push, writer, &mut in_flight.ids, ctx.listener()).await?;
                     }
                     result = reader.next() => break 'select result,
                 }
@@ -690,7 +757,7 @@ async fn handle_ipc_loop(
 
         let ids = ipc::FrameIds::peek(&frame);
         if let Some(reverse_id) = ids.reverse_id {
-            deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
+            deliver_reverse_reply(&mut pushes.pending_reverse, reverse_id, &frame);
             continue;
         }
 
@@ -755,7 +822,7 @@ async fn handle_ipc_loop(
         // cancellation-safe: replies to reverse requests are routed at once,
         // everything else waits in `deferred` for its turn. Without this an
         // inline request that triggers elicitation could never read its reply.
-        let mut read_ahead = log_rx.is_some();
+        let mut read_ahead = pushes.subscribed();
 
         let response = {
             use std::pin::pin;
@@ -773,35 +840,15 @@ async fn handle_ipc_loop(
                         result = Some(resp);
                         done = true;
                     }
-                    reverse = recv_reverse(&mut reverse_rx) => {
-                        if let Some((reverse_req, resp_tx)) = reverse {
-                            send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
-                        } else {
-                            // Channel closed (e.g. bridge deregistered) — stop polling it.
-                            reverse_rx = None;
-                        }
-                    }
-                    Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
-                        write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
-                    }
-                    recv = recv_if_subscribed(&mut log_rx) => {
-                        if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
-                            send_ipc_logging_notification(writer, recv).await?;
-                        }
-                    }
-                    recv = recv_if_subscribed(&mut ctrl_rx) => {
-                        if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
-                            send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
-                        }
-                    }
-                    _ = modern_gate_changed(&mut gate_rx) => {
-                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
+                    push = pushes.next(in_flight, &mut reverse_rx) => {
+                        let listener = (&*engine, &*registry, dispatch_session_id.as_deref());
+                        pushes.deliver(push, writer, &mut in_flight.ids, listener).await?;
                     }
                     next = reader.next(), if read_ahead => {
                         match next {
                             Ok(Some(frame)) => match ipc::FrameIds::peek(&frame).reverse_id {
                                 Some(reverse_id) => {
-                                    deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
+                                    deliver_reverse_reply(&mut pushes.pending_reverse, reverse_id, &frame);
                                 }
                                 None => deferred.push_back(Ok(Some(frame))),
                             },
@@ -838,19 +885,10 @@ async fn handle_ipc_loop(
         }
 
         // Send what queued while the request dispatched.
-        if let Some(rx) = log_rx.as_mut() {
-            while let Some(recv) = queued(rx) {
-                if may_tell(ctx.listener(), &recv) {
-                    send_ipc_logging_notification(writer, recv).await?;
-                }
-            }
-        }
-        if let Some(rx) = ctrl_rx.as_mut() {
-            while let Some(recv) = queued(rx) {
-                if may_tell(ctx.listener(), &recv) {
-                    send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
-                }
-            }
+        while let Some(push) = pushes.queued() {
+            pushes
+                .deliver(push, writer, &mut in_flight.ids, ctx.listener())
+                .await?;
         }
     }
 
@@ -955,10 +993,7 @@ fn queued<T: Clone>(
 /// [`plug_core::proxy::ToolRouter::client_may_be_told`].
 fn may_tell(
     (engine, registry, session_id): (&Engine, &ClientRegistry, Option<&str>),
-    recv: &Result<
-        plug_core::notifications::ProtocolNotification,
-        tokio::sync::broadcast::error::RecvError,
-    >,
+    recv: &BroadcastRecv,
 ) -> bool {
     let Ok(notification) = recv else {
         return true;
@@ -984,10 +1019,7 @@ impl ConnectionContext {
 /// errors. A failed write is returned, so a dead connection ends at once.
 async fn send_ipc_logging_notification(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
-    recv: Result<
-        plug_core::notifications::ProtocolNotification,
-        tokio::sync::broadcast::error::RecvError,
-    >,
+    recv: BroadcastRecv,
 ) -> anyhow::Result<()> {
     use plug_core::notifications::ProtocolNotification;
     use tokio::sync::broadcast::error::RecvError;
@@ -3381,6 +3413,34 @@ allowed_servers = ["slack"]
         let _ = server_task.await;
         engine.shutdown().await;
         let _ = std::fs::remove_file(&socket_path);
+    }
+
+    /// An operator connection reads one reply per request, so a gate push
+    /// before the reply would be taken for it. Only a registered connection
+    /// is told.
+    #[tokio::test]
+    async fn only_a_registered_connection_is_pushed_gate_changes() {
+        let engine = Engine::new(plug_core::config::Config::default());
+        let router = engine.tool_router();
+        let mut pushes = Pushes::new(router);
+        let mut in_flight = InFlight::default();
+
+        router.set_modern_downstream_enabled(true);
+        let unregistered = tokio::time::timeout(
+            Duration::from_millis(50),
+            pushes.next(&mut in_flight, &mut None),
+        )
+        .await;
+        assert!(unregistered.is_err(), "unregistered connection was pushed");
+
+        pushes.subscribe(router);
+        let push = tokio::time::timeout(
+            Duration::from_secs(5),
+            pushes.next(&mut in_flight, &mut None),
+        )
+        .await
+        .expect("registered connection is pushed the change");
+        assert!(matches!(push, Push::ModernGate));
     }
 
     /// A Deregister that FAILS validation (here: SESSION_MISMATCH) must not
