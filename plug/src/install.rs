@@ -282,7 +282,7 @@ fn verify_shadow_identity(path: &Path) -> bool {
 pub fn discover_shadow_installations(
     app: Option<&VerifiedAppInstallation>,
 ) -> Vec<ShadowInstallation> {
-    let mut candidates: Vec<(&str, PathBuf)> = crate::service::legacy_program_candidates()
+    let mut candidates: Vec<(&str, PathBuf)> = crate::legacy_programs::legacy_program_candidates()
         .into_iter()
         .map(|path| (shadow_kind(&path), path))
         .collect();

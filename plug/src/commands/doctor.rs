@@ -111,7 +111,7 @@ pub fn classify_plug_client_command(
 }
 
 fn is_recognized_legacy_plug_path(path: &Path) -> bool {
-    if crate::service::is_recognized_legacy_program(path) {
+    if crate::legacy_programs::is_recognized_legacy_program(path) {
         return true;
     }
 
