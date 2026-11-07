@@ -429,12 +429,15 @@ async fn tools_call(
         .map_err(|error| McpError::invalid_params(format!("tools/call: {error}"), None))?;
     // A modern client asks for a task by declaring the tasks extension; a
     // legacy one by the SEP-1686 `task` parameter, carried under
-    // `LEGACY_TASK_REQUEST_KEY` once rewritten.
+    // `LEGACY_TASK_REQUEST_KEY` once rewritten. A modern call that cannot be a
+    // task (no `tasks:use`, or a plug meta-tool) runs as a plain call.
     let modern_task = era == ProtocolEra::Modern
         && ctx
             .modern_task_client()
             .is_some_and(ClientCapabilities::supports_tasks)
-        && router.supports_tasks_for_client(call.client_type);
+        && router.supports_tasks_for_client(call.client_type)
+        && crate::proxy::PlugTool::named(params.name.as_ref()).is_none()
+        && call.policy_decision(MethodFamily::Tasks) == crate::admission::PolicyDecision::Allow;
     let legacy_task = params
         .meta
         .as_ref()

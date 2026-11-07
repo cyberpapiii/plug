@@ -61,6 +61,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A remote client that declares task support but whose grant leaves out `tasks:use`, or that calls one of Plug's own tools such as `plug__search_tools`, gets its tool call run as a plain call. It used to be refused. This only applies with `http.modern_downstream_enabled` on.
 - Saving an edited server in the app works again. The daemon checked every edit as a new server under a name already taken, so it refused each one and the sheet said "Choose another name." for a name you cannot change.
 - Signing in to a server with OAuth refuses a registration, token or other sign-in address on a cloud metadata endpoint, such as `169.254.169.254`, even when the server's own sign-in details name it. Only a redirect to one used to be refused.
 - Plug refuses a server that is Plug itself, one that names Plug's own address such as `http://localhost:3282/mcp` or runs `plug connect` or `plug serve`, however it is added: Add Server in the app, `plug server add`, or the config file. Only `plug import` used to skip one, and a server added any other way connected Plug to itself. A config file that already has one does not load until that server is removed.

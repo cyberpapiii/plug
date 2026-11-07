@@ -610,7 +610,6 @@ impl super::ToolRouter {
         result
     }
 
-    /// Total number of tools in the unfiltered cache.
     pub fn supports_tasks_for_client(&self, client_type: ClientType) -> bool {
         matches!(
             self.config.lazy_surface_for_client(client_type),
