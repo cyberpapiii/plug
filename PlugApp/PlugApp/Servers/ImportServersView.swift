@@ -16,7 +16,7 @@ struct ImportServersView: View {
 
     @State private var scan: ImportScan?
     @State private var chosen: Set<String> = []
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     @State private var importing = false
     @State private var scanFailed = false
 
@@ -53,7 +53,8 @@ struct ImportServersView: View {
         if scanFailed {
             ProblemNote(
                 title: "Plug could not read your other clients' settings.",
-                reason: failure,
+                reason: failure?.reason,
+                advice: failure?.advice,
                 actionTitle: "Try Again",
                 action: { Task { await load() } },
                 failed: true
@@ -182,7 +183,7 @@ struct ImportServersView: View {
         } catch {
             scan = nil
             scanFailed = true
-            failure = error.localizedDescription
+            failure = SheetFailure(error)
         }
     }
 
@@ -199,7 +200,7 @@ struct ImportServersView: View {
                 names = try await model.actions.importServers(wanted)
             } catch {
                 importing = false
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 return
             }
             importing = false

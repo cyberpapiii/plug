@@ -962,6 +962,20 @@ final class PopoverRecentTests: XCTestCase {
         XCTAssertTrue(Explain.advice(for: outside).contains("address"))
     }
 
+    /// Edit Server, like every sheet, keeps the error's advice, so a
+    /// timed-out or garbled answer from Plug's own connection gets the same
+    /// next step in the sheet as on a button press, not the advice its words
+    /// would pick ("deadline" for a slow server, "unexpected" for a bad entry).
+    func testASheetKeepsTheAdviceTheErrorCarries() {
+        for error in [PlugIPCError.timedOut, PlugIPCError.unexpectedResponse("ServerConfig")] {
+            let failure = SheetFailure(error)
+            XCTAssertEqual(failure.reason, error.localizedDescription)
+            XCTAssertEqual(failure.advice, Explain.fallback, "\(error)")
+            XCTAssertNotEqual(failure.advice, Explain.advice(forReason: failure.reason), "\(error)")
+        }
+        XCTAssertTrue(SheetFailure(PlugIPCError.daemon("E", "token expired")).advice.contains("Sign in"))
+    }
+
     /// A new sign-in under a name others gave asks which one it is, once.
     func testANewSignInAsksAboutEarlierOnesWithItsName() {
         let now = Date(timeIntervalSince1970: 2_000_000)

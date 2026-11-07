@@ -13,7 +13,7 @@ struct EditServerView: View {
 
     @State private var form: ServerForm?
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
 
     var body: some View {
         SheetFrame(
@@ -36,8 +36,8 @@ struct EditServerView: View {
                 // edit. Say why and offer the one thing that can help.
                 ProblemNote(
                     title: "Plug could not read this server's settings.",
-                    reason: failure,
-                    advice: Explain.advice(forReason: failure),
+                    reason: failure.reason,
+                    advice: failure.advice,
                     actionTitle: "Try Again",
                     action: { Task { await load() } },
                     failed: true
@@ -58,7 +58,7 @@ struct EditServerView: View {
         do {
             form = ServerForm(config: try await model.serverConfig(name: name))
         } catch {
-            failure = error.localizedDescription
+            failure = SheetFailure(error)
         }
     }
 
@@ -74,7 +74,7 @@ struct EditServerView: View {
                 saving = false
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }

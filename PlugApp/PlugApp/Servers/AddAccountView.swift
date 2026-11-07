@@ -11,7 +11,7 @@ struct AddAccountView: View {
     @Environment(\.dismiss) private var dismiss
     @State private var typed = ""
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
 
     private var label: String? { AccountDraft.label(from: typed) }
 
@@ -79,7 +79,7 @@ struct AddAccountView: View {
                 router.reveal(server: AccountDraft.serverName(server: server, label: label))
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }

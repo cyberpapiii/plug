@@ -16,7 +16,7 @@ struct AddWatchView: View {
     @State private var showsAllTools = false
     @State private var showsOptions = false
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     @FocusState private var nameFocused: Bool
     @FocusState private var argumentsFocused: Bool
 
@@ -202,7 +202,7 @@ struct AddWatchView: View {
                 saving = false
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }

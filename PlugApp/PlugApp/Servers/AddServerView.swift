@@ -16,7 +16,7 @@ struct AddServerView: View {
     /// The filled-in form, once a server was picked or a paste was understood.
     @State private var form: ServerForm?
     @State private var saving = false
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
     /// The person's answer to "is this address an API?", when they gave one.
     @State private var addressIsAPI: Bool?
     /// The operations of the API being added, once the daemon has read its
@@ -290,7 +290,7 @@ struct AddServerView: View {
                 router.reveal(server: finalName)
                 dismiss()
             } catch {
-                failure = error.localizedDescription
+                failure = SheetFailure(error)
                 saving = false
             }
         }
