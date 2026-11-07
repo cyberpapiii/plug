@@ -3,18 +3,49 @@
 use rmcp::ErrorData as McpError;
 use rmcp::model::ProtocolVersion;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeSet, HashMap};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
-use crate::proxy::DownstreamTransport;
-use crate::types::PrincipalId;
-
+/// The legacy revision: every upstream and every legacy downstream speaks it.
 pub const SUPPORTED_PROTOCOL_VERSION: &str = "2025-11-25";
-pub const ANNOUNCED_FUTURE_PROTOCOL_VERSION: &str = "2026-07-28";
+/// The stateless 2026-07-28 revision, served downstream only while
+/// `http.modern_downstream_enabled` is on.
+pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 /// SEP-2322 discriminator for a fully materialized result. A proxied upstream
 /// result carries no pagination or task state, so this is the value a modern
 /// client would infer from an absent field on an earlier-revision server.
 pub const RESULT_TYPE_COMPLETE: &str = "complete";
+/// SEP-2322 discriminator for a result that asks the client for input first.
+pub const RESULT_TYPE_INPUT_REQUIRED: &str = "input_required";
+
+/// The `_meta` key a modern message declares its protocol version under.
+pub const PROTOCOL_VERSION_META_KEY: &str = "io.modelcontextprotocol/protocolVersion";
+
+/// The protocol versions a JSON-RPC message declares in its body.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DeclaredVersions<'a> {
+    /// Under [`PROTOCOL_VERSION_META_KEY`] in `params._meta`.
+    pub meta: Option<&'a str>,
+    /// An `initialize` request's `params.protocolVersion`.
+    pub initialize: Option<&'a str>,
+}
+
+impl<'a> DeclaredVersions<'a> {
+    pub fn of(value: &'a serde_json::Value) -> Self {
+        let params = value.get("params");
+        let initialize =
+            value.get("method").and_then(serde_json::Value::as_str) == Some("initialize");
+        Self {
+            meta: params
+                .and_then(|params| params.get("_meta"))
+                .and_then(|meta| meta.get(PROTOCOL_VERSION_META_KEY))
+                .and_then(serde_json::Value::as_str),
+            initialize: params
+                .filter(|_| initialize)
+                .and_then(|params| params.get("protocolVersion"))
+                .and_then(serde_json::Value::as_str),
+        }
+    }
+}
 
 /// Classify an HTTP JSON-RPC envelope before any era-specific rewriting or
 /// typed deserialization occurs.
@@ -23,19 +54,10 @@ pub fn classify_http_request_era(
     header_version: Option<&str>,
 ) -> Result<ProtocolEra, String> {
     let method = value.get("method").and_then(serde_json::Value::as_str);
-    let meta_version = value
-        .get("params")
-        .and_then(|params| params.get("_meta"))
-        .and_then(|meta| meta.get("io.modelcontextprotocol/protocolVersion"))
-        .and_then(serde_json::Value::as_str);
-    let initialize_version = (method == Some("initialize"))
-        .then(|| {
-            value
-                .get("params")
-                .and_then(|params| params.get("protocolVersion"))
-                .and_then(serde_json::Value::as_str)
-        })
-        .flatten();
+    let DeclaredVersions {
+        meta: meta_version,
+        initialize: initialize_version,
+    } = DeclaredVersions::of(value);
 
     let declared = [header_version, meta_version, initialize_version]
         .into_iter()
@@ -50,12 +72,12 @@ pub fn classify_http_request_era(
     let modern = method == Some("server/discover")
         || declared
             .first()
-            .is_some_and(|version| *version == ANNOUNCED_FUTURE_PROTOCOL_VERSION);
+            .is_some_and(|version| *version == MODERN_PROTOCOL_VERSION);
     if modern {
-        if header_version != Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION) {
+        if header_version != Some(MODERN_PROTOCOL_VERSION) {
             return Err("modern requests require MCP-Protocol-Version: 2026-07-28".to_string());
         }
-        if value.get("id").is_some() && meta_version != Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION) {
+        if value.get("id").is_some() && meta_version != Some(MODERN_PROTOCOL_VERSION) {
             return Err(
                 "modern requests require matching protocolVersion in params._meta".to_string(),
             );
@@ -72,26 +94,31 @@ pub enum ProtocolEra {
     Modern,
 }
 
-/// Remove modern capabilities whose transport/ownership bridges are not yet
-/// implemented. Keep this projection shared by HTTP and direct RMCP handlers
-/// so discovery cannot outrun dispatch.
-pub fn suppress_unimplemented_modern_capabilities(
-    capabilities: &mut rmcp::model::ServerCapabilities,
-) {
-    capabilities.extensions = None;
-    capabilities.experimental = None;
-    if let Some(resources) = capabilities.resources.as_mut() {
-        resources.subscribe = None;
-    }
-}
-
 impl ProtocolEra {
-    pub fn from_version(version: &ProtocolVersion) -> Self {
-        if version.as_str() == ANNOUNCED_FUTURE_PROTOCOL_VERSION {
+    /// The era a negotiated or declared version belongs to. Anything but the
+    /// modern revision is served as legacy.
+    pub fn of(version: &str) -> Self {
+        if version == MODERN_PROTOCOL_VERSION {
             Self::Modern
         } else {
             Self::Legacy
         }
+    }
+
+    pub fn from_version(version: &ProtocolVersion) -> Self {
+        Self::of(version.as_str())
+    }
+
+    pub fn version_str(self) -> &'static str {
+        match self {
+            Self::Legacy => SUPPORTED_PROTOCOL_VERSION,
+            Self::Modern => MODERN_PROTOCOL_VERSION,
+        }
+    }
+
+    pub fn version(self) -> ProtocolVersion {
+        serde_json::from_value(serde_json::Value::String(self.version_str().to_string()))
+            .expect("Plug's protocol versions must parse")
     }
 }
 
@@ -113,142 +140,6 @@ impl ClientMetadata {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum MethodFamily {
-    ToolsList,
-    ToolsCall,
-    ResourcesList,
-    ResourcesRead,
-    ResourcesSubscribe,
-    PromptsList,
-    PromptsGet,
-    Completion,
-    Tasks,
-    Listeners,
-    Logging,
-    /// Receiving `notifications/message`, as opposed to `Logging`, which is
-    /// setting the level. No method string maps here: log delivery is a
-    /// broadcast, not a request, so this family exists only to answer
-    /// "may this principal observe log output?" through the same
-    /// `decide_method` path as everything else.
-    LoggingRead,
-    Continuations,
-    Extensions,
-    Administration,
-    Unknown,
-}
-
-/// Default downstream OAuth grant: the method families a normal MCP client
-/// exercises. Every entry must be a `MethodFamily::required_scope` string.
-pub const DEFAULT_DOWNSTREAM_OAUTH_SCOPES: [&str; 9] = [
-    "tools:read",
-    "resources:read",
-    "prompts:read",
-    "completion:use",
-    "tasks:use",
-    "subscriptions:listen",
-    "logging:configure",
-    "logging:read",
-    "continuations:complete",
-];
-
-impl MethodFamily {
-    pub fn from_method(method: &str) -> Self {
-        match method {
-            "tools/list" => Self::ToolsList,
-            "tools/call" => Self::ToolsCall,
-            "resources/list" | "resources/templates/list" => Self::ResourcesList,
-            "resources/read" => Self::ResourcesRead,
-            "resources/subscribe" | "resources/unsubscribe" => Self::ResourcesSubscribe,
-            "prompts/list" => Self::PromptsList,
-            "prompts/get" => Self::PromptsGet,
-            "completion/complete" => Self::Completion,
-            m if m.starts_with("tasks/") || m.starts_with("plug/legacy/tasks/") => Self::Tasks,
-            "subscriptions/listen" => Self::Listeners,
-            "logging/setLevel" => Self::Logging,
-            "tools/complete" => Self::Continuations,
-            m if m.starts_with("extensions/") => Self::Extensions,
-            m if m.starts_with("plug/admin/") => Self::Administration,
-            _ => Self::Unknown,
-        }
-    }
-
-    fn required_scope(self) -> Option<&'static str> {
-        match self {
-            Self::ToolsList | Self::ToolsCall => Some("tools:read"),
-            Self::ResourcesList | Self::ResourcesRead | Self::ResourcesSubscribe => {
-                Some("resources:read")
-            }
-            Self::PromptsList | Self::PromptsGet => Some("prompts:read"),
-            Self::Completion => Some("completion:use"),
-            Self::Tasks => Some("tasks:use"),
-            Self::Listeners => Some("subscriptions:listen"),
-            Self::Logging => Some("logging:configure"),
-            Self::LoggingRead => Some("logging:read"),
-            Self::Continuations => Some("continuations:complete"),
-            Self::Extensions => Some("extensions:use"),
-            Self::Administration => Some("plug:admin"),
-            Self::Unknown => None,
-        }
-    }
-
-    fn durable(self) -> bool {
-        matches!(self, Self::Tasks | Self::Listeners | Self::Continuations)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CapabilityPolicyInput<'a> {
-    pub era: ProtocolEra,
-    pub transport: DownstreamTransport,
-    pub principal: Option<&'a PrincipalId>,
-    pub scopes: &'a BTreeSet<String>,
-    pub local_trust: bool,
-    pub modern_direction_enabled: bool,
-    pub bridge_implemented: bool,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PolicyDecision {
-    Allow,
-    Deny(ProtocolOutcome),
-}
-
-impl PolicyDecision {
-    pub fn is_allowed(&self) -> bool {
-        matches!(self, Self::Allow)
-    }
-}
-
-/// The single projection/admission policy. Unknown combinations fail closed.
-pub fn decide_method(input: &CapabilityPolicyInput<'_>, family: MethodFamily) -> PolicyDecision {
-    if family == MethodFamily::Unknown {
-        return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
-    }
-    if input.era == ProtocolEra::Modern && !input.modern_direction_enabled {
-        return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
-    }
-    if family.durable() && input.principal.is_none() {
-        return PolicyDecision::Deny(ProtocolOutcome::AuthorizationRequired);
-    }
-    if matches!(
-        family,
-        MethodFamily::Continuations | MethodFamily::Extensions
-    ) && !input.bridge_implemented
-    {
-        return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
-    }
-    if input.local_trust {
-        return PolicyDecision::Allow;
-    }
-    match family.required_scope() {
-        Some(scope) if input.scopes.contains(scope) => PolicyDecision::Allow,
-        Some(_) => PolicyDecision::Deny(ProtocolOutcome::PermissionDenied),
-        None => PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge),
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProtocolOutcome {
     AuthorizationRequired,
@@ -262,6 +153,10 @@ pub enum ProtocolOutcome {
     QuotaExceeded,
 }
 
+/// The JSON-RPC code for a caller that has not proved it may do this: a
+/// missing or rejected credential, or an events client without a grant.
+pub const AUTHORIZATION_REQUIRED_CODE: i32 = -32001;
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct OutcomeEncoding {
     pub code: i32,
@@ -273,7 +168,12 @@ pub struct OutcomeEncoding {
 impl ProtocolOutcome {
     pub fn encode(self, era: ProtocolEra) -> OutcomeEncoding {
         let (legacy_code, modern_code, message, retryable) = match self {
-            Self::AuthorizationRequired => (-32001, -32001, "authorization required", false),
+            Self::AuthorizationRequired => (
+                AUTHORIZATION_REQUIRED_CODE,
+                AUTHORIZATION_REQUIRED_CODE,
+                "authorization required",
+                false,
+            ),
             Self::UpstreamUnavailable => (-32002, -32002, "upstream unavailable", true),
             Self::UnsupportedBridge => (-32601, -32601, "unsupported protocol bridge", false),
             Self::RetryableTransition => (-32003, -32003, "retryable transition", true),
@@ -307,168 +207,19 @@ impl ProtocolOutcome {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum QuotaResource {
-    Tasks,
-    QueuedTaskCreations,
-    Listeners,
-    UpstreamSubscriptions,
-    Continuations,
-    ContinuationBytes,
-    ConcurrentModernRequests,
-}
-
-#[derive(Debug, Clone)]
-pub struct AdmissionQuotaConfig {
-    pub tasks: usize,
-    pub queued_task_creations: usize,
-    pub listeners: usize,
-    pub upstream_subscriptions: usize,
-    pub continuations: usize,
-    pub continuation_bytes: usize,
-    pub concurrent_modern_requests: usize,
-    pub per_principal_divisor: usize,
-}
-
-impl Default for AdmissionQuotaConfig {
-    fn default() -> Self {
-        Self {
-            tasks: 1_024,
-            queued_task_creations: 128,
-            listeners: 2_048,
-            upstream_subscriptions: 1_024,
-            continuations: 512,
-            continuation_bytes: 16 * 1024 * 1024,
-            concurrent_modern_requests: 512,
-            per_principal_divisor: 8,
-        }
-    }
-}
-
-impl AdmissionQuotaConfig {
-    fn limit(&self, resource: QuotaResource) -> usize {
-        match resource {
-            QuotaResource::Tasks => self.tasks,
-            QuotaResource::QueuedTaskCreations => self.queued_task_creations,
-            QuotaResource::Listeners => self.listeners,
-            QuotaResource::UpstreamSubscriptions => self.upstream_subscriptions,
-            QuotaResource::Continuations => self.continuations,
-            QuotaResource::ContinuationBytes => self.continuation_bytes,
-            QuotaResource::ConcurrentModernRequests => self.concurrent_modern_requests,
-        }
-    }
-}
-
-#[derive(Default)]
-struct QuotaCounts {
-    global: HashMap<QuotaResource, usize>,
-    principals: HashMap<(PrincipalId, QuotaResource), usize>,
-}
-
-struct AdmissionQuotaInner {
-    config: AdmissionQuotaConfig,
-    counts: Mutex<QuotaCounts>,
-}
-
-#[derive(Clone)]
-pub struct AdmissionQuotas(Arc<AdmissionQuotaInner>);
-
-impl AdmissionQuotas {
-    pub fn new(config: AdmissionQuotaConfig) -> Self {
-        Self(Arc::new(AdmissionQuotaInner {
-            config,
-            counts: Mutex::new(QuotaCounts::default()),
-        }))
-    }
-
-    /// Reserve capacity atomically. Call this before initiating upstream work.
-    pub fn try_acquire(
-        &self,
-        principal: &PrincipalId,
-        resource: QuotaResource,
-        units: usize,
-    ) -> Result<QuotaLease, ProtocolOutcome> {
-        let mut counts = self.0.counts.lock().expect("quota mutex poisoned");
-        let global = counts.global.get(&resource).copied().unwrap_or(0);
-        let principal_key = (principal.clone(), resource);
-        let principal_count = counts.principals.get(&principal_key).copied().unwrap_or(0);
-        let global_limit = self.0.config.limit(resource);
-        let per_principal_limit = global_limit
-            .checked_div(self.0.config.per_principal_divisor.max(1))
-            .unwrap_or(global_limit)
-            .max(1);
-        if global.saturating_add(units) > global_limit
-            || principal_count.saturating_add(units) > per_principal_limit
-        {
-            return Err(ProtocolOutcome::QuotaExceeded);
-        }
-        counts.global.insert(resource, global + units);
-        counts
-            .principals
-            .insert(principal_key, principal_count + units);
-        Ok(QuotaLease {
-            inner: Arc::clone(&self.0),
-            principal: principal.clone(),
-            resource,
-            units,
-        })
-    }
-}
-
-pub struct QuotaLease {
-    inner: Arc<AdmissionQuotaInner>,
-    principal: PrincipalId,
-    resource: QuotaResource,
-    units: usize,
-}
-
-impl Drop for QuotaLease {
-    fn drop(&mut self) {
-        let mut counts = self.inner.counts.lock().expect("quota mutex poisoned");
-        if let std::collections::hash_map::Entry::Occupied(mut global) =
-            counts.global.entry(self.resource)
-        {
-            let remaining = global.get().saturating_sub(self.units);
-            if remaining == 0 {
-                global.remove();
-            } else {
-                *global.get_mut() = remaining;
-            }
-        }
-        if let std::collections::hash_map::Entry::Occupied(mut principal) = counts
-            .principals
-            .entry((self.principal.clone(), self.resource))
-        {
-            let remaining = principal.get().saturating_sub(self.units);
-            if remaining == 0 {
-                principal.remove();
-            } else {
-                *principal.get_mut() = remaining;
-            }
-        }
-    }
-}
-
-/// Parse the single protocol revision Plug is currently prepared to serve.
-/// Keeping construction here prevents individual transports from drifting.
 pub fn supported_protocol_version() -> ProtocolVersion {
-    serde_json::from_value(serde_json::Value::String(
-        SUPPORTED_PROTOCOL_VERSION.to_string(),
-    ))
-    .expect("Plug's supported protocol version must parse")
+    ProtocolEra::Legacy.version()
 }
 
 /// Every downstream protocol revision Plug will speak, oldest first.
 ///
-/// All three downstream transports answer version queries from this one list:
-/// stdio and IPC through `ServerHandler::supported_protocol_versions`, HTTP
-/// through the `server/discover` result. They diverged once — HTTP advertised
-/// only `2026-07-28` — which told a modern client that Plug had dropped the
-/// legacy revision it still serves on the very same port.
+/// `plug connect` answers version negotiation and the dispatcher answers
+/// `server/discover` from this one list. Legacy belongs in it: the same
+/// listener still serves `2025-11-25` through `initialize`.
 pub fn supported_downstream_protocol_versions(modern_enabled: bool) -> Vec<ProtocolVersion> {
     let mut versions = vec![supported_protocol_version()];
     if modern_enabled {
-        versions.push(ProtocolVersion::V_2026_07_28);
+        versions.push(ProtocolEra::Modern.version());
     }
     versions
 }
@@ -527,8 +278,8 @@ pub fn rewrite_legacy_request(value: &mut serde_json::Value) {
 }
 
 /// Rewrite the removed SEP-1686 `task` parameter on a bare tools/call params
-/// object. The HTTP and stdio adapters call [`rewrite_legacy_request`] on a
-/// complete JSON-RPC envelope; daemon IPC carries params without that envelope.
+/// object. HTTP calls [`rewrite_legacy_request`] on a complete JSON-RPC
+/// envelope; the dispatcher sees params without one.
 pub fn rewrite_legacy_call_params(value: &mut serde_json::Value) {
     let Some(params) = value.as_object_mut() else {
         return;
@@ -641,113 +392,16 @@ pub fn rewrite_modern_result(value: &mut serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::types::PrincipalId;
-    use uuid::Uuid;
 
     #[test]
-    fn parsed_supported_version_matches_policy_literal() {
+    fn era_versions_are_the_revisions_rmcp_names() {
+        assert_eq!(ProtocolEra::Legacy.version(), ProtocolVersion::V_2025_11_25);
+        assert_eq!(ProtocolEra::Modern.version(), ProtocolVersion::V_2026_07_28);
         assert_eq!(
-            supported_protocol_version().as_str(),
-            SUPPORTED_PROTOCOL_VERSION
+            ProtocolEra::from_version(&ProtocolVersion::V_2026_07_28),
+            ProtocolEra::Modern
         );
-    }
-
-    #[test]
-    fn default_downstream_oauth_scopes_match_method_family_required_scopes() {
-        let expected = [
-            MethodFamily::ToolsList,
-            MethodFamily::ResourcesRead,
-            MethodFamily::PromptsGet,
-            MethodFamily::Completion,
-            MethodFamily::Tasks,
-            MethodFamily::Listeners,
-            MethodFamily::Logging,
-            MethodFamily::LoggingRead,
-            MethodFamily::Continuations,
-        ]
-        .map(|family| {
-            family
-                .required_scope()
-                .expect("default-grant families all require a scope")
-        });
-        assert_eq!(
-            DEFAULT_DOWNSTREAM_OAUTH_SCOPES, expected,
-            "default grant must track MethodFamily::required_scope"
-        );
-        let unique: BTreeSet<&str> = DEFAULT_DOWNSTREAM_OAUTH_SCOPES.into_iter().collect();
-        assert_eq!(
-            unique.len(),
-            DEFAULT_DOWNSTREAM_OAUTH_SCOPES.len(),
-            "default grant must not repeat a scope"
-        );
-    }
-
-    #[test]
-    fn permission_projection_and_admission_share_default_deny_policy() {
-        let principal = PrincipalId::downstream_oauth("https://issuer", "client", "plug");
-        let scopes = BTreeSet::from(["tools:read".to_string()]);
-        let input = CapabilityPolicyInput {
-            era: ProtocolEra::Legacy,
-            transport: DownstreamTransport::Http,
-            principal: Some(&principal),
-            scopes: &scopes,
-            local_trust: false,
-            modern_direction_enabled: false,
-            bridge_implemented: false,
-        };
-        assert_eq!(
-            decide_method(&input, MethodFamily::ToolsCall),
-            PolicyDecision::Allow
-        );
-        assert_eq!(
-            decide_method(&input, MethodFamily::PromptsGet),
-            PolicyDecision::Deny(ProtocolOutcome::PermissionDenied)
-        );
-        assert_eq!(
-            decide_method(&input, MethodFamily::Unknown),
-            PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge)
-        );
-    }
-
-    #[test]
-    fn anonymous_callers_cannot_own_durable_state() {
-        let scopes = BTreeSet::new();
-        let input = CapabilityPolicyInput {
-            era: ProtocolEra::Legacy,
-            transport: DownstreamTransport::Http,
-            principal: None,
-            scopes: &scopes,
-            local_trust: true,
-            modern_direction_enabled: false,
-            bridge_implemented: false,
-        };
-        assert_eq!(
-            decide_method(&input, MethodFamily::Tasks),
-            PolicyDecision::Deny(ProtocolOutcome::AuthorizationRequired)
-        );
-    }
-
-    #[test]
-    fn every_outcome_has_stable_era_encodings() {
-        let outcomes = [
-            ProtocolOutcome::AuthorizationRequired,
-            ProtocolOutcome::UpstreamUnavailable,
-            ProtocolOutcome::UnsupportedBridge,
-            ProtocolOutcome::RetryableTransition,
-            ProtocolOutcome::Cancelled,
-            ProtocolOutcome::ExpiredContinuation,
-            ProtocolOutcome::PermissionDenied,
-            ProtocolOutcome::InputRequired,
-            ProtocolOutcome::QuotaExceeded,
-        ];
-        for outcome in outcomes {
-            let legacy = outcome.encode(ProtocolEra::Legacy);
-            let modern = outcome.encode(ProtocolEra::Modern);
-            assert_eq!(legacy.kind, outcome);
-            assert_eq!(modern.kind, outcome);
-            assert!(!legacy.message.is_empty());
-            assert!(!modern.message.is_empty());
-        }
+        assert_eq!(ProtocolEra::of("2025-06-18"), ProtocolEra::Legacy);
     }
 
     #[test]
@@ -755,80 +409,6 @@ mod tests {
         let error = ProtocolOutcome::QuotaExceeded.into_error(ProtocolEra::Legacy);
         assert_eq!(error.code, rmcp::model::ErrorCode(-32007));
         assert_eq!(error.data.unwrap()["kind"], "quota_exceeded");
-    }
-
-    #[test]
-    fn quotas_are_atomic_and_isolated_per_principal() {
-        let quotas = AdmissionQuotas::new(AdmissionQuotaConfig {
-            tasks: 4,
-            per_principal_divisor: 2,
-            ..AdmissionQuotaConfig::default()
-        });
-        let a = PrincipalId::daemon_ipc(Uuid::new_v4());
-        let b = PrincipalId::daemon_ipc(Uuid::new_v4());
-        let a1 = quotas.try_acquire(&a, QuotaResource::Tasks, 1).unwrap();
-        let a2 = quotas.try_acquire(&a, QuotaResource::Tasks, 1).unwrap();
-        assert_eq!(
-            quotas.try_acquire(&a, QuotaResource::Tasks, 1).err(),
-            Some(ProtocolOutcome::QuotaExceeded)
-        );
-        let b1 = quotas.try_acquire(&b, QuotaResource::Tasks, 1).unwrap();
-        drop((a1, a2, b1));
-        assert!(quotas.try_acquire(&a, QuotaResource::Tasks, 2).is_ok());
-    }
-
-    #[test]
-    fn concurrent_quota_admission_never_overbooks_or_starves_another_principal() {
-        let quotas = AdmissionQuotas::new(AdmissionQuotaConfig {
-            tasks: 8,
-            per_principal_divisor: 2,
-            ..AdmissionQuotaConfig::default()
-        });
-        let principals = [
-            PrincipalId::daemon_ipc(Uuid::from_u128(1)),
-            PrincipalId::daemon_ipc(Uuid::from_u128(2)),
-        ];
-        let barrier = Arc::new(std::sync::Barrier::new(17));
-        let successes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let mut threads = Vec::new();
-        for index in 0..16 {
-            let quotas = quotas.clone();
-            let principal = principals[index % 2].clone();
-            let barrier = Arc::clone(&barrier);
-            let successes = Arc::clone(&successes);
-            threads.push(std::thread::spawn(move || {
-                let lease = quotas.try_acquire(&principal, QuotaResource::Tasks, 1).ok();
-                if lease.is_some() {
-                    successes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                }
-                barrier.wait();
-                lease
-            }));
-        }
-        barrier.wait();
-        assert_eq!(successes.load(std::sync::atomic::Ordering::SeqCst), 8);
-        for thread in threads {
-            drop(thread.join().unwrap());
-        }
-        let counts = quotas.0.counts.lock().expect("quota mutex poisoned");
-        assert!(counts.principals.is_empty());
-        assert!(counts.global.is_empty());
-    }
-
-    #[test]
-    fn quota_ledger_does_not_retain_zero_count_principals_under_churn() {
-        let quotas = AdmissionQuotas::new(AdmissionQuotaConfig::default());
-        for value in 1..=10_000 {
-            let principal = PrincipalId::daemon_ipc(Uuid::from_u128(value));
-            let lease = quotas
-                .try_acquire(&principal, QuotaResource::ConcurrentModernRequests, 1)
-                .unwrap();
-            drop(lease);
-        }
-
-        let counts = quotas.0.counts.lock().expect("quota mutex poisoned");
-        assert!(counts.principals.is_empty());
-        assert!(counts.global.is_empty());
     }
 
     #[test]
@@ -876,24 +456,9 @@ mod tests {
             "params": { "requestId": 7 }
         });
         assert_eq!(
-            classify_http_request_era(&notification, Some(ANNOUNCED_FUTURE_PROTOCOL_VERSION)),
+            classify_http_request_era(&notification, Some(MODERN_PROTOCOL_VERSION)),
             Ok(ProtocolEra::Modern)
         );
-    }
-
-    #[test]
-    fn modern_projection_suppresses_upstream_subscription_capability() {
-        let mut capabilities = rmcp::model::ServerCapabilities::default();
-        let mut resources = rmcp::model::ResourcesCapability::default();
-        resources.subscribe = Some(true);
-        resources.list_changed = Some(true);
-        capabilities.resources = Some(resources);
-
-        suppress_unimplemented_modern_capabilities(&mut capabilities);
-
-        let resources = capabilities.resources.expect("resources remain advertised");
-        assert_eq!(resources.subscribe, None);
-        assert_eq!(resources.list_changed, Some(true));
     }
 
     #[test]

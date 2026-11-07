@@ -1,9 +1,6 @@
 //! Workspace/app-bound signing credentials. No environment or file fallback.
+use crate::platform_keyring;
 use crate::types::SecretString;
-#[cfg(not(target_os = "linux"))]
-use keyring as platform_keyring;
-#[cfg(target_os = "linux")]
-use keyring_core as platform_keyring;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum CredentialError {
@@ -28,7 +25,8 @@ pub struct KeychainSigningSecrets;
 impl KeychainSigningSecrets {
     fn entry(account: &str) -> Result<platform_keyring::Entry, CredentialError> {
         crate::oauth::initialize_platform_keyring().map_err(|_| CredentialError::Unavailable)?;
-        platform_keyring::Entry::new("plug", account).map_err(|_| CredentialError::Unavailable)
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, account)
+            .map_err(|_| CredentialError::Unavailable)
     }
 }
 impl SigningSecretBackend for KeychainSigningSecrets {

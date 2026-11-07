@@ -6,7 +6,7 @@
 
 use std::io::{IsTerminal, Read};
 
-use plug_core::secrets::{self, FILE, KEYCHAIN, SecretError, Stores};
+use plug_core::secrets::{self, FILE, SecretError, Stores, WRITABLE};
 use plug_core::types::SecretString;
 
 use crate::ui;
@@ -17,7 +17,12 @@ pub(crate) async fn cmd_secret(
 ) -> anyhow::Result<()> {
     let stores = match super::config::load_editable_config(config_path) {
         Ok((_, config)) => Stores::from_config(&config.secrets),
-        Err(_) => Stores::builtin(),
+        Err(error) => {
+            ui::print_warning_line(format!(
+                "The settings file could not be read, so only the built-in stores are used: {error}"
+            ));
+            Stores::builtin()
+        }
     };
     match command {
         crate::SecretCommands::Set { name, store } => {
@@ -44,13 +49,12 @@ pub(crate) async fn cmd_secret(
     Ok(())
 }
 
-/// The store named `id`, if Plug can write to it. A command store only reads:
-/// its own tool is where a value is put.
+/// The store named `id`, if Plug can write to it.
 fn writable(stores: &Stores, id: &str) -> anyhow::Result<std::sync::Arc<dyn secrets::SecretStore>> {
     match stores.get(id) {
-        Some(store) if [KEYCHAIN, FILE].contains(&id) => Ok(std::sync::Arc::clone(store)),
+        Some(store) if WRITABLE.contains(&id) => Ok(std::sync::Arc::clone(store)),
         Some(_) => anyhow::bail!("Plug only reads from `{id}`; store the value with its own tool"),
-        None => anyhow::bail!("no store named `{id}`; use `{KEYCHAIN}` or `{FILE}`"),
+        None => anyhow::bail!("no store named `{id}`; use `{}`", WRITABLE.join("` or `")),
     }
 }
 
@@ -93,7 +97,7 @@ async fn move_keys(
             },
         )
         .await?;
-        let left = plug_core::operator::load_editable_config(&path)?
+        let left = plug_core::config::load_editable_config(&path)?
             .servers
             .get(&name)
             .map(|server| stores.plaintext(server))

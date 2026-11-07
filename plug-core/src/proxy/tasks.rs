@@ -1,23 +1,152 @@
 use super::*;
 
-use rmcp::service::{RequestHandle, RoleClient, ServiceError};
+use rmcp::service::ServiceError;
 
 use crate::legacy_tasks::{
     CancelTaskResult, CreateTaskResult, GetTaskPayloadResult, GetTaskResult, ListTasksResult,
 };
 use crate::tasks::{OwnerLivenessProbe, UpstreamRecordOutcome, owner_closed_during_create_error};
 
-struct TaskWireContext {
-    progress_token: Option<ProgressToken>,
-    extension_meta: Option<MetaObject>,
+/// Ask a task-native upstream about one of its tasks.
+async fn ask_task_upstream(
+    server: &crate::server::UpstreamServer,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<rmcp::model::ServerResult, McpError> {
+    answer_within(
+        upstream_call_timeout(server),
+        server
+            .client
+            .peer()
+            .send_request(crate::legacy_tasks::request(method, Some(params))),
+    )
+    .await
 }
 
-/// RAII cover for the send-to-record gap in `execute_tool_task`: constructed
-/// the moment `send_cancellable_request` returns (the upstream request is in
-/// flight) and defused once the request id is safely recorded on the task
-/// record — or once an explicit cancel has already been sent. If the
-/// executing future is aborted while the guard is still armed (teardown's
-/// phase-A `handle.abort()` landing between send and record), Drop fires a
+/// The connection to cancel `upstream` on, and how long to wait: its
+/// server's call timeout. `None` when the server is gone, which leaves
+/// nothing to cancel.
+fn cancel_route(
+    server_manager: &ServerManager,
+    upstream: &TaskUpstreamRef,
+) -> Option<(Peer<RoleClient>, Duration)> {
+    let server = server_manager.get_upstream(upstream.server_id())?;
+    Some((server.client.peer().clone(), upstream_call_timeout(&server)))
+}
+
+/// Stop a task's upstream half: the task its server runs itself, by id, or
+/// the request still running for it. Waits at most `bound`, since rmcp
+/// waits for an answer forever. A failure is logged.
+async fn cancel_upstream(
+    peer: &Peer<RoleClient>,
+    upstream: &TaskUpstreamRef,
+    reason: &str,
+    bound: Duration,
+) {
+    match upstream {
+        TaskUpstreamRef::Task { server_id, task_id } => {
+            let params =
+                serde_json::to_value(crate::legacy_tasks::CancelTaskParams::new(task_id.clone()))
+                    .expect("legacy task cancel params serialize");
+            let send =
+                peer.send_request(crate::legacy_tasks::request("tasks/cancel", Some(params)));
+            match tokio::time::timeout(bound, send).await {
+                Err(_) => tracing::warn!(
+                    server = %server_id,
+                    upstream_task_id = %task_id,
+                    reason,
+                    timeout_secs = bound.as_secs(),
+                    "upstream tasks/cancel timed out"
+                ),
+                Ok(Err(error)) => tracing::debug!(
+                    server = %server_id,
+                    upstream_task_id = %task_id,
+                    reason,
+                    %error,
+                    "upstream tasks/cancel failed"
+                ),
+                Ok(Ok(_)) => {}
+            }
+        }
+        TaskUpstreamRef::Request { request_id, .. } => {
+            cancel_upstream_request(peer, request_id.clone(), reason, bound).await;
+        }
+    }
+}
+
+/// Wait for cancels spawned by `spawn_upstream_cancel`.
+async fn finish_cancels(cancels: Vec<tokio::task::JoinHandle<()>>) {
+    for cancel in cancels {
+        if let Err(error) = cancel.await {
+            tracing::warn!(%error, "upstream cancel did not finish");
+        }
+    }
+}
+
+/// After a task create timed out, wait one more `window` for its answer and
+/// cancel the task if one still arrives. If none does, the upstream task may
+/// be orphaned.
+///
+/// rmcp 3.1.0 (`service.rs`): once the request-level cancel passes through
+/// the peer loop, rmcp resolves the pending responder with
+/// `ServiceError::Cancelled` and drops any later response for that id, so a
+/// late `CreateTaskResult` reaches this only when it beat the cancel. An
+/// upstream that honors the request-level cancel creates nothing.
+pub(super) fn spawn_late_task_reaper(
+    rx: tokio::sync::oneshot::Receiver<Result<ServerResult, ServiceError>>,
+    server_manager: Arc<ServerManager>,
+    window: Duration,
+    server_id: String,
+    trace_id: Arc<str>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        match tokio::time::timeout(window, rx).await {
+            Ok(Ok(Ok(response))) => {
+                // A late answer without a task created nothing to cancel.
+                let Ok(result) = crate::legacy_tasks::parse_create_result(response) else {
+                    return;
+                };
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    server = %server_id,
+                    task_id = %result.task.task_id,
+                    "native task created after its create timed out; cancelling upstream task"
+                );
+                let upstream = TaskUpstreamRef::Task {
+                    server_id,
+                    task_id: result.task.task_id,
+                };
+                if let Some((peer, bound)) = cancel_route(&server_manager, &upstream) {
+                    cancel_upstream(
+                        &peer,
+                        &upstream,
+                        "task created after its create timed out",
+                        bound,
+                    )
+                    .await;
+                }
+            }
+            // `ServiceError::Cancelled` once the request-level cancel went
+            // through, or a dropped responder once the connection is gone.
+            Ok(_) => {}
+            Err(_elapsed) => {
+                tracing::warn!(
+                    trace_id = %trace_id,
+                    server = %server_id,
+                    window_secs = window.as_secs(),
+                    "native create reaper window expired; upstream task may be orphaned"
+                );
+            }
+        }
+    })
+}
+
+/// RAII cover for the send-to-record gap in `record_task_request`:
+/// constructed the moment the upstream request is in flight and defused
+/// once the request id is safely recorded on the task record — or once an
+/// explicit cancel has already been sent. If the executing future is
+/// aborted while the guard is still armed (teardown's phase-A
+/// `handle.abort()` landing between send and record), Drop fires a
 /// detached, bounded request-level cancellation so the upstream call is
 /// stopped instead of running to completion for a result nobody can ever
 /// collect.
@@ -58,30 +187,19 @@ impl Drop for UpstreamRequestCancelGuard {
         // worth cancelling either — skip instead of panicking.
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
-                let send = peer.notify_cancelled(CancelledNotificationParam::new(
-                    Some(request_id),
-                    Some("task aborted before upstream request was recorded".to_string()),
-                ));
-                if tokio::time::timeout(bound, send).await.is_err() {
-                    tracing::warn!(
-                        timeout_secs = bound.as_secs(),
-                        "upstream cancellation notify timed out after task abort"
-                    );
-                }
+                cancel_upstream_request(
+                    &peer,
+                    request_id,
+                    "task aborted before upstream request was recorded",
+                    bound,
+                )
+                .await;
             });
         }
     }
 }
 
 impl super::ToolRouter {
-    pub fn task_owner_for_ipc_client(client_id: &str) -> TaskOwner {
-        TaskOwner::new(Arc::<str>::from(format!("ipc:{client_id}")))
-    }
-
-    pub fn task_owner_for_http_session(session_id: &str) -> TaskOwner {
-        TaskOwner::new(Arc::<str>::from(format!("http:{session_id}")))
-    }
-
     pub async fn enqueue_tool_task(
         self: &Arc<Self>,
         tool_name: &str,
@@ -91,15 +209,11 @@ impl super::ToolRouter {
         owner_liveness: Option<OwnerLivenessProbe>,
         downstream: Option<DownstreamCallContext>,
     ) -> Result<CreateTaskResult, McpError> {
-        let extension_meta = downstream
-            .as_ref()
-            .and_then(|context| context.extension_envelope.as_ref())
-            .and_then(crate::types::ExtensionEnvelope::to_meta);
         // Task augmentation is a second method family layered on tools/call.
         // Authorize and reserve both queue + durable-record capacity before
         // touching the lifecycle ledger, task store, or any upstream.
         let (_queued_task_lease, task_quota_lease) = if let Some(context) = downstream.as_ref() {
-            context.authorize(crate::protocol::MethodFamily::Tasks)?;
+            context.authorize(crate::admission::MethodFamily::Tasks)?;
             let principal = context.principal.as_ref().ok_or_else(|| {
                 crate::protocol::ProtocolOutcome::AuthorizationRequired
                     .into_error(context.protocol_era)
@@ -108,13 +222,13 @@ impl super::ToolRouter {
                 .admission_quotas
                 .try_acquire(
                     principal,
-                    crate::protocol::QuotaResource::QueuedTaskCreations,
+                    crate::admission::QuotaResource::QueuedTaskCreations,
                     1,
                 )
                 .map_err(|outcome| outcome.into_error(context.protocol_era))?;
             let task = self
                 .admission_quotas
-                .try_acquire(principal, crate::protocol::QuotaResource::Tasks, 1)
+                .try_acquire(principal, crate::admission::QuotaResource::Tasks, 1)
                 .map_err(|outcome| outcome.into_error(context.protocol_era))?;
             (Some(queued), Some(task))
         } else {
@@ -130,7 +244,9 @@ impl super::ToolRouter {
         // `create`/`create_passthrough` refuses to insert a record for the
         // already-torn-down owner instead of leaving an untracked Working
         // record (and, on the native path, an upstream task nobody cancels).
-        let create_guard = self.task_store.lock().await.begin_owner_create(&owner);
+        let create_guard = self
+            .with_task_store(|store| store.begin_owner_create(&owner))
+            .await;
 
         // Owner-liveness re-check, deliberately ordered AFTER the guard
         // registration above. This closes the other half of the
@@ -154,8 +270,8 @@ impl super::ToolRouter {
         // re-registered client accepts the create, which is benign — the same
         // `ipc:<client_id>` owner is live again and owns the record — and the
         // tombstone catch-all remains the backstop, with a bounded spurious
-        // refusal as the worst case. stdio passes `None`: it has no teardown
-        // path that calls task cleanup, so its owner is always live.
+        // refusal as the worst case. A caller with no session to tear down
+        // passes `None`.
         if let Some(owner_is_live) = owner_liveness
             && !owner_is_live()
         {
@@ -169,15 +285,11 @@ impl super::ToolRouter {
         // still tombstones this in-flight owner during cleanup, preventing a
         // late record from surviving. A revocation that already completed is
         // rejected here before route lookup or any upstream request.
-        if let Some(context) = downstream.as_ref()
-            && let Some(lifecycle) = context.principal_lifecycle.as_ref()
-            && !lifecycle.is_active()
-        {
-            return Err(crate::protocol::ProtocolOutcome::AuthorizationRequired
-                .into_error(context.protocol_era));
+        if let Some(context) = downstream.as_ref() {
+            context.ensure_principal_lifecycle_active()?;
         }
 
-        if canonical_plug_meta_tool_name(tool_name).is_some() {
+        if PlugTool::named(tool_name).is_some() {
             return Err(McpError::from(ProtocolError::InvalidRequest {
                 detail:
                     "plug meta-tools do not support task-wrapped calls; call the meta-tool directly"
@@ -205,229 +317,83 @@ impl super::ToolRouter {
             .as_ref()
             .is_some_and(|context| context.protocol_era == crate::protocol::ProtocolEra::Modern);
         if !modern_downstream
-            && let Some(upstream) = self.server_manager.get_upstream(&server_id)
-            && crate::protocol::legacy_tasks_capability(&upstream.capabilities)
+            && self
+                .server_manager
+                .get_upstream(&server_id)
+                .is_some_and(|upstream| {
+                    crate::protocol::legacy_tasks_capability(&upstream.capabilities)
+                })
         {
-            let call_timeout = Duration::from_secs(upstream.config.call_timeout_secs);
-            let peer = upstream.client.peer().clone();
-            drop(upstream);
-
-            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-            if let Some(args) = arguments.clone() {
-                upstream_params = upstream_params.with_arguments(args);
-            }
-            if let Some(meta) = extension_meta.clone() {
-                merge_call_extension_meta(&mut upstream_params, meta);
-            }
-            upstream_params
-                .meta
-                .get_or_insert_with(Default::default)
-                .insert(
-                    crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-                    serde_json::json!({}),
-                );
-            if let Some(token) = progress_token.clone() {
-                upstream_params.set_progress_token(token);
-            }
-            let upstream_params =
-                crate::legacy_tasks::call_tool_params(upstream_params).map_err(|error| {
-                    McpError::internal_error(
-                        format!("failed to serialize legacy task-wrapped tool call: {error}"),
-                        None,
-                    )
-                })?;
-
-            // The round trip is DETACHED: it runs in its own spawned task and
-            // the `OwnerCreateGuard` moves into it, so a caller whose future
-            // is dropped mid-await (e.g. axum dropping the POST handler on
-            // client disconnect) can neither release the guard early nor
-            // orphan the upstream task — the round trip completes in the
-            // background and either records the created task (owner still
-            // live; it stays retrievable via tasks/list) or hits the
-            // tombstone branch and cancels the upstream task.
+            // The round trip runs on a task of its own that owns the create
+            // guard, so a caller dropped mid-await (axum drops the handler
+            // when the client disconnects) can neither release the guard
+            // early nor orphan the upstream task: the task the server makes
+            // is recorded for a live owner or cancelled upstream.
             let router = Arc::clone(self);
             let tool_name = tool_name.to_string();
             let round_trip = tokio::spawn(async move {
                 let _queued_task_lease = _queued_task_lease;
                 let _create_guard = create_guard;
-                let deadline = tokio::time::Instant::now() + call_timeout;
-
-                let request = crate::legacy_tasks::request("tools/call", Some(upstream_params));
-                // DEFAULT options on purpose: setting rmcp's own
-                // `options.timeout` would hand the timeout path to
-                // `await_response`, whose auto-cancel awaits an UNBOUNDED
-                // `send_notification` — a wedged sink would hang this task
-                // forever. The bound lives in our own `tokio::time::timeout`
-                // below, paired with a bounded explicit cancel. The same
-                // deadline covers BOTH queueing the request and receiving
-                // its response: rmcp's peer channel is bounded, so acquiring
-                // a RequestHandle can itself backpressure before a request id
-                // exists to cancel.
-                let handle = match tokio::time::timeout_at(
-                    deadline,
-                    peer.send_cancellable_request(request, PeerRequestOptions::default()),
-                )
-                .await
-                {
-                    Ok(Ok(handle)) => handle,
-                    Ok(Err(error)) => {
-                        return Err(match error {
-                            ServiceError::McpError(mcp_err) => mcp_err,
-                            other => McpError::internal_error(other.to_string(), None),
-                        });
-                    }
-                    Err(_elapsed) => {
-                        tracing::warn!(
+                let answer = router
+                    .call_tool_inner(
+                        &tool_name,
+                        ToolRoundInput {
+                            arguments,
+                            input_responses: None,
+                            request_state: None,
+                            expected_route: None,
+                        },
+                        progress_token,
+                        downstream,
+                        CallKind::CreateTask,
+                        false,
+                    )
+                    .await?;
+                let CallToolResponse::Task(created) = answer else {
+                    return Err(McpError::internal_error(
+                        "upstream task-capable server returned an invalid legacy task response",
+                        None,
+                    ));
+                };
+                let task = crate::legacy_tasks::Task::from(&created.task);
+                let upstream = TaskUpstreamRef::Task {
+                    server_id: server_id.clone(),
+                    task_id: task.task_id.clone(),
+                };
+                let recorded = router
+                    .with_task_store(|store| {
+                        let recorded = store.create_passthrough(
+                            owner,
+                            &tool_name,
+                            &task,
+                            upstream.clone(),
+                            task_quota_lease,
+                        );
+                        if let Ok(record) = &recorded {
+                            store.record_source(&record.task_id, &server_id, &original_name);
+                        }
+                        recorded
+                    })
+                    .await;
+                match recorded {
+                    Ok(record) => Ok(CreateTaskResult::new(record)),
+                    Err(error) => {
+                        // The owner was torn down during the round trip, so
+                        // nothing here tracks the task the server made.
+                        tracing::info!(
                             trace_id = %trace_id,
                             server = %server_id,
-                            tool = %original_name,
-                            timeout_secs = call_timeout.as_secs(),
-                            "native task creation timed out while queueing upstream request"
+                            task_id = %task.task_id,
+                            "owner torn down during native task creation; cancelling upstream task"
                         );
-                        return Err(McpError::internal_error(
-                            ServiceError::Timeout {
-                                timeout: call_timeout,
-                            }
-                            .to_string(),
-                            None,
-                        ));
-                    }
-                };
-                let RequestHandle {
-                    mut rx,
-                    id: upstream_request_id,
-                    peer: request_peer,
-                    ..
-                } = handle;
-
-                let recv = match tokio::time::timeout_at(deadline, &mut rx).await {
-                    Ok(recv) => recv,
-                    Err(_elapsed) => {
-                        tracing::warn!(
-                            trace_id = %trace_id,
-                            server = %server_id,
-                            tool = %original_name,
-                            timeout_secs = call_timeout.as_secs(),
-                            "native task creation timed out; cancelling upstream request"
-                        );
-                        // Best-effort request-level cancel, bounded on its
-                        // own: a wedged transport sink must not hang this
-                        // detached task.
-                        let cancel =
-                            request_peer.notify_cancelled(CancelledNotificationParam::new(
-                                Some(upstream_request_id.clone()),
-                                Some("task creation timed out".to_string()),
-                            ));
-                        if tokio::time::timeout(call_timeout, cancel).await.is_err() {
-                            tracing::warn!(
-                                trace_id = %trace_id,
-                                server = %server_id,
-                                timeout_secs = call_timeout.as_secs(),
-                                "request cancel notify timed out after native create timeout"
-                            );
+                        if let Some((peer, bound)) = cancel_route(&router.server_manager, &upstream)
+                        {
+                            cancel_upstream(&peer, &upstream, "task owner disconnected", bound)
+                                .await;
                         }
-                        // Reaper: if the CreateTaskResult still lands late,
-                        // cancel the just-created task by id. The guard is
-                        // NOT handed to the reaper — it dies with this task
-                        // (the reaper only cancels; it never creates
-                        // records).
-                        router.spawn_native_create_reaper(
-                            rx,
-                            call_timeout,
-                            server_id.clone(),
-                            Arc::clone(&trace_id),
-                        );
-                        return Err(McpError::internal_error(
-                            ServiceError::Timeout {
-                                timeout: call_timeout,
-                            }
-                            .to_string(),
-                            None,
-                        ));
+                        Err(error)
                     }
-                };
-                // Replicate rmcp `await_response`'s oneshot mapping: a
-                // dropped responder means the transport went away.
-                let response = match recv {
-                    Ok(Ok(response)) => response,
-                    Ok(Err(error)) => {
-                        return Err(match error {
-                            ServiceError::McpError(mcp_err) => mcp_err,
-                            other => McpError::internal_error(other.to_string(), None),
-                        });
-                    }
-                    Err(_recv_error) => {
-                        return Err(McpError::internal_error(
-                            ServiceError::TransportClosed.to_string(),
-                            None,
-                        ));
-                    }
-                };
-
-                if let Ok(result) = crate::legacy_tasks::parse_create_result(response) {
-                    tracing::info!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        tool = %original_name,
-                        task_id = %result.task.task_id,
-                        "proxy native upstream task created"
-                    );
-                    let upstream = TaskUpstreamRef::Task {
-                        server_id: server_id.clone(),
-                        task_id: result.task.task_id.clone(),
-                    };
-                    let (created, expired_cleanup) = {
-                        let mut store = router.task_store.lock().await;
-                        let created = match task_quota_lease {
-                            Some(lease) => store.create_passthrough_with_quota(
-                                owner,
-                                &tool_name,
-                                &result.task,
-                                upstream,
-                                lease,
-                            ),
-                            None => {
-                                store.create_passthrough(owner, &tool_name, &result.task, upstream)
-                            }
-                        };
-                        if let Ok(task) = &created {
-                            store.record_source(&task.task_id, &server_id, &original_name);
-                        }
-                        (created, store.take_expired_cleanup())
-                    };
-                    router.finish_expired_task_cleanup(expired_cleanup).await;
-                    return match created {
-                        Ok(task) => Ok(CreateTaskResult::new(task)),
-                        Err(error) => {
-                            // The owner was torn down during the upstream
-                            // round trip: the native task exists upstream but
-                            // nothing tracks it locally anymore. Best-effort
-                            // bounded cancel so the upstream stops instead of
-                            // running to completion for a result nobody will
-                            // ever collect.
-                            tracing::info!(
-                                trace_id = %trace_id,
-                                server = %server_id,
-                                task_id = %result.task.task_id,
-                                "owner torn down during native task creation; cancelling upstream task"
-                            );
-                            if let Some(cancellation) =
-                                router.spawn_bounded_upstream_cancellation(TaskUpstreamRef::Task {
-                                    server_id,
-                                    task_id: result.task.task_id.clone(),
-                                })
-                            {
-                                let _ = cancellation.await;
-                            }
-                            Err(error)
-                        }
-                    };
                 }
-
-                Err(McpError::internal_error(
-                    "upstream task-capable server returned an invalid legacy task response",
-                    None,
-                ))
             });
             return match round_trip.await {
                 Ok(result) => result,
@@ -438,68 +404,38 @@ impl super::ToolRouter {
             };
         }
 
-        // Create + spawn + attach in ONE task_store lock scope: `tokio::spawn`
+        // Create + spawn + attach in ONE task store lock scope: `tokio::spawn`
         // is synchronous, and the spawned future's own store accesses simply
         // queue on this same lock, so no teardown can interleave between the
-        // record insert and the abort-handle attach. (Previously these were
-        // three separate lock scopes; a `cleanup_owner` interleaving drained a
-        // record whose handle was still `None`, `attach_abort_handle` then
-        // silently no-opped on the missing record and dropped the JoinHandle —
-        // detaching the future, which kept running and kept holding its
-        // server's `max_concurrent` semaphore permit.) No await is held
+        // record insert and the abort-handle attach. A record drained before
+        // its handle was attached would detach the future, which would keep
+        // running and holding its server's call slot. No await is held
         // across this scope other than acquiring the lock itself.
-        // The way the call itself routes, so a tool called by its server's
-        // own name is recorded too.
-        let behind = self
-            .cache
-            .load()
-            .resolve_route(tool_name)
-            .filter(|(server, _)| server != "__plug_internal__")
-            .cloned();
-        let created = {
-            let mut store = self.task_store.lock().await;
-            let task = match task_quota_lease {
-                Some(lease) => store.create_with_quota(owner, tool_name, lease),
-                None => store.create(owner, tool_name),
-            };
-            match task {
-                Ok(task) => {
-                    let task_id = task.task_id.clone();
-                    if let Some((server, own_tool)) = &behind {
-                        store.record_source(&task_id, server, own_tool);
-                    }
-                    let router = Arc::clone(self);
-                    let tool_name = tool_name.to_string();
-                    let handle = tokio::spawn(async move {
-                        router
-                            .execute_tool_task(
-                                task_id,
-                                tool_name,
-                                arguments,
-                                TaskWireContext {
-                                    progress_token,
-                                    extension_meta,
-                                },
-                                false,
-                                trace_id,
-                            )
-                            .await;
-                    });
-                    store.attach_abort_handle(&task.task_id, handle);
-                    Ok((task, store.take_expired_cleanup()))
+        let behind = self.tool_behind(tool_name);
+        let task = self
+            .with_task_store(|store| {
+                let task = store.create(owner, tool_name, task_quota_lease)?;
+                let task_id = task.task_id.clone();
+                if let Some((server, own_tool)) = &behind {
+                    store.record_source(&task_id, server, own_tool);
                 }
-                Err(error) => Err((error, store.take_expired_cleanup())),
-            }
-        };
-
-        let (task, expired_cleanup) = match created {
-            Ok(created) => created,
-            Err((error, cleanup)) => {
-                self.finish_expired_task_cleanup(cleanup).await;
-                return Err(error);
-            }
-        };
-        self.finish_expired_task_cleanup(expired_cleanup).await;
+                let router = Arc::clone(self);
+                let tool_name = tool_name.to_string();
+                let handle = tokio::spawn(async move {
+                    router
+                        .execute_tool_task(
+                            task_id,
+                            tool_name,
+                            arguments,
+                            progress_token,
+                            downstream,
+                        )
+                        .await;
+                });
+                store.attach_abort_handle(&task.task_id, handle);
+                Ok::<_, McpError>(task)
+            })
+            .await?;
 
         Ok(CreateTaskResult::new(task))
     }
@@ -509,13 +445,14 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         request: Option<PaginatedRequestParams>,
     ) -> Result<ListTasksResult, McpError> {
-        let (result, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let result = store.list_for_owner(owner, request);
-            (result, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
-        Ok(result)
+        let tasks = self
+            .with_task_store(|store| store.list_for_owner(owner))
+            .await;
+        catalog::paginated_result("tasks/list", &tasks, request, |tasks, next_cursor| {
+            let mut result = ListTasksResult::new(tasks);
+            result.next_cursor = next_cursor;
+            result
+        })
     }
 
     pub async fn get_task_info_for_owner(
@@ -523,12 +460,9 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskResult, McpError> {
-        let (upstream, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let upstream = store.upstream_for_owner(owner, task_id);
-            (upstream, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
+        let upstream = self
+            .with_task_store(|store| store.upstream_for_owner(owner, task_id))
+            .await;
         let upstream = upstream?;
         if let Some(TaskUpstreamRef::Task {
             server_id,
@@ -539,22 +473,13 @@ impl super::ToolRouter {
             let params =
                 serde_json::to_value(crate::legacy_tasks::GetTaskParams::new(upstream_task_id))
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let response = server
-                .client
-                .peer()
-                .send_request(crate::legacy_tasks::request("tasks/get", Some(params)))
-                .await
-                .map_err(|error| match error {
-                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                    other => McpError::internal_error(other.to_string(), None),
-                })?;
+            let response = ask_task_upstream(&server, "tasks/get", params).await?;
             if let Ok(result) = crate::legacy_tasks::parse_get_result(response) {
-                let (synced, cleanup) = {
-                    let mut store = self.task_store.lock().await;
-                    let synced = store.sync_from_upstream_for_owner(owner, task_id, &result.task);
-                    (synced, store.take_expired_cleanup())
-                };
-                self.finish_expired_task_cleanup(cleanup).await;
+                let synced = self
+                    .with_task_store(|store| {
+                        store.sync_from_upstream_for_owner(owner, task_id, &result.task)
+                    })
+                    .await;
                 return Ok(GetTaskResult::new(synced?));
             }
             return Err(McpError::internal_error(
@@ -562,13 +487,8 @@ impl super::ToolRouter {
                 None,
             ));
         }
-        let (result, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let result = store.get_info_for_owner(owner, task_id);
-            (result, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
-        result
+        self.with_task_store(|store| store.get_info_for_owner(owner, task_id))
+            .await
     }
 
     /// SEP-2663 projection of the same retained task record used by legacy
@@ -588,13 +508,8 @@ impl super::ToolRouter {
             // modern inlined completed result.
             let _ = self.get_task_result_for_owner(owner, task_id).await?;
         }
-        let (result, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let result = store.get_modern_for_owner(owner, task_id);
-            (result, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
-        result
+        self.with_task_store(|store| store.get_modern_for_owner(owner, task_id))
+            .await
     }
 
     pub async fn validate_task_owner(
@@ -602,13 +517,8 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<(), McpError> {
-        let (result, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let result = store.validate_owner(owner, task_id);
-            (result, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
-        result
+        self.with_task_store(|store| store.validate_owner(owner, task_id))
+            .await
     }
 
     pub async fn get_task_result_for_owner(
@@ -616,12 +526,9 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<GetTaskPayloadResult, McpError> {
-        let (upstream, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let upstream = store.upstream_for_owner(owner, task_id);
-            (upstream, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
+        let upstream = self
+            .with_task_store(|store| store.upstream_for_owner(owner, task_id))
+            .await;
         let upstream = upstream?;
         if let Some(TaskUpstreamRef::Task {
             server_id,
@@ -633,48 +540,63 @@ impl super::ToolRouter {
                 upstream_task_id,
             ))
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-            let response = server
-                .client
-                .peer()
-                .send_request(crate::legacy_tasks::request("tasks/result", Some(params)))
-                .await
-                .map_err(|error| match error {
-                    rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                    other => McpError::internal_error(other.to_string(), None),
-                })?;
-            let payload = crate::legacy_tasks::parse_payload_result(response)
+            let response = ask_task_upstream(&server, "tasks/result", params).await?;
+            let mut payload = crate::legacy_tasks::parse_payload_result(response)
                 .map_err(|error| McpError::internal_error(error.to_string(), None))?
                 .0;
-            let (cached, source, cleanup) = {
-                let mut store = self.task_store.lock().await;
-                let cached = store.cache_result_for_owner(owner, task_id, payload.clone());
-                (
-                    cached,
-                    store.source_of(task_id),
-                    store.take_expired_cleanup(),
-                )
-            };
-            self.finish_expired_task_cleanup(cleanup).await;
-            cached?;
-            return self
-                .artifact_store
-                .maybe_spill_task_payload(source.as_ref(), task_id, payload)
+            // The upstream ran the tool itself, so its result is sanitized
+            // here as `call_tool_inner` sanitizes a call's.
+            if let Ok(mut result) = serde_json::from_value::<CallToolResult>(payload.clone()) {
+                super::outward_tool_result(&server_id, &mut result);
+                payload = serde_json::to_value(result)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+            }
+            let (cached, source) = self
+                .with_task_store(|store| {
+                    let cached = store.cache_result_for_owner(owner, task_id, payload.clone());
+                    (cached, store.source_of(task_id))
+                })
                 .await;
+            cached?;
+            return self.task_payload(source, task_id, payload).await;
         }
-        let (payload, source, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let payload = store.get_result_for_owner(owner, task_id);
-            (
-                payload,
-                store.source_of(task_id),
-                store.take_expired_cleanup(),
-            )
+        let (payload, source) = self
+            .with_task_store(|store| {
+                let payload = store.get_result_for_owner(owner, task_id);
+                (payload, store.source_of(task_id))
+            })
+            .await;
+        self.task_payload(source, task_id, payload?.0).await
+    }
+
+    /// A task's result as `tasks/result` sends it. A tool result too large
+    /// to send is kept as an artifact with the tool the task ran; one whose
+    /// task no longer says which is kept with no tool, and is withheld from a
+    /// client with a block.
+    async fn task_payload(
+        &self,
+        source: Option<crate::tasks::TaskSource>,
+        task_id: &str,
+        payload: serde_json::Value,
+    ) -> Result<GetTaskPayloadResult, McpError> {
+        let Ok(result) = serde_json::from_value::<CallToolResult>(payload.clone()) else {
+            return Ok(GetTaskPayloadResult::new(payload));
         };
-        self.finish_expired_task_cleanup(cleanup).await;
-        let payload = payload?;
-        self.artifact_store
-            .maybe_spill_task_payload(source.as_ref(), task_id, payload.0)
-            .await
+        let listed = source.as_ref().map_or_else(
+            || format!("task_result:{task_id}"),
+            |source| source.listed.clone(),
+        );
+        let behind = source
+            .as_ref()
+            .and_then(|source| source.behind.as_ref())
+            .map(|(server, own_tool)| (server.as_str(), own_tool.as_str()));
+        let spilled = self
+            .artifact_store
+            .maybe_spill_result_of(behind, &listed, result)
+            .await?;
+        serde_json::to_value(spilled)
+            .map(GetTaskPayloadResult::new)
+            .map_err(|error| McpError::internal_error(error.to_string(), None))
     }
 
     /// Tears down every task record owned by `owner` — HTTP session
@@ -689,23 +611,24 @@ impl super::ToolRouter {
     /// upstream also stops instead of completing the call for a result
     /// nobody will ever collect.
     ///
-    /// Mirrors the cancellation-forwarding branches in `cancel_task_for_owner`,
-    /// minus the store sync-back — the records are already gone by the time
-    /// cancellation is forwarded, so there is nothing left to update. Errors
-    /// notifying any one upstream are ignored and never skip the rest.
+    /// Each upstream is cancelled as `cancel_task_for_owner` cancels one
+    /// (`cancel_upstream`). A failure with one upstream is logged and never
+    /// skips the rest.
     ///
     /// Returns in bounded time regardless of upstream behavior: local aborts
     /// happen first and synchronously, and every upstream cancellation is
-    /// forwarded concurrently under a per-upstream timeout (see
-    /// `spawn_bounded_upstream_cancellation`). Callers include the daemon's
+    /// forwarded concurrently under a per-upstream timeout. Callers include the daemon's
     /// idle-session expiry loop, which is a single serialized loop — an
     /// unbounded hang here would permanently stop idle cleanup daemon-wide.
     pub async fn cleanup_tasks_for_owner(&self, owner: &TaskOwner) {
-        // Durable task and continuation ownership share the authenticated
-        // principal key. Teardown/revocation must invalidate both before any
-        // asynchronous upstream cleanup can be delayed or cancelled.
+        // Revoked before any upstream cleanup can be delayed or cancelled.
+        // The key matches a continuation's owner only for a principal-owned
+        // task, so a session's teardown also revokes by its principal
+        // (`sessions.rs`).
         self.continuation_registry.revoke_owner_key(owner.as_key());
-        let drained = self.task_store.lock().await.cleanup_owner(owner);
+        let drained = self
+            .with_task_store(|store| store.cleanup_owner(owner))
+            .await;
 
         // Phase A: abort every still-running local future synchronously,
         // before any upstream await — one unresponsive upstream must never
@@ -726,179 +649,56 @@ impl super::ToolRouter {
         // max(per-server bound), not the sum — and a cancellation outlives
         // even a caller that gets aborted mid-await (e.g. an HTTP DELETE
         // request task).
-        let cancellations: Vec<_> = upstreams
+        let cancellations = upstreams
             .into_iter()
-            .filter_map(|upstream| self.spawn_bounded_upstream_cancellation(upstream))
+            .filter_map(|upstream| self.spawn_upstream_cancel(upstream, "task owner disconnected"))
             .collect();
-        for cancellation in cancellations {
-            let _ = cancellation.await;
-        }
+        finish_cancels(cancellations).await;
+    }
+
+    /// Run `op` on the task store. Every store operation drops the records
+    /// that expired; their upstream halves are cancelled and their quota
+    /// released here, after the lock is let go.
+    async fn with_task_store<T>(&self, op: impl FnOnce(&mut TaskStore) -> T) -> T {
+        let (out, expired) = {
+            let mut store = self.task_store.lock().await;
+            let out = op(&mut store);
+            (out, store.take_expired_cleanup())
+        };
+        self.finish_expired_task_cleanup(expired).await;
+        out
     }
 
     async fn finish_expired_task_cleanup(&self, cleanup: Vec<crate::tasks::ExpiredTaskCleanup>) {
         let cancellations = cleanup
             .iter()
             .filter_map(|item| item.upstream.clone())
-            .filter_map(|upstream| self.spawn_bounded_upstream_cancellation(upstream))
-            .collect::<Vec<_>>();
-        for cancellation in cancellations {
-            let _ = cancellation.await;
-        }
+            .filter_map(|upstream| self.spawn_upstream_cancel(upstream, "task expired"))
+            .collect();
+        finish_cancels(cancellations).await;
         // Dropping only after every bounded cancellation attempt releases
         // the quota leases retained by stale live records.
         drop(cleanup);
     }
 
-    /// Spawns a best-effort cancellation of `upstream` (task cancel request
-    /// or request-cancel notification), bounded by the owning server's
-    /// `call_timeout_secs`. rmcp's plain `send_request` sets no timeout of
-    /// its own and awaits the response oneshot forever, so without this
-    /// bound a single unresponsive upstream would wedge the caller.
-    /// Returns `None` when the server is no longer registered (nothing left
-    /// to cancel). Timeouts and errors are logged, never propagated.
-    fn spawn_bounded_upstream_cancellation(
+    /// Cancel `upstream` on a task of its own, so the cancel finishes even
+    /// when the caller is dropped. `None` when its server is gone.
+    fn spawn_upstream_cancel(
         &self,
         upstream: TaskUpstreamRef,
+        reason: &'static str,
     ) -> Option<tokio::task::JoinHandle<()>> {
-        let server_id = match &upstream {
-            TaskUpstreamRef::Task { server_id, .. }
-            | TaskUpstreamRef::Request { server_id, .. } => server_id,
-        };
-        let server = self.server_manager.get_upstream(server_id)?;
-        let bound = Duration::from_secs(server.config.call_timeout_secs);
-        let peer = server.client.peer().clone();
-        drop(server);
-
+        let (peer, bound) = cancel_route(&self.server_manager, &upstream)?;
         Some(tokio::spawn(async move {
-            match upstream {
-                TaskUpstreamRef::Task {
-                    server_id,
-                    task_id: upstream_task_id,
-                } => {
-                    let params = serde_json::to_value(crate::legacy_tasks::CancelTaskParams::new(
-                        upstream_task_id.clone(),
-                    ))
-                    .expect("legacy task cancel params serialize");
-                    let send = peer
-                        .send_request(crate::legacy_tasks::request("tasks/cancel", Some(params)));
-                    match tokio::time::timeout(bound, send).await {
-                        Err(_) => tracing::warn!(
-                            server = %server_id,
-                            upstream_task_id = %upstream_task_id,
-                            timeout_secs = bound.as_secs(),
-                            "upstream tasks/cancel timed out during task teardown"
-                        ),
-                        Ok(Err(error)) => tracing::debug!(
-                            server = %server_id,
-                            upstream_task_id = %upstream_task_id,
-                            %error,
-                            "upstream tasks/cancel failed during task teardown"
-                        ),
-                        Ok(Ok(_)) => {}
-                    }
-                }
-                TaskUpstreamRef::Request {
-                    server_id,
-                    request_id,
-                } => {
-                    let send = peer.notify_cancelled(CancelledNotificationParam::new(
-                        Some(request_id),
-                        Some("task owner disconnected".to_string()),
-                    ));
-                    match tokio::time::timeout(bound, send).await {
-                        Err(_) => tracing::warn!(
-                            server = %server_id,
-                            timeout_secs = bound.as_secs(),
-                            "upstream cancellation notify timed out during task teardown"
-                        ),
-                        Ok(Err(error)) => tracing::debug!(
-                            server = %server_id,
-                            %error,
-                            "upstream cancellation notify failed during task teardown"
-                        ),
-                        Ok(Ok(())) => {}
-                    }
-                }
-            }
+            cancel_upstream(&peer, &upstream, reason, bound).await;
         }))
     }
 
-    /// Spawns the detached reaper backing a timed-out native create: keeps
-    /// awaiting the request's response oneshot for up to one more `window`
-    /// and, if a `CreateTaskResult` still lands late, sends a bounded
-    /// task-id cancellation so the just-created upstream task is stopped
-    /// instead of orphaned. If the window also expires, it logs and gives
-    /// up (residual: the upstream task may be orphaned).
-    ///
-    /// rmcp caveat (verified against rmcp 1.7.0 `service.rs`): once our
-    /// request-level cancel passes through the peer loop, rmcp resolves the
-    /// pending responder with `ServiceError::Cancelled` and DROPS any later
-    /// response for that id — so a late `CreateTaskResult` is only
-    /// observable here when it beats that clobber. A spec-compliant
-    /// upstream honors the request-level cancel anyway; the reaper is
-    /// defense-in-depth for the race where the response was already in
-    /// flight.
-    fn spawn_native_create_reaper(
-        self: &Arc<Self>,
-        rx: tokio::sync::oneshot::Receiver<Result<ServerResult, ServiceError>>,
-        window: Duration,
-        server_id: String,
-        trace_id: Arc<str>,
-    ) -> tokio::task::JoinHandle<()> {
-        let router = Arc::clone(self);
-        tokio::spawn(async move {
-            match tokio::time::timeout(window, rx).await {
-                Ok(Ok(Ok(response)))
-                    if crate::legacy_tasks::parse_create_result(response.clone()).is_ok() =>
-                {
-                    let result = crate::legacy_tasks::parse_create_result(response)
-                        .expect("guard proved legacy create response");
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        task_id = %result.task.task_id,
-                        "native task created after enqueue timed out; cancelling upstream task"
-                    );
-                    if let Some(cancellation) =
-                        router.spawn_bounded_upstream_cancellation(TaskUpstreamRef::Task {
-                            server_id,
-                            task_id: result.task.task_id.clone(),
-                        })
-                    {
-                        let _ = cancellation.await;
-                    }
-                }
-                // A late non-task response created nothing to cancel.
-                Ok(Ok(Ok(_other))) => {}
-                // Includes `ServiceError::Cancelled`: rmcp resolved the
-                // responder once our request-level cancel went through — the
-                // cancel reached the upstream, nothing further to do here.
-                Ok(Ok(Err(_error))) => {}
-                // Responder dropped: transport/service went away entirely.
-                Ok(Err(_recv_error)) => {}
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        trace_id = %trace_id,
-                        server = %server_id,
-                        window_secs = window.as_secs(),
-                        "native create reaper window expired; upstream task may be orphaned"
-                    );
-                }
-            }
-        })
-    }
-
-    /// Count of task records currently stored for `owner`. Tasks are
-    /// owner-scoped so this cannot observe another owner's records; it
-    /// exists as a test probe for teardown-cleanup assertions.
+    /// How many task records `owner` has.
+    #[cfg(any(test, feature = "test-helpers"))]
     pub async fn task_count_for_owner(&self, owner: &TaskOwner) -> usize {
-        let (count, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let count = store.list_for_owner(owner, None).tasks.len();
-            (count, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
-        count
+        self.with_task_store(|store| store.list_for_owner(owner).len())
+            .await
     }
 
     /// Creates a task record for `owner` with `handle` attached as its abort
@@ -915,7 +715,7 @@ impl super::ToolRouter {
     ) -> crate::legacy_tasks::Task {
         let mut store = self.task_store.lock().await;
         let task = store
-            .create(owner, name)
+            .create(owner, name, None)
             .expect("test task owner must not be tombstoned");
         store.attach_abort_handle(&task.task_id, handle);
         task
@@ -926,75 +726,14 @@ impl super::ToolRouter {
         owner: &TaskOwner,
         task_id: &str,
     ) -> Result<CancelTaskResult, McpError> {
-        let (cancelled, cleanup) = {
-            let mut store = self.task_store.lock().await;
-            let cancelled = store.mark_cancelled(owner, task_id);
-            (cancelled, store.take_expired_cleanup())
-        };
-        self.finish_expired_task_cleanup(cleanup).await;
+        let cancelled = self
+            .with_task_store(|store| store.mark_cancelled(owner, task_id))
+            .await;
         let (task, upstream, handle) = cancelled?;
-        if let Some(upstream) = upstream {
-            match upstream {
-                TaskUpstreamRef::Task {
-                    server_id,
-                    task_id: upstream_task_id,
-                } => {
-                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        // Bounded like the teardown path: rmcp's plain
-                        // `send_request` awaits its response forever, and an
-                        // unresponsive upstream must not wedge the caller. On
-                        // timeout we fall through to returning the locally
-                        // cancelled task, exactly like any other non-
-                        // CancelTaskResult response.
-                        let bound = Duration::from_secs(server.config.call_timeout_secs);
-                        let response = tokio::time::timeout(
-                            bound,
-                            server.client.peer().send_request({
-                                let params = serde_json::to_value(
-                                    crate::legacy_tasks::CancelTaskParams::new(upstream_task_id),
-                                )
-                                .expect("legacy task cancel params serialize");
-                                crate::legacy_tasks::request("tasks/cancel", Some(params))
-                            }),
-                        )
-                        .await;
-                        match response {
-                            Ok(Ok(_)) => {}
-                            Err(_) => tracing::debug!(
-                                server = %server_id,
-                                task_id = %task_id,
-                                timeout_secs = bound.as_secs(),
-                                "upstream tasks/cancel timed out; returning locally cancelled task"
-                            ),
-                            Ok(_) => {}
-                        }
-                    }
-                }
-                TaskUpstreamRef::Request {
-                    server_id,
-                    request_id,
-                } => {
-                    if let Some(server) = self.server_manager.get_upstream(&server_id) {
-                        let bound = Duration::from_secs(server.config.call_timeout_secs);
-                        let notify =
-                            server
-                                .client
-                                .peer()
-                                .notify_cancelled(CancelledNotificationParam::new(
-                                    Some(request_id),
-                                    Some("task cancelled".to_string()),
-                                ));
-                        if tokio::time::timeout(bound, notify).await.is_err() {
-                            tracing::debug!(
-                                server = %server_id,
-                                task_id = %task_id,
-                                timeout_secs = bound.as_secs(),
-                                "upstream cancellation notify timed out during task cancel"
-                            );
-                        }
-                    }
-                }
-            }
+        if let Some(upstream) = upstream
+            && let Some((peer, bound)) = cancel_route(&self.server_manager, &upstream)
+        {
+            cancel_upstream(&peer, &upstream, "task cancelled", bound).await;
         }
         if let Some(handle) = handle {
             handle.abort();
@@ -1007,293 +746,91 @@ impl super::ToolRouter {
         task_id: String,
         tool_name: String,
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
-        wire: TaskWireContext,
-        is_retry: bool,
-        trace_id: Arc<str>,
+        progress_token: Option<ProgressToken>,
+        downstream: Option<DownstreamCallContext>,
     ) {
-        let TaskWireContext {
-            progress_token,
-            extension_meta,
-        } = wire;
-        let cache = self.cache.load();
-        let (server_id, original_name) = match cache.resolve_route(tool_name.as_str()) {
-            Some(route) => route.clone(),
-            None => {
-                drop(cache);
-                self.task_store
-                    .lock()
-                    .await
-                    .fail(&task_id, format!("tool not found: {tool_name}"));
-                return;
-            }
-        };
-        drop(cache);
-
-        let mut current_arguments = arguments;
-        let mut allow_retry = !is_retry;
-
-        loop {
-            let call_id = next_call_id();
-            tracing::info!(
-                call_id,
-                trace_id = %trace_id,
-                task_id = %task_id,
-                server = %server_id,
-                tool = %original_name,
-                retry = is_retry,
-                "proxy background task tool call started"
-            );
-            let semaphore_timeout = Duration::from_secs(1);
-            let semaphore = self
-                .server_manager
-                .semaphores
-                .get(&server_id)
-                .map(|entry| Arc::clone(entry.value()));
-            let permit = if let Some(sem) = semaphore {
-                match tokio::time::timeout(semaphore_timeout, sem.acquire_owned()).await {
-                    Ok(Ok(permit)) => Some(permit),
-                    Ok(Err(_)) => {
-                        self.task_store
-                            .lock()
-                            .await
-                            .fail(&task_id, format!("server unavailable: {server_id}"));
-                        return;
-                    }
-                    Err(_) => {
-                        self.task_store
-                            .lock()
-                            .await
-                            .fail(&task_id, format!("server busy: {server_id}"));
-                        return;
-                    }
-                }
-            } else {
-                None
-            };
-
-            let Some(upstream) = self.server_manager.get_upstream(&server_id) else {
-                self.task_store
-                    .lock()
-                    .await
-                    .fail(&task_id, format!("server unavailable: {server_id}"));
-                return;
-            };
-
-            let timeout_duration = Duration::from_secs(upstream.config.call_timeout_secs);
-            let transport_type = upstream.config.transport.clone();
-            let peer = upstream.client.peer().clone();
-            drop(upstream);
-
-            let upstream_progress_token = progress_token.as_ref().map(|_| {
-                ProgressToken(NumberOrString::String(Arc::from(format!(
-                    "plug-task-progress-{call_id}"
-                ))))
-            });
-            let retry_arguments = current_arguments.clone();
-            let mut upstream_params = CallToolRequestParams::new(original_name.clone());
-            if let Some(args) = current_arguments.take() {
-                upstream_params = upstream_params.with_arguments(args);
-            }
-            if let Some(meta) = extension_meta.clone() {
-                merge_call_extension_meta(&mut upstream_params, meta);
-            }
-            if let Some(token) = upstream_progress_token.clone() {
-                upstream_params.set_progress_token(token);
-            }
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
-            // No `options.timeout` on purpose: rmcp's own timeout machinery
-            // in `await_response` auto-cancels via an UNBOUNDED
-            // `send_notification`, so a wedged sink would hang this task
-            // forever. The bound lives in our own `tokio::time::timeout`
-            // below, paired with a bounded explicit cancel.
-            let mut options = PeerRequestOptions::default();
-            options.meta = extension_meta.clone().map(RequestMetaObject);
-            if let Some(token) = upstream_progress_token.clone() {
-                options
-                    .meta
-                    .get_or_insert_with(RequestMetaObject::new)
-                    .set_progress_token(token);
-            }
-
-            let request_handle = match peer.send_cancellable_request(request, options).await {
-                Ok(handle) => handle,
-                Err(error) => {
-                    drop(permit);
-                    self.task_store
-                        .lock()
-                        .await
-                        .fail(&task_id, error.to_string());
-                    return;
-                }
-            };
-            let RequestHandle {
-                mut rx,
-                id: upstream_request_id,
-                peer: request_peer,
-                ..
-            } = request_handle;
-
-            // Covers the send-to-record gap: the request is in flight, but
-            // until `set_upstream_request` lands below, no store record knows
-            // its id — an abort (teardown's phase-A `handle.abort()`) landing
-            // in that gap would otherwise leave the upstream call running
-            // with nothing left to cancel it. While armed, the guard's Drop
-            // fires a bounded request-level cancel.
-            let mut abort_guard = UpstreamRequestCancelGuard::new(
-                request_peer.clone(),
-                upstream_request_id.clone(),
-                timeout_duration,
-            );
-
-            let recorded = self.task_store.lock().await.set_upstream_request(
-                &task_id,
-                TaskUpstreamRef::Request {
-                    server_id: server_id.clone(),
-                    request_id: upstream_request_id.clone(),
+        let outcome = self
+            .call_tool_inner(
+                &tool_name,
+                ToolRoundInput {
+                    arguments,
+                    input_responses: None,
+                    request_state: None,
+                    expected_route: None,
                 },
-            );
+                progress_token,
+                downstream,
+                CallKind::Task(task_id.clone()),
+                false,
+            )
+            .await;
+        self.with_task_store(|store| match outcome {
+            Ok(CallToolResponse::Complete(result)) => match serde_json::to_value(&result) {
+                Ok(payload) => store.complete(&task_id, payload),
+                Err(error) => store.fail(
+                    &task_id,
+                    format!("failed to serialize task result: {error}"),
+                ),
+            },
+            Ok(other) => store.fail(
+                &task_id,
+                format!("unexpected upstream task response: {other:?}"),
+            ),
+            Err(error) => store.fail(&task_id, error.message.into_owned()),
+        })
+        .await;
+    }
 
-            match recorded {
-                UpstreamRecordOutcome::Recorded { pending_cancel } => {
-                    // The record now owns the upstream ref: teardown/cancel
-                    // paths drain it and forward cancellation themselves, so
-                    // the send-gap guard stands down.
-                    abort_guard.defuse();
-
-                    // A cancel arrived before the upstream request id was
-                    // recorded above (see `mark_cancelled` /
-                    // `set_upstream_request` on `TaskStore`) — replay it now
-                    // so the upstream stops running the call instead of
-                    // completing it for a result nobody wants.
-                    if let Some(reason) = pending_cancel {
-                        let _ = request_peer
-                            .notify_cancelled(CancelledNotificationParam::new(
-                                Some(upstream_request_id.clone()),
-                                Some(reason),
-                            ))
-                            .await;
-                    }
+    /// Hand a running task's upstream request to its record, where a cancel
+    /// or a teardown finds it. When the record is already gone, its owner
+    /// was torn down while the request was sent and nothing else will
+    /// cancel it, so this does.
+    pub(super) async fn record_task_request(
+        &self,
+        task_id: &str,
+        server_id: &str,
+        peer: &Peer<RoleClient>,
+        request_id: &RequestId,
+        bound: Duration,
+    ) -> Result<(), McpError> {
+        let mut abort_guard =
+            UpstreamRequestCancelGuard::new(peer.clone(), request_id.clone(), bound);
+        let recorded = self
+            .with_task_store(|store| {
+                store.set_upstream_request(
+                    task_id,
+                    TaskUpstreamRef::Request {
+                        server_id: server_id.to_string(),
+                        request_id: request_id.clone(),
+                    },
+                )
+            })
+            .await;
+        match recorded {
+            UpstreamRecordOutcome::Recorded { pending_cancel } => {
+                abort_guard.defuse();
+                // A cancel that arrived before the request id was recorded.
+                if let Some(reason) = pending_cancel {
+                    cancel_upstream_request(peer, request_id.clone(), &reason, bound).await;
                 }
-                UpstreamRecordOutcome::Missing => {
-                    // The owner was torn down between send and record:
-                    // cleanup drained the store before this record held an
-                    // upstream ref, so no teardown path will ever cancel this
-                    // request — send the explicit bounded cancel ourselves.
-                    // The guard stays ARMED until that cancel resolves: an
-                    // abort landing mid-cancel still fires the Drop path — a
-                    // rare double-cancel notification is harmless, a missed
-                    // cancel is not.
-                    tracing::info!(
-                        call_id,
-                        trace_id = %trace_id,
-                        task_id = %task_id,
-                        server = %server_id,
-                        "task record gone before upstream request was recorded; cancelling upstream request"
-                    );
-                    let cancel = request_peer.notify_cancelled(CancelledNotificationParam::new(
-                        Some(upstream_request_id.clone()),
-                        Some("task owner disconnected".to_string()),
-                    ));
-                    if tokio::time::timeout(timeout_duration, cancel)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            call_id,
-                            task_id = %task_id,
-                            server = %server_id,
-                            timeout_secs = timeout_duration.as_secs(),
-                            "upstream cancellation notify timed out for recordless task"
-                        );
-                    }
-                    abort_guard.defuse();
-                    drop(permit);
-                    return;
-                }
+                Ok(())
             }
-
-            // Own the response await + timeout: map the oneshot exactly as
-            // rmcp's `await_response` does, and on timeout send a bounded
-            // explicit request cancel before surfacing the same
-            // `ServiceError::Timeout` the old (rmcp-managed) path produced —
-            // callers match on that error the same way they always did.
-            let result = match tokio::time::timeout(timeout_duration, &mut rx).await {
-                Ok(Ok(inner)) => inner,
-                Ok(Err(_recv_error)) => Err(ServiceError::TransportClosed),
-                Err(_elapsed) => {
-                    let cancel = request_peer.notify_cancelled(CancelledNotificationParam::new(
-                        Some(upstream_request_id.clone()),
-                        Some(RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON.to_string()),
-                    ));
-                    if tokio::time::timeout(timeout_duration, cancel)
-                        .await
-                        .is_err()
-                    {
-                        tracing::warn!(
-                            call_id,
-                            task_id = %task_id,
-                            server = %server_id,
-                            timeout_secs = timeout_duration.as_secs(),
-                            "upstream cancellation notify timed out after task call timeout"
-                        );
-                    }
-                    Err(ServiceError::Timeout {
-                        timeout: timeout_duration,
-                    })
-                }
-            };
-            drop(permit);
-
-            match result {
-                Ok(ServerResult::CallToolResult(mut response)) => {
-                    admit_tool_result_meta(&mut response);
-                    tracing::info!(
-                        call_id,
-                        trace_id = %trace_id,
-                        task_id = %task_id,
-                        server = %server_id,
-                        tool = %original_name,
-                        "proxy background task tool call completed"
-                    );
-                    match serde_json::to_value(&response) {
-                        Ok(payload) => self.task_store.lock().await.complete(&task_id, payload),
-                        Err(error) => self.task_store.lock().await.fail(
-                            &task_id,
-                            format!("failed to serialize task result: {error}"),
-                        ),
-                    }
-                    return;
-                }
-                Err(e) if is_session_error(&e) && allow_retry => {
-                    if self.reconnect_server_now(&server_id).await.is_ok() {
-                        tracing::info!(
-                            call_id,
-                            trace_id = %trace_id,
-                            task_id = %task_id,
-                            server = %server_id,
-                            "reconnected, retrying background task tool call"
-                        );
-                        current_arguments = retry_arguments;
-                        allow_retry = false;
-                        continue;
-                    }
-                    self.task_store.lock().await.fail(&task_id, e.to_string());
-                    return;
-                }
-                Err(e) => {
-                    if matches!(transport_type, crate::config::TransportType::Stdio) {
-                        self.reconnect_server_in_background(server_id.clone());
-                    }
-                    self.task_store.lock().await.fail(&task_id, e.to_string());
-                    return;
-                }
-                Ok(other) => {
-                    self.task_store.lock().await.fail(
-                        &task_id,
-                        format!("unexpected upstream task response: {other:?}"),
-                    );
-                    return;
-                }
+            UpstreamRecordOutcome::Missing => {
+                tracing::info!(
+                    task_id = %task_id,
+                    server = %server_id,
+                    "task record gone before upstream request was recorded; cancelling upstream request"
+                );
+                // The guard stays armed until this cancel resolves: an abort
+                // landing mid-cancel still fires it. A rare double cancel is
+                // harmless, a missed one is not.
+                cancel_upstream_request(peer, request_id.clone(), "task owner disconnected", bound)
+                    .await;
+                abort_guard.defuse();
+                Err(McpError::internal_error(
+                    format!("task {task_id} ended before its call was recorded"),
+                    None,
+                ))
             }
         }
     }
@@ -1306,21 +843,6 @@ mod tests {
     use super::*;
     use crate::legacy_tasks::{Task, TaskStatus};
     use rmcp::model::PingRequest;
-
-    fn test_router_config() -> RouterConfig {
-        RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        }
-    }
 
     /// Drop guard that flips a flag when the future holding it stops
     /// running — this is how the tests below prove an aborted task's future
@@ -1350,7 +872,7 @@ mod tests {
 
     async fn assert_owner_teardown_aborts_long_running_local_task(owner: TaskOwner) {
         let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(sm, test_router_config());
+        let router = ToolRouter::new(sm, RouterConfig::default());
 
         let dropped = Arc::new(AtomicBool::new(false));
         let observer = AbortObserver(Arc::clone(&dropped));
@@ -1365,7 +887,7 @@ mod tests {
         {
             let mut store = router.task_store.lock().await;
             let task = store
-                .create(owner.clone(), "long_running_tool")
+                .create(owner.clone(), "long_running_tool", None)
                 .expect("create task");
             store.attach_abort_handle(&task.task_id, handle);
         }
@@ -1388,7 +910,7 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_tasks_for_owner_aborts_long_running_local_task_for_http_session() {
-        let owner = ToolRouter::task_owner_for_http_session("session-abort-http");
+        let owner = crate::downstream_identity::http_session_task_owner("session-abort-http");
         assert_owner_teardown_aborts_long_running_local_task(owner).await;
     }
 
@@ -1398,16 +920,16 @@ mod tests {
         // through the same `cleanup_tasks_for_owner` — the owner key is the
         // only thing that differs (`ipc:<client_id>` vs `http:<session_id>`)
         // — so this is the shared-layer proof for the daemon teardown path.
-        let owner = ToolRouter::task_owner_for_ipc_client("client-abort-ipc");
+        let owner = crate::downstream_identity::ipc_task_owner("client-abort-ipc");
         assert_owner_teardown_aborts_long_running_local_task(owner).await;
     }
 
     #[tokio::test]
     async fn cleanup_tasks_for_owner_ignores_other_owners_running_tasks() {
         let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(sm, test_router_config());
-        let owner_a = ToolRouter::task_owner_for_http_session("session-a");
-        let owner_b = ToolRouter::task_owner_for_http_session("session-b");
+        let router = ToolRouter::new(sm, RouterConfig::default());
+        let owner_a = crate::downstream_identity::http_session_task_owner("session-a");
+        let owner_b = crate::downstream_identity::http_session_task_owner("session-b");
 
         let dropped = Arc::new(AtomicBool::new(false));
         let observer = AbortObserver(Arc::clone(&dropped));
@@ -1419,18 +941,16 @@ mod tests {
         {
             let mut store = router.task_store.lock().await;
             let task = store
-                .create(owner_b.clone(), "long_running_tool")
+                .create(owner_b.clone(), "long_running_tool", None)
                 .expect("create task");
             store.attach_abort_handle(&task.task_id, handle);
         }
 
         router.cleanup_tasks_for_owner(&owner_a).await;
 
-        // Give the runtime a moment to run anything it might (incorrectly)
-        // have scheduled for abort before asserting it never happened.
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // An aborted task is dropped within a few scheduler turns.
         assert!(
-            !dropped.load(Ordering::SeqCst),
+            !yield_until(&dropped).await,
             "teardown for a different owner must not touch this task"
         );
         assert_eq!(router.task_count_for_owner(&owner_b).await, 1);
@@ -1445,9 +965,10 @@ mod tests {
     // window or prove teardown stays bounded against an unresponsive upstream.
 
     use rmcp::ServiceExt as _;
+    use rmcp::handler::server::ServerHandler;
+    use rmcp::service::{RequestContext, RoleServer};
 
     use crate::server::{UpstreamClientHandler, UpstreamServer};
-    use crate::types::ServerHealth;
 
     /// Async gate: `wait()` parks until `open()`. Same shape as the gates in
     /// `proxy::tests`.
@@ -1496,18 +1017,18 @@ mod tests {
         /// only way a test can see the cancel).
         enqueue_cancelled: AtomicBool,
         enqueue_cancel_notify: tokio::sync::Notify,
-        hang_cancel: bool,
+        hang_task_requests: bool,
         cancel_log: std::sync::Mutex<Vec<String>>,
     }
 
     impl GatedTaskUpstreamState {
-        fn new(hang_cancel: bool, enqueue_gate_open: bool) -> Arc<Self> {
+        fn new(hang_task_requests: bool, enqueue_gate_open: bool) -> Arc<Self> {
             Arc::new(Self {
                 enqueue_gate: TestGate::new(enqueue_gate_open),
                 enqueue_entered: AtomicBool::new(false),
                 enqueue_cancelled: AtomicBool::new(false),
                 enqueue_cancel_notify: tokio::sync::Notify::new(),
-                hang_cancel,
+                hang_task_requests,
                 cancel_log: std::sync::Mutex::new(Vec::new()),
             })
         }
@@ -1623,7 +1144,7 @@ mod tests {
                         .expect("legacy cancel task id")
                         .to_string();
                     state.cancel_log.lock().unwrap().push(task_id);
-                    if !state.hang_cancel {
+                    if !state.hang_task_requests {
                         write_gated_legacy_response(
                             write.as_ref(),
                             serde_json::json!({"jsonrpc":"2.0","id":id,"result":{}}),
@@ -1631,6 +1152,7 @@ mod tests {
                         .await;
                     }
                 }
+                "tasks/get" | "tasks/result" if state.hang_task_requests => {}
                 "tasks/get" => {
                     let now = rmcp::task_manager::current_timestamp();
                     let task = Task::new(
@@ -1649,7 +1171,10 @@ mod tests {
                     write_gated_legacy_response(
                         write.as_ref(),
                         serde_json::json!({"jsonrpc":"2.0","id":id,"result":{
-                            "content":[{"type":"text","text":"done"}],
+                            "content":[
+                                {"type":"text","text":"done"},
+                                {"type":"resource_link","uri":"skill://refunds/SKILL.md","name":"SKILL.md"}
+                            ],
                             "isError":false
                         }}),
                     )
@@ -1669,28 +1194,9 @@ mod tests {
     fn gated_task_server_config(call_timeout_secs: u64) -> crate::config::ServerConfig {
         crate::config::ServerConfig {
             command: Some("fake".to_string()),
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: crate::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
             call_timeout_secs,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
             circuit_breaker_enabled: false,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+            ..Default::default()
         }
     }
 
@@ -1710,7 +1216,7 @@ mod tests {
         let handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            crate::server::no_events(),
         ));
         let client = handler
             .serve(client_transport)
@@ -1720,19 +1226,9 @@ mod tests {
         let capabilities = gated_legacy_task_capabilities();
 
         UpstreamServer {
-            name: name.to_string(),
             config: gated_task_server_config(call_timeout_secs),
-            client,
-            tools,
             capabilities,
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: crate::server::ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
-            child_pid: None,
-            stderr_tail: None,
+            ..UpstreamServer::for_tests(name.to_string(), client, tools)
         }
     }
 
@@ -1807,10 +1303,10 @@ mod tests {
         false
     }
 
-    /// Defect-1 regression test: teardown must be abort-first and bounded.
-    /// An upstream whose `tasks/cancel` never responds used to (a) block the
-    /// `handle.abort()` of every later record and (b) hang the caller
-    /// forever (rmcp's `send_request` has no timeout of its own). Paused
+    /// Teardown is abort-first and bounded: an upstream whose `tasks/cancel`
+    /// never responds must neither hold back the `handle.abort()` of later
+    /// records nor hang the caller (rmcp's `send_request` has no timeout of
+    /// its own). Paused
     /// time makes the bound assertion exact: the yield-only phase never
     /// advances the clock, and the final join can only complete via the
     /// per-upstream `call_timeout_secs` timer.
@@ -1818,14 +1314,14 @@ mod tests {
     async fn cleanup_is_bounded_and_aborts_local_tasks_before_hung_upstream_cancel() {
         let state = GatedTaskUpstreamState::new(true, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "hung",
             connect_gated_task_upstream("hung", Arc::clone(&state), 5).await,
         )
         .await;
 
-        let owner = ToolRouter::task_owner_for_http_session("session-hung-teardown");
+        let owner = crate::downstream_identity::http_session_task_owner("session-hung-teardown");
 
         // Record 1: passthrough task on the unresponsive upstream.
         // Record 2: still-running local future whose abort we observe.
@@ -1846,10 +1342,11 @@ mod tests {
                         server_id: "hung".to_string(),
                         task_id: "upstream-task-hung".to_string(),
                     },
+                    None,
                 )
                 .expect("create passthrough record");
             let local = store
-                .create(owner.clone(), "long_running_tool")
+                .create(owner.clone(), "long_running_tool", None)
                 .expect("create local record");
             store.attach_abort_handle(&local.task_id, handle);
         }
@@ -1893,14 +1390,14 @@ mod tests {
     async fn stale_live_task_expiry_sends_bounded_upstream_cancellation() {
         let state = GatedTaskUpstreamState::new(true, false);
         let sm = Arc::new(ServerManager::new());
-        let router = ToolRouter::new(Arc::clone(&sm), test_router_config());
+        let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
         sm.replace_server(
             "expiry-upstream",
             connect_gated_task_upstream("expiry-upstream", Arc::clone(&state), 5).await,
         )
         .await;
 
-        let owner = ToolRouter::task_owner_for_http_session("session-expired-upstream");
+        let owner = crate::downstream_identity::http_session_task_owner("session-expired-upstream");
         {
             let mut store = router.task_store.lock().await;
             store
@@ -1912,6 +1409,7 @@ mod tests {
                         server_id: "expiry-upstream".to_string(),
                         task_id: "upstream-expired-1".to_string(),
                     },
+                    None,
                 )
                 .expect("create stale passthrough task");
         }
@@ -1931,21 +1429,21 @@ mod tests {
         );
     }
 
-    /// Defect-1 companion for `cancel_task_for_owner`: the forwarding arm
-    /// gets the same per-upstream bound, and on timeout the caller still
+    /// `cancel_task_for_owner`'s forwarding arm gets the same per-upstream
+    /// bound, and on timeout the caller still
     /// gets the locally cancelled task instead of hanging forever.
     #[tokio::test(start_paused = true)]
     async fn cancel_task_for_owner_is_bounded_when_upstream_cancel_hangs() {
         let state = GatedTaskUpstreamState::new(true, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "hung",
             connect_gated_task_upstream("hung", Arc::clone(&state), 5).await,
         )
         .await;
 
-        let owner = ToolRouter::task_owner_for_http_session("session-hung-cancel");
+        let owner = crate::downstream_identity::http_session_task_owner("session-hung-cancel");
         let task = router
             .task_store
             .lock()
@@ -1958,6 +1456,7 @@ mod tests {
                     server_id: "hung".to_string(),
                     task_id: "upstream-task-hung".to_string(),
                 },
+                None,
             )
             .expect("create passthrough record");
 
@@ -1976,17 +1475,63 @@ mod tests {
         );
     }
 
-    /// Defect-2 regression test: a teardown that runs while the native
-    /// path's upstream CallToolRequest is still in flight used to see no
-    /// record, and the late `create_passthrough` then inserted a Working
-    /// record for the torn-down owner (unpruned for 24h) whose upstream
-    /// native task was never cancelled. Now the enqueue must error, leave no
-    /// record, and send the upstream a cancel for the task it created.
+    /// Asking a task-native upstream that never answers about its task
+    /// fails at the server's call timeout instead of waiting forever.
+    #[tokio::test(start_paused = true)]
+    async fn task_status_and_result_are_bounded_when_upstream_hangs() {
+        let state = GatedTaskUpstreamState::new(true, true);
+        let sm = Arc::new(ServerManager::new());
+        let router = ToolRouter::new(Arc::clone(&sm), RouterConfig::default());
+        sm.replace_server(
+            "hung",
+            connect_gated_task_upstream("hung", Arc::clone(&state), 5).await,
+        )
+        .await;
+
+        let owner = crate::downstream_identity::http_session_task_owner("session-hung-get");
+        let task = router
+            .task_store
+            .lock()
+            .await
+            .create_passthrough(
+                owner.clone(),
+                "hung_tool",
+                &upstream_working_task("upstream-task-hung"),
+                TaskUpstreamRef::Task {
+                    server_id: "hung".to_string(),
+                    task_id: "upstream-task-hung".to_string(),
+                },
+                None,
+            )
+            .expect("create passthrough record");
+
+        let started = tokio::time::Instant::now();
+        let status = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.get_task_info_for_owner(&owner, &task.task_id),
+        )
+        .await
+        .expect("tasks/get must give up within the call timeout");
+        assert!(status.is_err());
+        let result = tokio::time::timeout(
+            Duration::from_secs(60),
+            router.get_task_result_for_owner(&owner, &task.task_id),
+        )
+        .await
+        .expect("tasks/result must give up within the call timeout");
+        assert!(result.is_err());
+        assert_eq!(started.elapsed(), Duration::from_secs(10));
+    }
+
+    /// A teardown that runs while the native path's upstream
+    /// CallToolRequest is still in flight sees no record yet. The enqueue
+    /// must then error, leave no record for the torn-down owner, and send
+    /// the upstream a cancel for the task it created.
     #[tokio::test]
     async fn native_enqueue_racing_teardown_cancels_upstream_and_returns_error() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2000,23 +1545,10 @@ mod tests {
         );
         router.replace_snapshot(RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         });
 
-        let owner = ToolRouter::task_owner_for_http_session("session-native-race");
+        let owner = crate::downstream_identity::http_session_task_owner("session-native-race");
         let enqueue_router = Arc::clone(&router);
         let enqueue_owner = owner.clone();
         let enqueue = tokio::spawn(async move {
@@ -2062,7 +1594,7 @@ mod tests {
             .task_store
             .lock()
             .await
-            .create(owner.clone(), "fresh_tool")
+            .create(owner.clone(), "fresh_tool", None)
             .expect("fresh create after the tombstone cleared");
         assert_eq!(router.task_count_for_owner(&owner).await, 1);
     }
@@ -2075,7 +1607,7 @@ mod tests {
     async fn native_enqueue_bounds_request_handle_acquisition() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         let (upstream, _frozen_runtime) =
             connect_frozen_task_upstream("mock", Arc::clone(&state), 2);
         let peer = upstream.client.peer().clone();
@@ -2104,23 +1636,10 @@ mod tests {
         );
         router.replace_snapshot(RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         });
 
-        let owner = ToolRouter::task_owner_for_http_session("session-full-peer-queue");
+        let owner = crate::downstream_identity::http_session_task_owner("session-full-peer-queue");
         let result = tokio::time::timeout(
             Duration::from_secs(60),
             router.enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None),
@@ -2129,7 +1648,7 @@ mod tests {
         .expect("request-handle acquisition must respect the configured timeout");
 
         let error = result.expect_err("a full peer queue must time out task creation");
-        assert!(error.message.to_lowercase().contains("timeout"));
+        assert!(error.message.contains("timed out"), "{error:?}");
         assert_eq!(router.task_count_for_owner(&owner).await, 0);
     }
 
@@ -2144,20 +1663,7 @@ mod tests {
         );
         router.replace_snapshot(RouterSnapshot {
             routes,
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
+            ..Default::default()
         });
     }
 
@@ -2165,12 +1671,12 @@ mod tests {
         principal: crate::types::PrincipalId,
         request_id: i64,
     ) -> DownstreamCallContext {
-        DownstreamCallContext::http_for_client_with_trace(
+        DownstreamCallContext::http(
             format!("quota-session-{request_id}"),
             RequestId::from(NumberOrString::Number(request_id)),
             ClientType::Unknown,
-            Arc::<str>::from(format!("{request_id:032x}")),
         )
+        .with_trace_id(Arc::<str>::from(format!("{request_id:032x}")))
         .with_authorization(
             principal,
             std::collections::BTreeSet::from(["tools:read".to_string(), "tasks:use".to_string()]),
@@ -2181,19 +1687,17 @@ mod tests {
         principal: crate::types::PrincipalId,
         request_id: i64,
     ) -> DownstreamCallContext {
-        authorized_task_context(principal, request_id)
-            .with_protocol(
-                crate::protocol::ProtocolEra::Modern,
-                crate::protocol::ANNOUNCED_FUTURE_PROTOCOL_VERSION,
-            )
-            .with_modern_direction_enabled(true)
+        authorized_task_context(principal, request_id).with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::MODERN_PROTOCOL_VERSION,
+        )
     }
 
     #[tokio::test]
     async fn modern_downstream_forces_local_wrapper_around_legacy_native_upstream() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2242,7 +1746,7 @@ mod tests {
     async fn modern_get_inlines_result_for_legacy_passthrough_completed_in_same_process() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server("mock", connect_gated_task_upstream("mock", state, 5).await)
             .await;
         let owner = TaskOwner::new(Arc::<str>::from("shared-durable-principal"));
@@ -2258,6 +1762,7 @@ mod tests {
                     server_id: "mock".to_string(),
                     task_id: "upstream-task-1".to_string(),
                 },
+                None,
             )
             .expect("legacy passthrough record");
 
@@ -2270,6 +1775,8 @@ mod tests {
         };
         assert_eq!(result["content"][0]["text"], "done");
         assert_eq!(result["isError"], false);
+        // The upstream ran the tool, and its skill link still names it.
+        assert_eq!(result["content"][1]["uri"], "skill://mock/refunds/SKILL.md");
     }
 
     async fn enqueue_quota_test_task(
@@ -2292,16 +1799,17 @@ mod tests {
 
     #[tokio::test]
     async fn durable_task_quota_is_principal_isolated_and_released_on_cleanup() {
-        let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
-            tasks: 2,
-            queued_task_creations: 8,
-            per_principal_divisor: 2,
-            ..Default::default()
-        });
+        let quotas =
+            crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
+                tasks: 2,
+                queued_task_creations: 8,
+                per_principal_divisor: 2,
+                ..Default::default()
+            });
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        let router = Arc::new(ToolRouter::new_with_quotas(
             sm,
-            test_router_config(),
+            RouterConfig::default(),
             quotas,
         ));
         install_single_route(&router, "Mock__echo", "missing", "echo");
@@ -2336,16 +1844,17 @@ mod tests {
 
     #[tokio::test]
     async fn durable_task_quota_enforces_global_limit_and_releases_on_cleanup() {
-        let quotas = crate::protocol::AdmissionQuotas::new(crate::protocol::AdmissionQuotaConfig {
-            tasks: 1,
-            queued_task_creations: 8,
-            per_principal_divisor: 1,
-            ..Default::default()
-        });
+        let quotas =
+            crate::admission::AdmissionQuotas::new(crate::admission::AdmissionQuotaConfig {
+                tasks: 1,
+                queued_task_creations: 8,
+                per_principal_divisor: 1,
+                ..Default::default()
+            });
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new_with_admission_quotas_for_tests(
+        let router = Arc::new(ToolRouter::new_with_quotas(
             sm,
-            test_router_config(),
+            RouterConfig::default(),
             quotas,
         ));
         install_single_route(&router, "Mock__echo", "missing", "echo");
@@ -2375,15 +1884,15 @@ mod tests {
             .expect("cleanup must release global capacity");
     }
 
-    /// T1 (Part 1): an owner-liveness probe reporting the owner closed must
+    /// An owner-liveness probe reporting the owner closed must
     /// refuse the create outright — before route lookup, before any
     /// upstream traffic — leave no record, release the lifecycle-ledger
     /// entry (guard at zero), and leave no tombstone behind.
     #[tokio::test]
     async fn enqueue_refuses_when_owner_liveness_probe_reports_closed() {
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(sm, test_router_config()));
-        let owner = ToolRouter::task_owner_for_http_session("session-already-gone");
+        let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
+        let owner = crate::downstream_identity::http_session_task_owner("session-already-gone");
 
         let probe: OwnerLivenessProbe = Arc::new(|| false);
         let error = router
@@ -2409,11 +1918,11 @@ mod tests {
         // No tombstone residue either: a later create for the same owner
         // key (e.g. an IPC client id that reconnected) succeeds.
         store
-            .create(owner.clone(), "fresh_tool")
+            .create(owner.clone(), "fresh_tool", None)
             .expect("fresh create after a probe refusal");
     }
 
-    /// T2 (Part 2): a native create whose upstream never answers must
+    /// A native create whose upstream never answers must
     /// resolve within the per-upstream `call_timeout_secs` bound (paused
     /// time: only that timer can unblock it), surface a timeout error,
     /// send the upstream a request-level cancel for the parked call, and
@@ -2422,7 +1931,7 @@ mod tests {
     async fn hung_native_create_is_bounded_and_cancels_upstream_request() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 2).await,
@@ -2430,7 +1939,8 @@ mod tests {
         .await;
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-hung-native-create");
+        let owner =
+            crate::downstream_identity::http_session_task_owner("session-hung-native-create");
         let enqueue_router = Arc::clone(&router);
         let enqueue_owner = owner.clone();
         let enqueue = tokio::spawn(async move {
@@ -2456,7 +1966,7 @@ mod tests {
             .expect("enqueue task must not panic");
         let error = result.expect_err("a never-answering upstream must surface an error");
         assert!(
-            error.message.contains("request timeout"),
+            error.message.contains("timed out"),
             "unexpected error message: {}",
             error.message
         );
@@ -2479,11 +1989,11 @@ mod tests {
             "the create guard must be released after the timeout"
         );
         store
-            .create(owner.clone(), "fresh_tool")
+            .create(owner.clone(), "fresh_tool", None)
             .expect("fresh create after the timed-out enqueue resolved");
     }
 
-    /// T2 companion (Part 2): the reaper arm for a `CreateTaskResult` that
+    /// The reaper arm for a `CreateTaskResult` that
     /// lands after the create already timed out — driven directly through
     /// the response oneshot, because through the full stack rmcp resolves
     /// the responder with `Cancelled` once our request-level cancel is
@@ -2493,7 +2003,6 @@ mod tests {
     async fn native_create_reaper_cancels_late_created_upstream_task() {
         let state = GatedTaskUpstreamState::new(false, true);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2501,8 +2010,9 @@ mod tests {
         .await;
 
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let reaper = router.spawn_native_create_reaper(
+        let reaper = spawn_late_task_reaper(
             rx,
+            Arc::clone(&sm),
             Duration::from_secs(5),
             "mock".to_string(),
             Arc::from("trace-reaper-test"),
@@ -2523,7 +2033,7 @@ mod tests {
         );
     }
 
-    /// T3 (Part 2): dropping the enqueue caller mid-round-trip (axum drops
+    /// Dropping the enqueue caller mid-round-trip (axum drops
     /// its POST handler future when the HTTP client disconnects) must not
     /// orphan the native create — the detached round trip completes on its
     /// own and records the created task for the still-live owner, leaving
@@ -2532,7 +2042,7 @@ mod tests {
     async fn dropped_enqueue_caller_does_not_orphan_native_create() {
         let state = GatedTaskUpstreamState::new(false, false);
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_task_upstream("mock", Arc::clone(&state), 5).await,
@@ -2540,7 +2050,7 @@ mod tests {
         .await;
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-caller-drop");
+        let owner = crate::downstream_identity::http_session_task_owner("session-caller-drop");
         let enqueue_router = Arc::clone(&router);
         let enqueue_owner = owner.clone();
         let enqueue = tokio::spawn(async move {
@@ -2663,9 +2173,19 @@ mod tests {
         state: Arc<GatedCallUpstreamState>,
         call_timeout_secs: u64,
     ) -> UpstreamServer {
+        connect_call_upstream(name, GatedCallUpstreamHandler { state }, call_timeout_secs).await
+    }
+
+    /// A duplex-connected, non-task-capable `UpstreamServer` served by
+    /// `upstream`.
+    async fn connect_call_upstream(
+        name: &str,
+        upstream: impl ServerHandler,
+        call_timeout_secs: u64,
+    ) -> UpstreamServer {
         let (server_transport, client_transport) = tokio::io::duplex(4096);
         tokio::spawn(async move {
-            let server = GatedCallUpstreamHandler { state }
+            let server = upstream
                 .serve(server_transport)
                 .await
                 .expect("start gated call upstream test server");
@@ -2676,7 +2196,7 @@ mod tests {
         let handler = Arc::new(UpstreamClientHandler::new_for_tests(
             Arc::from(name.to_string()),
             Arc::clone(&tools),
-            std::sync::Weak::new(),
+            crate::server::no_events(),
         ));
         let client = handler
             .serve(client_transport)
@@ -2684,23 +2204,12 @@ mod tests {
             .expect("connect gated call upstream test client");
 
         UpstreamServer {
-            name: name.to_string(),
             config: gated_task_server_config(call_timeout_secs),
-            client,
-            tools,
-            capabilities: ServerCapabilities::default(),
-            upstream: None,
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            selected_protocol_version: crate::protocol::SUPPORTED_PROTOCOL_VERSION.to_string(),
-            protocol_gate_state: 0,
-            connection: crate::server::ConnectionGeneration::new(),
-            health: ServerHealth::Healthy,
-            child_pid: None,
-            stderr_tail: None,
+            ..UpstreamServer::for_tests(name.to_string(), client, tools)
         }
     }
 
-    /// T4 (Part 3): the record vanishes between `send_cancellable_request`
+    /// The record vanishes between `send_cancellable_request`
     /// and `set_upstream_request` (owner teardown drained the store while
     /// the executor was parked on the store lock). No teardown path can
     /// ever cancel this request — the executor's Missing branch must send
@@ -2710,19 +2219,16 @@ mod tests {
     async fn record_vanishing_between_send_and_record_cancels_upstream_request() {
         let state = GatedCallUpstreamState::new();
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
         )
         .await;
-        // `replace_server` does not build the per-server semaphore; install
-        // one so this test can prove the Missing branch releases its permit.
-        sm.semaphores
-            .insert("mock".to_string(), Arc::new(tokio::sync::Semaphore::new(1)));
+        sm.apply_live_settings("mock", &one_call_at_a_time());
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-record-vanish");
+        let owner = crate::downstream_identity::http_session_task_owner("session-record-vanish");
         let created = router
             .enqueue_tool_task("Mock__hang", None, None, owner.clone(), None, None)
             .await
@@ -2762,9 +2268,7 @@ mod tests {
         // The permit must come back: the Missing branch returns instead of
         // holding the server's `max_concurrent` slot on a dead call.
         let semaphore = sm
-            .semaphores
-            .get("mock")
-            .map(|entry| Arc::clone(entry.value()))
+            .call_slots("mock")
             .expect("mock semaphore installed above");
         let mut permit_released = false;
         for _ in 0..200 {
@@ -2785,7 +2289,7 @@ mod tests {
         );
     }
 
-    /// T5 (Part 3): teardown's phase-A `handle.abort()` lands in the
+    /// Teardown's phase-A `handle.abort()` lands in the
     /// send-to-record gap. The dropped executor future can no longer cancel
     /// anything itself — the armed `UpstreamRequestCancelGuard`'s Drop must
     /// fire the request-level cancel for the in-flight upstream call.
@@ -2793,23 +2297,22 @@ mod tests {
     async fn abort_between_send_and_record_fires_cancel_guard() {
         let state = GatedCallUpstreamState::new();
         let sm = Arc::new(ServerManager::new());
-        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), test_router_config()));
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
         sm.replace_server(
             "mock",
             connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
         )
         .await;
-        sm.semaphores
-            .insert("mock".to_string(), Arc::new(tokio::sync::Semaphore::new(1)));
+        sm.apply_live_settings("mock", &one_call_at_a_time());
         install_single_route(&router, "Mock__hang", "mock", "hang");
 
-        let owner = ToolRouter::task_owner_for_http_session("session-abort-in-gap");
+        let owner = crate::downstream_identity::http_session_task_owner("session-abort-in-gap");
         let created = router
             .enqueue_tool_task("Mock__hang", None, None, owner.clone(), None, None)
             .await
             .expect("enqueue local wrapper task");
 
-        // Same deterministic parking as T4: the executor has sent the
+        // The executor has sent the
         // request (call_tool entered), armed its guard, and is parked on
         // the store lock we hold — still pre-record.
         let mut store = router.task_store.lock().await;
@@ -2848,9 +2351,7 @@ mod tests {
 
         // The permit died with the aborted future.
         let semaphore = sm
-            .semaphores
-            .get("mock")
-            .map(|entry| Arc::clone(entry.value()))
+            .call_slots("mock")
             .expect("mock semaphore installed above");
         let mut permit_released = false;
         for _ in 0..200 {
@@ -2865,5 +2366,199 @@ mod tests {
             "aborting the executor must release the per-server concurrency permit"
         );
         assert_eq!(router.task_count_for_owner(&owner).await, 0);
+    }
+
+    fn one_call_at_a_time() -> crate::config::ServerConfig {
+        crate::config::ServerConfig {
+            max_concurrent: 1,
+            ..Default::default()
+        }
+    }
+
+    /// The task's record once it is no longer working.
+    async fn settled_task(router: &Arc<ToolRouter>, owner: &TaskOwner, task_id: &str) -> Task {
+        for _ in 0..500 {
+            let task = router
+                .get_task_info_for_owner(owner, task_id)
+                .await
+                .expect("task info")
+                .task;
+            if task.status != TaskStatus::Working {
+                return task;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("task {task_id} is still working");
+    }
+
+    #[tokio::test]
+    async fn a_task_on_a_server_waiting_for_sign_in_fails_without_calling_it() {
+        let state = GatedCallUpstreamState::new();
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+        sm.replace_server(
+            "mock",
+            connect_gated_call_upstream("mock", Arc::clone(&state), 5).await,
+        )
+        .await;
+        sm.mark_auth_required("mock");
+        install_single_route(&router, "Mock__hang", "mock", "hang");
+
+        let owner = crate::downstream_identity::http_session_task_owner("session-sign-in");
+        let created = router
+            .enqueue_tool_task("Mock__hang", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue");
+
+        let task = settled_task(&router, &owner, &created.task.task_id).await;
+        assert_eq!(task.status, TaskStatus::Failed);
+        assert!(!state.call_entered.load(Ordering::SeqCst));
+    }
+
+    /// A server that runs tasks itself is asked to create one the way any
+    /// tool is called: not while it waits for sign-in, and counted as a
+    /// call when it answers.
+    #[tokio::test]
+    async fn a_native_task_create_is_a_tool_call() {
+        let owner = crate::downstream_identity::http_session_task_owner("session-native-call");
+        let connect = |state: Arc<GatedTaskUpstreamState>| async move {
+            let sm = Arc::new(ServerManager::new());
+            let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+            sm.replace_server("mock", connect_gated_task_upstream("mock", state, 5).await)
+                .await;
+            install_single_route(&router, "Mock__echo", "mock", "echo");
+            (sm, router)
+        };
+
+        let state = GatedTaskUpstreamState::new(false, true);
+        let (sm, router) = connect(Arc::clone(&state)).await;
+        sm.mark_auth_required("mock");
+        router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect_err("a server waiting for sign-in is not asked");
+        assert!(!state.enqueue_entered.load(Ordering::SeqCst));
+
+        let (sm, router) = connect(GatedTaskUpstreamState::new(false, true)).await;
+        let created = router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("the server creates the task");
+        assert_ne!(created.task.task_id, "upstream-task-1");
+        assert_eq!(
+            sm.metrics_snapshot("mock")
+                .map(|metrics| metrics.call_count),
+            Some(1)
+        );
+        router.cleanup_tasks_for_owner(&owner).await;
+    }
+
+    struct SkillLinkUpstream;
+
+    impl ServerHandler for SkillLinkUpstream {
+        fn get_info(&self) -> ServerInfo {
+            ServerInfo::new(ServerCapabilities::default())
+        }
+
+        async fn call_tool(
+            &self,
+            _request: CallToolRequestParams,
+            _context: RequestContext<RoleServer>,
+        ) -> Result<CallToolResponse, McpError> {
+            Ok(CallToolResult::success(vec![ContentBlock::resource_link(
+                rmcp::model::Resource::new("skill://refunds/SKILL.md", "SKILL.md"),
+            )])
+            .into())
+        }
+    }
+
+    #[tokio::test]
+    async fn a_task_result_names_its_server_in_skill_links_and_counts_as_a_call() {
+        let sm = Arc::new(ServerManager::new());
+        let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+        sm.replace_server(
+            "mock",
+            connect_call_upstream("mock", SkillLinkUpstream, 5).await,
+        )
+        .await;
+        install_single_route(&router, "Mock__skill", "mock", "skill");
+
+        let owner = crate::downstream_identity::http_session_task_owner("session-skill");
+        let created = router
+            .enqueue_tool_task("Mock__skill", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue");
+        let task = settled_task(&router, &owner, &created.task.task_id).await;
+        assert_eq!(task.status, TaskStatus::Completed);
+
+        let payload = router
+            .get_task_result_for_owner(&owner, &created.task.task_id)
+            .await
+            .expect("task result");
+        let result: CallToolResult = serde_json::from_value(payload.0).expect("tool result");
+        let link = result.content[0]
+            .as_resource_link()
+            .expect("the skill link");
+        assert_eq!(link.uri, "skill://mock/refunds/SKILL.md");
+        assert_eq!(
+            sm.metrics_snapshot("mock")
+                .map(|metrics| metrics.call_count),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_server_dies_with_the_call_is_not_sent_again() {
+        let mut config = crate::config::Config::default();
+        let mut mock = crate::test_helpers::mock_server("echo");
+        mock.args
+            .extend(["--fail-mode".to_string(), "crash".to_string()]);
+        config.servers.insert("mock".to_string(), mock);
+        let engine = crate::engine::Engine::new(config);
+        engine.start().await;
+        let router = Arc::clone(engine.tool_router());
+
+        let owner = crate::downstream_identity::http_session_task_owner("session-crash");
+        let created = router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue");
+        let task = settled_task(&router, &owner, &created.task.task_id).await;
+
+        assert_eq!(task.status, TaskStatus::Failed);
+        let message = task.status_message.unwrap_or_default();
+        assert!(
+            message.contains("may or may not have completed"),
+            "unexpected status: {message}"
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_tasks_cursor_plug_never_gave_out_is_refused_not_restarted() {
+        let router = Arc::new(ToolRouter::new(
+            Arc::new(ServerManager::new()),
+            RouterConfig::default(),
+        ));
+        let owner = TaskOwner::new(Arc::<str>::from("cursor-owner"));
+        router
+            .task_store
+            .lock()
+            .await
+            .create(owner.clone(), "Mock__echo", None)
+            .expect("task");
+        let page = |cursor: &str| {
+            let mut request = PaginatedRequestParams::default();
+            request.cursor = Some(cursor.to_string());
+            router.list_tasks_for_owner(&owner, Some(request))
+        };
+
+        let error = page("not-a-cursor").await.expect_err("an unknown cursor");
+        assert_eq!(error.code, ErrorCode::INVALID_PARAMS);
+        // Past the end, as tasks expiring between pages leave it: the last
+        // page, empty, not the first one again.
+        let past_end = page("7").await.expect("a cursor past the end");
+        assert!(past_end.tasks.is_empty());
+        assert!(past_end.next_cursor.is_none());
     }
 }

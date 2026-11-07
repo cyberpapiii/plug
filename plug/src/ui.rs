@@ -73,37 +73,24 @@ pub(crate) fn wrap_text(text: &str, width: usize) -> Vec<String> {
 
         let mut current = String::new();
         for word in paragraph.split_whitespace() {
-            if current.is_empty() {
-                if word.chars().count() <= width {
-                    current.push_str(word);
-                } else {
-                    let mut chunk = String::new();
-                    for ch in word.chars() {
-                        chunk.push(ch);
-                        if chunk.chars().count() >= width {
-                            lines.push(chunk);
-                            chunk = String::new();
-                        }
-                    }
-                    current = chunk;
-                }
-            } else if current.chars().count() + 1 + word.chars().count() <= width {
+            let length = word.chars().count();
+            if !current.is_empty() && current.chars().count() + 1 + length <= width {
                 current.push(' ');
                 current.push_str(word);
-            } else {
-                lines.push(current);
-                if word.chars().count() <= width {
-                    current = word.to_string();
-                } else {
-                    let mut chunk = String::new();
-                    for ch in word.chars() {
-                        chunk.push(ch);
-                        if chunk.chars().count() >= width {
-                            lines.push(chunk);
-                            chunk = String::new();
-                        }
-                    }
-                    current = chunk;
+                continue;
+            }
+            if !current.is_empty() {
+                lines.push(std::mem::take(&mut current));
+            }
+            if length <= width {
+                current = word.to_string();
+                continue;
+            }
+            // A word longer than a line is cut into line-sized pieces.
+            for ch in word.chars() {
+                current.push(ch);
+                if current.chars().count() >= width {
+                    lines.push(std::mem::take(&mut current));
                 }
             }
         }
@@ -306,7 +293,10 @@ pub(crate) fn summarize_server_transport(
 pub(crate) fn server_place(server: Option<&plug_core::config::ServerConfig>) -> &'static str {
     match server.map(|server| &server.transport) {
         Some(plug_core::config::TransportType::Stdio) => "On this Mac",
-        Some(_) => "Over the network",
+        Some(plug_core::config::TransportType::OpenApi) => "Web API",
+        Some(plug_core::config::TransportType::Http | plug_core::config::TransportType::Sse) => {
+            "Over the network"
+        }
         None => "",
     }
 }
@@ -314,17 +304,10 @@ pub(crate) fn server_place(server: Option<&plug_core::config::ServerConfig>) -> 
 pub(crate) fn summarize_server_auth(
     server: Option<&plug_core::config::ServerConfig>,
 ) -> &'static str {
-    match server {
-        Some(server) => match (server.auth.as_deref(), server.auth_token.is_some()) {
-            (Some("oauth"), _) => "oauth",
-            (_, true) => "bearer",
-            _ => "none",
-        },
-        None => "unknown",
-    }
+    server.map_or("unknown", plug_core::config::ServerConfig::auth_label)
 }
 
-fn truncate_tail(value: &str, max_width: usize) -> String {
+pub(crate) fn truncate_tail(value: &str, max_width: usize) -> String {
     let char_count = value.chars().count();
     if max_width == 0 || char_count <= max_width {
         return value.to_string();
@@ -340,37 +323,13 @@ fn truncate_tail(value: &str, max_width: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        format_duration, summarize_server_auth, summarize_server_target, summarize_server_transport,
+        format_duration, summarize_server_auth, summarize_server_target,
+        summarize_server_transport, truncate_tail, wrap_text,
     };
     use plug_core::config::{ServerConfig, TransportType};
 
     fn server_config() -> ServerConfig {
-        ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: Default::default(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: Default::default(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
+        ServerConfig::default()
     }
 
     #[test]
@@ -424,5 +383,26 @@ mod tests {
         assert_eq!(format_duration(3 * 3600 + 5 * 60 + 9), "3h 5m");
         assert_eq!(format_duration(2 * 86400 + 4 * 3600), "2d 4h");
         assert_eq!(format_duration(5_174_062), "59d");
+    }
+
+    #[test]
+    fn wrap_text_fills_lines_and_cuts_words_longer_than_a_line() {
+        assert_eq!(wrap_text("one two three", 7), ["one two", "three"]);
+        assert_eq!(wrap_text("ab abcdefgh c", 4), ["ab", "abcd", "efgh", "c"]);
+        assert_eq!(
+            wrap_text(
+                "a
+
+b", 10
+            ),
+            ["a", "", "b"]
+        );
+        assert_eq!(wrap_text("", 10), [""]);
+    }
+
+    #[test]
+    fn truncate_tail_counts_characters_not_bytes() {
+        assert_eq!(truncate_tail("café crème brûlée", 8), "café ...");
+        assert_eq!(truncate_tail("short", 8), "short");
     }
 }

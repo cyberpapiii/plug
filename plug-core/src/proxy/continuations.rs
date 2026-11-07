@@ -17,7 +17,8 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use crate::protocol::{AdmissionQuotas, ProtocolOutcome, QuotaLease, QuotaResource};
+use crate::admission::{AdmissionQuotas, QuotaLease, QuotaResource};
+use crate::protocol::ProtocolOutcome;
 use crate::types::PrincipalId;
 
 const ASSOCIATED_DATA_DOMAIN: &[u8] = b"plug/mrtr/continuation-binding/v1\0";
@@ -26,6 +27,20 @@ pub(crate) const MRTR_MAX_BYTES: usize = 256 * 1024;
 pub(crate) const MRTR_MAX_REQUEST_STATE_BYTES: usize = 4 * 1024;
 pub(crate) const MRTR_MAX_ROUNDS: usize = 10;
 pub(crate) const MRTR_CHAIN_TTL: Duration = Duration::from_secs(5 * 60);
+
+/// Whether one round of a multi-round call is over Plug's limits: its
+/// request state, its number of input items, or the encoded size of
+/// `payload`. A payload that cannot be encoded cannot be measured, so it is
+/// over them.
+pub(crate) fn exceeds_continuation_limits(
+    request_state: Option<&str>,
+    items: usize,
+    payload: &impl Serialize,
+) -> bool {
+    request_state.is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
+        || items > MRTR_MAX_ITEMS
+        || !serde_json::to_vec(payload).is_ok_and(|encoded| encoded.len() <= MRTR_MAX_BYTES)
+}
 
 /// Digest only the semantic original tool request. Continuation material and
 /// `_meta` are deliberately excluded: the former changes each round and the
@@ -487,7 +502,7 @@ impl<T> ContinuationRegistry<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::AdmissionQuotaConfig;
+    use crate::admission::AdmissionQuotaConfig;
 
     fn principal(value: u128) -> PrincipalId {
         PrincipalId::daemon_ipc(Uuid::from_u128(value))
@@ -769,5 +784,35 @@ mod tests {
             ),
             Err(ContinuationError::Invalid)
         );
+    }
+
+    #[test]
+    fn a_round_over_any_limit_or_unmeasurable_exceeds_them() {
+        struct Unmeasurable;
+        impl Serialize for Unmeasurable {
+            fn serialize<S: serde::Serializer>(&self, _: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot be encoded"))
+            }
+        }
+        let small = serde_json::json!({});
+        let long_state = "s".repeat(MRTR_MAX_REQUEST_STATE_BYTES + 1);
+
+        assert!(!exceeds_continuation_limits(
+            Some("state"),
+            MRTR_MAX_ITEMS,
+            &small
+        ));
+        assert!(exceeds_continuation_limits(Some(&long_state), 0, &small));
+        assert!(exceeds_continuation_limits(
+            None,
+            MRTR_MAX_ITEMS + 1,
+            &small
+        ));
+        assert!(exceeds_continuation_limits(
+            None,
+            0,
+            &"x".repeat(MRTR_MAX_BYTES)
+        ));
+        assert!(exceeds_continuation_limits(None, 0, &Unmeasurable));
     }
 }

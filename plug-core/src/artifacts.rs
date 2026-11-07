@@ -3,7 +3,6 @@ use std::time::{Duration, SystemTime};
 
 use base64::Engine as _;
 use dashmap::DashMap;
-use directories::ProjectDirs;
 use rmcp::ErrorData as McpError;
 use rmcp::model::{
     CallToolResult, ContentBlock, MetaObject as Meta, ReadResourceResult, Resource,
@@ -13,11 +12,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::ProtocolError;
-use crate::legacy_tasks::GetTaskPayloadResult;
 
-pub const INLINE_RESULT_MAX_BYTES: usize = 512 * 1024;
-pub const ARTIFACT_RESULT_MIN_BYTES: usize = 16 * 1024 * 1024;
-pub const ARTIFACT_STORE_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+const INLINE_RESULT_MAX_BYTES: usize = 512 * 1024;
+const ARTIFACT_RESULT_MIN_BYTES: usize = 16 * 1024 * 1024;
+const ARTIFACT_STORE_MAX_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 const ARTIFACT_RETENTION: Duration = Duration::from_secs(72 * 60 * 60);
 const ARTIFACT_SCHEME_PREFIX: &str = "plug://artifact/";
 const MANIFEST_SUFFIX: &str = "/manifest";
@@ -70,9 +68,7 @@ struct ArtifactMetadata {
 
 impl ArtifactStore {
     pub fn new() -> Self {
-        let base_dir = ProjectDirs::from("", "", "plug")
-            .map(|dirs| dirs.cache_dir().join("artifacts"))
-            .unwrap_or_else(|| std::env::temp_dir().join("plug-artifacts"));
+        let base_dir = crate::paths::artifacts_dir();
         if let Err(error) = std::fs::create_dir_all(&base_dir) {
             tracing::warn!(
                 path = %base_dir.display(),
@@ -89,28 +85,20 @@ impl ArtifactStore {
         store
     }
 
-    pub async fn maybe_spill_tool_result(
-        &self,
-        source_tool: &str,
-        result: CallToolResult,
-    ) -> Result<CallToolResult, McpError> {
-        self.maybe_spill_tool_result_with_limit(None, source_tool, result, ARTIFACT_STORE_MAX_BYTES)
-            .await
-    }
-
-    /// [`ArtifactStore::maybe_spill_tool_result`] for a call to the tool
-    /// `source_server` calls `own_tool`, listed as `source_tool`. Both are
-    /// kept with the artifact, so who may read it later does not depend on
-    /// the tool still being listed, or listed under that name.
+    /// Keep a result too large to send, and answer with a link to it. The
+    /// result came from the tool listed as `source_tool`; `source` is its
+    /// server and that server's own name for it, when known. Both are kept
+    /// with the artifact, so who may read it later does not depend on the
+    /// tool still being listed, or listed under that name. A result kept
+    /// with no server is withheld from a client with a block.
     pub async fn maybe_spill_result_of(
         &self,
-        source_server: &str,
-        own_tool: &str,
+        source: Option<(&str, &str)>,
         source_tool: &str,
         result: CallToolResult,
     ) -> Result<CallToolResult, McpError> {
         self.maybe_spill_tool_result_with_limit(
-            Some((source_server, own_tool)),
+            source,
             source_tool,
             result,
             ARTIFACT_STORE_MAX_BYTES,
@@ -166,7 +154,10 @@ impl ArtifactStore {
         let materialized_path = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&write_dir)?;
             std::fs::write(&write_payload_path, &serialized)?;
-            maybe_materialize_attachment(&write_dir, attachment_source.as_deref())
+            std::io::Result::Ok(maybe_materialize_attachment(
+                &write_dir,
+                attachment_source.as_deref(),
+            ))
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -229,9 +220,9 @@ impl ArtifactStore {
     }
 
     /// Whose result the artifact at `uri` holds: the server, its own name
-    /// for the tool, and the name Plug listed the tool under. The server is
-    /// unknown for a task's result, and either can be for an artifact kept
-    /// before it was recorded.
+    /// for the tool, and the name Plug listed the tool under. The server and
+    /// the tool can be unknown for an artifact kept before they were
+    /// recorded.
     pub fn source(&self, uri: &str) -> Option<(Option<String>, Option<String>, String)> {
         let request = parse_artifact_uri(uri)?;
         let record = self.records.get(&request.id)?;
@@ -275,38 +266,6 @@ impl ArtifactStore {
         Ok(ReadResourceResult::new(vec![
             ResourceContents::text(text, uri).with_mime_type("application/json"),
         ]))
-    }
-
-    /// Keep a task's result when it is too large to send. It is kept with
-    /// the tool the task ran, when the task still says which; one that does
-    /// not is kept with no tool, and is withheld from a client with a block.
-    pub async fn maybe_spill_task_payload(
-        &self,
-        source: Option<&crate::tasks::TaskSource>,
-        task_id: &str,
-        payload: Value,
-    ) -> Result<GetTaskPayloadResult, McpError> {
-        match serde_json::from_value::<CallToolResult>(payload.clone()) {
-            Ok(result) => {
-                let unknown = format!("task_result:{task_id}");
-                let listed = source.map_or(unknown.as_str(), |source| source.listed.as_str());
-                let behind = source
-                    .and_then(|source| source.behind.as_ref())
-                    .map(|(server, own_tool)| (server.as_str(), own_tool.as_str()));
-                let spilled = self
-                    .maybe_spill_tool_result_with_limit(
-                        behind,
-                        listed,
-                        result,
-                        ARTIFACT_STORE_MAX_BYTES,
-                    )
-                    .await?;
-                let value = serde_json::to_value(spilled)
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(GetTaskPayloadResult::new(value))
-            }
-            Err(_) => Ok(GetTaskPayloadResult::new(payload)),
-        }
     }
 
     pub fn prune(&self) {
@@ -661,47 +620,56 @@ fn read_chunk_text(record: &ArtifactRecord, index: usize) -> anyhow::Result<Stri
 /// `attachment_source` is the first text content of the tool result,
 /// extracted by the caller so the blocking write task does not need to own
 /// the whole `CallToolResult`.
+/// Write the file a result carries, when it carries one, next to the
+/// payload. The file is extra: a result whose file cannot be written is kept
+/// without it.
 fn maybe_materialize_attachment(
     artifact_dir: &Path,
     attachment_source: Option<&str>,
-) -> anyhow::Result<Option<PathBuf>> {
-    let Some(text) = attachment_source else {
-        return Ok(None);
+) -> Option<PathBuf> {
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(attachment_source?) else {
+        return None;
     };
-
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(text) else {
-        return Ok(None);
-    };
-
-    let Some(filename) = obj.get("filename").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(content) = obj.get("content").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let encoding = obj
+    let filename = obj.get("filename").and_then(Value::as_str)?;
+    let content = obj.get("content").and_then(Value::as_str)?;
+    let bytes = match obj
         .get("encoding")
         .and_then(Value::as_str)
-        .unwrap_or("none");
-
-    let bytes = match encoding {
-        "base64" => base64::engine::general_purpose::STANDARD.decode(content)?,
+        .unwrap_or("none")
+    {
+        "base64" => match base64::engine::general_purpose::STANDARD.decode(content) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(%error, "result's attachment is not base64; kept without it");
+                return None;
+            }
+        },
         "none" => content.as_bytes().to_vec(),
-        _ => return Ok(None),
+        _ => return None,
     };
 
-    let attachment_path = artifact_dir.join(sanitize_filename(filename));
-    std::fs::write(&attachment_path, bytes)?;
-    Ok(Some(attachment_path))
+    let attachment_path = artifact_dir.join(attachment_filename(filename));
+    if let Err(error) = std::fs::write(&attachment_path, bytes) {
+        tracing::warn!(%error, "could not write a result's attachment; kept without it");
+        return None;
+    }
+    Some(attachment_path)
 }
 
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
+/// A name for an attachment that stays inside its artifact's folder and
+/// leaves the artifact's own files alone.
+fn attachment_filename(name: &str) -> String {
+    let name: String = name
+        .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '\0' => '_',
             _ => ch,
         })
-        .collect()
+        .collect();
+    match name.as_str() {
+        "" | "." | ".." | PAYLOAD_FILE | METADATA_FILE => format!("attachment-{name}"),
+        _ => name,
+    }
 }
 
 fn write_metadata(artifact_dir: &Path, record: &ArtifactRecord) -> anyhow::Result<()> {
@@ -735,56 +703,20 @@ fn write_metadata(artifact_dir: &Path, record: &ArtifactRecord) -> anyhow::Resul
 }
 
 fn load_record_from_dir(dir: &Path) -> Option<ArtifactRecord> {
-    let metadata_path = dir.join(METADATA_FILE);
-    if metadata_path.exists() {
-        let bytes = std::fs::read(&metadata_path).ok()?;
-        let metadata: ArtifactMetadata = serde_json::from_slice(&bytes).ok()?;
-        let payload_path = dir.join(metadata.payload_file);
-        let materialized_path = metadata.materialized_file.map(|file| dir.join(file));
-        return Some(ArtifactRecord {
-            id: metadata.id,
-            source_tool: metadata.source_tool,
-            source_server: metadata.source_server,
-            source_own_tool: metadata.source_own_tool,
-            original_size_bytes: metadata.original_size_bytes,
-            created_at: from_unix_secs(metadata.created_at_secs),
-            expires_at: from_unix_secs(metadata.expires_at_secs),
-            payload_path,
-            materialized_path,
-            chunk_count: metadata.chunk_count,
-            preview: metadata.preview,
-        });
-    }
-
-    let payload_path = dir.join(PAYLOAD_FILE);
-    if !payload_path.exists() {
-        return None;
-    }
-    let payload = std::fs::read(&payload_path).ok()?;
-    let result: CallToolResult = serde_json::from_slice(&payload).ok()?;
-    let materialized_path = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .find(|path| path.is_file() && path.file_name().is_some_and(|name| name != PAYLOAD_FILE));
-
-    let modified = std::fs::metadata(&payload_path)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .unwrap_or_else(SystemTime::now);
-    let id = dir.file_name()?.to_string_lossy().into_owned();
+    let bytes = std::fs::read(dir.join(METADATA_FILE)).ok()?;
+    let metadata: ArtifactMetadata = serde_json::from_slice(&bytes).ok()?;
     Some(ArtifactRecord {
-        id,
-        source_tool: "unknown".to_string(),
-        source_server: None,
-        source_own_tool: None,
-        original_size_bytes: payload.len(),
-        created_at: modified,
-        expires_at: modified + ARTIFACT_RETENTION,
-        payload_path,
-        materialized_path,
-        chunk_count: payload.len().div_ceil(ARTIFACT_CHUNK_BYTES),
-        preview: build_preview(&result),
+        id: metadata.id,
+        source_tool: metadata.source_tool,
+        source_server: metadata.source_server,
+        source_own_tool: metadata.source_own_tool,
+        original_size_bytes: metadata.original_size_bytes,
+        created_at: from_unix_secs(metadata.created_at_secs),
+        expires_at: from_unix_secs(metadata.expires_at_secs),
+        payload_path: dir.join(metadata.payload_file),
+        materialized_path: metadata.materialized_file.map(|file| dir.join(file)),
+        chunk_count: metadata.chunk_count,
+        preview: metadata.preview,
     })
 }
 
@@ -854,13 +786,7 @@ mod tests {
     use super::*;
 
     fn temp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "plug-artifacts-test-{}-{}",
-            name,
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        crate::paths::test::scratch(&format!("artifacts-{name}"))
     }
 
     fn test_store(base_dir: PathBuf) -> ArtifactStore {
@@ -910,7 +836,6 @@ mod tests {
 
         assert!(store.records.is_empty());
         assert!(!artifact_dir.exists());
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -959,7 +884,6 @@ mod tests {
             !store.records.contains_key("expired-read-id"),
             "expired record should be evicted after a read"
         );
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -1001,8 +925,6 @@ mod tests {
             read_chunk_text(&record, record.chunk_count).is_err(),
             "an out-of-range chunk index must error"
         );
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[test]
@@ -1021,7 +943,6 @@ mod tests {
 
         assert!(!old_dir.exists(), "oldest artifact should be evicted first");
         assert!(new_dir.exists(), "newest artifact should remain");
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -1032,7 +953,7 @@ mod tests {
             "R".repeat(ARTIFACT_RESULT_MIN_BYTES + 1),
         )]);
         let spilled = store
-            .maybe_spill_tool_result("rehydrate_tool", result)
+            .maybe_spill_result_of(None, "rehydrate_tool", result)
             .await
             .expect("spill result");
         let uri = spilled
@@ -1047,22 +968,18 @@ mod tests {
         rehydrated.rehydrate_from_disk();
         let manifest = rehydrated.read(&uri).expect("read rehydrated manifest");
         assert_eq!(manifest.contents.len(), 1);
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
-    async fn a_tasks_large_result_is_kept_with_the_tool_the_task_ran() {
-        let base_dir = temp_dir("task-source");
+    async fn a_large_result_is_kept_with_the_tool_it_came_from() {
+        let base_dir = temp_dir("result-source");
         let store = test_store(base_dir.clone());
         let large = || {
-            serde_json::to_value(CallToolResult::success(vec![ContentBlock::text(
+            CallToolResult::success(vec![ContentBlock::text(
                 "T".repeat(ARTIFACT_RESULT_MIN_BYTES + 1),
-            )]))
-            .unwrap()
+            )])
         };
-        let kept = |payload: GetTaskPayloadResult| {
-            let result: CallToolResult = serde_json::from_value(payload.0).unwrap();
+        let kept = |result: CallToolResult| {
             let uri = &result
                 .content
                 .iter()
@@ -1072,34 +989,26 @@ mod tests {
             store.source(uri).expect("a kept artifact")
         };
 
-        let source = crate::tasks::TaskSource {
-            listed: "git__commit".to_string(),
-            behind: Some(("git".to_string(), "commit".to_string())),
-        };
-        let payload = store
-            .maybe_spill_task_payload(Some(&source), "task_1", large())
+        let spilled = store
+            .maybe_spill_result_of(Some(("git", "commit")), "git__commit", large())
             .await
             .unwrap();
         assert_eq!(
-            kept(payload),
+            kept(spilled),
             (
                 Some("git".to_string()),
                 Some("commit".to_string()),
                 "git__commit".to_string()
             )
         );
-        // A task that is gone says nothing, and its result is kept with no
-        // tool: a client with a block does not get it.
-        let payload = store
-            .maybe_spill_task_payload(None, "task_2", large())
+        let spilled = store
+            .maybe_spill_result_of(None, "task_result:task_2", large())
             .await
             .unwrap();
         assert_eq!(
-            kept(payload),
+            kept(spilled),
             (None, None, "task_result:task_2".to_string())
         );
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -1130,8 +1039,6 @@ mod tests {
             Some("artifact-too-large")
         );
         assert!(store.records.is_empty());
-
-        let _ = std::fs::remove_dir_all(base_dir);
     }
 
     #[tokio::test]
@@ -1148,7 +1055,7 @@ mod tests {
         let result = CallToolResult::success(vec![ContentBlock::text(text)]);
 
         let spilled = store
-            .maybe_spill_tool_result("Mock__attachment_get_data", result)
+            .maybe_spill_result_of(None, "Mock__attachment_get_data", result)
             .await
             .expect("spill result");
 
@@ -1178,7 +1085,61 @@ mod tests {
             record.payload_path.exists(),
             "payload file must be written to disk"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(base_dir);
+    /// The attachment is an extra. A name that would land on the artifact's
+    /// own files, or content that cannot be decoded, never costs the result.
+    #[tokio::test]
+    async fn an_attachment_never_costs_the_result_it_came_with() {
+        let base_dir = temp_dir("attachment-names");
+        let store = test_store(base_dir.clone());
+        let body = "A".repeat(ARTIFACT_RESULT_MIN_BYTES + 1);
+        for (filename, encoding, kept_as) in [
+            (PAYLOAD_FILE, "none", Some("attachment-result.json")),
+            (METADATA_FILE, "none", Some("attachment-metadata.json")),
+            ("..", "none", Some("attachment-..")),
+            ("", "none", Some("attachment-")),
+            ("data.bin", "base64", None),
+        ] {
+            let text = serde_json::json!({
+                "filename": filename,
+                "encoding": encoding,
+                "content": format!("-_{body}"),
+            })
+            .to_string();
+            let spilled = store
+                .maybe_spill_result_of(
+                    None,
+                    "Mock__attachment_get_data",
+                    CallToolResult::success(vec![ContentBlock::text(text.clone())]),
+                )
+                .await
+                .expect("the result is kept");
+            let uri = spilled
+                .content
+                .iter()
+                .find_map(ContentBlock::as_resource_link)
+                .expect("artifact resource_link")
+                .uri
+                .clone();
+            let id = parse_artifact_uri(&uri).expect("artifact uri").id;
+            let record = store.records.get(&id).expect("record").clone();
+            assert_eq!(
+                record
+                    .materialized_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str()),
+                kept_as,
+                "{filename}"
+            );
+            let payload: CallToolResult =
+                serde_json::from_slice(&std::fs::read(&record.payload_path).unwrap()).unwrap();
+            assert_eq!(
+                payload.content[0].as_text().map(|text| text.text.as_str()),
+                Some(text.as_str()),
+                "the payload is the result, not the attachment"
+            );
+        }
     }
 }

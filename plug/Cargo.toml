@@ -30,12 +30,10 @@ base64.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 
-# Daemon (Phase 4)
 tracing-appender.workspace = true
 fs4.workspace = true
 socket2.workspace = true
 subtle.workspace = true
-directories.workspace = true
 uuid.workspace = true
 dashmap.workspace = true
 dirs.workspace = true

@@ -15,9 +15,8 @@ struct SheetFrame<Content: View, Extra: View>: View {
 
     let title: String
     var subtitle: String?
-    /// What went wrong, in a sentence. Stays until the next attempt. The
-    /// sheet adds what to do about it.
-    var failure: String?
+    /// What went wrong and what to do about it. Stays until the next attempt.
+    var failure: SheetFailure?
     /// True while the sheet is saving; it cannot be closed half way.
     var busy = false
     var cancelTitle = "Cancel"
@@ -48,7 +47,7 @@ struct SheetFrame<Content: View, Extra: View>: View {
             content
 
             if let failure {
-                ProblemNote(reason: failure)
+                ProblemNote(failure)
                     .padding(.horizontal, Metric.roomy)
             }
 
@@ -87,7 +86,7 @@ extension SheetFrame where Extra == EmptyView {
     init(
         title: String,
         subtitle: String? = nil,
-        failure: String? = nil,
+        failure: SheetFailure? = nil,
         busy: Bool = false,
         cancelTitle: String = "Cancel",
         confirmTitle: String? = nil,
@@ -107,5 +106,22 @@ extension SheetFrame where Extra == EmptyView {
             extra: { EmptyView() },
             content: content
         )
+    }
+}
+
+/// A failure inside a sheet: the error's words, and the advice the error
+/// carries. The sheet keeps this, not the error's text, so the app's own
+/// errors keep the advice chosen with them.
+struct SheetFailure: Equatable {
+    let reason: String
+    let advice: String
+
+    init(_ error: any Error) {
+        self.init(reason: error.localizedDescription, advice: Explain.advice(for: error))
+    }
+
+    init(reason: String, advice: String) {
+        self.reason = reason
+        self.advice = advice
     }
 }

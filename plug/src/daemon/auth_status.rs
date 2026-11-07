@@ -7,7 +7,8 @@ use super::ConnectionContext;
 /// Handle `AuthStatus` — return per-server OAuth state from config + credential stores.
 pub(super) async fn dispatch_auth_status(ctx: &ConnectionContext) -> IpcResponse {
     IpcResponse::AuthStatus {
-        servers: auth_status_from_statuses(ctx, &ctx.server_manager.server_statuses()).await,
+        servers: auth_status_from_statuses(ctx, &ctx.engine.server_manager().server_statuses())
+            .await,
     }
 }
 
@@ -40,7 +41,7 @@ pub(super) async fn auth_status_from_statuses(
     let mut oauth_servers: Vec<_> = config
         .servers
         .iter()
-        .filter(|(_, sc)| sc.auth.as_deref() == Some("oauth") && sc.enabled)
+        .filter(|(_, sc)| sc.is_oauth() && sc.enabled)
         .collect();
     oauth_servers.sort_by_key(|(name, _)| (*name).clone());
 
@@ -79,8 +80,8 @@ pub(super) async fn auth_status_from_statuses(
 mod tests {
     use super::*;
     use crate::daemon::tests::{
-        auth_status_test_context, cleanup_temp_config, clear_store, seeded_credentials,
-        temp_config_path, write_oauth_config, write_oauth_config_with_enabled,
+        auth_status_test_context, clear_store, seeded_credentials, temp_config_path,
+        write_oauth_config, write_oauth_config_with_enabled,
     };
     use rmcp::transport::auth::CredentialStore;
 
@@ -109,7 +110,6 @@ mod tests {
         assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -136,7 +136,6 @@ mod tests {
         assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -168,7 +167,6 @@ mod tests {
         assert_eq!(recovery.source, Some("keyring"));
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     /// A disabled OAuth server never gets a runtime status entry, so before
@@ -197,7 +195,6 @@ mod tests {
         );
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
@@ -211,7 +208,7 @@ mod tests {
         store.save(seeded_credentials()).await.unwrap();
 
         let ctx = auth_status_test_context(config_path);
-        ctx.server_manager.mark_auth_required(&server_name);
+        ctx.engine.server_manager().mark_auth_required(&server_name);
 
         let response = dispatch_auth_status(&ctx).await;
         let IpcResponse::AuthStatus { servers } = response else {
@@ -228,6 +225,5 @@ mod tests {
         assert!(servers[0].warnings.is_empty());
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 }

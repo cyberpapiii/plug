@@ -1,176 +1,369 @@
 import XCTest
 @testable import PlugIPC
 
-/// Contract tests for shared `testdata/ipc/*.json` fixtures serialized by Rust.
+/// The app against the wire the daemon speaks, as `testdata/ipc` pins it.
+/// `plug-core/tests/ipc_goldens.rs` checks the same files against the
+/// daemon's types and fails when they drift, so a change on either side that
+/// the other does not make fails one of the two.
 final class GoldenPayloadTests: XCTestCase {
-    private let decoder: JSONDecoder = {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-        return decoder
+    private let decoder = PlugIPCClient.makeDecoder()
+
+    private static let repoRoot = URL(fileURLWithPath: #filePath)
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+        .deletingLastPathComponent()
+
+    private func golden(_ name: String) throws -> Data {
+        try Data(contentsOf: Self.repoRoot.appending(path: "testdata/ipc/\(name)"))
+    }
+
+    /// Each golden in a file of them, as the JSON the daemon wrote.
+    private func goldens(_ name: String) throws -> [String: Any] {
+        try XCTUnwrap(JSONSerialization.jsonObject(with: golden(name)) as? [String: Any])
+    }
+
+    // MARK: Requests
+
+    private static let token = "golden-auth-token"
+
+    private static let stdioServer = ServerConfig(
+        command: "uvx",
+        args: ["workspace-mcp", "--single-user"],
+        env: ["WORKSPACE_TOKEN": "$WORKSPACE_TOKEN"],
+        enabled: false,
+        transport: "stdio",
+        timeoutSecs: 45,
+        callTimeoutSecs: 600,
+        maxConcurrent: 2,
+        healthCheckIntervalSecs: 120,
+        circuitBreakerEnabled: false,
+        toolRenames: ["search": "find"],
+        toolGroups: [ToolGroupRule(prefix: "Gmail", contains: ["gmail"], strip: ["gmail"])],
+        sandbox: StdioSandboxConfig(enabled: true, allowNetwork: true, allowRead: ["/Users/me/notes"])
+    )
+
+    private static let remoteServer = ServerConfig(
+        transport: "sse",
+        url: "https://example.com/sse",
+        auth: "oauth",
+        oauthClientID: "plug",
+        oauthScopes: ["read"]
+    )
+
+    private static let apiServer = ServerConfig(
+        transport: "openapi",
+        authToken: "\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}",
+        maxConcurrent: 4,
+        spec: "https://example.com/openapi.json",
+        operations: ["listPets"],
+        tokenIn: "header:X-Api-Key"
+    )
+
+    /// Every request the app sends, by its name in `requests.json`.
+    private static let requests: [String: IPCRequest] = {
+        func op(_ request: OperatorRequest) -> IPCRequest { .operator(token: token, request) }
+        func mutate(_ mutation: OperatorMutation) -> IPCRequest { op(.mutate(mutation)) }
+        func block(_ kind: ClientBlockKind, _ target: String, _ blocked: Bool) -> IPCRequest {
+            mutate(.setClientBlock(key: "claude-code", kind: kind, target: target, blocked: blocked))
+        }
+        return [
+            "handshake": .handshake(clientVersion: "0.9.0"),
+            "status": .status,
+            "list_tools": .listTools,
+            "snapshot": op(.snapshot),
+            "activity": op(.activity(afterSequence: 41, limit: 200, failuresOnly: false)),
+            "get_server_config": op(.serverConfig(name: "workspace")),
+            "validate_server": op(.validateServer(name: "workspace", server: stdioServer, replacing: false)),
+            "validate_server_edit": op(.validateServer(name: "workspace", server: stdioServer, replacing: true)),
+            "describe_api": op(.describeAPI(spec: "https://example.com/openapi.json")),
+            "add_server": op(.mutate(.addServer(name: "workspace", server: stdioServer), secretStore: "file")),
+            "add_remote_server": mutate(.addServer(name: "notes", server: remoteServer)),
+            "update_server": mutate(.updateServer(name: "pets", server: apiServer)),
+            "import_servers": mutate(.importServers([ImportedServer(
+                name: "github",
+                sourceTarget: "cursor",
+                server: .command("npx", args: ["-y", "github-mcp"])
+            )])),
+            "remove_server": mutate(.removeServer(name: "workspace")),
+            "add_account": mutate(.addAccount(server: "workspace", account: "work")),
+            "set_server_enabled": mutate(.setServerEnabled(name: "workspace", enabled: false)),
+            "set_tool_enabled": mutate(.setToolEnabled(tool: "Gmail__send", enabled: true)),
+            "rename_client": mutate(.renameClient(key: "oauth:abc", name: "Work laptop")),
+            "move_client_settings": mutate(.moveClientSettings(from: "oauth:old", to: "oauth:new")),
+            "set_client_place": mutate(.setClientPlace(key: "oauth:abc", place: "Studio Mac")),
+            "block_server": block(.server, "slack", true),
+            "block_tool": block(.tool, "Gmail__send", false),
+            "allow_server": block(.allowedServer, "github", true),
+            "allow_tool": block(.allowedTool, "GitHub__search", false),
+            "allow_list": block(.allowList, "*", true),
+            "add_watch": mutate(.addWatch(WatchConfig(
+                name: "inbox",
+                server: "workspace",
+                tool: "search_gmail_messages",
+                arguments: ["query": .string("is:unread"), "maxResults": .number(5)],
+                everySecs: 60,
+                allowWrites: true
+            ))),
+            "remove_watch": mutate(.removeWatch(event: "workspace.inbox")),
+            "restart_server": op(.restartServer(serverID: "workspace")),
+            "reload": op(.reload),
+            "revoke_client": op(.revokeClient(clientID: "abc")),
+            "shutdown": op(.shutdown),
+        ]
     }()
 
-    private func goldenData(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws -> Data {
-        let repoRoot = URL(fileURLWithPath: "\(file)")
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-            .deletingLastPathComponent()
-        let url = repoRoot.appending(path: "testdata/ipc/\(name)")
-        guard FileManager.default.fileExists(atPath: url.path) else {
-            struct MissingGolden: Error {}
-            XCTFail("missing shared golden fixture at \(url.path)", file: file, line: line)
-            throw MissingGolden()
-        }
-        return try Data(contentsOf: url)
+    func testEveryRequestGoldenHasAnAppRequestAndNoneIsLeftOut() throws {
+        XCTAssertEqual(Set(try goldens("requests.json").keys), Set(Self.requests.keys))
     }
 
-    private func goldenJSON(_ name: String, file: StaticString = #filePath, line: UInt = #line) throws -> (Data, [String: Any]) {
-        let data = try goldenData(name, file: file, line: line)
-        guard let object = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-            XCTFail("golden \(name) must be a JSON object", file: file, line: line)
-            return (data, [:])
+    /// The app writes each request as the daemon does. The daemon writes a
+    /// field with nothing in it as `null` and the app leaves it out, which
+    /// the daemon reads the same way. A server setting the app leaves out is
+    /// one the daemon fills with its default, from `server_config_default.json`.
+    func testTheAppWritesEveryRequestAsTheDaemonDoes() throws {
+        let golden = try goldens("requests.json")
+        let defaults = try goldens("server_config_default.json")
+        let encoder = PlugIPCClient.makeEncoder()
+        for (name, request) in Self.requests {
+            let sent = Self.withServerDefaults(
+                try JSONSerialization.jsonObject(with: encoder.encode(request)), defaults
+            )
+            XCTAssertEqual(
+                Self.withoutNulls(sent) as? NSDictionary,
+                Self.withoutNulls(golden[name] as Any) as? NSDictionary,
+                name
+            )
         }
-        return (data, object)
     }
 
-    func testGoldenOperatorHandshakeResponseDecodesInSwift() throws {
-        let (payload, object) = try goldenJSON("operator_handshake_response.json")
-        try assertExactKeys(
-            object,
-            expected: ["type", "handshake"],
-            context: "operator handshake response"
-        )
-
-        guard case let .handshake(handshake) = try decoder.decode(IPCResponse.self, from: payload) else {
-            return XCTFail("expected OperatorHandshake IPCResponse variant")
+    /// `value` with each server in it filled in where the daemon would fill
+    /// it, for a field the app left out.
+    private static func withServerDefaults(_ value: Any, _ defaults: [String: Any]) -> Any {
+        if let object = value as? [String: Any] {
+            var filled = object.mapValues { withServerDefaults($0, defaults) }
+            if var server = filled["server"] as? [String: Any] {
+                for (key, value) in defaults where server[key] == nil { server[key] = value }
+                filled["server"] = server
+            }
+            return filled
         }
-
-        XCTAssertEqual(handshake.daemonVersion, "0.7.0")
-        XCTAssertEqual(handshake.ipcMin, 3)
-        XCTAssertEqual(handshake.ipcMax, 6)
-        XCTAssertEqual(handshake.ownership, "app_managed")
-        XCTAssertTrue(handshake.capabilities.contains("server_config_read"))
-        XCTAssertTrue(handshake.capabilities.contains("server_mutation"))
+        if let array = value as? [Any] { return array.map { withServerDefaults($0, defaults) } }
+        return value
     }
 
-    func testGoldenGetServerConfigRequestDecodesThroughFrameCodec() throws {
-        let (payload, object) = try goldenJSON("get_server_config_request.json")
-        try assertExactKeys(
-            object,
-            expected: ["type", "auth_token", "name"],
-            context: "GetServerConfig request"
-        )
-
-        var frame = Data()
-        var length = UInt32(payload.count).bigEndian
-        frame.append(Data(bytes: &length, count: MemoryLayout<UInt32>.size))
-        frame.append(payload)
-
-        let decoded = try FrameCodec.decode(GetServerConfigRequestFixture.self, from: frame, decoder: decoder)
-        XCTAssertEqual(decoded.type, "GetServerConfig")
-        XCTAssertEqual(decoded.authToken, "golden-auth-token")
-        XCTAssertEqual(decoded.name, "workspace")
+    private static func withoutNulls(_ value: Any) -> Any {
+        switch value {
+        case let object as [String: Any]:
+            object.filter { !($0.value is NSNull) }.mapValues(withoutNulls)
+        case let array as [Any]:
+            array.map(withoutNulls)
+        default:
+            value
+        }
     }
 
-    func testGoldenGetServerConfigResponseDecodesInSwift() throws {
-        let (payload, object) = try goldenJSON("get_server_config_response.json")
-        try assertExactKeys(
-            object,
-            expected: ["type", "name", "server"],
-            context: "ServerConfig response"
-        )
+    // MARK: Responses
 
-        guard case let .serverConfig(name, server) = try decoder.decode(IPCResponse.self, from: payload) else {
-            return XCTFail("expected ServerConfig IPCResponse variant")
-        }
-
-        XCTAssertEqual(name, "workspace")
-        XCTAssertEqual(server.command, "uvx")
-        XCTAssertEqual(server.args, ["workspace-mcp"])
-        XCTAssertEqual(server.transport, "stdio")
+    private func response(_ name: String) throws -> IPCResponse {
+        let json = try XCTUnwrap(goldens("responses.json")[name], "no response golden \(name)")
+        return try decoder.decode(IPCResponse.self, from: JSONSerialization.data(withJSONObject: json))
     }
 
-    /// The snapshot the app polls every two seconds, as Rust writes it, with
-    /// one server in every daemon health. The app maps these health strings
-    /// to what a person reads, so a renamed variant must fail here first.
-    func testGoldenOperatorSnapshotDecodesEveryServerHealthInSwift() throws {
-        let (payload, object) = try goldenJSON("operator_snapshot_response.json")
-        try assertExactKeys(object, expected: ["type", "snapshot"], context: "OperatorSnapshot response")
-
-        guard case let .snapshot(snapshot) = try decoder.decode(IPCResponse.self, from: payload) else {
-            return XCTFail("expected OperatorSnapshot IPCResponse variant")
+    func testEveryResponseGoldenDecodes() throws {
+        for name in try goldens("responses.json").keys {
+            XCTAssertNoThrow(try response(name), name)
         }
+    }
 
-        XCTAssertEqual(snapshot.runtimeVersion, "0.7.0")
+    func testHandshake() throws {
+        guard case let .handshake(handshake) = try response("handshake") else { return XCTFail() }
+        XCTAssertEqual(handshake.daemonVersion, "0.9.0")
+        XCTAssertEqual(handshake.daemonExecutable?.path, "/Applications/Plug.app/Contents/Resources/plug")
+        XCTAssertEqual(handshake.ownership, .appManaged)
+    }
+
+    func testSnapshot() throws {
+        guard case let .snapshot(snapshot) = try response("snapshot") else { return XCTFail() }
+        XCTAssertEqual(snapshot.runtimeVersion, "0.9.0")
+        XCTAssertEqual(snapshot.prefixDelimiter, ".")
+        XCTAssertEqual(snapshot.startedId, 9_000_000_000)
         XCTAssertEqual(snapshot.toolCatalogRevision, 7)
-        XCTAssertEqual(snapshot.ownership, "app_managed")
-        XCTAssertEqual(snapshot.configuredServers.map(\.name), ["healthy", "degraded", "failed", "auth-required"])
-        XCTAssertEqual(snapshot.configuredServers.map(\.transport), ["stdio", "stdio", "stdio", "stdio"])
-        XCTAssertEqual(snapshot.servers.map(\.serverId), ["healthy", "degraded", "failed", "auth-required"])
-        XCTAssertEqual(snapshot.servers.map(\.health), ["Healthy", "Degraded", "Failed", "AuthRequired"])
-        XCTAssertEqual(snapshot.servers.map(\.toolCount), [12, 4, 0, 0])
+        XCTAssertEqual(snapshot.ownership, .appManaged)
+        XCTAssertEqual(snapshot.configuredServers.map(\.name), ["healthy", "degraded", "failed", "auth-required", "notes"])
+        XCTAssertEqual(snapshot.configuredServers.map(\.transport), ["stdio", "stdio", "stdio", "stdio", "sse"])
+        XCTAssertEqual(snapshot.configuredServers.map(\.oauth), [false, false, false, true, true])
+        XCTAssertEqual(snapshot.servers.map(\.health), [.healthy, .degraded, .failed, .authRequired])
+        XCTAssertEqual(snapshot.servers.map(\.toolCount), [0, 4, 8, 12])
+        XCTAssertEqual(snapshot.servers[2].error, "failed to spawn `npx`: not found")
+        XCTAssertEqual(snapshot.servers[0].upstream?.websiteUrl, "https://example.com")
+
+        let local = snapshot.liveSessions[0]
+        XCTAssertEqual(local.transport, "daemon_proxy")
+        XCTAssertEqual(local.clientType, "ClaudeCode")
+        XCTAssertEqual(local.host?.executable, "/opt/homebrew/bin/claude")
+        XCTAssertEqual(local.clientKey, "claude-code")
+        XCTAssertEqual(local.accessKey, "claude-code")
+        XCTAssertEqual(local.target, "claude-code")
+        let remote = snapshot.liveSessions[1]
+        XCTAssertEqual(remote.transport, "http")
+        XCTAssertEqual(remote.clientKey, "oauth:abc")
+        XCTAssertNil(remote.target)
+
+        XCTAssertEqual(snapshot.upstreamAuth.first?.tokenExpiresInSecs, 7_300)
+        XCTAssertEqual(snapshot.upstreamAuth.first?.warnings, ["token expires soon"])
+        let grant = try XCTUnwrap(snapshot.downstreamClients.first)
+        XCTAssertEqual(grant.clientName, "ChatGPT")
+        XCTAssertEqual(grant.signedIn, true)
+        XCTAssertEqual(grant.lastUsedAt, 1_700_000_500)
+        XCTAssertEqual(grant.clientKey, "oauth:abc")
+        XCTAssertNil(grant.target)
+        XCTAssertEqual(snapshot.clientNames, [ClientName(key: "oauth:abc", name: "Work laptop")])
+        XCTAssertEqual(snapshot.clientPlaces, [ClientPlace(key: "oauth:abc", place: "Studio Mac")])
+
+        let blocks = try XCTUnwrap(snapshot.clientBlocks)
+        XCTAssertEqual(blocks[0].servers, ["degraded"])
+        XCTAssertEqual(blocks[0].tools, ["healthy__send", "failed__*"])
+        XCTAssertEqual(blocks[1].onlyAllowed, true)
+        XCTAssertEqual(blocks[1].allowedServers, ["healthy"])
+        XCTAssertEqual(blocks[1].allowedTools, ["failed__read"])
+        XCTAssertEqual(blocks[0].offServers, ["degraded"])
+        XCTAssertEqual(blocks[0].offTools, [
+            OffTool(name: "healthy__send", rule: nil), OffTool(name: "failed__read", rule: "failed__*"),
+        ])
+        XCTAssertEqual(blocks[1].offServers, ["degraded", "notes"])
+        XCTAssertEqual(blocks[1].offTools?.map(\.name), ["failed__write"])
+
+        let events = try XCTUnwrap(snapshot.events)
         XCTAssertEqual(
-            snapshot.servers.map(\.error),
-            [nil, nil, "failed to spawn `npx`: not found on the fallback PATH (the login shell PATH probe failed)", nil]
+            events.map(\.state),
+            [.waiting, .watching, .toolMissing, .notReadOnly, .callFailed, .tooLarge, .watching]
         )
-        XCTAssertEqual(snapshot.liveSessions.first?.transport, "daemon_proxy")
-        XCTAssertEqual(snapshot.liveSessions.first?.clientType, "ClaudeCode")
-        XCTAssertEqual(snapshot.clientVisibility.first?.visibleToolCount, 16)
-        XCTAssertEqual(snapshot.upstreamAuth.first?.health, "AuthRequired")
-        XCTAssertEqual(snapshot.upstreamAuth.first?.authenticated, false)
-        XCTAssertEqual(snapshot.downstreamClients.first?.source, "dynamic_registration")
+        XCTAssertEqual(events[0].lastChanged, 1_700_000_000)
+        XCTAssertNil(events[1].lastChanged)
+        XCTAssertEqual(events[5].subscribers, 5)
+        XCTAssertNil(events[6].tool)
+        XCTAssertNil(events[6].everySecs)
+        XCTAssertEqual(snapshot.clientAddress, "https://plug.example.com/mcp")
     }
 
-    func testRenamedHandshakeFieldFailsExactKeyContract() throws {
-        let (_, object) = try goldenJSON("operator_handshake_response.json")
-        guard var handshake = object["handshake"] as? [String: Any] else {
-            return XCTFail("handshake object expected")
-        }
-
-        try assertExactKeys(
-            handshake,
-            expected: [
-                "daemon_version",
-                "ipc_min",
-                "ipc_max",
-                "ownership",
-                "capabilities",
-            ],
-            context: "operator handshake body"
-        )
-
-        handshake.removeValue(forKey: "daemon_version")
-        handshake["version"] = "0.7.0"
-        var mutatedObject = object
-        mutatedObject["handshake"] = handshake
-        let mutated = try JSONSerialization.data(withJSONObject: mutatedObject)
-
-        XCTAssertThrowsError(try decoder.decode(IPCResponse.self, from: mutated)) { error in
-            XCTAssertTrue(error is DecodingError, "renamed snake_case field must fail Swift decode")
+    /// `registered_clients.json` holds what the daemon's `is_unactivated`
+    /// says of a client in each sign-in state.
+    func testAnUnfinishedClientIsTheOneTheDaemonCallsUnactivated() throws {
+        let cases = try goldens("registered_clients.json")
+        XCTAssertEqual(cases.count, 4)
+        for (name, value) in cases {
+            let golden = try XCTUnwrap(value as? [String: Any], name)
+            let summary = try JSONSerialization.data(withJSONObject: XCTUnwrap(golden["summary"], name))
+            let client = try decoder.decode(DownstreamClient.self, from: summary)
+            XCTAssertEqual(client.isUnfinished, golden["unfinished"] as? Bool, name)
         }
     }
 
-    private func assertExactKeys(
-        _ object: [String: Any],
-        expected: Set<String>,
-        context: String,
-        file: StaticString = #filePath,
-        line: UInt = #line
-    ) throws {
-        let actual = Set(object.keys)
+    func testStatus() throws {
+        guard case let .status(servers) = try response("status") else { return XCTFail() }
+        XCTAssertEqual(servers.map(\.serverId), ["healthy"])
+    }
+
+    func testServerConfigs() throws {
+        guard case let .serverConfig(name, server) = try response("server_config") else { return XCTFail() }
+        XCTAssertEqual(name, "workspace")
+        XCTAssertEqual(server, try asTheDaemonKeepsIt(Self.stdioServer))
+        guard case let .serverConfig(_, api) = try response("api_server_config") else { return XCTFail() }
+        XCTAssertEqual(api, try asTheDaemonKeepsIt(Self.apiServer))
+        // A field whose name ends in an initialism is read back, so a save
+        // does not drop it.
+        guard case let .serverConfig(_, remote) = try response("remote_server_config") else { return XCTFail() }
+        XCTAssertEqual(remote, try asTheDaemonKeepsIt(Self.remoteServer))
+    }
+
+    /// Every setting the daemon's `ServerConfig` has is a field here. A
+    /// setting added to the daemon fails this until the app models it.
+    func testTheAppModelsEveryServerSetting() throws {
+        let server = try decoder.decode(ServerConfig.self, from: golden("server_config_every_field.json"))
+        let sent = try JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(server))
         XCTAssertEqual(
-            actual,
-            expected,
-            "unexpected JSON keys in \(context); rename drift should fail CI",
-            file: file,
-            line: line
+            sent as? NSDictionary,
+            try JSONSerialization.jsonObject(with: golden("server_config_every_field.json")) as? NSDictionary
         )
     }
-}
 
-private struct GetServerConfigRequestFixture: Decodable {
-    let type: String
-    let authToken: String
-    let name: String
+    /// A server the app sent, read back once the daemon has filled in what
+    /// the app left out.
+    private func asTheDaemonKeepsIt(_ server: ServerConfig) throws -> ServerConfig {
+        let sent = try JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(["server": server]))
+        let kept = Self.withServerDefaults(sent, try goldens("server_config_default.json"))
+        let data = try JSONSerialization.data(withJSONObject: kept)
+        return try decoder.decode([String: ServerConfig].self, from: data)["server"]!
+    }
+
+    func testActivity() throws {
+        guard case let .activity(events) = try response("activity") else { return XCTFail() }
+        XCTAssertEqual(events.map(\.sequence), [42, 43, 44])
+        XCTAssertEqual(events.map(\.outcome), [.success, .error, .cancelled])
+        XCTAssertEqual(events[0].clientKey, "claude-code")
+        XCTAssertEqual(events[0].clientLabel, "claude-code 2.0")
+        XCTAssertEqual(events[0].tool, "healthy__send")
+        XCTAssertEqual(events[0].target, "claude-code")
+        XCTAssertEqual(events.map(\.remote), [false, true, true])
+        XCTAssertEqual(events[1].reason, "upstream timed out")
+        XCTAssertNil(events[2].server)
+        XCTAssertEqual(events[2].clientKey, ActivityEvent.sharedRemoteKey)
+    }
+
+    func testTools() throws {
+        guard case let .tools(tools) = try response("tools") else { return XCTFail() }
+        XCTAssertEqual(tools.map(\.name), ["healthy__send", "failed__read"])
+        XCTAssertEqual(tools[0].ownName, "send")
+        XCTAssertEqual(tools[0].title, "Send")
+        XCTAssertFalse(tools[0].readOnly)
+        XCTAssertTrue(tools[1].disabled)
+        XCTAssertEqual(tools[1].disabledByPattern, "failed__*")
+        XCTAssertTrue(tools[1].readOnly)
+    }
+
+    func testApiDescribed() throws {
+        guard case let .apiDescribed(api) = try response("api_described") else { return XCTFail() }
+        XCTAssertEqual(api.title, "Pets")
+        XCTAssertEqual(api.operations.map(\.name), ["listPets", "addPet"])
+        XCTAssertEqual(api.operations[0].tag, "pets")
+        XCTAssertNil(api.operations[1].tag)
+    }
+
+    func testSmallReplies() throws {
+        guard case .validated = try response("server_validated") else { return XCTFail() }
+        guard case let .mutation(server, none) = try response("mutation") else { return XCTFail() }
+        XCTAssertEqual(server, "workspace")
+        XCTAssertEqual(none, [])
+        // An import says the name each server went in under.
+        guard case let .mutation(single, imported) = try response("imported") else { return XCTFail() }
+        XCTAssertNil(single)
+        XCTAssertEqual(imported, ["github-cursor"])
+        guard case let .revoked(id) = try response("revoked") else { return XCTFail() }
+        XCTAssertEqual(id, "abc")
+        guard case .reloaded = try response("reloaded") else { return XCTFail() }
+        guard case .ok = try response("ok") else { return XCTFail() }
+        guard case let .error(code, message) = try response("error") else { return XCTFail() }
+        XCTAssertEqual(code, "OPERATOR_MUTATION_FAILED")
+        XCTAssertEqual(message, "unknown server `gone`")
+        guard case let .error(taken, _) = try response("server_name_taken") else { return XCTFail() }
+        XCTAssertEqual(taken, PlugIPCError.serverNameTaken)
+    }
+
+    // MARK: Chunked
+
+    func testAChunkedReplyReassemblesIntoTheReply() throws {
+        let frames = try XCTUnwrap(JSONSerialization.jsonObject(with: golden("chunked_response.json")) as? [Any])
+            .map { try JSONSerialization.data(withJSONObject: $0) }
+        XCTAssertGreaterThan(frames.count, 2)
+        var remaining = frames[...]
+        let payload = try PlugIPCClient.readResponsePayload(decoder: decoder) {
+            guard let frame = remaining.popFirst() else { throw PlugIPCError.disconnected }
+            return frame
+        }
+        XCTAssertTrue(remaining.isEmpty)
+        guard case let .tools(tools) = try decoder.decode(IPCResponse.self, from: payload) else { return XCTFail() }
+        XCTAssertEqual(tools.count, 2)
+    }
 }

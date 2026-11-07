@@ -10,7 +10,9 @@ pub(crate) const MCP_NAME_HEADER: &str = "Mcp-Name";
 pub(crate) const TRACEPARENT_HEADER: &str = "traceparent";
 pub(crate) const TRACESTATE_HEADER: &str = "tracestate";
 pub(crate) const BAGGAGE_HEADER: &str = "baggage";
-pub(crate) const HEADER_MISMATCH_CODE: i32 = -32001;
+/// The 2026-07-28 spec's code for a mirrored header that disagrees with
+/// the body, which rmcp uses too.
+pub(crate) const HEADER_MISMATCH_CODE: i32 = rmcp::model::ErrorCode::HEADER_MISMATCH.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HeaderMismatch {
@@ -35,12 +37,34 @@ pub(crate) fn mirrored_headers_for_message(
         headers.insert(HeaderName::from_static("mcp-method"), value);
     }
     if let Some(name) = fields.name
-        && let Ok(value) = HeaderValue::from_str(&name)
+        && let Ok(value) = HeaderValue::from_str(&encode_standard_header_value(&name))
     {
         headers.insert(HeaderName::from_static("mcp-name"), value);
     }
 
     headers
+}
+
+const BASE64_PREFIX: &str = "=?base64?";
+const BASE64_SUFFIX: &str = "?=";
+
+/// A value that cannot travel as a bare header (non-ASCII or control
+/// characters, edge whitespace, or something that already looks wrapped) is
+/// sent as `=?base64?…?=`, the form the 2026-07-28 spec defines and rmcp
+/// decodes.
+fn encode_standard_header_value(value: &str) -> String {
+    let needs_wrapping = value.starts_with([' ', '\t'])
+        || value.ends_with([' ', '\t'])
+        || value.chars().any(|c| !(' '..='~').contains(&c))
+        || (value.starts_with(BASE64_PREFIX) && value.ends_with(BASE64_SUFFIX));
+    if needs_wrapping {
+        format!(
+            "{BASE64_PREFIX}{}{BASE64_SUFFIX}",
+            BASE64_STANDARD.encode(value)
+        )
+    } else {
+        value.to_string()
+    }
 }
 
 pub(crate) fn validate_mirrored_headers(
@@ -51,9 +75,9 @@ pub(crate) fn validate_mirrored_headers(
         return Ok(());
     };
 
-    validate_if_present(headers, MCP_METHOD_HEADER, &fields.method)?;
+    validate_if_present(headers, MCP_METHOD_HEADER, &fields.method, false)?;
     if let Some(expected_name) = fields.name {
-        validate_if_present(headers, MCP_NAME_HEADER, &expected_name)?;
+        validate_if_present(headers, MCP_NAME_HEADER, &expected_name, true)?;
     }
 
     Ok(())
@@ -144,35 +168,13 @@ fn require_and_validate(
             message: format!("Header mismatch: modern requests require {header_name}"),
         });
     }
-    let actual = headers
-        .get(header_name)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| HeaderMismatch {
-            message: format!("Header mismatch: {header_name} header is malformed"),
-        })?;
-    let actual = if decode_base64 {
-        decode_standard_header_value(actual).ok_or_else(|| HeaderMismatch {
-            message: format!("Header mismatch: {header_name} header has invalid Base64"),
-        })?
-    } else {
-        actual.to_string()
-    };
-    if actual != expected {
-        return Err(HeaderMismatch {
-            message: format!(
-                "Header mismatch: {header_name} header value '{actual}' does not match body value '{expected}'"
-            ),
-        });
-    }
-    Ok(())
+    validate_if_present(headers, header_name, expected, decode_base64)
 }
 
 fn decode_standard_header_value(value: &str) -> Option<String> {
-    const PREFIX: &str = "=?base64?";
-    const SUFFIX: &str = "?=";
     match value
-        .strip_prefix(PREFIX)
-        .and_then(|inner| inner.strip_suffix(SUFFIX))
+        .strip_prefix(BASE64_PREFIX)
+        .and_then(|inner| inner.strip_suffix(BASE64_SUFFIX))
     {
         Some(inner) => String::from_utf8(BASE64_STANDARD.decode(inner).ok()?).ok(),
         None => Some(value.to_string()),
@@ -183,6 +185,7 @@ fn validate_if_present(
     headers: &HeaderMap,
     header_name: &'static str,
     expected: &str,
+    decode_base64: bool,
 ) -> Result<(), HeaderMismatch> {
     let Some(actual) = headers.get(header_name) else {
         return Ok(());
@@ -190,6 +193,13 @@ fn validate_if_present(
     let actual = actual.to_str().map_err(|_| HeaderMismatch {
         message: format!("Header mismatch: {header_name} header is malformed"),
     })?;
+    let actual = if decode_base64 {
+        decode_standard_header_value(actual).ok_or_else(|| HeaderMismatch {
+            message: format!("Header mismatch: {header_name} header has invalid Base64"),
+        })?
+    } else {
+        actual.to_string()
+    };
     if actual != expected {
         return Err(HeaderMismatch {
             message: format!(
@@ -258,6 +268,25 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("weather")
         );
+    }
+
+    #[test]
+    fn a_name_a_header_cannot_carry_is_sent_base64_and_read_back() {
+        for name in ["météo", " padded", "=?base64?looks-wrapped?="] {
+            let message = tool_call_message(name);
+            let headers = mirrored_headers_for_message(&message);
+            let value = headers
+                .get(&HeaderName::from_static("mcp-name"))
+                .and_then(|value| value.to_str().ok())
+                .expect("the name travels");
+            assert!(value.starts_with("=?base64?"), "{name}: {value}");
+            let mut received = HeaderMap::new();
+            for (header, value) in headers {
+                received.insert(header, value);
+            }
+            validate_required_mirrored_headers(&received, &message).expect("modern reads it back");
+            validate_mirrored_headers(&received, &message).expect("legacy reads it back");
+        }
     }
 
     #[test]

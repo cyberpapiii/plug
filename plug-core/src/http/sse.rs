@@ -9,21 +9,30 @@ use tokio_util::sync::CancellationToken;
 
 use crate::session::SseEvent;
 
-/// SSE stream from an mpsc receiver with priming event, keepalive comments
-/// (each one calling `on_keepalive`), and cancel.
+/// SSE stream from an mpsc receiver with keepalive comments (each one
+/// calling `on_keepalive`) and cancel. It opens with an empty event carrying
+/// `seen_through`, the id of the last event the client has.
 pub fn sse_stream_with_heartbeat<F>(
     rx: mpsc::Receiver<SseEvent>,
+    seen_through: u64,
     cancel: CancellationToken,
     on_keepalive: F,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>>
 where
     F: FnMut() + Send + 'static,
 {
-    sse_stream_with_heartbeat_interval(rx, cancel, Duration::from_secs(15), on_keepalive)
+    sse_stream_with_heartbeat_interval(
+        rx,
+        seen_through,
+        cancel,
+        Duration::from_secs(15),
+        on_keepalive,
+    )
 }
 
 fn sse_stream_with_heartbeat_interval<F>(
     rx: mpsc::Receiver<SseEvent>,
+    seen_through: u64,
     cancel: CancellationToken,
     keepalive_interval: Duration,
     mut on_keepalive: F,
@@ -32,7 +41,7 @@ where
     F: FnMut() + Send + 'static,
 {
     let stream = async_stream::stream! {
-        yield Ok(Event::default().id("0").data(""));
+        yield Ok(Event::default().id(seen_through.to_string()).data(""));
 
         let mut rx = ReceiverStream::new(rx);
 
@@ -68,35 +77,10 @@ where
     Sse::new(stream)
 }
 
-/// Collect SSE events from a response body until the stream ends or timeout.
-/// Shared by HTTP SSE unit tests so `server` and `sse` modules do not diverge.
-#[cfg(test)]
-pub(crate) async fn collect_sse_events(body: axum::body::Body, max_events: usize) -> Vec<String> {
-    let mut events = Vec::new();
-    let mut stream = body.into_data_stream();
-
-    let timeout = tokio::time::timeout(Duration::from_secs(2), async {
-        while let Some(Ok(chunk)) = stream.next().await {
-            let text = String::from_utf8_lossy(&chunk).to_string();
-            for part in text.split("\n\n") {
-                let trimmed = part.trim();
-                if !trimmed.is_empty() {
-                    events.push(trimmed.to_string());
-                }
-            }
-            if events.len() >= max_events {
-                break;
-            }
-        }
-    });
-
-    let _ = timeout.await;
-    events
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_helpers::collect_sse_events;
     use axum::response::IntoResponse;
 
     #[tokio::test]
@@ -104,16 +88,14 @@ mod tests {
         let (tx, rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
-        let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
+        let sse = sse_stream_with_heartbeat(rx, 0, cancel.clone(), || {});
         let response = sse.into_response();
         let body = response.into_body();
 
-        // Drop sender so stream ends after priming event
         drop(tx);
 
         let events = collect_sse_events(body, 2).await;
         assert!(!events.is_empty(), "expected at least the priming event");
-        // Priming event should have id: 0
         assert!(
             events[0].contains("id: 0"),
             "first event should have id 0, got: {}",
@@ -122,15 +104,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn messages_forwarded_with_incrementing_ids() {
+    async fn messages_are_forwarded_with_their_ids() {
         let (tx, rx) = mpsc::channel(8);
         let cancel = CancellationToken::new();
 
-        let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
+        let sse = sse_stream_with_heartbeat(rx, 0, cancel.clone(), || {});
         let response = sse.into_response();
         let body = response.into_body();
 
-        // Send two messages
         tx.send(SseEvent {
             id: 1,
             message: crate::session::SseMessage::from_json_value(
@@ -152,7 +133,6 @@ mod tests {
         drop(tx);
 
         let events = collect_sse_events(body, 4).await;
-        // Should have: priming (id 0) + 2 messages (id 1, id 2)
         assert!(events.len() >= 3, "expected 3 events, got: {events:?}");
         assert!(events[1].contains("id: 1"), "second event should be id 1");
         assert!(events[2].contains("id: 2"), "third event should be id 2");
@@ -167,21 +147,21 @@ mod tests {
         let (_tx, rx) = mpsc::channel::<SseEvent>(8);
         let cancel = CancellationToken::new();
 
-        let sse = sse_stream_with_heartbeat(rx, cancel.clone(), || {});
-        let response = sse.into_response();
-        let body = response.into_body();
-
-        // Cancel immediately after priming
-        tokio::task::yield_now().await;
+        let sse = sse_stream_with_heartbeat(rx, 0, cancel.clone(), || {});
+        let mut body = sse.into_response().into_body().into_data_stream();
         cancel.cancel();
 
-        let events = collect_sse_events(body, 5).await;
-        // Should have at most the priming event — stream should close
-        assert!(
-            events.len() <= 2,
-            "stream should close after cancel, got {} events",
-            events.len()
-        );
+        // The sender is still held and the keepalive is 15 s away, so only
+        // the cancel can end the stream within the timeout.
+        let mut chunks = Vec::new();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while let Some(chunk) = body.next().await {
+                chunks.push(chunk.expect("SSE chunk"));
+            }
+        })
+        .await
+        .expect("the stream ends once cancelled");
+        assert_eq!(chunks.len(), 1, "only the priming event: {chunks:?}");
     }
 
     #[tokio::test]
@@ -194,6 +174,7 @@ mod tests {
 
         let sse = sse_stream_with_heartbeat_interval(
             rx,
+            0,
             cancel.clone(),
             Duration::from_millis(10),
             move || {

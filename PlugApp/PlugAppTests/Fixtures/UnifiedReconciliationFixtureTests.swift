@@ -30,7 +30,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             fixture.canonicalClientContents
         )
 
-        await harness.coordinator.adopt()
+        await harness.coordinator.reconcile(trigger: .explicitAdoption)
 
         guard let adopted = healthySnapshot(harness.coordinator.state) else { return }
         assertExactHealthy(adopted, fixture: fixture)
@@ -73,7 +73,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertEqual(harness.connector.sessions, ["stdio-fixture-1", "stdio-fixture-2"])
         XCTAssertTrue(harness.connector.observedReconnect)
 
-        await harness.coordinator.retry()
+        await harness.coordinator.reconcile(trigger: .retry)
 
         guard let retried = healthySnapshot(harness.coordinator.state) else { return }
         assertExactHealthy(retried, fixture: fixture)
@@ -105,7 +105,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         }
         let firstRetryConnector = harness.connector.snapshot
 
-        await harness.coordinator.retry()
+        await harness.coordinator.reconcile(trigger: .retry)
 
         guard let retriedAgain = healthySnapshot(harness.coordinator.state) else { return }
         XCTAssertEqual(retriedAgain, firstRetryState)
@@ -156,7 +156,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             return XCTFail("Legacy fixture must pause at explicit adoption, got \(harness.coordinator.state)")
         }
 
-        await harness.coordinator.adopt()
+        await harness.coordinator.reconcile(trigger: .explicitAdoption)
 
         guard case .blocked = harness.coordinator.state else {
             return XCTFail("Interrupted cleanup must remain retryable")
@@ -168,7 +168,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
         XCTAssertEqual(harness.connector.replayCount, 1)
         assertProtectedFilesUnchanged(fixture)
 
-        await harness.coordinator.retry()
+        await harness.coordinator.reconcile(trigger: .retry)
 
         guard let snapshot = healthySnapshot(harness.coordinator.state) else { return }
         assertExactHealthy(snapshot, fixture: fixture)
@@ -268,8 +268,6 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
                           (try? String(contentsOf: url, encoding: .utf8)) == "legacy plug \(fixture.legacyVersion)\n"
                     else { return nil }
                     return LegacyBinaryIdentity(
-                        identifier: "plug",
-                        teamID: AppInstallationInspector.teamID,
                         sha256: "fixture-cargo"
                     )
                 }
@@ -304,9 +302,10 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             launchdInspector: launchd,
             backend: backend,
             legacyPaths: [fixture.cargoURL],
-            retryLimit: 1
+            startupBudget: .zero
         )
         let coordinator = InstallationCoordinator(
+            serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
             appInspector: fixture.inspector,
             legacyMigrator: migrator,
             clientRepairer: ClientRepairService(runner: runner),
@@ -481,9 +480,7 @@ private struct SignedReconciliationFixture {
             bundleURL: bundleURL,
             executableURL: executableURL,
             appVersion: appVersion,
-            buildVersion: appBuild,
-            embeddedVersion: appVersion,
-            teamID: AppInstallationInspector.teamID
+            buildVersion: appBuild
         )
         formulaURL = rootURL.appending(path: "homebrew/opt/plug/bin/plug")
         brewURL = rootURL.appending(path: "homebrew/bin/brew")
@@ -494,85 +491,52 @@ private struct SignedReconciliationFixture {
         ipcSocketURL = URL(
             fileURLWithPath: "/tmp/plug-app-task7-\(UUID().uuidString.prefix(8)).sock"
         )
-        configURL = rootURL.appending(path: "Library/Application Support/Plug/config.toml")
-        credentialURL = rootURL.appending(path: "Library/Keychains/plug-credential")
+        // The files a migration or repair must never touch sit where they
+        // really live, under the home the migrator and connector are given.
+        configURL = homeURL.appending(path: PlugPaths.directory).appending(path: "config.toml")
+        credentialURL = homeURL.appending(path: "Library/Keychains/plug-credential")
         unknownDecoyURL = rootURL.appending(path: "decoys/plug-not-owned")
         logURL = rootURL.appending(path: "reconciliation.log")
         legacyJob = LaunchdJobRecord(
             label: "local.fixture.plug",
             programURL: cargoURL,
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         currentJob = LaunchdJobRecord(
             label: "com.plug.daemon",
             programURL: executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: appBuild,
-            loaded: true
+            parentBundleVersion: appBuild
         )
         launchdDecoyJob = LaunchdJobRecord(
             label: "com.example.unrelated",
             programURL: rootURL.appending(path: "decoys/other-daemon"),
             parentBundleIdentifier: "com.example.other",
-            parentBundleVersion: "1",
-            loaded: true
+            parentBundleVersion: "1"
         )
 
-        try createBundle(from: signedHost)
-        try createProtectedFixtures()
-        if mode == .legacy { try createLegacyFixtures() }
+        do {
+            try createBundle(from: signedHost)
+            try createProtectedFixtures()
+            if mode == .legacy { try createLegacyFixtures() }
+        } catch {
+            try? FileManager.default.removeItem(at: rootURL)
+            throw error
+        }
     }
 
+    /// The app's own readers, on the fixture bundle. Only the version run
+    /// differs: PLUG_DEV keeps the copied binary from handing `--version` to
+    /// an installed Plug.app.
     var inspector: AppInstallationInspector {
         let bundleURL = self.bundleURL
-        let executableURL = canonical.executableURL
-        let expectedVersion = version
         return AppInstallationInspector(
             bundleURL: { bundleURL },
-            signatureReader: { url in
-                try fixtureSignatureEvidence(at: url)
-            },
-            infoReader: { url in
-                let infoURL = url.appending(path: "Contents/Info.plist")
-                guard let data = try? Data(contentsOf: infoURL),
-                      let object = try? PropertyListSerialization.propertyList(
-                          from: data,
-                          options: [],
-                          format: nil
-                      ) as? [String: Any],
-                      let appVersion = object["CFBundleShortVersionString"] as? String,
-                      let buildVersion = object["CFBundleVersion"] as? String
-                else { throw AppInstallationError.missingMetadata }
-                return [
-                    "CFBundleShortVersionString": appVersion,
-                    "CFBundleVersion": buildVersion,
-                ]
-            },
-            embeddedVersionReader: { url in
-                guard url.standardizedFileURL == executableURL,
-                      FileManager.default.isExecutableFile(atPath: url.path)
-                else { throw AppInstallationError.missingEmbeddedExecutable(url) }
-                // PLUG_DEV keeps the copied binary from delegating to any
-                // live installation while still exercising its real --version
-                // path and proving the embedded version.
-                let result = try await ProcessRunner().run(
-                    executable: URL(fileURLWithPath: "/usr/bin/env"),
-                    arguments: ["PLUG_DEV=1", url.path, "--version"],
-                    timeout: .seconds(3)
-                )
-                let output = String(decoding: result.stdout, as: UTF8.self)
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                guard result.status == 0,
-                      let version = output.split(whereSeparator: \.isWhitespace).last,
-                      String(version) == expectedVersion
-                else {
-                    throw AppInstallationError.embeddedVersionFailure(
-                        String(decoding: result.stderr, as: UTF8.self)
-                    )
-                }
-                return String(version)
+            signatureReader: AppInstallationInspector.readSignature,
+            infoReader: AppInstallationInspector.readBundleInfo,
+            embeddedVersionReader: {
+                try await AppInstallationInspector.readEmbeddedVersion(at: $0, runner: DevModeRunner())
             }
         )
     }
@@ -649,32 +613,15 @@ private struct SignedReconciliationFixture {
     }
 }
 
-private func fixtureSignatureEvidence(at bundleURL: URL) throws -> AppSignatureEvidence {
-    var staticCode: SecStaticCode?
-    guard SecStaticCodeCreateWithPath(bundleURL as CFURL, [], &staticCode) == errSecSuccess,
-          let staticCode
-    else { throw AppInstallationError.invalidSignature }
-
-    let requirementText = "anchor apple generic and identifier \"\(AppInstallationInspector.bundleIdentifier)\" and certificate leaf[subject.OU] = \"\(AppInstallationInspector.teamID)\""
-    var requirement: SecRequirement?
-    guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
-          let requirement
-    else { throw AppInstallationError.invalidSignature }
-
-    var signingInformation: CFDictionary?
-    guard SecCodeCopySigningInformation(
-        staticCode,
-        SecCSFlags(rawValue: kSecCSSigningInformation),
-        &signingInformation
-    ) == errSecSuccess,
-    let information = signingInformation as? [String: Any]
-    else { throw AppInstallationError.invalidSignature }
-
-    return AppSignatureEvidence(
-        valid: SecStaticCodeCheckValidity(staticCode, [], requirement) == errSecSuccess,
-        bundleIdentifier: information[kSecCodeInfoIdentifier as String] as? String ?? "",
-        teamID: information[kSecCodeInfoTeamIdentifier as String] as? String ?? ""
-    )
+/// Runs a command with `PLUG_DEV=1` in its environment.
+private struct DevModeRunner: ProcessRunning {
+    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
+        try await ProcessRunner().run(
+            executable: URL(fileURLWithPath: "/usr/bin/env"),
+            arguments: ["PLUG_DEV=1", executable.path] + arguments,
+            timeout: timeout
+        )
+    }
 }
 
 private actor FixtureProcessRunner: ProcessRunning {
@@ -730,21 +677,14 @@ private actor FixtureProcessRunner: ProcessRunning {
 
         if executable == canonicalExecutable {
             if arguments == ["repair", "--all", "--dry-run", "--output", "json"] {
-                let disposition = clientNeedsRepair ? "recognized_legacy" : "canonical"
-                let json = "{\"items\":[{\"changed\":false,\"disposition\":\"\(disposition)\"}]}"
-                return ProcessResult(
-                    status: 0,
-                    stdout: Data(json.utf8),
-                    stderr: Data()
-                )
+                return try .golden(clientNeedsRepair ? "repair_needed.json" : "repair_clean.json")
             }
             if arguments == ["repair", "--all", "--output", "json"] {
                 if clientNeedsRepair {
                     try Data(canonicalClientContents.utf8).write(to: clientURL, options: .atomic)
                     clientNeedsRepair = false
                 }
-                let json = "{\"items\":[{\"changed\":true,\"disposition\":\"canonical\"},{\"changed\":false,\"disposition\":\"canonical\"}]}"
-                return ProcessResult(status: 0, stdout: Data(json.utf8), stderr: Data())
+                return try .golden("repair_clean.json")
             }
         }
 
@@ -801,7 +741,7 @@ private struct FixtureLegacyMigrator: LegacyInstallMigrating {
 
     func removeVerifiedCargoBinary(
         _ snapshot: LegacyInstallSnapshot,
-        proof: ReconciliationProof
+        proof: OwnDaemonProof
     ) async throws {
         if await interruptions.consumeCargoRemovalFailure() {
             throw LegacyInstallError.fileOperation("interrupted fixture cleanup")
@@ -856,6 +796,9 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
     private let process: Process?
     private let executableURL: URL?
     private let daemonVersion: String?
+    /// The daemon's `handshake` reply from `testdata/ipc/responses.json`,
+    /// which `plug connect` validates.
+    private let handshakeReply: [String: Any]?
     private let input: FileHandle?
     private let outputWrite: FileHandle?
     private let errorWrite: FileHandle?
@@ -892,6 +835,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             process = nil
             self.executableURL = nil
             self.daemonVersion = nil
+            handshakeReply = nil
             input = nil
             outputWrite = nil
             errorWrite = nil
@@ -907,7 +851,11 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
         self.socketURL = socketURL.standardizedFileURL
         self.executableURL = executableURL.standardizedFileURL
         self.daemonVersion = daemonVersion
-        let listener = try Self.makeListener(path: socketURL.path)
+        guard let handshakeReply = try ipcResponseGoldens()["handshake"] else {
+            throw CocoaError(.fileReadCorruptFile)
+        }
+        self.handshakeReply = handshakeReply
+        let listener = try TestSocket.listen(at: socketURL.path, backlog: 4)
         self.listener = listener
         socketOwned = true
 
@@ -1302,27 +1250,27 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
             }
         }
 
-        while let payload = Self.readFrame(connection),
-              let object = (try? JSONSerialization.jsonObject(with: payload)) as? [String: Any],
-              let type = object["type"] as? String {
+        while let object = TestSocket.readRequest(connection), let type = object["type"] as? String {
+            // A registered connector tags its requests and matches each
+            // reply by the tag, as the daemon echoes it.
+            let reply = { (response: [String: Any]) in
+                var response = response
+                response["ipc_id"] = object["ipc_id"]
+                TestSocket.writeJSON(response, to: connection)
+            }
             lock.lock()
             let method = object["method"] as? String
             requestStorage.append(method.map { "\(type):\($0)" } ?? type)
             lock.unlock()
             switch type {
             case "OperatorHandshake":
-                guard let executableURL, let daemonVersion else { break }
-                Self.sendJSON([
-                    "type": "OperatorHandshake",
-                    "handshake": [
-                        "daemon_version": daemonVersion,
-                        "daemon_executable": executableURL.path,
-                        "ipc_min": 3,
-                        "ipc_max": 4,
-                        "ownership": "app_managed",
-                        "capabilities": [],
-                    ],
-                ], to: connection)
+                guard let executableURL, let daemonVersion, var response = handshakeReply,
+                      var handshake = response["handshake"] as? [String: Any]
+                else { break }
+                handshake["daemon_version"] = daemonVersion
+                handshake["daemon_executable"] = executableURL.path
+                response["handshake"] = handshake
+                reply(response)
             case "Register":
                 lock.lock()
                 registerStorage += 1
@@ -1331,112 +1279,39 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 sessionStorage.append(session)
                 let clientID = object["client_id"] as? String ?? "fixture-client"
                 lock.unlock()
-                Self.sendJSON([
+                var registered: [String: Any] = [
                     "type": "Registered",
-                    "protocol_version": object["protocol_version"] as? Int ?? 3,
                     "client_id": clientID,
                     "session_id": session,
                     "modern_downstream_enabled": false,
                     "cancellation_capability": "fixture-cancellation",
-                ], to: connection)
+                    "request_ceiling_ms": 660_000,
+                ]
+                registered["protocol_version"] = object["protocol_version"]
+                reply(registered)
             case "Capabilities":
-                Self.sendJSON(["type": "Capabilities", "capabilities": [:]], to: connection)
+                reply(["type": "Capabilities", "capabilities": [:]])
             case "UpdateSession", "UpdateCapabilities", "RestoreResourceSubscriptions":
                 if type == "UpdateCapabilities" && generation > 1 {
                     lock.lock()
                     replayStorage += 1
                     lock.unlock()
                 }
-                Self.sendJSON(["type": "Ok"], to: connection)
+                reply(["type": "Ok"])
             case "Ping":
-                Self.sendJSON(["type": "Pong"], to: connection)
+                reply(["type": "Pong"])
             case "ModernDownstreamGate":
-                Self.sendJSON(["type": "ModernDownstreamGate", "enabled": false], to: connection)
-            case "McpRequest", "McpRequestWithContext":
+                reply(["type": "ModernDownstreamGate", "enabled": false])
+            case "McpRequest":
                 let method = object["method"] as? String ?? ""
                 switch method {
                 case "tools/list":
-                    Self.sendJSON(["type": "McpResponse", "payload": ["tools": []]], to: connection)
+                    reply(["type": "McpResponse", "payload": ["tools": []]])
                 default:
-                    Self.sendJSON(["type": "McpResponse", "payload": [:]], to: connection)
+                    reply(["type": "McpResponse", "payload": [:]])
                 }
             default:
-                Self.sendJSON(["type": "Ok"], to: connection)
-            }
-        }
-    }
-
-    private static func makeListener(path: String) throws -> Int32 {
-        let descriptor = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard descriptor >= 0 else { throw FixtureConnectorError.socket(errno) }
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(path.utf8CString)
-        guard bytes.count <= MemoryLayout.size(ofValue: address.sun_path) else {
-            Darwin.close(descriptor)
-            throw FixtureConnectorError.socketPathTooLong
-        }
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
-        }
-        let offset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
-        let length = socklen_t(offset + bytes.count)
-        let result = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(descriptor, $0, length)
-            }
-        }
-        guard result == 0, Darwin.listen(descriptor, 4) == 0 else {
-            let code = errno
-            Darwin.close(descriptor)
-            throw FixtureConnectorError.socket(code)
-        }
-        return descriptor
-    }
-
-    private static func readFrame(_ descriptor: Int32) -> Data? {
-        guard let header = readExactly(4, from: descriptor) else { return nil }
-        let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-        guard length <= UInt32(FrameCodec.maximumPayloadSize) else { return nil }
-        return readExactly(Int(length), from: descriptor)
-    }
-
-    private static func readExactly(_ count: Int, from descriptor: Int32) -> Data? {
-        var result = Data()
-        result.reserveCapacity(count)
-        while result.count < count {
-            var buffer = [UInt8](repeating: 0, count: count - result.count)
-            let readCount = buffer.withUnsafeMutableBytes { bytes in
-                Darwin.read(descriptor, bytes.baseAddress, bytes.count)
-            }
-            if readCount == 0 { return nil }
-            if readCount < 0 {
-                if errno == EINTR { continue }
-                return nil
-            }
-            result.append(buffer, count: readCount)
-        }
-        return result
-    }
-
-    private static func sendJSON(_ object: [String: Any], to descriptor: Int32) {
-        guard let payload = try? JSONSerialization.data(withJSONObject: object) else { return }
-        var length = UInt32(payload.count).bigEndian
-        var frame = Data(bytes: &length, count: MemoryLayout<UInt32>.size)
-        frame.append(payload)
-        frame.withUnsafeBytes { bytes in
-            var offset = 0
-            while offset < bytes.count {
-                let written = Darwin.write(
-                    descriptor,
-                    bytes.baseAddress!.advanced(by: offset),
-                    bytes.count - offset
-                )
-                if written <= 0 {
-                    if errno == EINTR { continue }
-                    break
-                }
-                offset += written
+                reply(["type": "Ok"])
             }
         }
     }
@@ -1475,8 +1350,6 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
 private enum FixtureConnectorError: Error {
     case processDidNotInitialize(String)
     case processDidNotListTools(String)
-    case socket(Int32)
-    case socketPathTooLong
 }
 
 @MainActor
@@ -1557,25 +1430,15 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
     func handshake() async throws -> OperatorHandshake {
         let version = enabled ? currentVersion : legacyVersion
         events.append(.handshake(version))
-        return fixtureHandshake(
+        return makeTestHandshake(
             version: version,
             executable: enabled ? currentExecutable : legacyExecutable
         )
     }
 
+    var now: ContinuousClock.Instant { .now }
+
     func waitBeforeRetry() async {}
 
     func openLoginItemSettings() {}
-}
-
-private func fixtureHandshake(version: String, executable: URL) -> OperatorHandshake {
-    let data = try! JSONSerialization.data(withJSONObject: [
-        "daemonVersion": version,
-        "daemonExecutable": executable.path,
-        "ipcMin": 3,
-        "ipcMax": 4,
-        "ownership": "app_managed",
-        "capabilities": ["stdio-replay"],
-    ])
-    return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
 }

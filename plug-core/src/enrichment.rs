@@ -1,20 +1,8 @@
-//! Tool enrichment: annotation inference and name normalization.
-//!
-//! Opt-in per server via `enrichment = true` in config.toml.
-//! `plug` also applies semantic normalization to all routed tools so clients
-//! do not inherit obviously wrong upstream safety hints.
+//! Safety hints read from a tool's name, description, input schema and
+//! `x-actions`. `plug` normalizes every routed tool, so clients do not
+//! inherit obviously wrong upstream hints.
 
 use rmcp::model::Tool;
-
-const LEGACY_TASK_SUPPORT_META_KEY: &str = "plug.dev/legacy-task-support";
-
-/// Apply enrichment to a tool: infer annotations from name patterns,
-/// normalize title from snake_case. Only fills missing values.
-pub fn enrich_tool(tool: &mut Tool) {
-    let name = tool.name.to_string();
-    normalize_annotations(tool, &name);
-    infer_title(tool);
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ToolSemantics {
@@ -39,19 +27,10 @@ enum ToolWorldScope {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ToolTaskSupportMode {
-    Forbidden,
-    Optional,
-    Required,
-    Unknown,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ToolProfile {
     semantics: ToolSemantics,
     repeatability: ToolRepeatability,
     world_scope: ToolWorldScope,
-    task_support: ToolTaskSupportMode,
 }
 
 impl ToolProfile {
@@ -66,13 +45,11 @@ impl ToolProfile {
 
         let repeatability = infer_repeatability(name, semantics, tool.description.as_deref());
         let world_scope = infer_world_scope(tool, name);
-        let task_support = infer_task_support(tool, name, semantics);
 
         Self {
             semantics,
             repeatability,
             world_scope,
-            task_support,
         }
     }
 }
@@ -556,53 +533,6 @@ fn infer_world_scope(tool: &Tool, name: &str) -> ToolWorldScope {
     ToolWorldScope::Unknown
 }
 
-fn infer_task_support(tool: &Tool, name: &str, semantics: ToolSemantics) -> ToolTaskSupportMode {
-    if let Some(task_support) = tool
-        .meta
-        .as_ref()
-        .and_then(|meta| meta.0.get(LEGACY_TASK_SUPPORT_META_KEY))
-        .and_then(serde_json::Value::as_str)
-    {
-        return match task_support {
-            "forbidden" => ToolTaskSupportMode::Forbidden,
-            "optional" => ToolTaskSupportMode::Optional,
-            "required" => ToolTaskSupportMode::Required,
-            _ => ToolTaskSupportMode::Unknown,
-        };
-    }
-
-    let lowered_name = name.to_ascii_lowercase();
-    let description = tool
-        .description
-        .as_deref()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-    let long_running_signals = [
-        "watch",
-        "stream",
-        "tail",
-        "deep_researcher_start",
-        "takes 15 seconds",
-        "takes 15 seconds to 2 minutes",
-        "long-running",
-        "background",
-        "while user tests manually",
-    ];
-
-    if long_running_signals
-        .iter()
-        .any(|signal| lowered_name.contains(signal) || description.contains(signal))
-    {
-        return match semantics {
-            ToolSemantics::ReadOnly => ToolTaskSupportMode::Optional,
-            ToolSemantics::Mutating | ToolSemantics::Destructive => ToolTaskSupportMode::Required,
-            ToolSemantics::Unknown => ToolTaskSupportMode::Optional,
-        };
-    }
-
-    ToolTaskSupportMode::Unknown
-}
-
 /// Normalize annotation hints from a tool name.
 ///
 /// For high-confidence semantic prefixes, `plug` prefers the tool-name-derived
@@ -639,49 +569,6 @@ pub fn normalize_annotations(tool: &mut Tool, name: &str) {
         ToolWorldScope::Open => annotations.open_world_hint = Some(true),
         ToolWorldScope::Unknown => {}
     }
-
-    let task_support = match profile.task_support {
-        ToolTaskSupportMode::Forbidden => Some("forbidden"),
-        ToolTaskSupportMode::Optional => Some("optional"),
-        ToolTaskSupportMode::Required => Some("required"),
-        ToolTaskSupportMode::Unknown => None,
-    };
-    if let Some(task_support) = task_support {
-        tool.meta.get_or_insert_with(Default::default).0.insert(
-            LEGACY_TASK_SUPPORT_META_KEY.to_string(),
-            task_support.into(),
-        );
-    }
-}
-
-/// Infer a human-readable title from a snake_case tool name.
-/// `create_github_issue` → `"Create Github Issue"`
-/// Only sets `title` if not already present.
-fn infer_title(tool: &mut Tool) {
-    let annotations = tool.annotations.get_or_insert_with(Default::default);
-    if annotations.title.is_some() {
-        return;
-    }
-
-    let title = tool
-        .name
-        .split('_')
-        .filter(|s| !s.is_empty())
-        .map(capitalize)
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    if !title.is_empty() {
-        annotations.title = Some(title);
-    }
-}
-
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().chain(chars).collect(),
-    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────
@@ -691,6 +578,11 @@ mod tests {
     use super::*;
     use rmcp::model::Tool;
     use serde_json::json;
+
+    fn normalize(tool: &mut Tool) {
+        let name = tool.name.to_string();
+        normalize_annotations(tool, &name);
+    }
 
     fn make_tool(name: &str) -> Tool {
         serde_json::from_value(json!({
@@ -716,7 +608,7 @@ mod tests {
             "conversations_history",
         ] {
             let mut tool = make_tool(name);
-            enrich_tool(&mut tool);
+            normalize(&mut tool);
             assert_eq!(
                 tool.annotations.as_ref().unwrap().read_only_hint,
                 Some(true),
@@ -730,7 +622,7 @@ mod tests {
         for prefix in ["delete_", "remove_", "drop_", "destroy_"] {
             let name = format!("{prefix}items");
             let mut tool = make_tool(&name);
-            enrich_tool(&mut tool);
+            normalize(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
             assert_eq!(
                 ann.destructive_hint,
@@ -761,7 +653,7 @@ mod tests {
             "batch_update_variables",
         ] {
             let mut tool = make_tool(name);
-            enrich_tool(&mut tool);
+            normalize(&mut tool);
             let ann = tool.annotations.as_ref().unwrap();
             assert_eq!(
                 ann.read_only_hint,
@@ -769,16 +661,6 @@ mod tests {
                 "expected readOnlyHint=false for {name}"
             );
         }
-    }
-
-    #[test]
-    fn title_inferred_from_snake_case() {
-        let mut tool = make_tool("create_github_issue");
-        enrich_tool(&mut tool);
-        assert_eq!(
-            tool.annotations.as_ref().unwrap().title.as_deref(),
-            Some("Create Github Issue")
-        );
     }
 
     #[test]
@@ -793,7 +675,7 @@ mod tests {
         }))
         .unwrap();
 
-        enrich_tool(&mut tool);
+        normalize(&mut tool);
         let ann = tool.annotations.as_ref().unwrap();
         assert_eq!(ann.read_only_hint, Some(true)); // normalized from get_ semantics
         assert_eq!(ann.title.as_deref(), Some("Custom Title")); // not overridden
@@ -1172,32 +1054,13 @@ mod tests {
     }
 
     #[test]
-    fn task_support_is_inferred_for_long_running_tools_without_upstream_execution() {
-        let mut tool: Tool = serde_json::from_value(json!({
-            "name": "deep_researcher_start",
-            "description": "Start an AI research agent that searches, reads, and writes a detailed report. Takes 15 seconds to 2 minutes.",
-            "inputSchema": { "type": "object" }
-        }))
-        .unwrap();
-
-        normalize_annotations(&mut tool, "deep_researcher_start");
-        assert_eq!(
-            tool.meta
-                .as_ref()
-                .and_then(|meta| meta.0.get(LEGACY_TASK_SUPPORT_META_KEY))
-                .and_then(serde_json::Value::as_str),
-            Some("required")
-        );
-    }
-
-    #[test]
     fn no_pattern_match_no_annotation() {
         let mut tool = make_tool("do_something");
-        enrich_tool(&mut tool);
-        let ann = tool.annotations.as_ref().unwrap();
-        assert!(ann.read_only_hint.is_none());
-        assert!(ann.destructive_hint.is_none());
-        // But title should still be set
-        assert_eq!(ann.title.as_deref(), Some("Do Something"));
+        normalize(&mut tool);
+        assert!(
+            tool.annotations
+                .as_ref()
+                .is_none_or(|ann| ann.read_only_hint.is_none() && ann.destructive_hint.is_none())
+        );
     }
 }

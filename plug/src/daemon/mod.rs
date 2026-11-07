@@ -1,7 +1,5 @@
-//! Daemon mode — headless Engine with Unix socket IPC.
-//!
-//! Provides `plug serve --daemon` functionality: starts the Engine without TUI,
-//! listens on a Unix socket for CLI queries, and logs to file.
+//! The daemon's Unix socket: local connectors, the app and the CLI send
+//! length-prefixed JSON requests here and receive replies and pushes.
 
 use std::future::Future;
 use std::path::PathBuf;
@@ -18,21 +16,29 @@ use tokio::net::UnixListener;
 use tokio_util::sync::CancellationToken;
 
 use plug_core::engine::Engine;
-use plug_core::ipc::{self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse};
-use plug_core::proxy::{DownstreamBridge, ToolRouter};
-use plug_core::session::SessionStore;
+use plug_core::http::server::{ClientRevocation, HttpState};
+use plug_core::ipc::{
+    self, IpcClientRequest, IpcClientResponse, IpcRequest, IpcResponse, OperatorRequest,
+};
+use plug_core::proxy::{ConnectorAfter, EndedSession};
+use plug_core::proxy::{DownstreamBridge, ReverseRequest, ToolRouter};
 
 mod framing;
 use framing::FrameReader;
 
-mod paths;
-#[cfg(test)]
-pub(crate) use paths::{
-    clear_test_runtime_paths, runtime_paths_test_lock, set_test_runtime_paths,
-    test_runtime_paths_active,
-};
-use paths::{ensure_dir, pid_path, runtime_dir, set_file_permissions_0600, token_path};
-pub use paths::{log_dir, socket_path};
+use plug_core::paths::{log_dir, pid_path, socket_path, token_path};
+
+/// Create a directory, and any missing parents, readable by this user only.
+fn ensure_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    plug_core::fs_perm::ensure_dir_0700(path)
+        .with_context(|| format!("failed to create directory: {}", path.display()))
+}
+
+fn set_file_permissions_0600(path: &std::path::Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("failed to set permissions on {}", path.display()))
+}
 
 mod registry;
 use registry::ClientRegistry;
@@ -53,29 +59,10 @@ use auth_status::{auth_status_from_statuses, dispatch_auth_status};
 // makes the same call for the same reason.
 #[allow(clippy::result_large_err)]
 fn load_editable_config(path: &std::path::Path) -> Result<plug_core::config::Config, IpcResponse> {
-    plug_core::operator::load_editable_config(path).map_err(|error| IpcResponse::Error {
+    plug_core::config::load_editable_config(path).map_err(|error| IpcResponse::Error {
         code: "CONFIG_READ_FAILED".to_string(),
         message: error.to_string(),
     })
-}
-
-/// A config parse error without the quoted source lines. The TOML parser
-/// echoes the offending line, and in config.toml that line can hold a token;
-/// the snapshot is polled constantly and the app may show this text.
-fn config_error_summary(message: &str) -> String {
-    message
-        .lines()
-        .filter(|line| {
-            let line = line.trim_start();
-            !line
-                .trim_start_matches(|c: char| c.is_ascii_digit())
-                .trim_start()
-                .starts_with('|')
-        })
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .collect::<Vec<_>>()
-        .join(" ")
 }
 
 #[cfg(target_os = "macos")]
@@ -114,13 +101,10 @@ fn restore_token_file(
 
 // ──────────────────────────── PID file locking ───────────────────────────────
 
-/// Acquire an exclusive lock on the PID file, returning the locked file handle.
-///
-/// The file handle MUST be held for the daemon's lifetime — dropping it releases the lock.
 /// How long to keep retrying a contended PID-file lock before concluding that
 /// another daemon owns it.
 ///
-/// `runtime_lock_is_held` probes the same lock by taking it and letting it go
+/// `ipc_client::daemon_starting` probes the same lock by taking it and letting it go
 /// again, and every status surface calls that probe. A real daemon holds the
 /// lock for its whole life, so retrying cannot mistake one for a probe; without
 /// the retry, a `plug status` that happened to land in the same microsecond as
@@ -158,9 +142,13 @@ fn lock_with_retry(
     }
 }
 
+/// Acquire an exclusive lock on the PID file, returning the locked file handle.
+///
+/// The file handle MUST be held for the daemon's lifetime — dropping it releases the lock.
 fn acquire_pid_lock(pid_path: &std::path::Path) -> anyhow::Result<std::fs::File> {
     let file = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .read(true)
         .open(pid_path)
@@ -186,13 +174,10 @@ pub(crate) struct DaemonRuntimeLock {
     pid_file_path: PathBuf,
 }
 
-/// Claim singleton daemon ownership before any upstream initialization.
-///
-/// `plug connect` clients can all notice a missing socket at once. The winner
-/// must own this lock before loading OAuth credentials or spawning upstreams;
-/// every loser exits without touching either.
+/// Claim singleton daemon ownership before any upstream initialization:
+/// only the holder of this lock loads OAuth credentials or spawns upstreams.
 pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
-    ensure_dir(&runtime_dir())?;
+    ensure_dir(&plug_core::paths::dir())?;
     let pid_file_path = pid_path();
     let file = acquire_pid_lock(&pid_file_path)?;
     Ok(DaemonRuntimeLock {
@@ -201,176 +186,39 @@ pub(crate) fn acquire_runtime_lock() -> anyhow::Result<DaemonRuntimeLock> {
     })
 }
 
-/// Return whether another process currently owns the daemon singleton lock.
-///
-/// This probe never creates or rewrites the PID file. Auto-start callers use it
-/// to distinguish a failed child from a child that correctly lost to another
-/// daemon which is still booting. `cmd_daemon` claims the lock before it binds
-/// anything, so a held lock with no socket is the signature of a healthy cold
-/// start rather than a dead one. That window is now short, because the socket
-/// no longer waits for `Engine::start`.
-pub(crate) fn runtime_lock_is_held() -> bool {
-    let Ok(file) = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(pid_path())
-    else {
-        return false;
-    };
-
-    match fs4::FileExt::try_lock(&file) {
-        Err(fs4::TryLockError::WouldBlock) => true,
-        Ok(()) => {
-            let _ = fs4::FileExt::unlock(&file);
-            false
-        }
-        Err(fs4::TryLockError::Error(_)) => false,
-    }
-}
-
-// ───────────────────────── Grace-period auto-shutdown ─────────────────────────
-
-/// Spawn the grace-period auto-shutdown task.
-///
-/// Watches `count_rx` for IPC client-count changes. When the count drops to
-/// zero, starts a `grace_period_secs` countdown. If the countdown fires while
-/// IPC count is still zero but daemon-owned HTTP sessions are active, the
-/// daemon is kept alive — but instead of falling back to the plain IPC watch
-/// (which would never wake on an HTTP-session-count change, stranding the
-/// daemon alive indefinitely), the task enters a bounded re-check loop that
-/// polls both counts on `recheck_interval` until either an IPC client
-/// reconnects (control returns to the outer watch loop) or HTTP sessions
-/// drain to zero (the daemon is cancelled). The re-check loop does not
-/// restart a fresh grace period — the grace period already expired once;
-/// HTTP sessions were the only thing holding the daemon up, and the
-/// session-store's own timeout already governs their lifetime.
-fn spawn_grace_period_task(
-    grace_period_secs: u64,
-    mut count_rx: tokio::sync::watch::Receiver<usize>,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-    daemon_cancel: CancellationToken,
-    grace_token: CancellationToken,
-) {
-    tokio::spawn(async move {
-        // Bounded: never busier than 1s, never lazier than 30s; scales down
-        // for short test-sized grace periods.
-        let recheck_interval = Duration::from_secs(grace_period_secs.clamp(1, 30));
-
-        loop {
-            // Wait for a change in client count
-            if count_rx.changed().await.is_err() {
-                return; // Sender dropped (registry gone)
-            }
-
-            let count = *count_rx.borrow();
-            if count == 0 {
-                tracing::info!(
-                    grace_secs = grace_period_secs,
-                    "last client disconnected, starting grace period"
-                );
-
-                tokio::select! {
-                    _ = tokio::time::sleep(Duration::from_secs(grace_period_secs)) => {
-                        // Grace period expired — recheck IPC and daemon-owned HTTP sessions.
-                        let http_session_count = http_sessions
-                            .as_ref()
-                            .map(|sessions| sessions.session_count())
-                            .unwrap_or(0);
-                        if *count_rx.borrow() == 0 && http_session_count == 0 {
-                            tracing::info!("grace period expired with no clients, shutting down");
-                            daemon_cancel.cancel();
-                            return;
-                        } else if *count_rx.borrow() == 0 && http_session_count > 0 {
-                            tracing::info!(
-                                http_session_count,
-                                "grace period expired but HTTP sessions are still active; keeping daemon alive"
-                            );
-
-                            // Re-check loop: HTTP sessions are the only thing keeping the
-                            // daemon alive. Poll until they drain (shut down) or an IPC
-                            // client reconnects (resume the outer watch loop).
-                            'recheck: loop {
-                                tokio::select! {
-                                    _ = tokio::time::sleep(recheck_interval) => {
-                                        if *count_rx.borrow() > 0 {
-                                            tracing::info!("client reconnected, grace period cancelled");
-                                            break 'recheck;
-                                        }
-                                        let http_session_count = http_sessions
-                                            .as_ref()
-                                            .map(|sessions| sessions.session_count())
-                                            .unwrap_or(0);
-                                        if http_session_count == 0 {
-                                            tracing::info!("grace period expired with no clients, shutting down");
-                                            daemon_cancel.cancel();
-                                            return;
-                                        }
-                                        // Still held alive by HTTP sessions; keep polling.
-                                    }
-                                    result = count_rx.changed() => {
-                                        if result.is_err() {
-                                            return;
-                                        }
-                                        if *count_rx.borrow() > 0 {
-                                            tracing::info!("client reconnected, grace period cancelled");
-                                            break 'recheck;
-                                        }
-                                        // Still 0; keep polling the re-check loop.
-                                    }
-                                    _ = grace_token.cancelled() => return,
-                                }
-                            }
-                        }
-                    }
-                    result = count_rx.changed() => {
-                        if result.is_err() {
-                            return;
-                        }
-                        if *count_rx.borrow() > 0 {
-                            tracing::info!("client reconnected, grace period cancelled");
-                        }
-                    }
-                    _ = grace_token.cancelled() => return,
-                }
-            }
-        }
-    });
-}
-
 // ─────────────────────────── Daemon entry point ──────────────────────────────
 
-/// Start the daemon: Engine + Unix socket IPC listener + file logging.
-///
-/// Returns the tracing-appender guard that MUST be held for the daemon's lifetime
-/// (dropping it flushes and closes the log file).
+/// `run_daemon_with_lock` after taking the runtime lock, with HTTP sessions
+/// but no downstream OAuth.
 #[cfg(test)]
-pub async fn run_daemon(
-    engine: Arc<Engine>,
-    config_path: PathBuf,
-    grace_period_secs: u64,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-) -> anyhow::Result<()> {
+pub async fn run_daemon(engine: Arc<Engine>, config_path: PathBuf) -> anyhow::Result<()> {
     let runtime_lock = acquire_runtime_lock()?;
+    let http = Arc::new(HttpState::new(
+        Arc::clone(engine.tool_router()),
+        Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+        engine.cancel_token().clone(),
+    ));
     run_daemon_with_lock(
         engine,
         config_path,
-        grace_period_secs,
-        http_sessions,
-        None,
+        http,
         runtime_lock,
+        ipc::DaemonOwnershipMode::Unknown,
     )
     .await
 }
 
+/// Serve local connectors on the daemon socket. `http` is the downstream
+/// HTTP state the same process serves, whose sessions the daemon lists and
+/// whose clients it revokes.
 pub(crate) async fn run_daemon_with_lock(
     engine: Arc<Engine>,
     config_path: PathBuf,
-    grace_period_secs: u64,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
+    http: Arc<HttpState>,
     runtime_lock: DaemonRuntimeLock,
+    ownership: ipc::DaemonOwnershipMode,
 ) -> anyhow::Result<()> {
-    let rt_dir = runtime_dir();
+    let rt_dir = plug_core::paths::dir();
     let log_directory = log_dir();
 
     // Create directories with secure permissions
@@ -432,28 +280,11 @@ pub(crate) async fn run_daemon_with_lock(
 
     let cancel = engine.cancel_token().clone();
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
-    let (client_registry, count_rx) = ClientRegistry::new();
-    let client_registry = Arc::new(client_registry);
-
-    // Grace period: when the last proxy client disconnects, start a countdown.
-    // If no new client reconnects and no daemon-owned HTTP sessions remain when it
-    // fires, shut down the daemon.
-    // A grace_period_secs of 0 disables auto-shutdown (explicit shutdown only),
-    // which is the default behavior.
-    let grace_cancel = CancellationToken::new();
+    let started_id = uuid::Uuid::new_v4().as_u64_pair().0;
+    let client_registry = Arc::new(ClientRegistry::new());
 
     #[cfg(target_os = "macos")]
     menu_bar::spawn(cancel.clone());
-
-    if grace_period_secs > 0 {
-        spawn_grace_period_task(
-            grace_period_secs,
-            count_rx,
-            http_sessions.clone(),
-            cancel.clone(),
-            grace_cancel.clone(),
-        );
-    }
 
     // Accept IPC connections until shutdown
     loop {
@@ -465,33 +296,19 @@ pub(crate) async fn run_daemon_with_lock(
             result = listener.accept() => {
                 match result {
                     Ok((stream, _addr)) => {
-                        let engine_cancel = engine.cancel_token().clone();
-                        let server_manager = engine.server_manager().clone();
-                        let snapshot = engine.snapshot();
-                        let auth = auth_token.clone();
-                        let engine_clone = engine.clone();
-                        let registry = client_registry.clone();
-                        let config_path = config_path.clone();
-                        let http_sessions = http_sessions.clone();
-                        let downstream_oauth = downstream_oauth.clone();
-
+                        let ctx = ConnectionContext {
+                            cancel: cancel.clone(),
+                            auth_token: Arc::clone(&auth_token),
+                            engine: Arc::clone(&engine),
+                            config_path: config_path.clone(),
+                            client_registry: Arc::clone(&client_registry),
+                            http: Arc::clone(&http),
+                            ownership,
+                            started_id,
+                            session_id: None,
+                            reverse_request_rx: None,
+                        };
                         tokio::spawn(async move {
-                            let started_at = Instant::now()
-                                .checked_sub(snapshot.uptime)
-                                .unwrap_or_else(Instant::now);
-                            let ctx = ConnectionContext {
-                                cancel: engine_cancel,
-                                auth_token: auth,
-                                server_manager,
-                                engine: engine_clone,
-                                config_path: config_path.clone(),
-                                started_at,
-                                client_registry: registry,
-                                http_sessions,
-                                downstream_oauth,
-                                session_id: None,
-                                reverse_request_rx: None,
-                            };
                             if let Err(e) = handle_ipc_connection(stream, ctx).await {
                                 tracing::debug!(error = %e, "IPC connection ended");
                             }
@@ -508,10 +325,6 @@ pub(crate) async fn run_daemon_with_lock(
         }
     }
 
-    // Stop grace period task
-    grace_cancel.cancel();
-
-    // Cleanup
     tracing::info!("daemon shutting down, cleaning up");
     std::fs::remove_file(&sock_path).ok();
     std::fs::remove_file(&pid_file_path).ok();
@@ -568,13 +381,8 @@ impl DownstreamBridge for DaemonBridge {
         request: ElicitRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<ElicitResult, McpError>> + Send + '_>> {
         let caps = self.client_registry.capabilities(&self.session_id);
-        if caps.as_ref().and_then(|c| c.elicitation.as_ref()).is_none() {
-            return Box::pin(async {
-                Err(McpError::internal_error(
-                    format!("client {} does not support elicitation", self.session_id),
-                    None,
-                ))
-            });
+        if let Err(error) = ReverseRequest::Elicitation.check_declared(caps.as_ref()) {
+            return Box::pin(async { Err(error) });
         }
         Box::pin(async move {
             match self
@@ -598,13 +406,8 @@ impl DownstreamBridge for DaemonBridge {
         request: CreateMessageRequestParams,
     ) -> Pin<Box<dyn Future<Output = Result<CreateMessageResult, McpError>> + Send + '_>> {
         let caps = self.client_registry.capabilities(&self.session_id);
-        if caps.as_ref().and_then(|c| c.sampling.as_ref()).is_none() {
-            return Box::pin(async {
-                Err(McpError::internal_error(
-                    format!("client {} does not support sampling", self.session_id),
-                    None,
-                ))
-            });
+        if let Err(error) = ReverseRequest::Sampling.check_declared(caps.as_ref()) {
+            return Box::pin(async { Err(error) });
         }
         Box::pin(async move {
             match self
@@ -626,29 +429,24 @@ impl DownstreamBridge for DaemonBridge {
 
 // ──────────────────────── Connection Context ──────────────────────────────────
 
-/// Per-connection context — everything needed to handle IPC requests without
-/// holding a reference to Engine.
+/// What one IPC connection's requests are answered from.
 struct ConnectionContext {
     cancel: CancellationToken,
     auth_token: Arc<str>,
-    server_manager: Arc<plug_core::server::ServerManager>,
     engine: Arc<Engine>,
     config_path: PathBuf,
-    started_at: Instant,
     client_registry: Arc<ClientRegistry>,
-    http_sessions: Option<Arc<dyn SessionStore>>,
-    downstream_oauth: Option<plug_core::downstream_oauth::DownstreamOauthManager>,
+    http: Arc<HttpState>,
+    /// Who started this daemon, read once when it started.
+    ownership: ipc::DaemonOwnershipMode,
+    /// [`ipc::OperatorSnapshot::started_id`].
+    started_id: u64,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
     /// Receiver for reverse requests from the daemon bridge. Created during
     /// Register, consumed by the IPC loop to forward reverse requests to the
     /// proxy client. See `DaemonBridge` for the sender side.
-    reverse_request_rx: Option<
-        tokio::sync::mpsc::Receiver<(
-            IpcClientRequest,
-            tokio::sync::oneshot::Sender<IpcClientResponse>,
-        )>,
-    >,
+    reverse_request_rx: Option<ReverseRequestRx>,
 }
 
 impl ConnectionContext {
@@ -659,25 +457,17 @@ impl ConnectionContext {
         Self {
             cancel: self.cancel.clone(),
             auth_token: Arc::clone(&self.auth_token),
-            server_manager: Arc::clone(&self.server_manager),
             engine: Arc::clone(&self.engine),
             config_path: self.config_path.clone(),
-            started_at: self.started_at,
             client_registry: Arc::clone(&self.client_registry),
-            http_sessions: self.http_sessions.clone(),
-            downstream_oauth: self.downstream_oauth.clone(),
+            http: Arc::clone(&self.http),
+            ownership: self.ownership,
+            started_id: self.started_id,
             session_id: self.session_id.clone(),
             reverse_request_rx: None,
         }
     }
 }
-
-/// Requests one registered connection may have dispatching at once. The
-/// proxy keeps to the same limit, so a request over it is answered at once
-/// with a retryable `BUSY` error rather than queued: the loop never waits for
-/// a slot, and so never stops reading the reverse-request replies the
-/// running requests may be waiting on.
-pub(crate) const MAX_CONCURRENT_REQUESTS_PER_CONNECTION: usize = 32;
 
 /// Requests tagged with `ipc_id` on a registered connection, dispatching on
 /// their own tasks. Each task returns the response for the loop to write.
@@ -687,44 +477,10 @@ struct InFlight {
     ids: std::collections::HashMap<tokio::task::Id, u64>,
 }
 
-/// Reverse requests written to the proxy and awaiting its reply, oldest first.
+/// Reverse requests written to the proxy and awaiting its reply, by id. The
+/// proxy tags each reply with the id as `reverse_id`.
 type PendingReverse =
-    std::collections::BTreeMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
-
-/// The reverse request `frame` answers, if it is a reverse-request reply.
-///
-/// A v4 proxy tags its reply with `reverse_id`. A v3 proxy sends a bare
-/// `IpcClientResponse` and answers reverse requests one at a time in the
-/// order it received them, so a bare reply belongs to the oldest one waiting.
-/// No `IpcRequest` variant shares a name with an `IpcClientResponse` variant,
-/// so a request never parses as a reply.
-fn reverse_reply_target(pending: &PendingReverse, frame: &[u8], ids: ipc::FrameIds) -> Option<u64> {
-    if ids.reverse_id.is_some() {
-        return ids.reverse_id;
-    }
-    if ids.ipc_id.is_some() {
-        return None;
-    }
-    let oldest = *pending.keys().next()?;
-    serde_json::from_slice::<IpcClientResponse>(frame)
-        .is_ok()
-        .then_some(oldest)
-}
-
-/// True for requests that run on the connection loop even when tagged: those
-/// that change the connection's own session and so must run in order, and
-/// cheap control requests that must answer even when every request slot is
-/// taken by a long call (the proxy's heartbeat is a `Ping`).
-fn must_run_inline(request: &IpcRequest) -> bool {
-    matches!(
-        request,
-        IpcRequest::Register { .. }
-            | IpcRequest::Deregister { .. }
-            | IpcRequest::Shutdown { .. }
-            | IpcRequest::Ping { .. }
-            | IpcRequest::ModernDownstreamGate { .. }
-    )
-}
+    std::collections::HashMap<u64, tokio::sync::oneshot::Sender<IpcClientResponse>>;
 
 /// Handle a single IPC connection: read requests, dispatch, send responses.
 ///
@@ -768,95 +524,163 @@ async fn handle_ipc_connection(
         }
     }
 
-    // Auto-deregister on disconnect (clean or crash)
-    if let Some(ref session_id) = ctx.session_id {
-        let removed_client_id = ctx.client_registry.client_id(session_id);
-        ctx.client_registry.deregister(session_id);
-        let target = plug_core::notifications::NotificationTarget::Ipc {
-            client_id: std::sync::Arc::from(session_id.as_str()),
-        };
-        ctx.engine
-            .tool_router()
-            .cleanup_subscriptions_for_target(&target)
-            .await;
-        ctx.engine
-            .tool_router()
-            .unregister_downstream_bridge(&target);
-        if ctx.engine.tool_router().clear_roots_for_target(&target) {
-            ctx.engine
-                .tool_router()
-                .forward_roots_list_changed_to_upstreams()
-                .await;
-        }
-        ctx.engine.tool_router().remove_client_log_level(session_id);
-        let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Ipc,
-            session_id,
-        );
-        ctx.engine
-            .tool_router()
-            .clear_lazy_session(&lazy_session_key);
-        if let Some(client_id) = removed_client_id
-            && !ctx.client_registry.client_sessions.contains_key(&client_id)
-        {
-            ctx.engine.tool_router().revoke_continuations_for_principal(
-                &plug_core::types::PrincipalId::daemon_ipc_registry(&client_id),
-            );
-            let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-            ctx.engine
-                .tool_router()
-                .cleanup_tasks_for_owner(&owner)
-                .await;
-        }
+    if let Some(session_id) = ctx.session_id.take() {
+        end_ipc_session(&ctx, &session_id).await;
     }
 
     result
 }
 
-/// Key a live session's lazy working set the way its transport stores it:
-/// bridge sessions under `ipc:`, HTTP and SSE sessions under `http:`.
-fn live_session_lazy_key(session: &plug_core::ipc::IpcLiveSessionInfo) -> String {
-    let transport = match session.transport {
-        plug_core::ipc::LiveSessionTransport::DaemonProxy => {
-            plug_core::proxy::DownstreamTransport::Ipc
-        }
-        plug_core::ipc::LiveSessionTransport::Http | plug_core::ipc::LiveSessionTransport::Sse => {
-            plug_core::proxy::DownstreamTransport::Http
-        }
+/// Take `session_id` out of the registry and release what the router holds
+/// for it. A session a newer registration already replaced was released
+/// then; what is released again here is only what it picked up since.
+async fn end_ipc_session(ctx: &ConnectionContext, session_id: &str) {
+    let last_of_client = ctx.client_registry.deregister(session_id);
+    let connector = match last_of_client.as_deref() {
+        Some(client_id) => ConnectorAfter::Gone { client_id },
+        None => ConnectorAfter::StillRegistered,
     };
-    plug_core::proxy::ToolRouter::lazy_session_key(transport, &session.session_id)
+    ctx.engine
+        .tool_router()
+        .end_downstream_session(EndedSession::Ipc {
+            session_id,
+            connector,
+        })
+        .await;
 }
 
-/// Resolves when the modern downstream gate may have changed. Never resolves
-/// once the sender is gone, so a closed channel cannot spin a select loop.
-async fn modern_gate_changed(gate_rx: &mut tokio::sync::watch::Receiver<bool>) {
-    if gate_rx.changed().await.is_err() {
-        std::future::pending::<()>().await;
-    }
+type BroadcastRecv = Result<
+    plug_core::notifications::ProtocolNotification,
+    tokio::sync::broadcast::error::RecvError,
+>;
+
+/// Something a connection writes without the proxy asking for it.
+enum Push {
+    /// The reply of a request that dispatched on its own task.
+    Reply(Result<(tokio::task::Id, IpcResponse), tokio::task::JoinError>),
+    Logging(BroadcastRecv),
+    Control(BroadcastRecv),
+    /// The modern downstream gate may have changed.
+    ModernGate,
+    Reverse(
+        IpcClientRequest,
+        tokio::sync::oneshot::Sender<IpcClientResponse>,
+    ),
 }
 
-/// Push `ModernDownstreamGateChanged` when the gate differs from the value
-/// this connection last reported.
-async fn push_modern_gate_change(
-    writer: &mut tokio::net::unix::OwnedWriteHalf,
-    gate_rx: &mut tokio::sync::watch::Receiver<bool>,
-    last_modern_gate: &mut bool,
-) -> anyhow::Result<()> {
-    let enabled = *gate_rx.borrow_and_update();
-    if enabled != *last_modern_gate {
-        ipc::send_response(
-            writer,
-            &IpcResponse::ModernDownstreamGateChanged { enabled },
-        )
-        .await?;
-        *last_modern_gate = enabled;
+type NotificationRx =
+    tokio::sync::broadcast::Receiver<plug_core::notifications::ProtocolNotification>;
+
+/// Every source of [`Push`]es on one connection. Notifications and gate
+/// changes start once the connection registers; a connection that never
+/// registers is sent only its replies.
+struct Pushes {
+    log_rx: Option<NotificationRx>,
+    ctrl_rx: Option<NotificationRx>,
+    /// The router outlives the connection, so the sender never closes under it.
+    gate_rx: tokio::sync::watch::Receiver<bool>,
+    last_modern_gate: bool,
+    pending_reverse: PendingReverse,
+}
+
+impl Pushes {
+    fn new(router: &ToolRouter) -> Self {
+        let mut gate_rx = router.watch_modern_downstream();
+        let last_modern_gate = *gate_rx.borrow_and_update();
+        Self {
+            log_rx: None,
+            ctrl_rx: None,
+            gate_rx,
+            last_modern_gate,
+            pending_reverse: PendingReverse::new(),
+        }
     }
-    Ok(())
+
+    fn subscribed(&self) -> bool {
+        self.log_rx.is_some()
+    }
+
+    fn subscribe(&mut self, router: &ToolRouter) {
+        self.log_rx = Some(router.subscribe_logging());
+        self.ctrl_rx = Some(router.subscribe_notifications());
+    }
+
+    /// The next push. Cancellation-safe, so it can sit in a `select!` beside
+    /// the frame reader. A reverse-request channel that closes is set to
+    /// `None`: its bridge is gone.
+    async fn next(
+        &mut self,
+        in_flight: &mut InFlight,
+        reverse_rx: &mut Option<ReverseRequestRx>,
+    ) -> Push {
+        let mut gate_open = self.subscribed();
+        loop {
+            tokio::select! {
+                biased;
+                reverse = recv_reverse(reverse_rx) => match reverse {
+                    Some((request, reply)) => return Push::Reverse(request, reply),
+                    None => *reverse_rx = None,
+                },
+                Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
+                    return Push::Reply(joined);
+                }
+                recv = recv_if_subscribed(&mut self.log_rx) => return Push::Logging(recv),
+                recv = recv_if_subscribed(&mut self.ctrl_rx) => return Push::Control(recv),
+                changed = self.gate_rx.changed(), if gate_open => match changed {
+                    Ok(()) => return Push::ModernGate,
+                    Err(_) => gate_open = false,
+                },
+            }
+        }
+    }
+
+    /// A notification already queued, logging first, or `None` when nothing is.
+    fn queued(&mut self) -> Option<Push> {
+        if let Some(recv) = self.log_rx.as_mut().and_then(queued) {
+            return Some(Push::Logging(recv));
+        }
+        self.ctrl_rx.as_mut().and_then(queued).map(Push::Control)
+    }
+
+    /// Write `push`, unless it is a notification `listener` may not be told.
+    async fn deliver(
+        &mut self,
+        push: Push,
+        writer: &mut tokio::net::unix::OwnedWriteHalf,
+        in_flight_ids: &mut std::collections::HashMap<tokio::task::Id, u64>,
+        listener: (&Engine, &ClientRegistry, Option<&str>),
+    ) -> anyhow::Result<()> {
+        match push {
+            Push::Reply(joined) => write_in_flight_reply(writer, in_flight_ids, joined).await,
+            Push::Logging(recv) if may_tell(listener, &recv) => {
+                send_ipc_logging_notification(writer, recv).await
+            }
+            Push::Control(recv) if may_tell(listener, &recv) => {
+                send_ipc_control_notification(writer, recv, listener.2).await
+            }
+            Push::Logging(_) | Push::Control(_) => Ok(()),
+            Push::ModernGate => {
+                let enabled = *self.gate_rx.borrow_and_update();
+                if enabled != self.last_modern_gate {
+                    ipc::send_response(
+                        writer,
+                        &IpcResponse::ModernDownstreamGateChanged { enabled },
+                    )
+                    .await?;
+                    self.last_modern_gate = enabled;
+                }
+                Ok(())
+            }
+            Push::Reverse(request, reply) => {
+                send_reverse_request(writer, &mut self.pending_reverse, request, reply).await
+            }
+        }
+    }
 }
 
 /// Inner loop for IPC connection handling.
 ///
-/// Untagged requests run one at a time, as they always have: the loop
+/// Untagged requests run one at a time: the loop
 /// dispatches each inline and writes its reply before taking the next. On a
 /// registered connection, a request tagged with `ipc_id` dispatches on its own
 /// task (see `InFlight`) and the loop keeps reading, so one slow call does not
@@ -868,32 +692,19 @@ async fn handle_ipc_loop(
     ctx: &mut ConnectionContext,
     in_flight: &mut InFlight,
 ) -> anyhow::Result<()> {
-    use plug_core::notifications::ProtocolNotification;
-
-    // Logging subscription — activated after Register so the daemon can push
-    // logging notifications to this IPC client in real time.
-    let mut log_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    // Protocol notification subscription — activated after Register so the daemon
-    // can push list_changed, progress, and cancelled notifications to this IPC client.
-    let mut ctrl_rx: Option<tokio::sync::broadcast::Receiver<ProtocolNotification>> = None;
-    // Modern downstream gate changes are pushed as they happen. The router
-    // outlives this connection, so the sender never closes under it.
-    let mut gate_rx = ctx.engine.tool_router().watch_modern_downstream();
-    let mut last_modern_gate = *gate_rx.borrow_and_update();
-    let mut pending_reverse = PendingReverse::new();
+    let mut pushes = Pushes::new(ctx.engine.tool_router());
     // Frames read while an inline request was dispatching, in arrival order.
     let mut deferred: std::collections::VecDeque<anyhow::Result<Option<Vec<u8>>>> =
         std::collections::VecDeque::new();
     let permits = Arc::new(tokio::sync::Semaphore::new(
-        MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
+        ipc::MAX_CONCURRENT_REQUESTS_PER_CONNECTION,
     ));
 
     loop {
         // After registration, subscribe to notification channels for push
         // delivery and move frame reads onto the cancellation-safe reader.
-        if ctx.session_id.is_some() && log_rx.is_none() {
-            log_rx = Some(ctx.engine.tool_router().subscribe_logging());
-            ctrl_rx = Some(ctx.engine.tool_router().subscribe_notifications());
+        if ctx.session_id.is_some() && !pushes.subscribed() {
+            pushes.subscribe(ctx.engine.tool_router());
             reader.ensure_multiplexed();
         }
 
@@ -902,9 +713,7 @@ async fn handle_ipc_loop(
         // the timeout to reclaim resources.
         let frame = if let Some(deferred_frame) = deferred.pop_front() {
             deferred_frame
-        } else if let Some(ref mut rx) = log_rx {
-            // Registered with notifications — multiplex request reads, push
-            // notifications, and replies from requests dispatching on tasks.
+        } else if pushes.subscribed() {
             'select: loop {
                 tokio::select! {
                     biased;
@@ -912,40 +721,8 @@ async fn handle_ipc_loop(
                         flush_finished_replies(writer, in_flight).await;
                         return Ok(());
                     }
-                    Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
-                        write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
-                    }
-                    recv = rx.recv() => {
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_logging_notification(writer, recv).await?;
-                        }
-                    }
-                    recv = async {
-                        if let Some(ref mut crx) = ctrl_rx {
-                            crx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_control_notification(writer, recv, ctx.session_id.as_deref()).await?;
-                        }
-                    }
-                    _ = modern_gate_changed(&mut gate_rx) => {
-                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
-                    }
-                    reverse = async {
-                        if let Some(ref mut rx) = ctx.reverse_request_rx {
-                            rx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        if let Some((reverse_req, resp_tx)) = reverse {
-                            send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
-                        } else {
-                            ctx.reverse_request_rx = None;
-                        }
+                    push = pushes.next(in_flight, &mut ctx.reverse_request_rx) => {
+                        pushes.deliver(push, writer, &mut in_flight.ids, ctx.listener()).await?;
                     }
                     result = reader.next() => break 'select result,
                 }
@@ -980,8 +757,8 @@ async fn handle_ipc_loop(
         };
 
         let ids = ipc::FrameIds::peek(&frame);
-        if let Some(reverse_id) = reverse_reply_target(&pending_reverse, &frame, ids) {
-            deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
+        if let Some(reverse_id) = ids.reverse_id {
+            deliver_reverse_reply(&mut pushes.pending_reverse, reverse_id, &frame);
             continue;
         }
 
@@ -990,9 +767,8 @@ async fn handle_ipc_loop(
             Ok(req) => req,
             Err(e) => {
                 tracing::debug!(error = %e, "IPC parse error");
-                let resp = protocol_parse_error_response(&frame).unwrap_or(IpcResponse::Error {
-                    code: "PARSE_ERROR".to_string(),
-                    message: "invalid request format".to_string(),
+                let resp = protocol_parse_error_response(&frame).unwrap_or_else(|| {
+                    IpcResponse::error(ipc::IpcErrorCode::ParseError, "invalid request format")
                 });
                 ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp)
                     .await
@@ -1002,40 +778,29 @@ async fn handle_ipc_loop(
         };
 
         // Auth check for admin commands
-        if ipc::requires_auth(&request) {
-            match ipc::extract_auth_token(&request) {
-                Some(provided) => {
-                    if !verify_auth_token(provided, &ctx.auth_token) {
-                        let resp = IpcResponse::Error {
-                            code: "AUTH_FAILED".to_string(),
-                            message: "invalid auth token".to_string(),
-                        };
-                        ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
-                        continue;
-                    }
-                }
-                None => {
-                    let resp = IpcResponse::Error {
-                        code: "AUTH_REQUIRED".to_string(),
-                        message: "auth_token required for this command".to_string(),
-                    };
-                    ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
-                    continue;
-                }
-            }
+        if let Some(provided) = request.auth_token()
+            && !verify_auth_token(provided, &ctx.auth_token)
+        {
+            let resp = IpcResponse::Error {
+                code: "AUTH_FAILED".to_string(),
+                message: "invalid auth token".to_string(),
+            };
+            ipc::send_chunked_response_with_id(writer, ids.ipc_id, &resp).await?;
+            continue;
         }
 
         if let Some(ipc_id) = ids.ipc_id
             && ctx.session_id.is_some()
-            && !must_run_inline(&request)
+            && !request.runs_inline()
         {
             let Ok(permit) = Arc::clone(&permits).try_acquire_owned() else {
-                let busy = IpcResponse::Error {
-                    code: "BUSY".to_string(),
-                    message: format!(
-                        "this connection already has {MAX_CONCURRENT_REQUESTS_PER_CONNECTION} requests running; retry"
+                let busy = IpcResponse::error(
+                    ipc::IpcErrorCode::Busy,
+                    format!(
+                        "this connection already has {} requests running; retry",
+                        ipc::MAX_CONCURRENT_REQUESTS_PER_CONNECTION
                     ),
-                };
+                );
                 ipc::send_chunked_response_with_id(writer, Some(ipc_id), &busy).await?;
                 continue;
             };
@@ -1048,28 +813,17 @@ async fn handle_ipc_loop(
             continue;
         }
 
-        // Dispatch request. During a tools/call, the upstream MCP server may
-        // issue reverse requests (elicitation, sampling) via the DaemonBridge
-        // channel. We service those concurrently with the dispatch future.
-        //
-        // We temporarily take `reverse_request_rx` out of `ctx` to avoid
-        // borrow conflicts — `dispatch_request` borrows `ctx` mutably.
+        // Dispatch inline. A tools/call may make the upstream send reverse
+        // requests (elicitation, sampling) through the DaemonBridge, which
+        // are serviced while it runs, so the receiver comes out of `ctx`,
+        // which `dispatch_request` borrows mutably.
         let mut reverse_rx = ctx.reverse_request_rx.take();
-        // Capture session_id before dispatch borrows ctx mutably.
         let dispatch_session_id = ctx.session_id.clone();
-        // Capture whether this request is a Deregister before dispatch — a
-        // SUCCESSFUL Deregister drops the bridge channel's sender, closing
-        // it, so the taken-out `reverse_rx` above must not be restored below.
-        // The restore site additionally gates on the response being Ok: a
-        // Deregister that fails validation (SESSION_MISMATCH /
-        // SESSION_REPLACED) early-returns without touching the bridge, and
-        // the still-live channel must be restored as usual.
-        let request_was_deregister = is_deregister_request(&request);
         // Keep reading while this request dispatches, once reads are
         // cancellation-safe: replies to reverse requests are routed at once,
         // everything else waits in `deferred` for its turn. Without this an
         // inline request that triggers elicitation could never read its reply.
-        let mut read_ahead = log_rx.is_some();
+        let mut read_ahead = pushes.subscribed();
 
         let response = {
             use std::pin::pin;
@@ -1087,61 +841,15 @@ async fn handle_ipc_loop(
                         result = Some(resp);
                         done = true;
                     }
-                    // Service reverse requests from DaemonBridge while tool call is in-flight
-                    reverse = async {
-                        if let Some(ref mut rx) = reverse_rx {
-                            rx.recv().await
-                        } else {
-                            // No bridge registered — pend forever
-                            std::future::pending().await
-                        }
-                    } => {
-                        if let Some((reverse_req, resp_tx)) = reverse {
-                            send_reverse_request(writer, &mut pending_reverse, reverse_req, resp_tx).await?;
-                        } else {
-                            // Channel closed (e.g. bridge deregistered) — stop polling it.
-                            reverse_rx = None;
-                        }
-                    }
-                    Some(joined) = in_flight.tasks.join_next_with_id(), if !in_flight.tasks.is_empty() => {
-                        write_in_flight_reply(writer, &mut in_flight.ids, joined).await?;
-                    }
-                    // Also forward logging notifications while waiting
-                    recv = async {
-                        if let Some(ref mut rx) = log_rx {
-                            rx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
-                            send_ipc_logging_notification(writer, recv).await?;
-                        }
-                    }
-                    // Forward control notifications (list_changed, progress, cancelled)
-                    recv = async {
-                        if let Some(ref mut crx) = ctrl_rx {
-                            crx.recv().await
-                        } else {
-                            std::future::pending().await
-                        }
-                    } => {
-                        if may_tell((&engine, &registry, dispatch_session_id.as_deref()), &recv) {
-                            send_ipc_control_notification(writer, recv, dispatch_session_id.as_deref()).await?;
-                        }
-                    }
-                    _ = modern_gate_changed(&mut gate_rx) => {
-                        push_modern_gate_change(writer, &mut gate_rx, &mut last_modern_gate).await?;
+                    push = pushes.next(in_flight, &mut reverse_rx) => {
+                        let listener = (&*engine, &*registry, dispatch_session_id.as_deref());
+                        pushes.deliver(push, writer, &mut in_flight.ids, listener).await?;
                     }
                     next = reader.next(), if read_ahead => {
                         match next {
-                            Ok(Some(frame)) => match reverse_reply_target(
-                                &pending_reverse,
-                                &frame,
-                                ipc::FrameIds::peek(&frame),
-                            ) {
+                            Ok(Some(frame)) => match ipc::FrameIds::peek(&frame).reverse_id {
                                 Some(reverse_id) => {
-                                    deliver_reverse_reply(&mut pending_reverse, reverse_id, &frame);
+                                    deliver_reverse_reply(&mut pushes.pending_reverse, reverse_id, &frame);
                                 }
                                 None => deferred.push_back(Ok(Some(frame))),
                             },
@@ -1156,82 +864,31 @@ async fn handle_ipc_loop(
             result.unwrap()
         };
 
-        // Restore reverse_request_rx (dispatch_request may have replaced it
-        // during a Register call, in which case ctx already has the new one).
-        // Skip the restore only after a SUCCESSFUL Deregister — its handler
-        // intentionally cleared ctx.reverse_request_rx and dropped the
-        // bridge's sender, so the channel we took out above is now closed;
-        // restoring it would resurrect a dead channel that busy-spins
-        // Ready(None) on selects. A FAILED Deregister (SESSION_MISMATCH /
-        // SESSION_REPLACED) early-returns without touching the bridge, so
-        // the taken-out channel is still live and must be restored, or every
-        // future reverse request for this still-active session would fail.
-        let deregister_succeeded = request_was_deregister && matches!(response, IpcResponse::Ok);
-        if ctx.reverse_request_rx.is_none() && !deregister_succeeded {
+        // The receiver belongs to the session it was taken out with. A
+        // Register made a new one, already in `ctx`, so the old one is dropped.
+        if ctx.reverse_request_rx.is_none() {
             ctx.reverse_request_rx = reverse_rx;
         }
 
         ipc::send_chunked_response_with_id(writer, ids.ipc_id, &response).await?;
 
         // Shutdown request — send OK then trigger cancel
-        if matches!(request, IpcRequest::Shutdown { .. }) {
+        if matches!(
+            request,
+            IpcRequest::Operator {
+                request: OperatorRequest::Shutdown,
+                ..
+            }
+        ) {
             ctx.cancel.cancel();
             break;
         }
 
-        // Drain any notifications that queued during request dispatch
-        if let Some(ref mut rx) = log_rx {
-            use tokio::sync::broadcast::error::TryRecvError;
-            loop {
-                match rx.try_recv() {
-                    Ok(notif) => {
-                        let recv = Ok(notif);
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_logging_notification(writer, recv).await?;
-                        }
-                    }
-                    Err(TryRecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "IPC logging notification lagged");
-                        let synthetic = IpcResponse::LoggingNotification {
-                            params: serde_json::json!({
-                                "level": "warning",
-                                "logger": "plug",
-                                "data": format!("skipped {skipped} log messages")
-                            }),
-                        };
-                        ipc::send_response(writer, &synthetic).await.ok();
-                    }
-                    Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
-                }
-            }
-        }
-        if let Some(ref mut crx) = ctrl_rx {
-            use tokio::sync::broadcast::error::TryRecvError;
-            loop {
-                match crx.try_recv() {
-                    Ok(notif) => {
-                        let recv = Ok(notif);
-                        if may_tell(ctx.listener(), &recv) {
-                            send_ipc_control_notification(writer, recv, ctx.session_id.as_deref())
-                                .await?;
-                        }
-                    }
-                    Err(TryRecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "IPC control notification lagged");
-                        let notif = IpcResponse::LoggingNotification {
-                            params: serde_json::to_value(
-                                plug_core::notifications::ProtocolNotification::control_lagged_logging_params(
-                                    skipped as u64,
-                                    "ipc",
-                                ),
-                            )
-                            .unwrap_or_default(),
-                        };
-                        ipc::send_response(writer, &notif).await.ok();
-                    }
-                    Err(TryRecvError::Closed) | Err(TryRecvError::Empty) => break,
-                }
-            }
+        // Send what queued while the request dispatched.
+        while let Some(push) = pushes.queued() {
+            pushes
+                .deliver(push, writer, &mut in_flight.ids, ctx.listener())
+                .await?;
         }
     }
 
@@ -1242,9 +899,6 @@ async fn handle_ipc_loop(
 /// queues, and macOS caps socket buffers at 8 MB.
 const IPC_SEND_BUFFER: usize = 4 * 1024 * 1024;
 
-/// Write the reply of a request that dispatched on its own task, tagged with
-/// the `ipc_id` it arrived with. A task that panicked answers with an error,
-/// so the proxy's waiter never hangs on it.
 /// How long a cancelled connection waits for request tasks to finish and
 /// their replies to be written.
 const REPLY_FLUSH_WINDOW: Duration = Duration::from_millis(250);
@@ -1266,6 +920,9 @@ async fn flush_finished_replies(
     .await;
 }
 
+/// Write the reply of a request that dispatched on its own task, tagged with
+/// the `ipc_id` it arrived with. A task that panicked answers with an error,
+/// so the proxy's waiter never hangs on it.
 async fn write_in_flight_reply(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
     ids: &mut std::collections::HashMap<tokio::task::Id, u64>,
@@ -1290,27 +947,53 @@ async fn write_in_flight_reply(
     ipc::send_chunked_response_with_id(writer, Some(ipc_id), &response).await
 }
 
-/// True when `request` is an `IpcRequest::Deregister`. On SUCCESS, the
-/// Deregister handler in `dispatch_request` clears `ctx.reverse_request_rx`
-/// and drops the bridge channel's sender (closing it), so `handle_ipc_loop`'s
-/// post-dispatch restore step must skip putting the (now-closed) taken-out
-/// channel back — otherwise the next request's select loop busy-spins on
-/// `Ready(None)`. This predicate alone is NOT sufficient to skip the restore:
-/// a Deregister that fails validation early-returns without touching the
-/// bridge, leaving the taken-out channel live, so the call site additionally
-/// gates the skip on the response being `IpcResponse::Ok`.
-fn is_deregister_request(request: &IpcRequest) -> bool {
-    matches!(request, IpcRequest::Deregister { .. })
+type ReverseRequestRx = tokio::sync::mpsc::Receiver<(
+    IpcClientRequest,
+    tokio::sync::oneshot::Sender<IpcClientResponse>,
+)>;
+
+/// The next notification once subscribed; pends forever before then.
+async fn recv_if_subscribed<T: Clone>(
+    rx: &mut Option<tokio::sync::broadcast::Receiver<T>>,
+) -> Result<T, tokio::sync::broadcast::error::RecvError> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The next reverse request once the session has a bridge; pends forever
+/// without one. `None` means the bridge is gone.
+async fn recv_reverse(
+    rx: &mut Option<ReverseRequestRx>,
+) -> Option<(
+    IpcClientRequest,
+    tokio::sync::oneshot::Sender<IpcClientResponse>,
+)> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// A notification already queued, as `recv` would have returned it, or
+/// `None` when nothing is.
+fn queued<T: Clone>(
+    rx: &mut tokio::sync::broadcast::Receiver<T>,
+) -> Option<Result<T, tokio::sync::broadcast::error::RecvError>> {
+    use tokio::sync::broadcast::error::{RecvError, TryRecvError};
+    match rx.try_recv() {
+        Ok(value) => Some(Ok(value)),
+        Err(TryRecvError::Lagged(skipped)) => Some(Err(RecvError::Lagged(skipped))),
+        Err(TryRecvError::Empty | TryRecvError::Closed) => None,
+    }
 }
 
 /// Whether this connection's client may be sent what `recv` holds. See
 /// [`plug_core::proxy::ToolRouter::client_may_be_told`].
 fn may_tell(
     (engine, registry, session_id): (&Engine, &ClientRegistry, Option<&str>),
-    recv: &Result<
-        plug_core::notifications::ProtocolNotification,
-        tokio::sync::broadcast::error::RecvError,
-    >,
+    recv: &BroadcastRecv,
 ) -> bool {
     let Ok(notification) = recv else {
         return true;
@@ -1332,38 +1015,28 @@ impl ConnectionContext {
     }
 }
 
-/// Send a logging notification to the IPC client, handling broadcast errors.
+/// Send a logging notification to the IPC client, handling broadcast
+/// errors. A failed write is returned, so a dead connection ends at once.
 async fn send_ipc_logging_notification(
     writer: &mut tokio::net::unix::OwnedWriteHalf,
-    recv: Result<
-        plug_core::notifications::ProtocolNotification,
-        tokio::sync::broadcast::error::RecvError,
-    >,
+    recv: BroadcastRecv,
 ) -> anyhow::Result<()> {
     use plug_core::notifications::ProtocolNotification;
     use tokio::sync::broadcast::error::RecvError;
 
-    match recv {
-        Ok(ProtocolNotification::LoggingMessage { params }) => {
-            let notif = IpcResponse::LoggingNotification {
-                params: serde_json::to_value(params).unwrap_or_default(),
-            };
-            ipc::send_response(writer, &notif).await.ok();
-        }
-        Ok(_) => {} // non-logging notification on wrong channel
+    let params = match recv {
+        Ok(ProtocolNotification::LoggingMessage { params }) => serde_json::to_value(params),
+        // Only logging is sent on this channel.
+        Ok(_) | Err(RecvError::Closed) => return Ok(()),
         Err(RecvError::Lagged(skipped)) => {
             tracing::warn!(skipped, "IPC logging notification lagged");
-            let synthetic = IpcResponse::LoggingNotification {
-                params: serde_json::json!({
-                    "level": "warning",
-                    "logger": "plug",
-                    "data": format!("skipped {skipped} log messages")
-                }),
-            };
-            ipc::send_response(writer, &synthetic).await.ok();
+            serde_json::to_value(ProtocolNotification::lagged_logging_params(skipped))
         }
-        Err(RecvError::Closed) => {}
-    }
+    };
+    let notification = IpcResponse::LoggingNotification {
+        params: params.unwrap_or_default(),
+    };
+    ipc::send_response(writer, &notification).await?;
     Ok(())
 }
 
@@ -1389,9 +1062,8 @@ async fn send_reverse_request(
         request: Box::new(request),
     };
 
-    // Entries whose caller gave up stay until the proxy answers them: a v3
-    // proxy's bare reply is matched to the oldest entry, so dropping one
-    // early would hand the next reply to the wrong waiter.
+    // A caller that gave up has no use for its reply.
+    pending.retain(|_, waiter| !waiter.is_closed());
     pending.insert(id, response_tx);
     tracing::debug!(
         reverse_request_id = id,
@@ -1422,38 +1094,12 @@ fn deliver_reverse_reply(pending: &mut PendingReverse, reverse_id: u64, frame: &
     }
 }
 
-async fn dispatch_operator_mutation(
-    ctx: &ConnectionContext,
-    mutation: plug_core::operator::OperatorMutation,
-) -> IpcResponse {
-    dispatch_operator_mutation_keeping(ctx, mutation, None).await
-}
-
-async fn dispatch_operator_mutation_keeping(
-    ctx: &ConnectionContext,
-    mutation: plug_core::operator::OperatorMutation,
-    secret_store: Option<&str>,
-) -> IpcResponse {
-    match ctx
-        .engine
-        .apply_operator_mutation_keeping(&ctx.config_path, mutation, secret_store)
-        .await
-    {
-        Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
-        Err(error) => IpcResponse::Error {
-            code: "OPERATOR_MUTATION_FAILED".to_string(),
-            message: error.to_string(),
-        },
-    }
-}
-
 fn current_daemon_executable() -> Option<std::path::PathBuf> {
     std::env::current_exe()
         .ok()
         .and_then(|path| std::fs::canonicalize(path).ok())
 }
 
-/// Dispatch a single IPC request to the appropriate Engine query.
 /// Drop upstream branding icons from an operator snapshot's server statuses.
 ///
 /// An icon is a base64 data URI, and a server that advertises a large one makes
@@ -1489,74 +1135,101 @@ fn tool_catalog_revision(ctx: &ConnectionContext) -> u64 {
     hasher.finish()
 }
 
-async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
-    fn downstream_http_live_sessions(
-        sessions: &dyn SessionStore,
-    ) -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
-        let mut live_sessions = sessions
-            .session_snapshots()
-            .into_iter()
-            .map(|snapshot| plug_core::ipc::IpcLiveSessionInfo {
-                transport: match snapshot.transport {
-                    plug_core::session::DownstreamTransport::Http => {
-                        plug_core::ipc::LiveSessionTransport::Http
-                    }
-                },
-                client_id: None,
-                grant: snapshot.grant,
-                link_target: None,
-                session_id: snapshot.session_id,
-                client_type: snapshot.client_type,
-                client_info: None,
-                adapter_version: None,
-                host: None,
-                connected_secs: snapshot.connected_seconds,
-                last_activity_secs: Some(snapshot.idle_seconds),
-            })
-            .collect::<Vec<_>>();
-        live_sessions.sort_by(|a, b| {
-            a.client_type
-                .to_string()
-                .cmp(&b.client_type.to_string())
-                .then(a.session_id.cmp(&b.session_id))
-        });
-        live_sessions
+/// What each client is kept from: the owner's lists, by the names the app and
+/// the command line show, and what the daemon enforces of them.
+fn client_blocks(
+    config: &plug_core::config::Config,
+    configured: &[plug_core::operator::OperatorServerSummary],
+    router: &ToolRouter,
+) -> Vec<plug_core::ipc::ClientBlocks> {
+    let limited: Vec<_> = config
+        .clients
+        .iter()
+        .filter(|(_, settings)| {
+            !settings.blocked_servers.is_empty()
+                || !settings.blocked_tools.is_empty()
+                || settings.has_allow_list()
+        })
+        .collect();
+    if limited.is_empty() {
+        return Vec::new();
     }
-
-    match request {
-        IpcRequest::Status => {
-            let servers = ctx.server_manager.server_statuses();
-            IpcResponse::Status {
-                servers,
-                clients: ctx.client_registry.count(),
-                uptime_secs: ctx.started_at.elapsed().as_secs(),
-                runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-                resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
+    let listed: Vec<(String, String)> = router
+        .list_all_tools_with_risk()
+        .into_iter()
+        .map(|(server, tool, _)| (tool.name.to_string(), server))
+        .collect();
+    limited
+        .into_iter()
+        .map(|(key, settings)| {
+            let key_ref = Some(key.as_str());
+            // By the name each tool is listed under now, which is how the
+            // app and the command line know a tool.
+            let tools: Vec<String> = settings
+                .blocked_tools
+                .iter()
+                .map(|block| match block {
+                    plug_core::config::ToolBlock::Of { server, tool } => router
+                        .listed_name(server, tool)
+                        .unwrap_or_else(|| block.to_string()),
+                    plug_core::config::ToolBlock::Named(name) => name.clone(),
+                })
+                .collect();
+            let off_servers: Vec<String> = configured
+                .iter()
+                .map(|server| &server.name)
+                .filter(|server| !router.client_may_use_server(key_ref, server))
+                .cloned()
+                .collect();
+            let off_tools = listed
+                .iter()
+                .filter(|(_, server)| !off_servers.contains(server))
+                .filter(|(name, _)| !router.client_may_use_tool(key_ref, name))
+                .map(|(name, _)| plug_core::ipc::OffTool {
+                    name: name.clone(),
+                    rule: tools
+                        .iter()
+                        .filter(|rule| rule.contains('*'))
+                        .find(|rule| {
+                            plug_core::tool_patterns::is_disabled_tool(
+                                std::slice::from_ref(*rule),
+                                name,
+                            )
+                        })
+                        .cloned(),
+                })
+                .collect();
+            plug_core::ipc::ClientBlocks {
+                key: key.clone(),
+                servers: settings.blocked_servers.clone(),
+                tools,
+                only_allowed: settings.has_allow_list(),
+                allowed_servers: settings.allowed_servers.clone(),
+                allowed_tools: settings
+                    .allowed_tools
+                    .iter()
+                    .map(|allowed| {
+                        router
+                            .listed_name(&allowed.server, &allowed.tool)
+                            // The form `plug clients only --remove` takes for
+                            // a tool Plug no longer lists.
+                            .unwrap_or_else(|| format!("{}/{}", allowed.server, allowed.tool))
+                    })
+                    .collect(),
+                off_servers,
+                off_tools,
             }
-        }
-        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
-            handshake: plug_core::ipc::OperatorHandshake {
-                daemon_version: env!("CARGO_PKG_VERSION").to_string(),
-                daemon_executable: current_daemon_executable(),
-                ipc_min: plug_core::ipc::OPERATOR_IPC_MIN,
-                ipc_max: plug_core::ipc::OPERATOR_IPC_MAX,
-                ownership: crate::service::ipc_ownership(),
-                capabilities: vec![
-                    plug_core::ipc::OperatorCapability::ServerMutation,
-                    plug_core::ipc::OperatorCapability::ClientMutation,
-                    plug_core::ipc::OperatorCapability::AuthMutation,
-                    plug_core::ipc::OperatorCapability::ConfigMutation,
-                    plug_core::ipc::OperatorCapability::ActivityStream,
-                    plug_core::ipc::OperatorCapability::ToolMutation,
-                    plug_core::ipc::OperatorCapability::ServerConfigRead,
-                ],
-            },
-        },
-        IpcRequest::ActivitySnapshot {
+        })
+        .collect()
+}
+
+/// Answer a request that came with the daemon token.
+async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContext) -> IpcResponse {
+    match request {
+        OperatorRequest::Activity {
             after_sequence,
             limit,
             failures_only,
-            ..
         } => IpcResponse::ActivitySnapshot {
             events: ctx.engine.tool_router().activity_snapshot(
                 &plug_core::activity::ActivityFilter {
@@ -1566,20 +1239,15 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             ),
         },
-        IpcRequest::OperatorSnapshot { .. } => {
+        OperatorRequest::Snapshot => {
             // The configured servers come from the file, so the app can see a
             // server the daemon has not loaded. A file that does not parse,
             // often one saved mid-edit, must not blank the app while the
-            // daemon keeps serving its last good config: report the error and
-            // list the running config instead.
-            let (config, config_error) =
-                match plug_core::operator::load_editable_config(&ctx.config_path) {
-                    Ok(config) => (std::sync::Arc::new(config), None),
-                    Err(error) => (
-                        std::sync::Arc::clone(&ctx.engine.config()),
-                        Some(config_error_summary(&error.to_string())),
-                    ),
-                };
+            // daemon keeps serving its last good config: list that instead.
+            let config = match plug_core::config::load_editable_config(&ctx.config_path) {
+                Ok(config) => std::sync::Arc::new(config),
+                Err(_) => std::sync::Arc::clone(&ctx.engine.config()),
+            };
             let mut configured_servers = config
                 .servers
                 .iter()
@@ -1588,28 +1256,10 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 })
                 .collect::<Vec<_>>();
             configured_servers.sort_by(|a, b| a.name.cmp(&b.name));
-            let mut live_sessions = ctx.client_registry.list_live_sessions();
-            if let Some(http_sessions) = ctx.http_sessions.as_ref() {
-                live_sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
-            }
-            live_sessions.sort_by(|a, b| a.session_id.cmp(&b.session_id));
-            let client_visibility = live_sessions
-                .iter()
-                .map(|session| plug_core::ipc::OperatorClientVisibility {
-                    session_id: session.session_id.clone(),
-                    client_type: session.client_type,
-                    visible_tool_count: ctx
-                        .engine
-                        .tool_router()
-                        .list_tools_for_client_session(
-                            session.client_type,
-                            Some(live_session_lazy_key(session).as_str()),
-                            session.access_key().as_deref(),
-                        )
-                        .len(),
-                    client_key: session.client_key(),
-                })
-                .collect();
+            let live_sessions = plug_core::session::live_sessions(
+                ctx.client_registry.list_live_sessions(),
+                &ctx.http.sessions,
+            );
             let client_names = config
                 .clients
                 .iter()
@@ -1630,87 +1280,38 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     })
                 })
                 .collect();
-            let client_blocks = config
-                .clients
-                .iter()
-                .filter(|(_, settings)| {
-                    !settings.blocked_servers.is_empty()
-                        || !settings.blocked_tools.is_empty()
-                        || settings.has_allow_list()
-                })
-                .map(|(key, settings)| plug_core::ipc::ClientBlocks {
-                    key: key.clone(),
-                    servers: settings.blocked_servers.clone(),
-                    only_allowed: settings.has_allow_list(),
-                    partly_allowed_servers: {
-                        let mut servers: Vec<String> = settings
-                            .allowed_tools
-                            .iter()
-                            .map(|allowed| allowed.server.clone())
-                            .collect();
-                        servers.sort();
-                        servers.dedup();
-                        servers
-                    },
-                    allowed_servers: settings.allowed_servers.clone(),
-                    allowed_tools: settings
-                        .allowed_tools
-                        .iter()
-                        .map(|allowed| {
-                            ctx.engine
-                                .tool_router()
-                                .listed_name(&allowed.server, &allowed.tool)
-                                // The form `plug clients only --remove`
-                                // takes for a tool Plug no longer lists.
-                                .unwrap_or_else(|| format!("{}/{}", allowed.server, allowed.tool))
-                        })
-                        .collect(),
-                    // By the name each tool is listed under now, which is
-                    // how the app and the command line know a tool.
-                    tools: settings
-                        .blocked_tools
-                        .iter()
-                        .map(|block| match block {
-                            plug_core::config::ToolBlock::Of { server, tool } => ctx
-                                .engine
-                                .tool_router()
-                                .listed_name(server, tool)
-                                .unwrap_or_else(|| block.to_string()),
-                            plug_core::config::ToolBlock::Named(name) => name.clone(),
-                        })
-                        .collect(),
-                })
-                .collect();
+            let client_blocks =
+                client_blocks(&config, &configured_servers, ctx.engine.tool_router());
             let events = ctx.engine.event_statuses(&config).await;
-            let mut server_statuses = ctx.server_manager.server_statuses();
+            let mut server_statuses = ctx.engine.server_manager().server_statuses();
             strip_upstream_icons(&mut server_statuses);
             let upstream_auth = auth_status_from_statuses(ctx, &server_statuses).await;
-            let downstream_clients = match ctx.downstream_oauth.as_ref() {
+            let downstream_clients = match ctx.http.downstream_oauth() {
                 Some(manager) => manager.list_clients().await,
                 None => Vec::new(),
             };
             IpcResponse::OperatorSnapshot {
                 snapshot: Box::new(plug_core::ipc::OperatorSnapshot {
                     runtime_version: env!("CARGO_PKG_VERSION").to_string(),
-                    uptime_secs: ctx.started_at.elapsed().as_secs(),
+                    uptime_secs: ctx.engine.uptime().as_secs(),
+                    started_id: ctx.started_id,
                     tool_catalog_revision: tool_catalog_revision(ctx),
-                    ownership: crate::service::ipc_ownership(),
+                    ownership: ctx.ownership,
                     configured_servers,
                     servers: server_statuses,
                     live_sessions,
-                    client_visibility,
                     upstream_auth,
                     downstream_clients,
                     client_names,
                     client_places,
                     client_blocks,
                     events,
-                    config_error,
-                    client_address: Some(crate::commands::clients::http_export_url(&config)),
+                    client_address: Some(config.http.mcp_url()),
+                    prefix_delimiter: config.prefix_delimiter.clone(),
                 }),
             }
         }
-        IpcRequest::GetServerConfig { name, .. } => {
+        OperatorRequest::GetServerConfig { name } => {
             let config = match load_editable_config(&ctx.config_path) {
                 Ok(config) => config,
                 Err(response) => return response,
@@ -1729,49 +1330,37 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::RevokeDownstreamClient { client_id, .. } => {
-            let Some(manager) = ctx.downstream_oauth.as_ref() else {
-                return IpcResponse::Error {
-                    code: "DOWNSTREAM_OAUTH_DISABLED".to_string(),
-                    message: "downstream OAuth is not enabled".to_string(),
-                };
-            };
-            match manager.revoke_client(client_id).await {
-                Ok(true) => {
-                    if let Some(sessions) = ctx.http_sessions.as_ref() {
-                        sessions.end_sessions_of(client_id);
-                    }
-                    IpcResponse::DownstreamClientRevoked {
-                        client_id: client_id.clone(),
-                    }
-                }
-                Ok(false) => IpcResponse::Error {
+        OperatorRequest::RevokeDownstreamClient { client_id } => {
+            match ctx.http.revoke_downstream_client(client_id).await {
+                ClientRevocation::Revoked => IpcResponse::DownstreamClientRevoked {
+                    client_id: client_id.clone(),
+                },
+                ClientRevocation::UnknownClient => IpcResponse::Error {
                     code: "UNKNOWN_DOWNSTREAM_CLIENT".to_string(),
                     message: format!("registered client `{client_id}` was not found"),
                 },
-                Err(error) => {
-                    // The grant stopped working before the save was tried,
-                    // so its sessions end even though the save failed.
-                    if let Some(sessions) = ctx.http_sessions.as_ref() {
-                        sessions.end_sessions_of(client_id);
-                    }
-                    IpcResponse::Error {
-                        code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
-                        message: error.to_string(),
-                    }
-                }
-            }
-        }
-        IpcRequest::ValidateServer { name, server, .. } => {
-            match ctx.engine.validate_server_draft(name, server) {
-                Ok(server) => IpcResponse::ServerValidated { server },
-                Err(error) => IpcResponse::Error {
-                    code: "INVALID_SERVER".to_string(),
+                ClientRevocation::OauthDisabled => IpcResponse::Error {
+                    code: "DOWNSTREAM_OAUTH_DISABLED".to_string(),
+                    message: "downstream OAuth is not enabled".to_string(),
+                },
+                ClientRevocation::SaveFailed(error) => IpcResponse::Error {
+                    code: "DOWNSTREAM_CLIENT_REVOKE_FAILED".to_string(),
                     message: error.to_string(),
                 },
             }
         }
-        IpcRequest::DescribeApi { spec, .. } => {
+        OperatorRequest::ValidateServer {
+            name,
+            server,
+            replacing,
+        } => match ctx.engine.validate_server_draft(name, server, *replacing) {
+            Ok(server) => IpcResponse::ServerValidated { server },
+            Err(error) => IpcResponse::Error {
+                code: plug_core::operator::NameTaken::code_or(&error, "INVALID_SERVER").to_string(),
+                message: error.to_string(),
+            },
+        },
+        OperatorRequest::DescribeApi { spec } => {
             match plug_core::openapi::describe(spec, API_DESCRIBE_TIMEOUT).await {
                 Ok(api) => IpcResponse::ApiDescribed { api },
                 Err(error) => IpcResponse::Error {
@@ -1780,150 +1369,39 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::AddServer {
-            name,
-            server,
+        OperatorRequest::Mutate {
+            mutation,
             secret_store,
-            ..
         } => {
-            dispatch_operator_mutation_keeping(
-                ctx,
-                plug_core::operator::OperatorMutation::AddServer {
-                    name: name.clone(),
-                    server: *server.clone(),
-                },
-                secret_store.as_deref(),
-            )
-            .await
-        }
-        IpcRequest::UpdateServer {
-            name,
-            server,
-            secret_store,
-            ..
-        } => {
-            dispatch_operator_mutation_keeping(
-                ctx,
-                plug_core::operator::OperatorMutation::UpdateServer {
-                    name: name.clone(),
-                    server: *server.clone(),
-                },
-                secret_store.as_deref(),
-            )
-            .await
-        }
-        IpcRequest::RemoveServer { name, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::RemoveServer { name: name.clone() },
-            )
-            .await
-        }
-        IpcRequest::AddAccount {
-            server, account, ..
-        } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::AddAccount {
-                    server: server.clone(),
-                    account: account.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::SetServerEnabled { name, enabled, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetServerEnabled {
-                    name: name.clone(),
-                    enabled: *enabled,
-                },
-            )
-            .await
-        }
-        IpcRequest::SetToolEnabled { tool, enabled, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetToolEnabled {
-                    tool: tool.clone(),
-                    enabled: *enabled,
-                },
-            )
-            .await
-        }
-        IpcRequest::RenameClient { key, name, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::RenameClient {
-                    key: key.clone(),
-                    name: name.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::MoveClientSettings { from, to, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::MoveClientSettings {
-                    from: from.clone(),
-                    to: to.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::SetClientPlace { key, place, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetClientPlace {
-                    key: key.clone(),
-                    place: place.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::SetClientBlock {
-            key,
-            kind,
-            target,
-            blocked,
-            ..
-        } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::SetClientBlock {
-                    key: key.clone(),
-                    kind: *kind,
-                    target: target.clone(),
-                    blocked: *blocked,
-                },
-            )
-            .await
-        }
-        IpcRequest::AddWatch { watch, .. } => {
-            if let Err(error) = ctx.engine.check_watch(watch) {
+            if let plug_core::operator::OperatorMutation::AddWatch { watch } = &**mutation
+                && let Err(error) = ctx.engine.check_watch(watch)
+            {
                 return IpcResponse::Error {
                     code: "OPERATOR_MUTATION_FAILED".to_string(),
                     message: error.to_string(),
                 };
             }
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::AddWatch {
-                    watch: watch.clone(),
+            match ctx
+                .engine
+                .apply_operator_mutation_keeping(
+                    &ctx.config_path,
+                    (**mutation).clone(),
+                    secret_store.as_deref(),
+                )
+                .await
+            {
+                Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
+                Err(error) => IpcResponse::Error {
+                    code: plug_core::operator::NameTaken::code_or(
+                        &error,
+                        "OPERATOR_MUTATION_FAILED",
+                    )
+                    .to_string(),
+                    message: error.to_string(),
                 },
-            )
-            .await
+            }
         }
-        IpcRequest::RemoveWatch { event, .. } => {
-            dispatch_operator_mutation(
-                ctx,
-                plug_core::operator::OperatorMutation::RemoveWatch {
-                    event: event.clone(),
-                },
-            )
-            .await
-        }
-        IpcRequest::RestartServer { server_id, .. } => {
+        OperatorRequest::RestartServer { server_id } => {
             match ctx.engine.restart_server(server_id).await {
                 Ok(()) => IpcResponse::Ok,
                 Err(e) => IpcResponse::Error {
@@ -1932,32 +1410,54 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 },
             }
         }
-        IpcRequest::Reload { .. } => {
+        OperatorRequest::Reload => {
             // Load fresh config from disk and apply via Engine
             match plug_core::config::load_config(Some(&ctx.config_path)) {
-                Ok(new_config) => match ctx.engine.reload_config(new_config).await {
-                    Ok(report) => {
-                        tracing::info!(
-                            added = report.added.len(),
-                            removed = report.removed.len(),
-                            changed = report.changed.len(),
-                            "config reloaded via IPC"
-                        );
-                        IpcResponse::Reloaded { report }
-                    }
-                    Err(e) => IpcResponse::Error {
-                        code: "RELOAD_FAILED".to_string(),
-                        message: e.to_string(),
-                    },
-                },
+                Ok(new_config) => {
+                    let report = ctx.engine.reload_config(new_config).await;
+                    tracing::info!(
+                        added = report.added.len(),
+                        removed = report.removed.len(),
+                        changed = report.changed.len(),
+                        "config reloaded via IPC"
+                    );
+                    IpcResponse::Reloaded { report }
+                }
                 Err(e) => IpcResponse::Error {
                     code: "CONFIG_LOAD_FAILED".to_string(),
                     message: e.to_string(),
                 },
             }
         }
-        IpcRequest::Shutdown { .. } => IpcResponse::Ok,
+        OperatorRequest::Shutdown => IpcResponse::Ok,
+    }
+}
 
+async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> IpcResponse {
+    if let Some(session_id) = request.connection_session_id()
+        && let Some(refusal) = reject_unowned_session(ctx, session_id)
+    {
+        return refusal;
+    }
+    match request {
+        IpcRequest::Status => {
+            let servers = ctx.engine.server_manager().server_statuses();
+            IpcResponse::Status {
+                servers,
+                clients: ctx.client_registry.count(),
+                uptime_secs: ctx.engine.uptime().as_secs(),
+                runtime_version: env!("CARGO_PKG_VERSION").to_string(),
+                resource_subscriptions: ctx.engine.tool_router().active_subscription_count(),
+            }
+        }
+        IpcRequest::OperatorHandshake { .. } => IpcResponse::OperatorHandshake {
+            handshake: plug_core::ipc::OperatorHandshake::new(
+                env!("CARGO_PKG_VERSION").to_string(),
+                current_daemon_executable(),
+                ctx.ownership,
+            ),
+        },
+        IpcRequest::Operator { request, .. } => dispatch_operator(request, ctx).await,
         IpcRequest::Register {
             protocol_version,
             client_id,
@@ -1966,23 +1466,17 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             host,
             link_target,
         } => {
-            if !(plug_core::ipc::IPC_PROTOCOL_VERSION_MIN..=plug_core::ipc::IPC_PROTOCOL_VERSION)
-                .contains(protocol_version)
-            {
-                return IpcResponse::Error {
-                    code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
-                    message: format!(
-                        "daemon supports IPC protocol v{}..=v{}, got v{}",
-                        plug_core::ipc::IPC_PROTOCOL_VERSION_MIN,
+            if *protocol_version != plug_core::ipc::IPC_PROTOCOL_VERSION {
+                return IpcResponse::error(
+                    ipc::IpcErrorCode::ProtocolVersionUnsupported,
+                    format!(
+                        "daemon supports IPC protocol v{}, got v{}",
                         plug_core::ipc::IPC_PROTOCOL_VERSION,
                         protocol_version
                     ),
-                };
+                );
             }
-            // Enforce one registration per connection — deregister previous if exists
-            if let Some(ref old_session) = ctx.session_id {
-                ctx.client_registry.deregister(old_session);
-            }
+            let previous_session_id = ctx.session_id.take();
             let registration = ctx.client_registry.register_hosted(
                 client_id.clone(),
                 client_info.clone(),
@@ -1998,32 +1492,21 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     new_session_id = %registration.session_id,
                     "client transport session replaced"
                 );
-                let target = plug_core::notifications::NotificationTarget::Ipc {
-                    client_id: Arc::from(replaced_session_id.as_str()),
-                };
                 ctx.engine
                     .tool_router()
-                    .cleanup_subscriptions_for_target(&target)
+                    .end_downstream_session(EndedSession::Ipc {
+                        session_id: replaced_session_id,
+                        // The new registration holds the same client id.
+                        connector: ConnectorAfter::StillRegistered,
+                    })
                     .await;
-                ctx.engine
-                    .tool_router()
-                    .unregister_downstream_bridge(&target);
-                if ctx.engine.tool_router().clear_roots_for_target(&target) {
-                    ctx.engine
-                        .tool_router()
-                        .forward_roots_list_changed_to_upstreams()
-                        .await;
-                }
-                ctx.engine
-                    .tool_router()
-                    .remove_client_log_level(replaced_session_id);
-                let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                    plug_core::proxy::DownstreamTransport::Ipc,
-                    replaced_session_id,
-                );
-                ctx.engine
-                    .tool_router()
-                    .clear_lazy_session(&lazy_session_key);
+            }
+            // One registration per connection: one this connection made
+            // earlier for another client id ends now.
+            if let Some(previous) = previous_session_id
+                && registration.replaced_session_id.as_ref() != Some(&previous)
+            {
+                end_ipc_session(ctx, &previous).await;
             }
             let session_id = registration.session_id;
             ctx.session_id = Some(session_id.clone());
@@ -2045,74 +1528,25 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             );
             ctx.reverse_request_rx = Some(reverse_rx);
 
-            // Echo the client's version: a v3 client checks for an exact match.
             IpcResponse::Registered {
-                protocol_version: *protocol_version,
+                protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
                 client_id: client_id.clone(),
                 session_id,
                 modern_downstream_enabled: ctx.engine.tool_router().modern_downstream_enabled(),
                 cancellation_capability: plug_core::ipc::IpcCancellationCapability::new(
                     registration.cancellation_capability,
                 ),
+                request_ceiling_ms: plug_core::ipc::proxy_request_ceiling(&ctx.engine.config())
+                    .as_millis()
+                    .try_into()
+                    .unwrap_or(u64::MAX),
             }
-        }
-
-        IpcRequest::Deregister { session_id } => {
-            // Enforce session ownership — only deregister your own session
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            let removed_client_id = ctx.client_registry.client_id(session_id);
-            ctx.client_registry.deregister(session_id);
-            let target = plug_core::notifications::NotificationTarget::Ipc {
-                client_id: std::sync::Arc::from(session_id.as_str()),
-            };
-            ctx.engine
-                .tool_router()
-                .cleanup_subscriptions_for_target(&target)
-                .await;
-            ctx.engine
-                .tool_router()
-                .unregister_downstream_bridge(&target);
-            if ctx.engine.tool_router().clear_roots_for_target(&target) {
-                ctx.engine
-                    .tool_router()
-                    .forward_roots_list_changed_to_upstreams()
-                    .await;
-            }
-            ctx.engine.tool_router().remove_client_log_level(session_id);
-            let lazy_session_key = plug_core::proxy::ToolRouter::lazy_session_key(
-                plug_core::proxy::DownstreamTransport::Ipc,
-                session_id,
-            );
-            ctx.engine
-                .tool_router()
-                .clear_lazy_session(&lazy_session_key);
-            if let Some(client_id) = removed_client_id
-                && !ctx.client_registry.client_sessions.contains_key(&client_id)
-            {
-                ctx.engine.tool_router().revoke_continuations_for_principal(
-                    &plug_core::types::PrincipalId::daemon_ipc_registry(&client_id),
-                );
-                let owner = plug_core::proxy::ToolRouter::task_owner_for_ipc_client(&client_id);
-                ctx.engine
-                    .tool_router()
-                    .cleanup_tasks_for_owner(&owner)
-                    .await;
-            }
-            ctx.session_id = None;
-            ctx.reverse_request_rx = None;
-            IpcResponse::Ok
         }
 
         IpcRequest::UpdateSession {
             session_id,
             client_info,
         } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             if ctx
                 .client_registry
                 .update_client_info(session_id, client_info.clone())
@@ -2131,12 +1565,7 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
-        IpcRequest::Ping { session_id } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            IpcResponse::Pong
-        }
+        IpcRequest::Ping { .. } => IpcResponse::Pong,
 
         IpcRequest::ListTools => {
             let tool_router = ctx.engine.tool_router();
@@ -2160,12 +1589,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                             &server_id,
                             config.servers.get(&server_id),
                         ),
-                        risk,
-                        disabled: plug_core::ipc::tool_is_disabled(
+                        risk: plug_core::ipc::IpcToolRiskInfo::from_annotations(
+                            risk.upstream_declared.as_ref(),
+                            risk.plug_inferred.as_ref(),
+                            risk.effective.as_ref(),
+                        ),
+                        disabled: plug_core::tool_patterns::is_disabled_tool(
                             &config.disabled_tools,
                             tool.name.as_ref(),
                         ),
-                        disabled_by_pattern: plug_core::ipc::disabling_wildcard(
+                        disabled_by_pattern: plug_core::tool_patterns::disabling_wildcard(
                             &config.disabled_tools,
                             tool.name.as_ref(),
                         ),
@@ -2181,50 +1614,22 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             IpcResponse::Tools { tools: ipc_tools }
         }
         IpcRequest::ListLiveSessions => IpcResponse::LiveSessions {
-            sessions: {
-                let mut sessions = ctx.client_registry.list_live_sessions();
-                if let Some(http_sessions) = ctx.http_sessions.as_ref() {
-                    sessions.extend(downstream_http_live_sessions(http_sessions.as_ref()));
-                }
-                sessions.sort_by(|a, b| {
-                    let transport_order =
-                        |transport: plug_core::ipc::LiveSessionTransport| match transport {
-                            plug_core::ipc::LiveSessionTransport::DaemonProxy => 0,
-                            plug_core::ipc::LiveSessionTransport::Http => 1,
-                            plug_core::ipc::LiveSessionTransport::Sse => 2,
-                        };
-                    transport_order(a.transport)
-                        .cmp(&transport_order(b.transport))
-                        .then(a.client_type.to_string().cmp(&b.client_type.to_string()))
-                        .then(a.session_id.cmp(&b.session_id))
-                });
-                sessions
-            },
-            scope: if ctx.http_sessions.is_some() {
-                plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-            } else {
-                plug_core::ipc::LiveSessionInventoryScope::DaemonProxyOnly
-            },
+            sessions: plug_core::session::live_sessions(
+                ctx.client_registry.list_live_sessions(),
+                &ctx.http.sessions,
+            ),
         },
         IpcRequest::Capabilities { session_id } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             // Capabilities are negotiated once per session and never
             // revisited, so answering from a catalog that is still filling
             // would tell a client the daemon has no tools and leave it with no
             // way to learn otherwise. This is the one answer that must not be
             // partial.
             ctx.engine.wait_until_ready().await;
-            let client_type = ctx
-                .client_registry
-                .client_info(session_id)
-                .map(|info| plug_core::client_detect::detect_client(&info))
-                .unwrap_or(plug_core::types::ClientType::Unknown);
-            let caps = ctx
-                .engine
-                .tool_router()
-                .synthesized_capabilities_for_client(client_type);
+            let caps = plug_core::dispatch::server_capabilities(
+                ctx.engine.tool_router(),
+                &mcp_dispatch::ipc_context(ctx, session_id, None),
+            );
             match serde_json::to_value(caps) {
                 Ok(capabilities) => IpcResponse::Capabilities { capabilities },
                 Err(error) => IpcResponse::Error {
@@ -2234,20 +1639,11 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             }
         }
 
-        IpcRequest::ModernDownstreamGate { session_id } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            IpcResponse::ModernDownstreamGate {
-                enabled: ctx.engine.tool_router().modern_downstream_enabled(),
-            }
-        }
+        IpcRequest::ModernDownstreamGate { .. } => IpcResponse::ModernDownstreamGate {
+            enabled: ctx.engine.tool_router().modern_downstream_enabled(),
+        },
 
         IpcRequest::UpdateRoots { session_id, roots } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             match serde_json::from_value::<Vec<rmcp::model::Root>>(roots.clone()) {
                 Ok(parsed_roots) => {
                     let target = plug_core::notifications::NotificationTarget::Ipc {
@@ -2276,10 +1672,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             capabilities,
         } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             if ctx
                 .client_registry
                 .update_capabilities(session_id, *capabilities.clone())
@@ -2298,9 +1690,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
         }
 
         IpcRequest::RestoreResourceSubscriptions { session_id, uris } => {
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
             let target = plug_core::notifications::NotificationTarget::Ipc {
                 client_id: Arc::from(session_id.as_str()),
             };
@@ -2364,27 +1753,8 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
             session_id,
             method,
             params,
-        } => {
-            // Enforce session ownership
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            dispatch_mcp_request(ctx, session_id, method, params.as_ref(), None).await
-        }
-
-        IpcRequest::McpRequestWithContext {
-            session_id,
-            method,
-            params,
             context,
-        } => {
-            // Context-bearing requests use the same connection ownership
-            // rules as the legacy IPC request shape.
-            if let Some(response) = reject_unowned_session(ctx, session_id) {
-                return response;
-            }
-            dispatch_mcp_request(ctx, session_id, method, params.as_ref(), Some(context)).await
-        }
+        } => dispatch_mcp_request(ctx, session_id, method, params.as_ref(), context.as_ref()).await,
 
         IpcRequest::CancelMcpRequest {
             session_id,
@@ -2406,20 +1776,12 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 return response;
             }
 
-            let client_type = ctx
-                .client_registry
-                .client_info(session_id)
-                .as_deref()
-                .map(plug_core::client_detect::detect_client)
-                .unwrap_or(plug_core::types::ClientType::Unknown);
-            let downstream = plug_core::proxy::DownstreamCallContext::ipc_for_client(
+            let downstream = plug_core::proxy::DownstreamCallContext::ipc(
                 session_id.as_str(),
                 request_id.clone(),
-                client_type,
+                ctx.client_registry.client_type(session_id),
+                Some(client_id),
             )
-            .with_local_principal(plug_core::types::PrincipalId::daemon_ipc_registry(
-                client_id,
-            ))
             .with_client_key(ctx.client_registry.client_key(session_id));
             ctx.engine
                 .tool_router()
@@ -2436,16 +1798,16 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
 /// (`SESSION_REPLACED`).
 fn reject_unowned_session(ctx: &ConnectionContext, session_id: &str) -> Option<IpcResponse> {
     if ctx.session_id.as_deref() != Some(session_id) {
-        return Some(IpcResponse::Error {
-            code: "SESSION_MISMATCH".to_string(),
-            message: "session_id does not match this connection".to_string(),
-        });
+        return Some(IpcResponse::error(
+            ipc::IpcErrorCode::SessionMismatch,
+            "session_id does not match this connection",
+        ));
     }
     if !ctx.client_registry.session_exists(session_id) {
-        return Some(IpcResponse::Error {
-            code: "SESSION_REPLACED".to_string(),
-            message: "session is no longer active for this client".to_string(),
-        });
+        return Some(IpcResponse::error(
+            ipc::IpcErrorCode::SessionReplaced,
+            "session is no longer active for this client",
+        ));
     }
     None
 }
@@ -2457,10 +1819,10 @@ fn reject_invalid_cancellation_identity(
     cancellation_capability: &plug_core::ipc::IpcCancellationCapability,
 ) -> Option<IpcResponse> {
     if !registry.session_exists(session_id) {
-        return Some(IpcResponse::Error {
-            code: "SESSION_REPLACED".to_string(),
-            message: "session is no longer active for this client".to_string(),
-        });
+        return Some(IpcResponse::error(
+            ipc::IpcErrorCode::SessionReplaced,
+            "session is no longer active for this client",
+        ));
     }
     if registry.client_id(session_id).as_deref() != Some(client_id) {
         return Some(IpcResponse::Error {
@@ -2485,13 +1847,13 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
         Some("Register")
             if value.get("protocol_version").is_none() || value.get("client_id").is_none() =>
         {
-            Some(IpcResponse::Error {
-                code: "PROTOCOL_VERSION_UNSUPPORTED".to_string(),
-                message: format!(
+            Some(IpcResponse::error(
+                ipc::IpcErrorCode::ProtocolVersionUnsupported,
+                format!(
                     "daemon requires IPC protocol v{} registration fields",
                     plug_core::ipc::IPC_PROTOCOL_VERSION
                 ),
-            })
+            ))
         }
         _ => None,
     }
@@ -2500,32 +1862,35 @@ fn protocol_parse_error_response(frame: &[u8]) -> Option<IpcResponse> {
 // ──────────────────────── Unix signal handling ───────────────────────────────
 
 /// How long a signalled daemon lets running tool calls finish before it tears
-/// down. The launchd plists set `ExitTimeOut` to twenty seconds, which leaves
-/// room for upstream shutdown after the drain.
-const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
+/// down. It has to fit inside the plists' `ExitTimeOut`, which a service test
+/// checks.
+pub(crate) const CALL_DRAIN_TIMEOUT: Duration = Duration::from_secs(8);
 
-/// Wait for SIGTERM or SIGINT (for daemon mode), then let running tool calls
-/// finish before cancelling. Clients and transports stay up while the calls
-/// drain, so an update or a stop does not fail a call an agent is waiting on.
-///
-/// Systemd sends SIGTERM for graceful shutdown, not SIGINT.
-#[cfg(unix)]
-pub async fn shutdown_signal(cancel: CancellationToken, router: Arc<ToolRouter>) {
+/// When `stop` resolves, let running tool calls finish, then cancel. Clients
+/// and transports stay up while the calls drain, so an update or a stop does
+/// not fail a call an agent is waiting on. Returns at once when something else
+/// cancels first.
+pub(crate) async fn shutdown_on(
+    stop: impl Future<Output = ()>,
+    cancel: CancellationToken,
+    router: Arc<ToolRouter>,
+) {
+    tokio::select! {
+        () = stop => drain_calls(&router).await,
+        () = cancel.cancelled() => {}
+    }
+    cancel.cancel();
+}
+
+/// SIGTERM, which launchd sends to stop the daemon, or SIGINT.
+pub(crate) async fn termination_signal() {
     use tokio::signal::unix::{SignalKind, signal};
     let mut sigterm = signal(SignalKind::terminate()).expect("failed to install SIGTERM handler");
     let mut sigint = signal(SignalKind::interrupt()).expect("failed to install SIGINT handler");
     tokio::select! {
-        _ = sigterm.recv() => {
-            tracing::info!("received SIGTERM");
-            drain_calls(&router).await;
-        }
-        _ = sigint.recv() => {
-            tracing::info!("received SIGINT");
-            drain_calls(&router).await;
-        }
-        _ = cancel.cancelled() => {}
+        _ = sigterm.recv() => tracing::info!("received SIGTERM"),
+        _ = sigint.recv() => tracing::info!("received SIGINT"),
     }
-    cancel.cancel();
 }
 
 async fn drain_calls(router: &ToolRouter) {
@@ -2539,18 +1904,6 @@ async fn drain_calls(router: &ToolRouter) {
     }
 }
 
-/// Fallback for non-Unix platforms.
-#[cfg(not(unix))]
-pub async fn shutdown_signal(cancel: CancellationToken, _router: Arc<ToolRouter>) {
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            tracing::info!("received Ctrl+C");
-        }
-        _ = cancel.cancelled() => {}
-    }
-    cancel.cancel();
-}
-
 // ──────────────────────── File logging setup ─────────────────────────────────
 
 /// Set up file logging with daily rotation for daemon mode.
@@ -2559,14 +1912,12 @@ pub async fn shutdown_signal(cancel: CancellationToken, _router: Arc<ToolRouter>
 /// Must be called BEFORE any other tracing subscriber is initialized.
 pub fn setup_file_logging(
     log_directory: &std::path::Path,
+    filter: tracing_subscriber::EnvFilter,
 ) -> anyhow::Result<tracing_appender::non_blocking::WorkerGuard> {
     ensure_dir(log_directory)?;
 
     let file_appender = ReopeningLog::open(log_directory, LOG_FILE_CHECK_EVERY)?;
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-
-    let filter = tracing_subscriber::EnvFilter::try_from_env("PLUG_LOG")
-        .unwrap_or_else(|_| crate::default_log_filter("info"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)
@@ -2588,7 +1939,7 @@ fn daily_log_appender(
 ) -> anyhow::Result<tracing_appender::rolling::RollingFileAppender> {
     Ok(tracing_appender::rolling::RollingFileAppender::builder()
         .rotation(tracing_appender::rolling::Rotation::DAILY)
-        .filename_prefix("plug.log")
+        .filename_prefix(plug_core::paths::LOG_FILE_PREFIX)
         .max_log_files(LOG_FILES_KEPT)
         .build(log_directory)?)
 }
@@ -2621,9 +1972,12 @@ impl ReopeningLog {
 
     fn has_a_file(&self) -> bool {
         std::fs::read_dir(&self.directory).is_ok_and(|entries| {
-            entries
-                .flatten()
-                .any(|entry| entry.file_name().to_string_lossy().starts_with("plug.log"))
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(plug_core::paths::LOG_FILE_PREFIX)
+            })
         })
     }
 
@@ -2654,78 +2008,15 @@ impl std::io::Write for ReopeningLog {
     }
 }
 
-// ──────────────────────── Client helpers ──────────────────────────────────────
-
-/// Connect to a running daemon's Unix socket.
-///
-/// Returns None if no daemon is running (socket doesn't exist or connection refused).
-pub async fn connect_to_daemon() -> Option<tokio::net::UnixStream> {
-    let sock = socket_path();
-    if !sock.exists() {
-        return None;
-    }
-    tokio::net::UnixStream::connect(&sock).await.ok()
-}
-
-/// How long an operator request may wait for the daemon to answer. Generous,
-/// because a request can land while the daemon is refreshing credentials, but
-/// bounded, because an unbounded wait reports nothing at all.
-const IPC_REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
-
-/// Send a request to the daemon and read the response.
-pub async fn ipc_request(request: &IpcRequest) -> anyhow::Result<IpcResponse> {
-    ipc_request_with_timeout(request, IPC_REQUEST_TIMEOUT).await
-}
-
-/// The body of [`ipc_request`], with the wait made explicit so it can be proven
-/// to end.
-pub(crate) async fn ipc_request_with_timeout(
-    request: &IpcRequest,
-    timeout: std::time::Duration,
-) -> anyhow::Result<IpcResponse> {
-    let stream = connect_to_daemon()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no plug daemon running"))?;
-
-    let (mut reader, mut writer) = stream.into_split();
-
-    // Send request
-    let payload = serde_json::to_vec(request)?;
-    ipc::write_frame(&mut writer, &payload).await?;
-
-    // Read response. A daemon that accepted the connection but cannot answer,
-    // because its engine is stuck on an upstream or a Keychain read, would
-    // otherwise hang the caller forever with nothing to report.
-    let frame = tokio::time::timeout(timeout, ipc::read_frame(&mut reader))
-        .await
-        .map_err(|_| {
-            anyhow::anyhow!(
-                "daemon did not answer within {}s; see {}",
-                timeout.as_secs(),
-                log_dir().display()
-            )
-        })??
-        .ok_or_else(|| anyhow::anyhow!("daemon closed connection"))?;
-
-    let response: IpcResponse = serde_json::from_slice(&frame)?;
-    Ok(response)
-}
-
-/// Read the auth token from the daemon's token file.
-pub fn read_auth_token() -> anyhow::Result<String> {
-    let path = token_path();
-    std::fs::read_to_string(&path)
-        .with_context(|| format!("failed to read auth token from {}", path.display()))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use plug_core::test_helpers::mock_server;
 
     #[test]
     fn the_log_starts_a_new_file_when_its_folder_is_emptied() {
         use std::io::Write;
-        let dir = std::env::temp_dir().join(format!("plug-log-reopen-{}", uuid::Uuid::new_v4()));
+        let dir = plug_core::paths::test::scratch("log-reopen").join("logs");
         let mut log = ReopeningLog::open(&dir, Duration::ZERO).expect("open the log");
         log.write_all(b"before\n").expect("write");
         log.flush().expect("flush");
@@ -2741,7 +2032,6 @@ mod tests {
             .expect("a new log file");
         let text = std::fs::read_to_string(file.path()).expect("read the new file");
         assert_eq!(text, "after\n");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// One server advertising a large icon can outweigh every other server in
@@ -2783,65 +2073,14 @@ mod tests {
         );
     }
 
-    /// A daemon whose engine is stuck still accepts connections, so an
-    /// unbounded read turns `plug status`, `plug doctor` and every app checkup
-    /// into a spinner with nothing to report. The wait has to end.
-    #[tokio::test]
-    async fn operator_request_gives_up_on_a_daemon_that_never_answers() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        // Short and directly under /tmp: a Unix socket path has to fit in
-        // SUN_LEN, and the macOS per-user temp directory alone nearly fills it.
-        let root = std::path::PathBuf::from(format!(
-            "/tmp/plug-q{}{:x}",
-            std::process::id(),
-            uuid::Uuid::new_v4().as_fields().0
-        ));
-        set_test_runtime_paths(root.clone(), root.clone());
-        let socket = socket_path();
-        std::fs::create_dir_all(socket.parent().expect("socket has a parent"))
-            .expect("create runtime dir");
-        let listener = tokio::net::UnixListener::bind(&socket).expect("bind daemon socket");
-        // Accept and hold the connection open without ever replying.
-        let silent = tokio::spawn(async move {
-            let accepted = listener.accept().await;
-            std::future::pending::<()>().await;
-            drop(accepted);
-        });
-
-        let error = ipc_request_with_timeout(
-            &IpcRequest::Shutdown {
-                auth_token: "unused".to_string(),
-            },
-            Duration::from_millis(200),
-        )
-        .await
-        .expect_err("a silent daemon must not be waited on forever");
-
-        silent.abort();
-        clear_test_runtime_paths();
-        let _ = std::fs::remove_dir_all(&root);
-
-        assert!(
-            error.to_string().contains("did not answer"),
-            "unexpected error: {error}"
-        );
-    }
-
     use oauth2::{AccessToken, RefreshToken, basic::BasicTokenType};
     use rmcp::transport::auth::{CredentialStore, StoredCredentials, VendorExtraTokenFields};
     use std::collections::HashMap;
-    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use std::time::Duration;
     use tokio::io::AsyncWriteExt;
 
     pub(super) fn temp_config_path(name: &str) -> std::path::PathBuf {
-        crate::install_test_credential_environment();
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!("plug-daemon-{name}-{unique}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir.join("config.toml")
+        plug_core::paths::test::scratch(name).join("config.toml")
     }
 
     pub(super) async fn clear_store(server_name: &str) {
@@ -2849,21 +2088,11 @@ mod tests {
         store.clear().await.unwrap();
     }
 
-    pub(super) fn cleanup_temp_config(config_path: &std::path::Path) {
-        if let Some(dir) = config_path.parent() {
-            let _ = std::fs::remove_dir_all(dir);
-        }
-    }
-
     /// Daily logs used to be kept forever. Pruning must keep the file names
     /// `scripts/perf.sh` globs and leave other files in the directory alone.
     #[test]
     fn daily_log_appender_prunes_old_logs_and_keeps_names() {
-        let dir = std::env::temp_dir().join(format!(
-            "plug-log-retention-{}",
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = plug_core::paths::test::scratch("log-retention");
         let old: Vec<String> = (1..=20)
             .map(|day| format!("plug.log.2000-01-{day:02}"))
             .collect();
@@ -2878,7 +2107,6 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        let _ = std::fs::remove_dir_all(&dir);
         let logs: Vec<&String> = names
             .iter()
             .filter(|name| name.starts_with("plug.log."))
@@ -2903,7 +2131,7 @@ mod tests {
 
     #[test]
     fn cancellation_identity_cannot_cross_client_boundary() {
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let first = registry.register("first-client".to_string(), Some("client".to_string()), None);
         let second = registry.register(
             "second-client".to_string(),
@@ -2956,17 +2184,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn daemon_tests_do_not_use_the_real_plug_token_directory() {
-        let config_path = temp_config_path("credential-isolation");
-        let production = plug_core::config::config_dir().join("tokens");
-        let actual = plug_core::oauth::tokens_dir();
-
-        assert_ne!(actual, production);
-        assert!(actual.starts_with(std::env::temp_dir()));
-        cleanup_temp_config(&config_path);
-    }
-
     pub(super) fn write_oauth_config(path: &std::path::Path, servers: &[&str]) {
         write_oauth_config_with_enabled(path, servers, true);
     }
@@ -2981,30 +2198,16 @@ mod tests {
             config.servers.insert(
                 (*name).to_string(),
                 plug_core::config::ServerConfig {
-                    command: None,
-                    args: Vec::new(),
-                    env: HashMap::new(),
                     enabled,
                     transport: plug_core::config::TransportType::Http,
-                    protocol_mode: Default::default(),
                     url: Some("https://example.com/mcp".to_string()),
-                    auth_token: None,
                     auth: Some("oauth".to_string()),
                     oauth_client_id: Some("test-client".to_string()),
                     oauth_scopes: Some(vec!["read".to_string()]),
-                    timeout_secs: 30,
                     call_timeout_secs: 30,
                     max_concurrent: 4,
-                    health_check_interval_secs: 60,
                     circuit_breaker_enabled: false,
-                    enrichment: false,
-                    tool_renames: HashMap::new(),
-                    tool_groups: Vec::new(),
-
-                    sandbox: None,
-                    spec: None,
-                    operations: Vec::new(),
-                    token_in: None,
+                    ..Default::default()
                 },
             );
         }
@@ -3031,21 +2234,92 @@ mod tests {
 
     pub(super) fn auth_status_test_context(config_path: std::path::PathBuf) -> ConnectionContext {
         let config = plug_core::config::load_config(Some(&config_path)).unwrap();
-        let engine = Arc::new(Engine::new(config));
-        let (client_registry, _count_rx) = ClientRegistry::new();
-        ConnectionContext {
-            cancel: CancellationToken::new(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine,
+        let engine = Engine::new(config);
+        let client_registry = ClientRegistry::new();
+        test_connection_context(
+            &engine,
+            CancellationToken::new(),
+            client_registry,
             config_path,
-            started_at: Instant::now(),
+        )
+    }
+
+    /// A connection that has not registered yet, holding the token `test-token`.
+    fn test_connection_context(
+        engine: &Arc<Engine>,
+        cancel: CancellationToken,
+        client_registry: ClientRegistry,
+        config_path: impl Into<std::path::PathBuf>,
+    ) -> ConnectionContext {
+        ConnectionContext {
+            cancel,
+            auth_token: Arc::from("test-token"),
+            engine: Arc::clone(engine),
+            config_path: config_path.into(),
             client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
+            ownership: ipc::DaemonOwnershipMode::Unknown,
+            started_id: 1,
+            http: Arc::new(HttpState::new(
+                Arc::clone(engine.tool_router()),
+                Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )),
             session_id: None,
             reverse_request_rx: None,
         }
+    }
+
+    /// The snapshot says which servers each limited client gets nothing of,
+    /// as the router enforces its lists, so the app need not work it out.
+    #[tokio::test]
+    async fn operator_snapshot_says_what_each_client_is_kept_from() {
+        let config_path = temp_config_path("snapshot-client-blocks");
+        std::fs::write(
+            &config_path,
+            r#"
+[servers.git]
+command = "git-mcp"
+[servers.slack]
+command = "slack-mcp"
+[servers.notes]
+command = "notes-mcp"
+
+[clients.cursor]
+blocked_servers = ["git"]
+
+[clients.pi]
+allowed_servers = ["slack"]
+"#,
+        )
+        .unwrap();
+        let mut ctx = auth_status_test_context(config_path);
+
+        let response = dispatch_request(
+            &IpcRequest::Operator {
+                auth_token: "test-token".to_string().into(),
+                request: OperatorRequest::Snapshot,
+            },
+            &mut ctx,
+        )
+        .await;
+        let IpcResponse::OperatorSnapshot { snapshot } = response else {
+            panic!("expected a snapshot, got {response:?}");
+        };
+
+        let off: Vec<(&str, Vec<&str>)> = snapshot
+            .client_blocks
+            .iter()
+            .map(|blocks| {
+                (
+                    blocks.key.as_str(),
+                    blocks.off_servers.iter().map(String::as_str).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            off,
+            vec![("cursor", vec!["git"]), ("pi", vec!["git", "notes"])]
+        );
     }
 
     /// The app polls this snapshot every few seconds. A config.toml saved
@@ -3065,8 +2339,9 @@ mod tests {
         .unwrap();
 
         let response = dispatch_request(
-            &IpcRequest::OperatorSnapshot {
-                auth_token: "test-token".to_string(),
+            &IpcRequest::Operator {
+                auth_token: "test-token".to_string().into(),
+                request: OperatorRequest::Snapshot,
             },
             &mut ctx,
         )
@@ -3075,12 +2350,6 @@ mod tests {
             panic!("expected a snapshot, got {response:?}");
         };
 
-        let config_error = snapshot.config_error.as_deref().expect("config_error");
-        assert!(config_error.contains("line 2"), "{config_error}");
-        assert!(
-            !config_error.contains("sk-secret-value"),
-            "the error must not quote the config: {config_error}"
-        );
         let configured: Vec<_> = snapshot
             .configured_servers
             .iter()
@@ -3091,36 +2360,25 @@ mod tests {
         assert_eq!(snapshot.upstream_auth[0].name, server_name);
 
         clear_store(&server_name).await;
-        cleanup_temp_config(&ctx.config_path);
     }
 
     #[tokio::test]
     async fn list_live_sessions_includes_http_sessions_when_daemon_owns_http() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-test-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-test");
         let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
         let mut ctx = auth_status_test_context(config_path);
-        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let session_id = session_store.create_session().expect("session");
-        session_store
+        let session_id = ctx.http.sessions.create_session().expect("session");
+        ctx.http
+            .sessions
             .set_client_type(&session_id, plug_core::types::ClientType::ClaudeDesktop)
             .expect("set client type");
-        ctx.http_sessions = Some(Arc::new(session_store));
 
         let response = dispatch_request(&IpcRequest::ListLiveSessions, &mut ctx).await;
-        let IpcResponse::LiveSessions { sessions, scope } = response else {
+        let IpcResponse::LiveSessions { sessions } = response else {
             panic!("expected live sessions response");
         };
 
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].transport,
@@ -3130,147 +2388,109 @@ mod tests {
             sessions[0].client_type,
             plug_core::types::ClientType::ClaudeDesktop
         );
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
-    // Paused time: spawn_grace_period_task only awaits in-memory watch
-    // channels and a fixed timer (no real I/O), so tokio's auto-advance
-    // fires the grace-period timer instantly instead of burning 1.5s of
-    // wall-clock per test.
-    #[tokio::test(start_paused = true)]
-    async fn grace_period_shuts_down_when_no_http_sessions() {
-        let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None, None);
-
-        let daemon_cancel = CancellationToken::new();
-        let grace_cancel = CancellationToken::new();
-
-        spawn_grace_period_task(
-            1,
-            count_rx,
-            None,
-            daemon_cancel.clone(),
-            grace_cancel.clone(),
+    /// The app and `plug auth clients revoke` revoke over the socket. That
+    /// used to end the client's sessions but leave the tasks it owned.
+    #[tokio::test]
+    async fn revoking_a_client_over_ipc_ends_its_sessions_and_its_tasks() {
+        let mut config = plug_core::config::Config::default();
+        config
+            .servers
+            .insert("mock".to_string(), mock_server("echo"));
+        let engine = Engine::new(config);
+        engine.start().await;
+        let oauth_path = plug_core::paths::test::scratch("daemon-revoke").join("state.json");
+        let manager = plug_core::downstream_oauth::DownstreamOauthManager::new_with_state_path(
+            plug_core::downstream_oauth::DownstreamOauthConfig {
+                public_base_url: "https://plug.example.com".to_string(),
+                oauth_scopes: vec!["tools:read".to_string()],
+            },
+            oauth_path.clone(),
+        )
+        .expect("OAuth manager");
+        let client = manager
+            .register_client(
+                plug_core::downstream_oauth::ClientRegistrationRequest {
+                    redirect_uris: vec!["https://client.example/callback".to_string()],
+                    client_name: Some("revoked client".to_string()),
+                    token_endpoint_auth_method: Some("none".to_string()),
+                    grant_types: Some(vec!["authorization_code".to_string()]),
+                    response_types: Some(vec!["code".to_string()]),
+                    scope: None,
+                },
+                "daemon-revoke-test",
+            )
+            .await
+            .expect("register client");
+        let mut ctx = test_connection_context(
+            &engine,
+            CancellationToken::new(),
+            ClientRegistry::new(),
+            plug_core::paths::default_config_path(),
         );
+        ctx.http = Arc::new(
+            HttpState::new(
+                Arc::clone(engine.tool_router()),
+                Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+                CancellationToken::new(),
+            )
+            .with_auth(plug_core::http::server::HttpAuth::Oauth(manager.clone())),
+        );
+        let session_id = ctx.http.sessions.create_session().expect("session");
+        ctx.http
+            .sessions
+            .bind(
+                &session_id,
+                plug_core::session::SessionBinding {
+                    grant: Some(plug_core::session::GrantBinding {
+                        client_id: client.client_id.clone(),
+                        still_allowed: Arc::new(|| true),
+                    }),
+                    broadcast_audience: plug_core::session::BroadcastAudience::unrestricted(),
+                },
+            )
+            .expect("bind session");
+        let resource = manager.resource();
+        let owner = plug_core::downstream_identity::HttpCredential::Grant {
+            issuer: manager.base_url(),
+            client_id: &client.client_id,
+            resource: &resource,
+        }
+        .task_owner(None);
+        let router = Arc::clone(engine.tool_router());
+        router
+            .enqueue_tool_task("Mock__echo", None, None, owner.clone(), None, None)
+            .await
+            .expect("enqueue a task for the client");
 
-        registry.deregister(&registration.session_id);
+        let response = dispatch_request(
+            &IpcRequest::Operator {
+                auth_token: "test-token".to_string().into(),
+                request: OperatorRequest::RevokeDownstreamClient {
+                    client_id: client.client_id.clone(),
+                },
+            },
+            &mut ctx,
+        )
+        .await;
 
-        tokio::time::sleep(Duration::from_millis(1500)).await;
         assert!(
-            daemon_cancel.is_cancelled(),
-            "daemon should shut down once grace expires with no IPC clients and no HTTP sessions"
+            matches!(response, IpcResponse::DownstreamClientRevoked { .. }),
+            "{response:?}"
         );
-
-        grace_cancel.cancel();
-    }
-
-    // Paused time: same rationale as grace_period_shuts_down_when_no_http_sessions.
-    #[tokio::test(start_paused = true)]
-    async fn grace_period_rearms_when_http_sessions_drain_to_zero() {
-        let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None, None);
-
-        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let http_session_id = session_store.create_session().expect("session");
-        let http_sessions: Arc<dyn SessionStore> = Arc::new(session_store);
-
-        let daemon_cancel = CancellationToken::new();
-        let grace_cancel = CancellationToken::new();
-
-        spawn_grace_period_task(
-            1,
-            count_rx,
-            Some(http_sessions.clone()),
-            daemon_cancel.clone(),
-            grace_cancel.clone(),
-        );
-
-        // Last IPC client disconnects -> grace countdown starts.
-        registry.deregister(&registration.session_id);
-
-        // Grace period (1s) expires while the HTTP session is still active: the
-        // daemon must NOT fall back to an IPC-only wait and must stay alive.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            !daemon_cancel.is_cancelled(),
-            "daemon should stay alive while HTTP sessions are active"
-        );
-
-        // Drain the HTTP session; the bounded re-check loop (1s poll) should
-        // notice on its next tick and shut the daemon down.
-        http_sessions.remove(&http_session_id);
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(
-            daemon_cancel.is_cancelled(),
-            "daemon should shut down within one re-check interval of HTTP sessions draining to zero"
-        );
-
-        grace_cancel.cancel();
-    }
-
-    // Paused time: same rationale as grace_period_shuts_down_when_no_http_sessions.
-    #[tokio::test(start_paused = true)]
-    async fn grace_period_ipc_reconnect_during_held_alive_resumes_watching() {
-        let (registry, count_rx) = ClientRegistry::new();
-        let registration = registry.register("client-1".to_string(), None, None);
-
-        let session_store = plug_core::session::StatefulSessionStore::new(1800, 100);
-        let _http_session_id = session_store.create_session().expect("session");
-        let http_sessions: Arc<dyn SessionStore> = Arc::new(session_store);
-
-        let daemon_cancel = CancellationToken::new();
-        let grace_cancel = CancellationToken::new();
-
-        spawn_grace_period_task(
-            1,
-            count_rx,
-            Some(http_sessions),
-            daemon_cancel.clone(),
-            grace_cancel.clone(),
-        );
-
-        registry.deregister(&registration.session_id);
-
-        // Grace period expires with the HTTP session still active -> the daemon
-        // is held alive and enters the bounded re-check loop.
-        tokio::time::sleep(Duration::from_millis(1500)).await;
-        assert!(!daemon_cancel.is_cancelled());
-
-        // An IPC client reconnects while the daemon is held alive by the HTTP session.
-        let reconnect = registry.register("client-2".to_string(), None, None);
-
-        // Give the re-check loop's `count_rx.changed()` branch time to observe it.
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !daemon_cancel.is_cancelled(),
-            "daemon must not shut down once an IPC client reconnects"
-        );
-
-        // Disconnecting again should start a *fresh* grace period (the task
-        // returned to the outer watch loop, not a stale re-check that fires
-        // immediately).
-        registry.deregister(&reconnect.session_id);
-        tokio::time::sleep(Duration::from_millis(300)).await;
-        assert!(
-            !daemon_cancel.is_cancelled(),
-            "a fresh grace period should not have expired yet"
-        );
-
-        grace_cancel.cancel();
+        assert!(ctx.http.sessions.validate(&session_id).is_err());
+        assert_eq!(router.task_count_for_owner(&owner).await, 0);
+        engine.shutdown().await;
     }
 
     #[test]
     fn pid_lock_survives_the_momentary_hold_a_status_probe_takes() {
-        // `runtime_lock_is_held` takes the lock and lets it go again, and every
+        // `ipc_client::daemon_starting` takes the lock and lets it go again, and every
         // status surface calls it. A start that collided with one used to fail
         // outright. The window is passed explicitly so the assertion is about
         // retrying at all, not about how a loaded machine schedules threads.
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-pid-lock-probe-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-pid-lock-probe");
         let pid_file = temp.join("plug.pid");
 
         let held = acquire_pid_lock(&pid_file).expect("probe holds the lock");
@@ -3281,6 +2501,7 @@ mod tests {
 
         let claiming = std::fs::OpenOptions::new()
             .create(true)
+            .truncate(false)
             .read(true)
             .write(true)
             .open(&pid_file)
@@ -3294,17 +2515,11 @@ mod tests {
         );
 
         drop(claiming);
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]
     fn pid_lock_still_refuses_a_second_daemon_that_keeps_holding_it() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-pid-lock-held-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-pid-lock-held");
         let pid_file = temp.join("plug.pid");
 
         let _held = acquire_pid_lock(&pid_file).expect("first pid lock");
@@ -3313,18 +2528,11 @@ mod tests {
             error.to_string().contains("already running"),
             "unexpected error: {error}"
         );
-
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[test]
     fn acquire_pid_lock_does_not_truncate_existing_file_on_failed_relock() {
-        let temp = std::env::temp_dir().join(format!(
-            "plug-daemon-pid-lock-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&temp).expect("create temp dir");
+        let temp = plug_core::paths::test::scratch("daemon-pid-lock");
         let pid_file = temp.join("plug.pid");
 
         let first_lock = acquire_pid_lock(&pid_file).expect("first pid lock");
@@ -3345,31 +2553,17 @@ mod tests {
         );
 
         drop(first_lock);
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     #[tokio::test]
     async fn losing_daemon_start_does_not_boot_upstream_servers() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-early-lock-runtime-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-early-lock-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let temp = plug_core::paths::test::scratch("plug-d");
 
-        std::fs::create_dir_all(runtime_dir()).expect("create daemon runtime dir");
+        std::fs::create_dir_all(plug_core::paths::dir()).expect("create daemon runtime dir");
         let winning_lock = acquire_pid_lock(&pid_path()).expect("winning daemon lock");
 
-        let marker = state_root.join("upstream-started");
-        let config_path = state_root.join("config.toml");
+        let marker = temp.join("upstream-started");
+        let config_path = temp.join("config.toml");
         let mut config = plug_core::config::Config::default();
         let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
         config.http.port = probe.local_addr().expect("HTTP address").port();
@@ -3380,26 +2574,10 @@ mod tests {
                 command: Some("/bin/sh".to_string()),
                 args: vec!["-c".to_string(), "touch \"$MARKER\"".to_string()],
                 env: HashMap::from([("MARKER".to_string(), marker.display().to_string())]),
-                enabled: true,
-                transport: plug_core::config::TransportType::Stdio,
-                protocol_mode: Default::default(),
-                url: None,
-                auth_token: None,
-                auth: None,
-                oauth_client_id: None,
-                oauth_scopes: None,
                 timeout_secs: 1,
                 call_timeout_secs: 1,
-                max_concurrent: 1,
-                health_check_interval_secs: 60,
                 circuit_breaker_enabled: false,
-                enrichment: false,
-                tool_renames: HashMap::new(),
-                tool_groups: Vec::new(),
-                sandbox: None,
-                spec: None,
-                operations: Vec::new(),
-                token_in: None,
+                ..Default::default()
             },
         );
         std::fs::write(
@@ -3408,7 +2586,12 @@ mod tests {
         )
         .expect("write config");
 
-        let result = crate::runtime::cmd_daemon(Some(&config_path)).await;
+        let result = crate::runtime::serve_until(
+            Some(&config_path),
+            std::future::pending(),
+            plug_core::ipc::DaemonOwnershipMode::Unknown,
+        )
+        .await;
         let error = result.expect_err("losing daemon should exit immediately");
         assert!(
             error.to_string().contains("PID file locked"),
@@ -3420,50 +2603,44 @@ mod tests {
         );
 
         drop(winning_lock);
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
-    /// `run_daemon` must bind and serve without a started engine, which is what
-    /// lets `cmd_daemon` run `Engine::start` alongside it. `Engine::start` waits
-    /// on third-party server processes, so a socket bound after it makes a
-    /// healthy cold start look like an absent daemon for as long as the slowest
-    /// upstream takes.
+    /// `serve_until` binds the IPC socket while upstreams are still starting.
+    /// `Engine::start` waits on third-party server processes, so a socket bound
+    /// after it makes a healthy cold start look like an absent daemon for as
+    /// long as the slowest upstream takes.
     #[tokio::test]
     async fn ipc_socket_is_bound_while_upstream_startup_is_still_running() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        // The bound socket lives under this root, and a Unix socket path has to
-        // fit in SUN_LEN, so keep the directory names short.
-        let suffix = uuid::Uuid::new_v4().simple().to_string();
-        let runtime_root = std::env::temp_dir().join(format!("plug-eb-{}", &suffix[..8]));
-        let state_root = std::env::temp_dir().join(format!("plug-ebs-{}", &suffix[..8]));
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
-
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
-        // flight until the upstream timeout expires.
-        let mut server = ipc_harness_mock_config("noop");
+        // flight for the five seconds it sleeps, far longer than the checks
+        // below take, and the child is gone soon after the test.
+        let mut server = mock_server("noop");
         server.command = Some("/bin/sleep".to_string());
-        server.args = vec!["30".to_string()];
+        server.args = vec!["5".to_string()];
         server.timeout_secs = 20;
         let mut config = plug_core::config::Config::default();
         config.servers.insert("slow".to_string(), server);
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
+        let port = probe.local_addr().expect("HTTP address").port();
+        drop(probe);
+        config.http.port = port;
 
-        let config_path = runtime_root.join("config.toml");
-        std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(config));
+        std::fs::create_dir_all(plug_core::paths::dir()).expect("create runtime dir");
+        let config_path = plug_core::paths::dir().join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
 
-        let startup = {
-            let engine = engine.clone();
-            tokio::spawn(async move { engine.start().await })
-        };
-        let daemon = {
-            let engine = engine.clone();
-            let config_path = config_path.clone();
-            tokio::spawn(async move { run_daemon(engine, config_path, 30, None).await })
-        };
+        let daemon = tokio::spawn(async move {
+            crate::runtime::serve_until(
+                Some(&config_path),
+                std::future::pending(),
+                plug_core::ipc::DaemonOwnershipMode::Unknown,
+            )
+            .await
+        });
 
         let sock_path = socket_path();
         let mut connected = false;
@@ -3479,50 +2656,34 @@ mod tests {
             panic!("daemon exited early: {:?}", daemon.await);
         }
         assert!(connected, "socket never accepted a connection");
+        // HTTP binds only once every upstream has started, so a closed port
+        // shows the slow start is still in flight.
         assert!(
-            !startup.is_finished(),
-            "upstream startup finished first, so this run proves nothing"
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "HTTP came up, so upstream startup finished first and this run proves nothing"
         );
 
-        engine.cancel_token().cancel();
-        startup.abort();
         daemon.abort();
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).ok();
-        std::fs::remove_dir_all(state_root).ok();
     }
 
     #[tokio::test]
     async fn run_daemon_losing_start_does_not_rotate_existing_token() {
-        // Hold the shared lock for the whole window the global paths are set, so
-        // this test is safe to run alongside other global-paths tests in parallel.
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-runtime-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-state-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let temp = plug_core::paths::test::scratch("plug-d");
 
-        let rt_dir = runtime_dir();
+        let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
         let token_file = token_path();
         std::fs::write(&token_file, "stable-token").expect("write seed token");
         let pid_file = pid_path();
         let winning_lock = acquire_pid_lock(&pid_file).expect("winning pid lock");
 
-        let config_path = runtime_root.join("config.toml");
+        let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
 
-        let result = run_daemon(engine, config_path, 0, None).await;
+        let result = run_daemon(engine, config_path).await;
         assert!(result.is_err(), "losing concurrent start should fail");
 
         let token_after =
@@ -3530,40 +2691,24 @@ mod tests {
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
     #[tokio::test]
     async fn run_daemon_restores_existing_token_when_startup_fails_after_token_write() {
-        let _guard = runtime_paths_test_lock().lock().await;
-        let runtime_root = std::env::temp_dir().join(format!(
-            "plug-daemon-runtime-post-token-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        let state_root = std::env::temp_dir().join(format!(
-            "plug-daemon-state-post-token-{}-{}",
-            std::process::id(),
-            uuid::Uuid::new_v4().simple()
-        ));
-        std::fs::create_dir_all(&runtime_root).expect("create runtime root");
-        std::fs::create_dir_all(&state_root).expect("create state root");
-        set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let temp = plug_core::paths::test::scratch("plug-d");
 
-        let rt_dir = runtime_dir();
+        let rt_dir = plug_core::paths::dir();
         std::fs::create_dir_all(&rt_dir).expect("create daemon runtime dir");
         let token_file = token_path();
         std::fs::write(&token_file, "stable-token").expect("write seed token");
         let sock_path = socket_path();
         std::fs::create_dir_all(&sock_path).expect("create blocking socket directory");
 
-        let config_path = runtime_root.join("config.toml");
+        let config_path = temp.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
+        let engine = Engine::new(plug_core::config::Config::default());
 
-        let result = run_daemon(engine, config_path, 0, None).await;
+        let result = run_daemon(engine, config_path).await;
         assert!(
             result.is_err(),
             "startup with a blocking socket directory should fail"
@@ -3572,10 +2717,6 @@ mod tests {
         let token_after =
             std::fs::read_to_string(&token_file).expect("read token after failed startup");
         assert_eq!(token_after, "stable-token");
-
-        clear_test_runtime_paths();
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
     }
 
     #[test]
@@ -3603,36 +2744,12 @@ mod tests {
         assert!(json.contains("\"session_id\":\"session-123\""));
     }
 
-    #[test]
-    fn is_deregister_request_detects_only_deregister() {
-        // Regression guard for the restore-skip predicate in
-        // `handle_ipc_loop`: only a Deregister request should suppress
-        // restoring `reverse_request_rx`, since only Deregister's handler
-        // closes the channel out from under the dispatch loop.
-        assert!(is_deregister_request(&IpcRequest::Deregister {
-            session_id: "session-123".to_string(),
-        }));
-
-        assert!(!is_deregister_request(&IpcRequest::Status));
-        assert!(!is_deregister_request(&IpcRequest::Ping {
-            session_id: "session-123".to_string(),
-        }));
-        assert!(!is_deregister_request(&IpcRequest::Register {
-            protocol_version: plug_core::ipc::IPC_PROTOCOL_VERSION,
-            client_id: "client-123".to_string(),
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            link_target: None,
-        }));
-    }
-
     #[tokio::test]
     async fn daemon_bridge_rejects_elicitation_without_capability() {
         use plug_core::proxy::DownstreamBridge;
         use rmcp::model::{ClientCapabilities, ElicitRequestParams};
 
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let registry = Arc::new(registry);
         let reg_result =
             registry.register("test-client".to_string(), Some("test".to_string()), None);
@@ -3705,7 +2822,7 @@ mod tests {
         use plug_core::proxy::DownstreamBridge;
         use rmcp::model::ClientCapabilities;
 
-        let (registry, _count_rx) = ClientRegistry::new();
+        let registry = ClientRegistry::new();
         let registry = Arc::new(registry);
         let reg_result =
             registry.register("test-client".to_string(), Some("test".to_string()), None);
@@ -3764,7 +2881,7 @@ mod tests {
         );
     }
 
-    // ── IPC end-to-end test harness (U5) ─────────────────────────────────────
+    // ── IPC end-to-end test harness ─────────────────────────────────────
     //
     // Boots a daemon-backed engine with a stdio mock upstream over a TEMPORARY
     // Unix socket and drives real `tools/call` round-trips through the actual
@@ -3773,51 +2890,18 @@ mod tests {
     // so it (and the cross-transport parity matrix that builds on it) must live
     // here rather than in plug-core's integration tests.
     //
-    // Each harness binds a unique temp socket and touches no global runtime path,
-    // so it is safe under the parallel test suite without the runtime-paths lock.
+    // Each harness binds a unique temp socket. The engine keeps its other files
+    // under the test thread's own Plug folder (`plug_core::paths::test`).
 
-    /// Build a stdio mock-upstream `ServerConfig` exposing `tools` (comma-separated).
-    fn ipc_harness_mock_config(tools: &str) -> plug_core::config::ServerConfig {
-        ipc_harness_mock_config_with(tools, &[])
-    }
-
-    /// Mock upstream config with extra mock-server flags appended (e.g. to enable
+    /// `mock_server` with extra mock-server flags appended (e.g. to enable
     /// the resources / prompts / completions capability fixtures).
     fn ipc_harness_mock_config_with(
         tools: &str,
         extra_args: &[&str],
     ) -> plug_core::config::ServerConfig {
-        let mut args = vec!["--tools".to_string(), tools.to_string()];
-        args.extend(extra_args.iter().map(|a| a.to_string()));
-        plug_core::config::ServerConfig {
-            command: Some(
-                plug_test_harness::mock_server_bin()
-                    .to_string_lossy()
-                    .into_owned(),
-            ),
-            args,
-            env: HashMap::new(),
-            enabled: true,
-            transport: plug_core::config::TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 10,
-            call_timeout_secs: 5,
-            max_concurrent: 4,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
-        }
+        let mut server = mock_server(tools);
+        server.args.extend(extra_args.iter().map(|a| a.to_string()));
+        server
     }
 
     /// A connected, registered IPC client wired to a real daemon connection loop
@@ -3828,16 +2912,15 @@ mod tests {
         server_task: Option<tokio::task::JoinHandle<()>>,
         stream: tokio::net::UnixStream,
         session_id: String,
-        socket_path: std::path::PathBuf,
     }
 
     impl IpcTestHarness {
         async fn start(tools: &str) -> Self {
-            Self::start_with_config(ipc_harness_mock_config(tools)).await
+            Self::start_with_config(mock_server(tools)).await
         }
 
         /// Full-capability variant for the parity matrix: same upstream config as
-        /// the stdio/HTTP parity drivers so every method family is comparable.
+        /// the HTTP parity driver so every method family is comparable.
         async fn start_full() -> Self {
             Self::start_with_config(parity_mock_config()).await
         }
@@ -3859,36 +2942,22 @@ mod tests {
             for (name, server) in servers {
                 config.servers.insert(name.to_string(), server);
             }
-            let engine = Arc::new(Engine::new(config));
-            engine.start().await.expect("engine start");
+            let engine = Engine::new(config);
+            engine.start().await;
 
-            // Short unique socket path in /tmp — a Unix socket path must fit in
-            // SUN_LEN (~104 bytes), and the platform temp dir is already long. No
-            // global runtime path is touched, so this is safe under parallel tests.
-            let socket_path = std::path::PathBuf::from(format!(
-                "/tmp/plug-ipc-{}.sock",
-                &uuid::Uuid::new_v4().simple().to_string()[..12]
-            ));
-            let _ = std::fs::remove_file(&socket_path);
+            let socket_path = plug_core::paths::test::scratch("ipc").join("s.sock");
 
             let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
             let cancel = CancellationToken::new();
 
             // Server side: accept exactly one connection and run the real handler.
-            let (client_registry, _count_rx) = ClientRegistry::new();
-            let ctx = ConnectionContext {
-                cancel: cancel.clone(),
-                auth_token: Arc::from("test-token"),
-                server_manager: Arc::clone(engine.server_manager()),
-                engine: Arc::clone(&engine),
-                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
-                started_at: Instant::now(),
-                client_registry: Arc::new(client_registry),
-                http_sessions: None,
-                downstream_oauth: None,
-                session_id: None,
-                reverse_request_rx: None,
-            };
+            let client_registry = ClientRegistry::new();
+            let ctx = test_connection_context(
+                &engine,
+                cancel.clone(),
+                client_registry,
+                plug_core::paths::default_config_path(),
+            );
             let server_task = tokio::spawn(async move {
                 if let Ok((stream, _addr)) = listener.accept().await {
                     let _ = handle_ipc_connection(stream, ctx).await;
@@ -3929,7 +2998,6 @@ mod tests {
                 server_task: Some(server_task),
                 stream,
                 session_id,
-                socket_path,
             }
         }
 
@@ -3942,6 +3010,7 @@ mod tests {
                     session_id: self.session_id.clone(),
                     method: method.to_string(),
                     params: Some(params),
+                    context: None,
                 },
             )
             .await;
@@ -3963,6 +3032,7 @@ mod tests {
                     session_id: self.session_id.clone(),
                     method: "tools/call".to_string(),
                     params: Some(params),
+                    context: None,
                 },
             )
             .await;
@@ -3970,8 +3040,8 @@ mod tests {
         }
 
         /// Graceful async teardown: cancel the connection loop, join the server
-        /// task, shut the engine down (killing the mock subprocess), and remove the
-        /// socket. Idempotent with `Drop` so a test that asserts before calling this
+        /// task, and shut the engine down (killing the mock subprocess).
+        /// Idempotent with `Drop` so a test that asserts before calling this
         /// still cleans up on panic (via `Drop`), just without the async engine
         /// shutdown.
         async fn shutdown(&mut self) {
@@ -3980,7 +3050,6 @@ mod tests {
                 let _ = task.await;
             }
             self.engine.shutdown().await;
-            let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
@@ -3988,14 +3057,13 @@ mod tests {
         fn drop(&mut self) {
             // Best-effort synchronous cleanup so a panicking test (e.g. a parity
             // assertion that fires before `shutdown().await`) does not orphan the
-            // server task or leak the temp socket. The engine's async shutdown can
-            // only run in `shutdown()`; here we cancel + abort to release the task's
-            // engine handle and remove the socket file.
+            // server task. The engine's async shutdown can only run in
+            // `shutdown()`; here we cancel + abort to release the task's engine
+            // handle.
             self.cancel.cancel();
             if let Some(task) = self.server_task.take() {
                 task.abort();
             }
-            let _ = std::fs::remove_file(&self.socket_path);
         }
     }
 
@@ -4020,24 +3088,11 @@ mod tests {
                 .expect("unexpected EOF before response");
             let resp: IpcResponse =
                 serde_json::from_slice(&frame).expect("decode ipc response frame");
-            if is_ipc_push_notification(&resp) {
+            if resp.is_push() {
                 continue;
             }
             return resp;
         }
-    }
-
-    fn is_ipc_push_notification(resp: &IpcResponse) -> bool {
-        matches!(
-            resp,
-            IpcResponse::LoggingNotification { .. }
-                | IpcResponse::ToolListChangedNotification
-                | IpcResponse::ResourceListChangedNotification
-                | IpcResponse::PromptListChangedNotification
-                | IpcResponse::ResourceUpdatedNotification { .. }
-                | IpcResponse::ProgressNotification { .. }
-                | IpcResponse::CancelledNotification { .. }
-        )
     }
 
     #[tokio::test]
@@ -4059,91 +3114,35 @@ mod tests {
         );
     }
 
-    /// After a `Deregister`, the bridge channel's sender is dropped (closed)
-    /// and `ctx.reverse_request_rx` is cleared. Sending another request on
-    /// the same connection must not resurrect that closed channel — the
-    /// direct regression guard for the restore-skip predicate is
-    /// `is_deregister_request_detects_only_deregister`; this test documents
-    /// the end-to-end sequence still completing normally afterward, matching
-    /// the plan's minimum bar (pre-fix this also passes functionally, since
-    /// a busy-spun `Ready(None)` arm still lets the dispatch future resolve —
-    /// it just burns CPU doing so).
-    #[tokio::test]
-    async fn deregister_then_status_request_completes_normally() {
-        let mut harness = IpcTestHarness::start("echo").await;
-
-        write_ipc(
-            &mut harness.stream,
-            &IpcRequest::Deregister {
-                session_id: harness.session_id.clone(),
-            },
-        )
-        .await;
-        let deregister_resp = read_ipc_response(&mut harness.stream).await;
-        assert!(
-            matches!(deregister_resp, IpcResponse::Ok),
-            "expected Ok, got {deregister_resp:?}"
-        );
-
-        write_ipc(&mut harness.stream, &IpcRequest::Status).await;
-        let status_resp = read_ipc_response(&mut harness.stream).await;
-
-        harness.shutdown().await;
-
-        assert!(
-            matches!(status_resp, IpcResponse::Status { .. }),
-            "expected Status, got {status_resp:?}"
-        );
-    }
-
-    /// Bug 4 regression: an elicitation/sampling request arriving on
-    /// `ctx.reverse_request_rx` while a registered connection is idle (no
-    /// request currently being dispatched) must reach the client without the
-    /// client sending another frame first — pre-fix, the registered-idle
-    /// `select!` had no arm for `reverse_request_rx`, so the request would
-    /// hang until the next client-initiated request happened to service it.
-    ///
-    /// This injects directly into a hand-built reverse-request channel
-    /// (mirroring `daemon_bridge_rejects_elicitation_without_capability`)
-    /// rather than driving it through a real task-wrapped tool call: the
-    /// background-task dispatch path (`execute_tool_task` in
-    /// `plug-core/src/proxy/tasks.rs`) doesn't register into `active_calls`,
-    /// so upstream-triggered reverse-request routing for it is a separate
-    /// concern from the idle-select servicing arm this test targets.
+    /// An elicitation or sampling request arriving while a registered
+    /// connection is idle reaches the client without the client sending
+    /// another frame first. The request goes straight into the connection's
+    /// reverse-request channel, so the test covers only the idle loop's arm.
     #[tokio::test]
     async fn idle_registered_connection_services_reverse_request_without_new_client_frame() {
         let config = plug_core::config::Config::default();
-        let engine = Arc::new(Engine::new(config));
-        engine.start().await.expect("engine start");
+        let engine = Engine::new(config);
+        engine.start().await;
 
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-idle-reverse-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let socket_path = plug_core::paths::test::scratch("idle-reverse").join("s.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
 
-        let (client_registry, _count_rx) = ClientRegistry::new();
+        let client_registry = ClientRegistry::new();
         let session_id = "idle-reverse-session".to_string();
 
         // Pre-seed `session_id` and a hand-built reverse-request channel
         // directly on the initial context, bypassing a real `Register` call
         // (whose handler would create its own channel and discard ours).
         let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
-        let ctx = ConnectionContext {
-            cancel: cancel.clone(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine: Arc::clone(&engine),
-            config_path: std::path::PathBuf::from("/tmp/plug-ipc-idle-reverse-config.toml"),
-            started_at: Instant::now(),
-            client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
-            session_id: Some(session_id.clone()),
-            reverse_request_rx: Some(reverse_rx),
-        };
+        let mut ctx = test_connection_context(
+            &engine,
+            cancel.clone(),
+            client_registry,
+            plug_core::paths::default_config_path(),
+        );
+        ctx.session_id = Some(session_id.clone());
+        ctx.reverse_request_rx = Some(reverse_rx);
 
         let server_task = tokio::spawn(async move {
             if let Ok((stream, _addr)) = listener.accept().await {
@@ -4230,76 +3229,26 @@ mod tests {
         drop(stream);
         let _ = server_task.await;
         engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
-    }
-
-    /// The operator snapshot counts visible tools from the same working-set
-    /// key each transport writes, not the raw session id.
-    #[test]
-    fn live_session_lazy_key_matches_the_transport_key() {
-        let session = |transport| plug_core::ipc::IpcLiveSessionInfo {
-            transport,
-            client_id: None,
-            session_id: "sess-1".to_string(),
-            client_type: plug_core::types::ClientType::Unknown,
-            client_info: None,
-            adapter_version: None,
-            host: None,
-            grant: None,
-            link_target: None,
-            connected_secs: 0,
-            last_activity_secs: None,
-        };
-        let ipc = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Ipc,
-            "sess-1",
-        );
-        let http = plug_core::proxy::ToolRouter::lazy_session_key(
-            plug_core::proxy::DownstreamTransport::Http,
-            "sess-1",
-        );
-        assert_eq!(
-            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::DaemonProxy)),
-            ipc
-        );
-        assert_eq!(
-            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Http)),
-            http
-        );
-        assert_eq!(
-            live_session_lazy_key(&session(plug_core::ipc::LiveSessionTransport::Sse)),
-            http
-        );
     }
 
     /// A registered connection hears about a modern downstream gate change
     /// without sending another request.
     #[tokio::test]
     async fn registered_connection_is_pushed_modern_gate_changes() {
-        let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
-        engine.start().await.expect("engine start");
+        let engine = Engine::new(plug_core::config::Config::default());
+        engine.start().await;
 
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-gate-push-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
+        let socket_path = plug_core::paths::test::scratch("gate-push").join("s.sock");
         let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
         let cancel = CancellationToken::new();
-        let (client_registry, _count_rx) = ClientRegistry::new();
-        let ctx = ConnectionContext {
-            cancel: cancel.clone(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine: Arc::clone(&engine),
-            config_path: std::path::PathBuf::from("/tmp/plug-ipc-gate-push-config.toml"),
-            started_at: Instant::now(),
-            client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
-            session_id: Some("gate-push-session".to_string()),
-            reverse_request_rx: None,
-        };
+        let client_registry = ClientRegistry::new();
+        let mut ctx = test_connection_context(
+            &engine,
+            cancel.clone(),
+            client_registry,
+            plug_core::paths::default_config_path(),
+        );
+        ctx.session_id = Some("gate-push-session".to_string());
         let server_task = tokio::spawn(async move {
             if let Ok((stream, _addr)) = listener.accept().await {
                 let _ = handle_ipc_connection(stream, ctx).await;
@@ -4337,144 +3286,34 @@ mod tests {
         drop(stream);
         let _ = server_task.await;
         engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
     }
 
-    /// A Deregister that FAILS validation (here: SESSION_MISMATCH) must not
-    /// kill the connection's live reverse-request channel. The Deregister
-    /// handler only clears `ctx.reverse_request_rx` and drops the bridge's
-    /// sender on its SUCCESS path — the validation early-returns leave the
-    /// channel untouched. If the dispatch loop's restore-skip predicate keyed
-    /// on the request TYPE alone (rather than request type AND `Ok` response),
-    /// the still-live receiver taken out for the dispatch would be dropped at
-    /// end of iteration, closing the bridge sender and permanently breaking
-    /// elicitation/sampling for a session that is still active.
+    /// An operator connection reads one reply per request, so a gate push
+    /// before the reply would be taken for it. Only a registered connection
+    /// is told.
     #[tokio::test]
-    async fn failed_deregister_does_not_kill_reverse_channel() {
-        let config = plug_core::config::Config::default();
-        let engine = Arc::new(Engine::new(config));
-        engine.start().await.expect("engine start");
+    async fn only_a_registered_connection_is_pushed_gate_changes() {
+        let engine = Engine::new(plug_core::config::Config::default());
+        let router = engine.tool_router();
+        let mut pushes = Pushes::new(router);
+        let mut in_flight = InFlight::default();
 
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-failed-dereg-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
-        let cancel = CancellationToken::new();
-
-        let (client_registry, _count_rx) = ClientRegistry::new();
-        let session_id = "failed-dereg-session".to_string();
-
-        // Same hand-built harness as
-        // `idle_registered_connection_services_reverse_request_without_new_client_frame`:
-        // pre-seed `session_id` and a hand-built reverse-request channel.
-        let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
-        let ctx = ConnectionContext {
-            cancel: cancel.clone(),
-            auth_token: Arc::from("test-token"),
-            server_manager: Arc::clone(engine.server_manager()),
-            engine: Arc::clone(&engine),
-            config_path: std::path::PathBuf::from("/tmp/plug-ipc-failed-dereg-config.toml"),
-            started_at: Instant::now(),
-            client_registry: Arc::new(client_registry),
-            http_sessions: None,
-            downstream_oauth: None,
-            session_id: Some(session_id.clone()),
-            reverse_request_rx: Some(reverse_rx),
-        };
-
-        let server_task = tokio::spawn(async move {
-            if let Ok((stream, _addr)) = listener.accept().await {
-                let _ = handle_ipc_connection(stream, ctx).await;
-            }
-        });
-
-        let mut stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .expect("client connect");
-
-        // Enter the registered-idle loop (subscribes log/ctrl channels).
-        write_ipc(&mut stream, &IpcRequest::Status).await;
-        let status = read_ipc_response(&mut stream).await;
-        assert!(
-            matches!(status, IpcResponse::Status { .. }),
-            "expected Status, got {status:?}"
-        );
-
-        // Deregister with the WRONG session id — the handler must reject it
-        // with SESSION_MISMATCH and leave the connection fully registered.
-        write_ipc(
-            &mut stream,
-            &IpcRequest::Deregister {
-                session_id: "not-the-session".to_string(),
-            },
+        router.set_modern_downstream_enabled(true);
+        let unregistered = tokio::time::timeout(
+            Duration::from_millis(50),
+            pushes.next(&mut in_flight, &mut None),
         )
         .await;
-        let deregister_resp = read_ipc_response(&mut stream).await;
-        match &deregister_resp {
-            IpcResponse::Error { code, .. } => {
-                assert_eq!(code, "SESSION_MISMATCH", "unexpected error code");
-            }
-            other => panic!("expected SESSION_MISMATCH error, got {other:?}"),
-        }
+        assert!(unregistered.is_err(), "unregistered connection was pushed");
 
-        // The reverse channel must still be alive and serviced: inject a
-        // reverse request with no further client frame and expect it pushed.
-        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-        let request = plug_core::ipc::IpcClientRequest::CreateElicitation {
-            params: serde_json::from_value(serde_json::json!({
-                "message": "post-failed-deregister test",
-                "requestedSchema": { "type": "object", "properties": {} }
-            }))
-            .unwrap(),
-        };
-        reverse_tx
-            .send((request, resp_tx))
-            .await
-            .expect("reverse channel receiver was dropped — failed Deregister killed it");
-
-        let frame = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            plug_core::ipc::read_frame(&mut stream),
+        pushes.subscribe(router);
+        let push = tokio::time::timeout(
+            Duration::from_secs(5),
+            pushes.next(&mut in_flight, &mut None),
         )
         .await
-        .expect("timed out waiting for the reverse request after failed Deregister")
-        .expect("read frame")
-        .expect("unexpected EOF waiting for reverse request");
-
-        let msg: plug_core::ipc::DaemonToProxyMessage =
-            serde_json::from_slice(&frame).expect("decode DaemonToProxyMessage");
-        let reverse_id = match msg {
-            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { id, request } => {
-                assert!(
-                    matches!(
-                        *request,
-                        plug_core::ipc::IpcClientRequest::CreateElicitation { .. }
-                    ),
-                    "expected CreateElicitation, got {request:?}"
-                );
-                id
-            }
-            other => panic!("expected ReverseRequest envelope, got {other:?}"),
-        };
-
-        // Answer the reverse request so everything winds down cleanly.
-        let reply = IpcClientResponse::Error {
-            message: "test reply".to_string(),
-        };
-        plug_core::ipc::write_frame(
-            &mut stream,
-            &plug_core::ipc::encode_reverse_response(reverse_id, &reply).unwrap(),
-        )
-        .await
-        .expect("write reverse-request reply");
-
-        cancel.cancel();
-        drop(stream);
-        let _ = server_task.await;
-        engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
+        .expect("registered connection is pushed the change");
+        assert!(matches!(push, Push::ModernGate));
     }
 
     /// Regression test for the frame-reader cancellation-safety fix.
@@ -4490,11 +3329,8 @@ mod tests {
     /// desyncing the length-prefixed protocol and killing the connection with
     /// a spurious frame error. After the fix, frame reads go through a
     /// dedicated reader task feeding an `mpsc` channel, whose `recv()` is
-    /// cancellation-safe, so this should round-trip cleanly.
-    ///
-    /// Confirmed to reproduce pre-fix: reverting the `FrameReader` change and
-    /// running this test fails with `frame too large: N bytes (max
-    /// 4194304)` — the exact desync symptom this fix prevents.
+    /// cancellation-safe, so this should round-trip cleanly. Without it the
+    /// test fails with `frame too large`.
     #[tokio::test]
     async fn ipc_registered_client_survives_notification_flood_during_fragmented_frame() {
         let mut harness = IpcTestHarness::start("echo").await;
@@ -4506,6 +3342,7 @@ mod tests {
                 "name": "Mock__echo",
                 "arguments": { "input": "fragmented-hello" }
             })),
+            context: None,
         };
         let payload = serde_json::to_vec(&request).expect("serialize ipc request");
         let len = u32::try_from(payload.len()).expect("payload fits in u32");
@@ -4592,18 +3429,15 @@ mod tests {
         );
     }
 
-    // ── Cross-transport tools/call parity matrix (U6) ────────────────────────
+    // ── Cross-transport parity matrix ────────────────────────────────────────
     //
-    // Drives identical tools/call scenarios through the REAL stdio, HTTP, and IPC
-    // downstream transports and asserts identical decoded results and identical
-    // error codes. This is the CI gate that freezes cross-transport parity for the
-    // tools/call method family: a fix or regression that lands on one transport's
-    // shim but not the others fails the assert_eq here.
+    // Drives identical scenarios through the real HTTP and IPC downstream
+    // transports and asserts identical decoded results and error codes, so a
+    // change to one transport's adapter that the other does not share fails here.
     //
     // Each transport drives its own engine + mock upstream so the only variable is
-    // the downstream transport. Envelopes (HTTP 200-with-error-body, IPC McpResponse
-    // frame, rmcp ServiceError) are normalized to a transport-agnostic ParityOutcome
-    // before comparison.
+    // the downstream transport. Envelopes (HTTP 200-with-error-body, IPC
+    // McpResponse frame) are normalized to a transport-agnostic outcome first.
 
     #[derive(Debug, Clone, PartialEq, Eq)]
     enum ParityOutcome {
@@ -4611,34 +3445,26 @@ mod tests {
         Error { code: i64 },
     }
 
-    /// Minimal rmcp client handler for driving the stdio transport.
-    struct ParityClient;
-
-    impl rmcp::handler::client::ClientHandler for ParityClient {
-        fn get_info(&self) -> rmcp::model::ClientInfo {
-            rmcp::model::ClientInfo::default()
-        }
-    }
-
     /// A `tools/call` result JSON is either a `CallToolResult` ({content, isError})
-    /// or a serialized `McpError` ({code, message}). Normalize either to a
-    /// ParityOutcome.
+    /// or a serialized `McpError`, decoded the way the proxy decodes it.
     fn parity_from_result_json(payload: &serde_json::Value) -> ParityOutcome {
-        if let Some(code) = payload.get("code").and_then(|c| c.as_i64()) {
-            return ParityOutcome::Error { code };
-        }
-        ParityOutcome::Success {
-            text: payload["content"][0]["text"]
-                .as_str()
-                .unwrap_or_default()
-                .to_string(),
-            is_error: payload["isError"].as_bool().unwrap_or(false),
+        match plug_core::ipc::mcp_result(payload.clone()) {
+            Err(error) => ParityOutcome::Error {
+                code: i64::from(error.code.0),
+            },
+            Ok(result) => ParityOutcome::Success {
+                text: result["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
+                is_error: result["isError"].as_bool().unwrap_or(false),
+            },
         }
     }
 
     /// Full-capability mock upstream for the cross-transport parity matrix: tools,
     /// resources, resource templates, prompts, and completion, so every method
-    /// family has real routed content to compare across transports. All three
+    /// family has real routed content to compare across transports. Both
     /// transport drivers build their engine from this identical config so the
     /// only variable in a parity row is the downstream transport.
     fn parity_mock_config() -> plug_core::config::ServerConfig {
@@ -4658,44 +3484,7 @@ mod tests {
         config
             .servers
             .insert("mock".to_string(), parity_mock_config());
-        Arc::new(Engine::new(config))
-    }
-
-    /// stdio: drive tools/call through a real ProxyHandler served over a duplex,
-    /// with an rmcp client issuing the call.
-    async fn parity_stdio(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
-        use rmcp::ServiceExt;
-
-        let engine = parity_mock_engine();
-        engine.start().await.expect("engine start");
-        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
-        let (server_transport, client_transport) = tokio::io::duplex(8192);
-        let server = tokio::spawn(async move {
-            if let Ok(running) = proxy.serve(server_transport).await {
-                let _ = running.waiting().await;
-            }
-        });
-        let client = ParityClient
-            .serve(client_transport)
-            .await
-            .expect("stdio client serve");
-
-        let mut params = rmcp::model::CallToolRequestParams::new(tool.to_string());
-        if let Some(obj) = arguments.as_object() {
-            params = params.with_arguments(obj.clone());
-        }
-        let outcome = match client.call_tool(params).await {
-            Ok(result) => parity_from_result_json(&serde_json::to_value(&result).unwrap()),
-            Err(rmcp::service::ServiceError::McpError(m)) => ParityOutcome::Error {
-                code: m.code.0 as i64,
-            },
-            Err(other) => panic!("unexpected stdio service error: {other:?}"),
-        };
-
-        let _ = client.cancel().await;
-        server.abort();
-        engine.shutdown().await;
-        outcome
+        Engine::new(config)
     }
 
     /// HTTP: drive a `tools/call` through the real axum router and return the raw
@@ -4712,25 +3501,12 @@ mod tests {
         use tower::ServiceExt as _;
 
         let engine = parity_mock_engine();
-        engine.start().await.expect("engine start");
-        let state = Arc::new(plug_core::http::server::HttpState {
-            router: engine.tool_router().clone(),
-            sessions: Arc::new(plug_core::session::StatefulSessionStore::new(1800, 100))
-                as Arc<dyn SessionStore>,
-            cancel: CancellationToken::new(),
-            auth_mode: plug_core::config::DownstreamAuthMode::Auto,
-            downstream_oauth: None,
-            slack_events: None,
-            watch_events: None,
-            sse_channel_capacity: 32,
-            allowed_origins: Vec::new(),
-            notification_task_started: std::sync::atomic::AtomicBool::new(false),
-            auth_token: None,
-            roots_capable_sessions: dashmap::DashMap::new(),
-            pending_client_requests: dashmap::DashMap::new(),
-            reverse_request_counter: std::sync::atomic::AtomicU64::new(1),
-            client_capabilities: dashmap::DashMap::new(),
-        });
+        engine.start().await;
+        let state = Arc::new(plug_core::http::server::HttpState::new(
+            engine.tool_router().clone(),
+            Arc::new(plug_core::session::SessionStore::new(1800, 100)),
+            CancellationToken::new(),
+        ));
         let app = plug_core::http::server::build_router(state);
 
         let init_body = serde_json::json!({
@@ -4798,9 +3574,8 @@ mod tests {
 
     /// IPC: drive tools/call through the real daemon socket loop.
     async fn parity_ipc(tool: &str, arguments: serde_json::Value) -> ParityOutcome {
-        // Use the same full-capability upstream config as the stdio/HTTP parity
-        // drivers (parity_mock_engine) so all three transports share an identical
-        // upstream and the only variable in a parity row is the transport.
+        // The same full-capability upstream as `parity_mock_engine`, so the only
+        // variable in a parity row is the transport.
         let mut harness = IpcTestHarness::start_full().await;
         let resp = harness.call_tool(tool, arguments).await;
         harness.shutdown().await;
@@ -4816,156 +3591,25 @@ mod tests {
     // generic drivers extend the matrix to every other method family: each takes
     // a JSON-RPC `method` + `params`, drives it through the real transport against
     // the shared full-capability mock upstream, and normalizes to a transport-
-    // agnostic `MethodOutcome` (a canonicalized result JSON, or an error code).
+    // agnostic `MethodOutcome` (a result JSON, or an error code).
 
-    /// Normalized cross-transport outcome for any MCP method: either a
-    /// canonicalized result object or an error code. Result JSON is key-sorted so
-    /// structural equality is independent of each transport's serialization order.
+    /// Normalized cross-transport outcome for any MCP method: either a result
+    /// object or an error code. JSON object equality ignores key order.
     #[derive(Debug, Clone, PartialEq)]
     enum MethodOutcome {
         Result(serde_json::Value),
         Error { code: i64 },
     }
 
-    /// Recursively sort object keys so two structurally-equal results with
-    /// different key order compare equal.
-    fn canonicalize_json(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::Object(map) => {
-                let mut keys: Vec<&String> = map.keys().collect();
-                keys.sort();
-                let mut sorted = serde_json::Map::new();
-                for k in keys {
-                    sorted.insert(k.clone(), canonicalize_json(&map[k]));
-                }
-                serde_json::Value::Object(sorted)
-            }
-            serde_json::Value::Array(arr) => {
-                serde_json::Value::Array(arr.iter().map(canonicalize_json).collect())
-            }
-            other => other.clone(),
-        }
-    }
-
-    /// Normalize a bare result payload (IPC carries success and a serialized
-    /// `McpError` over the same channel) to a `MethodOutcome`. A top-level integer
-    /// `code` marks an error; none of the routed result types carry one.
+    /// Normalize a bare result payload, which IPC uses for both a result and
+    /// a serialized `McpError`, the way the proxy decodes it.
     fn method_outcome_from_payload(payload: &serde_json::Value) -> MethodOutcome {
-        // A serialized McpError carries BOTH a top-level integer `code` and a
-        // string `message`. Requiring both (not `code` alone) keeps a future
-        // result type that happens to expose a top-level integer `code` from
-        // being misclassified as an error.
-        let code = payload.get("code").and_then(|c| c.as_i64());
-        let has_message = payload.get("message").and_then(|m| m.as_str()).is_some();
-        if let (Some(code), true) = (code, has_message) {
-            return MethodOutcome::Error { code };
-        }
-        MethodOutcome::Result(canonicalize_json(payload))
-    }
-
-    /// Build an optional paginated request from a `{ "cursor": "..." }` params
-    /// object, matching the rmcp typed list-method signatures.
-    fn parity_paginated(params: &serde_json::Value) -> Option<rmcp::model::PaginatedRequestParams> {
-        params.get("cursor").and_then(|c| c.as_str()).map(|cursor| {
-            rmcp::model::PaginatedRequestParams::default().with_cursor(Some(cursor.to_string()))
-        })
-    }
-
-    /// stdio: drive an arbitrary method through a real `ProxyHandler` served over
-    /// a duplex, with an rmcp client issuing the typed request. The rmcp client is
-    /// typed, so each method maps to its typed call; the Ok result is serialized
-    /// to the same JSON the server emitted, and an `McpError` maps to its code.
-    async fn parity_stdio_call(method: &str, params: serde_json::Value) -> MethodOutcome {
-        use rmcp::ServiceExt;
-
-        let engine = parity_mock_engine();
-        engine.start().await.expect("engine start");
-        let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
-        let (server_transport, client_transport) = tokio::io::duplex(8192);
-        let server = tokio::spawn(async move {
-            if let Ok(running) = proxy.serve(server_transport).await {
-                let _ = running.waiting().await;
-            }
-        });
-        let client = ParityClient
-            .serve(client_transport)
-            .await
-            .expect("stdio client serve");
-
-        macro_rules! outcome {
-            ($call:expr) => {
-                match $call.await {
-                    Ok(result) => MethodOutcome::Result(canonicalize_json(
-                        &serde_json::to_value(&result).unwrap(),
-                    )),
-                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
-                        code: m.code.0 as i64,
-                    },
-                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
-                }
-            };
-        }
-
-        // subscribe/unsubscribe return EmptyResult on the wire; the typed rmcp
-        // client discards it to `()`, so normalize Ok to the canonical empty-ok
-        // ({}) that HTTP (EmptyResult) and IPC (json!({})) also produce.
-        macro_rules! outcome_unit {
-            ($call:expr) => {
-                match $call.await {
-                    Ok(()) => MethodOutcome::Result(serde_json::json!({})),
-                    Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
-                        code: m.code.0 as i64,
-                    },
-                    Err(other) => panic!("unexpected stdio service error: {other:?}"),
-                }
-            };
-        }
-
-        let outcome = match method {
-            "tools/list" => outcome!(client.list_tools(parity_paginated(&params))),
-            "resources/list" => outcome!(client.list_resources(parity_paginated(&params))),
-            "resources/templates/list" => {
-                outcome!(client.list_resource_templates(parity_paginated(&params)))
-            }
-            "resources/read" => {
-                outcome!(client.read_resource(serde_json::from_value(params).unwrap()))
-            }
-            "prompts/list" => outcome!(client.list_prompts(parity_paginated(&params))),
-            "prompts/get" => outcome!(client.get_prompt(serde_json::from_value(params).unwrap())),
-            "completion/complete" => {
-                outcome!(client.complete(serde_json::from_value(params).unwrap()))
-            }
-            "resources/subscribe" => {
-                outcome_unit!(client.subscribe(serde_json::from_value(params).unwrap()))
-            }
-            "resources/unsubscribe" => {
-                outcome_unit!(client.unsubscribe(serde_json::from_value(params).unwrap()))
-            }
-            // `ping` has no typed helper on the rmcp client, so drive the raw
-            // request and normalize the EmptyResult to the canonical empty-ok
-            // ({}) that HTTP and IPC also produce.
-            "ping" => match client
-                .send_request(rmcp::model::ClientRequest::PingRequest(
-                    rmcp::model::PingRequest::default(),
-                ))
-                .await
-            {
-                Ok(rmcp::model::ServerResult::EmptyResult(_)) => {
-                    MethodOutcome::Result(serde_json::json!({}))
-                }
-                Ok(other) => panic!("unexpected stdio ping result: {other:?}"),
-                Err(rmcp::service::ServiceError::McpError(m)) => MethodOutcome::Error {
-                    code: m.code.0 as i64,
-                },
-                Err(other) => panic!("unexpected stdio service error: {other:?}"),
+        match plug_core::ipc::mcp_result(payload.clone()) {
+            Ok(result) => MethodOutcome::Result(result),
+            Err(error) => MethodOutcome::Error {
+                code: i64::from(error.code.0),
             },
-            other => panic!("unsupported parity method for stdio: {other}"),
-        };
-
-        let _ = client.cancel().await;
-        server.abort();
-        engine.shutdown().await;
-        outcome
+        }
     }
 
     /// HTTP: drive an arbitrary method through the real axum router and normalize.
@@ -4976,7 +3620,7 @@ mod tests {
                 code: err["code"].as_i64().unwrap_or(0),
             }
         } else {
-            MethodOutcome::Result(canonicalize_json(&json["result"]))
+            MethodOutcome::Result(json["result"].clone())
         }
     }
 
@@ -4991,30 +3635,25 @@ mod tests {
         }
     }
 
-    /// Drive `method`+`params` through all three transports and assert the three
-    /// normalized outcomes are identical, returning the agreed outcome for any
-    /// further method-specific assertions. The core parity gate for a method.
+    /// Drive `method`+`params` through both transports and assert the normalized
+    /// outcomes are identical, returning the agreed outcome for any further
+    /// method-specific assertions. The core parity gate for a method.
     async fn assert_parity(method: &str, params: serde_json::Value) -> MethodOutcome {
-        let stdio = parity_stdio_call(method, params.clone()).await;
         let http = parity_http_call(method, params.clone()).await;
         let ipc = parity_ipc_call(method, params.clone()).await;
-        assert_eq!(stdio, http, "{method}: stdio vs http divergence");
         assert_eq!(http, ipc, "{method}: http vs ipc divergence");
-        stdio
+        http
     }
 
     #[tokio::test]
     async fn parity_tools_call_success_matches_across_transports() {
         let args = serde_json::json!({ "input": "parity" });
-        let stdio = parity_stdio("Mock__echo", args.clone()).await;
         let http = parity_http("Mock__echo", args.clone()).await;
         let ipc = parity_ipc("Mock__echo", args.clone()).await;
 
-        // All three must produce the identical decoded CallToolResult.
-        assert_eq!(stdio, http, "stdio vs http success divergence");
         assert_eq!(http, ipc, "http vs ipc success divergence");
         // And it must actually be the echo success, not a coincidental match.
-        match &stdio {
+        match &http {
             ParityOutcome::Success { text, is_error } => {
                 assert!(!is_error, "echo should not be an error result");
                 assert!(
@@ -5029,80 +3668,29 @@ mod tests {
     #[tokio::test]
     async fn parity_tools_call_unknown_tool_matches_across_transports() {
         let args = serde_json::json!({});
-        let stdio = parity_stdio("Mock__missing", args.clone()).await;
         let http = parity_http("Mock__missing", args.clone()).await;
         let ipc = parity_ipc("Mock__missing", args.clone()).await;
 
-        // All three must surface the identical error code (ToolNotFound ->
-        // METHOD_NOT_FOUND, -32601). A transport that diverged here would fail.
-        assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
+        // ToolNotFound -> METHOD_NOT_FOUND (-32601) on both.
         assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
         assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
     }
 
-    /// An empty tool name now routes through the shared dispatcher on every
-    /// transport (IPC's old INVALID_PARAMS pre-check was removed), so all three
-    /// return the same router error as any other unknown tool.
+    /// An empty tool name is just another unknown tool.
     #[tokio::test]
     async fn parity_tools_call_empty_name_matches_across_transports() {
         let args = serde_json::json!({});
-        let stdio = parity_stdio("", args.clone()).await;
         let http = parity_http("", args.clone()).await;
         let ipc = parity_ipc("", args.clone()).await;
 
-        assert_eq!(stdio, ParityOutcome::Error { code: -32601 }, "stdio");
         assert_eq!(http, ParityOutcome::Error { code: -32601 }, "http");
         assert_eq!(ipc, ParityOutcome::Error { code: -32601 }, "ipc");
     }
 
-    /// Documents and locks the intentional task-augmentation divergence between
-    /// transports. The stdio path goes through rmcp's `ServerHandler`, which
-    /// validates the tool's task capability and REJECTS a task-augmented call to a
-    /// non-task tool with INVALID_PARAMS (-32602) before the dispatcher runs. The
-    /// HTTP and IPC paths bypass that rmcp validation and create a plug-side
-    /// passthrough task. This is pre-existing behavior the dispatcher preserves —
-    /// the test pins it so a future change can't silently alter it on one transport.
+    /// A legacy task-augmented call to a tool creates a plug-side passthrough
+    /// task on both transports.
     #[tokio::test]
-    async fn parity_task_augmented_call_diverges_stdio_rejects_http_ipc_create_task() {
-        // stdio: rmcp's ServerHandler rejects a task call to a non-task tool.
-        let stdio_err = {
-            use rmcp::ServiceExt;
-            let engine = parity_mock_engine();
-            engine.start().await.expect("engine start");
-            let proxy = plug_core::proxy::ProxyHandler::from_router(engine.tool_router().clone());
-            let (server_transport, client_transport) = tokio::io::duplex(8192);
-            let server = tokio::spawn(async move {
-                if let Ok(running) = proxy.serve(server_transport).await {
-                    let _ = running.waiting().await;
-                }
-            });
-            let client = ParityClient
-                .serve(client_transport)
-                .await
-                .expect("stdio client serve");
-            let mut params = rmcp::model::CallToolRequestParams::new("Mock__echo".to_string());
-            params = params.with_arguments(serde_json::Map::new());
-            params.meta.get_or_insert_with(Default::default).insert(
-                plug_core::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
-                serde_json::json!({}),
-            );
-            let err = client
-                .call_tool(params)
-                .await
-                .expect_err("stdio should reject a task call to a non-task tool");
-            let _ = client.cancel().await;
-            server.abort();
-            engine.shutdown().await;
-            err
-        };
-        match stdio_err {
-            rmcp::service::ServiceError::McpError(m) => assert_eq!(
-                m.code.0, -32602,
-                "stdio task rejection should be INVALID_PARAMS"
-            ),
-            other => panic!("unexpected stdio error: {other:?}"),
-        }
-
+    async fn parity_task_augmented_call_creates_a_task_on_http_and_ipc() {
         // HTTP: the direct path also creates a plug-side passthrough task.
         let http_json = http_tools_call_response(serde_json::json!({
             "name": "Mock__echo",
@@ -5136,14 +3724,14 @@ mod tests {
         );
     }
 
-    // ── Method-family parity rows (U3) ───────────────────────────────────────
+    // ── Method-family parity rows ────────────────────────────────────────────
     //
-    // Each row drives one method through stdio + HTTP + IPC against the shared
-    // full-capability mock and asserts the three decoded results agree, plus a
-    // light content check so a coincidental three-way error can't pass as success.
+    // Each row drives one method through HTTP and IPC against the shared
+    // full-capability mock and asserts the decoded results agree, plus a light
+    // content check so a coincidental error on both can't pass as success.
     // Routed names use the "Mock" server prefix (server "mock" -> "Mock__name").
     // The fixtures fit in one page (PAGE_SIZE = 500), so list results carry no
-    // cursor; first-page parity still asserts nextCursor agreement across all three.
+    // cursor; first-page parity still asserts nextCursor agreement.
 
     /// Collect `name`-field values from a result array at `key`.
     fn result_names(json: &serde_json::Value, key: &str) -> Vec<String> {
@@ -5157,12 +3745,9 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// `ping` returns an empty result on every downstream transport. IPC used to
-    /// be the odd one out: its MCP dispatch table had no `ping` arm, so the
-    /// method fell through to UNSUPPORTED_METHOD. That was only reachable via the
-    /// `plug/legacy/` escape hatch or a raw IPC speaker — a downstream client's
-    /// ping is answered by RMCP's default handler inside `plug connect` and never
-    /// reaches the daemon — but the hole is closed and pinned here.
+    /// A downstream client's `ping` is answered by RMCP inside `plug connect`
+    /// and reaches the daemon only from a raw IPC speaker or the `plug/legacy/`
+    /// escape hatch; it still answers like HTTP.
     #[tokio::test]
     async fn parity_ping_matches_across_transports() {
         match assert_parity("ping", serde_json::json!({})).await {
@@ -5240,9 +3825,9 @@ mod tests {
     #[tokio::test]
     async fn parity_resources_read_unknown_uri_matches_across_transports() {
         // Unknown URI is rejected by the shared router before any upstream call,
-        // so all three transports must surface the identical error code.
+        // so both transports must surface the identical error code.
         let params = serde_json::json!({ "uri": "file:///does/not/exist" });
-        // assert_parity already proves the three transports agree on the code;
+        // assert_parity already proves the transports agree on the code;
         // pin the absolute value too (InvalidRequest -> -32600) so a uniform
         // drift to a different-but-equal code can't pass silently.
         match assert_parity("resources/read", params).await {
@@ -5318,14 +3903,10 @@ mod tests {
         }
     }
 
-    // ── Subscribe/unsubscribe lifecycle parity (U4) ──────────────────────────
+    // ── Subscribe/unsubscribe lifecycle parity ───────────────────────────────
     //
-    // The three transports encode an empty success differently (stdio's typed
-    // client discards it to `()`, HTTP returns EmptyResult, IPC returns json!({})).
-    // The drivers normalize all three to the canonical empty-ok ({}), so these
-    // rows prove the divergent encodings are equivalent. Each call is a fresh
-    // session, so the unsubscribe row also exercises the idempotent (not-currently-
-    // subscribed) path.
+    // Each call is a fresh session, so the unsubscribe row also exercises the
+    // idempotent (not-currently-subscribed) path.
 
     fn assert_empty_ok(outcome: MethodOutcome, label: &str) {
         match outcome {
@@ -5351,7 +3932,7 @@ mod tests {
         assert_empty_ok(outcome, "unsubscribe");
     }
 
-    /// Send `request` tagged with `ipc_id`, as a v4 proxy does.
+    /// Send `request` tagged with `ipc_id`, as the proxy does.
     async fn write_tagged_ipc(stream: &mut tokio::net::UnixStream, ipc_id: u64, req: &IpcRequest) {
         let payload = plug_core::ipc::encode_tagged(Some(ipc_id), req).expect("encode request");
         plug_core::ipc::write_frame(stream, &payload)
@@ -5362,9 +3943,7 @@ mod tests {
     /// Read the next reply that carries an `ipc_id`, reassembling a chunked
     /// one. Fails if another frame lands between the chunks of a response.
     async fn read_tagged_reply(stream: &mut tokio::net::UnixStream) -> (u64, IpcResponse) {
-        use base64::Engine as _;
-        let mut chunks: Vec<u8> = Vec::new();
-        let mut in_chunked = false;
+        let mut decoder = plug_core::ipc::DaemonFrameDecoder::default();
         loop {
             let frame = tokio::time::timeout(
                 std::time::Duration::from_secs(10),
@@ -5374,40 +3953,16 @@ mod tests {
             .expect("timed out waiting for a tagged reply")
             .expect("read frame")
             .expect("unexpected EOF before reply");
-            let body = if frame.starts_with(b"{\"envelope\":") {
-                match serde_json::from_slice(&frame).expect("decode envelope") {
-                    plug_core::ipc::DaemonToProxyMessage::ResponseChunk {
-                        chunk_index,
-                        chunk_count,
-                        payload_b64,
-                    } => {
-                        assert_eq!(chunk_index == 0, !in_chunked, "chunks out of sequence");
-                        in_chunked = true;
-                        chunks.extend(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(payload_b64)
-                                .expect("chunk payload"),
-                        );
-                        if chunk_index + 1 < chunk_count {
-                            continue;
-                        }
-                        in_chunked = false;
-                        std::mem::take(&mut chunks)
-                    }
-                    other => panic!("unexpected envelope {other:?}"),
+            match decoder.decode(&frame).expect("decode frame") {
+                None => {}
+                Some(plug_core::ipc::DaemonFrame::Reply { response, .. }) if response.is_push() => {
                 }
-            } else {
-                assert!(!in_chunked, "a frame interleaved with a chunked response");
-                frame
-            };
-            let response: IpcResponse = serde_json::from_slice(&body).expect("decode reply");
-            if is_ipc_push_notification(&response) {
-                continue;
+                Some(plug_core::ipc::DaemonFrame::Reply { ipc_id, response }) => {
+                    let ipc_id = ipc_id.expect("a tagged request gets a tagged reply");
+                    return (ipc_id, response);
+                }
+                Some(other) => panic!("unexpected frame {other:?}"),
             }
-            let ipc_id = plug_core::ipc::FrameIds::peek(&body)
-                .ipc_id
-                .expect("a tagged request gets a tagged reply");
-            return (ipc_id, response);
         }
     }
 
@@ -5417,8 +3972,18 @@ mod tests {
                 "slow",
                 ipc_harness_mock_config_with("echo", &["--delay-ms", "1500"]),
             ),
-            ("fast", ipc_harness_mock_config("echo,chunked_text")),
+            ("fast", mock_server("echo,chunked_text")),
         ]
+    }
+
+    async fn wait_for_a_running_call(router: &ToolRouter) {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while router.calls_running() == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the call never started");
     }
 
     fn tool_call_request(session_id: &str, name: &str) -> IpcRequest {
@@ -5426,6 +3991,7 @@ mod tests {
             session_id: session_id.to_string(),
             method: "tools/call".to_string(),
             params: Some(serde_json::json!({ "name": name, "arguments": { "input": name } })),
+            context: None,
         }
     }
 
@@ -5442,8 +4008,8 @@ mod tests {
             &tool_call_request(&session_id, "Slow__echo"),
         )
         .await;
-        // Let the call reach the upstream, then shut down as the daemon does.
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        // Once the call is running, shut down as the daemon does.
+        wait_for_a_running_call(harness.engine.tool_router()).await;
         let remaining = harness
             .engine
             .tool_router()
@@ -5477,9 +4043,10 @@ mod tests {
                 "name": "Slow__echo",
                 "arguments": { "input": input },
             })),
+            context: None,
         };
         write_tagged_ipc(&mut harness.stream, 1, &request).await;
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        wait_for_a_running_call(harness.engine.tool_router()).await;
         let remaining = harness
             .engine
             .tool_router()
@@ -5592,181 +4159,20 @@ mod tests {
         harness.shutdown().await;
     }
 
-    /// Fail if a frame sent to a v3 proxy carries a field v3 never saw.
-    fn assert_v3_frame(bytes: &[u8]) {
-        let value: serde_json::Value = serde_json::from_slice(bytes).expect("frame is JSON");
-        for field in ["ipc_id", "reverse_id"] {
-            assert!(
-                value.get(field).is_none(),
-                "a v3 proxy got a frame with `{field}`"
-            );
-        }
-    }
-
-    /// Read the reply to an untagged request the way a v3 proxy does: one
-    /// frame at a time, reassembling chunks and answering each reverse request
-    /// with a bare `IpcClientResponse` before reading on. Returns the reply
-    /// and how many reverse requests were answered.
-    async fn read_v3_reply(stream: &mut tokio::net::UnixStream) -> (IpcResponse, usize) {
-        use base64::Engine as _;
-        let mut chunks: Vec<u8> = Vec::new();
-        let mut reverse_requests = 0;
-        loop {
-            let frame = tokio::time::timeout(
-                std::time::Duration::from_secs(10),
-                plug_core::ipc::read_frame(stream),
-            )
-            .await
-            .expect("timed out waiting for a reply")
-            .expect("read frame")
-            .expect("unexpected EOF before reply");
-            assert_v3_frame(&frame);
-            let body = if frame.starts_with(b"{\"envelope\":") {
-                match serde_json::from_slice(&frame).expect("decode envelope") {
-                    plug_core::ipc::DaemonToProxyMessage::ResponseChunk {
-                        chunk_index,
-                        chunk_count,
-                        payload_b64,
-                    } => {
-                        chunks.extend(
-                            base64::engine::general_purpose::STANDARD
-                                .decode(payload_b64)
-                                .expect("chunk payload"),
-                        );
-                        if chunk_index + 1 < chunk_count {
-                            continue;
-                        }
-                        std::mem::take(&mut chunks)
-                    }
-                    plug_core::ipc::DaemonToProxyMessage::ReverseRequest { request, .. } => {
-                        assert!(
-                            matches!(*request, IpcClientRequest::CreateElicitation { .. }),
-                            "{request:?}"
-                        );
-                        reverse_requests += 1;
-                        let reply = IpcClientResponse::CreateElicitation {
-                            result: serde_json::from_value(
-                                serde_json::json!({ "action": "accept", "content": {} }),
-                            )
-                            .expect("elicit result"),
-                        };
-                        let payload = serde_json::to_vec(&reply).expect("encode reply");
-                        plug_core::ipc::write_frame(stream, &payload)
-                            .await
-                            .expect("write reverse reply");
-                        continue;
-                    }
-                    other => panic!("unexpected envelope {other:?}"),
-                }
-            } else {
-                frame
-            };
-            assert_v3_frame(&body);
-            let response: IpcResponse = serde_json::from_slice(&body).expect("decode reply");
-            if is_ipc_push_notification(&response) {
-                continue;
-            }
-            return (response, reverse_requests);
-        }
-    }
-
-    fn reply_text(response: &IpcResponse) -> String {
-        let IpcResponse::McpResponse { payload } = response else {
-            panic!("expected an MCP response, got {response:?}");
-        };
-        payload["content"][0]["text"]
-            .as_str()
-            .expect("text content")
-            .to_string()
-    }
-
-    /// A `plug connect` started before an upgrade speaks v3. It must keep
-    /// working against the new daemon until its host restarts it.
-    #[tokio::test]
-    async fn v3_proxy_keeps_working_against_this_daemon() {
-        let mut harness = IpcTestHarness::start_registered(
-            vec![(
-                "mock",
-                ipc_harness_mock_config_with(
-                    "echo,chunked_text",
-                    &["--reverse-request", "elicitation"],
-                ),
-            )],
-            3,
-        )
-        .await;
-        let session_id = harness.session_id.clone();
-
-        let capabilities: rmcp::model::ClientCapabilities =
-            serde_json::from_value(serde_json::json!({ "elicitation": {} }))
-                .expect("client capabilities");
-        write_ipc(
-            &mut harness.stream,
-            &IpcRequest::UpdateCapabilities {
-                session_id: session_id.clone(),
-                capabilities: Box::new(capabilities),
-            },
-        )
-        .await;
-        let (reply, _) = read_v3_reply(&mut harness.stream).await;
-        assert!(matches!(reply, IpcResponse::Ok), "{reply:?}");
-
-        // A call whose upstream asks the client for input mid-call.
-        write_ipc(
-            &mut harness.stream,
-            &tool_call_request(&session_id, "Mock__echo"),
-        )
-        .await;
-        let (reply, reverse_requests) = read_v3_reply(&mut harness.stream).await;
-        assert_eq!(reverse_requests, 1);
-        assert!(
-            reply_text(&reply).contains("reverse=elicitation:Accept"),
-            "{reply:?}"
-        );
-
-        // A reply over MAX_FRAME_SIZE arrives in chunks.
-        write_ipc(
-            &mut harness.stream,
-            &tool_call_request(&session_id, "Mock__chunked_text"),
-        )
-        .await;
-        let (reply, _) = read_v3_reply(&mut harness.stream).await;
-        assert_eq!(reply_text(&reply).len(), 6 * 1024 * 1024);
-
-        write_ipc(
-            &mut harness.stream,
-            &IpcRequest::Ping {
-                session_id: session_id.clone(),
-            },
-        )
-        .await;
-        let (reply, _) = read_v3_reply(&mut harness.stream).await;
-        assert!(matches!(reply, IpcResponse::Pong), "{reply:?}");
-
-        harness.shutdown().await;
-    }
-
     #[tokio::test]
     async fn register_rejects_versions_outside_the_supported_range() {
         for version in [
-            plug_core::ipc::IPC_PROTOCOL_VERSION_MIN - 1,
+            plug_core::ipc::IPC_PROTOCOL_VERSION - 1,
             plug_core::ipc::IPC_PROTOCOL_VERSION + 1,
         ] {
-            let (client_registry, _count_rx) = ClientRegistry::new();
-            let engine = Arc::new(Engine::new(plug_core::config::Config::default()));
-            let mut ctx = ConnectionContext {
-                cancel: CancellationToken::new(),
-                auth_token: Arc::from("test-token"),
-                server_manager: Arc::clone(engine.server_manager()),
-                engine: Arc::clone(&engine),
-                config_path: std::path::PathBuf::from("/tmp/plug-ipc-test-config.toml"),
-                started_at: Instant::now(),
-                client_registry: Arc::new(client_registry),
-                http_sessions: None,
-                downstream_oauth: None,
-                session_id: None,
-                reverse_request_rx: None,
-            };
+            let client_registry = ClientRegistry::new();
+            let engine = Engine::new(plug_core::config::Config::default());
+            let mut ctx = test_connection_context(
+                &engine,
+                CancellationToken::new(),
+                client_registry,
+                plug_core::paths::default_config_path(),
+            );
             let response = dispatch_request(
                 &IpcRequest::Register {
                     protocol_version: version,
@@ -5798,7 +4204,7 @@ mod tests {
         .await;
         let session_id = harness.session_id.clone();
 
-        let limit = MAX_CONCURRENT_REQUESTS_PER_CONNECTION as u64;
+        let limit = ipc::MAX_CONCURRENT_REQUESTS_PER_CONNECTION as u64;
         for ipc_id in 1..=limit + 1 {
             write_tagged_ipc(
                 &mut harness.stream,

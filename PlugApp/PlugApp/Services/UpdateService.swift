@@ -6,10 +6,15 @@ final class UpdateService {
     static let shared = UpdateService()
 
     private let controller = SPUStandardUpdaterController(
-        startingUpdater: true,
+        startingUpdater: false,
         updaterDelegate: nil,
         userDriverDelegate: nil
     )
+
+    /// Runs once, at launch: from then on Sparkle checks on its own schedule.
+    func start() {
+        controller.startUpdater()
+    }
 
     var canCheckForUpdates: Bool { controller.updater.canCheckForUpdates }
 

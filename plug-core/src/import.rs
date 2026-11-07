@@ -1,146 +1,32 @@
-//! Config import: scan AI client config files and extract MCP server definitions.
-//!
-//! Scans AI client config files for MCP server definitions.
+//! Config import: read other AI clients' settings files for MCP servers.
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-use crate::config::{ServerConfig, TransportType};
-
-// ── Types ───────────────────────────────────────────────────────────────────
+use crate::clients::{ClientTarget, ServerEntry};
+use crate::config::{Config, HttpConfig, ServerConfig, TransportType};
 
 /// A server discovered from a client config file.
 #[derive(Debug, Clone, Serialize)]
 pub struct DiscoveredServer {
     /// Server name as defined in the source config.
     pub name: String,
-    /// Converted server config.
     pub config: ServerConfig,
-    /// Which client this was discovered from.
-    pub source: ClientSource,
-}
-
-/// Identifies which client config a server was imported from.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
-pub enum ClientSource {
-    ClaudeDesktop,
-    ClaudeCode,
-    Cursor,
-    Devin,
-    VSCodeCopilot,
-    CopilotCli,
-    GeminiCli,
-    CodexCli,
-    GrokBuild,
-    OpenCode,
-    Zed,
-    Cline,
-    ClineCli,
-    RooCode,
-    Factory,
-    Nanobot,
-    Junie,
-    Kilo,
-    Pi,
-    Warp,
-    Kiro,
-    KimiCode,
-    QwenCode,
-    Antigravity,
-    Goose,
-    Hermes,
-    Amp,
-    OpenClaw,
-    LmStudio,
-    MuseCode,
-}
-
-impl ClientSource {
-    /// Human-readable name for display.
-    pub fn display_name(&self) -> &'static str {
-        match self {
-            Self::ClaudeDesktop => "Claude Desktop",
-            Self::ClaudeCode => "Claude Code",
-            Self::Cursor => "Cursor",
-            Self::Devin => "Devin",
-            Self::VSCodeCopilot => "VS Code Copilot",
-            Self::CopilotCli => "GitHub Copilot CLI",
-            Self::GeminiCli => "Gemini CLI",
-            Self::CodexCli => "Codex CLI",
-            Self::GrokBuild => "Grok Build",
-            Self::OpenCode => "OpenCode",
-            Self::Zed => "Zed",
-            Self::Cline => "Cline (VS Code)",
-            Self::ClineCli => "Cline CLI",
-            Self::RooCode => "RooCode",
-            Self::Factory => "Factory",
-            Self::Nanobot => "Nanobot",
-            Self::Junie => "JetBrains Junie",
-            Self::Kilo => "Kilo Code",
-            Self::Pi => "Pi",
-            Self::Warp => "Warp",
-            Self::Kiro => "Kiro",
-            Self::KimiCode => "Kimi Code",
-            Self::QwenCode => "Qwen Code",
-            Self::Antigravity => "Google Antigravity",
-            Self::Goose => "Goose",
-            Self::Hermes => "Hermes Agent",
-            Self::Amp => "Amp",
-            Self::OpenClaw => "OpenClaw",
-            Self::LmStudio => "LM Studio",
-            Self::MuseCode => "Muse Code",
-        }
-    }
-
-    /// All known client sources.
-    pub fn all() -> &'static [ClientSource] {
-        &[
-            Self::ClaudeDesktop,
-            Self::ClaudeCode,
-            Self::Cursor,
-            Self::Devin,
-            Self::VSCodeCopilot,
-            Self::CopilotCli,
-            Self::GeminiCli,
-            Self::CodexCli,
-            Self::GrokBuild,
-            Self::OpenCode,
-            Self::Zed,
-            Self::Cline,
-            Self::ClineCli,
-            Self::RooCode,
-            Self::Factory,
-            Self::Nanobot,
-            Self::Junie,
-            Self::Kilo,
-            Self::Pi,
-            Self::Warp,
-            Self::Kiro,
-            Self::KimiCode,
-            Self::QwenCode,
-            Self::Antigravity,
-            Self::Goose,
-            Self::Hermes,
-            Self::Amp,
-            Self::OpenClaw,
-            Self::LmStudio,
-            Self::MuseCode,
-        ]
-    }
-}
-
-impl std::fmt::Display for ClientSource {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.display_name())
-    }
+    #[serde(skip)]
+    pub source: ClientTarget,
+    /// `source`'s slug, as `plug link` takes it.
+    pub source_target: &'static str,
+    pub source_name: &'static str,
 }
 
 /// Result of scanning a single client.
 #[derive(Debug, Clone, Serialize)]
 pub struct ScanResult {
-    pub source: ClientSource,
+    #[serde(skip)]
+    pub source: ClientTarget,
+    pub source_target: &'static str,
+    pub source_name: &'static str,
     pub servers: Vec<DiscoveredServer>,
     pub error: Option<String>,
 }
@@ -154,53 +40,59 @@ pub struct ImportReport {
     pub duplicates_merged: usize,
 }
 
-// ── Scanner ─────────────────────────────────────────────────────────────────
-
-/// Scan a specific client source for MCP server definitions.
-pub fn scan_client(source: ClientSource) -> ScanResult {
-    let paths = config_paths(source);
+/// The servers `source`'s settings hold, but for Plug, which serves at `plug`.
+pub fn scan_client(source: ClientTarget, plug: &HttpConfig) -> ScanResult {
     let mut servers = Vec::new();
     let mut error = None;
 
-    for path in paths {
+    for path in source.import_paths() {
         if !path.exists() {
             continue;
         }
-        match parse_config(source, &path) {
-            Ok(mut found) => {
-                // Ignore any server named "plug" to avoid recursion
-                found.retain(|s| s.name != "plug");
-                servers.append(&mut found);
-            }
-            Err(e) => {
-                error = Some(format!("{}: {e}", path.display()));
-            }
+        let found = std::fs::read_to_string(&path)
+            .map_err(|e| e.to_string())
+            .and_then(|content| source.layout().read_servers(&content, plug));
+        match found {
+            Ok(found) => servers.extend(
+                found
+                    .into_iter()
+                    .map(|(name, entry)| discovered(source, name, entry)),
+            ),
+            Err(e) => error = Some(format!("{}: {e}", path.display())),
         }
     }
 
     ScanResult {
         source,
+        source_target: source.slug(),
+        source_name: source.display_name(),
         servers,
         error,
     }
 }
 
-/// Run the full import: scan, deduplicate, and compute what's new.
-pub fn import(existing: &HashMap<String, ServerConfig>, sources: &[ClientSource]) -> ImportReport {
-    let scanned: Vec<ScanResult> = sources.iter().map(|s| scan_client(*s)).collect();
+/// Scan, deduplicate, and keep what `config` does not already have.
+pub fn import(config: &Config, sources: &[ClientTarget]) -> ImportReport {
+    let scanned = sources
+        .iter()
+        .map(|source| scan_client(*source, &config.http))
+        .collect();
+    report(&config.servers, scanned)
+}
 
+fn report(existing: &HashMap<String, ServerConfig>, scanned: Vec<ScanResult>) -> ImportReport {
     let mut all_discovered: Vec<DiscoveredServer> =
         scanned.iter().flat_map(|r| r.servers.clone()).collect();
 
     let duplicates_before = all_discovered.len();
-    dedup_servers(&mut all_discovered);
+    let mut seen = HashSet::new();
+    all_discovered.retain(|s| seen.insert(server_signature(&s.config)));
     let duplicates_merged = duplicates_before - all_discovered.len();
 
-    let existing_sigs: std::collections::HashSet<String> =
-        existing.values().map(server_signature).collect();
+    let existing_sigs: HashSet<String> = existing.values().map(server_signature).collect();
     let new_servers: Vec<DiscoveredServer> = all_discovered
         .into_iter()
-        .filter(|d| !is_existing_server(d, &existing_sigs))
+        .filter(|d| !existing_sigs.contains(&server_signature(&d.config)))
         .collect();
 
     let skipped = duplicates_before - duplicates_merged - new_servers.len();
@@ -213,704 +105,73 @@ pub fn import(existing: &HashMap<String, ServerConfig>, sources: &[ClientSource]
     }
 }
 
-// ── Config Paths ────────────────────────────────────────────────────────────
+/// A discovered server on its way into the config, as
+/// [`crate::operator::OperatorMutation::ImportServers`] carries it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportedServer {
+    pub name: String,
+    /// The slug of the client it came from.
+    pub source_target: String,
+    pub server: ServerConfig,
+}
 
-/// Returns the platform-appropriate config paths for a client.
-fn config_paths(source: ClientSource) -> Vec<PathBuf> {
-    let home = match dirs::home_dir() {
-        Some(h) => h,
-        None => return Vec::new(),
-    };
-
-    match source {
-        ClientSource::ClaudeDesktop => claude_desktop_paths(&home),
-        ClientSource::ClaudeCode => {
-            vec![home.join(".claude.json"), PathBuf::from(".mcp.json")]
+impl From<&DiscoveredServer> for ImportedServer {
+    fn from(found: &DiscoveredServer) -> Self {
+        Self {
+            name: found.name.clone(),
+            source_target: found.source_target.to_string(),
+            server: found.config.clone(),
         }
-        ClientSource::Cursor => {
-            vec![
-                home.join(".cursor/mcp.json"),
-                PathBuf::from(".cursor/mcp.json"),
-            ]
-        }
-        ClientSource::Devin => {
-            vec![
-                home.join(".config/devin/mcp_config.json"),
-                PathBuf::from(".devin/mcp_config.json"),
-                // Cascade's file from the Windsurf days. Devin no longer
-                // writes it, but a server configured there is still worth
-                // importing.
-                home.join(".codeium/windsurf/mcp_config.json"),
-            ]
-        }
-        ClientSource::VSCodeCopilot => {
-            let mut paths = Vec::new();
-            if let Some(config) = dirs::config_dir() {
-                paths.push(config.join("Code/User/mcp.json"));
-            }
-            paths.push(home.join(".vscode/mcp.json"));
-            paths.push(PathBuf::from(".vscode/mcp.json"));
-            paths
-        }
-        ClientSource::CopilotCli => {
-            vec![
-                home.join(".copilot/mcp-config.json"),
-                PathBuf::from(".github/mcp.json"),
-            ]
-        }
-        ClientSource::GeminiCli => {
-            vec![
-                home.join(".gemini/settings.json"),
-                PathBuf::from(".gemini/settings.json"),
-            ]
-        }
-        ClientSource::CodexCli => {
-            vec![
-                home.join(".codex/config.toml"),
-                PathBuf::from(".codex/config.toml"),
-            ]
-        }
-        ClientSource::GrokBuild => {
-            vec![
-                home.join(".grok/config.toml"),
-                PathBuf::from(".grok/config.toml"),
-            ]
-        }
-        ClientSource::OpenCode => {
-            vec![
-                home.join(".config/opencode/opencode.json"),
-                PathBuf::from("opencode.json"),
-            ]
-        }
-        ClientSource::Zed => {
-            vec![home.join(".config/zed/settings.json")]
-        }
-        ClientSource::Cline => {
-            vec![home.join(
-                ".vscode/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
-            )]
-        }
-        ClientSource::ClineCli => {
-            vec![home.join(".cline/data/settings/cline_mcp_settings.json")]
-        }
-        ClientSource::RooCode => {
-            vec![
-                home.join(".vscode/globalStorage/rooveterinaryinc.roo-cline/settings/cline_mcp_settings.json"),
-                home.join(".roo/mcp.json"),
-                PathBuf::from(".roo/mcp.json"),
-            ]
-        }
-        ClientSource::Factory => {
-            vec![home.join(".factory/config.json")]
-        }
-        ClientSource::Nanobot => {
-            vec![
-                home.join(".nanobot/config.json"),
-                PathBuf::from(".nanobot/config.json"),
-            ]
-        }
-        ClientSource::Junie => {
-            vec![
-                home.join(".junie/mcp/mcp.json"),
-                PathBuf::from(".junie/mcp/mcp.json"),
-            ]
-        }
-        ClientSource::Kilo => {
-            vec![
-                home.join(".config/kilo/opencode.json"),
-                PathBuf::from("opencode.json"),
-            ]
-        }
-        ClientSource::Pi => {
-            vec![
-                home.join(".pi/agent/mcp.json"),
-                PathBuf::from(".pi/mcp.json"),
-            ]
-        }
-        ClientSource::Warp => {
-            vec![
-                home.join(".warp/.mcp.json"),
-                PathBuf::from(".warp/.mcp.json"),
-            ]
-        }
-        ClientSource::Kiro => {
-            vec![
-                home.join(".kiro/settings/mcp.json"),
-                PathBuf::from(".kiro/settings/mcp.json"),
-            ]
-        }
-        ClientSource::KimiCode => {
-            vec![
-                home.join(".kimi-code/mcp.json"),
-                PathBuf::from(".kimi-code/mcp.json"),
-            ]
-        }
-        ClientSource::QwenCode => {
-            vec![
-                home.join(".qwen/settings.json"),
-                PathBuf::from(".qwen/settings.json"),
-            ]
-        }
-        ClientSource::Antigravity => antigravity_paths(&home),
-        ClientSource::Goose => goose_paths(&home),
-        ClientSource::Hermes => vec![home.join(".hermes/config.yaml")],
-        ClientSource::Amp => vec![home.join(".config/amp/settings.json")],
-        ClientSource::OpenClaw => vec![home.join(".openclaw/openclaw.json")],
-        ClientSource::LmStudio => vec![home.join(".lmstudio/mcp.json")],
-        ClientSource::MuseCode => vec![home.join(".config/muse/settings.json")],
     }
 }
 
-/// Platform-specific config paths for Goose.
-#[allow(unused_variables)]
-fn goose_paths(home: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        paths.push(home.join(".config/goose/config.yaml"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(home.join(".config/goose/config.yaml"));
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        paths.push(PathBuf::from(appdata).join("Block/goose/config/config.yaml"));
-    }
-    paths
-}
-
-/// Platform-specific config paths for Claude Desktop.
-/// Extracted to its own function to satisfy clippy's `vec_init_then_push` lint
-/// when using `#[cfg]` attributes on individual push calls.
-#[allow(unused_variables)]
-fn claude_desktop_paths(home: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        paths.push(home.join("Library/Application Support/Claude/claude_desktop_config.json"));
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        paths.push(PathBuf::from(appdata).join("Claude/claude_desktop_config.json"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(home.join(".config/claude/claude_desktop_config.json"));
-    }
-    paths
-}
-
-/// Platform-specific config paths for Google Antigravity.
-#[allow(unused_variables)]
-fn antigravity_paths(home: &Path) -> Vec<PathBuf> {
-    let mut paths = Vec::new();
-    #[cfg(target_os = "macos")]
-    {
-        paths.push(home.join("Library/Application Support/Antigravity/antigravity_config.json"));
-        paths.push(home.join("Library/Application Support/Google/Antigravity/config.json"));
-    }
-    #[cfg(target_os = "windows")]
-    if let Some(appdata) = std::env::var_os("APPDATA") {
-        paths.push(PathBuf::from(appdata).join("Antigravity/antigravity_config.json"));
-    }
-    #[cfg(target_os = "linux")]
-    {
-        paths.push(home.join(".config/Antigravity/antigravity_config.json"));
-    }
-    paths
-}
-
-// ── Parsers ─────────────────────────────────────────────────────────────────
-
-/// Parse a client config file and extract server definitions.
-fn parse_config(source: ClientSource, path: &Path) -> Result<Vec<DiscoveredServer>, String> {
-    let content = std::fs::read_to_string(path).map_err(|e| e.to_string())?;
-
-    match source {
-        // TOML clients: cleanse "plug" entries first to avoid parse errors from duplicates
-        ClientSource::CodexCli | ClientSource::GrokBuild => {
-            let cleansed = unlink_toml(&content);
-            parse_toml_mcp_servers(&cleansed, source, "mcp_servers")
-        }
-
-        // JSON clients with "mcpServers" key
-        ClientSource::ClaudeDesktop
-        | ClientSource::ClaudeCode
-        | ClientSource::Cursor
-        | ClientSource::Devin
-        | ClientSource::CopilotCli
-        | ClientSource::GeminiCli
-        | ClientSource::Cline
-        | ClientSource::ClineCli
-        | ClientSource::RooCode
-        | ClientSource::Factory
-        | ClientSource::OpenCode
-        | ClientSource::Junie
-        | ClientSource::Kilo
-        | ClientSource::Pi
-        | ClientSource::Warp
-        | ClientSource::Kiro
-        | ClientSource::KimiCode
-        | ClientSource::QwenCode
-        | ClientSource::Antigravity => parse_json_mcp_servers(&content, source, "mcpServers"),
-
-        // Nanobot uses tools.mcpServers
-        ClientSource::Nanobot => parse_nanobot_config(&content, source),
-
-        // VS Code uses top-level "servers"; older settings nested it under "mcp"
-        ClientSource::VSCodeCopilot => parse_vscode_config(&content, source),
-
-        // Zed uses "context_servers"
-        ClientSource::Zed => parse_json_mcp_servers(&content, source, "context_servers"),
-
-        // YAML clients
-        ClientSource::Goose => parse_yaml_mcp_extensions(&content, source, "extensions"),
-        ClientSource::Hermes => parse_yaml_mcp_extensions(&content, source, "mcp_servers"),
-
-        // Amp keeps its servers under one dotted key at the top of the file
-        ClientSource::Amp => parse_json_mcp_servers(&content, source, "amp.mcpServers"),
-        // OpenClaw nests them under "mcp" -> "servers", as VS Code once did
-        ClientSource::OpenClaw => parse_vscode_config(&content, source),
-        ClientSource::LmStudio => parse_json_mcp_servers(&content, source, "mcpServers"),
-        ClientSource::MuseCode => parse_json_mcp_servers(&content, source, "mcp_servers"),
+/// Give each of `servers` the name it goes into `config` under. A name
+/// already taken gets the client's slug after it, and a number after that
+/// if it is taken too. Names already settled stay as they are.
+pub fn settle_names(config: &Config, servers: &mut [ImportedServer]) {
+    let mut taken: HashSet<String> = config.servers.keys().cloned().collect();
+    for server in servers {
+        let renamed = format!("{}-{}", server.name, server.source_target);
+        let name = std::iter::once(server.name.clone())
+            .chain(std::iter::once(renamed.clone()))
+            .chain((2..).map(|n| format!("{renamed}-{n}")))
+            .find(|name| !taken.contains(name))
+            .expect("an unused name");
+        taken.insert(name.clone());
+        server.name = name;
     }
 }
 
-/// Parse YAML config with a top-level key containing server definitions.
-fn parse_yaml_mcp_extensions(
-    content: &str,
-    source: ClientSource,
-    key: &str,
-) -> Result<Vec<DiscoveredServer>, String> {
-    let value: serde_norway::Value =
-        serde_norway::from_str(content).map_err(|e| format!("YAML parse error: {e}"))?;
-
-    let servers_obj = match value.get(key).and_then(|v| v.as_mapping()) {
-        Some(s) => s,
-        None => return Ok(Vec::new()),
-    };
-
-    let mut servers = Vec::new();
-    for (name_val, entry) in servers_obj {
-        let name = match name_val.as_str() {
-            Some(s) => s.to_string(),
-            None => continue,
-        };
-        if name.eq_ignore_ascii_case("plug") {
-            continue;
-        }
-        if let Some(config) = yaml_entry_to_server_config(entry) {
-            servers.push(DiscoveredServer {
-                name,
-                config,
-                source,
-            });
-        }
-    }
-
-    Ok(servers)
-}
-
-/// Convert a YAML entry to a ServerConfig.
-fn yaml_entry_to_server_config(entry: &serde_norway::Value) -> Option<ServerConfig> {
-    let obj = entry.as_mapping()?;
-
-    // Goose uses "type: stdio" or "sse". Hermes Agent has no type: an entry
-    // with a `url` and no `command` is an HTTP server.
-    let untyped = if obj.get("command").is_none() && obj.get("url").is_some() {
-        "http"
-    } else {
-        "stdio"
-    };
-    let transport_type = obj.get("type").and_then(|v| v.as_str()).unwrap_or(untyped);
-    let transport = match transport_type {
-        "stdio" => crate::config::TransportType::Stdio,
-        "sse" => crate::config::TransportType::Sse,
-        "http" => crate::config::TransportType::Http,
-        _ => return None,
-    };
-
-    let command = obj
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let args = obj
-        .get("args")
-        .and_then(|v| v.as_sequence())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
+/// Add `servers` to `config` under the names [`settle_names`] gives them.
+/// Returns those names.
+pub fn add_to_config(config: &mut Config, mut servers: Vec<ImportedServer>) -> Vec<String> {
+    settle_names(config, &mut servers);
+    servers
+        .into_iter()
+        .map(|server| {
+            config.servers.insert(server.name.clone(), server.server);
+            server.name
         })
-        .unwrap_or_default();
-
-    let url = obj
-        .get("uri")
-        .or_else(|| obj.get("url"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let env = obj
-        .get("env")
-        .and_then(|v| v.as_mapping())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let key = k.as_str()?.to_string();
-                    let val = v.as_str()?.to_string();
-                    Some((key, val))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let enabled = obj.get("enabled").and_then(|v| v.as_bool()).unwrap_or(true);
-
-    Some(ServerConfig {
-        command,
-        args,
-        env,
-        enabled,
-        transport,
-        protocol_mode: Default::default(),
-        url,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 300,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
-    })
+        .collect()
 }
 
-/// Parse JSON config with a top-level key containing server definitions.
-fn parse_json_mcp_servers(
-    content: &str,
-    source: ClientSource,
-    key: &str,
-) -> Result<Vec<DiscoveredServer>, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("JSON parse error: {e}"))?;
-
-    let servers_obj = match value.get(key).and_then(|v| v.as_object()) {
-        Some(obj) => obj,
-        None => return Ok(Vec::new()),
-    };
-
-    let mut servers = Vec::new();
-    for (name, entry) in servers_obj {
-        if name == "plug" {
-            continue;
-        }
-        if let Some(config) = json_entry_to_server_config(entry) {
-            servers.push(DiscoveredServer {
-                name: name.clone(),
-                config,
-                source,
-            });
-        }
-    }
-    Ok(servers)
-}
-
-/// Parse Nanobot config which nests servers under "tools" -> "mcpServers".
-fn parse_nanobot_config(
-    content: &str,
-    source: ClientSource,
-) -> Result<Vec<DiscoveredServer>, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("JSON parse error: {e}"))?;
-
-    let servers = value
-        .get("tools")
-        .and_then(|t| t.get("mcpServers"))
-        .and_then(|s| s.as_object());
-
-    if let Some(obj) = servers {
-        let mut result = Vec::new();
-        for (name, entry) in obj {
-            if name == "plug" {
-                continue;
-            }
-            if let Some(config) = json_entry_to_server_config(entry) {
-                result.push(DiscoveredServer {
-                    name: name.clone(),
-                    config,
-                    source,
-                });
-            }
-        }
-        return Ok(result);
-    }
-
-    Ok(Vec::new())
-}
-
-/// Parse a VS Code config: top-level "servers" in `mcp.json`, or the older
-/// "mcp" -> "servers" nesting from `settings.json`.
-fn parse_vscode_config(
-    content: &str,
-    source: ClientSource,
-) -> Result<Vec<DiscoveredServer>, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(content).map_err(|e| format!("JSON parse error: {e}"))?;
-
-    // Try "mcp" -> "servers" first (settings.json style)
-    if let Some(servers) = value
-        .get("mcp")
-        .and_then(|m| m.get("servers"))
-        .and_then(|s| s.as_object())
-    {
-        let mut result = Vec::new();
-        for (name, entry) in servers {
-            if name == "plug" {
-                continue;
-            }
-            if let Some(config) = json_entry_to_server_config(entry) {
-                result.push(DiscoveredServer {
-                    name: name.clone(),
-                    config,
-                    source,
-                });
-            }
-        }
-        return Ok(result);
-    }
-
-    // Fallback: try top-level "servers"
-    if let Some(servers) = value.get("servers").and_then(|s| s.as_object()) {
-        let mut result = Vec::new();
-        for (name, entry) in servers {
-            if name == "plug" {
-                continue;
-            }
-            if let Some(config) = json_entry_to_server_config(entry) {
-                result.push(DiscoveredServer {
-                    name: name.clone(),
-                    config,
-                    source,
-                });
-            }
-        }
-        return Ok(result);
-    }
-
-    Ok(Vec::new())
-}
-
-/// Convert a JSON server entry to our ServerConfig.
-fn json_entry_to_server_config(entry: &serde_json::Value) -> Option<ServerConfig> {
-    let obj = entry.as_object()?;
-
-    let command = obj
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let args: Vec<String> = obj
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let env: HashMap<String, String> = obj
-        .get("env")
-        .and_then(|v| v.as_object())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let val = v.as_str()?;
-                    // Security: never store literal secrets — convert to env var reference
-                    let safe_val = sanitize_env_value(k, val);
-                    Some((k.clone(), safe_val))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    // Determine transport: url present = HTTP, command present = stdio
-    let url = obj
-        .get("url")
-        .or_else(|| obj.get("httpUrl"))
-        .or_else(|| obj.get("sseUrl"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let (transport, command, url) = if let Some(url) = url {
-        (TransportType::Http, None, Some(url))
-    } else if command.is_some() {
-        (TransportType::Stdio, command, None)
-    } else {
-        return None; // Neither command nor URL — skip
-    };
-
-    Some(ServerConfig {
-        command,
-        args,
-        env,
-        enabled: true,
-        transport,
-        protocol_mode: Default::default(),
-        url,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 300,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
-    })
-}
-
-/// Parse TOML config with a section key containing server definitions.
-fn parse_toml_mcp_servers(
-    content: &str,
-    source: ClientSource,
-    key: &str,
-) -> Result<Vec<DiscoveredServer>, String> {
-    let value: toml::Value =
-        toml::from_str(content).map_err(|e| format!("TOML parse error: {e}"))?;
-
-    let servers_table = match value.get(key).and_then(|v| v.as_table()) {
-        Some(t) => t,
-        None => return Ok(Vec::new()),
-    };
-
-    let mut servers = Vec::new();
-    for (name, entry) in servers_table {
-        if name == "plug" {
-            continue;
-        }
-        if let Some(config) = toml_entry_to_server_config(entry) {
-            servers.push(DiscoveredServer {
-                name: name.clone(),
-                config,
-                source,
-            });
-        }
-    }
-    Ok(servers)
-}
-
-/// Convert a TOML server entry to our ServerConfig.
-fn toml_entry_to_server_config(entry: &toml::Value) -> Option<ServerConfig> {
-    let table = entry.as_table()?;
-
-    let command = table
-        .get("command")
-        .and_then(|v| v.as_str())
-        .map(String::from);
-    let args: Vec<String> = table
-        .get("args")
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let env: HashMap<String, String> = table
-        .get("env")
-        .and_then(|v| v.as_table())
-        .map(|m| {
-            m.iter()
-                .filter_map(|(k, v)| {
-                    let val = v.as_str()?;
-                    let safe_val = sanitize_env_value(k, val);
-                    Some((k.clone(), safe_val))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-
-    let url = table
-        .get("url")
-        .or_else(|| table.get("http_url"))
-        .and_then(|v| v.as_str())
-        .map(String::from);
-
-    let (transport, command, url) = if let Some(url) = url {
-        (TransportType::Http, None, Some(url))
-    } else if command.is_some() {
-        (TransportType::Stdio, command, None)
-    } else {
-        return None;
-    };
-
-    Some(ServerConfig {
-        command,
-        args,
-        env,
-        enabled: true,
-        transport,
-        protocol_mode: Default::default(),
-        url,
-        auth_token: None,
-        auth: None,
-        oauth_client_id: None,
-        oauth_scopes: None,
-        timeout_secs: 30,
-        call_timeout_secs: 300,
-        max_concurrent: 1,
-        health_check_interval_secs: 60,
-        circuit_breaker_enabled: true,
-        enrichment: false,
-        tool_renames: HashMap::new(),
-        tool_groups: Vec::new(),
-        sandbox: None,
-        spec: None,
-        operations: Vec::new(),
-        token_in: None,
-    })
-}
-
-// ── Security ────────────────────────────────────────────────────────────────
-
-/// Sanitize environment variable values: if a value looks like a literal secret,
-/// convert it to an env var reference ($VAR_NAME).
-fn sanitize_env_value(key: &str, value: &str) -> String {
-    // If it already looks like a var reference, keep it
-    if value.starts_with('$') {
-        return value.to_string();
-    }
-    // Heuristic: if the key suggests it's a secret and the value looks like one,
-    // replace with env var reference
-    let secret_keys = [
-        "token", "key", "secret", "password", "api_key", "apikey", "auth",
-    ];
-    let key_lower = key.to_lowercase();
-    if secret_keys.iter().any(|k| key_lower.contains(k)) && value.len() > 8 {
-        format!("${key}")
-    } else {
-        value.to_string()
+fn discovered(source: ClientTarget, name: String, entry: ServerEntry) -> DiscoveredServer {
+    DiscoveredServer {
+        name,
+        config: ServerConfig {
+            command: entry.command,
+            args: entry.args.unwrap_or_default(),
+            env: entry.env.into_iter().collect(),
+            enabled: entry.enabled,
+            transport: entry.transport,
+            url: entry.url,
+            ..Default::default()
+        },
+        source,
+        source_target: source.slug(),
+        source_name: source.display_name(),
     }
 }
-
-// ── Deduplication ───────────────────────────────────────────────────────────
 
 /// Dedup key: (command, args) for stdio, (url) for HTTP.
 fn server_signature(config: &ServerConfig) -> String {
@@ -935,452 +196,185 @@ fn server_signature(config: &ServerConfig) -> String {
     }
 }
 
-/// Deduplicate servers by their signature. First occurrence wins.
-fn dedup_servers(servers: &mut Vec<DiscoveredServer>) {
-    let mut seen = std::collections::HashSet::new();
-    servers.retain(|s| {
-        let sig = server_signature(&s.config);
-        seen.insert(sig)
-    });
-}
-
-/// Check if a discovered server already exists in the config.
-fn is_existing_server(
-    discovered: &DiscoveredServer,
-    existing_sigs: &std::collections::HashSet<String>,
-) -> bool {
-    existing_sigs.contains(&server_signature(&discovered.config))
-}
-
-/// Resolve name collisions: if name already exists, append source suffix.
-fn resolve_name_against_set(
-    name: &str,
-    source: ClientSource,
-    existing_names: &std::collections::HashSet<String>,
-) -> String {
-    if !existing_names.contains(name) {
-        return name.to_string();
-    }
-    let suffix = match source {
-        ClientSource::ClaudeDesktop => "claude-desktop",
-        ClientSource::ClaudeCode => "claude-code",
-        ClientSource::Cursor => "cursor",
-        ClientSource::Devin => "devin",
-        ClientSource::VSCodeCopilot => "vscode",
-        ClientSource::CopilotCli => "copilot",
-        ClientSource::GeminiCli => "gemini",
-        ClientSource::CodexCli => "codex",
-        ClientSource::GrokBuild => "grok",
-        ClientSource::OpenCode => "opencode",
-        ClientSource::Zed => "zed",
-        ClientSource::Cline => "cline",
-        ClientSource::ClineCli => "cline-cli",
-        ClientSource::RooCode => "roocode",
-        ClientSource::Factory => "factory",
-        ClientSource::Nanobot => "nanobot",
-        ClientSource::Junie => "junie",
-        ClientSource::Kilo => "kilo",
-        ClientSource::Pi => "pi",
-        ClientSource::Warp => "warp",
-        ClientSource::Kiro => "kiro",
-        ClientSource::KimiCode => "kimi",
-        ClientSource::QwenCode => "qwen",
-        ClientSource::Antigravity => "antigravity",
-        ClientSource::Goose => "goose",
-        ClientSource::Hermes => "hermes",
-        ClientSource::Amp => "amp",
-        ClientSource::OpenClaw => "openclaw",
-        ClientSource::LmStudio => "lmstudio",
-        ClientSource::MuseCode => "muse-code",
-    };
-    format!("{name}-{suffix}")
-}
-
-/// Remove any "plug" MCP server section from a TOML string.
-/// This helps avoid parse errors if multiple plug sections were accidentally appended.
-pub fn unlink_toml(content: &str) -> String {
-    let mut output = Vec::new();
-    let mut skipping = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-
-        // Start skipping if we hit any variation of the plug header
-        if trimmed == "[mcp_servers.plug]"
-            || trimmed == "[[mcp_servers.plug]]"
-            || trimmed == "[mcp_servers.\"plug\"]"
-        {
-            skipping = true;
-            continue;
-        }
-
-        if skipping {
-            // Stop skipping ONLY if we hit a new header that is NOT a plug header
-            if trimmed.starts_with('[')
-                && !trimmed.contains(".plug")
-                && !trimmed.contains("\"plug\"")
-            {
-                skipping = false;
-            } else {
-                // Still skipping: either it's more plug config or another duplicate plug header
-                continue;
-            }
-        }
-        output.push(line);
-    }
-    output.join("\n")
-}
-
-/// Generate TOML entries for new servers to append to config.toml.
-pub fn servers_to_toml(servers: &[DiscoveredServer], existing_names: &[String]) -> String {
-    let mut output = String::new();
-    let mut used_names: std::collections::HashSet<String> =
-        existing_names.iter().cloned().collect();
-
-    for server in servers {
-        let name = resolve_name_against_set(&server.name, server.source, &used_names);
-        used_names.insert(name.clone());
-
-        output.push_str(&format!("\n[servers.{name}]\n"));
-
-        match server.config.transport {
-            TransportType::Stdio => {
-                if let Some(ref cmd) = server.config.command {
-                    output.push_str(&format!("command = {}\n", toml_quote(cmd)));
-                }
-                if !server.config.args.is_empty() {
-                    let args: Vec<String> =
-                        server.config.args.iter().map(|a| toml_quote(a)).collect();
-                    output.push_str(&format!("args = [{}]\n", args.join(", ")));
-                }
-            }
-            TransportType::Http => {
-                if let Some(ref url) = server.config.url {
-                    output.push_str(&format!(
-                        "transport = \"http\"\nurl = {}\n",
-                        toml_quote(url)
-                    ));
-                }
-            }
-            TransportType::Sse => {
-                if let Some(ref url) = server.config.url {
-                    output.push_str(&format!("transport = \"sse\"\nurl = {}\n", toml_quote(url)));
-                }
-            }
-            // No client config describes an API server, so none is imported.
-            TransportType::OpenApi => {}
-        }
-
-        if !server.config.env.is_empty() {
-            output.push_str("[servers.");
-            output.push_str(&name);
-            output.push_str(".env]\n");
-            for (k, v) in &server.config.env {
-                output.push_str(&format!("{k} = {}\n", toml_quote(v)));
-            }
-        }
-    }
-
-    output
-}
-
-fn toml_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
-}
-
-// ── Tests ───────────────────────────────────────────────────────────────────
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_claude_desktop_json() {
-        let json = r#"{
-            "mcpServers": {
-                "github": {
-                    "command": "npx",
-                    "args": ["@modelcontextprotocol/server-github"],
-                    "env": { "GITHUB_TOKEN": "ghp_abc123" }
-                },
-                "filesystem": {
-                    "command": "npx",
-                    "args": ["@modelcontextprotocol/server-filesystem", "/home"]
-                }
-            }
-        }"#;
-        let servers =
-            parse_json_mcp_servers(json, ClientSource::ClaudeDesktop, "mcpServers").unwrap();
-        assert_eq!(servers.len(), 2);
+    fn imported(found: &[DiscoveredServer]) -> Vec<ImportedServer> {
+        found.iter().map(ImportedServer::from).collect()
+    }
 
-        let github = servers.iter().find(|s| s.name == "github").unwrap();
-        assert_eq!(github.config.command.as_deref(), Some("npx"));
-        assert_eq!(github.config.args.len(), 1);
-        // Secret should be sanitized to env var reference
-        assert_eq!(
-            github.config.env.get("GITHUB_TOKEN").unwrap(),
-            "$GITHUB_TOKEN"
-        );
+    fn read(target: ClientTarget, content: &str) -> Vec<DiscoveredServer> {
+        target
+            .layout()
+            .read_servers(content, &HttpConfig::default())
+            .unwrap()
+            .into_iter()
+            .map(|(name, entry)| discovered(target, name, entry))
+            .collect()
+    }
+
+    fn scanned(servers: Vec<DiscoveredServer>) -> ScanResult {
+        ScanResult {
+            source: ClientTarget::Cursor,
+            source_target: "cursor",
+            source_name: "Cursor",
+            servers,
+            error: None,
+        }
     }
 
     #[test]
-    fn parse_vscode_nested_config() {
-        let json = r#"{
-            "mcp": {
-                "servers": {
-                    "myserver": {
-                        "command": "node",
-                        "args": ["server.js"]
-                    }
-                }
-            }
-        }"#;
-        let servers = parse_vscode_config(json, ClientSource::VSCodeCopilot).unwrap();
+    fn a_literal_secret_is_kept_for_the_secret_store() {
+        let json = r#"{"mcpServers":{"github":{"command":"npx","args":["server-github"],"env":{"GITHUB_TOKEN":"ghp_abc123"}}}}"#;
+        let servers = read(ClientTarget::ClaudeDesktop, json);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].config.env["GITHUB_TOKEN"], "ghp_abc123");
+        assert_eq!(servers[0].source_target, "claude-desktop");
+        assert_eq!(servers[0].source_name, "Claude Desktop");
+    }
+
+    #[test]
+    fn vscode_settings_from_before_mcp_json_are_still_read() {
+        let json = r#"{"mcp":{"servers":{"myserver":{"command":"node","args":["server.js"]}}}}"#;
+        let servers = read(ClientTarget::VSCodeCopilot, json);
         assert_eq!(servers.len(), 1);
         assert_eq!(servers[0].name, "myserver");
     }
 
     #[test]
-    fn parse_zed_context_servers() {
-        let json = r#"{
-            "context_servers": {
-                "zed-server": {
-                    "command": "zed-mcp",
-                    "args": []
-                }
-            }
-        }"#;
-        let servers = parse_json_mcp_servers(json, ClientSource::Zed, "context_servers").unwrap();
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].name, "zed-server");
-    }
-
-    #[test]
-    fn parse_codex_toml() {
-        let toml = r#"
-[mcp_servers.github]
-command = "npx"
-args = ["@modelcontextprotocol/server-github"]
-
-[mcp_servers.github.env]
-GITHUB_TOKEN = "$GITHUB_TOKEN"
-"#;
-        let servers = parse_toml_mcp_servers(toml, ClientSource::CodexCli, "mcp_servers").unwrap();
-        assert_eq!(servers.len(), 1);
-        assert_eq!(
-            servers[0].config.env.get("GITHUB_TOKEN").unwrap(),
-            "$GITHUB_TOKEN"
-        );
-    }
-
-    #[test]
-    fn parse_hermes_yaml_imports_servers_and_skips_plug() {
+    fn hermes_yaml_skips_plug_whatever_its_case() {
         let yaml = "mcp_servers:\n  Plug:\n    command: plug\n    args: [connect]\n  files:\n    command: npx\n    args: [\"-y\", \"server-filesystem\"]\n  company:\n    url: https://mcp.example.com\n";
-        let servers = parse_yaml_mcp_extensions(yaml, ClientSource::Hermes, "mcp_servers").unwrap();
+        let servers = read(ClientTarget::Hermes, yaml);
         assert_eq!(servers.len(), 2);
-        assert_eq!(servers[0].name, "files");
-        assert_eq!(servers[0].config.command.as_deref(), Some("npx"));
-        assert_eq!(
-            servers[1].config.url.as_deref(),
-            Some("https://mcp.example.com")
-        );
-        assert!(matches!(
-            servers[1].config.transport,
-            crate::config::TransportType::Http
-        ));
+        let company = servers.iter().find(|s| s.name == "company").unwrap();
+        assert_eq!(company.config.transport, TransportType::Http);
     }
 
     #[test]
-    fn parse_goose_yaml_imports_servers_and_skips_plug() {
-        let yaml = r#"
-extensions:
-  plug:
-    type: sse
-    uri: https://plug.example.com/mcp
-    enabled: true
-  github:
-    type: stdio
-    command: npx
-    args:
-    - "@modelcontextprotocol/server-github"
-    env:
-      GITHUB_TOKEN: "$GITHUB_TOKEN"
-    enabled: true
-  remote:
-    type: sse
-    uri: https://remote.example.com/sse
-"#;
-
-        let servers = parse_yaml_mcp_extensions(yaml, ClientSource::Goose, "extensions").unwrap();
-
-        assert_eq!(servers.len(), 2);
-        let github = servers
-            .iter()
-            .find(|server| server.name == "github")
-            .unwrap();
-        assert_eq!(github.config.command.as_deref(), Some("npx"));
-        assert_eq!(
-            github.config.args,
-            vec!["@modelcontextprotocol/server-github"]
-        );
-        assert_eq!(
-            github.config.env.get("GITHUB_TOKEN").map(String::as_str),
-            Some("$GITHUB_TOKEN")
-        );
-
-        let remote = servers
-            .iter()
-            .find(|server| server.name == "remote")
-            .unwrap();
-        assert!(matches!(remote.config.transport, TransportType::Sse));
-        assert_eq!(
-            remote.config.url.as_deref(),
-            Some("https://remote.example.com/sse")
-        );
+    fn goose_sse_extensions_stay_sse() {
+        let yaml = "extensions:\n  github:\n    type: stdio\n    command: npx\n    env:\n      GITHUB_TOKEN: \"$GITHUB_TOKEN\"\n    enabled: true\n  remote:\n    type: sse\n    uri: https://remote.example.com/sse\n    enabled: false\n";
+        let servers = read(ClientTarget::Goose, yaml);
+        let remote = servers.iter().find(|s| s.name == "remote").unwrap();
+        assert_eq!(remote.config.transport, TransportType::Sse);
+        assert!(!remote.config.enabled);
     }
 
     #[test]
-    fn parse_http_transport_json() {
-        let json = r#"{
-            "mcpServers": {
-                "remote": {
-                    "url": "http://localhost:8080/mcp"
-                }
-            }
-        }"#;
-        let servers = parse_json_mcp_servers(json, ClientSource::Cursor, "mcpServers").unwrap();
-        assert_eq!(servers.len(), 1);
-        assert!(matches!(servers[0].config.transport, TransportType::Http));
-        assert_eq!(
-            servers[0].config.url.as_deref(),
-            Some("http://localhost:8080/mcp")
-        );
+    fn a_json_sse_entry_is_imported_as_sse() {
+        let json = r#"{"mcpServers":{"old":{"type":"sse","url":"https://example.com/sse"},"new":{"url":"https://example.com/mcp"}}}"#;
+        let servers = read(ClientTarget::ClaudeCode, json);
+        let kind = |name: &str| {
+            servers
+                .iter()
+                .find(|s| s.name == name)
+                .unwrap()
+                .config
+                .transport
+                .clone()
+        };
+        assert_eq!(kind("old"), TransportType::Sse);
+        assert_eq!(kind("new"), TransportType::Http);
     }
 
     #[test]
-    fn dedup_removes_duplicates() {
-        let mut servers = vec![
-            DiscoveredServer {
-                name: "github".into(),
-                config: ServerConfig {
-                    command: Some("npx".into()),
-                    args: vec!["server-github".into()],
-                    ..test_config()
-                },
-                source: ClientSource::ClaudeDesktop,
-            },
-            DiscoveredServer {
-                name: "github".into(),
-                config: ServerConfig {
-                    command: Some("npx".into()),
-                    args: vec!["server-github".into()],
-                    ..test_config()
-                },
-                source: ClientSource::Cursor,
-            },
-        ];
-        dedup_servers(&mut servers);
-        assert_eq!(servers.len(), 1);
-        assert_eq!(servers[0].source, ClientSource::ClaudeDesktop); // first wins
-    }
-
-    #[test]
-    fn sanitize_env_converts_secrets() {
-        assert_eq!(
-            sanitize_env_value("GITHUB_TOKEN", "ghp_abc123def456"),
-            "$GITHUB_TOKEN"
-        );
-        assert_eq!(sanitize_env_value("PATH", "/usr/bin"), "/usr/bin");
-        assert_eq!(sanitize_env_value("API_KEY", "$API_KEY"), "$API_KEY"); // already a reference
-    }
-
-    #[test]
-    fn resolve_name_handles_collisions() {
-        let existing: std::collections::HashSet<String> = ["github".to_string()].into();
-        assert_eq!(
-            resolve_name_against_set("github", ClientSource::Cursor, &existing),
-            "github-cursor"
-        );
-        assert_eq!(
-            resolve_name_against_set("slack", ClientSource::Cursor, &existing),
-            "slack"
-        );
-    }
-
-    #[test]
-    fn import_filters_existing() {
-        let mut existing = HashMap::new();
-        existing.insert(
-            "github".to_string(),
-            ServerConfig {
-                command: Some("npx".into()),
-                args: vec!["server-github".into()],
-                ..test_config()
-            },
-        );
-
-        // This will scan real filesystem, so we test the filtering logic directly
-        let discovered = vec![DiscoveredServer {
-            name: "github".into(),
-            config: ServerConfig {
-                command: Some("npx".into()),
-                args: vec!["server-github".into()],
-                ..test_config()
-            },
-            source: ClientSource::ClaudeDesktop,
-        }];
-
-        let existing_sigs: std::collections::HashSet<String> =
-            existing.values().map(server_signature).collect();
-        let filtered: Vec<_> = discovered
-            .into_iter()
-            .filter(|d| !is_existing_server(d, &existing_sigs))
-            .collect();
-        assert!(filtered.is_empty());
-    }
-
-    #[test]
-    fn servers_to_toml_output() {
-        let servers = vec![DiscoveredServer {
-            name: "github".into(),
-            config: ServerConfig {
-                command: Some("npx".into()),
-                args: vec!["@modelcontextprotocol/server-github".into()],
-                ..test_config()
-            },
-            source: ClientSource::ClaudeDesktop,
-        }];
-        let toml = servers_to_toml(&servers, &[]);
-        assert!(toml.contains("[servers.github]"));
-        assert!(toml.contains("command = \"npx\""));
-        assert!(toml.contains("@modelcontextprotocol/server-github"));
-    }
-
-    fn test_config() -> ServerConfig {
-        ServerConfig {
-            command: None,
-            args: Vec::new(),
-            env: HashMap::new(),
-            enabled: true,
-            transport: TransportType::Stdio,
-            protocol_mode: Default::default(),
-            url: None,
-            auth_token: None,
-            auth: None,
-            oauth_client_id: None,
-            oauth_scopes: None,
-            timeout_secs: 30,
-            call_timeout_secs: 300,
-            max_concurrent: 1,
-            health_check_interval_secs: 60,
-            circuit_breaker_enabled: true,
-            enrichment: false,
-            tool_renames: HashMap::new(),
-            tool_groups: Vec::new(),
-
-            sandbox: None,
-            spec: None,
-            operations: Vec::new(),
-            token_in: None,
+    fn opencode_and_kilo_servers_are_read_from_mcp() {
+        let json = r#"{"mcp":{"files":{"type":"local","command":["npx","-y","server-filesystem"],"enabled":true}}}"#;
+        for target in [ClientTarget::OpenCode, ClientTarget::Kilo] {
+            let servers = read(target, json);
+            assert_eq!(servers.len(), 1, "{target:?}");
+            assert_eq!(servers[0].config.command.as_deref(), Some("npx"));
+            assert_eq!(servers[0].config.args, ["-y", "server-filesystem"]);
         }
+    }
+
+    #[test]
+    fn a_duplicated_plug_table_does_not_hide_codex_servers() {
+        let toml = "[mcp_servers.plug]\ncommand = \"plug\"\n\n[mcp_servers.plug]\ncommand = \"plug\"\n\n[mcp_servers.github]\ncommand = \"npx\"\n\n[mcp_servers.github.env]\nGITHUB_TOKEN = \"$GITHUB_TOKEN\"\n";
+        let servers = read(ClientTarget::CodexCli, toml);
+        assert_eq!(servers.len(), 1);
+        assert_eq!(servers[0].config.env["GITHUB_TOKEN"], "$GITHUB_TOKEN");
+    }
+
+    #[test]
+    fn duplicates_merge_and_known_servers_are_skipped() {
+        let github = |source| DiscoveredServer {
+            source,
+            ..read(
+                ClientTarget::Cursor,
+                r#"{"mcpServers":{"github":{"command":"npx","args":["server-github"]}}}"#,
+            )
+            .remove(0)
+        };
+        let fresh = report(
+            &HashMap::new(),
+            vec![scanned(vec![
+                github(ClientTarget::ClaudeDesktop),
+                github(ClientTarget::Cursor),
+            ])],
+        );
+        assert_eq!(fresh.duplicates_merged, 1);
+        assert_eq!(fresh.new_servers.len(), 1);
+        assert_eq!(fresh.new_servers[0].source, ClientTarget::ClaudeDesktop);
+
+        let existing = HashMap::from([("github".to_string(), fresh.new_servers[0].config.clone())]);
+        let known = report(&existing, vec![scanned(vec![github(ClientTarget::Cursor)])]);
+        assert!(known.new_servers.is_empty());
+        assert_eq!(known.skipped, 1);
+    }
+
+    #[test]
+    fn a_name_already_taken_gets_the_clients_slug() {
+        let found = read(
+            ClientTarget::QwenCode,
+            r#"{"mcpServers":{"github":{"command":"npx"},"my.server":{"url":"https://example.com/mcp"}}}"#,
+        );
+        let mut config = Config::default();
+        config
+            .servers
+            .insert("github".to_string(), ServerConfig::default());
+        let mut names = add_to_config(&mut config, imported(&found));
+        names.sort();
+        assert_eq!(names, ["github-qwen-code", "my.server"]);
+        // The file Plug writes reads back with every server.
+        let written = toml::to_string_pretty(&config).unwrap();
+        let back: Config = toml::from_str(&written).unwrap();
+        assert!(back.servers.contains_key("my.server"));
+        assert!(back.servers.contains_key("github-qwen-code"));
+    }
+
+    #[test]
+    fn import_json_names_each_source_by_slug_and_name() {
+        let source = ClientTarget::KimiCode;
+        let scanned = ScanResult {
+            source,
+            source_target: source.slug(),
+            source_name: source.display_name(),
+            servers: Vec::new(),
+            error: None,
+        };
+        let json = serde_json::to_value(report(&HashMap::new(), vec![scanned])).unwrap();
+        assert_eq!(json["scanned"][0]["source_target"], "kimi-code");
+        assert_eq!(json["scanned"][0]["source_name"], "Kimi Code");
+        assert!(json["scanned"][0].get("source").is_none());
+    }
+
+    #[test]
+    fn a_renamed_server_never_replaces_one_already_there() {
+        let found = read(
+            ClientTarget::Cursor,
+            r#"{"mcpServers":{"github":{"command":"npx"}}}"#,
+        );
+        let mut config = Config::default();
+        for taken in ["github", "github-cursor", "github-cursor-2"] {
+            config
+                .servers
+                .insert(taken.to_string(), ServerConfig::default());
+        }
+        assert_eq!(
+            add_to_config(&mut config, imported(&found)),
+            ["github-cursor-3"]
+        );
+        assert_eq!(config.servers.len(), 4);
     }
 }

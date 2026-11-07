@@ -1,0 +1,20 @@
+{
+  "dir": "Library/Application Support/plug",
+  "log_dir": "Library/Logs/plug",
+  "log_file_prefix": "plug.log",
+  "config": "config.toml",
+  "socket": "plug.sock",
+  "pid": "plug.pid",
+  "token": "plug.token",
+  "service_disabled_marker": "service-disabled",
+  "menu_bar_hidden_marker": "menu-bar-hidden",
+  "daemon_label": "com.plug.daemon",
+  "app_bundle_id": "com.cyberpapiii.plug",
+  "team_id": "HJF7LN64XX",
+  "bundled_binary": "Contents/Resources/plug",
+  "app_executable": "Contents/MacOS/Plug",
+  "daemon_args": ["serve", "--daemon"],
+  "keychain_service": "plug",
+  "command_link": ".local/bin/plug",
+  "startup_budget_secs": 90
+}

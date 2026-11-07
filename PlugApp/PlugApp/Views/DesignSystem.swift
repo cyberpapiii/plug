@@ -15,7 +15,7 @@ struct ServicePowerToggle: View {
             }
         ))
         .toggleStyle(.switch)
-        .disabled(model.isChangingService || model.isRestartingService)
+        .disabled(model.gate.isChangingService || model.gate.isRestartingService)
         .accessibilityLabel("Plug")
         .help(model.serviceEnabled ? "Turn Plug off" : "Turn Plug on")
         .confirmationDialog("Turn off Plug?", isPresented: $confirmingOff, titleVisibility: .visible) {
@@ -27,20 +27,20 @@ struct ServicePowerToggle: View {
     }
 }
 
-/// Plug's top row, the same in the menu bar panel, the window and Settings:
-/// the character with how Plug is on its face, one line that says it, and
-/// the switch.
+/// Plug's top row in Settings: the character with how Plug is on its face,
+/// one line that says it, and the switch. The menu bar panel and the
+/// window's sidebar lay out their own, from the same parts.
 struct PlugHeadline: View {
     let model: AppModel
     let run: (PlugIntent) -> Void
-    var characterSize: CGFloat = 40
+    static let characterSize: CGFloat = 40
 
     var body: some View {
         let verdict = model.verdict
         HStack(spacing: Metric.panelGap) {
-            PlugCharacter(mood: verdict.mood, mark: verdict.tone == .blocked ? StatusColor.stopped : StatusColor.needsYou)
+            PlugCharacter(mood: verdict.mood, mark: verdict.markColor)
                 .foregroundStyle(.tint)
-                .frame(width: characterSize, height: characterSize)
+                .frame(width: Self.characterSize, height: Self.characterSize)
             Text(verdict.title)
                 .font(PanelType.title)
                 .lineLimit(2)
@@ -70,7 +70,6 @@ enum Metric {
     /// The picture at the start of a detail header.
     static let glyphSlot: CGFloat = 32
     static let popoverWidth: CGFloat = 340
-    static let popoverRowHeight: CGFloat = 34
     /// The space between one group and the next in the menu bar panel.
     static let panelGap: CGFloat = 12
     /// A server's tile in the menu bar panel, and the gap between two.
@@ -115,6 +114,12 @@ enum StatusColor {
     static let wash = 0.11
 }
 
+extension Verdict {
+    /// The colour of the mark beside Plug's character. The character itself
+    /// stays Plug blue.
+    var markColor: Color { tone == .blocked ? StatusColor.stopped : StatusColor.needsYou }
+}
+
 extension Verdict.Tone {
     var color: Color {
         switch self {
@@ -132,7 +137,7 @@ extension ServerHealth {
         case .working: StatusColor.working
         case .starting, .off: StatusColor.quiet
         case .signInNeeded, .notLoaded: StatusColor.needsYou
-        case .down, .unknown: StatusColor.stopped
+        case .down: StatusColor.stopped
         }
     }
 
@@ -146,7 +151,7 @@ extension ServerHealth {
         case .working: .working
         case .starting: .starting
         case .signInNeeded: .signIn
-        case .down, .unknown: .stopped
+        case .down: .stopped
         case .notLoaded: .needsYou
         case .off: .off
         }

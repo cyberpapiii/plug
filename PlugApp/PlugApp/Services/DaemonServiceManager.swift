@@ -2,9 +2,8 @@ import Darwin
 import Foundation
 import PlugIPC
 import ServiceManagement
-import UserNotifications
 
-enum DaemonServiceError: Error, Equatable {
+enum DaemonServiceError: LocalizedError, AdvisedError, Equatable {
     case adoptionRequired
     case unknownOwnership
     case evidenceChanged
@@ -13,6 +12,34 @@ enum DaemonServiceError: Error, Equatable {
     case registrationDisabled
     case verificationFailed(expectedVersion: String, actualVersion: String?)
     case commandFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .adoptionRequired:
+            "An older copy of Plug is running. Open Plug and let it replace that copy."
+        case .unknownOwnership:
+            "Something other than this app runs Plug's service, so Plug left it alone."
+        case .evidenceChanged:
+            "Plug's service changed while Plug was checking it. Try again."
+        case let .invalidAppVersion(expected, actual):
+            "This copy of Plug is version \(actual), and \(expected) was asked for. Quit Plug and open it again."
+        case .invalidJobEvidence:
+            "Plug could not tell which program a launchd job runs, so it left the job alone."
+        case .registrationDisabled:
+            "macOS has turned off Plug's service. Turn Plug on in System Settings, under General, Login Items."
+        case let .verificationFailed(expected, actual?):
+            "Plug's service answered as version \(actual) instead of \(expected). Try again."
+        case .verificationFailed:
+            "Plug's service did not answer after it started. Try again."
+        case let .commandFailed(detail):
+            detail.isEmpty ? "macOS did not change Plug's service. Try again." : detail
+        }
+    }
+
+    var advice: String {
+        if case let .commandFailed(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
+    }
 }
 
 @MainActor
@@ -26,9 +53,10 @@ protocol DaemonServiceBackend: AnyObject {
     func registerAgent() throws
     func kickstartAgent() async throws
     func handshake() async throws -> OperatorHandshake
+    /// The time a wait is measured against, so tests can move it.
+    var now: ContinuousClock.Instant { get }
     func waitBeforeRetry() async
     func openLoginItemSettings()
-    var backgroundItemAllowance: SystemAllowance { get }
 }
 
 @MainActor
@@ -39,7 +67,7 @@ final class DaemonServiceManager {
     private let launchdInspector: any LaunchdJobInspecting
     private let backend: any DaemonServiceBackend
     private let legacyPaths: Set<URL>
-    private let retryLimit: Int
+    private let startupBudget: Duration
     private var resumedStrandedConnectors = false
 
     init(
@@ -47,23 +75,24 @@ final class DaemonServiceManager {
         launchdInspector: any LaunchdJobInspecting = LaunchdJobInspector(),
         backend: any DaemonServiceBackend = SystemDaemonServiceBackend(),
         legacyPaths: Set<URL> = DaemonServiceManager.defaultLegacyPaths,
-        retryLimit: Int = 180
+        startupBudget: Duration = PlugPaths.startupBudget
     ) {
         self.appInspector = appInspector
         self.launchdInspector = launchdInspector
         self.backend = backend
         self.legacyPaths = legacyPaths
-        self.retryLimit = max(1, retryLimit)
+        self.startupBudget = startupBudget
     }
 
-    var appServiceEnabled: Bool { backend.enabled }
-    var mainAppAtLoginEnabled: Bool { SMAppService.mainApp.status == .enabled }
+    /// The wait between two checks of a starting daemon.
+    nonisolated static let retryInterval: Duration = .milliseconds(500)
 
-    /// What macOS says about Plug running in the background and opening at
-    /// login. Both are switched off by the person in System Settings > Login
-    /// Items, and neither says so on its own.
-    var backgroundItemAllowance: SystemAllowance { backend.backgroundItemAllowance }
-    var loginItemAllowance: SystemAllowance { SystemAllowance(SMAppService.mainApp.status) }
+    /// The name the daemon's LaunchAgent is registered under, which is also
+    /// its launchd label with `.plist` added.
+    nonisolated static let agentPlistName = "\(PlugPaths.daemonLabel).plist"
+    nonisolated static let daemonLabel = PlugPaths.daemonLabel
+
+    var appServiceEnabled: Bool { backend.enabled }
 
     func inspect(
         canonical: VerifiedAppInstallation,
@@ -83,20 +112,24 @@ final class DaemonServiceManager {
         let homebrew = records.filter { record in
             record.programURL.map(LegacyPlugProgram.isHomebrew) == true
         }
-        guard !homebrew.isEmpty else { return }
-        guard homebrew.allSatisfy({ $0.programURL != nil }) else {
-            throw DaemonServiceError.invalidJobEvidence
-        }
         for record in homebrew {
             try await backend.bootOut(record)
         }
     }
 
-    func adoptRecognizedLegacy(
+    /// Takes over a daemon this app does not own, with the owner's consent:
+    /// a leftover install's job, or a socket with no registration behind it.
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake {
-        guard case let .recognizedLegacy(records) = snapshot.ownership, !records.isEmpty else {
+        let records: [LaunchdJobRecord]
+        switch snapshot.ownership {
+        case let .recognizedLegacy(found) where !found.isEmpty:
+            records = found
+        case .unmanaged:
+            records = []
+        default:
             throw DaemonServiceError.adoptionRequired
         }
         let canonical = try await verifiedApp(expectedVersion: expectedVersion)
@@ -112,10 +145,9 @@ final class DaemonServiceManager {
             // the leftover job. Register from the inspect-time snapshot.
             bootOutLoadedJobs = false
         case .recognizedLegacy:
+            guard !records.isEmpty else { throw DaemonServiceError.evidenceChanged }
             bootOutLoadedJobs = true
-        case .unknown:
-            throw DaemonServiceError.unknownOwnership
-        case .appManagedCurrent, .appManagedStale:
+        case .unknown, .appManagedCurrent, .appManagedStale:
             throw DaemonServiceError.unknownOwnership
         }
         return try await replace(
@@ -144,47 +176,25 @@ final class DaemonServiceManager {
         )
     }
 
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
-        let canonical = try await verifiedApp(expectedVersion: expectedVersion)
-        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
-    }
-
-    /// For a caller that verified the app and read launchd moments ago in the
-    /// same pass. Verifying the app signs and runs the bundled binary, and a
-    /// launchd read runs `launchctl` once per job, so repeating both right
-    /// after the caller did was most of what a healthy launch spent. When the
-    /// inspected job is ours, one fresh handshake proves the daemon; anything
-    /// short of exact proof falls through to the full path, which reads
-    /// launchd again before it changes anything.
+    /// Proves this app's own daemon is running, starting or replacing it
+    /// when it is not. `inspected` is the caller's launchd read from moments
+    /// ago in the same pass: verifying the app signs and runs the bundled
+    /// binary, and a launchd read runs `launchctl` once per job, so repeating
+    /// both was most of what a healthy launch spent. When the inspected job is
+    /// ours, one fresh handshake proves the daemon; anything short of exact
+    /// proof reads launchd again before it changes anything.
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake {
         let expectedVersion = canonical.appVersion
-        guard canonical.embeddedVersion == expectedVersion else {
-            throw DaemonServiceError.invalidAppVersion(
-                expected: expectedVersion,
-                actual: canonical.embeddedVersion
-            )
-        }
         if case let .appManagedCurrent(record) = inspected.ownership,
            let handshake = try? await backend.handshake(),
-           exactProof(
-               record: record,
-               handshake: handshake,
-               canonical: canonical,
-               expectedVersion: expectedVersion
-           )
+           canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
         {
             return handshake
         }
-        return try await ensureRunning(canonical: canonical, expectedVersion: expectedVersion)
-    }
 
-    private func ensureRunning(
-        canonical: VerifiedAppInstallation,
-        expectedVersion: String
-    ) async throws -> OperatorHandshake {
         let inspection = try await inspectWithHandshake(
             canonical: canonical,
             legacyPaths: legacyPaths
@@ -192,12 +202,7 @@ final class DaemonServiceManager {
         switch inspection.snapshot.ownership {
         case let .appManagedCurrent(record):
             if let handshake = inspection.handshake,
-               exactProof(
-                   record: record,
-                   handshake: handshake,
-                   canonical: canonical,
-                   expectedVersion: expectedVersion
-               )
+               canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
             {
                 return handshake
             }
@@ -234,35 +239,8 @@ final class DaemonServiceManager {
         }
     }
 
-    // Compatibility entry point for the existing first-run button. It remains
-    // an explicit operator action and delegates to the evidence-backed methods.
-    func adopt() async throws {
-        let canonical = try await appInspector.inspectCurrentApp()
-        let snapshot = try await inspect(canonical: canonical, legacyPaths: legacyPaths)
-        switch snapshot.ownership {
-        case .recognizedLegacy:
-            _ = try await adoptRecognizedLegacy(
-                snapshot: snapshot,
-                expectedVersion: canonical.appVersion
-            )
-        case .unmanaged:
-            _ = try await replace(
-                verifiedRecords: [],
-                canonical: canonical,
-                expectedVersion: canonical.appVersion,
-                replacingAppRegistration: false,
-                inspectionPaths: inspectionPaths(including: snapshot),
-                bootOutLoadedJobs: true
-            )
-        case .appManagedCurrent, .appManagedStale:
-            _ = try await ensureRunning(expectedVersion: canonical.appVersion)
-        case .unknown:
-            throw DaemonServiceError.unknownOwnership
-        }
-    }
-
-    // Compatibility entry point for the existing restart button. Replacement
-    // still requires a newly verified app-owned record before any bootout.
+    /// Replaces this app's own daemon with a fresh one. Only a job read again
+    /// now and proved to be the app's own is booted out.
     func restart() async throws {
         let canonical = try await appInspector.inspectCurrentApp()
         let snapshot = try await inspect(canonical: canonical, legacyPaths: legacyPaths)
@@ -417,15 +395,17 @@ final class DaemonServiceManager {
         )
     }
 
-    /// Gives the running daemon a bounded window to prove its version and
-    /// executable. Returns the last version it reported when it never does.
+    /// Gives the running daemon the startup budget the CLI gives it to prove
+    /// its version and executable. Returns the last version it reported when
+    /// it never does.
     private func awaitProof(
         canonical: VerifiedAppInstallation,
         expectedVersion: String,
         inspectionPaths: Set<URL>
     ) async throws -> (OperatorHandshake?, String?) {
         var actualVersion: String?
-        for _ in 0..<retryLimit {
+        let deadline = backend.now + startupBudget
+        repeat {
             await backend.waitBeforeRetry()
             let inspection = try await inspectWithHandshake(
                 canonical: canonical,
@@ -434,16 +414,11 @@ final class DaemonServiceManager {
             actualVersion = inspection.snapshot.daemonVersion
             if case let .appManagedCurrent(record) = inspection.snapshot.ownership,
                let handshake = inspection.handshake,
-               exactProof(
-                   record: record,
-                   handshake: handshake,
-                   canonical: canonical,
-                   expectedVersion: expectedVersion
-               )
+               canonical.isOwnCurrentDaemon(record, version: handshake.daemonVersion, executable: handshake.daemonExecutable)
             {
                 return (handshake, actualVersion)
             }
-        }
+        } while backend.now < deadline
         return (nil, actualVersion)
     }
 
@@ -468,57 +443,31 @@ final class DaemonServiceManager {
         )
     }
 
-    private func exactProof(
-        record: LaunchdJobRecord,
-        handshake: OperatorHandshake,
-        canonical: VerifiedAppInstallation,
-        expectedVersion: String
-    ) -> Bool {
-        guard let program = record.programURL else { return false }
-        return resolved(program) == resolved(canonical.executableURL)
-            && record.parentBundleIdentifier == AppInstallationInspector.bundleIdentifier
-            && record.parentBundleVersion == canonical.buildVersion
-            && handshake.daemonExecutable.map { resolved($0) == resolved(canonical.executableURL) } == true
-            && handshake.daemonVersion == expectedVersion
-    }
-
     private func inspectionPaths(including snapshot: DaemonServiceSnapshot) -> Set<URL> {
         legacyPaths.union(snapshot.ownership.programURLs)
     }
 
     private func verifiedApp(expectedVersion: String) async throws -> VerifiedAppInstallation {
         let canonical = try await appInspector.inspectCurrentApp()
-        guard canonical.appVersion == expectedVersion,
-              canonical.embeddedVersion == expectedVersion
-        else {
+        guard canonical.appVersion == expectedVersion else {
             throw DaemonServiceError.invalidAppVersion(
                 expected: expectedVersion,
-                actual: canonical.embeddedVersion
+                actual: canonical.appVersion
             )
         }
         return canonical
     }
 
-    private func resolved(_ url: URL) -> URL {
-        url.resolvedStandardized
-    }
-
-    /// Existence probes for leftover files still on disk. Not the classify table.
-    /// Cellar and brew-bin shapes are classified by `LegacyPlugProgram` even after uninstall.
+    /// A launchd job that runs one of these, after symlinks, is a leftover
+    /// install. A link that resolves into the app's own binary still counts.
     private static var defaultLegacyPaths: Set<URL> {
-        let home = FileManager.default.homeDirectoryForCurrentUser
-        return [
-            home.appending(path: ".local/bin/plug"),
-            home.appending(path: ".cargo/bin/plug"),
-            URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug"),
-            URL(fileURLWithPath: "/usr/local/opt/plug/bin/plug"),
-        ]
+        LegacyPlugProgram.installPaths(home: FileManager.default.homeDirectoryForCurrentUser)
     }
 }
 
 @MainActor
 private final class SystemDaemonServiceBackend: DaemonServiceBackend {
-    private let agent = SMAppService.agent(plistName: "com.plug.daemon.plist")
+    private let agent = SMAppService.agent(plistName: DaemonServiceManager.agentPlistName)
     private let runner: any ProcessRunning
     private let probe: LaunchdJobProbe
 
@@ -528,7 +477,6 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     var enabled: Bool { agent.status == .enabled }
-    var backgroundItemAllowance: SystemAllowance { SystemAllowance(agent.status) }
 
     func pauseConnectors() async -> [Int32] {
         DaemonServiceManager.connectorPIDs(psOutput: await currentUserProcessList()).compactMap { pid in
@@ -591,17 +539,19 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
         // and killing that fresh instance runs into launchd's ten-second
         // respawn throttle, leaving no daemon for about eleven seconds. A plain
         // kickstart starts the job only when it is not already running.
-        try await launchctl(["kickstart", "gui/\(getuid())/com.plug.daemon"])
+        try await launchctl(["kickstart", "gui/\(getuid())/\(DaemonServiceManager.daemonLabel)"])
     }
 
     func handshake() async throws -> OperatorHandshake {
-        // Called several times a reconcile and up to `retryLimit` times while
-        // a replacement proves itself, so each probe closes its own socket.
-        try await PlugIPCClient().handshakeAndDisconnect()
+        // Called several times a reconcile and every retry while a
+        // replacement proves itself, so each probe closes its own socket.
+        try await PlugIPCClient(clientVersion: AppModel.defaultClientVersion).handshakeAndDisconnect()
     }
 
+    var now: ContinuousClock.Instant { .now }
+
     func waitBeforeRetry() async {
-        try? await Task.sleep(for: .milliseconds(500))
+        try? await Task.sleep(for: DaemonServiceManager.retryInterval)
     }
 
     func openLoginItemSettings() {
@@ -636,73 +586,4 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
 
 extension DaemonServiceBackend {
     func resumeStrandedConnectors() async {}
-    var backgroundItemAllowance: SystemAllowance { enabled ? .allowed : .notAsked }
-}
-
-/// Where one thing Plug needs from macOS stands.
-enum SystemAllowance: Equatable, Sendable {
-    case allowed
-    /// The person turned it off in System Settings; only they can turn it on.
-    case turnedOff
-    /// Nothing has asked macOS for it yet.
-    case notAsked
-
-    init(_ status: SMAppService.Status) {
-        switch status {
-        case .enabled: self = .allowed
-        case .requiresApproval: self = .turnedOff
-        case .notRegistered, .notFound: self = .notAsked
-        @unknown default: self = .notAsked
-        }
-    }
-
-    init(_ status: UNAuthorizationStatus) {
-        switch status {
-        case .authorized, .provisional, .ephemeral: self = .allowed
-        case .denied: self = .turnedOff
-        case .notDetermined: self = .notAsked
-        @unknown default: self = .notAsked
-        }
-    }
-}
-
-/// Whether Plug's menu bar icon comes back after something else closed the
-/// app. The daemon does the reopening and reads one file to know whether it
-/// may: `menu-bar-hidden` beside its socket means the owner wants the app
-/// left closed.
-struct MenuBarPresence {
-    static let preferenceKey = "keepInMenuBar"
-    static var standard: MenuBarPresence {
-        MenuBarPresence(
-            marker: URL.homeDirectory.appending(path: "Library/Application Support/plug/menu-bar-hidden"),
-            defaults: .standard
-        )
-    }
-
-    let marker: URL
-    let defaults: UserDefaults
-
-    /// On unless the person turned it off.
-    var keeps: Bool {
-        get { defaults.object(forKey: Self.preferenceKey) as? Bool ?? true }
-        nonmutating set {
-            defaults.set(newValue, forKey: Self.preferenceKey)
-            appDidOpen()
-        }
-    }
-
-    /// The app is open, so an earlier quit no longer hides it.
-    func appDidOpen() {
-        if keeps { try? FileManager.default.removeItem(at: marker) } else { hide() }
-    }
-
-    /// The owner quit the app themselves; it stays closed until they open it.
-    func ownerDidQuit() { hide() }
-
-    private func hide() {
-        try? FileManager.default.createDirectory(
-            at: marker.deletingLastPathComponent(), withIntermediateDirectories: true
-        )
-        try? Data().write(to: marker, options: .atomic)
-    }
 }

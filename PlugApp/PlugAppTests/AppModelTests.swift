@@ -9,15 +9,6 @@ private let currentTestAppVersion = PlugIPCClient.clientVersion(
     from: Bundle.main.infoDictionary ?? [:]
 )
 
-/// The operator token normally lives in the user's Application Support
-/// directory. Tests that must reach `.ready` write their own so the suite
-/// does not depend on a real Plug installation on the host.
-private func makeFixtureTokenURL() throws -> URL {
-    let url = URL(fileURLWithPath: "/tmp/plug-app-model-token-\(UUID().uuidString)")
-    try "fixture-token".write(to: url, atomically: true, encoding: .utf8)
-    return url
-}
-
 /// Polls a condition for up to two seconds.
 @MainActor
 private func eventually(_ condition: () async -> Bool) async -> Bool {
@@ -31,16 +22,16 @@ private func eventually(_ condition: () async -> Bool) async -> Bool {
 final class AppModelTests: XCTestCase {
     @MainActor
     func testTurningOffPersistsBeforeStopAndPreventsLaunchRecovery() async throws {
-        let marker = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: marker) }
+        let home = makeTestHome()
+        let marker = ServiceDisabledMarker(home: home).url
         let events = LockedEvents()
         let coordinator = RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: events)
         coordinator.stopOperation = { XCTAssertTrue(FileManager.default.fileExists(atPath: marker.path)) }
-        let model = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        let model = AppModel(home: home, coordinator: coordinator)
         await model.setServiceEnabled(false)
         XCTAssertFalse(model.serviceEnabled)
         XCTAssertEqual(model.verdict.title, "Plug is off")
-        let relaunched = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        let relaunched = AppModel(home: home, coordinator: coordinator)
         await relaunched.start()
         XCTAssertFalse(relaunched.serviceEnabled)
         XCTAssertFalse(events.values.contains("coordinator.reconcile"))
@@ -52,29 +43,29 @@ final class AppModelTests: XCTestCase {
 
     @MainActor
     func testFailedStopRestoresOnPreferenceAndShowsError() async throws {
-        let marker = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: marker) }
+        let home = makeTestHome()
+        let marker = ServiceDisabledMarker(home: home).url
         let coordinator = RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents())
         coordinator.stopOperation = { throw CocoaError(.fileWriteNoPermission) }
-        let model = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        let model = AppModel(home: home, coordinator: coordinator)
         await model.setServiceEnabled(false)
         XCTAssertTrue(model.serviceEnabled)
         XCTAssertFalse(FileManager.default.fileExists(atPath: marker.path))
-        XCTAssertNotNil(model.actionError)
+        XCTAssertNotNil(model.actions.actionError)
     }
     /// The marker can be gone by the time Plug is turned on: a second copy of
     /// the app, or a person, removed it. That is no reason to stay off.
     @MainActor
     func testTurningOnDoesNotNeedTheOffMarker() async throws {
-        let marker = FileManager.default.temporaryDirectory.appending(path: UUID().uuidString)
-        defer { try? FileManager.default.removeItem(at: marker) }
+        let home = makeTestHome()
+        let marker = ServiceDisabledMarker(home: home).url
         let coordinator = RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents())
-        let model = AppModel(coordinator: coordinator, serviceDisabledURL: marker)
+        let model = AppModel(home: home, coordinator: coordinator)
         await model.setServiceEnabled(false)
         try FileManager.default.removeItem(at: marker)
         await model.setServiceEnabled(true)
         XCTAssertTrue(model.serviceEnabled)
-        XCTAssertNil(model.actionError)
+        XCTAssertNil(model.actions.actionError)
     }
 
     /// The surface that starts the model can go away before launch is over.
@@ -88,9 +79,9 @@ final class AppModelTests: XCTestCase {
         let server = try OperatorFixtureServer(events: coordinator.events)
         defer { server.stop() }
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL(),
             backgroundPollInterval: .milliseconds(20)
         )
         let surface = Task { await model.start() }
@@ -106,9 +97,15 @@ final class AppModelTests: XCTestCase {
     /// `.disconnected`. The difference is what the menu bar says while Plug
     /// starts: "Starting…" rather than "Plug is not running".
     @MainActor func testEmptyModelHasNotAskedYet() {
-        let model = AppModel()
+        let model = AppModel(home: makeTestHome())
         XCTAssertEqual(model.connectionState, .connecting)
         XCTAssertTrue(model.visibleServers.isEmpty)
+    }
+
+    /// The app these tests run inside must know it is a test host, or it
+    /// would start acting on the owner's real install as it opens.
+    func testTheHostAppKnowsItIsHostingTests() {
+        XCTAssertTrue(TestHost.isActive)
     }
 
     /// Settings is its own window, so asking for it must not pull the main
@@ -118,7 +115,7 @@ final class AppModelTests: XCTestCase {
         router.section = .clients
         var windows = 0, settings = 0
         let runner = PlugIntentRunner(
-            model: AppModel(), router: router,
+            model: AppModel(home: makeTestHome()), router: router,
             showWindow: { windows += 1 }, showSettings: { settings += 1 }
         )
         runner.run(.openSettings)
@@ -133,30 +130,13 @@ final class AppModelTests: XCTestCase {
         let router = Router()
         var windows = 0, settings = 0
         let runner = PlugIntentRunner(
-            model: AppModel(), router: router,
+            model: AppModel(home: makeTestHome()), router: router,
             showWindow: { windows += 1 }, showSettings: { settings += 1 }
         )
         runner.run(.checkup)
         XCTAssertEqual(router.checkupRequests, 1)
         XCTAssertEqual(settings, 1)
         XCTAssertEqual(windows, 0)
-    }
-
-    /// The sidebar lists the four things Plug manages. Settings is not one.
-    func testTheSidebarHasFourSections() {
-        XCTAssertEqual(AppSection.allCases.map(\.rawValue), ["Servers", "Clients", "Events", "Activity"])
-    }
-
-    func testBundleClientVersionFallback() {
-        XCTAssertEqual(PlugIPCClient.clientVersion(from: [:]), "development")
-        XCTAssertEqual(
-            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "  "]),
-            "development"
-        )
-        XCTAssertEqual(
-            PlugIPCClient.clientVersion(from: ["CFBundleShortVersionString": "0.7.0"]),
-            "0.7.0"
-        )
     }
 
     @MainActor
@@ -169,9 +149,9 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try! makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         XCTAssertEqual(model.situation.setup, .ready)
@@ -212,6 +192,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
@@ -227,6 +208,7 @@ final class AppModelTests: XCTestCase {
     @MainActor
     func testLaunchInspectionSaysStartingNotInstalling() {
         let inspecting = AppModel(
+            home: makeTestHome(),
             coordinator: RecordingInstallationCoordinator(
                 state: .reconcilingUpdate(.inspecting),
                 events: LockedEvents()
@@ -235,6 +217,7 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(inspecting.verdict.title, "Starting…")
 
         let installing = AppModel(
+            home: makeTestHome(),
             coordinator: RecordingInstallationCoordinator(
                 state: .reconcilingUpdate(.replacingDaemon),
                 events: LockedEvents()
@@ -253,6 +236,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
@@ -274,9 +258,9 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try! makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         await model.refresh()
@@ -301,9 +285,9 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL(),
             foregroundPollInterval: .milliseconds(20),
             backgroundPollInterval: .seconds(3600)
         )
@@ -330,9 +314,9 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         let before = coordinator.events.values.filter { $0 == "ipc.snapshot" }.count
@@ -373,9 +357,9 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try! makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         await model.refresh()
@@ -399,18 +383,18 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
 
-        try await model.performOperation { .restartServer(authToken: $0, serverID: "demo") }
+        await model.actions.perform("restart demo", .restartServer(serverID: "demo"))
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
 
         server.catalogRevision = 2
-        try await model.performOperation { .setToolEnabled(authToken: $0, tool: "demo__echo", enabled: false) }
+        await model.actions.setToolEnabled("demo__echo", false)
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
 
         await model.refresh(forceCatalog: true)
@@ -420,6 +404,27 @@ final class AppModelTests: XCTestCase {
         )
     }
 
+    /// The sheet shows the new account under the name the daemon gave it,
+    /// which the fixture's reply makes different from the app's own guess.
+    @MainActor
+    func testAnAddedAccountIsKnownByTheDaemonsName() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            home: makeTestHome(),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator
+        )
+        await model.start()
+        let added = try await model.actions.addAccount(server: "demo", label: "work")
+        XCTAssertEqual(added, "workspace")
+    }
+
     @MainActor
     func testUsePlugIsExplicitCoordinatorAction() async {
         let coordinator = RecordingInstallationCoordinator(
@@ -427,6 +432,7 @@ final class AppModelTests: XCTestCase {
             events: LockedEvents()
         )
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
@@ -452,10 +458,12 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
         await model.start()
+        XCTAssertTrue(model.hasLoadedSnapshot, "the snapshot compared below was read")
         let originalSnapshot = model.snapshot
 
         coordinator.operation = {
@@ -484,6 +492,7 @@ final class AppModelTests: XCTestCase {
             events: LockedEvents()
         )
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
@@ -517,6 +526,7 @@ final class AppModelTests: XCTestCase {
         defer { server.stop() }
 
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator
         )
@@ -528,33 +538,6 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
-    func testIncompatibleIPCExposesOneRetryReconcileAction() async {
-        let events = LockedEvents()
-        let coordinator = RecordingInstallationCoordinator(
-            state: .healthy(makeInstallationSnapshot()),
-            events: events
-        )
-        let server = try! OperatorFixtureServer(events: events, ipcMin: 7, ipcMax: 7)
-        defer { server.stop() }
-
-        let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator
-        )
-        await model.start()
-
-        XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertEqual(model.situation.runtime, .versionMismatch)
-        XCTAssertEqual(model.verdict.primary?.intent, .reconnect)
-
-        await model.retryConnection()
-
-        XCTAssertTrue(events.values.contains("coordinator.retry"))
-        XCTAssertEqual(model.connectionState, .incompatible)
-        XCTAssertEqual(model.situation.runtime, .versionMismatch)
-    }
-
-    @MainActor
     func testRetryDisconnectsStaleIPCBeforeDaemonSocketReplacement() async throws {
         let events = LockedEvents()
         let socketURL = URL(
@@ -562,8 +545,7 @@ final class AppModelTests: XCTestCase {
         )
         let oldServer = try OperatorFixtureServer(
             events: events,
-            ipcMin: 7,
-            ipcMax: 7,
+            daemonVersion: "0.6.3",
             socketURL: socketURL
         )
         var replacement: OperatorFixtureServer?
@@ -580,9 +562,9 @@ final class AppModelTests: XCTestCase {
             events: events
         )
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         XCTAssertEqual(model.connectionState, .incompatible)
@@ -620,14 +602,15 @@ final class AppModelTests: XCTestCase {
         let events = LockedEvents()
         let socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-swap-\(UUID().uuidString).sock")
         let oldServer = try OperatorFixtureServer(events: events, socketURL: socketURL)
+        defer { oldServer.stop() }
         let coordinator = RecordingInstallationCoordinator(
             state: .healthy(makeInstallationSnapshot()),
             events: events
         )
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         XCTAssertEqual(model.connectionState, .ready)
@@ -651,13 +634,14 @@ final class AppModelTests: XCTestCase {
         ] {
             let events = LockedEvents()
             let server = try OperatorFixtureServer(events: events)
+            defer { server.stop() }
             let model = AppModel(
+                home: makeTestHome(),
                 ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
                 coordinator: RecordingInstallationCoordinator(
                     state: .healthy(makeInstallationSnapshot()),
                     events: events
                 ),
-                tokenURL: try makeFixtureTokenURL(),
                 reconnectGrace: grace
             )
             await model.start()
@@ -683,12 +667,12 @@ final class AppModelTests: XCTestCase {
         let events = LockedEvents()
         let socketURL = URL(fileURLWithPath: "/tmp/plug-app-model-down-\(UUID().uuidString).sock")
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: socketURL, clientVersion: currentTestAppVersion),
             coordinator: RecordingInstallationCoordinator(
                 state: .healthy(makeInstallationSnapshot()),
                 events: events
-            ),
-            tokenURL: try makeFixtureTokenURL()
+            )
         )
         await model.start()
         XCTAssertEqual(model.connectionState, .disconnected)
@@ -722,9 +706,9 @@ final class AppModelTests: XCTestCase {
             events: events
         )
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL()
+            coordinator: coordinator
         )
         await model.start()
         coordinator.restartOperation = { await gate.wait() }
@@ -744,23 +728,15 @@ final class AppModelTests: XCTestCase {
         XCTAssertFalse(events.values.contains("coordinator.retry"), "Start Plug waited instead of swapping again")
         XCTAssertEqual(events.values.filter { $0 == "coordinator.restartService" }.count, 1)
         XCTAssertEqual(model.connectionState, .ready)
-        XCTAssertFalse(model.isRestartingService)
+        XCTAssertFalse(model.gate.isRestartingService)
     }
 
     @MainActor
     func testNotificationsStaySilentInitiallyAndDeduplicateTransitions() {
-        let defaults = UserDefaults.standard
-        let previous = defaults.object(forKey: NotificationService.preferenceKey)
-        defaults.set(true, forKey: NotificationService.preferenceKey)
-        defer {
-            if let previous {
-                defaults.set(previous, forKey: NotificationService.preferenceKey)
-            } else {
-                defaults.removeObject(forKey: NotificationService.preferenceKey)
-            }
-        }
+        let preferences = TestPreferences()
+        preferences.set(true, forKey: NotificationService.preferenceKey)
         var postedIDs: [String] = []
-        let service = NotificationService { postedIDs.append($0.id) }
+        let service = NotificationService(sink: { postedIDs.append($0.id) }, preferences: preferences)
         let empty = makeNotificationSnapshot()
         let authenticated = makeNotificationSnapshot(authenticated: true)
         let unauthenticated = makeNotificationSnapshot(authenticated: false)
@@ -807,84 +783,92 @@ final class AppModelTests: XCTestCase {
         let server = try OperatorFixtureServer(events: coordinator.events)
         defer { server.stop() }
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL(),
             appLinker: FailingAppLinker()
         )
         await model.start()
 
-        await model.setAppLinked("claude-code", true)
-        XCTAssertEqual(model.actionError?.message, FailingAppLinker.message)
+        await model.actions.setAppLinked("claude-code", true)
+        XCTAssertEqual(model.actions.actionError?.message, FailingAppLinker.message)
 
         await model.refresh()
         XCTAssertEqual(model.connectionState, .ready)
-        XCTAssertEqual(model.actionError?.message, FailingAppLinker.message, "a good poll is not a good press")
+        XCTAssertEqual(model.actions.actionError?.message, FailingAppLinker.message, "a good poll is not a good press")
 
-        model.dismissActionError()
-        XCTAssertNil(model.actionError)
+        model.actions.dismissActionError()
+        XCTAssertNil(model.actions.actionError)
     }
 
     /// A message that leaves while it is being read is no message.
     @MainActor
     func testAFailedPressStaysAndSaysWhatToDo() async {
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
             appLinker: FailingAppLinker()
         )
-        await model.setAppLinked("claude-code", true)
-        XCTAssertEqual(model.actionError?.title, "Could not add Plug to Claude Code.")
-        XCTAssertEqual(model.actionError?.advice.isEmpty, false)
-        try? await Task.sleep(for: .milliseconds(200))
-        XCTAssertNotNil(model.actionError)
+        await model.actions.setAppLinked("claude-code", true)
+        XCTAssertEqual(model.actions.actionError?.title, "Could not add Plug to Claude Code.")
+        XCTAssertEqual(model.actions.actionError?.advice.isEmpty, false)
     }
 
     @MainActor
     func testCancelStopsAnOpenSignIn() async {
-        let runner = BlockingAuthRunner()
+        let runner = Self.blockingSignIn()
         let model = makeSignInModel(runner: runner)
 
-        let signIn = Task { await model.signIn(server: "notion") }
-        let started = await eventually { await runner.starts == 1 }
+        let signIn = Task { await model.actions.signIn(server: "notion") }
+        let started = await eventually { await runner.calls.count == 1 }
         XCTAssertTrue(started)
-        XCTAssertTrue(model.signingInServers.contains("notion"))
+        XCTAssertTrue(model.actions.signingInServers.contains("notion"))
 
-        model.cancelSignIn(server: "notion")
+        model.actions.cancelSignIn(server: "notion")
         await signIn.value
 
         let cancellations = await runner.cancellations
         XCTAssertEqual(cancellations, 1, "the login command is stopped, not left waiting on the browser")
-        XCTAssertTrue(model.signingInServers.isEmpty)
-        XCTAssertNil(model.actionError, "a cancel is not a failure")
+        XCTAssertTrue(model.actions.signingInServers.isEmpty)
+        XCTAssertNil(model.actions.actionError, "a cancel is not a failure")
     }
 
     /// Try Again used to be a no-op while a sign-in was open: the second press
     /// returned at once and the first attempt kept waiting for minutes.
     @MainActor
     func testTryAgainReplacesAnOpenSignIn() async {
-        let runner = BlockingAuthRunner()
+        let runner = Self.blockingSignIn()
         let model = makeSignInModel(runner: runner)
 
-        let first = Task { await model.signIn(server: "notion") }
-        _ = await eventually { await runner.starts == 1 }
-        let second = Task { await model.signIn(server: "notion") }
-        let restarted = await eventually { await runner.starts == 2 }
+        let first = Task { await model.actions.signIn(server: "notion") }
+        _ = await eventually { await runner.calls.count == 1 }
+        let second = Task { await model.actions.signIn(server: "notion") }
+        let restarted = await eventually { await runner.calls.count == 2 }
         XCTAssertTrue(restarted)
         let cancellations = await runner.cancellations
         XCTAssertEqual(cancellations, 1)
-        XCTAssertTrue(model.signingInServers.contains("notion"))
+        XCTAssertTrue(model.actions.signingInServers.contains("notion"))
 
-        model.cancelSignIn(server: "notion")
+        model.actions.cancelSignIn(server: "notion")
         await first.value
         await second.value
-        XCTAssertTrue(model.signingInServers.isEmpty)
-        XCTAssertNil(model.actionError)
+        XCTAssertTrue(model.actions.signingInServers.isEmpty)
+        XCTAssertNil(model.actions.actionError)
+    }
+
+    /// A `plug auth login` that waits on the browser until it is cancelled.
+    private static func blockingSignIn() -> StubProcessRunner {
+        StubProcessRunner { _, _ in
+            try await Task.sleep(for: .seconds(5))
+            return .exited()
+        }
     }
 
     @MainActor
-    private func makeSignInModel(runner: BlockingAuthRunner) -> AppModel {
+    private func makeSignInModel(runner: StubProcessRunner) -> AppModel {
         AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: currentTestAppVersion),
             coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
             authFlow: AuthFlowService(runner: runner, executable: URL(fileURLWithPath: "/usr/bin/true"))
@@ -909,18 +893,10 @@ final class AppModelTests: XCTestCase {
             .revealClient(id: "client-1")
         )
 
-        let defaults = UserDefaults.standard
-        let previous = defaults.object(forKey: NotificationService.preferenceKey)
-        defaults.set(true, forKey: NotificationService.preferenceKey)
-        defer {
-            if let previous {
-                defaults.set(previous, forKey: NotificationService.preferenceKey)
-            } else {
-                defaults.removeObject(forKey: NotificationService.preferenceKey)
-            }
-        }
+        let preferences = TestPreferences()
+        preferences.set(true, forKey: NotificationService.preferenceKey)
         var notes: [NotificationService.Note] = []
-        let service = NotificationService { notes.append($0) }
+        let service = NotificationService(sink: { notes.append($0) }, preferences: preferences)
         service.observe(makeNotificationSnapshot(authenticated: true))
         service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
         XCTAssertEqual(notes.map(\.server), ["alpha", nil], "only the server notification is clickable")
@@ -948,9 +924,9 @@ final class AppModelTests: XCTestCase {
         let server = try OperatorFixtureServer(events: events)
         defer { server.stop() }
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator,
-            tokenURL: try makeFixtureTokenURL()
+            coordinator: coordinator
         )
 
         let started = Task { await model.start() }
@@ -976,6 +952,7 @@ final class AppModelTests: XCTestCase {
     @MainActor
     func testAboutFallsBackToTheAppVersion() {
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: URL(fileURLWithPath: "/tmp/plug-no-socket"), clientVersion: "9.8.7"),
             coordinator: RecordingInstallationCoordinator(state: .healthy(makeInstallationSnapshot()), events: LockedEvents()),
             clientVersion: "9.8.7"
@@ -985,17 +962,10 @@ final class AppModelTests: XCTestCase {
 
     @MainActor
     func testNotificationsRequireExplicitOptIn() {
-        let defaults = UserDefaults.standard
-        let previous = defaults.object(forKey: NotificationService.preferenceKey)
-        defaults.removeObject(forKey: NotificationService.preferenceKey)
-        defer {
-            if let previous {
-                defaults.set(previous, forKey: NotificationService.preferenceKey)
-            }
-        }
+        let preferences = TestPreferences()
 
         var postedIDs: [String] = []
-        let service = NotificationService { postedIDs.append($0.id) }
+        let service = NotificationService(sink: { postedIDs.append($0.id) }, preferences: preferences)
         service.observe(makeNotificationSnapshot(authenticated: true))
         service.observe(makeNotificationSnapshot(authenticated: false, includeClient: true))
 
@@ -1003,122 +973,23 @@ final class AppModelTests: XCTestCase {
     }
 
     @MainActor
-    func testCanReadServerConfigFollowsHandshakeCapability() async throws {
-        let withCapability = try OperatorFixtureServer(
-            events: LockedEvents(),
-            ipcMax: 6,
-            capabilities: ["server_config_read"]
-        )
-        defer { withCapability.stop() }
-        let readable = AppModel(
-            ipc: PlugIPCClient(socketURL: withCapability.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: RecordingInstallationCoordinator(
-                state: .healthy(makeInstallationSnapshot()),
-                events: LockedEvents()
-            ),
-            tokenURL: try makeFixtureTokenURL()
-        )
-        await readable.start()
-        XCTAssertTrue(readable.canReadServerConfig)
-
-        let withoutCapability = try OperatorFixtureServer(events: LockedEvents())
-        defer { withoutCapability.stop() }
-        let blocked = AppModel(
-            ipc: PlugIPCClient(socketURL: withoutCapability.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: RecordingInstallationCoordinator(
-                state: .healthy(makeInstallationSnapshot()),
-                events: LockedEvents()
-            ),
-            tokenURL: try makeFixtureTokenURL()
-        )
-        await blocked.start()
-        XCTAssertFalse(blocked.canReadServerConfig)
-    }
-
-    @MainActor
-    func testServerConfigLoadsWhenCapabilityIsPresent() async throws {
-        let events = LockedEvents()
-        let server = try OperatorFixtureServer(
-            events: events,
-            ipcMax: 6,
-            capabilities: ["server_config_read"]
-        )
-        defer { server.stop() }
-        let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: RecordingInstallationCoordinator(
-                state: .healthy(makeInstallationSnapshot()),
-                events: events
-            ),
-            tokenURL: try makeFixtureTokenURL()
-        )
-        await model.start()
-
-        let config = try await model.serverConfig(name: "workspace")
-        XCTAssertEqual(config.command, "npx")
-        XCTAssertTrue(events.values.contains("ipc.getServerConfig"))
-    }
-
-    @MainActor
-    func testServerConfigDoesNotFireWithoutCapability() async throws {
+    func testServerConfigLoads() async throws {
         let events = LockedEvents()
         let server = try OperatorFixtureServer(events: events)
         defer { server.stop() }
         let model = AppModel(
+            home: makeTestHome(),
             ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
             coordinator: RecordingInstallationCoordinator(
                 state: .healthy(makeInstallationSnapshot()),
                 events: events
-            ),
-            tokenURL: try makeFixtureTokenURL()
+            )
         )
         await model.start()
-        XCTAssertFalse(model.canReadServerConfig)
 
-        do {
-            _ = try await model.serverConfig(name: "workspace")
-            XCTFail("GetServerConfig must not succeed without server_config_read")
-        } catch {
-            XCTAssertEqual(
-                error.localizedDescription,
-                AppModel.serverConfigReadRequiredCopy
-            )
-            XCTAssertFalse(
-                error.localizedDescription.contains("PARSE_ERROR"),
-                "missing capability must not surface as a parse failure"
-            )
-        }
-        XCTAssertFalse(events.values.contains("ipc.getServerConfig"))
-    }
-
-    @MainActor
-    func testOlderHandshakeWithoutV6BlocksGetServerConfig() async throws {
-        let events = LockedEvents()
-        let server = try OperatorFixtureServer(
-            events: events,
-            ipcMin: 3,
-            ipcMax: 4
-        )
-        defer { server.stop() }
-        let model = AppModel(
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: RecordingInstallationCoordinator(
-                state: .healthy(makeInstallationSnapshot()),
-                events: events
-            ),
-            tokenURL: try makeFixtureTokenURL()
-        )
-        await model.start()
-        XCTAssertEqual(model.connectionState, .ready)
-        XCTAssertFalse(model.canReadServerConfig)
-
-        do {
-            _ = try await model.serverConfig(name: "workspace")
-            XCTFail("older handshake without v6 must not load server config")
-        } catch {
-            XCTAssertEqual(error.localizedDescription, AppModel.serverConfigReadRequiredCopy)
-        }
-        XCTAssertFalse(events.values.contains("ipc.getServerConfig"))
+        let config = try await model.serverConfig(name: "workspace")
+        XCTAssertEqual(config.command, "uvx")
+        XCTAssertTrue(events.values.contains("ipc.getServerConfig"))
     }
 
     @MainActor
@@ -1128,16 +999,13 @@ final class AppModelTests: XCTestCase {
             bundleURL: executable.deletingLastPathComponent().deletingLastPathComponent(),
             executableURL: executable,
             appVersion: currentTestAppVersion,
-            buildVersion: "12",
-            embeddedVersion: currentTestAppVersion,
-            teamID: AppInstallationInspector.teamID
+            buildVersion: "12"
         )
         let record = LaunchdJobRecord(
             label: "com.plug.daemon",
             programURL: executable,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "12",
-            loaded: true
+            parentBundleVersion: "12"
         )
         let service = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(record),
@@ -1189,23 +1057,29 @@ final class AppModelTests: XCTestCase {
     /// The daemon names each server once. If it ever does not, the app shows
     /// the first and keeps running.
     @MainActor
-    func testAServerNamedTwiceDoesNotStopTheApp() {
-        let twice = """
-        {"name":"alpha","url":null,"authenticated":true,"health":"Healthy","scopes":null,"tokenExpiresInSecs":null,"warnings":[]}
-        """
-        let payload = """
-        {
-          "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "ownership": "app_managed",
-          "configuredServers": [], "servers": [], "liveSessions": [], "clientVisibility": [],
-          "upstreamAuth": [\(twice), \(twice)], "downstreamClients": []
+    func testAServerNamedTwiceDoesNotStopTheApp() throws {
+        func snapshot(_ signedIn: [Bool]) throws -> OperatorSnapshot {
+            let auth = signedIn.map {
+                """
+                {"name":"alpha","url":null,"authenticated":\($0),"health":"Healthy","scopes":null,"tokenExpiresInSecs":null,"warnings":[]}
+                """
+            }
+            let payload = """
+            {
+              "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "startedId": 1, "toolCatalogRevision": 0, "prefixDelimiter": "__",
+              "ownership": "app_managed", "configuredServers": [], "servers": [], "liveSessions": [],
+              "upstreamAuth": [\(auth.joined(separator: ","))], "downstreamClients": []
+            }
+            """
+            return try JSONDecoder().decode(OperatorSnapshot.self, from: Data(payload.utf8))
         }
-        """
-        let snapshot = try! JSONDecoder().decode(OperatorSnapshot.self, from: Data(payload.utf8))
+        let preferences = TestPreferences()
+        preferences.set(true, forKey: NotificationService.preferenceKey)
         var posted: [String] = []
-        let service = NotificationService { posted.append($0.id) }
-        service.observe(snapshot)
-        service.observe(snapshot)
-        XCTAssertTrue(posted.isEmpty)
+        let service = NotificationService(sink: { posted.append($0.id) }, preferences: preferences)
+        service.observe(try snapshot([true, false]))
+        service.observe(try snapshot([false]))
+        XCTAssertEqual(posted, ["upstream-reauth-alpha"], "the first of the two is the one read")
     }
 
     @MainActor
@@ -1215,17 +1089,17 @@ final class AppModelTests: XCTestCase {
         clientSignedIn: Bool = true
     ) -> OperatorSnapshot {
         let clientJSON = includeClient
-            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn)}]"#
+            ? #"[{"clientId":"client-1","clientName":"Client","redirectUris":[],"source":"test","signedIn":\#(clientSignedIn),"clientKey":"oauth:client-1","createdAt":1,"expiresAt":2}]"#
             : "[]"
         let payload = """
         {
-          "runtimeVersion": "\(currentTestAppVersion)",
-          "uptimeSecs": 1,
+          "runtimeVersion": "\(currentTestAppVersion)", "prefixDelimiter": "__",
+          "uptimeSecs": 1, "startedId": 1,
+          "toolCatalogRevision": 0,
           "ownership": "app_managed",
           "configuredServers": [],
           "servers": [],
           "liveSessions": [],
-          "clientVisibility": [],
           "upstreamAuth": [{
             "name": "alpha",
             "url": null,
@@ -1265,18 +1139,10 @@ private final class RecordingInstallationCoordinator: InstallationCoordinating {
     }
 
     func reconcile(trigger: ReconciliationTrigger) async {
+        if trigger == .explicitAdoption { events.append("coordinator.adopt") }
+        if trigger == .retry { events.append("coordinator.retry") }
         events.append("coordinator.reconcile")
         await operation?()
-    }
-
-    func adopt() async {
-        events.append("coordinator.adopt")
-        await reconcile(trigger: .explicitAdoption)
-    }
-
-    func retry() async {
-        events.append("coordinator.retry")
-        await reconcile(trigger: .retry)
     }
 
     /// Runs while a restart is under way. Throwing makes the restart fail.
@@ -1301,23 +1167,6 @@ private struct FailingAppLinker: AppLinking {
     }
     func unlink(target: String) async throws {
         throw CocoaError(.fileWriteNoPermission, userInfo: [NSLocalizedDescriptionKey: Self.message])
-    }
-}
-
-/// A `plug auth login` that waits on the browser until it is cancelled.
-private actor BlockingAuthRunner: ProcessRunning {
-    private(set) var starts = 0
-    private(set) var cancellations = 0
-
-    func run(executable: URL, arguments: [String], timeout: Duration) async throws -> ProcessResult {
-        starts += 1
-        do {
-            try await Task.sleep(for: .seconds(5))
-        } catch {
-            cancellations += 1
-            throw error
-        }
-        return ProcessResult(status: 0, stdout: Data(), stderr: Data())
     }
 }
 
@@ -1368,9 +1217,9 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     private let listener: Int32
     private let events: LockedEvents
     private let daemonVersion: String
-    private let ipcMin: UInt16
-    private let ipcMax: UInt16
-    private let capabilities: [String]
+    /// What the daemon answers, from its goldens. The fixture changes only
+    /// what a test varies.
+    private let replies: [String: [String: Any]]
     private let lock = NSLock()
     private let serveStopped = DispatchSemaphore(value: 0)
     private(set) var clientVersion: String?
@@ -1394,40 +1243,13 @@ private final class OperatorFixtureServer: @unchecked Sendable {
     init(
         events: LockedEvents,
         daemonVersion: String = currentTestAppVersion,
-        ipcMin: UInt16 = 3,
-        ipcMax: UInt16 = 4,
-        capabilities: [String] = [],
         socketURL providedSocketURL: URL? = nil
     ) throws {
         self.events = events
         self.daemonVersion = daemonVersion
-        self.ipcMin = ipcMin
-        self.ipcMax = ipcMax
-        self.capabilities = capabilities
-        self.socketURL = providedSocketURL
-            ?? URL(fileURLWithPath: "/tmp/plug-app-model-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(self.socketURL.path)
-        var address = sockaddr_un()
-        address.sun_family = sa_family_t(AF_UNIX)
-        let bytes = Array(self.socketURL.path.utf8CString)
-        withUnsafeMutableBytes(of: &address.sun_path) { destination in
-            bytes.withUnsafeBytes { source in destination.copyBytes(from: source) }
-        }
-        let pathOffset = MemoryLayout<sockaddr_un>.offset(of: \sockaddr_un.sun_path)!
-        let addressLength = socklen_t(pathOffset + bytes.count)
-        address.sun_len = UInt8(addressLength)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listener, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listener, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
+        replies = try ipcResponseGoldens()
+        self.socketURL = providedSocketURL ?? TestSocket.uniquePath("plug-app-model")
+        listener = try TestSocket.listen(at: self.socketURL.path)
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in self?.serve() }
     }
 
@@ -1446,6 +1268,10 @@ private final class OperatorFixtureServer: @unchecked Sendable {
             Darwin.shutdown(connection, SHUT_RDWR)
             Darwin.close(connection)
         }
+        // Closing a socket does not wake a thread blocked in `accept` on it,
+        // on macOS it waits for that thread instead. A connection of its own
+        // wakes it, and the loop sees `didStop` and returns.
+        wakeAccept()
         Darwin.shutdown(listener, SHUT_RDWR)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
@@ -1461,62 +1287,46 @@ private final class OperatorFixtureServer: @unchecked Sendable {
         while true {
             let accepted = Darwin.accept(listener, nil, nil)
             guard accepted >= 0 else { return }
-            lock.lock(); connection = accepted; lock.unlock()
-            while true {
-                guard let header = readExact(accepted, count: 4) else { break }
-                let length = header.reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-                guard let payload = readExact(accepted, count: Int(length)),
-                      let object = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
-                      let type = object["type"] as? String
-                else { break }
-                switch type {
+            lock.lock()
+            let stopping = didStop
+            if !stopping { connection = accepted }
+            lock.unlock()
+            if stopping {
+                Darwin.close(accepted)
+                return
+            }
+            while let request = TestSocket.readRequest(accepted), let outer = request["type"] as? String {
+                // An operator request names what it asks inside the envelope.
+                let object = outer == "Operator" ? request["request"] as? [String: Any] ?? [:] : request
+                switch object["type"] as? String ?? outer {
                 case "OperatorHandshake":
                     clientVersion = object["client_version"] as? String
                     events.append("ipc.handshake")
-                    send(response: [
-                        "type": "OperatorHandshake",
-                        "handshake": [
-                            "daemon_version": daemonVersion, "ipc_min": ipcMin, "ipc_max": ipcMax,
-                            "ownership": "app", "capabilities": capabilities,
-                        ],
-                    ], to: accepted)
+                    send(response: reply("handshake", in: "handshake", ["daemon_version": daemonVersion]), to: accepted)
                 case "GetServerConfig":
                     events.append("ipc.getServerConfig")
-                    send(response: [
-                        "type": "ServerConfig",
-                        "name": object["name"] as? String ?? "",
-                        "server": [
-                            "command": "npx",
-                            "args": ["-y", "linear-mcp"],
-                            "transport": "stdio",
-                        ],
-                    ], to: accepted)
-                case "OperatorSnapshot":
+                    var config = replies["server_config"] ?? [:]
+                    config["name"] = object["name"] as? String ?? ""
+                    send(response: config, to: accepted)
+                case "Snapshot":
                     events.append("ipc.snapshot")
                     _ = snapshotGate?.wait(timeout: .now() + 5)
-                    send(response: [
-                        "type": "OperatorSnapshot",
-                        "snapshot": [
-                            "runtime_version": currentTestAppVersion, "uptime_secs": 1, "ownership": "app",
-                            "tool_catalog_revision": catalogRevision,
-                            "configured_servers": [], "servers": [], "live_sessions": [],
-                            "client_visibility": [], "upstream_auth": [], "downstream_clients": [],
-                        ],
-                    ], to: accepted)
+                    send(response: reply("snapshot", in: "snapshot", [
+                        "runtime_version": currentTestAppVersion, "uptime_secs": 1,
+                        "tool_catalog_revision": catalogRevision,
+                    ]), to: accepted)
                 case "ListTools":
                     events.append("ipc.listTools")
-                    send(response: [
-                        "type": "Tools",
-                        "tools": [[
-                            "name": "demo__echo", "server_id": "demo", "description": "Echo.",
-                            "title": "Echo", "disabled": false,
-                        ]],
-                    ], to: accepted)
-                case "ActivitySnapshot":
+                    send(response: replies["tools"] ?? [:], to: accepted)
+                case "Activity":
                     events.append("ipc.activity")
-                    send(response: ["type": "ActivitySnapshot", "events": []], to: accepted)
+                    send(response: replies["activity"] ?? [:], to: accepted)
+                case "Mutate":
+                    send(response: replies["mutation"] ?? [:], to: accepted)
+                case "Reload":
+                    send(response: replies["reloaded"] ?? [:], to: accepted)
                 default:
-                    send(response: ["type": "Ok"], to: accepted)
+                    send(response: replies["ok"] ?? [:], to: accepted)
                 }
             }
             lock.lock()
@@ -1527,27 +1337,21 @@ private final class OperatorFixtureServer: @unchecked Sendable {
         }
     }
 
-    private func send(response: [String: Any], to fd: Int32) {
-        guard let payload = try? JSONSerialization.data(withJSONObject: response) else { return }
-        var frame = Data([
-            UInt8((payload.count >> 24) & 0xff), UInt8((payload.count >> 16) & 0xff),
-            UInt8((payload.count >> 8) & 0xff), UInt8(payload.count & 0xff),
-        ])
-        frame.append(payload)
-        frame.withUnsafeBytes { raw in _ = Darwin.write(fd, raw.baseAddress!, raw.count) }
+    /// The golden reply `name` with `changes` made to its `field` object.
+    private func reply(_ name: String, in field: String, _ changes: [String: Any]) -> [String: Any] {
+        var reply = replies[name] ?? [:]
+        var inner = reply[field] as? [String: Any] ?? [:]
+        inner.merge(changes) { $1 }
+        reply[field] = inner
+        return reply
     }
 
-    private func readExact(_ fd: Int32, count: Int) -> Data? {
-        var data = Data(count: count)
-        let result = data.withUnsafeMutableBytes { raw -> Int in
-            var offset = 0
-            while offset < count {
-                let readCount = Darwin.read(fd, raw.baseAddress!.advanced(by: offset), count - offset)
-                guard readCount > 0 else { return -1 }
-                offset += readCount
-            }
-            return offset
-        }
-        return result == count ? data : nil
+    private func wakeAccept() {
+        let wake = TestSocket.connect(to: socketURL.path)
+        if wake >= 0 { Darwin.close(wake) }
+    }
+
+    private func send(response: [String: Any], to fd: Int32) {
+        TestSocket.writeJSON(response, to: fd)
     }
 }

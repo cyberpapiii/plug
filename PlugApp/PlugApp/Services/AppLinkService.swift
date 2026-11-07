@@ -9,13 +9,14 @@ struct LinkableApp: Identifiable, Equatable, Sendable {
     let name: String
     /// Plug is written into this app's MCP configuration.
     let linked: Bool
-    /// The app is installed on this Mac.
     let detected: Bool
-    /// The app is talking to Plug right now.
     let live: Bool
     let sessions: Int
     /// How a linked app reaches Plug: on this Mac, or over the network.
     let transport: String?
+
+    /// The app is linked to reach Plug over the network.
+    var overNetwork: Bool { transport?.lowercased() == "http" }
 
     private enum CodingKeys: String, CodingKey {
         case target, name, linked, detected, live
@@ -37,7 +38,7 @@ extension LinkableApp: Decodable {
     }
 }
 
-enum AppLinkError: LocalizedError, Equatable {
+enum AppLinkError: LocalizedError, AdvisedError, Equatable {
     case serviceMissing
     case commandFailed(String)
     case malformedOutput
@@ -48,6 +49,11 @@ enum AppLinkError: LocalizedError, Equatable {
         case let .commandFailed(detail): detail
         case .malformedOutput: "Plug gave an answer it could not read. Try again."
         }
+    }
+
+    var advice: String {
+        if case let .commandFailed(detail) = self { return Explain.advice(forOutside: detail) }
+        return Explain.fallback
     }
 }
 

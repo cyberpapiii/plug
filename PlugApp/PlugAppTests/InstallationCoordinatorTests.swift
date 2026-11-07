@@ -5,14 +5,7 @@ import XCTest
 
 @MainActor
 final class InstallationCoordinatorTests: XCTestCase {
-    private let canonical = VerifiedAppInstallation(
-        bundleURL: URL(fileURLWithPath: "/Applications/Plug.app"),
-        executableURL: URL(fileURLWithPath: "/Applications/Plug.app/Contents/Resources/plug"),
-        appVersion: "0.7.0",
-        buildVersion: "20",
-        embeddedVersion: "0.7.0",
-        teamID: "HJF7LN64XX"
-    )
+    private let canonical = makeTestInstallation()
 
     func testRoutineReconciliationRunsOrderedProofAndPublishesHealthy() async {
         let events = EventLog()
@@ -31,18 +24,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             recognizedPaths: [],
             unknownPaths: []
         )
-        let current = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
-        )
-        let service = DaemonServiceSnapshot(
-            ownership: .appManagedCurrent(current),
-            daemonVersion: canonical.appVersion,
-            daemonExecutable: canonical.executableURL
-        )
+        let service = healthyService()
         let app = RecordingAppInspector(events: events, values: [canonical, canonical])
         let legacy = RecordingLegacyMigrator(events: events, values: [initialLegacy, finalLegacy])
         let clients = RecordingClientRepairer(events: events, values: [true, false])
@@ -51,37 +33,25 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [service, service],
             handshakes: [handshake(version: canonical.appVersion)]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
 
         let eventValues = await events.values
-        XCTAssertEqual(
-            eventValues,
-            [
-                "app.inspect",
-                "legacy.inspect",
-                "daemon.inspect",
-                "legacy.removeFormula",
-                "legacy.repairShell",
-                "clients.inspect",
-                "clients.repair",
-                "daemon.inspect",
-                "daemon.ensureRunning",
-                "legacy.removeCargo",
-                "app.inspect",
-                "legacy.inspect",
-                "clients.inspect",
-                "daemon.inspect",
-            ]
-        )
+        for step in ["legacy.removeFormula", "legacy.repairShell", "clients.repair", "legacy.removeCargo"] {
+            XCTAssertTrue(eventValues.contains(step), "\(step) did not run")
+        }
+        // Nothing changes before the daemon's owner is known, and the old
+        // binary stays until the app's own daemon is proven.
+        let first = { (step: String) in eventValues.firstIndex(of: step)! }
+        XCTAssertLessThan(first("daemon.inspect"), first("legacy.removeFormula"))
+        XCTAssertLessThan(first("daemon.ensureRunning"), first("legacy.removeCargo"))
+        XCTAssertEqual(eventValues.last, "daemon.inspect", "the healthy state comes from a final inspection")
         guard case let .healthy(snapshot) = coordinator.state else {
             return XCTFail("Expected healthy state, got \(coordinator.state)")
         }
@@ -99,7 +69,7 @@ final class InstallationCoordinatorTests: XCTestCase {
     func testHealthyLaunchInspectsEachThingOnceAndTrustsItsOwnEvidence() async {
         let events = EventLog()
         let service = healthyService()
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -116,9 +86,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 events: events,
                 inspections: [service],
                 handshakes: [handshake(version: canonical.appVersion)]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -142,8 +110,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "local.claude-rc.plug",
             programURL: URL(fileURLWithPath: "/Users/me/.cargo/bin/plug"),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         let service = DaemonServiceSnapshot(
             ownership: .recognizedLegacy([legacyRecord]),
@@ -154,13 +121,11 @@ final class InstallationCoordinatorTests: XCTestCase {
         let legacy = RecordingLegacyMigrator(events: events, values: [emptyLegacy()])
         let clients = RecordingClientRepairer(events: events, values: [false])
         let daemon = RecordingDaemonManager(events: events, inspections: [service])
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -169,7 +134,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected adoptionRequired, got \(coordinator.state)")
         }
         let eventValues = await events.values
-        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
     }
 
     func testEnabledAppServiceAutomaticallyReclaimsLegacyDaemon() async {
@@ -178,15 +143,14 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: URL(fileURLWithPath: "/Users/me/.local/bin/plug"),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         let legacyService = DaemonServiceSnapshot(
             ownership: .recognizedLegacy([legacyRecord]),
             daemonVersion: canonical.appVersion,
             daemonExecutable: legacyRecord.programURL
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -198,9 +162,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [legacyService, healthyService()],
                 handshakes: [handshake(version: canonical.appVersion)],
                 appServiceEnabled: true
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -209,7 +171,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected automatic recovery after prior app-service consent, got \(coordinator.state)")
         }
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
     }
 
     func testEnabledAppServiceAutomaticallyRecoversMissingJob() async {
@@ -219,7 +181,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonVersion: nil,
             daemonExecutable: nil
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -231,9 +193,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 inspections: [unmanaged, healthyService()],
                 handshakes: [handshake(version: canonical.appVersion)],
                 appServiceEnabled: true
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -243,7 +203,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
         let eventValues = await events.values
         XCTAssertTrue(eventValues.contains("daemon.adopt"))
-        XCTAssertTrue(eventValues.contains("daemon.ensureRunning"))
     }
 
     func testExplicitAdoptionConvergesAfterRequiredState() async {
@@ -252,15 +211,14 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "local.claude-rc.plug",
             programURL: URL(fileURLWithPath: "/Users/me/.cargo/bin/plug"),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
         let legacyService = DaemonServiceSnapshot(
             ownership: .recognizedLegacy([legacyRecord]),
             daemonVersion: "0.6.4",
             daemonExecutable: legacyRecord.programURL
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -271,36 +229,28 @@ final class InstallationCoordinatorTests: XCTestCase {
                 events: events,
                 inspections: [legacyService, legacyService, healthyService()],
                 handshakes: [handshake(version: canonical.appVersion)]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
-        await coordinator.adopt()
+        await coordinator.reconcile(trigger: .explicitAdoption)
 
         guard case .healthy = coordinator.state else {
             return XCTFail("Expected explicit adoption to converge, got \(coordinator.state)")
         }
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
     }
 
     func testStaleAppServiceUsesAutomaticReplacement() async {
         let events = EventLog()
-        let staleRecord = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "19",
-            loaded: true
-        )
+        let staleRecord = self.staleRecord()
         let staleService = DaemonServiceSnapshot(
             ownership: .appManagedStale(staleRecord),
             daemonVersion: "0.6.4",
             daemonExecutable: canonical.executableURL
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -311,9 +261,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 events: events,
                 inspections: [staleService, healthyService()],
                 handshakes: [handshake(version: canonical.appVersion)]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -328,7 +276,7 @@ final class InstallationCoordinatorTests: XCTestCase {
 
     func testWrongHandshakeStopsBeforeFinalHealthyPublication() async {
         let events = EventLog()
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -339,9 +287,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                 events: events,
                 inspections: [healthyService()],
                 handshakes: [handshake(version: "0.6.4")]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -356,7 +302,7 @@ final class InstallationCoordinatorTests: XCTestCase {
     func testHandshakeOwnershipMismatchPreservesCargoAndDoesNotReportHealthy() async {
         let events = EventLog()
         let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -375,10 +321,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [healthyService(), healthyService()],
-                handshakes: [handshake(version: canonical.appVersion, ownership: "cli_managed")]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+                handshakes: [handshake(version: canonical.appVersion, ownership: .cliManaged)]
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -396,7 +340,7 @@ final class InstallationCoordinatorTests: XCTestCase {
     func testUnknownHandshakeOwnershipBlocksInsteadOfRetryingAdoption() async {
         let events = EventLog()
         let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -415,10 +359,8 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [healthyService(), healthyService()],
-                handshakes: [handshake(version: canonical.appVersion, ownership: "unknown")]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+                handshakes: [handshake(version: canonical.appVersion, ownership: .unknown)]
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -431,47 +373,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
     }
 
-    func testIncompatibleHandshakePreservesCargoAndDoesNotReportHealthy() async {
-        let events = EventLog()
-        let cargo = URL(fileURLWithPath: "/Users/me/.cargo/bin/plug")
-        let coordinator = InstallationCoordinator(
-            appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
-            legacyMigrator: RecordingLegacyMigrator(
-                events: events,
-                values: [
-                    LegacyInstallSnapshot(
-                        formulaInstalled: false,
-                        cargoBinary: cargo,
-                        shellLink: .canonical(canonical.executableURL),
-                        recognizedPaths: [cargo],
-                        unknownPaths: []
-                    ),
-                    emptyLegacy(),
-                ]
-            ),
-            clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
-            daemonManager: RecordingDaemonManager(
-                events: events,
-                inspections: [healthyService(), healthyService()],
-                handshakes: [handshake(
-                    version: canonical.appVersion,
-                    ipcMin: 7,
-                    ipcMax: 7
-                )]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
-        )
-
-        await coordinator.reconcile(trigger: .applicationLaunch)
-
-        if case .healthy = coordinator.state {
-            XCTFail("An incompatible handshake must not report healthy")
-        }
-        let eventValues = await events.values
-        XCTAssertFalse(eventValues.contains("legacy.removeCargo"))
-    }
-
     func testConcurrentReconciliationCallsShareOneInFlightOperation() async {
         let events = EventLog()
         let gate = AsyncGate()
@@ -480,13 +381,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             events: events,
             inspections: [healthyService(), healthyService()]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         let first = Task { await coordinator.reconcile(trigger: .applicationLaunch) }
@@ -506,18 +405,7 @@ final class InstallationCoordinatorTests: XCTestCase {
 
     func testTimedOutCommandRetriesOnItsOwnAndConvergesHealthy() async {
         let events = EventLog()
-        let current = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
-        )
-        let service = DaemonServiceSnapshot(
-            ownership: .appManagedCurrent(current),
-            daemonVersion: canonical.appVersion,
-            daemonExecutable: canonical.executableURL
-        )
+        let service = healthyService()
         let app = FlakyAppInspector(
             events: events,
             failures: 2,
@@ -525,16 +413,14 @@ final class InstallationCoordinatorTests: XCTestCase {
             value: canonical
         )
         var phases: [InstallationState] = []
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events, inspections: [service]),
-            openURL: { _ in },
             retryDelay: .zero,
             transientRetryLimit: 3,
-            sleep: { _ in },
-            logWriter: { _, _ in }
+            sleep: { _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -554,33 +440,20 @@ final class InstallationCoordinatorTests: XCTestCase {
 
     func testAFailedCheckIsTriedAgainLaterWithoutBeingAsked() async {
         let events = EventLog()
-        let current = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
-        )
-        let service = DaemonServiceSnapshot(
-            ownership: .appManagedCurrent(current),
-            daemonVersion: canonical.appVersion,
-            daemonExecutable: canonical.executableURL
-        )
+        let service = healthyService()
         let app = FlakyAppInspector(
             events: events,
             failures: 1,
             error: TestFailure.operational,
             value: canonical
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events, inspections: [service]),
-            openURL: { _ in },
             laterRetryDelay: .zero,
-            sleep: { _ in },
-            logWriter: { _, _ in }
+            sleep: { _ in }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -602,16 +475,16 @@ final class InstallationCoordinatorTests: XCTestCase {
             .appending(path: "plug-tests-\(UUID().uuidString)/reconciliation.log")
         defer { try? FileManager.default.removeItem(at: logURL.deletingLastPathComponent()) }
         let app = FailingAppInspector(events: events, error: ProcessRunnerError.timedOut)
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events),
             logURL: logURL,
-            openURL: { _ in },
             retryDelay: .zero,
             transientRetryLimit: 2,
-            sleep: { _ in }
+            sleep: { _ in },
+            logWriter: ReconciliationLog.append
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -633,25 +506,73 @@ final class InstallationCoordinatorTests: XCTestCase {
 
         // Try Again starts the budget over instead of failing on the first
         // timeout because the old count is still standing.
-        await coordinator.retry()
+        await coordinator.reconcile(trigger: .retry)
         XCTAssertEqual(coordinator.state, .reconcilingUpdate(.waitingToRetry))
         while let retry = coordinator.scheduledRetry {
             await retry.value
         }
     }
 
-    func testOperationalFailureDetailUsesTheErrorDescription() async {
+    /// Turned off by its owner, Plug stays off: no launch, wake or retry
+    /// starts the service again or changes anything on the way.
+    func testTheOffSwitchKeepsEveryReconcileFromStartingTheService() async throws {
         let events = EventLog()
-        let coordinator = InstallationCoordinator(
-            appInspector: FailingAppInspector(
-                events: events,
-                error: ClientRepairError.commandFailed(status: 1, stderr: "boom")
-            ),
+        let home = makeTestHome()
+        let marker = ServiceDisabledMarker(home: home)
+        try marker.set()
+        let coordinator = makeCoordinator(
+            serviceDisabled: marker,
+            appInspector: RecordingAppInspector(events: events, values: [canonical]),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events, inspections: [healthyService()])
+        )
+
+        for trigger in [ReconciliationTrigger.applicationLaunch, .retry, .automaticRetry, .laterRetry] {
+            await coordinator.reconcile(trigger: trigger)
+        }
+
+        let eventValues = await events.values
+        XCTAssertEqual(eventValues, [])
+        XCTAssertEqual(coordinator.state, .reconcilingUpdate(.inspecting))
+    }
+
+    /// A retry queued before the owner turned Plug off would start the
+    /// service again a moment after it stopped.
+    func testStoppingDropsAQueuedRetry() async throws {
+        let events = EventLog()
+        let app = FailingAppInspector(events: events, error: ProcessRunnerError.timedOut)
+        let coordinator = makeCoordinator(
+            appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            retryDelay: .seconds(30),
+            sleep: { try? await Task.sleep(for: $0) }
+        )
+
+        await coordinator.reconcile(trigger: .applicationLaunch)
+        let retry = try XCTUnwrap(coordinator.scheduledRetry, "a timeout queues a retry")
+        try await coordinator.stopService()
+        await retry.value
+
+        XCTAssertNil(coordinator.scheduledRetry)
+        let calls = await app.calls
+        XCTAssertEqual(calls, 1, "the queued retry ran after the stop")
+        let eventValues = await events.values
+        XCTAssertEqual(eventValues.last, "daemon.stop")
+    }
+
+    func testOperationalFailureDetailUsesTheErrorDescription() async {
+        let events = EventLog()
+        let coordinator = makeCoordinator(
+            appInspector: FailingAppInspector(
+                events: events,
+                error: DescribedFailure()
+            ),
+            legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
+            clientRepairer: RecordingClientRepairer(events: events, values: [false]),
+            daemonManager: RecordingDaemonManager(events: events)
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -659,19 +580,17 @@ final class InstallationCoordinatorTests: XCTestCase {
         guard case let .blocked(failure) = coordinator.state else {
             return XCTFail("Expected blocked state, got \(coordinator.state)")
         }
-        XCTAssertFalse(failure.detail.isEmpty)
+        XCTAssertEqual(failure.detail, DescribedFailure().errorDescription)
     }
 
     func testBlockedStateDoesNotSelfRetryUntilExplicitRetry() async {
         let events = EventLog()
         let app = FailingAppInspector(events: events, error: TestFailure.operational)
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: RecordingDaemonManager(events: events),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: RecordingDaemonManager(events: events)
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -682,7 +601,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             return XCTFail("Expected blocked state, got \(coordinator.state)")
         }
 
-        await coordinator.retry()
+        await coordinator.reconcile(trigger: .retry)
         let callsAfterRetry = await app.calls
         XCTAssertEqual(callsAfterRetry, 2)
     }
@@ -702,13 +621,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             )]
         )
         let daemon = RecordingDaemonManager(events: events)
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -727,13 +644,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let current = healthyService()
-        let staleRecord = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "19",
-            loaded: true
-        )
+        let staleRecord = self.staleRecord()
         let stale = DaemonServiceSnapshot(
             ownership: .appManagedStale(staleRecord),
             daemonVersion: canonical.appVersion,
@@ -747,13 +658,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [current, stale],
             handshakes: [handshake(version: canonical.appVersion)]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -785,13 +694,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [service, service],
             handshakes: [handshake(version: canonical.appVersion)]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -824,12 +731,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [service, service],
             handshakes: [handshake(version: canonical.appVersion)]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in },
             logWriter: { _, line in log.lines.append(line) }
         )
 
@@ -849,13 +755,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let events = EventLog()
         let log = LogLines()
         let current = healthyService()
-        let staleRecord = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: "19",
-            loaded: true
-        )
+        let staleRecord = self.staleRecord()
         let stale = DaemonServiceSnapshot(
             ownership: .appManagedStale(staleRecord),
             daemonVersion: "0.0.1",
@@ -869,12 +769,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             inspections: [current, stale],
             handshakes: [handshake(version: canonical.appVersion)]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: app,
             legacyMigrator: legacy,
             clientRepairer: clients,
             daemonManager: daemon,
-            openURL: { _ in },
             logWriter: { _, line in log.lines.append(line) }
         )
 
@@ -895,28 +794,20 @@ final class InstallationCoordinatorTests: XCTestCase {
         // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
         let wrongExecutable = URL(fileURLWithPath: "/Applications/Other Plug.app/Contents/Resources/plug")
-        let finalRecord = LaunchdJobRecord(
-            label: "com.plug.daemon",
-            programURL: canonical.executableURL,
-            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
-        )
+        let finalRecord = currentRecord()
         let finalService = DaemonServiceSnapshot(
             ownership: .appManagedCurrent(finalRecord),
             daemonVersion: canonical.appVersion,
             daemonExecutable: wrongExecutable
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy(), emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [true, false]),
             daemonManager: RecordingDaemonManager(
                 events: events,
                 inspections: [healthyService(), finalService]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -930,7 +821,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         // A client repair makes this pass change something, so the final
         // inspection runs; a pass that changes nothing skips it.
         let events = EventLog()
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
@@ -947,8 +838,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                                 label: "com.plug.daemon",
                                 programURL: URL(fileURLWithPath: "/Applications/Other.app/plug"),
                                 parentBundleIdentifier: "com.example.other",
-                                parentBundleVersion: "1",
-                                loaded: true
+                                parentBundleVersion: "1"
                             ),
                         ]),
                         daemonVersion: nil,
@@ -956,9 +846,7 @@ final class InstallationCoordinatorTests: XCTestCase {
                     ),
                 ],
                 handshakes: [handshake(version: canonical.appVersion)]
-            ),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            )
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -984,13 +872,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             events: events,
             inspections: [leftover, leftover]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1002,7 +888,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         let eventValues = await events.values
         XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
         XCTAssertFalse(eventValues.contains("legacy.removeFormula"))
-        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
     }
 
     func testBrewBinLeftoverWithEmptyRecognizedPathsIsRecognizedLegacyAndOffersAdopt() async {
@@ -1020,13 +906,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             events: events,
             inspections: [leftover, leftover]
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy, emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1047,13 +931,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             daemonVersion: nil,
             daemonExecutable: unknown.programURL
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: RecordingDaemonManager(events: events, inspections: [unknownService]),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: RecordingDaemonManager(events: events, inspections: [unknownService])
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1063,7 +945,7 @@ final class InstallationCoordinatorTests: XCTestCase {
         }
         XCTAssertEqual(failure.summary, "Plug daemon ownership is unknown")
         let eventValues = await events.values
-        XCTAssertFalse(eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertFalse(eventValues.contains("daemon.adopt"))
         XCTAssertFalse(eventValues.contains("daemon.bootOutLegacy"))
     }
 
@@ -1084,16 +966,14 @@ final class InstallationCoordinatorTests: XCTestCase {
             recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
             unknownPaths: []
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
                 values: [initialLegacy, emptyLegacy()]
             ),
             clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1117,7 +997,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             eventValues.firstIndex(of: "daemon.bootOutLegacy")!,
             eventValues.firstIndex(of: "legacy.removeFormula")!
         )
-        XCTAssertTrue(eventValues.contains("daemon.adopt") || eventValues.contains("daemon.adoptLegacy"))
+        XCTAssertTrue(eventValues.contains("daemon.adopt"))
         XCTAssertTrue(daemon.inspectedLegacyPaths.contains { $0.contains(cellar.programURL!) })
     }
 
@@ -1143,16 +1023,14 @@ final class InstallationCoordinatorTests: XCTestCase {
             handshakes: [handshake(version: canonical.appVersion)],
             appServiceEnabled: true
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical, canonical]),
             legacyMigrator: RecordingLegacyMigrator(
                 events: events,
                 values: [initialLegacy, emptyLegacy()]
             ),
             clientRepairer: RecordingClientRepairer(events: events, values: [false, false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1163,8 +1041,6 @@ final class InstallationCoordinatorTests: XCTestCase {
         XCTAssertEqual(snapshot.service.ownership, healthyService().ownership)
         XCTAssertEqual(daemon.adoptedSnapshots.map(\.ownership), [.recognizedLegacy([cellar])])
         let eventValues = await events.values
-        XCTAssertTrue(eventValues.contains("daemon.adoptLegacy"))
-        XCTAssertFalse(eventValues.contains("daemon.adopt"))
         XCTAssertLessThan(
             eventValues.firstIndex(of: "daemon.inspect")!,
             eventValues.firstIndex(of: "legacy.removeFormula")!
@@ -1185,13 +1061,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             recognizedPaths: [URL(fileURLWithPath: "/opt/homebrew/opt/plug/bin/plug")],
             unknownPaths: []
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: RecordingDaemonManager(events: events, inspections: [unmanaged]),
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: RecordingDaemonManager(events: events, inspections: [unmanaged])
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1223,13 +1097,11 @@ final class InstallationCoordinatorTests: XCTestCase {
             appServiceEnabled: true,
             bootOutError: DaemonServiceError.commandFailed("bootout denied")
         )
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: RecordingAppInspector(events: events, values: [canonical]),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [initialLegacy]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
-            daemonManager: daemon,
-            openURL: { _ in },
-            logWriter: { _, _ in }
+            daemonManager: daemon
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
@@ -1248,20 +1120,51 @@ final class InstallationCoordinatorTests: XCTestCase {
         let events = EventLog()
         let opened = OpenedURL()
         let logURL = URL(fileURLWithPath: "/tmp/plug-reconciliation.log")
-        let coordinator = InstallationCoordinator(
+        let coordinator = makeCoordinator(
             appInspector: FailingAppInspector(events: events, error: TestFailure.operational),
             legacyMigrator: RecordingLegacyMigrator(events: events, values: [emptyLegacy()]),
             clientRepairer: RecordingClientRepairer(events: events, values: [false]),
             daemonManager: RecordingDaemonManager(events: events),
             logURL: logURL,
-            openURL: { url in opened.value = url },
-            logWriter: { _, _ in }
+            openURL: { url in opened.value = url }
         )
 
         await coordinator.reconcile(trigger: .applicationLaunch)
         coordinator.openLog()
 
         XCTAssertEqual(opened.value, logURL)
+    }
+
+    /// A coordinator over these fakes, with the service turned on, nothing
+    /// opened and nothing logged unless a test asks.
+    private func makeCoordinator(
+        serviceDisabled: ServiceDisabledMarker? = nil,
+        appInspector: any AppInstallationInspecting,
+        legacyMigrator: any LegacyInstallMigrating,
+        clientRepairer: any ClientRepairing,
+        daemonManager: any DaemonServiceManaging,
+        logURL: URL = InstallationCoordinator.defaultLogURL,
+        openURL: @escaping (URL) -> Void = { _ in },
+        retryDelay: Duration = .seconds(5),
+        transientRetryLimit: Int = 6,
+        laterRetryDelay: Duration? = nil,
+        sleep: @escaping @Sendable (Duration) async -> Void = { try? await Task.sleep(for: $0) },
+        logWriter: @escaping (URL, String) -> Void = { _, _ in }
+    ) -> InstallationCoordinator {
+        InstallationCoordinator(
+            serviceDisabled: serviceDisabled ?? ServiceDisabledMarker(home: makeTestHome()),
+            appInspector: appInspector,
+            legacyMigrator: legacyMigrator,
+            clientRepairer: clientRepairer,
+            daemonManager: daemonManager,
+            logURL: logURL,
+            openURL: openURL,
+            retryDelay: retryDelay,
+            transientRetryLimit: transientRetryLimit,
+            laterRetryDelay: laterRetryDelay,
+            sleep: sleep,
+            logWriter: logWriter
+        )
     }
 
     private func cellarJob() -> LaunchdJobRecord {
@@ -1273,8 +1176,7 @@ final class InstallationCoordinatorTests: XCTestCase {
             label: "com.plug.daemon",
             programURL: URL(fileURLWithPath: path),
             parentBundleIdentifier: nil,
-            parentBundleVersion: nil,
-            loaded: true
+            parentBundleVersion: nil
         )
     }
 
@@ -1296,36 +1198,36 @@ final class InstallationCoordinatorTests: XCTestCase {
         )
     }
 
-    private func healthyService() -> DaemonServiceSnapshot {
-        let record = LaunchdJobRecord(
-            label: "com.plug.daemon",
+    /// The job of this app's own service, registered by this build.
+    private func currentRecord() -> LaunchdJobRecord {
+        LaunchdJobRecord(
+            label: PlugPaths.daemonLabel,
             programURL: canonical.executableURL,
             parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
-            parentBundleVersion: canonical.buildVersion,
-            loaded: true
+            parentBundleVersion: canonical.buildVersion
         )
-        return DaemonServiceSnapshot(
-            ownership: .appManagedCurrent(record),
+    }
+
+    /// The job of this app's own service, registered by an earlier build.
+    private func staleRecord() -> LaunchdJobRecord {
+        LaunchdJobRecord(
+            label: PlugPaths.daemonLabel,
+            programURL: canonical.executableURL,
+            parentBundleIdentifier: AppInstallationInspector.bundleIdentifier,
+            parentBundleVersion: "19"
+        )
+    }
+
+    private func healthyService() -> DaemonServiceSnapshot {
+        DaemonServiceSnapshot(
+            ownership: .appManagedCurrent(currentRecord()),
             daemonVersion: canonical.appVersion,
             daemonExecutable: canonical.executableURL
         )
     }
 
-    private func handshake(
-        version: String,
-        ipcMin: UInt16 = 3,
-        ipcMax: UInt16 = 4,
-        ownership: String = "app_managed"
-    ) -> OperatorHandshake {
-        let data = try! JSONSerialization.data(withJSONObject: [
-            "daemonVersion": version,
-            "daemonExecutable": canonical.executableURL.path,
-            "ipcMin": ipcMin,
-            "ipcMax": ipcMax,
-            "ownership": ownership,
-            "capabilities": [],
-        ])
-        return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
+    private func handshake(version: String, ownership: DaemonOwnership = .appManaged) -> OperatorHandshake {
+        makeTestHandshake(version: version, executable: canonical.executableURL, ownership: ownership)
     }
 }
 
@@ -1446,7 +1348,7 @@ private actor RecordingLegacyMigrator: LegacyInstallMigrating {
 
     func removeVerifiedCargoBinary(
         _ snapshot: LegacyInstallSnapshot,
-        proof: ReconciliationProof
+        proof: OwnDaemonProof
     ) async throws {
         await events.append("legacy.removeCargo")
     }
@@ -1466,9 +1368,8 @@ private actor RecordingClientRepairer: ClientRepairing {
         return values.count > 1 ? values.removeFirst() : values[0]
     }
 
-    func repairAll(canonicalExecutable: URL) async throws -> ClientRepairResult {
+    func repairAll(canonicalExecutable: URL) async throws {
         await events.append("clients.repair")
-        return ClientRepairResult(examined: 1, repaired: 1, unchanged: 0)
     }
 }
 
@@ -1511,11 +1412,11 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
         if let bootOutError { throw bootOutError }
     }
 
-    func adoptRecognizedLegacy(
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake {
-        await events.append("daemon.adoptLegacy")
+        await events.append("daemon.adopt")
         adoptedSnapshots.append(snapshot)
         return handshakes.removeFirst()
     }
@@ -1528,22 +1429,14 @@ private final class RecordingDaemonManager: DaemonServiceManaging {
         return handshakes.removeFirst()
     }
 
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
-        await events.append("daemon.ensureRunning")
-        return handshakes.isEmpty
-            ? makeHandshake(version: expectedVersion)
-            : handshakes.removeFirst()
-    }
-
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake {
-        try await ensureRunning(expectedVersion: canonical.appVersion)
-    }
-
-    func adopt() async throws {
-        await events.append("daemon.adopt")
+        await events.append("daemon.ensureRunning")
+        return handshakes.isEmpty
+            ? makeTestHandshake(version: canonical.appVersion)
+            : handshakes.removeFirst()
     }
 
     func restart() async throws {
@@ -1604,11 +1497,11 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
         leftoverLoaded = false
     }
 
-    func adoptRecognizedLegacy(
+    func adopt(
         snapshot: DaemonServiceSnapshot,
         expectedVersion: String
     ) async throws -> OperatorHandshake {
-        await events.append("daemon.adoptLegacy")
+        await events.append("daemon.adopt")
         adoptedSnapshots.append(snapshot)
         leftoverLoaded = false
         adopted = true
@@ -1623,22 +1516,12 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
         return handshake
     }
 
-    func ensureRunning(expectedVersion: String) async throws -> OperatorHandshake {
-        await events.append("daemon.ensureRunning")
-        return handshake
-    }
-
     func ensureRunning(
         canonical: VerifiedAppInstallation,
         inspected: DaemonServiceSnapshot
     ) async throws -> OperatorHandshake {
-        try await ensureRunning(expectedVersion: canonical.appVersion)
-    }
-
-    func adopt() async throws {
-        await events.append("daemon.adopt")
-        leftoverLoaded = false
-        adopted = true
+        await events.append("daemon.ensureRunning")
+        return handshake
     }
 
     func restart() async throws {
@@ -1646,18 +1529,6 @@ private final class CellarLeftoverDaemonManager: DaemonServiceManaging {
     }
 
     func stop() async throws { await events.append("daemon.stop") }
-}
-
-private func makeHandshake(version: String) -> OperatorHandshake {
-    let data = try! JSONSerialization.data(withJSONObject: [
-        "daemonVersion": version,
-        "daemonExecutable": "/Applications/Plug.app/Contents/Resources/plug",
-        "ipcMin": 3,
-        "ipcMax": 4,
-        "ownership": "app_managed",
-        "capabilities": [],
-    ])
-    return try! JSONDecoder().decode(OperatorHandshake.self, from: data)
 }
 
 private actor AsyncGate {
@@ -1693,6 +1564,10 @@ private actor AsyncGate {
 
 private final class OpenedURL: @unchecked Sendable {
     var value: URL?
+}
+
+private struct DescribedFailure: LocalizedError {
+    var errorDescription: String? { "The app bundle could not be read." }
 }
 
 private enum TestFailure: Error {

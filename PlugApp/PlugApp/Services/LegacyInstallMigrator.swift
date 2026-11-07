@@ -3,18 +3,9 @@ import Foundation
 import CryptoKit
 import Security
 
-struct ReconciliationProof: Sendable {
-    let appVersion: String
-    let embeddedVersion: String
-    let daemonVersion: String
-    let shellTarget: URL
-    let daemonExecutable: URL?
-    let appManaged: Bool
-}
-
+/// A `cargo install` copy of Plug signed by Plug's team, by its contents, so
+/// a file swapped in after inspection is never the one removed.
 struct LegacyBinaryIdentity: Equatable, Sendable {
-    let identifier: String
-    let teamID: String
     let sha256: String
 }
 
@@ -43,12 +34,34 @@ struct LegacyInstallSnapshot: Equatable, Sendable {
     }
 }
 
-enum LegacyInstallError: Error, Equatable {
+enum LegacyInstallError: LocalizedError, AdvisedError, Equatable {
     case unrelatedShellCommand(URL)
     case formulaStillInstalled
     case brewUnavailable
     case brewFailed(String)
     case fileOperation(String)
+
+    var errorDescription: String? {
+        switch self {
+        case let .unrelatedShellCommand(path):
+            "Another file is in the way at \(path.path). Move it, then try again."
+        case .formulaStillInstalled:
+            "The old Homebrew copy of Plug is still installed. Run brew uninstall \(LegacyPlugProgram.formula), then try again."
+        case .brewUnavailable:
+            "Plug could not run Homebrew, so the old Homebrew copy of Plug stays."
+        case let .brewFailed(detail):
+            "Homebrew could not remove the old copy of Plug: \(detail)"
+        case let .fileOperation(message):
+            message
+        }
+    }
+
+    var advice: String {
+        switch self {
+        case let .brewFailed(detail), let .fileOperation(detail): Explain.advice(forOutside: detail)
+        default: Explain.fallback
+        }
+    }
 }
 
 protocol LegacyInstallMigrating: Sendable {
@@ -57,7 +70,7 @@ protocol LegacyInstallMigrating: Sendable {
     func repairShellLink(to executable: URL) async throws -> ShellLinkState
     func removeVerifiedCargoBinary(
         _ snapshot: LegacyInstallSnapshot,
-        proof: ReconciliationProof
+        proof: OwnDaemonProof
     ) async throws
 }
 
@@ -83,8 +96,8 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     }
 
     func inspect(canonical: VerifiedAppInstallation) async throws -> LegacyInstallSnapshot {
-        let shellURL = homeURL.appending(path: ".local/bin/plug")
-        let cargoURL = homeURL.appending(path: ".cargo/bin/plug")
+        let shellURL = homeURL.appending(path: LegacyPlugProgram.shellLink)
+        let cargoURL = homeURL.appending(path: LegacyPlugProgram.cargoBinary)
         let shellState = inspectShellLink(at: shellURL, canonical: canonical.executableURL)
         let cargoIdentity = identityReader(cargoURL)
         let formulaInstalled = try await installedBrew() != nil
@@ -108,9 +121,8 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
             unknownPaths.insert(cargoURL.standardizedFileURL)
         }
         if formulaInstalled {
-            for prefix in ["/opt/homebrew", "/usr/local"] {
-                let path = URL(fileURLWithPath: prefix).appending(path: "opt/plug/bin/plug")
-                if pathExists(path) { recognizedPaths.insert(path.standardizedFileURL) }
+            for link in LegacyPlugProgram.formulaLinks.map({ URL(fileURLWithPath: $0) }) where pathExists(link) {
+                recognizedPaths.insert(link.standardizedFileURL)
             }
         }
 
@@ -131,7 +143,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         }
         let result = try await runner.run(
             executable: brew,
-            arguments: ["uninstall", "cyberpapiii/tap/plug"],
+            arguments: ["uninstall", LegacyPlugProgram.formula],
             timeout: .seconds(60)
         )
         guard result.status == 0 else {
@@ -141,7 +153,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
     }
 
     func repairShellLink(to executable: URL) async throws -> ShellLinkState {
-        let shellURL = homeURL.appending(path: ".local/bin/plug")
+        let shellURL = homeURL.appending(path: LegacyPlugProgram.shellLink)
         if try await installedBrew() != nil {
             throw LegacyInstallError.formulaStillInstalled
         }
@@ -175,19 +187,16 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         return .canonical(executable.standardizedFileURL)
     }
 
+    /// Only with the daemon proved to be the app's own, so the command a
+    /// person types never stops working.
     func removeVerifiedCargoBinary(
         _ snapshot: LegacyInstallSnapshot,
-        proof: ReconciliationProof
+        proof: OwnDaemonProof
     ) async throws {
-        guard proof.appManaged,
-              proof.appVersion == proof.embeddedVersion,
-              proof.embeddedVersion == proof.daemonVersion,
-              snapshot.shellLink == .canonical(proof.shellTarget.standardizedFileURL),
-              proof.daemonExecutable.map({ resolved($0) == resolved(proof.shellTarget) }) == true,
-              let cargo = snapshot.cargoBinary,
+        guard let cargo = snapshot.cargoBinary,
               let expectedIdentity = snapshot.cargoBinaryIdentity,
               snapshot.recognizedPaths.contains(cargo.standardizedFileURL),
-              cargo.standardizedFileURL == homeURL.appending(path: ".cargo/bin/plug").standardizedFileURL
+              cargo.standardizedFileURL == homeURL.appending(path: LegacyPlugProgram.cargoBinary).standardizedFileURL
         else { return }
         guard identityReader(cargo) == expectedIdentity else { return }
         do {
@@ -201,7 +210,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         for brew in brewURLs where pathExists(brew) && formulaMayBeInstalled(beside: brew) {
             let result = try await runner.run(
                 executable: brew,
-                arguments: ["list", "--versions", "cyberpapiii/tap/plug"],
+                arguments: ["list", "--versions", LegacyPlugProgram.formula],
                 timeout: .seconds(10)
             )
             if result.status == 0, !result.stdout.isEmpty { return brew }
@@ -241,9 +250,8 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
 
     private func isRecognizedLegacyPath(_ url: URL) -> Bool {
         let path = url.standardizedFileURL.path
-        return path == homeURL.appending(path: ".cargo/bin/plug").standardizedFileURL.path
-            || path == "/opt/homebrew/opt/plug/bin/plug"
-            || path == "/usr/local/opt/plug/bin/plug"
+        return path == homeURL.appending(path: LegacyPlugProgram.cargoBinary).standardizedFileURL.path
+            || LegacyPlugProgram.formulaLinks.contains(path)
     }
 
     private func pathExists(_ url: URL) -> Bool {
@@ -268,10 +276,6 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         }
     }
 
-    private func resolved(_ url: URL) -> URL {
-        url.resolvedStandardized
-    }
-
     private static func readLegacyBinaryIdentity(at url: URL) -> LegacyBinaryIdentity? {
         guard isRegularFileWithoutFollowing(at: url),
               FileManager.default.isExecutableFile(atPath: url.path)
@@ -282,7 +286,7 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
               let staticCode
         else { return nil }
 
-        let requirementText = "anchor apple generic and identifier \"plug\" and certificate leaf[subject.OU] = \"\(AppInstallationInspector.teamID)\""
+        let requirementText = AppInstallationInspector.signingRequirement(identifier: "plug")
         var requirement: SecRequirement?
         guard SecRequirementCreateWithString(requirementText as CFString, [], &requirement) == errSecSuccess,
               let requirement,
@@ -300,8 +304,6 @@ struct LegacyInstallMigrator: LegacyInstallMigrating {
         else { return nil }
 
         return LegacyBinaryIdentity(
-            identifier: identifier,
-            teamID: teamID,
             sha256: SHA256.hash(data: data).map { String(format: "%02x", $0) }.joined()
         )
     }

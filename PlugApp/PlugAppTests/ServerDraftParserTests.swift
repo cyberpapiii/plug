@@ -5,11 +5,57 @@ import XCTest
 /// Adding a server means pasting whatever the server's instructions printed.
 /// These pin the shapes that arrive in practice.
 final class ServerDraftParserTests: XCTestCase {
-    private func draft(_ text: String) throws -> ServerDraft {
-        guard case let .draft(draft) = ServerDraftParser.parse(text) else {
-            throw XCTSkip("expected a draft for: \(text)")
+    /// A paste that does not parse fails the test that made it.
+    private func draft(_ text: String, file: StaticString = #filePath, line: UInt = #line) throws -> ServerDraft {
+        let parsed = ServerDraftParser.parse(text)
+        guard case let .draft(draft) = parsed else {
+            XCTFail("expected a draft, got \(parsed)", file: file, line: line)
+            throw ParseFailed()
         }
         return draft
+    }
+
+    private struct ParseFailed: Error {}
+
+    /// Every entry `plug import` reads, as `plug-core/tests/server_entries_golden.rs`
+    /// pins it, is read the same way when it is pasted.
+    func testAPastedEntryIsReadAsPlugImportReadsIt() throws {
+        struct Case: Decodable {
+            struct Server: Decodable {
+                let transport: String
+                let command: String?
+                let args: [String]
+                let url: String?
+                let env: [String: String]
+                let enabled: Bool
+            }
+            let name: String
+            let server: Server?
+        }
+        let root = URL(fileURLWithPath: "\(#filePath)")
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+        let data = try Data(contentsOf: root.appending(path: "testdata/server_entries.json"))
+        let cases = try JSONDecoder().decode([Case].self, from: data)
+        let entries = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [[String: Any]])
+        for (testCase, raw) in zip(cases, entries) {
+            let block = try JSONSerialization.data(withJSONObject: ["mcpServers": [testCase.name: raw["entry"]!]])
+            let parsed = ServerDraftParser.parse(String(decoding: block, as: UTF8.self))
+            guard let expected = testCase.server else {
+                if case .unreadable = parsed {} else { XCTFail("\(testCase.name): \(parsed)") }
+                continue
+            }
+            guard case let .draft(draft) = parsed else {
+                XCTFail("\(testCase.name): \(parsed)")
+                continue
+            }
+            XCTAssertEqual(draft.name, testCase.name)
+            XCTAssertEqual(draft.config.transport, expected.transport, testCase.name)
+            XCTAssertEqual(draft.config.command, expected.command, testCase.name)
+            XCTAssertEqual(draft.config.args, expected.args, testCase.name)
+            XCTAssertEqual(draft.config.url, expected.url, testCase.name)
+            XCTAssertEqual(draft.config.env, expected.env, testCase.name)
+            XCTAssertEqual(draft.config.enabled, expected.enabled, testCase.name)
+        }
     }
 
     func testEmptyPasteIsNotAnError() {

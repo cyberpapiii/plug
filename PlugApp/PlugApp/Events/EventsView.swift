@@ -27,9 +27,7 @@ struct EventsView: View {
 
     private static func summary(of all: [EventFacts]) -> String? {
         guard !all.isEmpty else { return nil }
-        let trouble = all.filter(\.health.needsAttention).count
-        let count = all.count == 1 ? "1 event" : "\(all.count) events"
-        return trouble == 0 ? count : "\(count) · \(trouble) \(trouble == 1 ? "needs" : "need") attention"
+        return PlugSituation.eventsSummary(count: all.count, failing: all.filter(\.health.needsAttention).count)
     }
 
     private var serverNames: Set<String> { Set(model.situation.servers.map(\.name)) }
@@ -40,60 +38,59 @@ struct EventsView: View {
         let all = self.all
         let events = matching(in: all)
         let selected = events.first { $0.name == router.selectedEvent }
-        return Group {
-            if model.isLoadingInitialData {
-                LoadingPage(message: "Loading events")
-            } else if model.initialDataUnavailable {
-                UnavailablePage(verdict: model.verdict, run: run)
-            } else if all.isEmpty {
-                EmptyPage(
-                    title: "No Events",
-                    message: "Plug can watch a tool and tell a client when its result changes.",
-                    actionTitle: model.canMutate ? "Watch a Tool…" : nil,
-                    actionIntent: model.canMutate ? .addWatch : nil,
-                    run: run
-                )
-            } else if events.isEmpty {
-                NoSearchResults(text: search)
-            } else {
-                // The detail says "5 min ago", so a tick a minute keeps it
-                // true between two changes of the snapshot.
-                TimelineView(.periodic(from: .now, by: 60)) { context in
-                    let now = UInt64(max(0, context.date.timeIntervalSince1970))
-                    ListDetail {
-                        List(selection: $router.selectedEvent) {
-                            ForEach(events) { event in
-                                EventRow(event: event)
-                                    .equatable()
-                                    .tag(event.name)
-                                    .listRowSeparator(.hidden)
-                                    .contextMenu {
-                                        Button("Copy Event Name") { copy(event.name) }
-                                        if event.canRemove, model.canMutate {
-                                            Button("Stop Watching…", role: .destructive) { askToStop(event) }
-                                        }
+        return SectionPage(
+            model: model,
+            loading: "Loading events",
+            isEmpty: all.isEmpty,
+            hasNoMatches: events.isEmpty,
+            search: search,
+            run: run
+        ) {
+            EmptyPage(
+                title: "No Events",
+                message: "Plug can watch a tool and tell a client when its result changes.",
+                actionTitle: model.canMutate ? "Watch a Tool…" : nil,
+                actionIntent: model.canMutate ? .addWatch : nil,
+                run: run
+            )
+        } content: {
+            // The detail says "5 min ago", so a tick a minute keeps it
+            // true between two changes of the snapshot.
+            TimelineView(.periodic(from: .now, by: 60)) { context in
+                let now = UInt64(max(0, context.date.timeIntervalSince1970))
+                ListDetail {
+                    List(selection: $router.selectedEvent) {
+                        ForEach(events) { event in
+                            EventRow(event: event)
+                                .equatable()
+                                .tag(event.name)
+                                .listRowSeparator(.hidden)
+                                .contextMenu {
+                                    Button("Copy Event Name") { copy(event.name) }
+                                    if event.canRemove, model.canMutate {
+                                        Button("Stop Watching…", role: .destructive) { askToStop(event) }
                                     }
-                            }
+                                }
                         }
-                        .onDeleteCommand {
-                            if model.canMutate, let selected, selected.canRemove { askToStop(selected) }
+                    }
+                    .onDeleteCommand {
+                        if model.canMutate, let selected, selected.canRemove { askToStop(selected) }
+                    }
+                } detail: {
+                    if let selected {
+                        EventDetail(
+                            event: selected,
+                            now: now,
+                            canMutate: model.canMutate,
+                            showServer: serverNames.contains(selected.server)
+                                ? { run(.reveal(server: selected.server)) }
+                                : nil
+                        ) {
+                            askToStop(selected)
                         }
-                    } detail: {
-                        if let selected {
-                            EventDetail(
-                                event: selected,
-                                now: now,
-                                canMutate: model.canMutate,
-                                showServer: serverNames.contains(selected.server)
-                                    ? { run(.reveal(server: selected.server)) }
-                                    : nil
-                            ) {
-                                askToStop(selected)
-                            }
-                            .id(selected.name)
-                        } else {
-                            NoSelection(item: "Event", icon: .events)
-                        }
+                        .id(selected.name)
+                    } else {
+                        NoSelection(item: "Event", icon: .events)
                     }
                 }
             }

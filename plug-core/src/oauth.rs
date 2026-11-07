@@ -1,8 +1,9 @@
-//! OAuth credential store and auth manager for upstream MCP server authentication.
+//! OAuth sign-in to upstream MCP servers: authority discovery and binding,
+//! token storage, refresh, and telling an auth refusal from other failures.
 //!
-//! Provides [`CompositeCredentialStore`] (OS keyring + file fallback) and
-//! [`CompositeStateStore`] (file-based PKCE state) that implement the rmcp
-//! `CredentialStore` and `StateStore` traits respectively.
+//! [`CompositeCredentialStore`] (Keychain plus a file mirror) and
+//! [`CompositeStateStore`] (file-based PKCE state) implement rmcp's
+//! `CredentialStore` and `StateStore` traits.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,34 +21,26 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-#[cfg(not(target_os = "linux"))]
-use keyring as platform_keyring;
-#[cfg(target_os = "linux")]
-use keyring_core as platform_keyring;
+use crate::platform_keyring;
 
 use crate::config;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
-/// Default token lifetime when `expires_in` is missing or invalid.
+/// Assumed when `expires_in` is missing or invalid.
 pub const DEFAULT_TOKEN_LIFETIME_SECS: u64 = 3600;
 
-/// Refresh window — refresh this many seconds before expiry.
+/// How long before expiry a token is refreshed.
 pub const TOKEN_REFRESH_WINDOW_SECS: u64 = 300;
 
-/// Minimum clamped `expires_in` value.
+/// `expires_in` is clamped into `MIN_EXPIRES_IN..=MAX_EXPIRES_IN`.
 const MIN_EXPIRES_IN: u64 = 60;
-
-/// Maximum clamped `expires_in` value.
 const MAX_EXPIRES_IN: u64 = 86400;
 
-/// Short-lived threshold: if `expires_in < 600`, use the 50% rule.
+/// A token living shorter than this is refreshed at half its lifetime.
 const SHORT_LIVED_THRESHOLD: u64 = 600;
 
 /// Seconds added to every wall-clock read in the token-expiry and
 /// refresh-scheduling paths. Always zero outside a test that opts in.
+#[cfg(any(test, feature = "test-helpers"))]
 static TEST_CLOCK_SKEW_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Seconds since the Unix epoch, as every OAuth expiry and refresh-scheduling
@@ -55,29 +48,38 @@ static TEST_CLOCK_SKEW_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::A
 ///
 /// Token lifetimes are measured against the wall clock, which
 /// `tokio::time::pause()` does not touch, so a test that only advances Tokio's
-/// timer sits forever at a token that never expires. This is the one seam that
-/// lets such a test move token expiry forward.
-///
-/// The skew is deliberately additive and forward-only: it can only make a token
-/// look *older* than it is, so the worst a stuck or malicious value could do is
-/// refresh earlier than necessary. Nothing can use it to make an expired token
-/// look fresh.
+/// timer sits forever at a token that never expires. Test builds add
+/// `advance_test_clock`'s skew, which can only make a token look older.
 fn unix_now() -> u64 {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    now.saturating_add(TEST_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed))
+    now.saturating_add(test_clock_skew_secs())
 }
 
-/// Move the OAuth clock forward by `secs` for the rest of this process.
-///
-/// Public only so workspace integration tests can drive a background token
-/// refresh without sleeping through a real token lifetime. Forward-only by
-/// construction — see [`unix_now`].
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-helpers"))]
+fn test_clock_skew_secs() -> u64 {
+    TEST_CLOCK_SKEW_SECS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(not(any(test, feature = "test-helpers")))]
+const fn test_clock_skew_secs() -> u64 {
+    0
+}
+
+/// Move the OAuth clock forward by `secs`, so a test can drive a background
+/// token refresh without sleeping through a real token lifetime. The skew is
+/// process-wide: undo it with [`reset_test_clock`].
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn advance_test_clock(secs: u64) {
     TEST_CLOCK_SKEW_SECS.fetch_add(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Put the OAuth clock back on the wall clock.
+#[cfg(any(test, feature = "test-helpers"))]
+pub fn reset_test_clock() {
+    TEST_CLOCK_SKEW_SECS.store(0, std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(target_os = "linux")]
@@ -112,62 +114,51 @@ pub(crate) fn initialize_platform_keyring() -> Result<(), String> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     INIT.get_or_init(|| {
-        platform_keyring::Entry::new("plug", "oauth:store-init")
+        platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, "oauth:store-init")
             .map(drop)
             .map_err(|error| error.to_string())
     })
     .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Global store registry
-// ---------------------------------------------------------------------------
-
 static STORES: LazyLock<DashMap<String, Arc<CompositeCredentialStore>>> =
     LazyLock::new(DashMap::new);
 
 /// Process-local credential backend used by tests.
 ///
-/// OAuth tests must never touch the operator's login Keychain or production
-/// token directory. Integration-test binaries opt in explicitly; this crate's
-/// unit tests install it lazily on first credential access.
+/// OAuth tests must never touch the operator's login Keychain. Any build with
+/// `cfg(test)` or the dev-only `test-helpers` feature installs it on first
+/// credential access, so no test has to remember to. Token files need no
+/// stand-in: a test build's `paths::tokens_dir()` is under the thread's own
+/// temporary root.
+#[cfg(any(test, feature = "test-helpers"))]
 struct TestCredentialEnvironment {
-    tokens_dir: PathBuf,
     keyring: std::sync::Mutex<std::collections::HashMap<String, String>>,
     keyring_reads: std::sync::Mutex<std::collections::HashMap<String, usize>>,
     failing_keyring_writes: std::sync::Mutex<std::collections::HashSet<String>>,
 }
 
+#[cfg(any(test, feature = "test-helpers"))]
 static TEST_CREDENTIAL_ENVIRONMENT: OnceLock<TestCredentialEnvironment> = OnceLock::new();
 
-/// Isolate OAuth credentials for the current test process.
-///
-/// This is public only so workspace integration-test binaries can install the
-/// isolated backend before exercising production credential-store code.
-#[doc(hidden)]
-pub fn install_test_credential_environment(tokens_dir: PathBuf) {
-    let environment = TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
-        tokens_dir: tokens_dir.clone(),
-        keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
-        keyring_reads: std::sync::Mutex::new(std::collections::HashMap::new()),
-        failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
-    });
-    assert_eq!(
-        environment.tokens_dir, tokens_dir,
-        "test credential environment was already installed with a different token directory"
-    );
+/// The isolated test backend, installed on first use. Always `Some`; the
+/// `Option` lets callers fall through to the real stores without the
+/// fall-through becoming unreachable code in test builds.
+#[cfg(any(test, feature = "test-helpers"))]
+fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
+    Some(
+        TEST_CREDENTIAL_ENVIRONMENT.get_or_init(|| TestCredentialEnvironment {
+            keyring: std::sync::Mutex::new(std::collections::HashMap::new()),
+            keyring_reads: std::sync::Mutex::new(std::collections::HashMap::new()),
+            failing_keyring_writes: std::sync::Mutex::new(std::collections::HashSet::new()),
+        }),
+    )
 }
 
 /// Seed only the isolated test keyring, without creating a token-file mirror.
-///
-/// This is public only for workspace integration tests that verify runtime
-/// paths do not probe the operator Keychain. It panics outside an explicitly
-/// installed test credential environment.
-#[doc(hidden)]
+#[cfg(any(test, feature = "test-helpers"))]
 pub fn seed_test_keyring_credentials(server_name: &str, credentials: &StoredCredentials) {
-    let environment = TEST_CREDENTIAL_ENVIRONMENT
-        .get()
-        .expect("test credential environment must be installed before seeding its keyring");
+    let environment = test_credential_environment().expect("test credential environment");
     let json = serde_json::to_string(credentials).expect("serialize test credentials");
     environment
         .keyring
@@ -176,26 +167,11 @@ pub fn seed_test_keyring_credentials(server_name: &str, credentials: &StoredCred
         .insert(server_name.to_string(), json);
 }
 
-#[cfg(test)]
-fn ensure_unit_test_credential_environment() {
-    static INIT: std::sync::Once = std::sync::Once::new();
-    INIT.call_once(|| {
-        install_test_credential_environment(
-            std::env::temp_dir().join(format!("plug-oauth-unit-tests-{}", std::process::id())),
-        );
-    });
-}
-
 /// Whether credentials go to the isolated test backend instead of the
 /// operator's Keychain.
+#[cfg(any(test, feature = "test-helpers"))]
 pub(crate) fn uses_test_credentials() -> bool {
     test_credential_environment().is_some()
-}
-
-fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
-    #[cfg(test)]
-    ensure_unit_test_credential_environment();
-    TEST_CREDENTIAL_ENVIRONMENT.get()
 }
 
 /// Get or create a per-server [`CompositeCredentialStore`].
@@ -203,24 +179,16 @@ fn test_credential_environment() -> Option<&'static TestCredentialEnvironment> {
 /// Callers may share the returned `Arc` freely; stores are lazily
 /// created and live for the process lifetime.
 pub fn get_or_create_store(server_name: &str) -> Arc<CompositeCredentialStore> {
-    #[cfg(test)]
-    ensure_unit_test_credential_environment();
     STORES
         .entry(server_name.to_string())
         .or_insert_with(|| Arc::new(CompositeCredentialStore::new(server_name.to_string())))
         .clone()
 }
 
-// ---------------------------------------------------------------------------
-// Token helpers
-// ---------------------------------------------------------------------------
-
-/// Return the `~/.config/plug/tokens/` directory path.
-pub fn tokens_dir() -> PathBuf {
-    if let Some(environment) = test_credential_environment() {
-        return environment.tokens_dir.clone();
-    }
-    config::config_dir().join("tokens")
+/// The file a server's sign-in is mirrored to.
+pub fn token_file_path(server_name: &str) -> Result<PathBuf, String> {
+    let safe = config::sanitize_server_name_for_path(server_name)?;
+    Ok(crate::paths::tokens_dir().join(format!("{safe}.json")))
 }
 
 /// Normalize an `expires_in` value: apply defaults and clamping.
@@ -231,28 +199,14 @@ fn effective_expires_in(expires_in: Option<u64>) -> u64 {
     }
 }
 
-/// Determine whether a token should be refreshed now.
+/// How long until a token received at `received_at` should be refreshed;
+/// [`Duration::ZERO`] once it should.
 ///
 /// Rules:
 /// - If `expires_in` is `None`, `0`: use [`DEFAULT_TOKEN_LIFETIME_SECS`].
 /// - Clamp to `[60, 86400]`.
 /// - If `expires_in < 600`: refresh at 50% of lifetime.
 /// - Otherwise: refresh at `expires_in - TOKEN_REFRESH_WINDOW_SECS`.
-pub fn token_needs_refresh(received_at: u64, expires_in: Option<u64>) -> bool {
-    let effective = effective_expires_in(expires_in);
-    let refresh_at = if effective < SHORT_LIVED_THRESHOLD {
-        effective / 2
-    } else {
-        effective.saturating_sub(TOKEN_REFRESH_WINDOW_SECS)
-    };
-
-    let elapsed = unix_now().saturating_sub(received_at);
-    elapsed >= refresh_at
-}
-
-/// Compute the [`Duration`] until the refresh window opens.
-///
-/// Returns [`Duration::ZERO`] if the window is already open.
 pub fn time_until_refresh_window(received_at: u64, expires_in: Option<u64>) -> Duration {
     let effective = effective_expires_in(expires_in);
     let refresh_at = if effective < SHORT_LIVED_THRESHOLD {
@@ -358,17 +312,11 @@ pub async fn bind_discovered_authority(
     resource_url: &str,
     budget: Duration,
 ) -> Result<(), AuthError> {
-    use rmcp::transport::auth::AuthorizationManager;
-
-    let manager = AuthorizationManager::new(resource_url).await?;
+    let manager = crate::upstream_http::authorization_manager(resource_url).await?;
     let resolution = bounded_discovery(resource_url, budget, manager.resolve_metadata()).await?;
     let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata)?;
     store.bind_verified_authority(&authority)
 }
-
-// ---------------------------------------------------------------------------
-// CachedCredentials
-// ---------------------------------------------------------------------------
 
 #[derive(Clone)]
 struct CachedCredentials {
@@ -425,6 +373,35 @@ struct BoundCredentialEnvelope {
 enum PersistedCredentialEnvelope {
     Bound(BoundCredentialEnvelope),
     Legacy(StoredCredentials),
+}
+
+/// How one save is persisted. A bound write always carries the generation its
+/// file and Keychain entry share, so a bound record without one cannot be built.
+enum WriteShape {
+    /// The bare record, for a store no authority is bound to yet.
+    Legacy,
+    Bound {
+        binding: CredentialBinding,
+        generation: String,
+    },
+}
+
+impl WriteShape {
+    fn encode(&self, credentials: &StoredCredentials) -> Result<serde_json::Value, AuthError> {
+        match self {
+            Self::Legacy => serde_json::to_value(credentials),
+            Self::Bound {
+                binding,
+                generation,
+            } => serde_json::to_value(BoundCredentialEnvelope {
+                version: CREDENTIAL_ENVELOPE_VERSION,
+                generation: generation.clone(),
+                binding: binding.clone(),
+                credentials: credentials.clone(),
+            }),
+        }
+        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
+    }
 }
 
 enum BoundPairProbe {
@@ -540,12 +517,8 @@ impl std::fmt::Debug for CachedCredentials {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CompositeCredentialStore
-// ---------------------------------------------------------------------------
-
 /// Credential store that mirrors credentials to a JSON file at
-/// `~/.config/plug/tokens/{server_name}.json` and can also use the OS keyring.
+/// `tokens/{server_name}.json` in Plug's config directory and can also use the OS keyring.
 ///
 /// Reads prefer the local 0600 token file once credentials have been mirrored
 /// there, which avoids repeated macOS keychain prompts across short-lived CLI
@@ -626,6 +599,7 @@ impl CompositeCredentialStore {
     }
 
     fn raw_keyring_json(&self) -> Option<String> {
+        #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
             *environment
                 .keyring_reads
@@ -734,42 +708,23 @@ impl CompositeCredentialStore {
             .and_then(|credentials| stored_access_token(&credentials))
     }
 
-    /// The persisted shape of `credentials`: a bound envelope when an
-    /// authority is bound, the bare legacy record otherwise.
-    fn credential_envelope(
-        &self,
-        credentials: &StoredCredentials,
-        generation: Option<&str>,
-    ) -> Result<serde_json::Value, AuthError> {
+    /// The shape of the next write, read once so the file and the Keychain
+    /// entry of one save agree. A bound write gets a fresh generation here.
+    fn write_shape(&self) -> WriteShape {
         match self.binding.load().as_ref().as_ref() {
-            Some(binding) => serde_json::to_value(BoundCredentialEnvelope {
-                version: CREDENTIAL_ENVELOPE_VERSION,
-                generation: generation
-                    .expect("bound credential writes require a transaction generation")
-                    .to_string(),
+            Some(binding) => WriteShape::Bound {
                 binding: binding.clone(),
-                credentials: credentials.clone(),
-            }),
-            None => serde_json::to_value(credentials),
+                generation: uuid::Uuid::new_v4().to_string(),
+            },
+            None => WriteShape::Legacy,
         }
-        .map_err(|error| AuthError::InternalError(format!("serialization failed: {error}")))
-    }
-
-    fn encode_credentials(
-        &self,
-        credentials: &StoredCredentials,
-        generation: Option<&str>,
-    ) -> Result<String, AuthError> {
-        Ok(self
-            .credential_envelope(credentials, generation)?
-            .to_string())
     }
 
     fn credential_write_lock_path(&self) -> Result<PathBuf, AuthError> {
         let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|error| {
             AuthError::InternalError(format!("invalid server name for lock path: {error}"))
         })?;
-        Ok(tokens_dir().join(format!("{safe}.credentials.lock")))
+        Ok(crate::paths::tokens_dir().join(format!("{safe}.credentials.lock")))
     }
 
     fn with_credential_write_lock<T>(
@@ -777,7 +732,6 @@ impl CompositeCredentialStore {
         operation: impl FnOnce() -> Result<T, AuthError>,
     ) -> Result<T, AuthError> {
         use fs4::FileExt;
-        #[cfg(unix)]
         use std::os::unix::fs::OpenOptionsExt;
 
         let path = self.credential_write_lock_path()?;
@@ -789,7 +743,6 @@ impl CompositeCredentialStore {
         })?;
         let mut options = std::fs::OpenOptions::new();
         options.read(true).write(true).create(true);
-        #[cfg(unix)]
         options.mode(0o600);
         let file = options.open(&path).map_err(|error| {
             AuthError::InternalError(format!("failed to open credential lock: {error}"))
@@ -808,13 +761,37 @@ impl CompositeCredentialStore {
         }
     }
 
-    fn save_credential_pair(&self, credentials: &StoredCredentials) -> Result<(), AuthError> {
-        self.with_credential_write_lock(|| {
-            let generation = uuid::Uuid::new_v4().to_string();
-            self.file_save_generation(credentials, Some(&generation))?;
-            self.keyring_save_generation(credentials, Some(&generation))?;
-            Ok(())
-        })
+    /// Write the file mirror, then the Keychain entry. A bound pair is one
+    /// transaction under the credential lock: a partial write returns Err, and
+    /// the generation mismatch makes the split pair unreadable on the next load.
+    fn persist(&self, credentials: &StoredCredentials) -> Result<(), AuthError> {
+        let shape = self.write_shape();
+        let write_both = || {
+            self.file_write(credentials, &shape)?;
+            self.keyring_write(credentials, &shape)
+        };
+        match shape {
+            WriteShape::Legacy => write_both(),
+            WriteShape::Bound { .. } => self.with_credential_write_lock(write_both),
+        }
+    }
+
+    /// Copy credentials read from the Keychain back to a missing or stale file
+    /// mirror. Only an unbound mirror can be repaired by itself: a bound file
+    /// must carry its Keychain entry's generation, which only [`Self::persist`]
+    /// writes.
+    fn repair_legacy_file_mirror(&self, credentials: &StoredCredentials) {
+        let shape = self.write_shape();
+        if matches!(shape, WriteShape::Bound { .. }) {
+            return;
+        }
+        if let Err(error) = self.file_write(credentials, &shape) {
+            warn!(
+                server = %self.server_name,
+                %error,
+                "token file mirror repair failed after keyring-backed load"
+            );
+        }
     }
 
     fn migrate_loaded_legacy_credentials(
@@ -824,12 +801,10 @@ impl CompositeCredentialStore {
         if !self.unbound_legacy_loaded.swap(false, Ordering::AcqRel) {
             return Ok(());
         }
-        self.save_credential_pair(credentials)?;
+        self.persist(credentials)?;
         self.update_cache(credentials);
         Ok(())
     }
-
-    // -- keyring helpers --------------------------------------------------
 
     fn keyring_entry(&self) -> Option<platform_keyring::Entry> {
         if let Err(error) = initialize_platform_keyring() {
@@ -838,7 +813,7 @@ impl CompositeCredentialStore {
         }
 
         let user = format!("oauth:{}", self.server_name);
-        match platform_keyring::Entry::new("plug", &user) {
+        match platform_keyring::Entry::new(crate::paths::KEYCHAIN_SERVICE, &user) {
             Ok(entry) => Some(entry),
             Err(e) => {
                 debug!(server = %self.server_name, error = %e, "keyring entry creation failed");
@@ -849,23 +824,15 @@ impl CompositeCredentialStore {
 
     fn keyring_load(&self) -> Option<StoredCredentials> {
         let json = self.raw_keyring_json()?;
-        let source = if test_credential_environment().is_some() {
-            "test keyring"
-        } else {
-            "keyring"
-        };
-        self.decode_credentials(&json, source)
+        self.decode_credentials(&json, "keyring")
     }
 
-    fn keyring_save(&self, creds: &StoredCredentials) -> bool {
-        self.keyring_save_generation(creds, None).is_ok()
-    }
-
-    fn keyring_save_generation(
+    fn keyring_write(
         &self,
         creds: &StoredCredentials,
-        generation: Option<&str>,
+        shape: &WriteShape,
     ) -> Result<(), AuthError> {
+        #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
             if environment
                 .failing_keyring_writes
@@ -877,7 +844,7 @@ impl CompositeCredentialStore {
                     "injected test keyring write failure".to_string(),
                 ));
             }
-            let json = self.encode_credentials(creds, generation)?;
+            let json = shape.encode(creds)?.to_string();
             environment
                 .keyring
                 .lock()
@@ -889,7 +856,7 @@ impl CompositeCredentialStore {
         let entry = self
             .keyring_entry()
             .ok_or_else(|| AuthError::InternalError("keyring entry is unavailable".to_string()))?;
-        let json = self.encode_credentials(creds, generation)?;
+        let json = shape.encode(creds)?.to_string();
         match entry.set_password(&json) {
             Ok(()) => {
                 debug!(server = %self.server_name, "keyring: credentials saved");
@@ -905,6 +872,7 @@ impl CompositeCredentialStore {
     }
 
     fn keyring_clear(&self) {
+        #[cfg(any(test, feature = "test-helpers"))]
         if let Some(environment) = test_credential_environment() {
             environment
                 .keyring
@@ -925,20 +893,17 @@ impl CompositeCredentialStore {
         }
     }
 
-    // -- file helpers -----------------------------------------------------
-
     fn token_file_path(&self) -> Result<PathBuf, AuthError> {
-        let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
+        token_file_path(&self.server_name).map_err(|e| {
             AuthError::InternalError(format!("invalid server name for file path: {e}"))
-        })?;
-        Ok(tokens_dir().join(format!("{safe}.json")))
+        })
     }
 
     fn registration_file_path(&self) -> Result<PathBuf, AuthError> {
         let safe = config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
             AuthError::InternalError(format!("invalid server name for registration path: {e}"))
         })?;
-        Ok(tokens_dir().join(format!("{safe}.registration.json")))
+        Ok(crate::paths::tokens_dir().join(format!("{safe}.registration.json")))
     }
 
     fn load_json_file<T: DeserializeOwned>(
@@ -983,71 +948,15 @@ impl CompositeCredentialStore {
         value: &T,
         file_kind: &'static str,
     ) -> Result<(), AuthError> {
-        use fs4::FileExt;
-        use std::io::Write;
-
         let dir = path.parent().ok_or_else(|| {
             AuthError::InternalError(format!("{file_kind} path has no parent directory"))
         })?;
         crate::fs_perm::ensure_dir_0700(dir)
             .map_err(|e| AuthError::InternalError(format!("failed to create tokens dir: {e}")))?;
-
         let json = serde_json::to_string_pretty(value)
             .map_err(|e| AuthError::InternalError(format!("serialization failed: {e}")))?;
-        let tmp_path = path.with_extension(format!("tmp-{}", uuid::Uuid::new_v4()));
-
-        #[cfg(unix)]
-        let file = {
-            use std::os::unix::fs::OpenOptionsExt;
-            std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp_path)
-        };
-        #[cfg(not(unix))]
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(&tmp_path);
-
-        let mut file = file.map_err(|e| {
-            AuthError::InternalError(format!("failed to open temp {file_kind}: {e}"))
-        })?;
-
-        // Fully qualified: std's inherent `File::lock` (Rust 1.89+) would
-        // otherwise shadow the fs4 trait method depending on toolchain version.
-        FileExt::lock(&file).map_err(|e| {
-            AuthError::InternalError(format!("failed to lock temp {file_kind}: {e}"))
-        })?;
-
-        file.write_all(json.as_bytes()).map_err(|e| {
-            let _ = FileExt::unlock(&file);
-            AuthError::InternalError(format!("failed to write temp {file_kind}: {e}"))
-        })?;
-        file.sync_all().map_err(|error| {
-            let _ = FileExt::unlock(&file);
-            AuthError::InternalError(format!("failed to sync temp {file_kind}: {error}"))
-        })?;
-
-        std::fs::rename(&tmp_path, &path).map_err(|e| {
-            let _ = FileExt::unlock(&file);
-            let _ = std::fs::remove_file(&tmp_path);
-            AuthError::InternalError(format!("failed to rename temp {file_kind}: {e}"))
-        })?;
-
-        FileExt::unlock(&file).map_err(|e| {
-            AuthError::InternalError(format!("failed to unlock committed {file_kind}: {e}"))
-        })?;
-
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
-        }
-
+        crate::fs_perm::write_private_atomic(&path, json.as_bytes())
+            .map_err(|e| AuthError::InternalError(format!("failed to write {file_kind}: {e}")))?;
         debug!(server = %self.server_name, file_kind, "credential store file saved");
         Ok(())
     }
@@ -1077,18 +986,9 @@ impl CompositeCredentialStore {
         self.decode_credentials(&json, "token file")
     }
 
-    fn file_save(&self, creds: &StoredCredentials) -> Result<(), AuthError> {
-        self.file_save_generation(creds, None)
-    }
-
-    fn file_save_generation(
-        &self,
-        creds: &StoredCredentials,
-        generation: Option<&str>,
-    ) -> Result<(), AuthError> {
+    fn file_write(&self, creds: &StoredCredentials, shape: &WriteShape) -> Result<(), AuthError> {
         let path = self.token_file_path()?;
-        let value = self.credential_envelope(creds, generation)?;
-        self.save_json_file(path, &value, "token file")
+        self.save_json_file(path, &shape.encode(creds)?, "token file")
     }
 
     fn file_clear(&self) {
@@ -1110,8 +1010,6 @@ impl CompositeCredentialStore {
     fn registration_clear(&self) {
         self.clear_json_file(self.registration_file_path(), "registration file");
     }
-
-    // -- cache helpers ----------------------------------------------------
 
     fn update_cache(&self, creds: &StoredCredentials) {
         let cached = creds.token_response.as_ref().map(|tr| {
@@ -1180,10 +1078,7 @@ impl CompositeCredentialStore {
         use oauth2::TokenResponse;
 
         let token_response = creds.token_response.as_ref()?;
-        let effective = token_response
-            .expires_in()
-            .map(|d| d.as_secs())
-            .unwrap_or(DEFAULT_TOKEN_LIFETIME_SECS);
+        let effective = effective_expires_in(token_response.expires_in().map(|d| d.as_secs()));
         let now = unix_now();
         let received_at = creds.token_received_at.unwrap_or(now);
 
@@ -1366,15 +1261,9 @@ impl CompositeCredentialStore {
                 if matches!(source, CredentialSource::Keyring)
                     && persisted_file
                         .as_ref()
-                        .map(|file| !Self::persisted_credentials_match(file, creds))
-                        .unwrap_or(true)
-                    && let Err(error) = self.file_save(creds)
+                        .is_none_or(|file| !Self::persisted_credentials_match(file, creds))
                 {
-                    warn!(
-                        server = %self.server_name,
-                        error = %error,
-                        "token file mirror repair failed after keyring-backed load"
-                    );
+                    self.repair_legacy_file_mirror(creds);
                 }
                 self.update_cache(creds);
                 CredentialSnapshot {
@@ -1447,36 +1336,17 @@ impl CredentialStore for CompositeCredentialStore {
         {
             if self.binding.load().as_ref().is_some() {
                 self.migrate_loaded_legacy_credentials(credentials)?;
-            } else if let Err(error) = self.file_save(credentials) {
-                warn!(
-                    server = %self.server_name,
-                    %error,
-                    "token file mirror repair failed after keyring-backed load"
-                );
+            } else {
+                self.repair_legacy_file_mirror(credentials);
             }
         }
         Ok(snapshot.credentials)
     }
 
     async fn save(&self, credentials: StoredCredentials) -> Result<(), AuthError> {
-        if self.binding.load().as_ref().is_some() {
-            // Bound credentials are one logical mirror transaction. A partial
-            // platform write returns Err and the generation mismatch makes the
-            // split pair unreadable on the next load.
-            self.save_credential_pair(&credentials)?;
-        } else {
-            // Legacy unbound records retain their compatibility write shape.
-            self.file_save(&credentials)?;
-            if !self.keyring_save(&credentials) {
-                return Err(AuthError::InternalError(
-                    "keyring credential save failed".to_string(),
-                ));
-            }
-        }
-
+        self.persist(&credentials)?;
         // Publish to the in-memory cache only after durable mirror success.
         self.update_cache(&credentials);
-
         Ok(())
     }
 
@@ -1489,12 +1359,8 @@ impl CredentialStore for CompositeCredentialStore {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CompositeStateStore
-// ---------------------------------------------------------------------------
-
 /// File-based PKCE state store. Each state entry is stored at
-/// `~/.config/plug/tokens/{server_name}_state_{csrf}.json`.
+/// `tokens/{server_name}_state_{csrf}.json` in Plug's config directory.
 pub struct CompositeStateStore {
     server_name: String,
 }
@@ -1505,22 +1371,26 @@ impl CompositeStateStore {
     }
 
     fn state_file_path(&self, csrf_token: &str) -> Result<PathBuf, AuthError> {
-        let safe_server =
-            config::sanitize_server_name_for_path(&self.server_name).map_err(|e| {
-                AuthError::InternalError(format!("invalid server name for state path: {e}"))
-            })?;
-        let safe_csrf: String = csrf_token
-            .chars()
-            .map(|c| {
-                if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
-        Ok(tokens_dir().join(format!("{safe_server}_state_{safe_csrf}.json")))
+        state_file_path(&self.server_name, csrf_token).map_err(|e| {
+            AuthError::InternalError(format!("invalid server name for state path: {e}"))
+        })
     }
+}
+
+/// The file a sign-in in progress keeps its state in, named by its CSRF token.
+pub fn state_file_path(server_name: &str, csrf_token: &str) -> Result<PathBuf, String> {
+    let safe_server = config::sanitize_server_name_for_path(server_name)?;
+    let safe_csrf: String = csrf_token
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '_' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    Ok(crate::paths::tokens_dir().join(format!("{safe_server}_state_{safe_csrf}.json")))
 }
 
 #[async_trait]
@@ -1539,25 +1409,7 @@ impl StateStore for CompositeStateStore {
 
         let json = serde_json::to_string_pretty(&state)
             .map_err(|e| AuthError::InternalError(format!("state serialization failed: {e}")))?;
-
-        #[cfg(unix)]
-        {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&path)
-                .map_err(|e| AuthError::InternalError(format!("failed to open state file: {e}")))?;
-            file.write_all(json.as_bytes()).map_err(|e| {
-                AuthError::InternalError(format!("failed to write state file: {e}"))
-            })?;
-        }
-
-        #[cfg(not(unix))]
-        std::fs::write(&path, &json)
+        crate::fs_perm::write_private_atomic(&path, json.as_bytes())
             .map_err(|e| AuthError::InternalError(format!("failed to write state file: {e}")))?;
 
         debug!(server = %self.server_name, "state file saved for CSRF flow");
@@ -1594,10 +1446,6 @@ impl StateStore for CompositeStateStore {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Token refresh
-// ---------------------------------------------------------------------------
 
 /// Outcome of an OAuth token refresh attempt.
 #[derive(Debug)]
@@ -1640,7 +1488,23 @@ fn has_token(haystack: &str, needle: &str) -> bool {
         })
 }
 
-pub(crate) fn is_auth_error(message: &str) -> bool {
+/// An upstream refused Plug's credentials: its owner has to sign in again.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub(crate) struct AuthRejected(pub(crate) String);
+
+/// Whether `error` means the server needs its owner to sign in again.
+///
+/// Plug's own refusals are [`AuthRejected`]. rmcp 3.1.0 reports its OAuth
+/// failures (`AuthError`, a refused token refresh) and some transport
+/// failures only as text, so for those the words in each cause are read.
+pub(crate) fn is_auth_rejection(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause.downcast_ref::<AuthRejected>().is_some() || is_auth_error(&cause.to_string())
+    })
+}
+
+fn is_auth_error(message: &str) -> bool {
     let normalized = message.to_lowercase();
 
     normalized.contains("authorization required")
@@ -1650,10 +1514,6 @@ pub(crate) fn is_auth_error(message: &str) -> bool {
         || normalized.contains("resource_metadata=")
         || has_token(&normalized, "unauthorized")
         || has_token(&normalized, "401")
-}
-
-pub(crate) fn is_auth_error_chain(error: &anyhow::Error) -> bool {
-    error.chain().any(|cause| is_auth_error(&cause.to_string()))
 }
 
 pub fn injected_client_identity(
@@ -1692,15 +1552,10 @@ pub async fn refresh_access_token(
     server_url: &str,
     oauth_client_id: Option<&str>,
 ) -> RefreshResult {
-    use rmcp::transport::auth::AuthorizationManager;
-
-    // Ensure the TLS provider is available (reqwest needs it even for HTTP).
-    crate::tls::ensure_rustls_provider_installed();
-
     // 1. Perform token-silent discovery and bind authority before any stored
     // credential is loaded, refreshed, or eligible for attachment.
     let store = get_or_create_store(server_name);
-    let mut auth_manager = match AuthorizationManager::new(server_url).await {
+    let mut auth_manager = match crate::upstream_http::authorization_manager(server_url).await {
         Ok(manager) => manager,
         Err(error) => {
             return RefreshResult::TransientError(format!("failed to init auth manager: {error}"));
@@ -1779,10 +1634,9 @@ pub async fn refresh_access_token(
 
     match auth_manager.refresh_token().await {
         Ok(_) => {
-            // rmcp's refresh_token() saves via the refresh store and updates its
-            // in-memory cache. Copy that fresh credential bundle into the shared
-            // store cache instead of re-reading persisted storage and re-hitting
-            // the keychain.
+            // rmcp's refresh_token() saves the new bundle through the refresh
+            // store. Read it back from there and copy it into the shared
+            // store's cache.
             let refreshed = match CredentialStore::load(&refresh_store).await {
                 Ok(Some(creds)) => creds,
                 Ok(None) => {
@@ -1811,8 +1665,7 @@ pub async fn refresh_access_token(
             RefreshResult::Refreshed
         }
         Err(e) => {
-            let err = anyhow::anyhow!("{e:#}");
-            if is_auth_error_chain(&err) {
+            if is_auth_rejection(&anyhow::anyhow!("{e:#}")) {
                 RefreshResult::AuthError(format!("{e}"))
             } else {
                 RefreshResult::TransientError(format!("{e}"))
@@ -1820,10 +1673,6 @@ pub async fn refresh_access_token(
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -1863,55 +1712,67 @@ mod tests {
         assert_eq!(store.delimiters[2], "");
     }
 
-    /// Token just received — should not need refresh.
     #[test]
-    fn test_token_needs_refresh_not_due() {
+    fn refresh_window_not_due() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
-        assert!(!token_needs_refresh(now, Some(3600)));
+        assert!(!time_until_refresh_window(now, Some(3600)).is_zero());
     }
 
-    /// Token near expiry — should need refresh.
     #[test]
-    fn test_token_needs_refresh_due() {
+    fn refresh_window_due() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         // Received 3500 seconds ago with expires_in = 3600.
         // Refresh window is 3600 - 300 = 3300 seconds. 3500 >= 3300 → true.
-        assert!(token_needs_refresh(now - 3500, Some(3600)));
+        assert!(time_until_refresh_window(now - 3500, Some(3600)).is_zero());
     }
 
-    /// When `expires_in` is `None`, uses the default lifetime.
     #[test]
-    fn test_token_needs_refresh_none_expires_in() {
+    fn refresh_window_none_expires_in() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         // Default lifetime is 3600, refresh at 3300.
         // Received 100s ago → not due.
-        assert!(!token_needs_refresh(now - 100, None));
+        assert!(!time_until_refresh_window(now - 100, None).is_zero());
         // Received 3400s ago → due (3400 >= 3300).
-        assert!(token_needs_refresh(now - 3400, None));
+        assert!(time_until_refresh_window(now - 3400, None).is_zero());
+    }
+
+    #[test]
+    fn reported_lifetime_follows_the_refresh_rule() {
+        let lifetime = |expires_in| {
+            CompositeCredentialStore::remaining_token_lifetime_secs(&make_test_token(
+                "a", None, expires_in,
+            ))
+            .unwrap()
+        };
+        // A second may pass between saving the token and reading it.
+        let about = |expected: u64| expected - 1..=expected;
+        assert!(about(MAX_EXPIRES_IN).contains(&lifetime(Some(10 * 365 * 86_400))));
+        assert!(about(MIN_EXPIRES_IN).contains(&lifetime(Some(5))));
+        assert!(about(DEFAULT_TOKEN_LIFETIME_SECS).contains(&lifetime(Some(0))));
+        assert!(about(DEFAULT_TOKEN_LIFETIME_SECS).contains(&lifetime(None)));
     }
 
     /// Short-lived token (expires_in < 600) uses the 50% rule.
     #[test]
-    fn test_token_needs_refresh_short_lived() {
+    fn refresh_window_short_lived() {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()
             .as_secs();
         // expires_in = 120, clamped to 120 (>= 60). Short-lived: refresh at 60s.
-        assert!(!token_needs_refresh(now - 30, Some(120))); // 30 < 60
-        assert!(token_needs_refresh(now - 70, Some(120))); // 70 >= 60
+        assert!(!time_until_refresh_window(now - 30, Some(120)).is_zero()); // 30 < 60
+        assert!(time_until_refresh_window(now - 70, Some(120)).is_zero()); // 70 >= 60
     }
 
-    /// Basic computation of time until refresh window.
     #[test]
     fn test_time_until_refresh_window() {
         let now = SystemTime::now()
@@ -1962,8 +1823,11 @@ mod tests {
         )
         .context("failed to connect to HTTP upstream");
 
-        assert!(is_auth_error_chain(&err));
+        assert!(is_auth_rejection(&err));
         assert!(!is_auth_error(&err.to_string()));
+        assert!(is_auth_rejection(
+            &anyhow::Error::new(AuthRejected("signed out".into())).context("start failed")
+        ));
     }
 
     #[test]
@@ -2013,7 +1877,7 @@ mod tests {
             Some(1234567890),
         );
 
-        let save_result = store.file_save(&creds);
+        let save_result = write_file_only(&store, &creds);
         assert!(save_result.is_ok(), "file_save failed: {save_result:?}");
 
         let loaded = store.file_load();
@@ -2023,7 +1887,6 @@ mod tests {
         assert_eq!(loaded.granted_scopes, vec!["read", "write"]);
         assert_eq!(loaded.token_received_at, Some(1234567890));
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let path = store.token_file_path().unwrap();
@@ -2054,7 +1917,6 @@ mod tests {
             .expect("expected dynamic registration");
         assert_eq!(loaded, registration);
 
-        #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             let path = store.registration_file_path().unwrap();
@@ -2131,14 +1993,12 @@ mod tests {
         let store = CompositeCredentialStore::new("my-server".to_string());
         let path = store.token_file_path().unwrap();
         assert!(path.ends_with("my-server.json"));
-        assert!(path.starts_with(tokens_dir()));
+        assert!(path.starts_with(crate::paths::tokens_dir()));
 
         // Invalid name (path separator) returns an error.
         let store = CompositeCredentialStore::new("../evil".to_string());
         assert!(store.token_file_path().is_err());
     }
-
-    // -- refresh_access_token tests ----------------------------------------
 
     /// Helper: build a synthetic token response for test fixtures.
     fn make_test_token(
@@ -2166,6 +2026,20 @@ mod tests {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         StoredCredentials::new("test-client".to_string(), Some(token), vec![], Some(now))
+    }
+
+    fn write_file_only(
+        store: &CompositeCredentialStore,
+        credentials: &StoredCredentials,
+    ) -> Result<(), AuthError> {
+        store.file_write(credentials, &store.write_shape())
+    }
+
+    fn write_keyring_only(
+        store: &CompositeCredentialStore,
+        credentials: &StoredCredentials,
+    ) -> Result<(), AuthError> {
+        store.keyring_write(credentials, &store.write_shape())
     }
 
     fn cached_access_token(server_name: &str) -> Option<String> {
@@ -2259,7 +2133,6 @@ mod tests {
     }
 
     async fn spawn_empty_oauth_authority() -> (String, tokio::task::JoinHandle<()>) {
-        crate::tls::ensure_rustls_provider_installed();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind OAuth authority");
@@ -2330,11 +2203,11 @@ mod tests {
 
     #[tokio::test]
     async fn verified_runtime_lookup_returns_matching_bound_credential_pair() {
-        use rmcp::transport::auth::AuthorizationManager;
-
         let name = format!("bound-runtime-{}", uuid::Uuid::new_v4());
         let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
-        let manager = AuthorizationManager::new(&resource_url).await.unwrap();
+        let manager = crate::upstream_http::authorization_manager(&resource_url)
+            .await
+            .unwrap();
         let resolution = manager.resolve_metadata().await.unwrap();
         let authority =
             VerifiedOAuthAuthority::verify(&resource_url, &resolution.metadata).unwrap();
@@ -2449,11 +2322,16 @@ mod tests {
     fn concurrent_bound_writers_publish_one_complete_generation() {
         let name = format!("bound-concurrent-{}", uuid::Uuid::new_v4());
         let authority = test_authority();
+        // Each thread has its own root, so the writers must share this one
+        // to contend for the same file and lock.
+        let shared = crate::paths::test::scratch("bound-concurrent");
         let mut threads = Vec::new();
         for access in ["writer-a", "writer-b"] {
             let name = name.clone();
             let authority = authority.clone();
+            let shared = shared.clone();
             threads.push(std::thread::spawn(move || {
+                let _root = crate::paths::test::isolate(&shared);
                 let store = CompositeCredentialStore::new(name);
                 store.bind_verified_authority(&authority).unwrap();
                 let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2472,6 +2350,11 @@ mod tests {
             thread.join().unwrap();
         }
 
+        let _root = crate::paths::test::isolate(&shared);
+        assert!(
+            token_file_path(&name).unwrap().exists(),
+            "the writers saved to the shared root"
+        );
         let reloaded = CompositeCredentialStore::new(name);
         reloaded.bind_verified_authority(&authority).unwrap();
         let runtime = tokio::runtime::Builder::new_current_thread()
@@ -2488,74 +2371,103 @@ mod tests {
         ));
     }
 
-    /// Authority discovery precedes even an empty-store check, so an
-    /// unreachable resource fails without inspecting local credential state.
-    #[tokio::test]
-    async fn test_refresh_no_credentials() {
-        let name = format!("refresh-nocreds-{}", std::process::id());
-        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::TransientError(_)));
+    /// Discover the empty local authority at `resource_url`, bind the shared
+    /// store to it, and save `credentials` as that bound pair.
+    async fn save_bound_to_local_authority(
+        name: &str,
+        resource_url: &str,
+        credentials: Option<StoredCredentials>,
+    ) -> Arc<CompositeCredentialStore> {
+        let manager = crate::upstream_http::authorization_manager(resource_url)
+            .await
+            .unwrap();
+        let resolution = manager.resolve_metadata().await.unwrap();
+        let authority = VerifiedOAuthAuthority::verify(resource_url, &resolution.metadata).unwrap();
+        let store = get_or_create_store(name);
+        store.bind_verified_authority(&authority).unwrap();
+        if let Some(credentials) = credentials {
+            CredentialStore::save(store.as_ref(), credentials)
+                .await
+                .unwrap();
+        }
+        store
     }
 
-    /// An unreachable authority cannot cause an injected credential to be
-    /// loaded before issuer binding.
     #[tokio::test]
-    async fn test_refresh_injected_token() {
-        let name = format!("refresh-injected-{}", std::process::id());
-        let store = get_or_create_store(&name);
+    async fn refresh_with_no_stored_pair_reports_no_credentials() {
+        let name = format!("refresh-nocreds-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let store = save_bound_to_local_authority(&name, &resource_url, None).await;
 
-        let mut creds = make_test_token("test-access", Some("test-refresh"), Some(3600));
-        creds.client_id = "injected".to_string();
-        store.save(creds).await.unwrap();
+        let result = refresh_access_token(&name, &resource_url, None).await;
 
-        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::TransientError(_)));
-
-        // Clean up
+        assert!(matches!(result, RefreshResult::NoCredentials), "{result:?}");
+        authority_task.abort();
         store.clear().await.unwrap();
     }
 
-    /// An unreachable authority cannot cause a no-refresh credential to be
-    /// loaded before issuer binding.
     #[tokio::test]
-    async fn test_refresh_no_refresh_token() {
-        let name = format!("refresh-norefresh-{}", std::process::id());
-        let store = get_or_create_store(&name);
+    async fn refresh_of_an_injected_token_is_left_alone() {
+        let name = format!("refresh-injected-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let mut credentials = make_test_token("test-access", Some("test-refresh"), Some(3600));
+        credentials.client_id = "injected".to_string();
+        let store = save_bound_to_local_authority(&name, &resource_url, Some(credentials)).await;
 
-        // Token without a refresh_token
-        let creds = make_test_token("test-access", None, Some(3600));
-        store.save(creds).await.unwrap();
+        let result = refresh_access_token(&name, &resource_url, None).await;
 
-        let result = refresh_access_token(&name, "http://localhost:9999", None).await;
-        assert!(matches!(result, RefreshResult::TransientError(_)));
-
-        // Clean up
+        assert!(matches!(result, RefreshResult::InjectedToken), "{result:?}");
+        authority_task.abort();
         store.clear().await.unwrap();
     }
 
-    /// Valid credentials but unreachable server → TransientError (metadata
-    /// discovery fails).
     #[tokio::test]
-    async fn test_refresh_transient_error_unreachable_server() {
-        crate::tls::ensure_rustls_provider_installed();
-        let name = format!("refresh-transient-{}", std::process::id());
+    async fn refresh_without_a_refresh_token_says_so() {
+        let name = format!("refresh-norefresh-{}", uuid::Uuid::new_v4());
+        let (resource_url, authority_task) = spawn_empty_oauth_authority().await;
+        let store = save_bound_to_local_authority(
+            &name,
+            &resource_url,
+            Some(make_test_token("test-access", None, Some(3600))),
+        )
+        .await;
+
+        let result = refresh_access_token(&name, &resource_url, None).await;
+
+        assert!(
+            matches!(result, RefreshResult::NoRefreshToken),
+            "{result:?}"
+        );
+        authority_task.abort();
+        store.clear().await.unwrap();
+    }
+
+    /// Discovery comes before any stored credential is read, so an authority
+    /// that cannot be reached is a transient failure even with a token saved.
+    #[tokio::test]
+    async fn refresh_against_an_unreachable_authority_is_transient() {
+        let name = format!("refresh-unreachable-{}", uuid::Uuid::new_v4());
         let store = get_or_create_store(&name);
+        store
+            .save(make_test_token(
+                "test-access",
+                Some("test-refresh"),
+                Some(3600),
+            ))
+            .await
+            .unwrap();
 
-        let creds = make_test_token("test-access", Some("test-refresh"), Some(3600));
-        store.save(creds).await.unwrap();
+        let result = refresh_access_token(&name, "http://127.0.0.1:1/mcp", None).await;
 
-        // Point at a non-existent server — metadata discovery will fail.
-        let result = refresh_access_token(&name, "http://127.0.0.1:1", None).await;
         assert!(
             matches!(result, RefreshResult::TransientError(_)),
-            "expected TransientError, got {result:?}"
+            "{result:?}"
         );
-
-        // Clean up
         store.clear().await.unwrap();
     }
 
     #[tokio::test]
+
     async fn test_load_prefers_in_memory_cache_before_backing_stores() {
         let name = format!("oauth-cache-first-{}", std::process::id());
         let store = get_or_create_store(&name);
@@ -2592,11 +2504,11 @@ mod tests {
         let mut fresher_keyring =
             make_test_token("keyring-access", Some("keyring-refresh"), Some(3600));
         fresher_keyring.token_received_at = Some(200);
-        assert!(store.keyring_save(&fresher_keyring));
+        write_keyring_only(&store, &fresher_keyring).unwrap();
 
         let mut mirrored_file = make_test_token("file-access", Some("file-refresh"), Some(3600));
         mirrored_file.token_received_at = Some(100);
-        store.file_save(&mirrored_file).unwrap();
+        write_file_only(&store, &mirrored_file).unwrap();
         store.clear_cache();
 
         let debug_snapshot = store.fallback_auth_debug_snapshot();
@@ -2627,11 +2539,7 @@ mod tests {
             .save(credentials)
             .await
             .expect_err("an unavailable authoritative mirror must fail the save");
-        assert!(
-            error
-                .to_string()
-                .contains("failed to rename temp token file")
-        );
+        assert!(error.to_string().contains("failed to write token file"));
         assert!(
             store.keyring_load().is_none(),
             "failed mirror persistence must not publish a newer Keychain-only credential"
@@ -2662,22 +2570,6 @@ mod tests {
     }
 
     #[test]
-    fn unit_tests_do_not_use_the_real_plug_token_directory() {
-        let production = config::config_dir().join("tokens");
-        let actual = tokens_dir();
-
-        assert_ne!(
-            actual, production,
-            "tests must not write production OAuth files"
-        );
-        assert!(
-            actual.starts_with(std::env::temp_dir()),
-            "test OAuth files must stay under the system temp directory: {}",
-            actual.display()
-        );
-    }
-
-    #[test]
     fn choose_fresher_credentials_prefers_keyring_on_tied_timestamp_and_different_tokens() {
         let mut file = make_test_token("file-access", Some("file-refresh"), Some(3600));
         file.token_received_at = Some(100);
@@ -2704,7 +2596,7 @@ mod tests {
         store.clear().await.unwrap();
 
         let creds = make_test_token("file-only-access", Some("file-only-refresh"), Some(3600));
-        store.file_save(&creds).unwrap();
+        write_file_only(&store, &creds).unwrap();
         store.keyring_clear();
 
         let warnings = store.credential_snapshot().warnings;
@@ -2766,7 +2658,7 @@ mod tests {
             Some("legacy-keyring-refresh"),
             Some(3600),
         );
-        assert!(store.keyring_save(&credentials));
+        write_keyring_only(&store, &credentials).unwrap();
         store.file_clear();
         store.clear_cache();
         store.binding.store(Arc::new(Some(CredentialBinding {
@@ -2800,6 +2692,73 @@ mod tests {
         assert_eq!(file.generation, keyring.generation);
         assert_eq!(file.binding, keyring.binding);
 
+        store.clear().await.unwrap();
+    }
+
+    /// `plug auth login` and `plug auth inject` read a snapshot of a store
+    /// whose Keychain entry is bound but whose file mirror is gone. Decoding
+    /// that entry binds the store, so the snapshot must not try to write the
+    /// file by itself: a bound file needs the generation it shares with the
+    /// Keychain entry.
+    #[tokio::test]
+    async fn snapshot_of_a_bound_keychain_entry_without_its_file_does_not_panic() {
+        let name = format!("oauth-bound-keyring-snapshot-{}", uuid::Uuid::new_v4());
+        let writer = CompositeCredentialStore::new(name.clone());
+        writer.bind_verified_authority(&test_authority()).unwrap();
+        CredentialStore::save(
+            &writer,
+            make_test_token("bound-access", Some("refresh"), Some(3600)),
+        )
+        .await
+        .unwrap();
+        writer.file_clear();
+        let keyring_before = writer.raw_keyring_json();
+
+        let reader = CompositeCredentialStore::new(name);
+        let snapshot = reader.credential_snapshot();
+
+        assert_eq!(snapshot.source, Some("keyring"));
+        assert_eq!(
+            snapshot
+                .credentials
+                .as_ref()
+                .and_then(stored_access_token)
+                .as_deref(),
+            Some("bound-access")
+        );
+        assert!(reader.raw_file_json().is_none());
+        assert_eq!(reader.raw_keyring_json(), keyring_before);
+        reader.clear().await.unwrap();
+    }
+
+    /// The same read after `bind_discovered_authority`, with a stale legacy
+    /// file and newer legacy Keychain credentials.
+    #[tokio::test]
+    async fn snapshot_of_a_store_bound_by_discovery_does_not_panic() {
+        let name = format!("oauth-discovery-bound-snapshot-{}", uuid::Uuid::new_v4());
+        let store = CompositeCredentialStore::new(name);
+        let mut stale = make_test_token("stale-file", Some("refresh"), Some(3600));
+        stale.token_received_at = Some(100);
+        write_file_only(&store, &stale).unwrap();
+        write_keyring_only(
+            &store,
+            &make_test_token("newer-keyring", Some("refresh"), Some(3600)),
+        )
+        .unwrap();
+        store.bind_verified_authority(&test_authority()).unwrap();
+
+        let snapshot = store.credential_snapshot();
+
+        assert_eq!(snapshot.source, Some("keyring"));
+        assert_eq!(
+            store
+                .file_load()
+                .as_ref()
+                .and_then(stored_access_token)
+                .as_deref(),
+            Some("stale-file"),
+            "a bound store's file is rewritten only by a full pair save"
+        );
         store.clear().await.unwrap();
     }
 
@@ -2853,7 +2812,7 @@ mod tests {
             Some("keyring-only-refresh"),
             Some(3600),
         );
-        assert!(store.keyring_save(&credentials));
+        write_keyring_only(&store, &credentials).unwrap();
         store.file_clear();
         store.clear_cache();
 

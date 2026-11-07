@@ -11,30 +11,26 @@ public enum FrameCodec {
         frame.append(payload)
         return frame
     }
-
-    public static func decode<T: Decodable>(_ type: T.Type, from frame: Data, decoder: JSONDecoder = JSONDecoder()) throws -> T {
-        guard frame.count >= 4 else { throw PlugIPCError.truncatedFrame }
-        let length = frame.prefix(4).reduce(UInt32.zero) { ($0 << 8) | UInt32($1) }
-        guard length <= maximumPayloadSize else { throw PlugIPCError.frameTooLarge(Int(length)) }
-        guard frame.count == Int(length) + 4 else { throw PlugIPCError.truncatedFrame }
-        return try decoder.decode(type, from: frame.dropFirst(4))
-    }
 }
 
 public enum PlugIPCError: LocalizedError, Equatable {
     case frameTooLarge(Int)
-    case truncatedFrame
     case socketPathTooLong
     case timedOut
     case disconnected
     case systemCall(String, Int32)
+    /// The daemon refused with a code and a message.
     case daemon(String, String)
     case unexpectedResponse(String)
+
+    /// The code the daemon refuses a name already in use with
+    /// (`NameTaken::CODE` in `plug-core/src/operator.rs`). The response
+    /// golden `server_name_taken` holds the two to the same value.
+    public static let serverNameTaken = "SERVER_NAME_TAKEN"
 
     public var errorDescription: String? {
         switch self {
         case .frameTooLarge: "Plug sent an unexpectedly large response."
-        case .truncatedFrame: "Plug closed the connection mid-response."
         case .socketPathTooLong: "Plug's local socket path is too long."
         case .timedOut: "Plug did not respond before the local IPC deadline."
         case let .systemCall(name, code): "\(name) failed (\(code))."

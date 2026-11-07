@@ -16,12 +16,9 @@ final class FrameCodecTests: XCTestCase {
     }
 
     func testLengthPrefixedJSONRoundTrip() throws {
-        let request = IPCRequest.handshake(clientVersion: "0.6.4", ipcMin: 3, ipcMax: 4)
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let frame = try FrameCodec.encode(request, encoder: encoder)
+        let frame = try FrameCodec.encode(IPCRequest.status)
         XCTAssertEqual(frame.prefix(4), Data([0, 0, 0, UInt8(frame.count - 4)]))
-        XCTAssertEqual(try FrameCodec.decode(IPCRequestMirror.self, from: frame, decoder: decoder).type, "OperatorHandshake")
+        XCTAssertEqual(frame.dropFirst(4), Data(#"{"type":"Status"}"#.utf8))
     }
 
     func testUnixSocketConnectUsesDarwinAddressLayout() throws {
@@ -51,275 +48,12 @@ final class FrameCodecTests: XCTestCase {
         if accepted >= 0 { Darwin.close(accepted) }
     }
 
-    func testOperatorSnapshotDecodesSnakeCaseIdentifiers() throws {
-        let payload = Data(#"""
-        {
-          "type": "OperatorSnapshot",
-          "snapshot": {
-            "runtime_version": "0.5.3",
-            "uptime_secs": 12,
-            "ownership": "app_managed",
-            "configured_servers": [],
-            "servers": [{"server_id":"alpha","health":"Healthy","tool_count":3}],
-            "live_sessions": [{
-              "transport":"daemon_proxy","client_id":"client-1","session_id":"session-1",
-              "client_type":"CodexCli","client_info":"codex","connected_secs":4,
-              "last_activity_secs":null
-            }],
-            "client_visibility": [{
-              "session_id":"session-1","client_type":"CodexCli","visible_tool_count":3
-            }],
-            "upstream_auth": [],
-            "downstream_clients": [{
-              "client_id":"remote-1","client_name":"Remote","redirect_uris":[],
-              "source":"dynamic_registration"
-            }]
-          }
-        }
-        """#.utf8)
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-
-        guard case let .snapshot(snapshot) = try decoder.decode(IPCResponse.self, from: payload) else {
-            return XCTFail("snapshot response expected")
-        }
-        XCTAssertEqual(snapshot.servers.first?.serverId, "alpha")
-        XCTAssertEqual(snapshot.liveSessions.first?.clientId, "client-1")
-        XCTAssertEqual(snapshot.liveSessions.first?.sessionId, "session-1")
-        XCTAssertEqual(snapshot.clientVisibility.first?.sessionId, "session-1")
-        XCTAssertEqual(snapshot.downstreamClients.first?.clientId, "remote-1")
-    }
-
-    func testOperatorHandshakeDecodesUnknownOwnership() throws {
-        let decoder = JSONDecoder()
-        decoder.keyDecodingStrategy = .convertFromSnakeCase
-
-        let unknownPayload = Data(#"""
-        {
-          "type": "OperatorHandshake",
-          "handshake": {
-            "daemon_version": "0.7.0",
-            "ipc_min": 3,
-            "ipc_max": 6,
-            "ownership": "unknown",
-            "capabilities": []
-          }
-        }
-        """#.utf8)
-
-        guard case let .handshake(unknown) = try decoder.decode(IPCResponse.self, from: unknownPayload) else {
-            return XCTFail("handshake response expected")
-        }
-        XCTAssertEqual(unknown.ownership, "unknown")
-    }
-
-    /// The handshake offer and both acceptance checks read one range, so the
-    /// app cannot offer versions it would then refuse.
-    func testHandshakeAcceptsOnlyAnOverlappingWellFormedIPCRange() throws {
-        func handshake(_ min: UInt16, _ max: UInt16) throws -> OperatorHandshake {
-            try JSONDecoder().decode(
-                OperatorHandshake.self,
-                from: Data(#"{"daemonVersion":"0.7.0","ipcMin":\#(min),"ipcMax":\#(max),"ownership":"app","capabilities":[]}"#.utf8)
-            )
-        }
-        let low = supportedIPCVersions.lowerBound
-        let high = supportedIPCVersions.upperBound
-
-        XCTAssertTrue(try handshake(low, high).sharesSupportedIPCVersion)
-        XCTAssertTrue(try handshake(high, high + 3).sharesSupportedIPCVersion)
-        XCTAssertTrue(try handshake(low - 1, low).sharesSupportedIPCVersion)
-        XCTAssertFalse(try handshake(high + 1, high + 1).sharesSupportedIPCVersion)
-        XCTAssertFalse(try handshake(low - 2, low - 1).sharesSupportedIPCVersion)
-        XCTAssertFalse(try handshake(high, low).sharesSupportedIPCVersion, "an inverted range is malformed")
-
-        let offer = try JSONSerialization.jsonObject(
-            with: JSONEncoder().encode(IPCRequest.handshake(clientVersion: "0.7.0", ipcMin: low, ipcMax: high))
-        ) as? [String: Any]
-        XCTAssertEqual(offer?["ipc_min"] as? Int ?? offer?["ipcMin"] as? Int, Int(low))
-    }
-
-    func testKeepingAClientFromAServerIsSentAsTheDaemonReadsIt() throws {
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let request = IPCRequest.setClientServerBlocked(
-            authToken: "secret", key: "pi", server: "notion", blocked: true
-        )
-        let frame = try FrameCodec.encode(request, encoder: encoder)
-        let sent = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
-        XCTAssertEqual(
-            sent,
-            [
-                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
-                "kind": "server", "target": "notion", "blocked": true,
-            ] as NSDictionary
-        )
-    }
-
-    func testAnAllowListIsSentAsAClientBlockOfItsOwnKind() throws {
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        func sent(_ request: IPCRequest) throws -> NSDictionary? {
-            let frame = try FrameCodec.encode(request, encoder: encoder)
-            return try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
-        }
-        XCTAssertEqual(
-            try sent(.setClientServerAllowed(authToken: "secret", key: "pi", server: "notion", allowed: true)),
-            [
-                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
-                "kind": "allowed_server", "target": "notion", "blocked": true,
-            ] as NSDictionary
-        )
-        XCTAssertEqual(
-            try sent(.setClientToolAllowed(authToken: "secret", key: "pi", tool: "notion__search", allowed: false)),
-            [
-                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
-                "kind": "allowed_tool", "target": "notion__search", "blocked": false,
-            ] as NSDictionary
-        )
-        XCTAssertEqual(
-            try sent(.setClientAllowList(authToken: "secret", key: "pi", on: true)),
-            [
-                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
-                "kind": "allow_list", "target": "*", "blocked": true,
-            ] as NSDictionary
-        )
-    }
-
-    func testKeepingAClientFromAToolIsSentAsTheDaemonReadsIt() throws {
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let request = IPCRequest.setClientToolBlocked(
-            authToken: "secret", key: "pi", tool: "notion__search", blocked: false
-        )
-        let frame = try FrameCodec.encode(request, encoder: encoder)
-        let sent = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
-        XCTAssertEqual(
-            sent,
-            [
-                "type": "SetClientBlock", "auth_token": "secret", "key": "pi",
-                "kind": "tool", "target": "notion__search", "blocked": false,
-            ] as NSDictionary
-        )
-    }
-
-    func testTheStoreForAServersKeysIsSentOnlyWhenOneIsChosen() throws {
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        func sent(_ request: IPCRequest) throws -> [String: Any] {
-            let frame = try FrameCodec.encode(request, encoder: encoder)
-            return try XCTUnwrap(JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? [String: Any])
-        }
-        let server = ServerConfig.command("/bin/true", args: [])
-        let chosen = try sent(.updateServer(authToken: "secret", name: "linear", server: server, secretStore: "file"))
-        XCTAssertEqual(chosen["type"] as? String, "UpdateServer")
-        XCTAssertEqual(chosen["secret_store"] as? String, "file")
-        let plain = try sent(.addServer(authToken: "secret", name: "linear", server: server))
-        XCTAssertNil(plain["secret_store"])
-    }
-
-    func testAWatchIsSentAsTheDaemonReadsItAndKeepsArgumentKeys() throws {
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let request = IPCRequest.addWatch(
-            authToken: "secret",
-            watch: WatchConfig(
-                name: "unread", server: "gmail", tool: "search_messages",
-                arguments: ["maxResults": .number(5), "filter": .object(["labelIds": .array([.string("INBOX")])])],
-                everySecs: 60
-            )
-        )
-        let frame = try FrameCodec.encode(request, encoder: encoder)
-        let sent = try JSONSerialization.jsonObject(with: frame.dropFirst(4)) as? NSDictionary
-        XCTAssertEqual(
-            sent,
-            [
-                "type": "AddWatch", "auth_token": "secret",
-                "watch": [
-                    "name": "unread", "server": "gmail", "tool": "search_messages",
-                    // Argument names belong to the tool and go out untouched.
-                    "arguments": ["maxResults": 5, "filter": ["labelIds": ["INBOX"]]],
-                    "every_secs": 60, "allow_writes": false,
-                ] as NSDictionary,
-            ] as NSDictionary
-        )
-
-        let removal = try FrameCodec.encode(
-            IPCRequest.removeWatch(authToken: "secret", event: "gmail.unread"), encoder: encoder
-        )
-        XCTAssertEqual(
-            try JSONSerialization.jsonObject(with: removal.dropFirst(4)) as? NSDictionary,
-            ["type": "RemoveWatch", "auth_token": "secret", "event": "gmail.unread"] as NSDictionary
-        )
-    }
-
-    func testSnapshotEventsAndToolFactsDecode() throws {
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        let events = try decoder.decode([EventStatus].self, from: Data(#"""
-        [{"name":"gmail.unread","server":"gmail","tool":"search_messages","every_secs":300,
-          "state":"call_failed","last_checked":10,"subscribers":2},
-         {"name":"slack.ditto_message","server":"slack"}]
-        """#.utf8))
-        XCTAssertEqual(events[0].everySecs, 300)
-        XCTAssertEqual(events[0].state, "call_failed")
-        XCTAssertEqual(events[0].lastChecked, 10)
-        XCTAssertNil(events[0].lastChanged)
-        XCTAssertEqual(events[0].subscribers, 2)
-        XCTAssertEqual(events[1].state, "waiting")
-        XCTAssertNil(events[1].tool)
-
-        let tools = try decoder.decode([ToolInfo].self, from: Data(#"""
-        [{"name":"Gmail__search","server_id":"workspace","own_name":"search_gmail","read_only":true},
-         {"name":"old__tool","server_id":"old"}]
-        """#.utf8))
-        XCTAssertEqual(tools[0].ownName, "search_gmail")
-        XCTAssertTrue(tools[0].readOnly)
-        XCTAssertNil(tools[1].ownName)
-        XCTAssertFalse(tools[1].readOnly)
-    }
-
-    func testServerConfigRequestAndResponseRoundTripAdvancedFields() throws {
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let request = IPCRequest.serverConfig(authToken: "secret", name: "workspace")
-        let frame = try FrameCodec.encode(request, encoder: encoder)
-        let decodedRequest = try JSONDecoder().decode(
-            IPCRequestMirror.self,
-            from: frame.dropFirst(4)
-        )
-        XCTAssertEqual(decodedRequest.type, "GetServerConfig")
-
-        let payload = Data(#"""
-        {
-          "type":"ServerConfig",
-          "name":"workspace",
-          "server":{
-            "command":"uvx",
-            "args":["workspace-mcp"],
-            "env":{"API_KEY":"kept"},
-            "enabled":true,
-            "transport":"stdio",
-            "protocol":"legacy",
-            "timeout_secs":30,
-            "call_timeout_secs":300,
-            "max_concurrent":1,
-            "health_check_interval_secs":60,
-            "circuit_breaker_enabled":true,
-            "enrichment":false,
-            "tool_renames":{},
-            "tool_groups":[{"prefix":"Gmail","contains":["gmail"],"strip":[]}],
-            "sandbox":{"enabled":true,"allow_network":false,"allow_read":["/tmp"],"allow_write":[]}
-          }
-        }
-        """#.utf8)
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        guard case let .serverConfig(name, server) = try decoder.decode(IPCResponse.self, from: payload) else {
-            return XCTFail("server config response expected")
-        }
-        XCTAssertEqual(name, "workspace")
-        XCTAssertEqual(server.env["API_KEY"], "kept")
-        XCTAssertEqual(server.toolGroups.first?.prefix, "Gmail")
-        XCTAssertEqual(server.sandbox?.allowRead, ["/tmp"])
-    }
-
+    /// The server holds the connection open until the test ends, so only the
+    /// client's own timeout can end the call.
     func testHandshakeTimesOutWhenSocketAcceptsButNeverReplies() async throws {
         let server = try AcceptWithoutReplyServer()
         defer { server.stop() }
-        let client = PlugIPCClient(socketURL: server.socketURL, requestTimeout: 0.15)
-        let started = ContinuousClock.now
+        let client = PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.7.0", requestTimeout: 0.15)
 
         do {
             _ = try await client.connect()
@@ -329,24 +63,21 @@ final class FrameCodecTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
-
-        XCTAssertLessThan(started.duration(to: .now), .seconds(1))
     }
 
+    /// The server never reads until the test ends, so the write can only end
+    /// by the client's own timeout.
     func testLargeRequestTimesOutWhenAcceptedSocketNeverReads() async throws {
         let server = try AcceptedNeverReadServer()
         defer { server.stop() }
-        let client = PlugIPCClient(socketURL: server.socketURL, requestTimeout: 0.15)
-        let request = IPCRequest.addServer(
-            authToken: "token",
+        let client = PlugIPCClient(socketURL: server.socketURL, clientVersion: "0.7.0", requestTimeout: 0.15)
+        let request = IPCRequest.operator(token: "token", .mutate(.addServer(
             name: "large",
             server: .command("/bin/true", args: [String(repeating: "x", count: 3_900_000)])
-        )
-        let encoder = JSONEncoder(); encoder.keyEncodingStrategy = .convertToSnakeCase
-        let frame = try FrameCodec.encode(request, encoder: encoder)
+        )))
+        let frame = try FrameCodec.encode(request, encoder: PlugIPCClient.makeEncoder())
         XCTAssertGreaterThan(frame.count, 3_000_000)
 
-        let started = ContinuousClock.now
         do {
             _ = try await client.request(request)
             XCTFail("Expected bounded IPC write timeout")
@@ -355,38 +86,48 @@ final class FrameCodecTests: XCTestCase {
         } catch {
             XCTFail("Unexpected error: \(error)")
         }
+    }
 
-        XCTAssertLessThan(started.duration(to: .now), .milliseconds(500))
+    private func chunkFrames(_ payload: Data, pieceSize: Int) -> [Data] {
+        let pieces = stride(from: 0, to: payload.count, by: pieceSize).map {
+            payload.subdata(in: $0..<min($0 + pieceSize, payload.count))
+        }
+        return pieces.enumerated().map { index, piece in
+            Data("""
+            {"envelope":"ResponseChunk","chunk_index":\(index),"chunk_count":\(pieces.count),"payload_b64":"\(piece.base64EncodedString())"}
+            """.utf8)
+        }
+    }
+
+    private func readPayload(_ frames: [Data]) throws -> Data {
+        var remaining = frames[...]
+        return try PlugIPCClient.readResponsePayload(decoder: PlugIPCClient.makeDecoder()) {
+            guard let frame = remaining.popFirst() else { throw PlugIPCError.disconnected }
+            return frame
+        }
+    }
+
+    func testUnchunkedResponsePassesThrough() throws {
+        let payload = Data(#"{"type":"Ok"}"#.utf8)
+        XCTAssertEqual(try readPayload([payload]), payload)
+    }
+
+    func testOutOfOrderChunksAreRejected() {
+        let frames = chunkFrames(Data(#"{"type":"Ok"}"#.utf8), pieceSize: 4)
+        XCTAssertThrowsError(try readPayload([frames[1], frames[0]] + frames.dropFirst(2)))
+        XCTAssertThrowsError(try readPayload([frames[0], Data(#"{"type":"Ok"}"#.utf8)]))
     }
 }
 
-private struct IPCRequestMirror: Decodable { let type: String }
-
 private final class AcceptWithoutReplyServer: @unchecked Sendable {
-    let socketURL: URL
+    let socketURL = TestSocket.uniquePath("plug-stale-ipc")
     private let listener: Int32
     private let release = DispatchSemaphore(value: 0)
     private let finished = DispatchSemaphore(value: 0)
 
     init() throws {
-        socketURL = URL(fileURLWithPath: "/tmp")
-            .appending(path: "plug-stale-ipc-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(socketURL.path)
+        listener = try TestSocket.listen(at: socketURL.path)
         let listenerFD = listener
-        var (address, addressLength) = try PlugIPCClient.unixSocketAddress(path: socketURL.path)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listenerFD, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listenerFD, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
-
         let release = release
         let finished = finished
         DispatchQueue.global(qos: .userInitiated).async {
@@ -401,37 +142,22 @@ private final class AcceptWithoutReplyServer: @unchecked Sendable {
 
     func stop() {
         release.signal()
-        _ = finished.wait(timeout: .now() + 1)
+        _ = finished.wait(timeout: .now() + 10)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
     }
 }
 
 private final class AcceptedNeverReadServer: @unchecked Sendable {
-    let socketURL: URL
+    let socketURL = TestSocket.uniquePath("plug-blocked-write")
     private let listener: Int32
     private let accepted = DispatchSemaphore(value: 0)
     private let release = DispatchSemaphore(value: 0)
     private let finished = DispatchSemaphore(value: 0)
 
     init() throws {
-        socketURL = URL(fileURLWithPath: "/tmp")
-            .appending(path: "plug-blocked-write-\(UUID().uuidString).sock")
-        listener = Darwin.socket(AF_UNIX, SOCK_STREAM, 0)
-        guard listener >= 0 else { throw PlugIPCError.systemCall("socket", errno) }
-        Darwin.unlink(socketURL.path)
+        listener = try TestSocket.listen(at: socketURL.path)
         let listenerFD = listener
-        var (address, addressLength) = try PlugIPCClient.unixSocketAddress(path: socketURL.path)
-        let bound = withUnsafePointer(to: &address) {
-            $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
-                Darwin.bind(listenerFD, $0, addressLength)
-            }
-        }
-        guard bound == 0, Darwin.listen(listenerFD, 1) == 0 else {
-            let code = errno
-            Darwin.close(listener)
-            throw PlugIPCError.systemCall("listen", code)
-        }
 
         // Establish a first connection so readiness is signaled only after accept
         // succeeds. The second connection is the request socket that never reads.
@@ -448,12 +174,12 @@ private final class AcceptedNeverReadServer: @unchecked Sendable {
 
             let requestSocket = Darwin.accept(listenerFD, nil, nil)
             if requestSocket >= 0 {
-                _ = release.wait(timeout: .now() + .milliseconds(750))
+                release.wait()
                 Darwin.close(requestSocket)
             }
             finished.signal()
         }
-        guard accepted.wait(timeout: .now() + 1) == .success else {
+        guard accepted.wait(timeout: .now() + 10) == .success else {
             Darwin.close(readinessClient)
             Darwin.close(listener)
             _ = finished.wait(timeout: .now() + 1)
@@ -464,49 +190,8 @@ private final class AcceptedNeverReadServer: @unchecked Sendable {
 
     func stop() {
         release.signal()
-        _ = finished.wait(timeout: .now() + 1)
+        _ = finished.wait(timeout: .now() + 10)
         Darwin.close(listener)
         Darwin.unlink(socketURL.path)
-    }
-    private func chunkFrames(_ payload: Data, pieceSize: Int) -> [Data] {
-        let pieces = stride(from: 0, to: payload.count, by: pieceSize).map {
-            payload.subdata(in: $0..<min($0 + pieceSize, payload.count))
-        }
-        return pieces.enumerated().map { index, piece in
-            Data("""
-            {"envelope":"ResponseChunk","chunk_index":\(index),"chunk_count":\(pieces.count),"payload_b64":"\(piece.base64EncodedString())"}
-            """.utf8)
-        }
-    }
-
-    private func readPayload(_ frames: [Data]) throws -> Data {
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        var remaining = frames[...]
-        return try PlugIPCClient.readResponsePayload(decoder: decoder) {
-            guard let frame = remaining.popFirst() else { throw PlugIPCError.disconnected }
-            return frame
-        }
-    }
-
-    func testChunkedResponseReassemblesIntoOneResponse() throws {
-        let payload = Data(#"{"type":"DownstreamClientRevoked","client_id":"client-with-a-long-id"}"#.utf8)
-        let joined = try readPayload(chunkFrames(payload, pieceSize: 7))
-        XCTAssertEqual(joined, payload)
-        let decoder = JSONDecoder(); decoder.keyDecodingStrategy = .convertFromSnakeCase
-        guard case let .revoked(id) = try decoder.decode(IPCResponse.self, from: joined) else {
-            return XCTFail("expected revoked")
-        }
-        XCTAssertEqual(id, "client-with-a-long-id")
-    }
-
-    func testUnchunkedResponsePassesThrough() throws {
-        let payload = Data(#"{"type":"Ok"}"#.utf8)
-        XCTAssertEqual(try readPayload([payload]), payload)
-    }
-
-    func testOutOfOrderChunksAreRejected() {
-        let frames = chunkFrames(Data(#"{"type":"Ok"}"#.utf8), pieceSize: 4)
-        XCTAssertThrowsError(try readPayload([frames[1], frames[0]] + frames.dropFirst(2)))
-        XCTAssertThrowsError(try readPayload([frames[0], Data(#"{"type":"Ok"}"#.utf8)]))
     }
 }

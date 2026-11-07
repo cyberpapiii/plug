@@ -7,11 +7,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-pub const APP_BUNDLE_ID: &str = "com.cyberpapiii.plug";
-pub const DEVELOPER_TEAM_ID: &str = "HJF7LN64XX";
-
-const LOOP_MARKER: &str = "PLUG_APP_EXEC";
-const BUNDLE_EXECUTABLE: &str = "Contents/Resources/plug";
+use plug_core::paths::BUNDLED_BINARY;
+#[cfg(target_os = "macos")]
+use plug_core::paths::{APP_BUNDLE_ID, TEAM_ID};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifiedAppInstallation {
@@ -34,45 +32,6 @@ pub struct ShadowInstallation {
     pub kind: String,
     pub path: PathBuf,
     pub verified_plug_owned: bool,
-}
-
-#[derive(Clone, Debug, Serialize)]
-pub struct UnifiedInstallSnapshot {
-    pub app: Option<VerifiedAppInstallation>,
-    pub shell_resolution: Option<PathBuf>,
-    pub daemon_version: Option<String>,
-    pub daemon_executable: Option<PathBuf>,
-    pub ownership: plug_core::ipc::DaemonOwnershipMode,
-    pub linked_clients: Vec<crate::commands::clients::ClientRepairItem>,
-    pub adapters: Vec<AdapterVersionState>,
-    pub shadows: Vec<ShadowInstallation>,
-    pub launchd_jobs: Vec<crate::service::LaunchdJobRecord>,
-    pub daemon_inspection_complete: bool,
-    pub adapter_inspection_complete: bool,
-    pub launchd_inspection_complete: bool,
-    pub app_service_daemon_invocation_verified: bool,
-    pub inspection_errors: Vec<String>,
-    pub client_repair_needed: bool,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct UninstallCleanupItem {
-    pub kind: String,
-    pub path: Option<PathBuf>,
-    pub label: Option<String>,
-    pub changed: bool,
-    pub message: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
-pub struct UninstallCleanupReport {
-    pub items: Vec<UninstallCleanupItem>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CleanupLaunchdPlan {
-    remove_labels: Vec<String>,
-    preserved: Vec<UninstallCleanupItem>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -115,7 +74,7 @@ pub fn canonical_client_command() -> Result<PathBuf> {
     let production_macos = true;
     #[cfg(not(target_os = "macos"))]
     let production_macos = false;
-    let dev = std::env::var_os("PLUG_DEV").as_deref() == Some(OsStr::new("1"));
+    let dev = plug_core::paths::is_development();
     canonical_client_command_from(app.as_ref(), &current, dev, production_macos)
 }
 
@@ -136,48 +95,26 @@ fn canonical_client_command_from(
     )
 }
 
-#[allow(dead_code)] // Exposed for focused decision tests and diagnostic callers.
-pub fn delegation_decision(
+/// The app's own executable stays, so the exec below cannot loop.
+fn delegation_decision(
     current: &Path,
     app: Option<&VerifiedAppInstallation>,
     dev: bool,
-) -> Result<DelegationDecision> {
-    delegation_decision_with_loop(current, app, dev, false)
-}
-
-fn delegation_decision_with_loop(
-    current: &Path,
-    app: Option<&VerifiedAppInstallation>,
-    dev: bool,
-    loop_marker: bool,
-) -> Result<DelegationDecision> {
-    let Some(app) = app else {
-        return Ok(DelegationDecision::Stay);
-    };
-    if dev {
-        return Ok(DelegationDecision::Stay);
+) -> DelegationDecision {
+    match app {
+        Some(app) if !dev && !paths_match(current, &app.executable_path) => {
+            DelegationDecision::Exec(app.executable_path.clone())
+        }
+        _ => DelegationDecision::Stay,
     }
-
-    // The marker is intentionally not an externally usable bypass: a forged
-    // marker on a standalone executable still delegates. The canonical path
-    // comparison is the durable loop guard after exec.
-    if loop_marker && paths_match(current, &app.executable_path) {
-        return Ok(DelegationDecision::Stay);
-    }
-
-    if paths_match(current, &app.executable_path) {
-        return Ok(DelegationDecision::Stay);
-    }
-
-    Ok(DelegationDecision::Exec(app.executable_path.clone()))
 }
 
 /// Re-exec a standalone macOS command through a freshly verified Plug.app.
-/// This must run before dotenv loading and Clap parsing.
+/// This must run before Clap parsing.
 pub fn maybe_delegate_to_app() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
-        let dev = std::env::var_os("PLUG_DEV").as_deref() == Some(OsStr::new("1"));
+        let dev = plug_core::paths::is_development();
         if dev {
             return Ok(());
         }
@@ -192,14 +129,13 @@ pub fn maybe_delegate_to_app() -> Result<()> {
         // every single invocation. Bundle integrity is owned by `plug doctor`
         // and by the app's own installation reconciliation, both of which
         // still run the full check.
-        if running_as_bundle_executable(&current) {
+        if is_app_executable(&current) {
             return Ok(());
         }
 
         let app = resolve_verified_app()?;
-        let loop_marker = std::env::var_os(LOOP_MARKER).is_some();
 
-        match delegation_decision_with_loop(&current, app.as_ref(), false, loop_marker)? {
+        match delegation_decision(&current, app.as_ref(), false) {
             DelegationDecision::Stay => Ok(()),
             DelegationDecision::Exec(executable) => {
                 use std::{io, os::unix::process::CommandExt, process::Stdio};
@@ -207,7 +143,6 @@ pub fn maybe_delegate_to_app() -> Result<()> {
                 let mut command = Command::new(&executable);
                 command
                     .args(std::env::args_os().skip(1))
-                    .env(LOOP_MARKER, "1")
                     .stdin(Stdio::inherit())
                     .stdout(Stdio::inherit())
                     .stderr(Stdio::inherit());
@@ -230,17 +165,17 @@ pub fn maybe_delegate_to_app() -> Result<()> {
     Ok(())
 }
 
-/// Whether the running executable is the embedded executable of some Plug.app.
+/// Whether `path` is the embedded executable of some Plug.app, wherever the
+/// app is.
 ///
 /// Local bundle paths are checked before the LaunchServices query because the
 /// canonical install is one of them, and answering from a path comparison
 /// alone keeps the common case free of any system call beyond `canonicalize`.
-#[cfg(target_os = "macos")]
-pub(crate) fn running_as_bundle_executable(current: &Path) -> bool {
+pub(crate) fn is_app_executable(path: &Path) -> bool {
     fallback_bundle_paths()
         .into_iter()
         .chain(std::iter::once_with(registered_bundle_paths).flatten())
-        .any(|bundle| paths_match(current, &bundle.join(BUNDLE_EXECUTABLE)))
+        .any(|bundle| paths_match(path, &bundle.join(BUNDLED_BINARY)))
 }
 
 /// Whether two paths name the same file once symlinks are resolved.
@@ -258,29 +193,55 @@ pub(crate) fn paths_match(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn bounded_output(
+pub(crate) fn bounded_output(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
+    use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().context("could not start bounded command")?;
+    // Read both pipes while the command runs: one that prints more than a
+    // pipe holds blocks on the write and never exits.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
     let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .context("could not collect command output");
+    // Most commands finish in a few milliseconds, so the first checks come
+    // quickly and later ones back off.
+    let mut pause = std::time::Duration::from_millis(1);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("command timed out after {}ms", timeout.as_millis());
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(20));
+    };
+    let collected = |reader: std::thread::JoinHandle<Vec<u8>>| {
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("could not collect command output"))
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: collected(stdout)?,
+        stderr: collected(stderr)?,
+    })
 }
 
 /// Resolve the command a normal interactive login shell will execute.
@@ -347,22 +308,14 @@ fn verify_shadow_identity(path: &Path) -> bool {
 pub fn discover_shadow_installations(
     app: Option<&VerifiedAppInstallation>,
 ) -> Vec<ShadowInstallation> {
-    let mut candidates = Vec::new();
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(("cargo", home.join(".cargo/bin/plug")));
-    }
-    candidates.push(("homebrew", PathBuf::from("/opt/homebrew/bin/plug")));
-    candidates.push(("homebrew", PathBuf::from("/usr/local/bin/plug")));
-    for cellar in ["/opt/homebrew/Cellar/plug", "/usr/local/Cellar/plug"] {
-        if let Ok(versions) = std::fs::read_dir(cellar) {
-            for version in versions.flatten() {
-                candidates.push(("homebrew_formula", version.path().join("bin/plug")));
-            }
-        }
-    }
-
+    let mut candidates: Vec<(&str, PathBuf)> = crate::legacy_programs::legacy_program_candidates()
+        .into_iter()
+        .map(|path| (shadow_kind(&path), path))
+        .collect();
     candidates.sort_by(|left, right| left.1.cmp(&right.1));
-    candidates.dedup_by(|left, right| left.1 == right.1);
+    // `opt/plug/bin/plug` links into the Cellar; report each file once.
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|(_, path)| seen.insert(std::fs::canonicalize(path).unwrap_or(path.clone())));
     candidates
         .into_iter()
         .filter(|(_, path)| path.exists())
@@ -375,258 +328,21 @@ pub fn discover_shadow_installations(
         .collect()
 }
 
-fn cleanup_command_link(
-    path: &Path,
-    app: Option<&VerifiedAppInstallation>,
-) -> Result<UninstallCleanupItem> {
-    let base = UninstallCleanupItem {
-        kind: "command_link".to_string(),
-        path: Some(path.to_path_buf()),
-        label: None,
-        changed: false,
-        message: String::new(),
-    };
-    let Ok(metadata) = std::fs::symlink_metadata(path) else {
-        return Ok(UninstallCleanupItem {
-            message: "Command link was absent; nothing changed.".to_string(),
-            ..base
-        });
-    };
-    if !metadata.file_type().is_symlink() {
-        return Ok(UninstallCleanupItem {
-            message: "Unknown command file was left untouched.".to_string(),
-            ..base
-        });
-    }
-    let Some(app) = app else {
-        return Ok(UninstallCleanupItem {
-            message: "Command link ownership could not be proven; left untouched.".to_string(),
-            ..base
-        });
-    };
-    let target = std::fs::read_link(path)?;
-    let resolved = if target.is_absolute() {
-        target
+/// How an older Plug at `path` was installed, by where it is.
+fn shadow_kind(path: &Path) -> &'static str {
+    let text = path.to_string_lossy();
+    if text.contains("/Cellar/") {
+        "homebrew_formula"
+    } else if text.contains("/.cargo/") {
+        "cargo"
+    } else if text.starts_with("/opt/homebrew/") || text.starts_with("/usr/local/") {
+        "homebrew"
     } else {
-        path.parent().unwrap_or_else(|| Path::new(".")).join(target)
-    };
-    if !paths_match(&resolved, &app.executable_path) {
-        return Ok(UninstallCleanupItem {
-            message: "Command link does not target the verified Plug.app; left untouched."
-                .to_string(),
-            ..base
-        });
-    }
-    std::fs::remove_file(path)?;
-    Ok(UninstallCleanupItem {
-        changed: true,
-        message: "Removed the verified Plug.app command link.".to_string(),
-        ..base
-    })
-}
-
-fn cleanup_launchd_plan(
-    jobs: &[crate::service::LaunchdJobRecord],
-    app: Option<&VerifiedAppInstallation>,
-    proven_daemon_invocations: &std::collections::BTreeSet<String>,
-) -> CleanupLaunchdPlan {
-    let mut remove_labels = Vec::new();
-    let mut preserved = Vec::new();
-    for job in jobs {
-        if job.label == "com.plug.daemon"
-            && proven_daemon_invocations.contains(&job.label)
-            && matches!(
-                crate::service::classify_launchd_program(
-                    job,
-                    app.map(|app| app.executable_path.as_path())
-                ),
-                crate::service::LaunchdProgramOwnership::CurrentApp
-            )
-        {
-            remove_labels.push(job.label.clone());
-        } else {
-            preserved.push(UninstallCleanupItem {
-                kind: "launchd_job".to_string(),
-                path: Some(job.program.clone()),
-                label: Some(job.label.clone()),
-                changed: false,
-                message: "Launchd job ownership was not proven app-owned; left untouched."
-                    .to_string(),
-            });
-        }
-    }
-    CleanupLaunchdPlan {
-        remove_labels,
-        preserved,
+        "local"
     }
 }
 
-/// Whether a launchd job is one plug could own.
-///
-/// Matching a label that merely *ends* in `.plug` sweeps in jobs that only
-/// mention plug: `local.claude-rc.plug` runs `claude remote-control` with this
-/// repo as its working directory, and `plug doctor` reported it as an unknown
-/// job on every run. A job plug owns either sits in plug's own label namespace
-/// or runs a binary called `plug`; the historical labels (`com.plug.daemon`,
-/// `com.plug.serve`) are both inside that namespace.
-pub fn is_plug_launchd_candidate(job: &crate::service::LaunchdJobRecord) -> bool {
-    job.label.to_ascii_lowercase().starts_with("com.plug.")
-        || job.program.file_name().and_then(|name| name.to_str()) == Some("plug")
-}
-
-fn receive_launchd_discovery(
-    receiver: std::sync::mpsc::Receiver<anyhow::Result<Vec<crate::service::LaunchdJobRecord>>>,
-    timeout: std::time::Duration,
-) -> Result<Vec<crate::service::LaunchdJobRecord>> {
-    receiver
-        .recv_timeout(timeout)
-        .map_err(|error| match error {
-            std::sync::mpsc::RecvTimeoutError::Timeout => {
-                anyhow::anyhow!(
-                    "launchd inspection timed out after {}ms",
-                    timeout.as_millis()
-                )
-            }
-            std::sync::mpsc::RecvTimeoutError::Disconnected => {
-                anyhow::anyhow!("launchd inspection worker stopped unexpectedly")
-            }
-        })?
-}
-
-pub fn discover_launchd_jobs_bounded(
-    timeout: std::time::Duration,
-) -> Result<Vec<crate::service::LaunchdJobRecord>> {
-    let (sender, receiver) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = sender.send(crate::service::discover_launchd_jobs());
-    });
-    receive_launchd_discovery(receiver, timeout)
-}
-
-fn login_user_id() -> Result<String> {
-    let uid = bounded_output(
-        {
-            let mut command = Command::new("/usr/bin/id");
-            command.arg("-u");
-            command
-        },
-        std::time::Duration::from_secs(2),
-    )?;
-    ensure!(uid.status.success(), "could not determine login user id");
-    Ok(String::from_utf8(uid.stdout)?.trim().to_string())
-}
-
-pub fn prove_app_daemon_invocation(label: &str, app: &VerifiedAppInstallation) -> Result<bool> {
-    if label != "com.plug.daemon" {
-        return Ok(false);
-    }
-    let uid = login_user_id()?;
-    let mut command = Command::new("/bin/launchctl");
-    command.args(["print", &format!("gui/{uid}/{label}")]);
-    let output = bounded_output(command, std::time::Duration::from_secs(2))?;
-    if !output.status.success() {
-        return Ok(false);
-    }
-    let output = String::from_utf8(output.stdout)?;
-    let has_daemon_arguments = output
-        .lines()
-        .map(str::trim)
-        .collect::<Vec<_>>()
-        .windows(2)
-        .any(|lines| lines == ["serve", "--daemon"]);
-    let identifies_app = output.contains("parent bundle identifier = com.cyberpapiii.plug")
-        || output.contains(&format!("program = {}", app.executable_path.display()));
-    Ok(has_daemon_arguments && identifies_app)
-}
-
-/// Remove only installation artifacts positively proven to belong to the
-/// currently verified Plug.app. Configuration and credentials are untouched.
-pub fn uninstall_cleanup() -> Result<UninstallCleanupReport> {
-    let mut items = Vec::new();
-    let app = match resolve_verified_app() {
-        Ok(app) => app,
-        Err(error) => {
-            items.push(UninstallCleanupItem {
-                kind: "app_verification".to_string(),
-                path: None,
-                label: None,
-                changed: false,
-                message: format!("Plug.app verification failed; all unknown files and jobs were left untouched: {error}"),
-            });
-            None
-        }
-    };
-    let command_path = dirs::home_dir()
-        .unwrap_or_else(|| PathBuf::from("."))
-        .join(".local/bin/plug");
-    items.push(cleanup_command_link(&command_path, app.as_ref())?);
-
-    let jobs = match discover_launchd_jobs_bounded(std::time::Duration::from_secs(4)) {
-        Ok(jobs) => jobs.into_iter().filter(is_plug_launchd_candidate).collect(),
-        Err(error) => {
-            items.push(UninstallCleanupItem {
-                kind: "launchd_discovery".to_string(),
-                path: None,
-                label: None,
-                changed: false,
-                message: format!("Launchd jobs could not be proven; left untouched: {error}"),
-            });
-            Vec::new()
-        }
-    };
-    let mut proven_daemon_invocations = std::collections::BTreeSet::new();
-    if let Some(app) = app.as_ref() {
-        for job in &jobs {
-            if prove_app_daemon_invocation(&job.label, app).unwrap_or(false) {
-                proven_daemon_invocations.insert(job.label.clone());
-            }
-        }
-    }
-    let plan = cleanup_launchd_plan(&jobs, app.as_ref(), &proven_daemon_invocations);
-    items.extend(plan.preserved);
-    if !plan.remove_labels.is_empty() {
-        let uid = login_user_id()?;
-        for label in plan.remove_labels {
-            let mut command = Command::new("/bin/launchctl");
-            command.args(["bootout", &format!("gui/{uid}/{label}")]);
-            let output = bounded_output(command, std::time::Duration::from_secs(5));
-            match output {
-                Ok(output) if output.status.success() => items.push(UninstallCleanupItem {
-                    kind: "launchd_job".to_string(),
-                    path: app.as_ref().map(|app| app.executable_path.clone()),
-                    label: Some(label),
-                    changed: true,
-                    message: "Unregistered the verified Plug.app launchd service.".to_string(),
-                }),
-                Ok(output) => items.push(UninstallCleanupItem {
-                    kind: "launchd_job".to_string(),
-                    path: app.as_ref().map(|app| app.executable_path.clone()),
-                    label: Some(label),
-                    changed: false,
-                    message: format!(
-                        "Verified app-owned launchd service could not be unregistered; left registered: {}",
-                        String::from_utf8_lossy(&output.stderr).trim()
-                    ),
-                }),
-                Err(error) => items.push(UninstallCleanupItem {
-                    kind: "launchd_job".to_string(),
-                    path: app.as_ref().map(|app| app.executable_path.clone()),
-                    label: Some(label),
-                    changed: false,
-                    message: format!("Verified app-owned launchd service could not be unregistered; left registered: {error}"),
-                }),
-            }
-        }
-    }
-    Ok(UninstallCleanupReport { items })
-}
-
-fn verify_candidate(
-    bundle_version: &str,
-    executable_version: &str,
-    signature_valid: bool,
-) -> Result<()> {
-    ensure!(signature_valid, "Plug.app signature verification failed");
+fn verify_candidate(bundle_version: &str, executable_version: &str) -> Result<()> {
     ensure!(
         bundle_version == executable_version,
         "Plug.app version {bundle_version} does not match embedded plug version {executable_version}"
@@ -650,7 +366,12 @@ fn registered_bundle_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
+/// Only macOS has LaunchServices to ask.
+#[cfg(not(target_os = "macos"))]
+fn registered_bundle_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn fallback_bundle_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/Applications/Plug.app")];
     if let Some(home) = dirs::home_dir() {
@@ -661,7 +382,7 @@ fn fallback_bundle_paths() -> Vec<PathBuf> {
 
 #[cfg(target_os = "macos")]
 fn verify_app_bundle(bundle_path: &Path) -> Result<VerifiedAppInstallation> {
-    let executable_path = bundle_path.join(BUNDLE_EXECUTABLE);
+    let executable_path = bundle_path.join(BUNDLED_BINARY);
     ensure!(
         executable_path.is_file(),
         "Plug.app is missing its embedded executable {}",
@@ -671,7 +392,7 @@ fn verify_app_bundle(bundle_path: &Path) -> Result<VerifiedAppInstallation> {
     verify_codesign(bundle_path)?;
     let bundle_version = bundle_version(bundle_path)?;
     let executable_version = executable_version(&executable_path)?;
-    verify_candidate(&bundle_version, &executable_version, true)?;
+    verify_candidate(&bundle_version, &executable_version)?;
 
     Ok(VerifiedAppInstallation {
         bundle_path: bundle_path.to_path_buf(),
@@ -710,7 +431,7 @@ fn codesign_requirement_argument() -> String {
     // argv element. Passing "-R" and the expression separately makes codesign
     // interpret the expression as a file path.
     format!(
-        "-R=anchor apple generic and identifier \"{APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{DEVELOPER_TEAM_ID}\""
+        "-R=anchor apple generic and identifier \"{APP_BUNDLE_ID}\" and certificate leaf[subject.OU] = \"{TEAM_ID}\""
     )
 }
 
@@ -757,12 +478,27 @@ fn version_probe_command(executable_path: &Path) -> Command {
     // A production executable normally resolves and verifies Plug.app before
     // parsing arguments. The verifier is already checking that same signed
     // bundle, so a nested --version probe must not enter delegation again.
-    command.arg("--version").env("PLUG_DEV", "1");
+    command.arg("--version").env(plug_core::paths::DEV_ENV, "1");
     command
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bounded_command_may_print_more_than_a_pipe_holds() {
+        // `launchctl print gui/<uid>` prints over 100 KB; a pipe holds 64 KB.
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "head -c 200000 /dev/zero; head -c 100000 /dev/zero >&2",
+        ]);
+        let output = super::bounded_output(command, std::time::Duration::from_secs(5))
+            .expect("the command finishes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 100_000);
+    }
+
     use std::path::{Path, PathBuf};
 
     use super::{
@@ -773,7 +509,7 @@ mod tests {
     fn app(path: impl Into<PathBuf>) -> VerifiedAppInstallation {
         let bundle_path = path.into();
         VerifiedAppInstallation {
-            executable_path: bundle_path.join("Contents/Resources/plug"),
+            executable_path: plug_core::paths::bundled_binary(&bundle_path),
             bundle_path,
             version: "0.6.4".into(),
         }
@@ -782,7 +518,7 @@ mod tests {
     #[test]
     fn absent_app_stays() {
         assert_eq!(
-            delegation_decision(Path::new("/usr/local/bin/plug"), None, false).unwrap(),
+            delegation_decision(Path::new("/usr/local/bin/plug"), None, false),
             DelegationDecision::Stay,
         );
     }
@@ -791,7 +527,7 @@ mod tests {
     fn bundle_executable_stays() {
         let app = app("/Applications/Plug.app");
         assert_eq!(
-            delegation_decision(&app.executable_path, Some(&app), false).unwrap(),
+            delegation_decision(&app.executable_path, Some(&app), false),
             DelegationDecision::Stay,
         );
     }
@@ -800,7 +536,7 @@ mod tests {
     fn stray_executable_delegates_to_verified_bundle() {
         let app = app("/Applications/Plug.app");
         assert_eq!(
-            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), false).unwrap(),
+            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), false),
             DelegationDecision::Exec(app.executable_path),
         );
     }
@@ -809,33 +545,23 @@ mod tests {
     fn development_mode_stays() {
         let app = app("/Applications/Plug.app");
         assert_eq!(
-            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), true).unwrap(),
+            delegation_decision(Path::new("/opt/homebrew/bin/plug"), Some(&app), true),
             DelegationDecision::Stay,
         );
     }
 
     #[test]
     fn mismatched_versions_and_invalid_signatures_fail_verification() {
-        assert!(verify_candidate("0.6.4", "0.6.5", true).is_err());
-        assert!(verify_candidate("0.6.4", "0.6.4", false).is_err());
+        assert!(verify_candidate("0.6.4", "0.6.5").is_err());
+        assert!(verify_candidate("0.6.4", "0.6.4").is_ok());
     }
 
     #[test]
     fn moved_registered_app_delegates() {
         let app = app("/Volumes/External Applications/Plug.app");
         assert_eq!(
-            delegation_decision(Path::new("/usr/local/bin/plug"), Some(&app), false).unwrap(),
+            delegation_decision(Path::new("/usr/local/bin/plug"), Some(&app), false),
             DelegationDecision::Exec(app.executable_path),
-        );
-    }
-
-    #[test]
-    fn loop_marker_prevents_a_second_delegation() {
-        let app = app("/Applications/Plug.app");
-        assert_eq!(
-            super::delegation_decision_with_loop(&app.executable_path, Some(&app), false, true,)
-                .unwrap(),
-            DelegationDecision::Stay,
         );
     }
 
@@ -878,8 +604,8 @@ mod tests {
     fn codesign_requirement_is_one_option_argument() {
         let argument = super::codesign_requirement_argument();
         assert!(argument.starts_with("-R=anchor apple generic"));
-        assert!(argument.contains(super::APP_BUNDLE_ID));
-        assert!(argument.contains(super::DEVELOPER_TEAM_ID));
+        assert!(argument.contains(plug_core::paths::APP_BUNDLE_ID));
+        assert!(argument.contains(plug_core::paths::TEAM_ID));
     }
 
     #[cfg(target_os = "macos")]
@@ -887,11 +613,7 @@ mod tests {
     fn embedded_version_probe_does_not_reenter_app_delegation() {
         use std::os::unix::fs::PermissionsExt;
 
-        let probe = std::env::temp_dir().join(format!(
-            "plug-version-probe-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
+        let probe = plug_core::paths::test::scratch("version-probe").join("plug");
         std::fs::write(
             &probe,
             "#!/bin/sh\nif [ \"${PLUG_DEV:-}\" = 1 ]; then echo 'plug 0.7.1'; exit 0; fi\nexec \"$0\"\n",
@@ -900,138 +622,17 @@ mod tests {
         std::fs::set_permissions(&probe, std::fs::Permissions::from_mode(0o700)).unwrap();
 
         assert_eq!(super::executable_version(&probe).unwrap(), "0.7.1");
-        std::fs::remove_file(probe).unwrap();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn uninstall_cleanup_removes_only_symlink_to_verified_app() {
-        use std::os::unix::fs::symlink;
-
-        let root = std::env::temp_dir().join(format!(
-            "plug-uninstall-cleanup-{}-{}",
-            std::process::id(),
-            std::thread::current().name().unwrap_or("test")
-        ));
-        let app = app(root.join("Plug.app"));
-        std::fs::create_dir_all(app.executable_path.parent().unwrap()).unwrap();
-        std::fs::write(&app.executable_path, "plug").unwrap();
-        let link = root.join("bin/plug");
-        std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-        symlink(&app.executable_path, &link).unwrap();
-
-        let outcome = super::cleanup_command_link(&link, Some(&app)).unwrap();
-        assert!(outcome.changed);
-        assert!(!link.exists());
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn uninstall_cleanup_reports_unknown_file_and_leaves_it_untouched() {
-        let root =
-            std::env::temp_dir().join(format!("plug-uninstall-unknown-{}", std::process::id()));
-        std::fs::create_dir_all(&root).unwrap();
-        let path = root.join("plug");
-        std::fs::write(&path, "unrelated").unwrap();
-
-        let outcome = super::cleanup_command_link(&path, None).unwrap();
-        assert!(!outcome.changed);
-        assert!(outcome.message.contains("left untouched"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "unrelated");
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn uninstall_cleanup_plans_only_proven_app_owned_launchd_jobs() {
-        let app = app("/Applications/Plug.app");
-        let jobs = vec![
-            crate::service::LaunchdJobRecord {
-                label: "com.plug.daemon".to_string(),
-                program: app.executable_path.clone(),
-            },
-            crate::service::LaunchdJobRecord {
-                label: "local.plug.unknown".to_string(),
-                program: PathBuf::from("/Applications/Other.app/other"),
-            },
-        ];
-
-        let proven = std::collections::BTreeSet::from(["com.plug.daemon".to_string()]);
-        let plan = super::cleanup_launchd_plan(&jobs, Some(&app), &proven);
-        assert_eq!(plan.remove_labels, vec!["com.plug.daemon"]);
-        assert_eq!(plan.preserved.len(), 1);
-        assert!(plan.preserved[0].message.contains("left untouched"));
-    }
-
-    #[test]
-    fn uninstall_cleanup_preserves_unknown_label_targeting_current_app() {
-        let app = app("/Applications/Plug.app");
-        let jobs = vec![crate::service::LaunchdJobRecord {
-            label: "unknown.helper".to_string(),
-            program: app.executable_path.clone(),
-        }];
-        let proven = std::collections::BTreeSet::from(["unknown.helper".to_string()]);
-        let plan = super::cleanup_launchd_plan(&jobs, Some(&app), &proven);
-        assert!(plan.remove_labels.is_empty());
-        assert_eq!(plan.preserved.len(), 1);
-        assert!(plan.preserved[0].message.contains("left untouched"));
-    }
-
-    #[test]
-    fn uninstall_cleanup_preserves_canonical_label_without_daemon_invocation_proof() {
-        let app = app("/Applications/Plug.app");
-        let jobs = vec![crate::service::LaunchdJobRecord {
-            label: "com.plug.daemon".to_string(),
-            program: app.executable_path.clone(),
-        }];
-        let plan =
-            super::cleanup_launchd_plan(&jobs, Some(&app), &std::collections::BTreeSet::new());
-        assert!(plan.remove_labels.is_empty());
-        assert_eq!(plan.preserved.len(), 1);
-    }
-
-    #[test]
-    fn launchd_discovery_timeout_fails_closed() {
-        let (_sender, receiver) = std::sync::mpsc::channel();
-        let result =
-            super::receive_launchd_discovery(receiver, std::time::Duration::from_millis(1));
-        assert!(result.unwrap_err().to_string().contains("timed out"));
-    }
-
-    #[test]
-    fn uninstall_cleanup_candidate_filter_ignores_unrelated_plugin_jobs() {
-        let unrelated = crate::service::LaunchdJobRecord {
-            label: "com.apple.XprotectFramework.PluginService".to_string(),
-            program: PathBuf::from("/System/Library/XProtectPluginService"),
-        };
-        // Named after the working directory it runs in, not after plug: the
-        // program is `claude`, so this job is nothing plug should report on.
-        let claude_remote_control = crate::service::LaunchdJobRecord {
-            label: "local.claude-rc.plug".to_string(),
-            program: PathBuf::from("/Users/example/.local/bin/claude"),
-        };
-        let legacy_serve = crate::service::LaunchdJobRecord {
-            label: "com.plug.serve".to_string(),
-            program: PathBuf::from("/Users/example/.cargo/bin/plug"),
-        };
-        let relabelled = crate::service::LaunchdJobRecord {
-            label: "local.something.else".to_string(),
-            program: PathBuf::from("/Users/example/.local/bin/plug"),
-        };
-        assert!(!super::is_plug_launchd_candidate(&unrelated));
-        assert!(!super::is_plug_launchd_candidate(&claude_remote_control));
-        assert!(super::is_plug_launchd_candidate(&legacy_serve));
-        assert!(super::is_plug_launchd_candidate(&relabelled));
     }
 
     #[test]
     #[cfg(target_os = "macos")]
     fn bundle_executables_skip_delegation_verification() {
         for bundle in super::fallback_bundle_paths() {
-            assert!(super::running_as_bundle_executable(
-                &bundle.join(super::BUNDLE_EXECUTABLE)
+            assert!(super::is_app_executable(
+                &bundle.join(plug_core::paths::BUNDLED_BINARY)
             ));
         }
-        assert!(!super::running_as_bundle_executable(std::path::Path::new(
+        assert!(!super::is_app_executable(std::path::Path::new(
             "/usr/local/bin/plug"
         )));
     }

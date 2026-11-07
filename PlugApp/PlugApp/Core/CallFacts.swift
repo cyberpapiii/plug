@@ -16,9 +16,19 @@ struct CallFacts: Equatable, Sendable {
     let grantName: String?
     /// Where the owner says this client runs.
     let place: String?
+    /// What joins a server's prefix to a tool's own name. Empty leaves the
+    /// name whole, for a reader that only asks how a call went.
+    let delimiter: String
 
-    init(_ event: ActivityEvent, ownerName: String? = nil, grantName: String? = nil, place: String? = nil) {
+    init(
+        _ event: ActivityEvent,
+        delimiter: String = "",
+        ownerName: String? = nil,
+        grantName: String? = nil,
+        place: String? = nil
+    ) {
         self.event = event
+        self.delimiter = delimiter
         self.ownerName = ownerName
         self.grantName = grantName
         self.place = place
@@ -30,58 +40,51 @@ struct CallFacts: Equatable, Sendable {
         return "\(caller) (\(place))"
     }
 
-    var succeeded: Bool { event.outcome == "success" }
+    var succeeded: Bool { event.outcome == .success }
     /// The client stopped the call. Nothing went wrong, so it is not a problem.
-    var cancelled: Bool { event.outcome == "cancelled" }
+    var cancelled: Bool { event.outcome == .cancelled }
     var failed: Bool { !succeeded && !cancelled }
 
     /// "Worked", "Failed", or "Canceled".
     var result: String {
         switch event.outcome {
-        case "success": "Worked"
-        case "cancelled": "Canceled"
-        default: "Failed"
+        case .success: "Worked"
+        case .cancelled: "Canceled"
+        case .error: "Failed"
         }
     }
 
-    /// Tool names arrive as `Server__tool`. The server half is shown once, as
-    /// a word; the tool half stands alone.
-    private var parts: (server: String?, tool: String) {
-        guard let tool = event.tool, !tool.isEmpty else { return (event.server, event.method) }
-        guard let range = tool.range(of: "__"), range.lowerBound > tool.startIndex,
-              range.upperBound < tool.endIndex
-        else { return (event.server, tool) }
-        return (String(tool[..<range.lowerBound]), String(tool[range.upperBound...]))
+    /// The tool as the tool list names it. A tool a group rule files under
+    /// another name, such as `Gmail__send` on `workspace`, keeps that name.
+    var tool: String {
+        guard let tool = event.tool, !tool.isEmpty else { return event.method }
+        guard let server = event.server else { return tool }
+        return ToolFacts.shortName(of: tool, server: server, delimiter: delimiter)
     }
 
-    var tool: String { parts.tool }
-    var server: String? { parts.server }
+    /// The server that answered, as the daemon routed the call.
+    var server: String? { event.server }
 
-    /// The icon to show for whoever called: the client its owner named it
-    /// as, else the client it reports, else the client its link or its
-    /// sign-in was written for. The Clients list pictures a client the same
-    /// way.
+    /// A search finds a call by the names its row shows, and by the ones
+    /// the call arrived with.
+    func matches(_ query: String) -> Bool {
+        [caller, place, tool, server, event.tool, event.method, event.clientLabel]
+            .contains { $0?.localizedCaseInsensitiveContains(query) ?? false }
+    }
+
+    /// The client whose icon the caller shows.
     var callerTarget: String {
-        if let ownerName {
-            let named = AppIcons.target(forClientType: ownerName)
-            if AppIcons.displayName(forTarget: named) != nil { return named }
-        }
-        let reported = AppIcons.target(forClientType: event.clientType ?? "")
-        if AppIcons.displayName(forTarget: reported) != nil { return reported }
-        if let key = event.clientKey, AppIcons.displayName(forTarget: key) != nil { return key }
-        if let grantName, !grantName.isEmpty { return AppIcons.target(forClientType: grantName) }
-        return reported
+        ClientIdentity.resolve(
+            ownerName: ownerName, daemonTarget: event.target,
+            reported: event.clientType, grantName: grantName
+        )
     }
-
-    /// The name the caller's icon is looked up by. A script has no icon of
-    /// its own, so it shows the language it is written in.
-    var callerIconName: String { callerTarget == "python" ? "Python" : caller }
 
     /// The product name when Plug recognises the client; the client's own
     /// label otherwise. A raw client type is the last resort.
     var caller: String {
         if let ownerName, !ownerName.isEmpty { return ownerName }
-        if let name = AppIcons.displayName(forTarget: callerTarget) { return name }
+        if let name = ClientIdentity.displayName(forTarget: callerTarget) { return name }
         if let grantName, !grantName.isEmpty { return grantName }
         if let label = event.clientLabel, !label.isEmpty { return label }
         guard let type = event.clientType, !type.isEmpty, type.lowercased() != "unknown" else {

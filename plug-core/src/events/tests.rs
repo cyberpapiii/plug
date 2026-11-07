@@ -1,8 +1,13 @@
+use super::watch::CHECKS_AT_ONCE;
 use super::*;
-use crate::slack_events::DeliveryResponse;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
-use reqwest::header::HeaderMap;
-use std::sync::atomic::AtomicU64;
+use serde_json::{Map, json};
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::Duration;
+use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 struct FakeAccess {
     watches: std::sync::Mutex<Vec<WatchConfig>>,
@@ -30,12 +35,16 @@ impl WatchAccess for FakeAccess {
             self.read_only.load(Ordering::SeqCst),
         ))
     }
-    async fn call(&self, tool: &str, _: Map<String, Value>) -> Option<Value> {
+    async fn call(&self, tool: &str, _: Map<String, Value>) -> Result<Value, String> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         if self.stuck.lock().unwrap().as_deref() == Some(tool) {
             std::future::pending::<()>().await;
         }
-        self.result.lock().unwrap().clone()
+        self.result
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| "failed".into())
     }
 }
 
@@ -105,6 +114,10 @@ async fn delivered(sender: &FakeDelivery) -> Vec<Value> {
         .map(|(_, body)| serde_json::from_slice::<Value>(body).unwrap())
         .filter(|body| body["type"] != "verification")
         .collect()
+}
+/// Under paused time, run every spawned task until each is waiting.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(1)).await;
 }
 
 #[tokio::test]
@@ -224,7 +237,7 @@ async fn unsubscribe_and_a_removed_watch_both_stop_delivery() {
     access.watches.lock().unwrap().clear();
     events.prune().await.unwrap();
     let state = events.state.lock().await;
-    assert!(state.subscriptions.is_empty() && state.baselines.is_empty());
+    assert!(state.subscriptions.is_empty() && state.source.baselines.is_empty());
 }
 
 #[tokio::test]
@@ -243,6 +256,50 @@ async fn a_gone_callback_removes_the_subscription_and_state_survives_reopen() {
     events.deliver_one().await.unwrap();
     let state = events.state.lock().await;
     assert!(state.subscriptions.is_empty() && state.queue.is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_send_is_retried_later_with_the_same_id_and_body() {
+    let (_dir, events, access, sender) = fixture();
+    events.subscribe("client", &params()).await.unwrap();
+    events.check(&watch()).await.unwrap();
+    *access.result.lock().unwrap() = Some(json!({"unread": 2}));
+    events.check(&watch()).await.unwrap();
+    for status in [503, 429, 408] {
+        sender.status.store(status, Ordering::SeqCst);
+        events.state.lock().await.queue[0].next_at = 0;
+        events.deliver_one().await.unwrap();
+    }
+    let pending = events.state.lock().await.queue[0].clone();
+    assert_eq!(pending.attempts, 3);
+    assert!(pending.next_at > now(), "waits before the next try");
+    sender.status.store(200, Ordering::SeqCst);
+    events.state.lock().await.queue[0].next_at = 0;
+    events.deliver_one().await.unwrap();
+    assert!(events.state.lock().await.queue.is_empty());
+    let calls = sender.calls.lock().await;
+    let sends: Vec<_> = calls.iter().skip(1).collect();
+    assert_eq!(sends.len(), 4);
+    assert!(
+        sends.iter().all(|(headers, body)| *body == sends[0].1
+            && headers["webhook-id"] == sends[0].0["webhook-id"])
+    );
+}
+
+#[tokio::test]
+async fn a_state_file_that_cannot_be_written_stops_events_until_restart() {
+    let (_dir, events, access, sender) = fixture();
+    events.subscribe("client", &params()).await.unwrap();
+    events.check(&watch()).await.unwrap();
+    std::fs::remove_file(&events.path).unwrap();
+    std::fs::create_dir(&events.path).unwrap();
+    *access.result.lock().unwrap() = Some(json!({"unread": 2}));
+    assert!(events.check(&watch()).await.is_err());
+    assert!(events.degraded.load(Ordering::SeqCst));
+    assert!(!events.discoverable_to("client"));
+    assert!(events.subscribe("client", &params()).await.is_err());
+    assert!(events.deliver_one().await.is_ok());
+    assert_eq!(delivered(&sender).await.len(), 0);
 }
 
 #[test]
@@ -269,11 +326,11 @@ fn config_rejects_bad_names_short_intervals_and_duplicates() {
     );
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_check_waiting_its_turn_does_not_run_once_the_watch_is_gone_or_plug_is_stopping() {
     let (_dir, events, access, _sender) = fixture();
-    let settle = || tokio::time::sleep(Duration::from_millis(100));
     let busy = events
+        .source
         .check_slots
         .clone()
         .acquire_many_owned(CHECKS_AT_ONCE as u32)
@@ -287,11 +344,12 @@ async fn a_check_waiting_its_turn_does_not_run_once_the_watch_is_gone_or_plug_is
     drop(busy);
     settle().await;
     assert_eq!(access.calls.load(Ordering::SeqCst), 0);
-    assert!(events.checking.lock().unwrap().is_empty());
+    assert!(events.source.checking.lock().unwrap().is_empty());
 
     // Still configured, but Plug is stopping.
     *access.watches.lock().unwrap() = vec![watch()];
     let busy = events
+        .source
         .check_slots
         .clone()
         .acquire_many_owned(CHECKS_AT_ONCE as u32)
@@ -305,10 +363,10 @@ async fn a_check_waiting_its_turn_does_not_run_once_the_watch_is_gone_or_plug_is
     drop(busy);
     settle().await;
     assert_eq!(access.calls.load(Ordering::SeqCst), 0);
-    assert!(events.checking.lock().unwrap().is_empty());
+    assert!(events.source.checking.lock().unwrap().is_empty());
 }
 
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn a_tool_that_does_not_answer_does_not_hold_up_the_other_watches() {
     let (_dir, events, access, _sender) = fixture();
     let slow = WatchConfig {
@@ -320,18 +378,22 @@ async fn a_tool_that_does_not_answer_does_not_hold_up_the_other_watches() {
     let watches = vec![slow, watch()];
     *access.watches.lock().unwrap() = watches.clone();
     let mut due = HashMap::new();
-    let settle = || tokio::time::sleep(Duration::from_millis(100));
 
     // Starting a round never waits on a tool.
     events.check_due(&watches, &mut due, &CancellationToken::new());
     settle().await;
     assert_eq!(access.calls.load(Ordering::SeqCst), 2);
-    assert!(
-        events.checked.lock().unwrap()["mail.inbox"]
-            .last_checked
-            .is_some()
-    );
-    assert!(!events.checked.lock().unwrap().contains_key("mail.slow"));
+    let checked = |event: &str| {
+        events
+            .source
+            .checked
+            .lock()
+            .unwrap()
+            .get(event)
+            .map(|c| c.last_checked)
+    };
+    assert!(checked("mail.inbox").flatten().is_some());
+    assert!(checked("mail.slow").is_none());
 
     // Both come due again while the slow tool still has not answered. The
     // other watch gets its next check on time, and the stuck tool is not

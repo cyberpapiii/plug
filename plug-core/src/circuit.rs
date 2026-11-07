@@ -10,17 +10,9 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 use tokio::time::Instant;
 
-// ---------------------------------------------------------------------------
-// Constants
-// ---------------------------------------------------------------------------
-
 const STATE_CLOSED: u8 = 0;
 const STATE_OPEN: u8 = 1;
 const STATE_HALF_OPEN: u8 = 2;
-
-// ---------------------------------------------------------------------------
-// Epoch helpers (process-wide monotonic base)
-// ---------------------------------------------------------------------------
 
 static EPOCH: OnceLock<Instant> = OnceLock::new();
 
@@ -32,16 +24,23 @@ fn nanos_since_epoch() -> u64 {
     epoch().elapsed().as_nanos() as u64
 }
 
-// ---------------------------------------------------------------------------
-// Public types
-// ---------------------------------------------------------------------------
-
 /// Observable state of the circuit breaker.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CircuitState {
     Closed,
     Open,
     HalfOpen,
+}
+
+impl CircuitState {
+    /// How status output names the state.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Open => "open",
+            Self::HalfOpen => "half-open",
+        }
+    }
 }
 
 /// Error returned when a call is rejected by the circuit breaker.
@@ -70,17 +69,14 @@ impl Default for CircuitBreakerConfig {
     }
 }
 
-// ---------------------------------------------------------------------------
-// CircuitBreaker
-// ---------------------------------------------------------------------------
-
 /// A lock-free circuit breaker.
 ///
 /// State machine: `Closed → Open → HalfOpen → Closed` (or back to Open).
 pub struct CircuitBreaker {
     state: AtomicU8,
     failure_count: AtomicU32,
-    /// Nanoseconds since [`EPOCH`] when the circuit was opened. `u64::MAX` means "not set".
+    /// Nanoseconds since [`EPOCH`] when the circuit opened, or when it went
+    /// half-open. `u64::MAX` while closed.
     open_since_nanos: AtomicU64,
     /// Semaphore starts with 0 permits; permits are added on Open→HalfOpen transition.
     probe_semaphore: Semaphore,
@@ -88,7 +84,6 @@ pub struct CircuitBreaker {
 }
 
 impl CircuitBreaker {
-    /// Create a new circuit breaker with the given configuration.
     pub fn new(config: CircuitBreakerConfig) -> Self {
         Self {
             state: AtomicU8::new(STATE_CLOSED),
@@ -129,10 +124,7 @@ impl CircuitBreaker {
                         )
                         .is_ok()
                     {
-                        // Drain leftover permits from previous half-open cycle
-                        // to avoid permit accumulation across multiple cycles.
-                        while self.probe_semaphore.try_acquire().is_ok() {}
-                        self.probe_semaphore.add_permits(self.config.probe_count);
+                        self.arm_probes(opened_at);
                     }
                     // Whether we won the CAS or someone else did, try a probe.
                     self.try_acquire_probe()
@@ -147,10 +139,7 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a successful call.
-    ///
-    /// - **Closed**: resets the failure counter.
-    /// - **HalfOpen**: transitions back to Closed and resets the failure counter.
+    /// Record a successful call: closes a half-open circuit.
     pub fn on_success(&self) {
         let s = self.state.load(Ordering::Acquire);
 
@@ -169,7 +158,6 @@ impl CircuitBreaker {
                     )
                     .is_ok() =>
             {
-                // HalfOpen → Closed
                 self.failure_count.store(0, Ordering::Relaxed);
                 self.open_since_nanos.store(u64::MAX, Ordering::Release);
             }
@@ -177,11 +165,8 @@ impl CircuitBreaker {
         }
     }
 
-    /// Record a failed call.
-    ///
-    /// - **Closed**: increments the failure counter. If the threshold is reached,
-    ///   transitions to Open and records the timestamp.
-    /// - **HalfOpen**: transitions immediately back to Open.
+    /// Record a failed call: opens the circuit at the threshold, and at once
+    /// from half-open.
     pub fn on_failure(&self) {
         let s = self.state.load(Ordering::Acquire);
 
@@ -222,16 +207,13 @@ impl CircuitBreaker {
         }
     }
 
-    /// Force-reset the circuit breaker to the Closed state.
-    ///
-    /// Useful after a successful manual reconnection.
+    /// Close the circuit, as after a reconnection.
     pub fn reset(&self) {
         self.state.store(STATE_CLOSED, Ordering::Release);
         self.failure_count.store(0, Ordering::Relaxed);
         self.open_since_nanos.store(u64::MAX, Ordering::Release);
     }
 
-    /// Return the current [`CircuitState`].
     pub fn state(&self) -> CircuitState {
         match self.state.load(Ordering::Acquire) {
             STATE_CLOSED => CircuitState::Closed,
@@ -241,23 +223,53 @@ impl CircuitBreaker {
         }
     }
 
-    // -- private helpers ----------------------------------------------------
+    /// Start a round of half-open probes, unless another caller already
+    /// started one since `since`.
+    fn arm_probes(&self, since: u64) {
+        if self
+            .open_since_nanos
+            .compare_exchange(
+                since,
+                nanos_since_epoch(),
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return;
+        }
+        // Leftover permits from an earlier round must not add up.
+        while self.probe_semaphore.try_acquire().is_ok() {}
+        self.probe_semaphore.add_permits(self.config.probe_count);
+    }
 
-    /// Try to acquire a half-open probe permit.
+    /// Take a half-open probe. A probe is used up for good: its outcome is
+    /// what closes or reopens the circuit. A caller that never reports one (a
+    /// dropped call, a timeout) would leave the circuit half-open with no
+    /// probes left, so after `open_duration` without an outcome another round
+    /// starts.
     fn try_acquire_probe(&self) -> Result<(), CircuitBreakerError> {
+        if let Ok(permit) = self.probe_semaphore.try_acquire() {
+            permit.forget();
+            return Ok(());
+        }
+        let since = self.open_since_nanos.load(Ordering::Acquire);
+        let waited = Duration::from_nanos(nanos_since_epoch().saturating_sub(since));
+        if self.state.load(Ordering::Acquire) != STATE_HALF_OPEN
+            || waited < self.config.open_duration
+        {
+            return Err(CircuitBreakerError);
+        }
+        self.arm_probes(since);
         match self.probe_semaphore.try_acquire() {
             Ok(permit) => {
-                permit.forget(); // consume permanently
+                permit.forget();
                 Ok(())
             }
             Err(_) => Err(CircuitBreakerError),
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
@@ -275,14 +287,13 @@ mod tests {
         })
     }
 
-    /// Trip the breaker by recording `n` failures (must be >= threshold).
+    /// Trip the breaker by recording exactly `threshold` failures.
     fn trip(cb: &CircuitBreaker) {
         for _ in 0..cb.config.failure_threshold {
             cb.on_failure();
         }
     }
 
-    // 1. Closed state always allows calls.
     #[test]
     fn closed_allows_calls() {
         let cb = default_breaker();
@@ -291,7 +302,6 @@ mod tests {
         assert!(cb.call_allowed().is_ok());
     }
 
-    // 2. After threshold failures the breaker opens and rejects calls.
     #[test]
     fn opens_after_threshold_failures() {
         let cb = breaker_with(3, 30, 2);
@@ -304,7 +314,6 @@ mod tests {
         assert!(cb.call_allowed().is_err());
     }
 
-    // 3. A success resets the failure count so the breaker stays closed.
     #[test]
     fn success_resets_failure_count() {
         let cb = breaker_with(3, 30, 2);
@@ -316,7 +325,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
-    // 4. Open state rejects immediately (before duration elapses).
     #[test]
     fn open_rejects_calls() {
         let cb = breaker_with(1, 9999, 2);
@@ -326,7 +334,6 @@ mod tests {
         assert!(cb.call_allowed().is_err());
     }
 
-    // 5. After open_duration the breaker transitions to HalfOpen and allows probes.
     #[tokio::test(start_paused = true)]
     async fn transitions_to_half_open_after_duration() {
         let cb = breaker_with(1, 30, 2);
@@ -339,7 +346,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::HalfOpen);
     }
 
-    // 6. A success in HalfOpen closes the breaker.
     #[tokio::test(start_paused = true)]
     async fn half_open_success_closes() {
         let cb = breaker_with(1, 30, 2);
@@ -353,7 +359,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Closed);
     }
 
-    // 7. A failure in HalfOpen re-opens the breaker.
     #[tokio::test(start_paused = true)]
     async fn half_open_failure_reopens() {
         let cb = breaker_with(1, 30, 2);
@@ -367,7 +372,6 @@ mod tests {
         assert_eq!(cb.state(), CircuitState::Open);
     }
 
-    // 8. Only probe_count calls are allowed while in HalfOpen.
     #[tokio::test(start_paused = true)]
     async fn probe_count_limits_half_open() {
         let cb = breaker_with(1, 30, 2);
@@ -380,7 +384,24 @@ mod tests {
         assert!(cb.call_allowed().is_err()); // no more probes
     }
 
-    // 9. reset() forces the breaker back to Closed.
+    /// Probes whose calls never reported back (dropped, timed out) used to
+    /// leave the circuit half-open with none left until a reconnect.
+    #[tokio::test(start_paused = true)]
+    async fn probes_that_never_report_are_replaced_after_the_open_duration() {
+        let cb = breaker_with(1, 30, 2);
+        trip(&cb);
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert!(cb.call_allowed().is_ok());
+        assert!(cb.call_allowed().is_ok());
+        assert!(cb.call_allowed().is_err());
+
+        tokio::time::advance(Duration::from_secs(31)).await;
+        assert_eq!(cb.state(), CircuitState::HalfOpen);
+        assert!(cb.call_allowed().is_ok());
+        assert!(cb.call_allowed().is_ok());
+        assert!(cb.call_allowed().is_err());
+    }
+
     #[test]
     fn reset_forces_closed() {
         let cb = breaker_with(1, 9999, 2);
@@ -392,8 +413,7 @@ mod tests {
         assert!(cb.call_allowed().is_ok());
     }
 
-    // 10. Many concurrent failures don't cause corruption.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_trip_idempotent() {
         use std::sync::Arc;
 

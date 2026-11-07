@@ -18,7 +18,13 @@ final class Router {
     var selectedEvent: String?
     var selectedCall: UInt64?
     /// Whether Activity shows every call or only the failed ones.
-    var activityScope: ActivityView.Scope = .everything
+    var activityScope: ActivityScope = .everything
+
+    enum ActivityScope: String, CaseIterable, Identifiable {
+        case everything = "All"
+        case problems = "Problems"
+        var id: Self { self }
+    }
     /// Counts the times a checkup was asked for from outside Settings, so
     /// Settings runs one each time the number moves.
     var checkupRequests = 0
@@ -56,12 +62,12 @@ final class Router {
 
     func reveal(clientID: String) {
         section = .clients
-        selectedClient = "grant:\(clientID)"
+        selectedClient = ClientEntry.id(grant: clientID)
     }
 }
 
-/// The single place an interface action turns into work. Views name a
-/// `PlugIntent`; nothing in the view layer talks to the model directly.
+/// Where a `PlugIntent` turns into work: navigation here, everything else
+/// through the model.
 @MainActor
 struct PlugIntentRunner {
     let model: AppModel
@@ -80,17 +86,15 @@ struct PlugIntentRunner {
         case .reconnect:
             Task { await model.retryConnection() }
         case let .signIn(server):
-            Task { await model.signIn(server: server) }
+            Task { await model.actions.signIn(server: server) }
         case let .cancelSignIn(server):
-            model.cancelSignIn(server: server)
+            model.actions.cancelSignIn(server: server)
         case let .signInClient(name, command):
-            Task { await model.signInClient(name: name, command: command) }
+            Task { await model.actions.signInClient(name: name, command: command) }
         case let .restartServer(name):
-            perform("restart \(name)") { .restartServer(authToken: $0, serverID: name) }
+            perform("restart \(name)", .restartServer(serverID: name))
         case let .setServerEnabled(name, enabled):
-            perform("turn \(name) \(enabled ? "on" : "off")") {
-                .setServerEnabled(authToken: $0, name: name, enabled: enabled)
-            }
+            perform("turn \(name) \(enabled ? "on" : "off")", .mutate(.setServerEnabled(name: name, enabled: enabled)))
         case let .editServer(name):
             router.reveal(server: name)
             router.sheet = .editServer(name)
@@ -100,42 +104,47 @@ struct PlugIntentRunner {
             router.sheet = .addAccount(server)
             showWindow()
         case let .setToolEnabled(tool, enabled):
-            Task { await model.setToolEnabled(tool, enabled) }
+            Task { await model.actions.setToolEnabled(tool, enabled) }
         case let .linkApp(target):
-            Task { await model.setAppLinked(target, true) }
+            Task { await model.actions.setAppLinked(target, true) }
         case let .unlinkApp(target):
-            Task { await model.setAppLinked(target, false) }
+            Task { await model.actions.setAppLinked(target, false) }
         case let .removeServer(name):
             if router.selectedServer == name { router.selectedServer = nil }
-            perform("remove \(name)") { .removeServer(authToken: $0, name: name) }
+            perform("remove \(name)", .mutate(.removeServer(name: name)))
         case let .revokeClient(id):
-            perform("remove that client's access") { .revokeClient(authToken: $0, clientID: id) }
+            perform("remove that client's access", .revokeClient(clientID: id))
         case let .renameClient(key, name):
-            perform("rename the client") { .renameClient(authToken: $0, key: key, name: name) }
-        case let .replaceClient(oldID, newID):
-            Task { await model.replaceClient(oldID: oldID, newID: newID) }
+            perform("rename the client", .mutate(.renameClient(key: key, name: name)))
+        case let .replaceClient(old, new):
+            Task { await model.actions.replaceClient(old: old, new: new) }
         case let .setClientPlace(key, place):
-            perform("say where the client runs") { .setClientPlace(authToken: $0, key: key, place: place) }
+            perform("say where the client runs", .mutate(.setClientPlace(key: key, place: place)))
         case let .setClientServerBlocked(key, server, blocked):
-            perform("\(blocked ? "turn off" : "turn on") \(server) for that client") {
-                .setClientServerBlocked(authToken: $0, key: key, server: server, blocked: blocked)
-            }
+            perform(
+                "\(blocked ? "turn off" : "turn on") \(server) for that client",
+                .mutate(.setClientBlock(key: key, kind: .server, target: server, blocked: blocked))
+            )
         case let .setClientToolBlocked(key, tool, blocked):
-            perform("\(blocked ? "turn off" : "turn on") that tool for that client") {
-                .setClientToolBlocked(authToken: $0, key: key, tool: tool, blocked: blocked)
-            }
+            perform(
+                "\(blocked ? "turn off" : "turn on") that tool for that client",
+                .mutate(.setClientBlock(key: key, kind: .tool, target: tool, blocked: blocked))
+            )
         case let .setClientServerAllowed(key, server, allowed):
-            perform("\(allowed ? "turn on" : "turn off") \(server) for that client") {
-                .setClientServerAllowed(authToken: $0, key: key, server: server, allowed: allowed)
-            }
+            perform(
+                "\(allowed ? "turn on" : "turn off") \(server) for that client",
+                .mutate(.setClientBlock(key: key, kind: .allowedServer, target: server, blocked: allowed))
+            )
         case let .setClientToolAllowed(key, tool, allowed):
-            perform("\(allowed ? "turn on" : "turn off") that tool for that client") {
-                .setClientToolAllowed(authToken: $0, key: key, tool: tool, allowed: allowed)
-            }
+            perform(
+                "\(allowed ? "turn on" : "turn off") that tool for that client",
+                .mutate(.setClientBlock(key: key, kind: .allowedTool, target: tool, blocked: allowed))
+            )
         case let .setClientAllowList(key, on):
-            perform("change what that client gets of new servers") {
-                .setClientAllowList(authToken: $0, key: key, on: on)
-            }
+            perform(
+                "change what that client gets of new servers",
+                .mutate(.setClientBlock(key: key, kind: .allowList, target: "*", blocked: on))
+            )
         case .addServer:
             router.section = .servers
             router.sheet = .addServer
@@ -149,13 +158,13 @@ struct PlugIntentRunner {
             router.sheet = .addWatch
             showWindow()
         case let .removeWatch(event):
-            perform("stop watching \(event)") { .removeWatch(authToken: $0, event: event) }
+            perform("stop watching \(event)", .mutate(.removeWatch(event: event)))
         case .importServers:
             router.section = .servers
             router.sheet = .importServers
             showWindow()
         case let .signOut(server):
-            Task { await model.signOut(server: server) }
+            Task { await model.actions.signOut(server: server) }
         case let .openWindow(section):
             router.section = section
             showWindow()
@@ -181,14 +190,16 @@ struct PlugIntentRunner {
             Task { await model.restartService() }
         case let .setServiceEnabled(enabled):
             Task { await model.setServiceEnabled(enabled) }
+        case .refresh:
+            Task { await model.refresh(forceCatalog: true) }
         case .reloadConfiguration:
-            perform("reload the settings file") { .reload(authToken: $0) }
+            perform("reload the settings file", .reload)
         case .openLogs:
             NSWorkspace.shared.activateFileViewerSelecting([
-                URL.homeDirectory.appending(path: "Library/Logs/plug", directoryHint: .isDirectory),
+                PlugPaths.logs,
             ])
         case .dismissActionError:
-            model.dismissActionError()
+            model.actions.dismissActionError()
         case .quit:
             quit()
         }
@@ -224,7 +235,7 @@ struct PlugIntentRunner {
         }
     }
 
-    private func perform(_ doing: String, _ request: @escaping (String) -> IPCRequest) {
-        Task { await model.perform(doing, request) }
+    private func perform(_ doing: String, _ request: OperatorRequest) {
+        Task { await model.actions.perform(doing, request) }
     }
 }

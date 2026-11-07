@@ -273,8 +273,8 @@ extension ProblemNote {
 
     /// A failure inside a sheet, where the sheet's title already says what
     /// was being done: the reason leads, and the next step follows.
-    init(reason: String) {
-        self.init(title: reason, advice: Explain.advice(forReason: reason), failed: true)
+    init(_ failure: SheetFailure) {
+        self.init(title: failure.reason, advice: failure.advice, failed: true)
     }
 }
 
@@ -364,6 +364,53 @@ struct LoadingPage: View {
     }
 }
 
+/// What every section shows before it has rows: loading, Plug unreachable,
+/// nothing there yet, or nothing matching the search, in that order.
+struct SectionPage<Empty: View, NoMatches: View, Content: View>: View {
+    let model: AppModel
+    /// For VoiceOver while the first read is under way.
+    let loading: String
+    let isEmpty: Bool
+    var hasNoMatches = false
+    let run: (PlugIntent) -> Void
+    @ViewBuilder let empty: () -> Empty
+    @ViewBuilder let noMatches: () -> NoMatches
+    @ViewBuilder let content: () -> Content
+
+    var body: some View {
+        if model.isLoadingInitialData {
+            LoadingPage(message: loading)
+        } else if model.initialDataUnavailable {
+            UnavailablePage(verdict: model.verdict, run: run)
+        } else if isEmpty {
+            empty()
+        } else if hasNoMatches {
+            noMatches()
+        } else {
+            content()
+        }
+    }
+}
+
+extension SectionPage where NoMatches == NoSearchResults {
+    /// A page whose only way to show no rows is a search that matched none.
+    init(
+        model: AppModel,
+        loading: String,
+        isEmpty: Bool,
+        hasNoMatches: Bool = false,
+        search: String,
+        run: @escaping (PlugIntent) -> Void,
+        @ViewBuilder empty: @escaping () -> Empty,
+        @ViewBuilder content: @escaping () -> Content
+    ) {
+        self.init(
+            model: model, loading: loading, isEmpty: isEmpty, hasNoMatches: hasNoMatches, run: run,
+            empty: empty, noMatches: { NoSearchResults(text: search) }, content: content
+        )
+    }
+}
+
 /// A short wait beside a line of text: Plug's three dots.
 struct WaitingDots: View {
     var body: some View {
@@ -421,7 +468,7 @@ struct UnavailablePage: View {
 struct EmptyPage: View {
     let title: String
     let message: String
-    var mood = PlugCharacter.Mood.curious
+    var mood = PlugMood.curious
     var actionTitle: String?
     var actionIntent: PlugIntent?
     /// A quieter second way out of an empty page, when there is more than one.
@@ -466,32 +513,54 @@ struct WindowSeenReader: NSViewRepresentable {
 }
 
 final class WindowSeenProbe: NSView {
-    var onSeen: ((Bool) -> Void)?
+    private lazy var watch = WindowSightWatch(view: self)
+    var onSeen: ((Bool) -> Void)? {
+        get { watch.onSeen }
+        set { watch.onSeen = newValue }
+    }
 
     override func hitTest(_ point: NSPoint) -> NSView? { nil }
     override var acceptsFirstResponder: Bool { false }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
         super.viewWillMove(toWindow: newWindow)
-        let centre = NotificationCenter.default
-        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
-        if let newWindow {
-            centre.addObserver(
-                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: newWindow
-            )
-        }
+        watch.watch(newWindow)
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        look()
+        watch.look()
+    }
+}
+
+/// Tells `onSeen` whether a view's window is on screen, each time that may
+/// have changed. The view calls `watch` as it moves to a window and `look`
+/// once it is there.
+@MainActor
+final class WindowSightWatch: NSObject {
+    var onSeen: ((Bool) -> Void)?
+    private weak var view: NSView?
+
+    init(view: NSView) {
+        self.view = view
     }
 
-    /// Said a moment later, never in the middle of an update.
-    @objc private func look() {
+    func watch(_ window: NSWindow?) {
+        let centre = NotificationCenter.default
+        centre.removeObserver(self, name: NSWindow.didChangeOcclusionStateNotification, object: nil)
+        if let window {
+            centre.addObserver(
+                self, selector: #selector(look), name: NSWindow.didChangeOcclusionStateNotification, object: window
+            )
+        }
+    }
+
+    /// Closed, covered, minimized or on another desktop, the window is not
+    /// on screen. Said a moment later, never in the middle of an update.
+    @objc func look() {
         Task { @MainActor [weak self] in
             guard let self else { return }
-            self.onSeen?(self.window?.occlusionState.contains(.visible) ?? false)
+            self.onSeen?(self.view?.window?.occlusionState.contains(.visible) ?? false)
         }
     }
 }

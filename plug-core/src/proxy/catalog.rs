@@ -159,7 +159,7 @@ pub(crate) fn sanitize_description(desc: &str) -> String {
         .collect()
 }
 
-/// Sort comparator: priority tools first (by priority_tools index), then alphabetical.
+/// Priority tools first, in `priority_tools` order, then alphabetical.
 pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> std::cmp::Ordering {
     let a_priority = priority_tools
         .iter()
@@ -178,80 +178,35 @@ pub(crate) fn priority_sort(a: &Tool, b: &Tool, priority_tools: &[String]) -> st
     }
 }
 
-pub(crate) fn is_disabled_tool(patterns: &[String], tool_name: &str) -> bool {
-    if patterns.is_empty() {
-        return false;
-    }
-    // Prefer pre-lowercased patterns (`RouterConfig::from`); still tolerate mixed case.
-    let tool_name = tool_name.to_ascii_lowercase();
-    patterns.iter().any(|pattern| {
-        if pattern.bytes().all(|b| !b.is_ascii_uppercase()) {
-            wildcard_match(pattern, &tool_name)
-        } else {
-            wildcard_match(&pattern.to_ascii_lowercase(), &tool_name)
-        }
-    })
-}
+/// Items in one page of a list Plug answers. Claude Desktop's remote
+/// connector ignores `nextCursor`, so it sees only the first page: every
+/// tool has to fit on it.
+pub(crate) const PAGE_SIZE: usize = 500;
 
-pub(crate) fn wildcard_match(pattern: &str, text: &str) -> bool {
-    if pattern == "*" {
-        return true;
-    }
-
-    let parts: Vec<&str> = pattern.split('*').collect();
-    if parts.len() == 1 {
-        return pattern == text;
-    }
-
-    let mut remainder = text;
-    let mut first = true;
-
-    for (index, part) in parts.iter().enumerate() {
-        if part.is_empty() {
-            continue;
-        }
-
-        if first && !pattern.starts_with('*') {
-            if !remainder.starts_with(part) {
-                return false;
-            }
-            remainder = &remainder[part.len()..];
-            first = false;
-            continue;
-        }
-
-        if index == parts.len() - 1 && !pattern.ends_with('*') {
-            return remainder.ends_with(part);
-        }
-
-        if let Some(found) = remainder.find(part) {
-            remainder = &remainder[found + part.len()..];
-            first = false;
-        } else {
-            return false;
-        }
-    }
-
-    true
-}
-
+/// The page of `items` that `request`'s cursor points at, built by `build`.
+///
+/// A cursor past the end, left by items that went away between pages, is
+/// the last page. One Plug never gave out is refused: answering it with the
+/// first page again would loop a client that follows it.
 pub(crate) fn paginated_result<T: Clone, R>(
+    method: &str,
     items: &[T],
     request: Option<PaginatedRequestParams>,
     build: impl FnOnce(Vec<T>, Option<String>) -> R,
-) -> R {
-    const PAGE_SIZE: usize = 500;
-
-    let start = request
-        .as_ref()
-        .and_then(|params| params.cursor.as_ref())
-        .and_then(|cursor| cursor.parse::<usize>().ok())
-        .filter(|idx| *idx < items.len())
-        .unwrap_or(0);
+) -> Result<R, McpError> {
+    let start = match request.and_then(|params| params.cursor) {
+        None => 0,
+        Some(cursor) => cursor
+            .parse::<usize>()
+            .map_err(|_| {
+                McpError::invalid_params(format!("unknown {method} cursor: {cursor}"), None)
+            })?
+            .min(items.len()),
+    };
     let end = usize::min(start + PAGE_SIZE, items.len());
     let next_cursor = (end < items.len()).then(|| end.to_string());
 
-    build(items[start..end].to_vec(), next_cursor)
+    Ok(build(items[start..end].to_vec(), next_cursor))
 }
 
 /// Cache directives for Plug's synthesized multi-upstream catalog pages.
@@ -295,20 +250,49 @@ pub(crate) fn fingerprint_tool_definition(tool: &Tool) -> u64 {
     hasher.finish()
 }
 
-pub(crate) fn canonical_plug_meta_tool_name(tool_name: &str) -> Option<&'static str> {
-    legacy_meta_tool_names()
-        .iter()
-        .copied()
-        .find(|name| name.eq_ignore_ascii_case(tool_name))
+/// A tool Plug serves itself rather than routing to a server.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlugTool {
+    ListServers,
+    ListTools,
+    SearchTools,
+    InvokeTool,
 }
 
-pub(crate) fn legacy_meta_tool_names() -> &'static [&'static str] {
-    &[
-        "plug__list_servers",
-        "plug__list_tools",
-        "plug__search_tools",
-        "plug__invoke_tool",
-    ]
+impl PlugTool {
+    /// Every Plug tool, which is also the legacy meta-tool surface.
+    pub(crate) const ALL: [Self; 4] = [
+        Self::ListServers,
+        Self::ListTools,
+        Self::SearchTools,
+        Self::InvokeTool,
+    ];
+
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::ListServers => "plug__list_servers",
+            Self::ListTools => "plug__list_tools",
+            Self::SearchTools => "plug__search_tools",
+            Self::InvokeTool => "plug__invoke_tool",
+        }
+    }
+
+    /// The Plug tool `tool_name` names, in any case: models drift in how
+    /// they case a tool's name.
+    pub(crate) fn named(tool_name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|tool| tool.name().eq_ignore_ascii_case(tool_name))
+    }
+
+    pub(crate) fn definition(self) -> Tool {
+        match self {
+            Self::ListServers => build_list_servers_meta_tool(),
+            Self::ListTools => build_list_tools_meta_tool(),
+            Self::SearchTools => build_search_tools_meta_tool(),
+            Self::InvokeTool => build_invoke_tool_meta_tool(),
+        }
+    }
 }
 
 pub(crate) fn tokenize_search_query(query: &str) -> Vec<String> {
@@ -378,7 +362,7 @@ impl ToolSearchIndex {
             .iter()
             .filter_map(|tool| {
                 let (server_id, _) = snapshot.routes.get(tool.name.as_ref())?;
-                if server_id == "__plug_internal__" {
+                if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
                     return None;
                 }
                 Some(ToolSearchEntry {
@@ -466,29 +450,24 @@ pub(crate) fn score_normalized_match(
 }
 
 pub(crate) fn build_meta_tools() -> Vec<Tool> {
-    vec![build_search_tools_meta_tool()]
+    vec![PlugTool::SearchTools.definition()]
 }
 
 pub(crate) fn build_legacy_meta_tools() -> Vec<Tool> {
-    vec![
-        build_list_servers_meta_tool(),
-        build_list_tools_meta_tool(),
-        build_search_tools_meta_tool(),
-        build_invoke_tool_meta_tool(),
-    ]
+    PlugTool::ALL.map(PlugTool::definition).to_vec()
 }
 
-pub(crate) fn build_list_servers_meta_tool() -> Tool {
+fn build_list_servers_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__list_servers"),
+        Cow::Borrowed(PlugTool::ListServers.name()),
         Cow::Borrowed("List upstream server IDs, health, and current routed tool counts."),
         Arc::new(serde_json::Map::new()),
     )
 }
 
-pub(crate) fn build_list_tools_meta_tool() -> Tool {
+fn build_list_tools_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__list_tools"),
+        Cow::Borrowed(PlugTool::ListTools.name()),
         Cow::Borrowed(
             "List routed tools hidden behind legacy meta-tool mode, optionally filtered by server or query.",
         ),
@@ -519,10 +498,9 @@ pub(crate) fn build_list_tools_meta_tool() -> Tool {
     )
 }
 
-/// Build the search_tools meta-tool definition.
-pub(crate) fn build_search_tools_meta_tool() -> Tool {
+fn build_search_tools_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__search_tools"),
+        Cow::Borrowed(PlugTool::SearchTools.name()),
         Cow::Borrowed(
             "Search hidden routed tools by name or description, load the matches into this session, then call the chosen real tool directly.",
         ),
@@ -550,9 +528,9 @@ pub(crate) fn build_search_tools_meta_tool() -> Tool {
     )
 }
 
-pub(crate) fn build_invoke_tool_meta_tool() -> Tool {
+fn build_invoke_tool_meta_tool() -> Tool {
     Tool::new(
-        Cow::Borrowed("plug__invoke_tool"),
+        Cow::Borrowed(PlugTool::InvokeTool.name()),
         Cow::Borrowed(
             "Invoke a specific routed tool by prefixed name and return the raw upstream result. Legacy meta-tool mode only.",
         ),
@@ -579,54 +557,36 @@ pub(crate) fn build_invoke_tool_meta_tool() -> Tool {
 }
 
 impl super::ToolRouter {
-    /// Get the current list of tools (zero-copy via Arc). Returns all tools.
-    pub fn list_tools(&self) -> Arc<Vec<Tool>> {
-        let snapshot = self.cache.load();
-        match self.config.lazy_surface_for_client(ClientType::Unknown) {
-            LazyToolSurface::Bridge => Arc::new(self.filter_meta_tools(&snapshot.meta_tools_all)),
-            LazyToolSurface::LegacyMeta => Arc::new(self.filtered_legacy_meta_tools()),
-            LazyToolSurface::Standard | LazyToolSurface::Native => Arc::clone(&snapshot.tools_all),
-        }
-    }
-
-    pub fn list_tools_page_for_client(
-        &self,
-        client_type: ClientType,
-        request: Option<PaginatedRequestParams>,
-    ) -> ListToolsResult {
-        self.list_tools_page_for_client_session(client_type, None, None, request)
-    }
-
     pub fn list_tools_page_for_client_session(
         &self,
         client_type: ClientType,
         session_key: Option<&str>,
         client_key: Option<&str>,
         request: Option<PaginatedRequestParams>,
-    ) -> ListToolsResult {
+    ) -> Result<ListToolsResult, McpError> {
         let tools = self.list_tools_for_client_session(client_type, session_key, client_key);
-        paginated_result(&tools, request, |tools, next_cursor| ListToolsResult {
-            meta: None,
-            next_cursor,
-            tools,
-            ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
-            cache_scope: Some(synthesized_catalog_cache_scope()),
-            ..Default::default()
+        paginated_result("tools/list", &tools, request, |tools, next_cursor| {
+            ListToolsResult {
+                meta: None,
+                next_cursor,
+                tools,
+                ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
+                cache_scope: Some(synthesized_catalog_cache_scope()),
+                ..Default::default()
+            }
         })
     }
 
-    /// Resolve the upstream server that owns a merged tool name.
+    /// The server a call to `name` goes to.
     pub fn server_for_tool(&self, name: &str) -> Option<String> {
-        let snapshot = self.cache.load();
-        snapshot
-            .routes
-            .get(name)
-            .or_else(|| snapshot.routes_lower.get(&name.to_ascii_lowercase()))
+        self.cache
+            .load()
+            .resolve_route(name)
             .map(|(server, _)| server.clone())
     }
 
     /// List all tools with their source server IDs and operator risk metadata.
-    pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, crate::ipc::IpcToolRiskInfo)> {
+    pub fn list_all_tools_with_risk(&self) -> Vec<(String, Tool, ToolRisk)> {
         let snapshot = self.cache.load();
         let mut result = Vec::new();
         for tool in snapshot.tools_all.iter() {
@@ -639,12 +599,10 @@ impl super::ToolRouter {
                 .tool_risk_inventory
                 .get(tool.name.as_ref())
                 .cloned()
-                .unwrap_or_else(|| {
-                    crate::ipc::IpcToolRiskInfo::from_annotations(
-                        None,
-                        tool.annotations.as_ref(),
-                        tool.annotations.as_ref(),
-                    )
+                .unwrap_or_else(|| ToolRisk {
+                    upstream_declared: None,
+                    plug_inferred: tool.annotations.clone(),
+                    effective: tool.annotations.clone(),
                 });
 
             result.push((server_id, tool.clone(), risk));
@@ -652,31 +610,11 @@ impl super::ToolRouter {
         result
     }
 
-    /// Total number of tools in the unfiltered cache.
-    pub fn tool_count(&self) -> usize {
-        self.cache.load().tools_all.len()
-    }
-
-    pub fn get_tool_definition(&self, name: &str, client_key: Option<&str>) -> Option<Tool> {
-        if !self.client_may_use_tool(client_key, name) {
-            return None;
-        }
-        self.cache.load().tool_by_name(name).cloned()
-    }
-
-    pub fn supports_tasks(&self) -> bool {
-        self.supports_tasks_for_client(ClientType::Unknown)
-    }
-
     pub fn supports_tasks_for_client(&self, client_type: ClientType) -> bool {
         matches!(
             self.config.lazy_surface_for_client(client_type),
             LazyToolSurface::Standard | LazyToolSurface::Native
         ) && !self.cache.load().tools_all.is_empty()
-    }
-
-    pub fn synthesized_capabilities(&self) -> ServerCapabilities {
-        self.synthesized_capabilities_for_client(ClientType::Unknown)
     }
 
     pub fn synthesized_capabilities_for_client(
@@ -732,7 +670,8 @@ impl super::ToolRouter {
         capabilities
     }
 
-    /// Get tools filtered for a specific client type. O(1) — single Arc::clone.
+    /// The tools a client of `client_type` sees, with no per-client blocks
+    /// applied.
     pub fn list_tools_for_client(&self, client_type: ClientType) -> Arc<Vec<Tool>> {
         self.list_tools_for_client_session(client_type, None, None)
     }
@@ -776,25 +715,23 @@ impl super::ToolRouter {
             self.config.lazy_surface_for_client(client_type),
             LazyToolSurface::LegacyMeta
         ) {
-            return Arc::new(self.filtered_legacy_meta_tools());
+            return Arc::clone(&self.cache.load().legacy_meta_tools);
         }
         let snapshot = self.cache.load();
-        // This client's own surface is Standard or Native here, so with
-        // filtering disabled it gets the whole catalog. `list_tools()` would
-        // resolve the Unknown client's lazy policy instead.
         if !self.config.tool_filter_enabled {
             return Arc::clone(&snapshot.tools_all);
         }
-        match client_type {
-            ClientType::Devin => Arc::clone(&snapshot.tools_devin),
-            ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),
+        match client_type.tool_limit() {
+            Some(limit) if limit < snapshot.tools_all.len() => {
+                Arc::new(snapshot.tools_all[..limit].to_vec())
+            }
             _ => Arc::clone(&snapshot.tools_all),
         }
     }
 
     fn bridge_visible_tools(&self, session_key: Option<&str>) -> Arc<Vec<Tool>> {
         let snapshot = self.cache.load();
-        let mut tools = self.filter_meta_tools(&snapshot.meta_tools_all);
+        let mut tools = (*snapshot.meta_tools_all).clone();
         let Some(session_key) = session_key else {
             return Arc::new(tools);
         };
@@ -812,32 +749,12 @@ impl super::ToolRouter {
         Arc::new(tools)
     }
 
-    fn filter_meta_tools(&self, tools: &[Tool]) -> Vec<Tool> {
-        tools
-            .iter()
-            .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
-            .cloned()
-            .collect()
-    }
-
-    fn filtered_legacy_meta_tools(&self) -> Vec<Tool> {
-        build_legacy_meta_tools()
-            .into_iter()
-            .filter(|tool| !is_disabled_tool(&self.config.disabled_tools, tool.name.as_ref()))
-            .collect()
-    }
-
-    pub fn list_resources(&self) -> Arc<Vec<Resource>> {
-        Arc::clone(&self.cache.load().resources_all)
-    }
-
     /// Number of resource URIs with at least one active downstream subscriber.
     /// Read-side observability; also lets tests assert that a degraded upstream's
     /// subscriptions survive a catalog refresh rather than being pruned.
     ///
     /// Counts tracked URIs regardless of transition state (Pending/Active/
-    /// Draining), matching the historical `DashMap::len()` semantics this
-    /// replaced.
+    /// Draining).
     pub fn active_subscription_count(&self) -> usize {
         self.resource_subscriptions.len()
     }
@@ -870,22 +787,21 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
         client_key: Option<&str>,
-    ) -> ListResourcesResult {
+    ) -> Result<ListResourcesResult, McpError> {
         let resources = self.list_resources_for_client(client_key);
-        paginated_result(&resources, request, |resources, next_cursor| {
-            ListResourcesResult {
+        paginated_result(
+            "resources/list",
+            &resources,
+            request,
+            |resources, next_cursor| ListResourcesResult {
                 meta: None,
                 next_cursor,
                 resources,
                 ttl_ms: Some(SYNTHESIZED_CATALOG_TTL_MS),
                 cache_scope: Some(synthesized_catalog_cache_scope()),
                 ..Default::default()
-            }
-        })
-    }
-
-    pub fn list_resource_templates(&self) -> Arc<Vec<ResourceTemplate>> {
-        Arc::clone(&self.cache.load().resource_templates_all)
+            },
+        )
     }
 
     pub fn list_resource_templates_for_client(
@@ -917,9 +833,10 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
         client_key: Option<&str>,
-    ) -> ListResourceTemplatesResult {
+    ) -> Result<ListResourceTemplatesResult, McpError> {
         let resource_templates = self.list_resource_templates_for_client(client_key);
         paginated_result(
+            "resources/templates/list",
             &resource_templates,
             request,
             |resource_templates, next_cursor| ListResourceTemplatesResult {
@@ -931,10 +848,6 @@ impl super::ToolRouter {
                 ..Default::default()
             },
         )
-    }
-
-    pub fn list_prompts(&self) -> Arc<Vec<Prompt>> {
-        Arc::clone(&self.cache.load().prompts_all)
     }
 
     pub fn list_prompts_for_client(&self, client_key: Option<&str>) -> Arc<Vec<Prompt>> {
@@ -963,9 +876,9 @@ impl super::ToolRouter {
         &self,
         request: Option<PaginatedRequestParams>,
         client_key: Option<&str>,
-    ) -> ListPromptsResult {
+    ) -> Result<ListPromptsResult, McpError> {
         let prompts = self.list_prompts_for_client(client_key);
-        paginated_result(&prompts, request, |prompts, next_cursor| {
+        paginated_result("prompts/list", &prompts, request, |prompts, next_cursor| {
             ListPromptsResult {
                 meta: None,
                 next_cursor,

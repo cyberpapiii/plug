@@ -39,17 +39,6 @@ impl Watch {
     }
 }
 
-/// The bundle this binary runs from, when it is `…/X.app/Contents/Resources/plug`.
-fn app_bundle(daemon_exe: &Path) -> Option<PathBuf> {
-    let resources = daemon_exe.parent()?;
-    let contents = resources.parent()?;
-    let bundle = contents.parent()?;
-    let inside_bundle = resources.file_name()? == "Resources"
-        && contents.file_name()? == "Contents"
-        && bundle.extension()? == "app";
-    inside_bundle.then(|| bundle.to_path_buf())
-}
-
 /// `ps -axo comm=` prints one executable path per line.
 fn app_is_running(ps_output: &str, app_exe: &Path) -> bool {
     ps_output
@@ -58,17 +47,17 @@ fn app_is_running(ps_output: &str, app_exe: &Path) -> bool {
 }
 
 fn hidden_marker() -> PathBuf {
-    super::paths::runtime_dir().join("menu-bar-hidden")
+    plug_core::paths::marker(plug_core::paths::MENU_BAR_HIDDEN_MARKER)
 }
 
 pub(super) fn spawn(cancel: CancellationToken) {
     let Some(bundle) = std::env::current_exe()
         .ok()
-        .and_then(|exe| app_bundle(&exe))
+        .and_then(|exe| plug_core::paths::app_bundle_of(&exe))
     else {
         return;
     };
-    let app_exe = bundle.join("Contents/MacOS/Plug");
+    let app_exe = bundle.join(plug_core::paths::APP_EXECUTABLE);
     tokio::spawn(async move {
         let mut watch = Watch::default();
         let mut ticker = tokio::time::interval(LOOK_EVERY);
@@ -146,19 +135,6 @@ mod tests {
         let mut watch = Watch::default();
         assert!(!watch.look(false, false));
         assert!(watch.look(false, false));
-    }
-
-    #[test]
-    fn only_a_daemon_inside_the_app_watches_for_it() {
-        assert_eq!(
-            app_bundle(Path::new("/Applications/Plug.app/Contents/Resources/plug")),
-            Some(PathBuf::from("/Applications/Plug.app"))
-        );
-        assert_eq!(
-            app_bundle(Path::new("/Users/me/plug/target/debug/plug")),
-            None
-        );
-        assert_eq!(app_bundle(Path::new("/opt/Contents/Resources/plug")), None);
     }
 
     #[test]

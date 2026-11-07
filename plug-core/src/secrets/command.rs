@@ -2,29 +2,15 @@
 //! what it prints. This is how any password manager with a command-line tool
 //! becomes a store, with nothing added to Plug.
 
-use std::ffi::OsString;
+use std::ffi::OsStr;
 use std::io::Read;
 use std::process::Stdio;
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::{SecretError, SecretStore, valid_name};
 use crate::types::SecretString;
 
-/// Where `{name}` goes in the command.
-pub const NAME: &str = "{name}";
-
-/// The 1Password store's id: `op://vault/item/field` is a reference as it is.
-pub const OP: &str = "op";
-
-/// The login shell's PATH. The service starts with a bare one, and a
-/// password manager's tool is rarely in `/usr/bin`.
-static LOGIN_PATH: OnceLock<OsString> = OnceLock::new();
-
-/// Give command stores the PATH a terminal would have.
-pub fn use_login_path(path: OsString) {
-    let _ = LOGIN_PATH.set(path);
-}
+use crate::config::secrets::{NAME, OP};
 
 pub struct Command {
     id: String,
@@ -52,7 +38,7 @@ impl Command {
             argv: ["op", "read", "--no-newline", "op:{name}"]
                 .map(str::to_string)
                 .to_vec(),
-            timeout: Duration::from_secs(15),
+            timeout: Duration::from_secs(crate::config::secrets::DEFAULT_COMMAND_TIMEOUT_SECS),
             accepts: |name| {
                 name.starts_with("//") && name.len() > 2 && !name.chars().any(char::is_control)
             },
@@ -99,7 +85,6 @@ fn drain(pipe: Option<impl Read + Send + 'static>) -> std::sync::mpsc::Receiver<
 /// process group, so this reaches a helper that would otherwise live on
 /// holding the pipes open.
 fn stop(child: &mut std::process::Child) {
-    #[cfg(unix)]
     let _ = std::process::Command::new("/bin/kill")
         .args(["-KILL", "--", &format!("-{}", child.id())])
         .stdin(Stdio::null())
@@ -112,6 +97,16 @@ fn stop(child: &mut std::process::Child) {
 
 impl SecretStore for Command {
     fn get(&self, name: &str) -> Result<Option<SecretString>, SecretError> {
+        self.get_on(name, None)
+    }
+
+    /// The service starts with a bare PATH, and a password manager's tool is
+    /// rarely in `/usr/bin`, so a server's start passes the login shell's.
+    fn get_on(
+        &self,
+        name: &str,
+        path: Option<&OsStr>,
+    ) -> Result<Option<SecretString>, SecretError> {
         let mut argv = self.argv.iter().map(|arg| arg.replace(NAME, name));
         let program = argv
             .next()
@@ -122,10 +117,9 @@ impl SecretStore for Command {
             .stdin(Stdio::null())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if let Some(path) = LOGIN_PATH.get() {
+        if let Some(path) = path {
             command.env("PATH", path);
         }
-        #[cfg(unix)]
         std::os::unix::process::CommandExt::process_group(&mut command, 0);
         let mut child = command.spawn().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
@@ -207,7 +201,7 @@ impl SecretStore for Command {
     }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -244,18 +238,23 @@ mod tests {
     }
 
     /// Whether the process whose id `script` wrote to `pid_file` is gone
-    /// within two seconds. `kill -0` asks only whether it is still there.
+    /// within five seconds. A zombie counts as gone: it has exited, and in a
+    /// container with no init to reap it, it stays a zombie.
     fn helper_is_gone(pid_file: &std::path::Path) -> bool {
-        let pid = std::fs::read_to_string(pid_file).unwrap();
+        let pid = std::fs::read_to_string(pid_file)
+            .expect("the script should write its helper's pid before it is stopped");
         let alive = || {
-            std::process::Command::new("/bin/kill")
-                .args(["-0", pid.trim()])
+            let state = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.trim()])
                 .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
+                .output()
+                .unwrap();
+            state.status.success()
+                && !String::from_utf8_lossy(&state.stdout)
+                    .trim()
+                    .starts_with('Z')
         };
-        let gone_by = Instant::now() + Duration::from_secs(2);
+        let gone_by = Instant::now() + Duration::from_secs(5);
         while alive() && Instant::now() < gone_by {
             std::thread::sleep(Duration::from_millis(25));
         }
@@ -267,7 +266,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pid_file = dir.path().join("pid");
         let script = format!("sleep 30 & echo $! > '{}'; wait", pid_file.display());
-        let store = shell(&script, Duration::from_millis(400));
+        // Long enough for `sh` to write the pid file under a loaded machine;
+        // the command never ends, so the test always waits all of it.
+        let store = shell(&script, Duration::from_secs(1));
         assert!(matches!(
             store.get("github"),
             Err(SecretError::TimedOut { .. })
@@ -285,7 +286,9 @@ mod tests {
             "sleep 30 >/dev/null & echo $! > '{}'; printf value",
             pid_file.display()
         );
-        let store = shell(&script, Duration::from_millis(300));
+        // The command is done in milliseconds; the timeout is only how long
+        // the store waits on the error pipe before stopping the helper.
+        let store = shell(&script, Duration::from_secs(1));
         assert_eq!(store.get("github").unwrap().unwrap().as_str(), "value");
         assert!(helper_is_gone(&pid_file), "the helper outlived the command");
     }
@@ -343,5 +346,36 @@ mod tests {
         let op = Command::one_password();
         assert!(op.accepts("//Private/My Item/password"));
         assert!(!op.accepts("github") && !op.accepts("//"));
+    }
+
+    /// The tool is found on the PATH of the start that asks, so a PATH the
+    /// login shell gave later is used and not the first one ever seen.
+    #[test]
+    fn the_tool_is_found_on_the_path_of_the_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let tool = dir.path().join("plug-test-vault-tool");
+        std::fs::write(&tool, "#!/bin/sh\nprintf 'from-path'\n").unwrap();
+        std::fs::set_permissions(&tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let store = Command::new(
+            "vault",
+            vec!["plug-test-vault-tool".to_string()],
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            store
+                .get_on("github", Some(OsStr::new("/nonexistent")))
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .get_on("github", Some(dir.path().as_os_str()))
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "from-path"
+        );
     }
 }

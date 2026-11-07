@@ -29,16 +29,17 @@ struct Check: Identifiable, Equatable, Sendable, Decodable {
         self.fix = fix
     }
 
+    /// As `CheckResult` serializes. A status Plug does not know is a
+    /// problem, never a pass.
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
         name = try container.decode(String.self, forKey: .name)
-        title = try container.decodeIfPresent(String.self, forKey: .title) ?? Self.readable(name)
-        message = try container.decodeIfPresent(String.self, forKey: .message) ?? ""
+        title = try container.decode(String.self, forKey: .title)
+        message = try container.decode(String.self, forKey: .message)
         fix = try container.decodeIfPresent(String.self, forKey: .fix)
-        let status = try container.decodeIfPresent(String.self, forKey: .status)?.lowercased()
-        result = switch status {
-        case "pass", "ok": .pass
-        case "warn", "warning": .warn
+        result = switch try container.decode(String.self, forKey: .status) {
+        case "Pass": .pass
+        case "Warn": .warn
         default: .fail
         }
     }
@@ -77,7 +78,7 @@ struct Checkup: Equatable, Sendable, Decodable {
     }
 }
 
-enum CheckupError: LocalizedError, Equatable {
+enum CheckupError: LocalizedError, AdvisedError, Equatable {
     case serviceMissing
     case unreadable
 

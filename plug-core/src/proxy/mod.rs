@@ -10,32 +10,26 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use rmcp::ErrorData as McpError;
-use rmcp::handler::server::ServerHandler;
-use rmcp::model::RequestParamsMeta;
 use rmcp::model::*;
-use rmcp::service::{NotificationContext, Peer, PeerRequestOptions, RequestContext, RoleServer};
+use rmcp::service::{Peer, PeerRequestOptions, RequestHandle, RoleClient};
 use tokio::sync::Mutex;
 use tokio::sync::broadcast;
-use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::artifacts::ArtifactStore;
-use crate::branding;
 use crate::circuit::CircuitBreakerError;
-use crate::client_detect::detect_client;
 use crate::config::{Config, LazyToolsConfig};
-use crate::engine::{Engine, next_call_id};
+use crate::downstream_identity::DownstreamTransport;
 use crate::error::ProtocolError;
-use crate::notifications::{NotificationTarget, ProtocolNotification};
+use crate::health::Recovery;
+use crate::notifications::{ListsChanged, NotificationTarget, ProtocolNotification};
 use crate::server::ServerManager;
 use crate::tasks::{TaskOwner, TaskStore, TaskUpstreamRef};
+use crate::tool_patterns::is_disabled_tool;
 use crate::types::{
     ClientType, ExtensionEnvelope, LazyToolMode, LazyToolModeOrigin, PrincipalId,
     ResolvedLazyToolPolicy, ServerHealth,
 };
-use continuations::{
-    MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ITEMS, MRTR_MAX_REQUEST_STATE_BYTES, MRTR_MAX_ROUNDS,
-};
+use continuations::{MRTR_CHAIN_TTL, MRTR_MAX_BYTES, MRTR_MAX_ROUNDS};
 
 const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 /// Backstop timeout for a single `refresh_tools` pass inside the notification
@@ -46,26 +40,26 @@ const LIST_CHANGED_REFRESH_DEBOUNCE: Duration = Duration::from_millis(750);
 const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
-#[cfg(test)]
-const LATEST_PROTOCOL_VERSION: &str = crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 
-fn plug_implementation() -> Implementation {
-    branding::plug_implementation(env!("CARGO_PKG_VERSION"))
+/// Make a tool result from `server_id` fit to leave Plug. A call's answer
+/// and a task's stored result both come through here.
+fn outward_tool_result(server_id: &str, result: &mut CallToolResult) {
+    admit_tool_result_meta(result);
+    skills::outward_tool_result(server_id, result);
 }
 
-/// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
-///
-/// Built once at `refresh_tools()` time so that `list_tools_for_client()` is O(1).
+/// Atomically-swapped catalog, built once at `refresh_tools()` time, so a
+/// listing reads it without rebuilding.
 #[derive(Clone)]
 pub(crate) struct RouterSnapshot {
-    /// Full sorted tool list (for clients with no limit).
+    /// Every routed tool, priority-sorted.
     pub tools_all: Arc<Vec<Tool>>,
-    /// Meta-tool-only list exposed when meta-tool mode is enabled.
+    /// What a Bridge client is listed before it loads any tool: Plug's
+    /// search tool, unless `disabled_tools` hides it.
     pub meta_tools_all: Arc<Vec<Tool>>,
-    /// Priority-sorted, truncated to 100 (Devin, for Cascade).
-    pub tools_devin: Arc<Vec<Tool>>,
-    /// Priority-sorted, truncated to 128 (VS Code Copilot).
-    pub tools_copilot: Arc<Vec<Tool>>,
+    /// What a legacy meta-tool client is listed, less what `disabled_tools`
+    /// hides.
+    pub legacy_meta_tools: Arc<Vec<Tool>>,
     /// Tool name → (server name, original tool name) routing table.
     pub routes: HashMap<String, (String, String)>,
     /// ASCII-lowercased route keys for O(1) case-insensitive tools/call fallback.
@@ -86,11 +80,55 @@ pub(crate) struct RouterSnapshot {
     pub prompt_routes: HashMap<String, (String, String)>,
     /// Fingerprints for routed tool definitions to detect material drift.
     pub tool_definition_fingerprints: HashMap<String, u64>,
-    /// Tool name -> operator-only risk metadata preserving upstream-vs-Plug annotation provenance.
-    pub tool_risk_inventory: HashMap<String, crate::ipc::IpcToolRiskInfo>,
+    /// Tool name -> where its risk annotations came from.
+    pub tool_risk_inventory: HashMap<String, ToolRisk>,
+}
+
+/// A tool's annotations as its server declared them, as Plug inferred them
+/// from the tool, and as Plug lists them.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ToolRisk {
+    pub upstream_declared: Option<ToolAnnotations>,
+    pub plug_inferred: Option<ToolAnnotations>,
+    pub effective: Option<ToolAnnotations>,
+}
+
+impl Default for RouterSnapshot {
+    /// No server's tools, resources or prompts: only Plug's own meta tools.
+    fn default() -> Self {
+        Self {
+            tools_all: Arc::default(),
+            meta_tools_all: Arc::new(build_meta_tools()),
+            legacy_meta_tools: Arc::new(build_legacy_meta_tools()),
+            routes: HashMap::new(),
+            routes_lower: HashMap::new(),
+            tools_by_name: HashMap::new(),
+            tools_by_name_lower: HashMap::new(),
+            resources_all: Arc::default(),
+            resource_templates_all: Arc::default(),
+            prompts_all: Arc::default(),
+            resource_routes: HashMap::new(),
+            prompt_routes: HashMap::new(),
+            tool_definition_fingerprints: HashMap::new(),
+            tool_risk_inventory: HashMap::new(),
+        }
+    }
 }
 
 impl RouterSnapshot {
+    /// Which lists a client is served differ between `previous` and this
+    /// snapshot, whatever surface the client lists tools through.
+    fn lists_changed_since(&self, previous: &Self) -> ListsChanged {
+        ListsChanged {
+            tools: self.tools_all != previous.tools_all
+                || self.meta_tools_all != previous.meta_tools_all
+                || self.legacy_meta_tools != previous.legacy_meta_tools,
+            resources: self.resources_all != previous.resources_all
+                || self.resource_templates_all != previous.resource_templates_all,
+            prompts: self.prompts_all != previous.prompts_all,
+        }
+    }
+
     /// Whether the tool listed as `name` only reads, so a watch may call it
     /// again and again. Only the server's own word counts. Plug's reading of
     /// a tool's name is a guess, good for sorting a list and not for calling
@@ -98,8 +136,20 @@ impl RouterSnapshot {
     fn safe_to_repeat(&self, name: &str) -> bool {
         self.tool_risk_inventory
             .get(name)
-            .and_then(|risk| risk.upstream_declared.read_only)
+            .and_then(|risk| risk.upstream_declared.as_ref()?.read_only_hint)
             .unwrap_or(false)
+    }
+
+    /// Whether a call to `name` that reached its server and lost the answer
+    /// may be sent again: the server says the tool only reads, or that a
+    /// second run has no further effect. Only the server's own word counts.
+    fn may_resend(&self, name: &str) -> bool {
+        self.tool_risk_inventory
+            .get(name)
+            .and_then(|risk| risk.upstream_declared.as_ref())
+            .is_some_and(|hints| {
+                hints.read_only_hint == Some(true) || hints.idempotent_hint == Some(true)
+            })
     }
 
     /// Populate O(1) lookup indexes after routes/tools are finalized.
@@ -275,14 +325,11 @@ pub struct RouterConfig {
     pub enable_prefix: bool,
     pub prefix_delimiter: String,
     pub priority_tools: Vec<String>,
-    pub disabled_tools: Vec<String>,
     pub tool_description_max_chars: Option<usize>,
     pub tool_search_threshold: usize,
     pub meta_tool_mode: bool,
     pub lazy_tools: LazyToolsConfig,
     pub tool_filter_enabled: bool,
-    /// Servers with enrichment enabled (annotation inference + title normalization).
-    pub enrichment_servers: std::collections::HashSet<String>,
 }
 
 fn merge_call_extension_meta(params: &mut CallToolRequestParams, meta: MetaObject) {
@@ -298,34 +345,25 @@ impl From<&Config> for RouterConfig {
             enable_prefix: config.enable_prefix,
             prefix_delimiter: config.prefix_delimiter.clone(),
             priority_tools: config.priority_tools.clone(),
-            disabled_tools: config
-                .disabled_tools
-                .iter()
-                .map(|pattern| pattern.to_ascii_lowercase())
-                .collect(),
             tool_description_max_chars: config.tool_description_max_chars,
             tool_search_threshold: config.tool_search_threshold,
             meta_tool_mode: config.meta_tool_mode,
             lazy_tools: config.lazy_tools.clone(),
             tool_filter_enabled: config.tool_filter_enabled,
-            enrichment_servers: config
-                .servers
-                .iter()
-                .filter(|(_, sc)| sc.enrichment)
-                .map(|(name, _)| name.clone())
-                .collect(),
         }
+    }
+}
+
+impl Default for RouterConfig {
+    fn default() -> Self {
+        Self::from(&Config::default())
     }
 }
 
 impl RouterConfig {
     fn lazy_policy_for_client(&self, client_type: ClientType) -> ResolvedLazyToolPolicy {
         let target = client_type.target_slug().unwrap_or("unknown");
-        crate::config::resolve_lazy_tool_policy_from_settings(
-            self.meta_tool_mode,
-            &self.lazy_tools,
-            target,
-        )
+        crate::clients::lazy_tool_policy(self.meta_tool_mode, &self.lazy_tools, target)
     }
 
     fn lazy_surface_for_client(&self, client_type: ClientType) -> LazyToolSurface {
@@ -349,6 +387,14 @@ enum LazyToolSurface {
     LegacyMeta,
 }
 
+/// Whether a task can carry a call to an upstream of `upstream_era`. A task
+/// cannot carry a modern upstream's rounds. An upstream that is not connected
+/// passes: the task owns its later result, and the era is judged again
+/// against the connection the task's call is sent on.
+fn task_can_carry(upstream_era: Option<crate::protocol::ProtocolEra>) -> bool {
+    upstream_era != Some(crate::protocol::ProtocolEra::Modern)
+}
+
 fn mrtr_pair_supported(
     downstream_era: crate::protocol::ProtocolEra,
     upstream_era: crate::protocol::ProtocolEra,
@@ -360,17 +406,12 @@ fn mrtr_pair_supported(
     if has_continuation && !native_modern {
         return false;
     }
-    if task_requested && upstream_era == crate::protocol::ProtocolEra::Modern {
+    if task_requested && !task_can_carry(Some(upstream_era)) {
         return false;
     }
     !(downstream_era == crate::protocol::ProtocolEra::Legacy
         && upstream_era == crate::protocol::ProtocolEra::Modern)
 }
-
-/// Shared tool routing logic used by both stdio (ProxyHandler) and HTTP handlers.
-/// Backs [`ToolRouter::catalog_revision`]. See that method for why it is
-/// process-global instead of a field.
-static CATALOG_REVISION: AtomicU64 = AtomicU64::new(0);
 
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
@@ -380,6 +421,8 @@ pub struct ToolRouter {
     /// without invalidating parked rounds; route targets and upstream
     /// instances may not.
     published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
+    /// Backs [`ToolRouter::catalog_revision`].
+    catalog_revision: AtomicU64,
     /// Search index for the current snapshot, rebuilt lazily when the
     /// snapshot changes. See [`ToolRouter::search_index_for`].
     search_index: std::sync::Mutex<Option<Arc<ToolSearchIndex>>>,
@@ -402,12 +445,9 @@ pub struct ToolRouter {
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
-    pending_tool_list_changed: AtomicBool,
-    pending_resource_list_changed: AtomicBool,
-    pending_prompt_list_changed: AtomicBool,
-    /// Weak reference to Engine for session recovery (reconnect on error).
-    /// Set after Engine construction via `set_engine()`.
-    engine: std::sync::RwLock<Option<Weak<Engine>>>,
+    /// Reconnects a server whose session failed under a call. Weak: the
+    /// runtime behind it owns this router.
+    recovery: Weak<dyn Recovery>,
     artifact_store: ArtifactStore,
     /// Resource subscription registry: upstream URI → set of downstream subscribers.
     /// Owns the atomic subscribe/unsubscribe state machine — see
@@ -426,10 +466,15 @@ pub struct ToolRouter {
     /// changes it while clients are connected. A client with no entry gets
     /// everything.
     client_access: ArcSwap<HashMap<String, ClientAccess>>,
-    /// Runtime-owned mutable task state. Intentionally not part of the immutable router snapshot.
+    /// The `disabled_tools` patterns, lowercased. Reloadable like
+    /// `client_access`.
+    disabled_tools: ArcSwap<Vec<String>>,
+    /// Runtime-owned mutable task state, not part of the router snapshot.
+    /// Reached through `with_task_store`, which finishes the cleanup of the
+    /// records each operation finds expired.
     task_store: Mutex<TaskStore>,
     /// One process-wide admission ledger shared by every downstream transport.
-    admission_quotas: crate::protocol::AdmissionQuotas,
+    admission_quotas: crate::admission::AdmissionQuotas,
     /// Process-wide, reloadable gate for the modern downstream lifecycle.
     /// It defaults off and is captured into each downstream call context.
     modern_downstream_enabled: AtomicBool,
@@ -489,16 +534,6 @@ impl Drop for RefreshLeaderGuard<'_> {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum DownstreamTransport {
-    Stdio,
-    Http,
-    /// Daemon IPC client (`plug connect` over the Unix socket). Has its own
-    /// lazy-session-key namespace (`ipc:`) and `NotificationTarget::Ipc` so it no
-    /// longer masquerades as `Stdio`.
-    Ipc,
-}
-
 #[derive(Clone, Debug)]
 pub struct DownstreamCallContext {
     pub transport: DownstreamTransport,
@@ -513,154 +548,105 @@ pub struct DownstreamCallContext {
     pub trace_id: Arc<str>,
     pub protocol_era: crate::protocol::ProtocolEra,
     pub protocol_version: Arc<str>,
-    /// Reloadable transport gate captured when this request context is built.
-    /// Modern policy remains fail-closed unless the owning adapter sets it.
-    pub modern_direction_enabled: bool,
-    pub principal: Option<PrincipalId>,
-    pub scopes: Arc<BTreeSet<String>>,
-    pub local_trust: bool,
+    principal: Option<PrincipalId>,
+    scopes: Arc<BTreeSet<String>>,
+    local_trust: bool,
     pub client_metadata: Option<crate::protocol::ClientMetadata>,
-    pub deadline: Option<std::time::Instant>,
-    pub cancellation: CancellationToken,
-    pub durable_owner: Option<TaskOwner>,
     /// OAuth client generation captured during bearer validation. Durable
     /// admission rechecks it after registering the TaskStore create guard.
-    pub principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
+    principal_lifecycle: Option<crate::downstream_oauth::PrincipalLifecycleLease>,
     /// Admitted peer metadata stays opaque to authorization and routing code.
     pub(crate) extension_envelope: Option<ExtensionEnvelope>,
+    /// Cancelled when the client cancels this request, so a call that then
+    /// fails is recorded as cancelled rather than as an error.
+    pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    /// The one HTTP exchange a stateless request arrived in. Its client id
+    /// names a whole principal, which several callers may share, so this is
+    /// what keeps their calls, and the notices about them, apart.
+    pub(crate) exchange: Option<u64>,
 }
 
 impl DownstreamCallContext {
-    pub fn stdio(client_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
-        Self::stdio_for_client(client_id, request_id, ClientType::Unknown)
-    }
-
-    pub fn stdio_for_client(
-        client_id: impl Into<Arc<str>>,
+    fn new(
+        transport: DownstreamTransport,
+        client_id: Arc<str>,
         request_id: RequestId,
         client_type: ClientType,
+        principal: Option<PrincipalId>,
+        local_trust: bool,
     ) -> Self {
-        let client_id = client_id.into();
         Self {
-            transport: DownstreamTransport::Stdio,
-            client_id: Arc::clone(&client_id),
+            transport,
+            client_id,
             request_id,
             client_type,
             client_key: None,
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: Some(PrincipalId::stdio_process(stable_instance_uuid(
-                "stdio", &client_id,
-            ))),
+            principal,
             scopes: Arc::new(BTreeSet::new()),
-            local_trust: true,
+            local_trust,
             client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
             principal_lifecycle: None,
             extension_envelope: None,
+            cancellation: tokio_util::sync::CancellationToken::new(),
+            exchange: None,
         }
     }
 
-    pub fn ipc_for_client(
-        client_id: impl Into<Arc<str>>,
+    /// A `plug connect` session. Local by construction, so trusted; see
+    /// [`crate::downstream_identity::ipc_principal`] for who it is.
+    pub fn ipc(
+        session_id: impl Into<Arc<str>>,
         request_id: RequestId,
         client_type: ClientType,
+        registry_client_id: Option<&str>,
     ) -> Self {
-        let client_id = client_id.into();
-        Self {
-            transport: DownstreamTransport::Ipc,
-            client_id: Arc::clone(&client_id),
+        let session_id = session_id.into();
+        let principal = crate::downstream_identity::ipc_principal(&session_id, registry_client_id);
+        Self::new(
+            DownstreamTransport::Ipc,
+            session_id,
             request_id,
             client_type,
-            client_key: None,
-            trace_id: Arc::from(new_trace_id()),
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: Some(PrincipalId::daemon_ipc(stable_instance_uuid(
-                "ipc", &client_id,
-            ))),
-            scopes: Arc::new(BTreeSet::new()),
-            local_trust: true,
-            client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
-            principal_lifecycle: None,
-            extension_envelope: None,
-        }
-    }
-
-    pub fn http(session_id: impl Into<Arc<str>>, request_id: RequestId) -> Self {
-        Self::http_for_client(session_id, request_id, ClientType::Unknown)
+            Some(principal),
+            true,
+        )
     }
 
     /// HTTP is the only internet-reachable transport, so its contexts start
     /// untrusted and an adapter opts in — `with_authorization` for a bearer
     /// principal, `with_local_principal` for a loopback listener that requires
-    /// no auth. Stdio and IPC are local by construction and stay trusted.
-    /// An adapter that forgets to say which it is gets a context that can do
-    /// nothing, rather than one that can do everything.
-    pub fn http_for_client(
-        session_id: impl Into<Arc<str>>,
+    /// no auth. An adapter that forgets to say which it is gets a context
+    /// that can do nothing, rather than one that can do everything.
+    pub fn http(
+        client_id: impl Into<Arc<str>>,
         request_id: RequestId,
         client_type: ClientType,
     ) -> Self {
-        let session_id = session_id.into();
-        Self {
-            transport: DownstreamTransport::Http,
-            client_id: session_id,
+        Self::new(
+            DownstreamTransport::Http,
+            client_id.into(),
             request_id,
             client_type,
-            client_key: None,
-            trace_id: Arc::from(new_trace_id()),
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: None,
-            scopes: Arc::new(BTreeSet::new()),
-            local_trust: false,
-            client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
-            principal_lifecycle: None,
-            extension_envelope: None,
-        }
+            None,
+            false,
+        )
     }
 
-    /// Untrusted by default, for the reasons on [`Self::http_for_client`].
-    pub fn http_for_client_with_trace(
-        session_id: impl Into<Arc<str>>,
-        request_id: RequestId,
-        client_type: ClientType,
-        trace_id: impl Into<Arc<str>>,
-    ) -> Self {
-        let session_id = session_id.into();
-        Self {
-            transport: DownstreamTransport::Http,
-            client_id: session_id,
-            request_id,
-            client_type,
-            client_key: None,
-            trace_id: trace_id.into(),
-            protocol_era: crate::protocol::ProtocolEra::Legacy,
-            protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
-            principal: None,
-            scopes: Arc::new(BTreeSet::new()),
-            local_trust: false,
-            client_metadata: None,
-            deadline: None,
-            cancellation: CancellationToken::new(),
-            durable_owner: None,
-            principal_lifecycle: None,
-            extension_envelope: None,
-        }
+    pub fn with_trace_id(mut self, trace_id: impl Into<Arc<str>>) -> Self {
+        self.trace_id = trace_id.into();
+        self
+    }
+
+    pub fn principal(&self) -> Option<&PrincipalId> {
+        self.principal.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn has_principal_lifecycle(&self) -> bool {
+        self.principal_lifecycle.is_some()
     }
 
     pub fn with_authorization(
@@ -720,71 +706,54 @@ impl DownstreamCallContext {
         self
     }
 
-    pub fn with_modern_direction_enabled(mut self, enabled: bool) -> Self {
-        self.modern_direction_enabled = enabled;
-        self
-    }
-
-    pub fn with_lifecycle(
-        mut self,
-        deadline: Option<std::time::Instant>,
-        cancellation: CancellationToken,
-        durable_owner: Option<TaskOwner>,
-    ) -> Self {
-        self.deadline = deadline;
-        self.cancellation = cancellation;
-        self.durable_owner = durable_owner;
+    pub(crate) fn in_exchange(mut self, exchange: u64) -> Self {
+        self.exchange = Some(exchange);
         self
     }
 
     pub fn policy_decision(
         &self,
-        family: crate::protocol::MethodFamily,
-    ) -> crate::protocol::PolicyDecision {
-        crate::protocol::decide_method(
-            &crate::protocol::CapabilityPolicyInput {
-                era: self.protocol_era,
-                transport: self.transport,
+        family: crate::admission::MethodFamily,
+    ) -> crate::admission::PolicyDecision {
+        self.decide(family, false)
+    }
+
+    /// `bridge_implemented` is true only where Plug itself completes a
+    /// multi-round tool call, the one bridge that exists.
+    fn decide(
+        &self,
+        family: crate::admission::MethodFamily,
+        bridge_implemented: bool,
+    ) -> crate::admission::PolicyDecision {
+        crate::admission::decide_method(
+            &crate::admission::CapabilityPolicyInput {
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
-                modern_direction_enabled: self.modern_direction_enabled,
-                bridge_implemented: false,
+                bridge_implemented,
             },
             family,
         )
     }
 
-    pub fn authorize(&self, family: crate::protocol::MethodFamily) -> Result<(), rmcp::ErrorData> {
-        match self.policy_decision(family) {
-            crate::protocol::PolicyDecision::Allow => Ok(()),
-            crate::protocol::PolicyDecision::Deny(outcome) => {
+    fn admit(&self, decision: crate::admission::PolicyDecision) -> Result<(), rmcp::ErrorData> {
+        match decision {
+            crate::admission::PolicyDecision::Allow => Ok(()),
+            crate::admission::PolicyDecision::Deny(outcome) => {
                 Err(outcome.into_error(self.protocol_era))
             }
         }
+    }
+
+    pub fn authorize(&self, family: crate::admission::MethodFamily) -> Result<(), rmcp::ErrorData> {
+        self.admit(self.decide(family, false))
     }
 
     fn authorize_continuation(&self) -> Result<(), rmcp::ErrorData> {
-        match crate::protocol::decide_method(
-            &crate::protocol::CapabilityPolicyInput {
-                era: self.protocol_era,
-                transport: self.transport,
-                principal: self.principal.as_ref(),
-                scopes: self.scopes.as_ref(),
-                local_trust: self.local_trust,
-                modern_direction_enabled: self.modern_direction_enabled,
-                bridge_implemented: true,
-            },
-            crate::protocol::MethodFamily::Continuations,
-        ) {
-            crate::protocol::PolicyDecision::Allow => Ok(()),
-            crate::protocol::PolicyDecision::Deny(outcome) => {
-                Err(outcome.into_error(self.protocol_era))
-            }
-        }
+        self.admit(self.decide(crate::admission::MethodFamily::Continuations, true))
     }
 
-    fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
+    pub(crate) fn ensure_principal_lifecycle_active(&self) -> Result<(), rmcp::ErrorData> {
         if self
             .principal_lifecycle
             .as_ref()
@@ -798,29 +767,20 @@ impl DownstreamCallContext {
     }
 
     pub fn notification_target(&self) -> NotificationTarget {
-        match self.transport {
-            DownstreamTransport::Stdio => NotificationTarget::Stdio {
-                client_id: Arc::clone(&self.client_id),
-            },
-            DownstreamTransport::Http => NotificationTarget::Http {
-                session_id: Arc::clone(&self.client_id),
-            },
-            DownstreamTransport::Ipc => NotificationTarget::Ipc {
-                client_id: Arc::clone(&self.client_id),
-            },
+        match self.exchange {
+            Some(exchange) => self
+                .transport
+                .notification_target(&Arc::from(format!("{}#{exchange}", self.client_id))),
+            None => self.transport.notification_target(&self.client_id),
         }
     }
 }
 
-fn stable_instance_uuid(namespace: &str, value: &str) -> Uuid {
-    let mut first = std::collections::hash_map::DefaultHasher::new();
-    namespace.hash(&mut first);
-    value.hash(&mut first);
-    let mut second = std::collections::hash_map::DefaultHasher::new();
-    value.hash(&mut second);
-    namespace.hash(&mut second);
-    0x706c_7567_u32.hash(&mut second);
-    Uuid::from_u128(((first.finish() as u128) << 64) | second.finish() as u128)
+/// Correlates a call's ToolCallStarted and ToolCallCompleted events.
+static NEXT_CALL_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_call_id() -> u64 {
+    NEXT_CALL_ID.fetch_add(1, Ordering::Relaxed)
 }
 
 static NEXT_TRACE_ID: AtomicU64 = AtomicU64::new(1);
@@ -836,6 +796,7 @@ struct DownstreamCallKey {
     transport: DownstreamTransport,
     client_id: Arc<str>,
     request_id: RequestId,
+    exchange: Option<u64>,
 }
 
 impl From<&DownstreamCallContext> for DownstreamCallKey {
@@ -844,6 +805,7 @@ impl From<&DownstreamCallContext> for DownstreamCallKey {
             transport: value.transport,
             client_id: Arc::clone(&value.client_id),
             request_id: value.request_id.clone(),
+            exchange: value.exchange,
         }
     }
 }
@@ -868,6 +830,42 @@ struct ActiveCallRecord {
     downstream_progress_token: Option<ProgressToken>,
     upstream_progress_token: Option<ProgressToken>,
     pending_cancel_reason: Option<Option<String>>,
+}
+
+/// Who waits for a tool call's answer.
+#[derive(Clone, Debug)]
+enum CallKind {
+    /// The downstream request that named the tool.
+    Direct,
+    /// `plug__invoke_tool`'s target, which a lazy session may call before
+    /// loading it.
+    Invoked,
+    /// The task with this id. Its record holds the upstream request, so a
+    /// cancel or a teardown reaches the call.
+    Task(String),
+    /// A legacy task-wrapped call to a server that runs tasks itself. Its
+    /// answer is the task the server created.
+    CreateTask,
+}
+
+impl CallKind {
+    fn is_task(&self) -> bool {
+        matches!(self, Self::Task(_))
+    }
+
+    fn task_id(&self) -> Option<&str> {
+        match self {
+            Self::Task(task_id) => Some(task_id),
+            Self::Direct | Self::Invoked | Self::CreateTask => None,
+        }
+    }
+
+    /// Whether a downstream cancel of the request reaches this call. A
+    /// task's request was answered when the task was created. A task create
+    /// is left to finish, so the task it makes is recorded or cancelled.
+    fn downstream_cancels(&self) -> bool {
+        matches!(self, Self::Direct | Self::Invoked)
+    }
 }
 
 #[derive(Clone)]
@@ -908,10 +906,41 @@ pub(crate) struct ContinuationInsertGate {
     pub release: Arc<std::sync::Barrier>,
 }
 
+/// A request an upstream server makes of the downstream client, which Plug
+/// relays through the client's [`DownstreamBridge`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReverseRequest {
+    Elicitation,
+    Sampling,
+}
+
+impl ReverseRequest {
+    /// Refuse a request the client did not declare at `initialize`.
+    pub fn check_declared(self, capabilities: Option<&ClientCapabilities>) -> Result<(), McpError> {
+        let (declared, name) = match self {
+            Self::Elicitation => (
+                capabilities.is_some_and(|c| c.elicitation.is_some()),
+                "elicitation",
+            ),
+            Self::Sampling => (
+                capabilities.is_some_and(|c| c.sampling.is_some()),
+                "sampling",
+            ),
+        };
+        if declared {
+            Ok(())
+        } else {
+            Err(McpError::internal_error(
+                format!("client does not support {name}"),
+                None,
+            ))
+        }
+    }
+}
+
 /// Abstraction for forwarding reverse requests (elicitation, sampling) to a downstream client.
 ///
 /// Each transport implements this trait differently:
-/// - stdio: calls `Peer<RoleServer>` methods directly
 /// - HTTP: sends JSON-RPC request via SSE, awaits POST response via oneshot channel
 /// - daemon IPC: sends `IpcClientRequest` to the proxy over Unix socket
 pub trait DownstreamBridge: Send + Sync {
@@ -927,54 +956,66 @@ pub trait DownstreamBridge: Send + Sync {
 }
 
 impl ToolRouter {
-    pub fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
+    /// A router over `server_manager` that spawns its background work on
+    /// `tracker` and reconnects failed sessions through `recovery`.
+    pub(crate) fn with_runtime(
+        server_manager: Arc<ServerManager>,
+        config: RouterConfig,
+        tracker: tokio_util::task::TaskTracker,
+        recovery: Weak<dyn Recovery>,
+    ) -> Self {
+        Self::build(
+            server_manager,
+            config,
+            crate::admission::AdmissionQuotas::new(Default::default()),
+            tracker,
+            recovery,
+        )
+    }
+
+    /// A router with no runtime behind it: nothing reconnects its servers.
+    #[cfg(test)]
+    pub(crate) fn new(server_manager: Arc<ServerManager>, config: RouterConfig) -> Self {
         Self::new_with_quotas(
             server_manager,
             config,
-            crate::protocol::AdmissionQuotas::new(Default::default()),
+            crate::admission::AdmissionQuotas::new(Default::default()),
         )
     }
 
     /// Changes whenever the merged tool catalog could look different to a
-    /// reader: a refreshed upstream catalog, or a reload that rebuilt the
-    /// router around new configuration.
-    ///
-    /// Process-global rather than per-router on purpose. A reload replaces the
-    /// `ToolRouter`, and a per-instance counter would restart at zero, letting
-    /// a client that had already seen revision zero skip the refetch the
-    /// reload just made necessary.
+    /// reader. It starts at a random number, so a reader still holding a
+    /// revision from an earlier daemon never takes this one for it.
     pub fn catalog_revision(&self) -> u64 {
-        CATALOG_REVISION.load(Ordering::Relaxed)
+        self.catalog_revision.load(Ordering::Relaxed)
     }
 
-    fn new_with_quotas(
+    #[cfg(test)]
+    pub(crate) fn new_with_quotas(
         server_manager: Arc<ServerManager>,
         config: RouterConfig,
-        admission_quotas: crate::protocol::AdmissionQuotas,
+        admission_quotas: crate::admission::AdmissionQuotas,
     ) -> Self {
-        // A reload builds a new router around new configuration, which can
-        // change the catalog a reader sees before any upstream refresh runs.
-        CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+        Self::build(
+            server_manager,
+            config,
+            admission_quotas,
+            tokio_util::task::TaskTracker::new(),
+            crate::health::no_recovery(),
+        )
+    }
+
+    fn build(
+        server_manager: Arc<ServerManager>,
+        config: RouterConfig,
+        admission_quotas: crate::admission::AdmissionQuotas,
+        tracker: tokio_util::task::TaskTracker,
+        recovery: Weak<dyn Recovery>,
+    ) -> Self {
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
-        let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all: Arc::new(Vec::new()),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }));
-        let resource_subscriptions = subscriptions::SubscriptionRegistry::new();
+        let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot::default()));
+        let resource_subscriptions = subscriptions::SubscriptionRegistry::new(tracker);
         // Drains resolve an entry's recorded owning server to a live handle
         // at drain time — never trusting a handle resolved earlier from the
         // route cache, which can point at the wrong server on either side
@@ -1011,7 +1052,8 @@ impl ToolRouter {
                         return;
                     };
                     tokio::spawn(async move {
-                        let published_route = cache.load().resource_routes.get(&uri).cloned();
+                        let published_route =
+                            completion::resolve_resource_route(&cache.load().resource_routes, &uri);
                         let Some(new_server_id) = published_route else {
                             // Route vanished entirely: the next refresh's
                             // prune plus the recorded owner drain it.
@@ -1052,6 +1094,7 @@ impl ToolRouter {
             activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
+            catalog_revision: AtomicU64::new(rand::random()),
             search_index: std::sync::Mutex::new(None),
             config,
             protocol_notification_tx,
@@ -1066,10 +1109,7 @@ impl ToolRouter {
             upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
-            pending_tool_list_changed: AtomicBool::new(false),
-            pending_resource_list_changed: AtomicBool::new(false),
-            pending_prompt_list_changed: AtomicBool::new(false),
-            engine: std::sync::RwLock::new(None),
+            recovery,
             artifact_store: ArtifactStore::new(),
             resource_subscriptions,
             subscriber_client_keys: DashMap::new(),
@@ -1077,6 +1117,7 @@ impl ToolRouter {
             downstream_bridges: DashMap::new(),
             lazy_working_sets: DashMap::new(),
             client_access: ArcSwap::from_pointee(HashMap::new()),
+            disabled_tools: ArcSwap::from_pointee(Vec::new()),
             task_store: Mutex::new(TaskStore::new()),
             admission_quotas,
             modern_downstream_enabled: AtomicBool::new(false),
@@ -1103,21 +1144,21 @@ impl ToolRouter {
         self.activity_store.snapshot(filter)
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_with_admission_quotas_for_tests(
-        server_manager: Arc<ServerManager>,
-        config: RouterConfig,
-        admission_quotas: crate::protocol::AdmissionQuotas,
-    ) -> Self {
-        Self::new_with_quotas(server_manager, config, admission_quotas)
-    }
-
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<ProtocolNotification> {
         self.protocol_notification_tx.subscribe()
     }
 
     pub fn publish_protocol_notification(&self, notification: ProtocolNotification) {
         let _ = self.protocol_notification_tx.send(notification);
+    }
+
+    /// Take the settings a reload changes on a running router. Returns
+    /// whether the tool catalog must be rebuilt, with `refresh_tools`, for
+    /// them to show.
+    pub(crate) fn apply_config(&self, config: &crate::config::Config) -> bool {
+        self.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
+        self.set_client_access(&config.clients);
+        self.set_disabled_tools(&config.disabled_tools)
     }
 
     /// Take the owner's per-client blocks. Clients are told their tool list
@@ -1186,11 +1227,25 @@ impl ToolRouter {
         };
         let servers_changed = server_blocks(&current) != server_blocks(&next);
         self.client_access.store(Arc::new(next));
-        self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
-        if servers_changed {
-            self.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
-            self.publish_protocol_notification(ProtocolNotification::PromptListChanged);
+        self.publish_lists_changed(ListsChanged {
+            tools: true,
+            resources: servers_changed,
+            prompts: servers_changed,
+        });
+    }
+
+    /// Take the owner's `disabled_tools`. Returns whether they changed; the
+    /// catalog they filter changes at the next `refresh_tools`.
+    fn set_disabled_tools(&self, patterns: &[String]) -> bool {
+        let next: Vec<String> = patterns
+            .iter()
+            .map(|pattern| pattern.to_ascii_lowercase())
+            .collect();
+        if **self.disabled_tools.load() == next {
+            return false;
         }
+        self.disabled_tools.store(Arc::new(next));
+        true
     }
 
     /// Whether the client behind `client_key` is kept from any server, so the
@@ -1223,7 +1278,7 @@ impl ToolRouter {
         };
         // Plug's own tools are how a client finds the rest. What they hand
         // back is filtered for the client, so no list keeps them from it.
-        if server_id == "__plug_internal__" {
+        if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
             return true;
         }
         !access.keeps_from(
@@ -1234,15 +1289,13 @@ impl ToolRouter {
         )
     }
 
-    /// The server and the server's own name behind `listed`, a name Plug
-    /// lists a tool under. Plug's own tools have neither.
+    /// The server and the server's own name behind `listed`, a name a call
+    /// to the tool may use. Plug's own tools have neither.
     pub fn tool_behind(&self, listed: &str) -> Option<(String, String)> {
-        let cache = self.cache.load();
-        cache
-            .routes
-            .get(listed)
-            .or_else(|| cache.routes_lower.get(&listed.to_ascii_lowercase()))
-            .filter(|(server, _)| server != "__plug_internal__")
+        self.cache
+            .load()
+            .resolve_route(listed)
+            .filter(|(server, _)| server != crate::tool_naming::INTERNAL_SERVER_ID)
             .cloned()
     }
 
@@ -1387,7 +1440,7 @@ impl ToolRouter {
         self.continuation_registry.clear();
     }
 
-    pub fn revoke_continuations_for_principal(&self, principal: &PrincipalId) {
+    pub(crate) fn revoke_continuations_for_principal(&self, principal: &PrincipalId) {
         self.continuation_registry.revoke_principal(principal);
     }
 
@@ -1397,6 +1450,31 @@ impl ToolRouter {
             .continuation_insert_gate
             .lock()
             .expect("continuation insert gate mutex poisoned") = gate;
+    }
+
+    /// The server behind `tool_name` and the era its connected upstream
+    /// speaks. `None` for a tool with no route; an era of `None` for an
+    /// upstream that is not connected.
+    fn tool_upstream_era(
+        &self,
+        tool_name: &str,
+    ) -> Option<(String, Option<crate::protocol::ProtocolEra>)> {
+        let server_id = self
+            .cache
+            .load()
+            .resolve_route(tool_name)
+            .map(|(server_id, _)| server_id.clone())?;
+        let era = self
+            .server_manager
+            .get_upstream(&server_id)
+            .map(|upstream| upstream.protocol_era);
+        Some((server_id, era))
+    }
+
+    /// Whether a task can carry a call to `tool_name`'s upstream as it is
+    /// connected now.
+    pub(crate) fn task_can_carry_tool(&self, tool_name: &str) -> bool {
+        task_can_carry(self.tool_upstream_era(tool_name).and_then(|(_, era)| era))
     }
 
     /// Fail-closed MRTR admission before a tools/call can reach an upstream.
@@ -1418,39 +1496,22 @@ impl ToolRouter {
                 .into_error(downstream.protocol_era));
         }
         self.ensure_client_may_use_tool(Some(downstream), tool_name)?;
-        if canonical_plug_meta_tool_name(tool_name).is_some() {
+        if PlugTool::named(tool_name).is_some() {
             if has_continuation {
                 return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                     .into_error(downstream.protocol_era));
             }
             return Ok(());
         }
-        let cache = self.cache.load();
-        let server_id = cache
-            .resolve_route(tool_name)
-            .map(|(server_id, _)| server_id.clone());
-        drop(cache);
-        let Some(server_id) = server_id else {
-            // Legacy task wrappers intentionally create their durable record
-            // before resolving a missing route, so teardown can still own a
-            // create racing session deletion. Only a resolved modern route
-            // needs the new pre-create pair rejection below.
-            if task_requested && downstream.protocol_era == crate::protocol::ProtocolEra::Legacy {
-                return Ok(());
-            }
+        let Some((server_id, upstream_era)) = self.tool_upstream_era(tool_name) else {
             return Err(McpError::from(ProtocolError::ToolNotFound {
                 tool_name: tool_name.to_string(),
             }));
         };
-        let Some(upstream_era) = self
-            .server_manager
-            .get_upstream(&server_id)
-            .map(|upstream| upstream.protocol_era)
-        else {
-            // Preserve legacy task enqueue semantics: the task owns its later
-            // upstream-unavailable result. Synchronous calls still fail in the
-            // router before any upstream effect.
-            if task_requested {
+        let Some(upstream_era) = upstream_era else {
+            // The task owns its later upstream-unavailable result. Synchronous
+            // calls still fail in the router before any upstream effect.
+            if task_requested && task_can_carry(None) {
                 return Ok(());
             }
             return Err(McpError::from(ProtocolError::ServerUnavailable {
@@ -1510,14 +1571,8 @@ impl ToolRouter {
         ))
     }
 
+    /// Publish `snapshot`, built [`RouterSnapshot::with_indexes`].
     fn publish_route_snapshot(&self, snapshot: Arc<RouterSnapshot>) {
-        let needs_indexes = (snapshot.routes_lower.is_empty() && !snapshot.routes.is_empty())
-            || (snapshot.tools_by_name.is_empty() && !snapshot.tools_all.is_empty());
-        let snapshot = if needs_indexes {
-            Arc::new((*snapshot).clone().with_indexes())
-        } else {
-            snapshot
-        };
         let material_routes = snapshot
             .routes
             .iter()
@@ -1541,12 +1596,25 @@ impl ToolRouter {
             .lock()
             .expect("published route mutex poisoned");
         let invalidate = *published != material_routes;
+        let mut changed = ListsChanged::default();
         self.continuation_registry
             .publish_with_invalidation(invalidate, || {
                 *published = material_routes;
+                changed = snapshot.lists_changed_since(&self.cache.load());
                 self.cache.store(snapshot);
-                CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+                self.catalog_revision.fetch_add(1, Ordering::Relaxed);
             });
+        drop(published);
+        // The one place clients hear their lists changed, whatever changed
+        // them: an upstream's own notice, a reload, a server going down or
+        // coming back, or a server needing sign-in.
+        self.publish_lists_changed(changed);
+    }
+
+    fn publish_lists_changed(&self, changed: ListsChanged) {
+        for notification in changed.notifications() {
+            self.publish_protocol_notification(notification);
+        }
     }
 
     /// Reserve one process-wide modern request slot before adapter code can
@@ -1556,17 +1624,14 @@ impl ToolRouter {
     pub fn admit_modern_request(
         &self,
         context: &DownstreamCallContext,
-    ) -> Result<crate::protocol::QuotaLease, McpError> {
+    ) -> Result<crate::admission::QuotaLease, McpError> {
         let principal = context.principal.clone().unwrap_or_else(|| {
-            PrincipalId::stdio_process(stable_instance_uuid(
-                "modern-request",
-                context.client_id.as_ref(),
-            ))
+            crate::downstream_identity::quota_principal_for_anonymous(context.client_id.as_ref())
         });
         self.admission_quotas
             .try_acquire(
                 &principal,
-                crate::protocol::QuotaResource::ConcurrentModernRequests,
+                crate::admission::QuotaResource::ConcurrentModernRequests,
                 1,
             )
             .map_err(|outcome| outcome.into_error(context.protocol_era))
@@ -1628,21 +1693,13 @@ impl ToolRouter {
     }
 
     /// Remove a client's log level (on disconnect) and recalculate.
-    pub fn remove_client_log_level(&self, client_id: &str) {
+    pub(crate) fn remove_client_log_level(&self, client_id: &str) {
         self.client_log_levels.remove(client_id);
         self.recalculate_effective_level();
     }
 
-    pub fn clear_lazy_session(&self, session_key: &str) {
+    pub(crate) fn clear_lazy_session(&self, session_key: &str) {
         self.lazy_working_sets.remove(session_key);
-    }
-
-    pub fn lazy_session_key(transport: DownstreamTransport, client_id: &str) -> String {
-        match transport {
-            DownstreamTransport::Stdio => format!("stdio:{client_id}"),
-            DownstreamTransport::Http => format!("http:{client_id}"),
-            DownstreamTransport::Ipc => format!("ipc:{client_id}"),
-        }
     }
 
     /// Recalculate effective level as the most permissive (lowest severity) across all clients.
@@ -1668,7 +1725,10 @@ impl ToolRouter {
             .map(|(name, upstream)| {
                 let params = params.clone();
                 async move {
-                    if let Err(error) = upstream.client.peer().set_level(params).await {
+                    if let Err(error) = self
+                        .bounded_request(&upstream, upstream.client.peer().set_level(params))
+                        .await
+                    {
                         tracing::warn!(
                             server = %name,
                             error = %error,
@@ -1703,7 +1763,7 @@ impl ToolRouter {
     }
 
     /// Remove cached roots for a disconnected client. Returns true if entry existed.
-    pub fn clear_roots_for_target(&self, target: &NotificationTarget) -> bool {
+    pub(crate) fn clear_roots_for_target(&self, target: &NotificationTarget) -> bool {
         self.client_roots.remove(target).is_some()
     }
 
@@ -1756,7 +1816,7 @@ impl ToolRouter {
     }
 
     /// Unregister a downstream bridge on client disconnect.
-    pub fn unregister_downstream_bridge(&self, target: &NotificationTarget) {
+    pub(crate) fn unregister_downstream_bridge(&self, target: &NotificationTarget) {
         self.downstream_bridges.remove(target);
     }
 
@@ -1815,19 +1875,19 @@ impl ToolRouter {
         }
     }
 
-    /// Forward an upstream elicitation request to the downstream client that triggered the tool call.
-    pub async fn create_elicitation_from_upstream(
+    /// The bridge to the downstream client whose tool call made `server_id`
+    /// send `upstream_request_id`: where an elicitation or sampling request
+    /// from that server goes.
+    fn bridge_for_upstream_request(
         &self,
         server_id: &str,
-        upstream_request_id: RequestId,
-        request: ElicitRequestParams,
-    ) -> Result<ElicitResult, McpError> {
-        let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
+        upstream_request_id: &RequestId,
+    ) -> Result<Arc<dyn DownstreamBridge>, McpError> {
+        let target = match self.active_call_for_upstream_request(server_id, upstream_request_id) {
             Ok(record) => record.downstream.notification_target(),
             Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
         };
-        let bridge = self
-            .downstream_bridges
+        self.downstream_bridges
             .get(&target)
             .map(|entry| Arc::clone(&*entry))
             .ok_or_else(|| {
@@ -1835,50 +1895,13 @@ impl ToolRouter {
                     format!("no downstream bridge registered for target {target:?}"),
                     None,
                 )
-            })?;
-        bridge.create_elicitation(request).await
+            })
     }
 
-    /// Forward an upstream sampling request to the downstream client that triggered the tool call.
-    pub async fn create_message_from_upstream(
-        &self,
-        server_id: &str,
-        upstream_request_id: RequestId,
-        request: CreateMessageRequestParams,
-    ) -> Result<CreateMessageResult, McpError> {
-        let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
-            Ok(record) => record.downstream.notification_target(),
-            Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
-        };
-        let bridge = self
-            .downstream_bridges
-            .get(&target)
-            .map(|entry| Arc::clone(&*entry))
-            .ok_or_else(|| {
-                McpError::internal_error(
-                    format!("no downstream bridge registered for target {target:?}"),
-                    None,
-                )
-            })?;
-        bridge.create_message(request).await
-    }
-
-    fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
-        match notification {
-            ProtocolNotification::ToolListChanged => {
-                self.pending_tool_list_changed.store(true, Ordering::SeqCst);
-            }
-            ProtocolNotification::ResourceListChanged => {
-                self.pending_resource_list_changed
-                    .store(true, Ordering::SeqCst);
-            }
-            ProtocolNotification::PromptListChanged => {
-                self.pending_prompt_list_changed
-                    .store(true, Ordering::SeqCst);
-            }
-            _ => {}
-        }
-
+    /// Refresh the catalog after an upstream says one of its lists changed,
+    /// once for a burst of such notices. Clients hear about whatever list the
+    /// refresh finds different.
+    pub fn schedule_catalog_refresh(self: &Arc<Self>) {
         self.notification_refresh_pending
             .store(true, Ordering::SeqCst);
 
@@ -1935,25 +1958,6 @@ impl ToolRouter {
                 }
 
                 if router
-                    .pending_tool_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
-                }
-                if router
-                    .pending_resource_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::ResourceListChanged);
-                }
-                if router
-                    .pending_prompt_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::PromptListChanged);
-                }
-
-                if router
                     .notification_refresh_pending
                     .swap(false, Ordering::SeqCst)
                 {
@@ -1983,18 +1987,6 @@ impl ToolRouter {
         });
     }
 
-    pub fn schedule_tool_list_changed_refresh(self: &Arc<Self>) {
-        self.schedule_list_changed_refresh(ProtocolNotification::ToolListChanged);
-    }
-
-    pub fn schedule_resource_list_changed_refresh(self: &Arc<Self>) {
-        self.schedule_list_changed_refresh(ProtocolNotification::ResourceListChanged);
-    }
-
-    pub fn schedule_prompt_list_changed_refresh(self: &Arc<Self>) {
-        self.schedule_list_changed_refresh(ProtocolNotification::PromptListChanged);
-    }
-
     fn track_call(&self) -> InFlightCall<'_> {
         self.calls_in_flight.fetch_add(1, Ordering::AcqRel);
         InFlightCall { router: self }
@@ -2018,6 +2010,12 @@ impl ToolRouter {
                 return self.calls_in_flight.load(Ordering::Acquire);
             }
         }
+    }
+
+    /// How many tool calls are running, as [`Self::drain_calls`] counts them.
+    #[cfg(any(test, feature = "test-helpers"))]
+    pub fn calls_running(&self) -> usize {
+        self.calls_in_flight.load(Ordering::Acquire)
     }
 
     #[cfg(test)]
@@ -2136,16 +2134,14 @@ impl ToolRouter {
         }
     }
 
-    pub(crate) fn forward_cancel_from_downstream(
+    /// Cancel the active call `context` names, and pass the cancel on to the
+    /// server running it.
+    pub fn cancel_downstream_request(
         &self,
         context: &DownstreamCallContext,
         reason: Option<String>,
     ) {
-        let Some(call_id) = self
-            .active_call_lookup
-            .get(&DownstreamCallKey::from(context))
-            .map(|entry| *entry)
-        else {
+        let Some(call_id) = self.active_call_for(context) else {
             tracing::debug!(
                 transport = ?context.transport,
                 request_id = ?context.request_id,
@@ -2157,6 +2153,7 @@ impl ToolRouter {
         let Some(mut record) = self.active_calls.get_mut(&call_id) else {
             return;
         };
+        record.downstream.cancellation.cancel();
 
         let Some(upstream) = self.server_manager.get_upstream(&record.upstream_server_id) else {
             tracing::warn!(
@@ -2187,17 +2184,33 @@ impl ToolRouter {
         });
     }
 
-    /// Cancel an active request owned by the supplied downstream context.
-    ///
-    /// Transport adapters use this narrow entry point when their own request
-    /// lifecycle ends. The router keeps the upstream-call lookup and
-    /// cancellation forwarding details private.
-    pub fn cancel_downstream_request(
-        &self,
-        context: &DownstreamCallContext,
-        reason: Option<String>,
-    ) {
-        self.forward_cancel_from_downstream(context, reason);
+    /// The active call `context` names. A cancel sent in an exchange of its
+    /// own names a stateless call by its request id alone, which finds it
+    /// only when no other caller under the same principal used that id.
+    fn active_call_for(&self, context: &DownstreamCallContext) -> Option<u64> {
+        let key = DownstreamCallKey::from(context);
+        if let Some(call_id) = self.active_call_lookup.get(&key) {
+            return Some(*call_id);
+        }
+        if key.exchange.is_some() {
+            return None;
+        }
+        let mut matching = self.active_call_lookup.iter().filter(|entry| {
+            let candidate = entry.key();
+            candidate.exchange.is_some()
+                && candidate.transport == key.transport
+                && candidate.client_id == key.client_id
+                && candidate.request_id == key.request_id
+        });
+        let call_id = *matching.next()?.value();
+        if matching.next().is_some() {
+            tracing::debug!(
+                request_id = ?context.request_id,
+                "a cancel names a request id two callers are using; cancelling neither"
+            );
+            return None;
+        }
+        Some(call_id)
     }
 
     pub(crate) fn route_upstream_progress(
@@ -2269,60 +2282,46 @@ impl ToolRouter {
         });
     }
 
-    /// Set the Engine reference for session recovery.
-    pub fn set_engine(&self, engine: Weak<Engine>) {
-        self.resource_subscriptions.set_engine(engine.clone());
-        let mut guard = self
-            .engine
-            .write()
-            .expect("engine RwLock poisoned — prior panic");
-        *guard = Some(engine);
-    }
-
-    fn upgrade_engine(&self) -> Option<Arc<Engine>> {
-        self.engine
-            .read()
-            .ok()
-            .and_then(|guard| guard.as_ref().and_then(|weak| weak.upgrade()))
-    }
-
+    /// Reconnect `server_id` once before the caller sends again. A failure
+    /// hands the server to its recovery episode.
     async fn reconnect_server_now(&self, server_id: &str) -> Result<(), anyhow::Error> {
-        let engine = self
-            .upgrade_engine()
-            .ok_or_else(|| anyhow::anyhow!("engine reference unavailable"))?;
-        engine.reconnect_server(server_id).await
+        let recovery = self.recovery.upgrade().ok_or_else(|| {
+            anyhow::anyhow!("nothing can reconnect `{server_id}`: Plug is stopping")
+        })?;
+        if let Err(error) = recovery.reconnect_server(server_id).await {
+            recovery.recover_server(server_id);
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn reconnect_server_in_background(&self, server_id: String) {
-        let Some(engine) = self.upgrade_engine() else {
-            tracing::warn!(
-                server = %server_id,
-                "no engine reference available for background reconnect"
-            );
-            return;
-        };
+        if let Some(recovery) = self.recovery.upgrade() {
+            recovery.recover_server(&server_id);
+        }
+    }
 
-        tokio::spawn(async move {
-            if let Err(reconnect_err) = engine.reconnect_server(&server_id).await {
-                tracing::warn!(
-                    server = %server_id,
-                    error = %reconnect_err,
-                    "background reconnect after timeout failed"
-                );
-            } else {
-                tracing::info!(
-                    server = %server_id,
-                    "background reconnect after timeout succeeded"
-                );
+    /// Wait for `upstream`'s answer no longer than one of its tool calls may
+    /// take, and reconnect it when its connection turns out to be gone.
+    async fn bounded_request<T>(
+        &self,
+        upstream: &crate::server::UpstreamServer,
+        request: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+    ) -> Result<T, McpError> {
+        let request = async {
+            let answer = request.await;
+            if matches!(answer, Err(rmcp::service::ServiceError::TransportClosed)) {
+                self.reconnect_server_in_background(upstream.name.clone());
             }
-        });
+            answer
+        };
+        answer_within(upstream_call_timeout(upstream), request).await
     }
 
     /// Refresh the merged tool list and routing table from all upstream servers.
     ///
-    /// Builds the full sorted list plus pre-cached filtered views for each
-    /// known client tool limit (Devin: 100, Copilot: 128). All views are
-    /// swapped atomically to prevent torn reads. The three live catalog
+    /// The whole catalog is swapped atomically to prevent torn reads. The
+    /// three live catalog
     /// families (resources, resource templates, prompts) are fetched
     /// concurrently; each is already server-concurrent internally, so a
     /// refresh's upstream latency is the max of the three instead of their
@@ -2414,7 +2413,7 @@ impl ToolRouter {
     async fn refresh_tools_once(&self) {
         #[cfg(test)]
         self.refresh_pass_count.fetch_add(1, Ordering::SeqCst);
-        let upstream_tools = self.server_manager.get_tools().await;
+        let upstream_tools = self.server_manager.get_tools();
         let (resources_result, resource_templates_result, prompts_result) = tokio::join!(
             self.server_manager.get_resources(),
             self.server_manager.get_resource_templates(),
@@ -2436,7 +2435,6 @@ impl ToolRouter {
         let upstream_prompts = prompts_result.items;
 
         // ── Pass 1: classify, sanitize, and try keyword stripping ──
-        // Each entry: (server_name, tool, prefix, stripped_name, full_name, matched_keyword)
         struct Classified {
             server_name: String,
             tool: Tool,
@@ -2451,7 +2449,7 @@ impl ToolRouter {
         // PER TOOL with at most one lookup PER SERVER. Reused in pass 3 for
         // icons so that pass doesn't re-hit `get_upstream_metadata` either.
         struct ServerRefreshCtx {
-            upstream: Option<Arc<crate::server::UpstreamServer>>,
+            settings: Option<Arc<crate::config::ServerConfig>>,
             tool_group_rules: Option<Vec<crate::config::ToolGroupRule>>,
             icons: Option<Vec<Icon>>,
         }
@@ -2474,42 +2472,36 @@ impl ToolRouter {
 
         for (server_name, mut tool) in upstream_tools {
             // Peer metadata is admitted before the descriptor enters any
-            // cache, enrichment, fingerprint, or operator-observable path.
+            // cache, fingerprint, or operator-observable path.
             catalog_metadata_budget.admit(&server_name, &mut tool.meta, "tool");
             let mut exposed_name = tool.name.to_string();
 
             let ctx = server_ctx.entry(server_name.clone()).or_insert_with(|| {
-                let upstream = self.server_manager.get_upstream(&server_name);
+                let settings = self.server_manager.settings(&server_name);
                 let metadata = self.server_manager.get_upstream_metadata(&server_name);
-                let tool_group_rules = upstream.as_ref().and_then(|u| {
-                    if !u.config.tool_groups.is_empty() {
-                        Some(u.config.tool_groups.clone())
-                    } else {
-                        crate::tool_naming::builtin_group_rules(
-                            &server_name,
-                            metadata.as_ref().map(|metadata| metadata.name.as_str()),
-                        )
-                    }
+                let tool_group_rules = settings.as_ref().and_then(|settings| {
+                    crate::tool_naming::group_rules(
+                        &server_name,
+                        settings,
+                        metadata.as_ref().map(|metadata| metadata.name.as_str()),
+                    )
                 });
                 let icons = metadata.and_then(|metadata| metadata.icons);
                 ServerRefreshCtx {
-                    upstream,
+                    settings,
                     tool_group_rules,
                     icons,
                 }
             });
 
-            // 1. Apply manual renames if any
-            if let Some(upstream) = ctx.upstream.as_ref()
-                && let Some(new_name) = upstream.config.tool_renames.get(&exposed_name)
+            if let Some(settings) = ctx.settings.as_ref()
+                && let Some(new_name) = settings.tool_renames.get(&exposed_name)
             {
                 exposed_name = new_name.clone();
             }
 
-            // 2. Sanitize to snake_case (hyphens, camelCase, dots -> snake_case)
             let sanitized = crate::tool_naming::sanitize_tool_name(&exposed_name);
 
-            // 3. Determine prefix and tool name via rules or server name
             let (prefix, full_name, stripped_name) = if let Some(ref rules) = ctx.tool_group_rules {
                 match crate::tool_naming::classify_with_rules(&sanitized, rules) {
                     Some(result) => {
@@ -2579,6 +2571,8 @@ impl ToolRouter {
             }
         }
 
+        let disabled_tools = self.disabled_tools.load_full();
+
         // ── Pass 2: detect collisions in stripped wire names ──
         // Count how many tools map to each (prefix, stripped_name) pair.
         let mut wire_name_counts: HashMap<String, usize> = HashMap::new();
@@ -2632,15 +2626,15 @@ impl ToolRouter {
 
             // A tool switched off stays off when a second account changes
             // its name, or when the account that changed it is removed.
-            if !self.config.disabled_tools.is_empty()
-                && (is_disabled_tool(&self.config.disabled_tools, &prefixed_name)
+            if !disabled_tools.is_empty()
+                && (is_disabled_tool(&disabled_tools, &prefixed_name)
                     || crate::tool_naming::other_names(
                         &prefixed_name,
                         &c.server_name,
                         &self.config.prefix_delimiter,
                     )
                     .iter()
-                    .any(|name| is_disabled_tool(&self.config.disabled_tools, name)))
+                    .any(|name| is_disabled_tool(&disabled_tools, name)))
             {
                 continue;
             }
@@ -2673,12 +2667,6 @@ impl ToolRouter {
                 inferred.annotations
             };
 
-            // Enrich BEFORE setting wire name (so get_* patterns match)
-            if self.config.enrichment_servers.contains(&c.server_name) {
-                prefixed_tool.name = Cow::Owned(final_name.clone());
-                crate::enrichment::enrich_tool(&mut prefixed_tool);
-            }
-
             crate::enrichment::normalize_annotations(&mut prefixed_tool, &final_name);
 
             // Display titles follow the same disambiguation path as wire names.
@@ -2690,39 +2678,40 @@ impl ToolRouter {
             prefixed_tool.icons =
                 normalized_icons_with_fallback(prefixed_tool.icons.as_deref(), upstream_icons);
 
-            // Strip optional fields for token efficiency
             strip_optional_fields(&mut prefixed_tool, self.config.tool_description_max_chars);
 
             tool_risk_inventory.insert(
                 prefixed_name.clone(),
-                crate::ipc::IpcToolRiskInfo::from_annotations(
-                    upstream_annotations.as_ref(),
-                    inferred_annotations.as_ref(),
-                    prefixed_tool.annotations.as_ref(),
-                ),
+                ToolRisk {
+                    upstream_declared: upstream_annotations.clone(),
+                    plug_inferred: inferred_annotations.clone(),
+                    effective: prefixed_tool.annotations.clone(),
+                },
             );
             tools.push(prefixed_tool);
         }
 
-        // Sort: priority tools first, then alphabetical
         tools.sort_unstable_by(|a, b| priority_sort(a, b, &self.config.priority_tools));
 
         // Add search_tools meta-tool if tool count exceeds threshold
         if tools.len() >= self.config.tool_search_threshold
-            && !is_disabled_tool(&self.config.disabled_tools, "plug__search_tools")
+            && !is_disabled_tool(&disabled_tools, PlugTool::SearchTools.name())
         {
-            let meta_tool = build_search_tools_meta_tool();
+            let meta_tool = PlugTool::SearchTools.definition();
             routes.insert(
                 meta_tool.name.to_string(),
-                ("__plug_internal__".to_string(), meta_tool.name.to_string()),
+                (
+                    crate::tool_naming::INTERNAL_SERVER_ID.to_string(),
+                    meta_tool.name.to_string(),
+                ),
             );
             tool_risk_inventory.insert(
                 meta_tool.name.to_string(),
-                crate::ipc::IpcToolRiskInfo::from_annotations(
-                    None,
-                    meta_tool.annotations.as_ref(),
-                    meta_tool.annotations.as_ref(),
-                ),
+                ToolRisk {
+                    upstream_declared: None,
+                    plug_inferred: meta_tool.annotations.clone(),
+                    effective: meta_tool.annotations.clone(),
+                },
             );
             // Insert at position 0 so it's always visible
             tools.insert(0, meta_tool);
@@ -2756,19 +2745,6 @@ impl ToolRouter {
             "refreshed tool cache"
         );
 
-        // Build pre-cached filtered views — only when tool filtering is
-        // enabled. `list_tools_for_client_session` (catalog.rs) is the only
-        // reader of these two fields, and it always returns `tools_all` early
-        // when filtering is disabled, so these views are provably never read
-        // in that case.
-        let (tools_devin, tools_copilot) = if self.config.tool_filter_enabled {
-            (
-                Arc::new(tools.iter().take(100).cloned().collect()),
-                Arc::new(tools.iter().take(128).cloned().collect()),
-            )
-        } else {
-            (Arc::new(Vec::new()), Arc::new(Vec::new()))
-        };
         let tools_all = Arc::new(tools);
 
         let mut resource_routes = HashMap::new();
@@ -2903,8 +2879,7 @@ impl ToolRouter {
         // Classify every currently-tracked subscription URI against the
         // old/new route snapshots. Pure decision — no registry mutation, no
         // upstream calls yet. See `SubscriptionRegistry::classify_route_changes`
-        // for the exact rebind/prune criteria (unchanged from the historical
-        // inline `retain` closure this replaced).
+        // for the exact rebind/prune criteria.
         let reconciliation = {
             let old_snapshot = self.cache.load();
             self.resource_subscriptions
@@ -2913,7 +2888,7 @@ impl ToolRouter {
 
         // Execute prunes for URIs that lost their route entirely
         // (best-effort upstream unsubscribe) before publishing the new
-        // snapshot — same ordering as the historical stale-unsubscribe pass.
+        // snapshot.
         // Distinct URIs use distinct transition locks, so parallelize them
         // (wall-clock = max RTT, not sum).
         {
@@ -2941,16 +2916,20 @@ impl ToolRouter {
             futures::future::join_all(prune_futs).await;
         }
 
+        let enabled = |tools: Vec<Tool>| -> Arc<Vec<Tool>> {
+            Arc::new(
+                tools
+                    .into_iter()
+                    .filter(|tool| !is_disabled_tool(&disabled_tools, tool.name.as_ref()))
+                    .collect(),
+            )
+        };
         let snapshot = Arc::new(
             RouterSnapshot {
                 routes,
-                routes_lower: HashMap::new(),
-                tools_by_name: HashMap::new(),
-                tools_by_name_lower: HashMap::new(),
                 tools_all,
-                meta_tools_all: Arc::new(build_meta_tools()),
-                tools_devin,
-                tools_copilot,
+                meta_tools_all: enabled(build_meta_tools()),
+                legacy_meta_tools: enabled(build_legacy_meta_tools()),
                 resources_all,
                 resource_templates_all,
                 prompts_all,
@@ -2958,6 +2937,7 @@ impl ToolRouter {
                 prompt_routes,
                 tool_definition_fingerprints,
                 tool_risk_inventory,
+                ..Default::default()
             }
             .with_indexes(),
         );
@@ -2968,7 +2948,7 @@ impl ToolRouter {
         self.publish_route_snapshot(snapshot);
 
         // Rebind subscriptions whose URI still exists but ownership changed,
-        // after publishing the new snapshot (same ordering as before).
+        // after publishing the new snapshot.
         Self::rebind_reconciled_routes(
             &self.server_manager,
             &self.resource_subscriptions,
@@ -3083,11 +3063,10 @@ impl ToolRouter {
 
     /// Resolve the upstream handles/capabilities for a subscription rebind
     /// and execute it, awaiting completion and returning the transition's
-    /// outcome. Shared by `refresh_tools`' rebind arm and the
-    /// post-subscribe owner/route self-check in `subscribe_resource`
-    /// (subscriptions.rs): both resolve the old owner as a route-derived
-    /// fallback (the registry prefers the entry's recorded owner at drain
-    /// time) and gate the new owner on subscribe support.
+    /// outcome. Used by the post-subscribe owner/route self-check in
+    /// `subscribe_resource` (subscriptions.rs). The old owner is resolved as
+    /// a route-derived fallback (the registry prefers the entry's recorded
+    /// owner at drain time) and the new owner is gated on subscribe support.
     async fn rebind_subscription_route(
         &self,
         uri: &str,
@@ -3104,9 +3083,9 @@ impl ToolRouter {
         .await
     }
 
-    /// `rebind_subscription_route` without `&self`, for callers that only
-    /// hold the Arc'd fields: the detached post-publish sweep and the
-    /// registry's post-confirm heal hook (both wired in `new()`).
+    /// `rebind_subscription_route` without `&self`, for the registry's
+    /// post-confirm heal hook, which `build()` wires and which holds only
+    /// the Arc'd fields.
     async fn rebind_subscription_route_with(
         server_manager: &Arc<ServerManager>,
         registry: &Arc<subscriptions::SubscriptionRegistry>,
@@ -3147,16 +3126,6 @@ impl ToolRouter {
         }
     }
 
-    /// Resolve an internal read-only probe through the published tool catalog.
-    pub(crate) fn event_probe_tool(&self, original: &str) -> Option<String> {
-        self.cache
-            .load()
-            .routes
-            .iter()
-            .find(|(_, (server, tool))| server == "slack" && tool == original)
-            .map(|(name, _)| name.clone())
-    }
-
     /// A listed tool's name on its own server, and whether that server marks
     /// it read-only.
     pub fn own_tool(&self, merged_name: &str) -> Option<(String, bool)> {
@@ -3182,7 +3151,9 @@ impl ToolRouter {
     /// Call a tool by its prefixed name, routing to the correct upstream server.
     ///
     /// Applies: health gate → circuit breaker → semaphore → timeout.
-    /// On session/transport errors, attempts one automatic reconnect + retry.
+    /// On a session or transport error the server is reconnected. The call
+    /// is sent again only when it cannot have reached the server, or when
+    /// the server declares the tool read-only or idempotent.
     pub async fn call_tool(
         &self,
         tool_name: &str,
@@ -3210,7 +3181,7 @@ impl ToolRouter {
                 },
                 progress_token,
                 downstream,
-                true,
+                CallKind::Direct,
                 false,
             )
             .await?
@@ -3243,7 +3214,7 @@ impl ToolRouter {
         let context = downstream.clone().ok_or_else(|| {
             McpError::internal_error("modern tool round requires downstream context", None)
         })?;
-        if canonical_plug_meta_tool_name(params.name.as_ref()).is_some() {
+        if PlugTool::named(params.name.as_ref()).is_some() {
             if params.input_responses.is_some() || params.request_state.is_some() {
                 return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                     .into_error(context.protocol_era));
@@ -3259,7 +3230,7 @@ impl ToolRouter {
                     },
                     progress_token,
                     downstream,
-                    true,
+                    CallKind::Direct,
                     false,
                 )
                 .await;
@@ -3357,7 +3328,7 @@ impl ToolRouter {
                 },
                 progress_token,
                 downstream,
-                true,
+                CallKind::Direct,
                 false,
             )
             .await?;
@@ -3371,17 +3342,11 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::ExpiredContinuation
                 .into_error(context.protocol_era));
         }
-        let context = context;
         let binding = binding.ok_or_else(|| {
             crate::protocol::ProtocolOutcome::AuthorizationRequired.into_error(context.protocol_era)
         })?;
         let input_requests = input_required.input_requests.clone().unwrap_or_default();
         if input_requests.is_empty()
-            || input_requests.len() > MRTR_MAX_ITEMS
-            || input_required
-                .request_state
-                .as_ref()
-                .is_some_and(|state| state.len() > MRTR_MAX_REQUEST_STATE_BYTES)
             || input_requests.values().any(|request| {
                 !matches!(
                     request,
@@ -3392,10 +3357,11 @@ impl ToolRouter {
             return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge
                 .into_error(context.protocol_era));
         }
-        let payload_bytes = serde_json::to_vec(&input_required)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?
-            .len();
-        if payload_bytes > MRTR_MAX_BYTES {
+        if continuations::exceeds_continuation_limits(
+            input_required.request_state.as_deref(),
+            input_requests.len(),
+            &input_required,
+        ) {
             return Err(McpError::invalid_request(
                 "upstream multi-round response exceeds Plug's bounded continuation limits",
                 None,
@@ -3441,59 +3407,50 @@ impl ToolRouter {
         Ok(CallToolResponse::InputRequired(input_required))
     }
 
-    /// Inner tool call implementation with retry support.
-    /// `is_retry` prevents infinite recursion — max 1 reconnect per call.
-    /// Uses `Box::pin` for the recursive call to avoid infinitely-sized future.
+    /// Route one tool call to its server and wait for the answer. Every
+    /// tool call, a task's and a task create's included, runs through here,
+    /// so the health gate, circuit breaker, call slots, timeout, metrics,
+    /// result sanitizing and the resend rule apply to each the same way.
+    /// `is_retry` marks the one resend after a reconnect.
     fn call_tool_inner<'a>(
         &'a self,
         tool_name: &'a str,
         round: ToolRoundInput,
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
-        enforce_lazy_visibility: bool,
+        kind: CallKind,
         is_retry: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CallToolResponse, McpError>> + Send + 'a>,
     > {
         Box::pin(async move {
-            let _in_flight = self.track_call();
+            // A task's answer stays in this process's task store, so a daemon
+            // swap gains nothing by waiting for it.
+            let _in_flight = (!kind.is_task()).then(|| self.track_call());
             // Every way to call a tool ends here, the invoke wrapper included,
             // so this is where a per-client block cannot be stepped around.
             self.ensure_client_may_use_tool(downstream.as_ref(), tool_name)?;
-            // Intercept plug meta-tools (case-insensitive for LLM casing drift).
-            if let Some(meta_tool_name) = canonical_plug_meta_tool_name(tool_name) {
-                if !self.meta_tool_visible_for_call(meta_tool_name, downstream.as_ref()) {
+            if let Some(plug_tool) = PlugTool::named(tool_name) {
+                if !self.meta_tool_visible_for_call(plug_tool, downstream.as_ref()) {
                     return Err(McpError::from(ProtocolError::ToolNotFound {
                         tool_name: tool_name.to_string(),
                     }));
                 }
-                match meta_tool_name {
-                    "plug__list_servers" => {
-                        return Ok(self.handle_list_servers(downstream.as_ref()).into());
+                return match plug_tool {
+                    PlugTool::ListServers => {
+                        Ok(self.handle_list_servers(downstream.as_ref()).into())
                     }
-                    "plug__list_tools" => {
-                        return self
-                            .handle_list_tools(round.arguments.clone(), downstream.as_ref())
-                            .map(Into::into);
-                    }
-                    "plug__search_tools" => {
-                        return self
-                            .handle_search_tools(round.arguments.clone(), downstream.as_ref())
-                            .map(Into::into);
-                    }
-                    "plug__invoke_tool" => {
-                        return self
-                            .handle_invoke_tool(
-                                round.arguments.clone(),
-                                progress_token,
-                                downstream,
-                                is_retry,
-                            )
-                            .await
-                            .map(Into::into);
-                    }
-                    _ => unreachable!("canonical plug meta-tool name is exhaustive"),
-                }
+                    PlugTool::ListTools => self
+                        .handle_list_tools(round.arguments.clone(), downstream.as_ref())
+                        .map(Into::into),
+                    PlugTool::SearchTools => self
+                        .handle_search_tools(round.arguments.clone(), downstream.as_ref())
+                        .map(Into::into),
+                    PlugTool::InvokeTool => self
+                        .handle_invoke_tool(round.arguments.clone(), progress_token, downstream)
+                        .await
+                        .map(Into::into),
+                };
             }
 
             let cache = self.cache.load_full();
@@ -3505,35 +3462,28 @@ impl ToolRouter {
 
             let server_id = server_id.clone();
             let original_name = original_name.to_string();
-            // A call that reached the server and lost its answer is sent
-            // again only when the tool says a second run does no harm.
-            let safe_to_repeat = cache
-                .tool_by_name(tool_name)
-                .and_then(|tool| tool.annotations.as_ref())
-                .is_some_and(|hints| {
-                    hints.read_only_hint == Some(true) || hints.idempotent_hint == Some(true)
-                });
+            let safe_to_repeat = cache.may_resend(tool_name);
             drop(cache);
 
-            if enforce_lazy_visibility {
+            if matches!(kind, CallKind::Direct) {
                 self.ensure_lazy_tool_loaded_for_direct_call(downstream.as_ref(), tool_name)?;
             }
+
+            let era = downstream
+                .as_ref()
+                .map(|context| context.protocol_era)
+                .unwrap_or(crate::protocol::ProtocolEra::Legacy);
 
             // Health gate — auth failure is actionable and must not be
             // flattened into a generic availability failure. The existing
             // outcome encoding tells clients not to retry until they have
             // re-authorized, without returning any credential material.
-            let health = self.server_manager.health.get(&server_id).map(|h| h.health);
+            let health = self.server_manager.health(&server_id);
             if let Some(outcome) = health.and_then(health_gate_outcome) {
-                let era = downstream
-                    .as_ref()
-                    .map(|context| context.protocol_era)
-                    .unwrap_or(crate::protocol::ProtocolEra::Legacy);
                 return Err(outcome.into_error(era));
             }
 
-            // Circuit breaker gate
-            if let Some(cb) = self.server_manager.circuit_breakers.get(&server_id) {
+            if let Some(cb) = self.server_manager.circuit_breaker(&server_id) {
                 cb.call_allowed().map_err(|_: CircuitBreakerError| {
                     McpError::from(ProtocolError::ServerUnavailable {
                         server_id: server_id.clone(),
@@ -3541,11 +3491,18 @@ impl ToolRouter {
                 })?;
             }
 
-            let semaphore_timeout = self
-                .server_manager
-                .get_upstream(&server_id)
-                .map(|upstream| Duration::from_secs(upstream.config.call_timeout_secs))
-                .unwrap_or(Duration::from_secs(30));
+            let unavailable = || {
+                McpError::from(ProtocolError::ServerUnavailable {
+                    server_id: server_id.clone(),
+                })
+            };
+            let slot_wait = Duration::from_secs(
+                self.server_manager
+                    .get_upstream(&server_id)
+                    .ok_or_else(unavailable)?
+                    .config
+                    .call_timeout_secs,
+            );
 
             let call_id = next_call_id();
             let trace_id = downstream
@@ -3564,22 +3521,29 @@ impl ToolRouter {
             upstream_params.input_responses = round.input_responses.clone();
             upstream_params.request_state = round.request_state.clone();
             let downstream_progress_token = progress_token.clone();
-            let upstream_progress_token = downstream_progress_token.as_ref().map(|_| {
-                ProgressToken(NumberOrString::String(Arc::from(format!(
-                    "plug-progress-{call_id}"
-                ))))
-            });
             if let Some(meta) = extension_meta.clone() {
                 merge_call_extension_meta(&mut upstream_params, meta);
             }
-            // Extension metadata must be installed before the translated
-            // progress token. Assigning it afterwards replaces the entire
-            // `_meta` object and silently disables progress forwarding.
-            if let Some(token) = upstream_progress_token.clone() {
-                upstream_params.set_progress_token(token);
-            }
 
-            let request = ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params));
+            let request = if matches!(kind, CallKind::CreateTask) {
+                upstream_params
+                    .meta
+                    .get_or_insert_with(Default::default)
+                    .insert(
+                        crate::protocol::LEGACY_TASK_REQUEST_KEY.to_string(),
+                        serde_json::json!({}),
+                    );
+                let params =
+                    crate::legacy_tasks::call_tool_params(upstream_params).map_err(|error| {
+                        McpError::internal_error(
+                            format!("failed to serialize legacy task-wrapped tool call: {error}"),
+                            None,
+                        )
+                    })?;
+                crate::legacy_tasks::request("tools/call", Some(params))
+            } else {
+                ClientRequest::CallToolRequest(CallToolRequest::new(upstream_params))
+            };
 
             struct ActiveCallGuard<'a> {
                 router: &'a ToolRouter,
@@ -3599,7 +3563,7 @@ impl ToolRouter {
                 }
             }
             let mut active_call_guard = None;
-            if let Some(call_context) = downstream.clone() {
+            if let Some(call_context) = downstream.clone().filter(|_| kind.downstream_cancels()) {
                 self.register_active_call(
                     call_id,
                     ActiveCallRecord {
@@ -3647,28 +3611,18 @@ impl ToolRouter {
             // the first is queued or executing, rather than waiting for the
             // semaphore and becoming a second side effect after the first
             // call unregisters.
-            let semaphore = self
-                .server_manager
-                .semaphores
-                .get(&server_id)
-                .map(|entry| Arc::clone(entry.value()));
-            let permit = if let Some(sem) = semaphore {
-                Some(
-                    tokio::time::timeout(semaphore_timeout, sem.acquire_owned())
+            let permit = match self.server_manager.call_slots(&server_id) {
+                Some(sem) => Some(
+                    tokio::time::timeout(slot_wait, sem.acquire_owned())
                         .await
                         .map_err(|_| {
                             McpError::from(ProtocolError::ServerBusy {
                                 server_id: server_id.clone(),
                             })
                         })?
-                        .map_err(|_| {
-                            McpError::from(ProtocolError::ServerUnavailable {
-                                server_id: server_id.clone(),
-                            })
-                        })?,
-                )
-            } else {
-                None
+                        .map_err(|_| unavailable())?,
+                ),
+                None => None,
             };
 
             // Resolve the live peer only after the queue wait. A reconnect may
@@ -3679,22 +3633,18 @@ impl ToolRouter {
             let upstream = self
                 .server_manager
                 .get_upstream(&server_id)
-                .ok_or_else(|| {
-                    McpError::from(ProtocolError::ServerUnavailable {
-                        server_id: server_id.clone(),
-                    })
-                })?;
+                .ok_or_else(unavailable)?;
+            // The upstream may have reconnected in another era since the task
+            // was admitted.
+            if matches!(kind, CallKind::Task(_)) && !task_can_carry(Some(upstream.protocol_era)) {
+                return Err(crate::protocol::ProtocolOutcome::UnsupportedBridge.into_error(era));
+            }
 
             if let Some(expected) = &round.expected_route {
                 let (actual, _) = self.tool_route_identity(tool_name)?;
                 if actual != *expected {
                     return Err(
-                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(
-                            downstream
-                                .as_ref()
-                                .map(|context| context.protocol_era)
-                                .unwrap_or(crate::protocol::ProtocolEra::Legacy),
-                        ),
+                        crate::protocol::ProtocolOutcome::ExpiredContinuation.into_error(era)
                     );
                 }
             }
@@ -3707,45 +3657,65 @@ impl ToolRouter {
             // when nothing else holds it, which cut this call off.
             let _held_through_the_call = upstream;
 
+            // No `options.timeout`: rmcp's timeout path cancels through an
+            // unbounded `send_notification`, so a wedged sink would hang the
+            // call forever. The bounds are the `tokio::time::timeout`s below,
+            // the answer's paired with a cancel bounded on its own. rmcp's
+            // peer channel is bounded too, so sending can wait before a
+            // request id exists to cancel.
             let mut options = PeerRequestOptions::default();
-            options.timeout = Some(timeout_duration);
             options.meta = extension_meta.clone().map(RequestMetaObject);
-            if let Some(token) = upstream_progress_token.clone() {
-                options
-                    .meta
-                    .get_or_insert_with(RequestMetaObject::new)
-                    .set_progress_token(token);
-            }
-            let request_handle = peer
-                .send_cancellable_request(request, options)
-                .await
-                .map_err(|error| {
-                    if let Some(ref mut guard) = active_call_guard {
-                        guard.disarm();
-                    }
-                    self.remove_active_call(call_id);
-                    match error {
-                        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
-                        other => McpError::internal_error(other.to_string(), None),
-                    }
-                })?;
+            // rmcp puts its own progress token on every request it sends;
+            // `request_progress_token` below is the one to map back.
+            let RequestHandle {
+                mut rx,
+                id: upstream_request_id,
+                peer: request_peer,
+                progress_token: request_progress_token,
+                ..
+            } = answer_within(
+                timeout_duration,
+                peer.send_cancellable_request(request, options),
+            )
+            .await
+            .inspect_err(|_| {
+                if let Some(ref mut guard) = active_call_guard {
+                    guard.disarm();
+                }
+                self.remove_active_call(call_id);
+            })?;
 
-            let actual_progress_token = downstream_progress_token
-                .as_ref()
-                .map(|_| request_handle.progress_token.clone());
-            self.attach_upstream_request_id(
-                call_id,
-                &server_id,
-                request_handle.id.clone(),
-                actual_progress_token,
-            );
+            match &kind {
+                CallKind::Task(task_id) => {
+                    self.record_task_request(
+                        task_id,
+                        &server_id,
+                        &request_peer,
+                        &upstream_request_id,
+                        timeout_duration,
+                    )
+                    .await?;
+                }
+                CallKind::CreateTask => {}
+                CallKind::Direct | CallKind::Invoked => {
+                    self.attach_upstream_request_id(
+                        call_id,
+                        &server_id,
+                        upstream_request_id.clone(),
+                        downstream_progress_token
+                            .as_ref()
+                            .map(|_| request_progress_token),
+                    );
+                }
+            }
             tracing::info!(
                 call_id,
                 trace_id = %trace_id,
+                task_id = ?kind.task_id(),
                 downstream_transport = ?downstream.as_ref().map(|context| context.transport),
                 downstream_client = ?downstream.as_ref().map(|context| context.client_id.as_ref()),
                 downstream_request_id = ?downstream.as_ref().map(|context| &context.request_id),
-                upstream_request_id = ?request_handle.id,
+                upstream_request_id = ?upstream_request_id,
                 server = %server_id,
                 tool = %original_name,
                 retry = is_retry,
@@ -3754,10 +3724,35 @@ impl ToolRouter {
 
             let call_start = std::time::Instant::now();
 
-            // Execute with timeout via rmcp RequestHandle so we retain upstream request ID.
-            let result = request_handle.await_response().await;
+            // The oneshot maps as rmcp's `await_response` maps it: a dropped
+            // responder means the transport went away.
+            let answer = tokio::time::timeout(timeout_duration, &mut rx).await;
+            let result = match answer {
+                Ok(Ok(inner)) => inner,
+                Ok(Err(_recv_error)) => Err(rmcp::service::ServiceError::TransportClosed),
+                Err(_elapsed) => {
+                    cancel_upstream_request(
+                        &request_peer,
+                        upstream_request_id.clone(),
+                        RequestHandle::<RoleClient>::REQUEST_TIMEOUT_REASON,
+                        timeout_duration,
+                    )
+                    .await;
+                    if matches!(kind, CallKind::CreateTask) {
+                        tasks::spawn_late_task_reaper(
+                            rx,
+                            Arc::clone(&self.server_manager),
+                            timeout_duration,
+                            server_id.clone(),
+                            Arc::clone(&trace_id),
+                        );
+                    }
+                    Err(rmcp::service::ServiceError::Timeout {
+                        timeout: timeout_duration,
+                    })
+                }
+            };
 
-            // Drop semaphore permit
             drop(permit);
 
             // Metrics RAII: any early exit / panic after await still records a
@@ -3792,12 +3787,7 @@ impl ToolRouter {
             };
             let duration_ms = call_start.elapsed().as_millis() as u64;
 
-            // Record circuit breaker outcome
-            let cb = self
-                .server_manager
-                .circuit_breakers
-                .get(&server_id)
-                .map(|entry| Arc::clone(entry.value()));
+            let cb = self.server_manager.circuit_breaker(&server_id);
 
             // Close out this attempt's ledgers: record the circuit breaker
             // outcome and call metrics when given, then drop the active-call
@@ -3819,12 +3809,46 @@ impl ToolRouter {
                 self.remove_active_call(call_id);
             };
 
+            let lost = result.as_ref().err().and_then(LostSession::of);
             match result {
+                Ok(answer) if matches!(kind, CallKind::CreateTask) => {
+                    match crate::legacy_tasks::parse_create_result(answer) {
+                        Ok(created) => {
+                            finish(Some(true), Some(true));
+                            tracing::info!(
+                                call_id,
+                                trace_id = %trace_id,
+                                server = %server_id,
+                                tool = %original_name,
+                                task_id = %created.task.task_id,
+                                duration_ms,
+                                "proxy native upstream task created"
+                            );
+                            Ok(CallToolResponse::Task(rmcp::model::CreateTaskResult::new(
+                                (&created.task).into(),
+                            )))
+                        }
+                        Err(error) => {
+                            finish(None, Some(false));
+                            tracing::warn!(
+                                call_id,
+                                trace_id = %trace_id,
+                                server = %server_id,
+                                tool = %original_name,
+                                %error,
+                                "upstream answered a task-wrapped call without a legacy task"
+                            );
+                            Err(McpError::internal_error(
+                                "upstream task-capable server returned an invalid legacy task response",
+                                None,
+                            ))
+                        }
+                    }
+                }
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
-                    admit_tool_result_meta(&mut response);
-                    skills::outward_tool_result(&server_id, &mut response);
+                    outward_tool_result(&server_id, &mut response);
                     finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,
@@ -3834,8 +3858,16 @@ impl ToolRouter {
                         duration_ms,
                         "proxy tool call completed"
                     );
+                    if kind.is_task() {
+                        // A task's result is spilled when it is fetched.
+                        return Ok(response.into());
+                    }
                     self.artifact_store
-                        .maybe_spill_result_of(&server_id, &original_name, tool_name, response)
+                        .maybe_spill_result_of(
+                            Some((&server_id, &original_name)),
+                            tool_name,
+                            response,
+                        )
                         .await
                         .map(Into::into)
                 }
@@ -3854,7 +3886,7 @@ impl ToolRouter {
                     );
                     Ok(CallToolResponse::InputRequired(response))
                 }
-                Err(e) if is_session_error(&e) && !(never_reached_server(&e) || safe_to_repeat) => {
+                Err(e) if lost == Some(LostSession::MayHaveArrived) && !safe_to_repeat => {
                     // The connection dropped after the call was sent. The
                     // tool may have run, so Plug does not send it again: a
                     // second message or a second record is worse than an
@@ -3877,13 +3909,12 @@ impl ToolRouter {
                     ))
                 }
                 Err(e)
-                    if is_session_error(&e)
+                    if lost.is_some()
                         && !is_retry
                         && round.input_responses.is_none()
                         && round.request_state.is_none()
                         && round.expected_route.is_none() =>
                 {
-                    // Session/transport error on first attempt — try to reconnect and retry
                     tracing::warn!(
                         server = %server_id,
                         tool = %original_name,
@@ -3923,15 +3954,8 @@ impl ToolRouter {
                         }
                     }
 
-                    self.call_tool_inner(
-                        tool_name,
-                        round,
-                        progress_token,
-                        downstream,
-                        enforce_lazy_visibility,
-                        true,
-                    )
-                    .await
+                    self.call_tool_inner(tool_name, round, progress_token, downstream, kind, true)
+                        .await
                 }
                 Err(rmcp::service::ServiceError::Timeout { timeout }) => {
                     tracing::error!(
@@ -3960,10 +3984,7 @@ impl ToolRouter {
                         "upstream tool call failed"
                     );
                     finish(Some(false), Some(false));
-                    match e {
-                        rmcp::service::ServiceError::McpError(mcp_err) => Err(mcp_err),
-                        other => Err(McpError::internal_error(other.to_string(), None)),
-                    }
+                    Err(map_service_error(e))
                 }
                 Ok(other) => {
                     // An unexpected upstream response is a terminal failure —
@@ -3980,10 +4001,10 @@ impl ToolRouter {
 
     fn meta_tool_visible_for_call(
         &self,
-        meta_tool_name: &str,
+        plug_tool: PlugTool,
         downstream: Option<&DownstreamCallContext>,
     ) -> bool {
-        if is_disabled_tool(&self.config.disabled_tools, meta_tool_name) {
+        if is_disabled_tool(&self.disabled_tools.load(), plug_tool.name()) {
             return false;
         }
 
@@ -3991,10 +4012,10 @@ impl ToolRouter {
             .map(|context| self.config.lazy_surface_for_client(context.client_type))
             .unwrap_or_else(|| self.config.lazy_surface_for_client(ClientType::Unknown));
         match surface {
-            LazyToolSurface::Bridge => meta_tool_name == "plug__search_tools",
-            LazyToolSurface::LegacyMeta => legacy_meta_tool_names().contains(&meta_tool_name),
+            LazyToolSurface::Bridge => plug_tool == PlugTool::SearchTools,
+            LazyToolSurface::LegacyMeta => true,
             LazyToolSurface::Standard | LazyToolSurface::Native => {
-                self.cache.load().resolve_route(meta_tool_name).is_some()
+                self.cache.load().resolve_route(plug_tool.name()).is_some()
             }
         }
     }
@@ -4004,7 +4025,9 @@ impl ToolRouter {
         let snapshot = self.cache.load();
         let mut tool_counts: HashMap<&str, usize> = HashMap::new();
         for (tool_name, (server_id, _)) in snapshot.routes.iter() {
-            if server_id != "__plug_internal__" && self.client_may_use_tool(client_key, tool_name) {
+            if server_id != crate::tool_naming::INTERNAL_SERVER_ID
+                && self.client_may_use_tool(client_key, tool_name)
+            {
                 *tool_counts.entry(server_id.as_str()).or_insert(0) += 1;
             }
         }
@@ -4061,7 +4084,7 @@ impl ToolRouter {
             let Some((server_id, _)) = snapshot.routes.get(tool.name.as_ref()) else {
                 continue;
             };
-            if server_id == "__plug_internal__" {
+            if server_id == crate::tool_naming::INTERNAL_SERVER_ID {
                 continue;
             }
             if !self.client_may_use_tool(client_key, tool.name.as_ref()) {
@@ -4248,7 +4271,6 @@ impl ToolRouter {
         arguments: Option<serde_json::Map<String, serde_json::Value>>,
         progress_token: Option<ProgressToken>,
         downstream: Option<DownstreamCallContext>,
-        is_retry: bool,
     ) -> std::pin::Pin<
         Box<dyn std::future::Future<Output = Result<CallToolResult, McpError>> + Send + 'a>,
     > {
@@ -4266,7 +4288,7 @@ impl ToolRouter {
                         detail: "plug__invoke_tool requires a string tool_name".to_string(),
                     })
                 })?;
-            if canonical_plug_meta_tool_name(target).is_some() {
+            if PlugTool::named(target).is_some() {
                 return Err(McpError::from(ProtocolError::InvalidRequest {
                     detail: "plug__invoke_tool cannot invoke plug meta-tools".to_string(),
                 }));
@@ -4310,8 +4332,8 @@ impl ToolRouter {
                 },
                 progress_token,
                 downstream,
+                CallKind::Invoked,
                 false,
-                is_retry,
             )
             .await
             .and_then(|response| match response {
@@ -4341,10 +4363,9 @@ impl ToolRouter {
                 detail: "lazy tool working-set actions require a downstream session".to_string(),
             }));
         };
-        Ok(Self::lazy_session_key(
-            downstream.transport,
-            downstream.client_id.as_ref(),
-        ))
+        Ok(downstream
+            .transport
+            .lazy_session_key(downstream.client_id.as_ref()))
     }
 
     fn json_tool_result(&self, value: serde_json::Value) -> Result<CallToolResult, McpError> {
@@ -4367,8 +4388,9 @@ impl ToolRouter {
         ) {
             return Ok(());
         }
-        let session_key =
-            Self::lazy_session_key(downstream.transport, downstream.client_id.as_ref());
+        let session_key = downstream
+            .transport
+            .lazy_session_key(downstream.client_id.as_ref());
         let Some(mut loaded) = self.lazy_working_sets.get_mut(&session_key) else {
             return Err(McpError::from(ProtocolError::InvalidRequest {
                 detail: format!(
@@ -4396,56 +4418,165 @@ impl ToolRouter {
     pub fn server_manager(&self) -> &Arc<ServerManager> {
         &self.server_manager
     }
-}
 
-// ---------------------------------------------------------------------------
-// Session error classification
-// ---------------------------------------------------------------------------
-
-/// Classify whether a ServiceError indicates a session/transport failure
-/// that should trigger automatic reconnection.
-///
-/// rmcp v1.0.0 error mapping:
-/// - HTTP 404 "Session not found" → `ServiceError::TransportSend(DynamicTransportError)`
-///   with formatted string containing "404" and "session not found"
-/// - Connection refused/reset → `ServiceError::TransportSend` or `TransportClosed`
-/// - JSON-RPC application errors → `ServiceError::McpError` (do NOT reconnect)
-/// - Timeouts → `ServiceError::Timeout` (do NOT reconnect)
-fn is_session_error(e: &rmcp::service::ServiceError) -> bool {
-    use rmcp::service::ServiceError;
-    match e {
-        // Transport send failures (HTTP 404, connection refused, etc.)
-        ServiceError::TransportSend(dyn_err) => {
-            let msg = dyn_err.to_string().to_lowercase();
-            msg.contains("404")
-                || msg.contains("session not found")
-                || msg.contains("connection refused")
-                || msg.contains("connection reset")
-                || msg.contains("broken pipe")
-        }
-        // Transport closed = connection dropped (server crashed/restarted)
-        ServiceError::TransportClosed => true,
-        // All other variants: do NOT reconnect
-        // McpError = application-level error (tool errors, invalid params)
-        // Timeout = slow tool, not a server failure
-        // Cancelled = task cancelled
-        // UnexpectedResponse = wrong response type
-        _ => false,
+    /// A router over a new server manager whose servers report to it, with
+    /// no runtime behind it.
+    #[cfg(test)]
+    pub(crate) fn linked(config: RouterConfig) -> Arc<Self> {
+        Arc::new_cyclic(|router: &Weak<Self>| {
+            let events: Weak<dyn crate::server::UpstreamEvents> = router.clone();
+            Self::new(Arc::new(ServerManager::reporting_to(events)), config)
+        })
     }
 }
 
-/// Whether a session error proves the server never took the call: it refused
-/// the connection or no longer knew the session. A closed, reset, or broken
-/// connection proves nothing, since the call may have arrived first.
-fn never_reached_server(e: &rmcp::service::ServiceError) -> bool {
-    match e {
-        rmcp::service::ServiceError::TransportSend(error) => {
-            let msg = error.to_string().to_lowercase();
-            msg.contains("404")
-                || msg.contains("session not found")
-                || msg.contains("connection refused")
+#[async_trait::async_trait]
+impl crate::server::UpstreamEvents for ToolRouter {
+    fn list_roots(&self) -> ListRootsResult {
+        self.list_roots_union()
+    }
+
+    async fn elicit(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: ElicitRequestParams,
+    ) -> Result<ElicitResult, McpError> {
+        self.bridge_for_upstream_request(server, &request_id)?
+            .create_elicitation(request)
+            .await
+    }
+
+    async fn create_message(
+        &self,
+        server: &str,
+        request_id: RequestId,
+        request: CreateMessageRequestParams,
+    ) -> Result<CreateMessageResult, McpError> {
+        self.bridge_for_upstream_request(server, &request_id)?
+            .create_message(request)
+            .await
+    }
+
+    fn tools_changed(self: Arc<Self>) {
+        self.schedule_catalog_refresh();
+    }
+
+    fn resources_changed(self: Arc<Self>) {
+        self.schedule_catalog_refresh();
+    }
+
+    fn prompts_changed(self: Arc<Self>) {
+        self.schedule_catalog_refresh();
+    }
+
+    fn progress(&self, server: &str, params: ProgressNotificationParam) {
+        self.route_upstream_progress(server, params);
+    }
+
+    fn cancelled(&self, server: &str, params: CancelledNotificationParam) {
+        self.route_upstream_cancelled(server, params);
+    }
+
+    fn auth_required(&self, server: &str) {
+        self.publish_protocol_notification(ProtocolNotification::AuthStateChanged {
+            server_id: Arc::from(server),
+            new_state: ServerHealth::AuthRequired,
+        });
+    }
+
+    fn resource_updated(&self, server: &str, mut params: ResourceUpdatedNotificationParam) {
+        self.name_skill_server(server, &mut params.uri);
+        self.route_upstream_resource_updated(server, params);
+    }
+
+    fn logging_message(&self, server: &str, params: LoggingMessageNotificationParam) {
+        self.route_upstream_logging_message(server, params);
+    }
+
+    fn log_level(&self) -> LoggingLevel {
+        ToolRouter::log_level(self)
+    }
+}
+
+/// A call that failed because the connection to its server was lost, which
+/// a reconnect may fix.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LostSession {
+    /// The server refused the connection or no longer knew the session, so
+    /// the call never reached it.
+    NeverArrived,
+    /// The connection closed, reset or broke. The call may have arrived first.
+    MayHaveArrived,
+}
+
+impl LostSession {
+    /// rmcp reports transport failures only as text: an HTTP 404 "Session
+    /// not found" and refused or reset connections arrive as
+    /// `TransportSend` with the cause in its message. Tool errors
+    /// (`McpError`), timeouts and cancels are not lost sessions.
+    fn of(error: &rmcp::service::ServiceError) -> Option<Self> {
+        match error {
+            rmcp::service::ServiceError::TransportSend(error) => {
+                let msg = error.to_string().to_lowercase();
+                let has = |needles: &[&str]| needles.iter().any(|needle| msg.contains(needle));
+                if has(&["404", "session not found", "connection refused"]) {
+                    Some(Self::NeverArrived)
+                } else if has(&["connection reset", "broken pipe"]) {
+                    Some(Self::MayHaveArrived)
+                } else {
+                    None
+                }
+            }
+            rmcp::service::ServiceError::TransportClosed => Some(Self::MayHaveArrived),
+            _ => None,
         }
-        _ => false,
+    }
+}
+
+fn map_service_error(error: rmcp::service::ServiceError) -> McpError {
+    match error {
+        rmcp::service::ServiceError::McpError(mcp_err) => mcp_err,
+        other => McpError::internal_error(other.to_string(), None),
+    }
+}
+
+fn upstream_call_timeout(upstream: &crate::server::UpstreamServer) -> Duration {
+    Duration::from_secs(upstream.config.call_timeout_secs)
+}
+
+/// Wait at most `timeout` for an upstream's answer. rmcp waits for one
+/// forever.
+async fn answer_within<T>(
+    timeout: Duration,
+    request: impl std::future::Future<Output = Result<T, rmcp::service::ServiceError>>,
+) -> Result<T, McpError> {
+    match tokio::time::timeout(timeout, request).await {
+        Ok(answer) => answer.map_err(map_service_error),
+        Err(_) => Err(McpError::from(ProtocolError::Timeout { duration: timeout })),
+    }
+}
+
+/// Ask `peer` to stop `request_id`, waiting at most `bound`: rmcp's
+/// notification send waits on a full transport sink forever.
+async fn cancel_upstream_request(
+    peer: &Peer<RoleClient>,
+    request_id: RequestId,
+    reason: &str,
+    bound: Duration,
+) {
+    let send = peer.notify_cancelled(CancelledNotificationParam::new(
+        Some(request_id),
+        Some(reason.to_string()),
+    ));
+    match tokio::time::timeout(bound, send).await {
+        Err(_) => tracing::warn!(
+            reason,
+            timeout_secs = bound.as_secs(),
+            "upstream cancellation notify timed out"
+        ),
+        Ok(Err(error)) => tracing::debug!(reason, %error, "upstream cancellation notify failed"),
+        Ok(Ok(())) => {}
     }
 }
 
@@ -4473,11 +4604,11 @@ impl Drop for InFlightCall<'_> {
 mod lifecycle_regression_tests {
     use super::*;
 
-    #[tokio::test]
+    #[tokio::test(start_paused = true)]
     async fn drain_calls_waits_for_running_calls_and_gives_up_at_the_deadline() {
         let router = Arc::new(ToolRouter::new(
             Arc::new(ServerManager::new()),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         assert_eq!(router.drain_calls(Duration::from_secs(5)).await, 0);
 
@@ -4486,60 +4617,27 @@ mod lifecycle_regression_tests {
         assert_eq!(router.drain_calls(Duration::from_millis(20)).await, 2);
 
         drop(first);
-        let started = std::time::Instant::now();
+        let started = tokio::time::Instant::now();
         let (remaining, ()) = tokio::join!(router.drain_calls(Duration::from_secs(5)), async {
             tokio::time::sleep(Duration::from_millis(50)).await;
             drop(second);
         });
         assert_eq!(remaining, 0);
-        assert!(started.elapsed() < Duration::from_secs(2));
-    }
-
-    fn test_router_config() -> RouterConfig {
-        RouterConfig {
-            enable_prefix: true,
-            prefix_delimiter: "__".to_string(),
-            priority_tools: Vec::new(),
-            disabled_tools: Vec::new(),
-            tool_description_max_chars: None,
-            tool_search_threshold: 50,
-            meta_tool_mode: false,
-            lazy_tools: crate::config::LazyToolsConfig::default(),
-            tool_filter_enabled: true,
-            enrichment_servers: std::collections::HashSet::new(),
-        }
-    }
-
-    #[test]
-    fn auth_required_health_has_non_retryable_authorization_outcome() {
-        let outcome = health_gate_outcome(ServerHealth::AuthRequired)
-            .expect("auth-required health must reject the call");
-        assert_eq!(
-            outcome,
-            crate::protocol::ProtocolOutcome::AuthorizationRequired
-        );
-        let encoded = outcome.encode(crate::protocol::ProtocolEra::Modern);
-        assert!(
-            !encoded.retryable,
-            "client must re-authorize before retrying"
-        );
-
-        assert_eq!(
-            health_gate_outcome(ServerHealth::Failed),
-            Some(crate::protocol::ProtocolOutcome::UpstreamUnavailable)
-        );
+        assert_eq!(started.elapsed(), Duration::from_millis(50));
     }
 
     #[test]
     fn concurrent_duplicate_downstream_key_never_evicts_the_winner() {
         let router = Arc::new(ToolRouter::new(
             Arc::new(ServerManager::new()),
-            test_router_config(),
+            RouterConfig::default(),
         ));
         let mut notifications = router.subscribe_notifications();
-        let context = DownstreamCallContext::stdio(
+        let context = DownstreamCallContext::ipc(
             "same-principal",
             RequestId::from(NumberOrString::Number(77)),
+            crate::types::ClientType::Unknown,
+            None,
         )
         .with_protocol(
             crate::protocol::ProtocolEra::Modern,
@@ -4631,6 +4729,64 @@ mod lifecycle_regression_tests {
         assert!(!router.active_call_lookup.contains_key(&key));
         assert!(router.active_calls.is_empty());
     }
+
+    /// Two stateless callers under one principal, such as two clients on an
+    /// open loopback listener, often send the same request id.
+    #[test]
+    fn stateless_callers_sharing_a_principal_keep_their_calls_apart() {
+        let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+        let call = |exchange: Option<u64>| {
+            let context = DownstreamCallContext::http(
+                "loopback-principal",
+                RequestId::from(NumberOrString::Number(1)),
+                crate::types::ClientType::Unknown,
+            )
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::MODERN_PROTOCOL_VERSION,
+            );
+            match exchange {
+                Some(exchange) => context.in_exchange(exchange),
+                None => context,
+            }
+        };
+        let record = |downstream: DownstreamCallContext| ActiveCallRecord {
+            downstream,
+            upstream_server_id: "upstream".to_string(),
+            upstream_request_id: None,
+            downstream_progress_token: None,
+            upstream_progress_token: None,
+            pending_cancel_reason: None,
+        };
+        let (first, second) = (call(Some(1)), call(Some(2)));
+        router
+            .register_active_call(1, record(first.clone()))
+            .unwrap();
+        router
+            .register_active_call(2, record(second.clone()))
+            .expect("the same id from another exchange is another call");
+        assert_ne!(first.notification_target(), second.notification_target());
+        let cancelled = |call_id: u64| {
+            router
+                .active_calls
+                .get(&call_id)
+                .unwrap()
+                .downstream
+                .cancellation
+                .is_cancelled()
+        };
+
+        // A cancel by request id alone cannot tell the two apart.
+        router.cancel_downstream_request(&call(None), None);
+        assert!(!cancelled(1) && !cancelled(2));
+        // An exchange that ends cancels only the call it carried.
+        router.cancel_downstream_request(&second, None);
+        assert!(!cancelled(1) && cancelled(2));
+        router.remove_active_call(2);
+        // With one call left under that id, the cancel finds it.
+        router.cancel_downstream_request(&call(None), None);
+        assert!(cancelled(1));
+    }
 }
 
 #[cfg(test)]
@@ -4661,12 +4817,12 @@ mod call_metadata_regression_tests {
 mod catalog;
 mod completion;
 pub mod continuations;
-mod handler;
+mod sessions;
 mod skills;
 mod subscriptions;
 mod tasks;
 pub(crate) use catalog::*;
-pub use handler::ProxyHandler;
+pub use sessions::{ConnectorAfter, EndedSession};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

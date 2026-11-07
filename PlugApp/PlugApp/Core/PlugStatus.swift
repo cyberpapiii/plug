@@ -1,9 +1,10 @@
 import Foundation
+import PlugIPC
 
 // MARK: - Server health
 
-/// Health of one upstream server, normalized out of the daemon's string form so
-/// the interface never compares raw protocol vocabulary.
+/// Health of one upstream server as the interface tells it, from the daemon's
+/// health and whether the server is on.
 enum ServerHealth: Equatable, Sendable {
     case working
     case starting
@@ -13,13 +14,12 @@ enum ServerHealth: Equatable, Sendable {
     /// nothing about it. Usually a server added to the file without a reload.
     case notLoaded
     case off
-    case unknown
 
     /// How long a running daemon may say nothing about a configured server
     /// before that silence stops meaning "still starting".
     static let notLoadedAfterSecs: UInt64 = 60
 
-    init(daemonValue: String?, enabled: Bool, daemonUptimeSecs: UInt64 = 0) {
+    init(daemonValue: DaemonHealth?, enabled: Bool, daemonUptimeSecs: UInt64 = 0) {
         guard enabled else {
             self = .off
             return
@@ -27,13 +27,11 @@ enum ServerHealth: Equatable, Sendable {
         switch daemonValue {
         // Degraded still routes calls, so it reads as running rather than
         // as an unknown state that asks for attention.
-        case "Healthy", "Degraded": self = .working
+        case .healthy, .degraded: self = .working
         case nil where daemonUptimeSecs > Self.notLoadedAfterSecs: self = .notLoaded
-        case "Starting", nil: self = .starting
-        case "AuthRequired": self = .signInNeeded
-        case "Failed": self = .down
-        case "Disabled": self = .off
-        default: self = .unknown
+        case nil: self = .starting
+        case .authRequired: self = .signInNeeded
+        case .failed: self = .down
         }
     }
 
@@ -46,19 +44,23 @@ enum ServerHealth: Equatable, Sendable {
         case .down: "Down"
         case .notLoaded: "Not loaded"
         case .off: "Off"
-        case .unknown: "Not responding"
         }
     }
 
     /// True when this server is the reason someone opened Plug.
     var needsAttention: Bool {
         switch self {
-        case .signInNeeded, .down, .notLoaded, .unknown: true
+        case .signInNeeded, .down, .notLoaded: true
         case .working, .starting, .off: false
         }
     }
 
     var isSettling: Bool { self == .starting }
+}
+
+/// A line made from rows read before the daemon went away says so.
+func lastKnown(_ line: String, stale: Bool) -> String {
+    stale ? "Last known · \(line)" : line
 }
 
 // MARK: - Facts
@@ -109,7 +111,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     var fix: Verdict.Button? {
         switch health {
         case .signInNeeded: .init(isSigningIn ? "Try Again" : "Sign In", .signIn(server: name))
-        case .down, .unknown: .init("Restart", .restartServer(name))
+        case .down: .init("Restart", .restartServer(name))
         case .notLoaded: .init("Reload", .reloadConfiguration)
         case .working, .starting, .off: nil
         }
@@ -128,7 +130,6 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
         case .signInNeeded: isSigningIn ? "Finish signing in with your browser" : "Needs sign-in"
         case .down: error ?? "Stopped"
         case .notLoaded: "Not loaded yet"
-        case .unknown: "Not responding"
         case .working, .starting, .off: health.label
         }
     }
@@ -145,7 +146,7 @@ struct ServerFacts: Identifiable, Equatable, Sendable {
     var transportLabel: String {
         switch transport.lowercased() {
         case "stdio": "On this Mac"
-        case "http", "sse", "streamable_http": "Over the network"
+        case "http", "sse": "Over the network"
         case "openapi": "Web API"
         default: transport.capitalized
         }
@@ -197,12 +198,8 @@ struct PlugSituation: Equatable, Sendable {
     let setup: Setup
     let runtime: Runtime
     let servers: [ServerFacts]
-    let connectedApps: Int
-    /// The distinct apps behind `connectedApps`, as icon targets, so the
-    /// panel can show who is connected rather than only how many.
-    let connectedAppTargets: [String]
-    /// The same clients with the name and picture the Clients list gives
-    /// each, so the panel shows them the same way.
+    /// The connected clients, with the name and picture the Clients list
+    /// gives each, so the panel shows them the same way.
     let connectedClients: [ConnectedClient]
     let version: String
 
@@ -210,20 +207,17 @@ struct PlugSituation: Equatable, Sendable {
         setup: Setup = .ready,
         runtime: Runtime = .stopped,
         servers: [ServerFacts] = [],
-        connectedApps: Int = 0,
-        connectedAppTargets: [String] = [],
         connectedClients: [ConnectedClient] = [],
         version: String = ""
     ) {
         self.setup = setup
         self.runtime = runtime
         self.servers = servers
-        self.connectedApps = connectedApps
-        self.connectedAppTargets = connectedAppTargets
         self.connectedClients = connectedClients
         self.version = version
     }
 
+    var connectedApps: Int { connectedClients.count }
     var activeServers: [ServerFacts] { servers.filter(\.enabled) }
     var troubledServers: [ServerFacts] { activeServers.filter(\.health.needsAttention) }
     var workingServers: [ServerFacts] { activeServers.filter { $0.health == .working } }
@@ -244,7 +238,7 @@ struct PlugSituation: Equatable, Sendable {
             ? "\(running) of \(activeServers.count) ready"
             : "\(running) running · \(totalTools) \(totalTools == 1 ? "tool" : "tools")"
         if !offServers.isEmpty { summary += " · \(offServers.count) off" }
-        return stale ? "Last known · \(summary)" : summary
+        return lastKnown(summary, stale: stale)
     }
 
     /// The one line the panel says about events.
@@ -284,24 +278,21 @@ struct PlugSituation: Equatable, Sendable {
 
     var connectedSummary: String { connectedSummaries[0] }
 
-    /// Every server in one order for every list: the ones that are on, then
-    /// the ones that are off.
-    var listedServers: [ServerFacts] { activeServers + servers.filter { !$0.enabled } }
-
     /// The count line under the Servers title. Rows read before the daemon
     /// went away say so.
     func countsSummary(stale: Bool) -> String {
         let count = activeServers.count
         let tools = totalTools
         let summary = "\(count) \(count == 1 ? "server" : "servers") · \(tools) \(tools == 1 ? "tool" : "tools")"
-        return stale ? "Last known · \(summary)" : summary
+        return lastKnown(summary, stale: stale)
     }
 }
 
 // MARK: - Intents
 
-/// Every action the interface can start, in one list. Views name an intent;
-/// a single dispatcher performs it. Nothing else calls the model directly.
+/// Every press the interface can make, in one list. Views name an intent and
+/// `PlugIntentRunner` performs it. A sheet that waits for its answer calls a
+/// named action on `AppModel.actions` instead; neither builds a request.
 enum PlugIntent: Equatable, Sendable {
     case allowBackgroundRunning
     case repairInstallation
@@ -324,7 +315,7 @@ enum PlugIntent: Equatable, Sendable {
     case renameClient(key: String, name: String)
     /// A client signed in again under a new id: it takes over the settings
     /// of the sign-in it replaces, and that one loses its access.
-    case replaceClient(oldID: String, newID: String)
+    case replaceClient(old: DownstreamClient, new: DownstreamClient)
     case setClientPlace(key: String, place: String)
     case setClientServerBlocked(key: String, server: String, blocked: Bool)
     case setClientToolBlocked(key: String, tool: String, blocked: Bool)
@@ -332,16 +323,11 @@ enum PlugIntent: Equatable, Sendable {
     case setClientToolAllowed(key: String, tool: String, allowed: Bool)
     case setClientAllowList(key: String, on: Bool)
     case addServer
-    /// Open the sheet that adds Plug to a client.
     case addClient
-    /// Open the sheet that picks a tool to watch.
     case addWatch
-    /// Stop watching, by event name.
     case removeWatch(event: String)
     case openWindow(AppSection)
-    /// Open the Settings window.
     case openSettings
-    /// Open the first-run guide.
     case showGuide
     /// Open Settings and check everything.
     case checkup
@@ -354,13 +340,13 @@ enum PlugIntent: Equatable, Sendable {
     /// uses. Nothing in the app ever kills it directly.
     case restartService
     case setServiceEnabled(Bool)
+    /// Read everything again now, the tool list included.
+    case refresh
     case reloadConfiguration
     /// Copy servers over from the other clients on this Mac.
     case importServers
-    /// Forget a server's stored account.
     case signOut(server: String)
     case openLogs
-    /// Hide the message about a press that failed.
     case dismissActionError
     case quit
 }
@@ -395,18 +381,18 @@ struct Verdict: Equatable, Sendable {
     let primary: Button?
     let secondary: Button?
     /// The face Plug's character wears while it says this.
-    let mood: PlugCharacter.Mood
+    let mood: PlugMood
 
     init(
         tone: Tone,
-        mood: PlugCharacter.Mood? = nil,
+        mood: PlugMood? = nil,
         title: String,
         detail: String? = nil,
         primary: Button? = nil,
         secondary: Button? = nil
     ) {
         self.tone = tone
-        self.mood = mood ?? PlugCharacter.Mood(tone)
+        self.mood = mood ?? PlugMood(tone)
         self.title = title
         self.detail = detail
         self.primary = primary
