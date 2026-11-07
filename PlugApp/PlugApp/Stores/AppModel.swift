@@ -519,9 +519,12 @@ final class AppModel {
             if next != activity { activity = next }
         }
         // The tool list is nearly a megabyte, and the snapshot reports when
-        // it would answer differently, so it is asked for only then.
+        // it would answer differently, so it is asked for only then. Every
+        // daemon counts its revision from the same start, so a daemon that
+        // started again can report the old one's revision for another list.
         let revision = value.toolCatalogRevision
-        if forceCatalog || !toolCatalog.isCurrent(at: revision), let tools = try await daemon.tools() {
+        if forceCatalog || daemonRestarted || !toolCatalog.isCurrent(at: revision),
+           let tools = try await daemon.tools() {
             let delimiter = value.prefixDelimiter
             toolCatalog = ToolCatalog(tools.map { ToolFacts($0, delimiter: delimiter) }, revision: revision)
         }
