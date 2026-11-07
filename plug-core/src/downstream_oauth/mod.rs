@@ -80,7 +80,7 @@ impl DownstreamOauthConfig {
         Some(Self {
             public_base_url: http.public_base_url.clone()?,
             oauth_scopes: http.oauth_scopes.clone().unwrap_or_else(|| {
-                crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
                     .iter()
                     .map(ToString::to_string)
                     .collect()
@@ -1762,7 +1762,7 @@ impl DownstreamOauthManager {
                     .split_whitespace()
                     .filter(|scope| {
                         offered(scope)
-                            || !crate::protocol::RETIRED_DOWNSTREAM_OAUTH_SCOPES.contains(scope)
+                            || !crate::admission::RETIRED_DOWNSTREAM_OAUTH_SCOPES.contains(scope)
                     })
                     .map(ToString::to_string)
                     .collect()
@@ -4866,7 +4866,7 @@ mod tests {
         let config = DownstreamOauthConfig::from_http_config(&http).expect("oauth config");
         assert_eq!(
             config.oauth_scopes,
-            crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
                 .iter()
                 .map(ToString::to_string)
                 .collect::<Vec<_>>(),
@@ -4901,7 +4901,7 @@ mod tests {
         let manager = DownstreamOauthManager::new_with_state_path(
             DownstreamOauthConfig {
                 public_base_url: "https://plug.example.com".to_string(),
-                oauth_scopes: crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+                oauth_scopes: crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
                     .iter()
                     .map(ToString::to_string)
                     .collect(),
@@ -4923,7 +4923,7 @@ mod tests {
             })
             .await
             .expect("begin authorization without an explicit scope");
-        let mut expected = crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+        let mut expected = crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
             .iter()
             .map(ToString::to_string)
             .collect::<Vec<_>>();
@@ -4952,7 +4952,7 @@ mod tests {
             .expect("exchange code");
         let scope = token.scope.expect("token response scope");
         let granted: HashSet<&str> = scope.split(' ').collect();
-        for required in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
+        for required in crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES {
             assert!(
                 granted.contains(required),
                 "token scope string must grant {required}, got {scope:?}"

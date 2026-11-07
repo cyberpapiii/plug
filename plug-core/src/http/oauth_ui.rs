@@ -204,7 +204,7 @@ fn scope_description(scope: &str) -> &'static str {
             "Stay connected after this browser window closes",
         ),
     ];
-    crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS
+    crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS
         .iter()
         .chain(&ASKED_FOR)
         .find(|(granted, _)| *granted == scope)
@@ -251,7 +251,7 @@ mod tests {
 
     #[test]
     fn every_scope_plug_asks_for_is_described() {
-        for scope in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+        for scope in crate::admission::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
             .into_iter()
             .chain([crate::events::EVENT_SCOPE, "offline_access"])
         {

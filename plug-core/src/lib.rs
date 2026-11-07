@@ -4,6 +4,7 @@
 #![allow(deprecated)]
 
 pub mod activity;
+pub mod admission;
 pub mod artifacts;
 pub mod auth;
 pub mod backoff;
