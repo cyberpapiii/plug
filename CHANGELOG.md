@@ -58,6 +58,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A client over the network with no sign-in of its own, such as Cursor on another Mac using Plug's token, is one client in the app under the key its calls carry. Renaming it or saying where it runs no longer renames or moves the same app on this Mac, and its calls in Activity show the name given to its row. Every such client shares one row and one name, because Plug cannot tell their requests apart.
 - Importing in the app names servers the way `plug import` does: a server whose name is taken, by a server already in Plug or by another one found, goes in with its client after it, such as `github-cursor`. The app used to refuse it as already existing. An import now adds everything ticked or nothing.
 - `plug import` and `plug setup` skip a link to Plug saved under another name, such as `plug-local`, by what it runs (`plug connect` or `plug serve`). They used to import it, which pointed Plug at itself. The app's import sheet takes its list from `plug import`, and pasting such an entry into Add Server says it is Plug's own.
 - Saving a server in the app keeps every setting the daemon sent for it, including one the app has no field for. A setting the app did not know was erased by the first edit.

@@ -354,10 +354,26 @@ final class AppRosterTests: XCTestCase {
         XCTAssertEqual(overNetwork.connected[0].sessions.map(\.sessionId), ["l1", "r2"])
         XCTAssertEqual(overNetwork.other.map(\.sessionId), ["r1"])
 
-        // The window and the menu bar count the same three clients.
+        // The window and the menu bar count the same three clients. The one
+        // with no sign-in is the daemon's shared key, which its calls carry.
         let names = ClientNames(names: [])
-        XCTAssertEqual(live.map(names.client(of:)), ["cursor", "oauth:abc", "remote:cursor"])
+        XCTAssertEqual(live.map(names.client(of:)), ["cursor", "oauth:abc", "remote:shared"])
         XCTAssertEqual(names.connectedClients(live + live).count, 3)
+        XCTAssertEqual(live.map(\.key), ["cursor", "oauth:abc", "remote:shared"])
+
+        // A name given to the local app is not the network client's, and one
+        // given to the network client is the name its calls show.
+        let named = ClientNames(names: try JSONDecoder().decode(
+            [ClientName].self,
+            from: Data(#"[{"key":"cursor","name":"Desk"},{"key":"remote:shared","name":"Token"}]"#.utf8)
+        ))
+        XCTAssertEqual(live.map(named.displayName), ["Desk", "Cursor", "Token"])
+        let call = ActivityEvent(
+            sequence: 1, occurredAtMs: 0, client: "r2", method: "tools/call", server: nil,
+            clientType: "Cursor", clientKey: ActivityEvent.sharedRemoteKey, target: "cursor",
+            remote: true, latencyMs: 1, outcome: .success
+        )
+        XCTAssertEqual(named.call(call, delimiter: "__").caller, "Token")
     }
 
     func testASessionFromNoKnownAppIsKeptApart() throws {
