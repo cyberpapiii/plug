@@ -359,9 +359,7 @@ pub(crate) async fn cmd_server_add(
             .interact_text()?,
     };
 
-    if config.servers.contains_key(&name) {
-        anyhow::bail!("server `{name}` already exists");
-    }
+    plug_core::operator::NameTaken::check(&config, &name)?;
 
     let provided_transport = transport.clone();
     let env_updates = parse_env_assignments(&env)?;

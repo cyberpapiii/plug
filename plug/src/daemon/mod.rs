@@ -1347,7 +1347,8 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             match ctx.engine.validate_server_draft(name, server) {
                 Ok(server) => IpcResponse::ServerValidated { server },
                 Err(error) => IpcResponse::Error {
-                    code: "INVALID_SERVER".to_string(),
+                    code: plug_core::operator::NameTaken::code_or(&error, "INVALID_SERVER")
+                        .to_string(),
                     message: error.to_string(),
                 },
             }
@@ -1384,7 +1385,11 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
             {
                 Ok((result, reload)) => IpcResponse::OperatorMutation { result, reload },
                 Err(error) => IpcResponse::Error {
-                    code: "OPERATOR_MUTATION_FAILED".to_string(),
+                    code: plug_core::operator::NameTaken::code_or(
+                        &error,
+                        "OPERATOR_MUTATION_FAILED",
+                    )
+                    .to_string(),
                     message: error.to_string(),
                 },
             }
