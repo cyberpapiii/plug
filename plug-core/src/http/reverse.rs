@@ -383,9 +383,13 @@ mod tests {
 
         // A pending request was sent in the same step, so it is queued for
         // replay behind the full channel before the client reconnects.
-        while state.pending_client_requests.is_empty() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while state.pending_client_requests.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the request is queued");
         let (reconnect_tx, mut reconnect_rx) = mpsc::channel(4);
         state
             .sessions
