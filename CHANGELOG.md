@@ -37,6 +37,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 - Plug rests when its window is covered, minimized or on another desktop, the way it does when the window is closed. It used to keep checking every two seconds, and the Clients page every five, for a window no one could see. It catches up the moment the window is back on screen.
 - The menu bar icon is a little larger and sits a point to the right, so it reads as centred and the same size as the icons beside it.
 - Start Plug has a sunrise beside it in the menu bar panel, to pair with the moon for off.
+- An OpenAPI server whose API address is a cloud metadata endpoint, such as `169.254.169.254`, now refuses each call to it. The server used to fail to start.
 - A server with many tools opens as fast as one with a few. Its page now makes each tool's row only when it scrolls into view, and the small switch on a row is drawn by Plug instead of being a full system control.
 - Clicking between servers is quicker, most of all onto one with many tools, and hiding or showing the sidebar is smoother. A server's tools are sorted once when they arrive, not on every redraw, and a tool's row is left alone unless that tool changed.
 - The window no longer stutters every two seconds. It was redrawing every server, client and tool on each check of Plug, because a few clocks in what it read had ticked; it now redraws only when something changed.

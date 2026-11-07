@@ -217,7 +217,7 @@ async fn restore_legacy_task_capability(
 
 #[derive(Clone)]
 struct InitializedNotificationCompatHttpClient {
-    inner: reqwest::Client,
+    inner: crate::upstream_http::Client,
     server_name: Arc<str>,
     /// Shared with the `UpstreamServer` this client backs.
     connection: ConnectionGeneration,
@@ -293,6 +293,13 @@ impl InitializedNotificationCompatHttpClient {
             None => *last = Some(Arc::clone(session_id)),
         }
     }
+}
+
+fn blocked(error: crate::upstream_http::Blocked) -> StreamableHttpError<reqwest::Error> {
+    StreamableHttpError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        error,
+    ))
 }
 
 fn is_initialized_notification_message(message: &rmcp::model::ClientJsonRpcMessage) -> bool {
@@ -421,7 +428,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
             &message,
         ));
         let result = <reqwest::Client as StreamableHttpClient>::post_message(
-            &self.inner,
+            self.inner.sending_to(&uri).map_err(blocked)?,
             uri,
             message,
             session_id.clone(),
@@ -454,7 +461,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         <reqwest::Client as StreamableHttpClient>::delete_session(
-            &self.inner,
+            self.inner.sending_to(&uri).map_err(blocked)?,
             uri,
             session_id,
             auth_header,
@@ -476,7 +483,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         // the wire before any request does.
         self.observe_session(session_id.as_ref());
         <reqwest::Client as StreamableHttpClient>::get_stream(
-            &self.inner,
+            self.inner.sending_to(&uri).map_err(blocked)?,
             uri,
             session_id,
             last_event_id,
@@ -2600,17 +2607,15 @@ impl Default for ServerManager {
     }
 }
 
-/// Check a remote upstream URL against the SSRF block list and resolve the
-/// bearer token to send: the verified OAuth token for `auth = "oauth"`, the
-/// static `auth_token` otherwise. Shared by the HTTP and legacy SSE paths.
+/// Resolve the bearer token to send to a remote upstream: the verified OAuth
+/// token for `auth = "oauth"`, the static `auth_token` otherwise. Shared by
+/// the HTTP and legacy SSE paths.
 async fn resolve_upstream_auth(
     name: &str,
     url: &str,
     config: &ServerConfig,
 ) -> Result<Option<String>, anyhow::Error> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-    crate::upstream_http::refuse_blocked(&parsed)?;
+    reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
 
     if !config.is_oauth() {
         return Ok(config.auth_token.as_ref().map(|t| t.as_str().to_string()));

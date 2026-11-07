@@ -199,11 +199,10 @@ async fn read_document(spec: &str, timeout: Duration) -> anyhow::Result<String> 
 
     let url = Url::parse(spec)
         .map_err(|e| anyhow::anyhow!("invalid OpenAPI document address '{spec}': {e}"))?;
-    crate::upstream_http::refuse_blocked(&url)?;
     // The bearer token is never sent here: the document may live on a
     // different host from the API it describes.
     let response = http_client()?
-        .get(url)
+        .request(reqwest::Method::GET, url.as_str())?
         .timeout(timeout)
         .header(
             http::header::ACCEPT,
@@ -252,7 +251,7 @@ fn expand_home(path: &str) -> std::path::PathBuf {
     }
 }
 
-fn http_client() -> anyhow::Result<reqwest::Client> {
+fn http_client() -> anyhow::Result<crate::upstream_http::Client> {
     crate::upstream_http::client(crate::upstream_http::Redirects::SameOrigin)
 }
 
@@ -483,7 +482,6 @@ fn base_url(root: &Value, spec: &str, url_override: Option<&str>) -> anyhow::Res
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
         "API address '{url}' must be an http or https URL"
     );
-    crate::upstream_http::refuse_blocked(&url)?;
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
@@ -808,7 +806,7 @@ fn plain_text(value: &Value) -> String {
 /// The MCP server that stands in for one API.
 pub(crate) struct OpenApiServer {
     document: ApiDocument,
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     auth_token: Option<crate::types::SecretString>,
     call_timeout: Duration,
 }
@@ -835,9 +833,13 @@ impl OpenApiServer {
         }
         let PlannedRequest { url, headers, body } = planned;
 
-        let mut request = self
-            .client
-            .request(operation.method.clone(), url)
+        let mut request = match self.client.request(operation.method.clone(), url.as_str()) {
+            Ok(request) => request,
+            Err(blocked) => {
+                return CallToolResult::error(vec![ContentBlock::text(blocked.to_string())]);
+            }
+        };
+        request = request
             .timeout(self.call_timeout)
             .header(http::header::ACCEPT, "application/json, */*;q=0.8");
         for (name, value) in headers {
@@ -1167,17 +1169,22 @@ mod tests {
         assert!(error.contains("set 'url'"), "{error}");
     }
 
-    #[test]
-    fn the_metadata_address_is_refused() {
-        let error = parse_document(
+    #[tokio::test]
+    async fn no_call_reaches_the_metadata_address() {
+        let document = parse_document(
             PETSTORE,
             "/tmp/p.json",
             Some("http://169.254.169.254/"),
             &[],
         )
-        .unwrap_err()
-        .to_string();
-        assert!(error.contains("blocked"), "{error}");
+        .unwrap();
+        let server = OpenApiServer::new(document, &ServerConfig::default()).unwrap();
+        let result = server
+            .call(operation(&server.document, "listPets"), &Map::new())
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let text = serde_json::to_string(&result.content).unwrap();
+        assert!(text.contains("blocked"), "{text}");
     }
 
     #[tokio::test]

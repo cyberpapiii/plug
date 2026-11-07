@@ -25,6 +25,8 @@ const POST_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum LegacySseError {
     #[error("reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Blocked(#[from] crate::upstream_http::Blocked),
     #[error("stream closed before endpoint event")]
     MissingEndpoint,
     #[error("invalid endpoint event payload: {0}")]
@@ -166,7 +168,7 @@ impl Transport<RoleClient> for LegacySseClientTransport {
 }
 
 struct LegacySseWorker {
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     config: LegacySseTransportConfig,
     stream: BoxedSseStream,
 }
@@ -362,7 +364,7 @@ fn publish_endpoint(
 }
 
 async fn run_sse_loop(
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     config: LegacySseTransportConfig,
     first_stream: BoxedSseStream,
     endpoint_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
@@ -498,13 +500,13 @@ async fn wait_for_endpoint(
 }
 
 async fn open_sse_stream(
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     uri: Arc<str>,
     auth_token: Option<Arc<str>>,
     last_event_id: Option<String>,
 ) -> Result<BoxedSseStream, LegacySseError> {
     let mut request = client
-        .get(uri.as_ref())
+        .request(reqwest::Method::GET, &uri)?
         .header(header::ACCEPT, "text/event-stream");
     if let Some(token) = auth_token {
         request = request.bearer_auth(token.as_ref());
@@ -535,13 +537,13 @@ async fn open_sse_stream(
 }
 
 async fn post_message(
-    client: &reqwest::Client,
+    client: &crate::upstream_http::Client,
     endpoint: Arc<str>,
     config: &LegacySseTransportConfig,
     message: ClientJsonRpcMessage,
 ) -> Result<(), LegacySseError> {
     let mut request = client
-        .post(endpoint.as_ref())
+        .request(reqwest::Method::POST, &endpoint)?
         .timeout(config.post_timeout)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json, text/event-stream");
