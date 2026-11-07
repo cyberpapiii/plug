@@ -2447,6 +2447,8 @@ impl SubGate {
 /// subscribe/unsubscribe call logs plus gates.
 struct SubscribableUpstreamState {
     resources: std::sync::Mutex<Vec<String>>,
+    templates: std::sync::Mutex<Vec<String>>,
+    completed_refs: std::sync::Mutex<Vec<String>>,
     list_calls: std::sync::atomic::AtomicUsize,
     list_gate: std::sync::Mutex<Option<Arc<SubGate>>>,
     list_entered: tokio::sync::Notify,
@@ -2468,6 +2470,8 @@ impl SubscribableUpstreamState {
     fn new(resources: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             resources: std::sync::Mutex::new(resources.iter().map(|uri| uri.to_string()).collect()),
+            templates: std::sync::Mutex::new(Vec::new()),
+            completed_refs: std::sync::Mutex::new(Vec::new()),
             list_calls: std::sync::atomic::AtomicUsize::new(0),
             list_gate: std::sync::Mutex::new(None),
             list_entered: tokio::sync::Notify::new(),
@@ -2591,6 +2595,35 @@ impl ServerHandler for SubscribableUpstreamHandler {
                     .collect(),
             ))
         }
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> + Send + '_ {
+        let templates = self.state.templates.lock().unwrap().clone();
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(
+            templates
+                .iter()
+                .map(|uri| ResourceTemplate::new(uri.as_str(), uri.as_str()))
+                .collect(),
+        )))
+    }
+
+    fn complete(
+        &self,
+        request: CompleteRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<CompleteResult, McpError>> + Send + '_ {
+        if let Reference::Resource(resource) = &request.r#ref {
+            self.state
+                .completed_refs
+                .lock()
+                .unwrap()
+                .push(resource.uri.clone());
+        }
+        std::future::ready(Ok(CompleteResult::default()))
     }
 
     fn subscribe(
@@ -3688,6 +3721,69 @@ async fn invoke_meta_tool_suppresses_modern_to_modern_input_required_before_invo
     assert_eq!(
         state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
         0
+    );
+}
+
+/// Reading, completing and subscribing find a resource's server the same
+/// way: through a template it advertises, or the server a skill URI names.
+#[tokio::test]
+async fn templated_and_skill_uris_subscribe_and_complete_where_they_read() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    let state = SubscribableUpstreamState::new(&["skill://refunds/SKILL.md"]);
+    state
+        .templates
+        .lock()
+        .unwrap()
+        .push("memory://notes/{id}".to_string());
+    sm.replace_server(
+        "notes",
+        connect_subscribable_upstream("notes", Arc::clone(&state)).await,
+    )
+    .await;
+    router.refresh_tools().await;
+
+    router
+        .subscribe_resource("memory://notes/7", sub_target("a"), None)
+        .await
+        .expect("a URI the template matches subscribes");
+    router
+        .subscribe_resource("skill://notes/refunds/notes.md", sub_target("a"), None)
+        .await
+        .expect("an unlisted skill file subscribes on its server");
+    assert_eq!(state.subscribe_count("memory://notes/7"), 1);
+    assert_eq!(state.subscribe_count("skill://refunds/notes.md"), 1);
+
+    // A refresh keeps both: their URIs still resolve to the same server.
+    router.refresh_tools().await;
+    assert_eq!(state.unsubscribe_count("memory://notes/7"), 0);
+    assert_eq!(state.unsubscribe_count("skill://refunds/notes.md"), 0);
+    let unsubscribed = state.unsubscribe_entered.notified();
+    router
+        .unsubscribe_resource("memory://notes/7", &sub_target("a"))
+        .await
+        .unwrap();
+    unsubscribed.await;
+    assert_eq!(state.unsubscribe_count("memory://notes/7"), 1);
+
+    for uri in ["memory://notes/7", "skill://notes/refunds/notes.md"] {
+        router
+            .complete_request(
+                CompleteRequestParams::new(
+                    Reference::for_resource(uri),
+                    ArgumentInfo::new("id", "7"),
+                ),
+                None,
+            )
+            .await
+            .expect("completion finds the server a read finds");
+    }
+    assert_eq!(
+        *state.completed_refs.lock().unwrap(),
+        vec![
+            "memory://notes/7".to_string(),
+            "skill://refunds/notes.md".to_string()
+        ]
     );
 }
 

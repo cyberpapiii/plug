@@ -1030,7 +1030,8 @@ impl ToolRouter {
                         return;
                     };
                     tokio::spawn(async move {
-                        let published_route = cache.load().resource_routes.get(&uri).cloned();
+                        let published_route =
+                            completion::resolve_resource_route(&cache.load().resource_routes, &uri);
                         let Some(new_server_id) = published_route else {
                             // Route vanished entirely: the next refresh's
                             // prune plus the recorded owner drain it.
