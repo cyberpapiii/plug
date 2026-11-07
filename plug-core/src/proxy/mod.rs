@@ -1455,6 +1455,22 @@ impl ToolRouter {
             .expect("continuation insert gate mutex poisoned") = gate;
     }
 
+    /// The era the connected upstream behind `tool_name` speaks. `None` for a
+    /// tool with no route or whose upstream is not connected.
+    pub(crate) fn tool_upstream_era(
+        &self,
+        tool_name: &str,
+    ) -> Option<crate::protocol::ProtocolEra> {
+        let server_id = self
+            .cache
+            .load()
+            .resolve_route(tool_name)
+            .map(|(server_id, _)| server_id.clone())?;
+        self.server_manager
+            .get_upstream(&server_id)
+            .map(|upstream| upstream.protocol_era)
+    }
+
     /// Fail-closed MRTR admission before a tools/call can reach an upstream.
     /// Mixed-era ownership transfer and task input are intentionally dormant
     /// until their parked-call coordinators exist; native modern rounds may
