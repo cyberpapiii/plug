@@ -41,10 +41,13 @@ final class ServerDraftParserTests: XCTestCase {
             let block = try JSONSerialization.data(withJSONObject: ["mcpServers": [testCase.name: raw["entry"]!]])
             let parsed = ServerDraftParser.parse(String(decoding: block, as: UTF8.self))
             guard let expected = testCase.server else {
-                guard case .unreadable = parsed else { return XCTFail("\(testCase.name): \(parsed)") }
+                if case .unreadable = parsed {} else { XCTFail("\(testCase.name): \(parsed)") }
                 continue
             }
-            guard case let .draft(draft) = parsed else { return XCTFail("\(testCase.name): \(parsed)") }
+            guard case let .draft(draft) = parsed else {
+                XCTFail("\(testCase.name): \(parsed)")
+                continue
+            }
             XCTAssertEqual(draft.name, testCase.name)
             XCTAssertEqual(draft.config.transport, expected.transport, testCase.name)
             XCTAssertEqual(draft.config.command, expected.command, testCase.name)

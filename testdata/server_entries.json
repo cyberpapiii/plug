@@ -50,6 +50,21 @@
     "server": { "transport": "stdio", "command": "srv", "args": [], "url": null, "env": {}, "enabled": false }
   },
   {
+    "name": "url-turned-off",
+    "entry": { "url": "https://off.example.com/mcp", "enabled": false },
+    "server": { "transport": "http", "command": null, "args": [], "url": "https://off.example.com/mcp", "env": {}, "enabled": false }
+  },
+  {
+    "name": "empty-command-list",
+    "entry": { "command": [] },
+    "server": null
+  },
+  {
+    "name": "command-list-with-a-number",
+    "entry": { "command": ["srv", 1] },
+    "server": null
+  },
+  {
     "name": "nothing-to-run",
     "entry": { "args": ["--port", "1"] },
     "server": null
