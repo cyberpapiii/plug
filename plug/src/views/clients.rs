@@ -60,8 +60,10 @@ pub(crate) fn client_list_json(
     })
 }
 
-fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    let (path, mut config) = crate::commands::config::load_editable_config(config_path)?;
+async fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
+    use plug_core::types::LazyToolSetting;
+
+    let (_, config) = crate::commands::config::load_editable_config(config_path)?;
     let targets: Vec<ClientTarget> = ClientTarget::listed().collect();
     let labels = targets
         .iter()
@@ -91,55 +93,36 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
     let target = targets[target_index];
     let slug = target.slug();
 
-    let mode_options = ["auto", "standard", "native", "bridge"];
+    let settings = [
+        LazyToolSetting::Auto,
+        LazyToolSetting::Standard,
+        LazyToolSetting::Native,
+        LazyToolSetting::Bridge,
+    ];
     let current = config
         .lazy_tools
         .clients
         .get(slug)
         .copied()
-        .unwrap_or(plug_core::types::LazyToolSetting::Auto);
-    let default = match current {
-        plug_core::types::LazyToolSetting::Auto => 0,
-        plug_core::types::LazyToolSetting::Standard => 1,
-        plug_core::types::LazyToolSetting::Native => 2,
-        plug_core::types::LazyToolSetting::Bridge => 3,
-    };
-
+        .unwrap_or_default();
     let mode_selection = Select::with_theme(&cli_prompt_theme())
         .with_prompt("Lazy tool mode")
-        .items(mode_options)
-        .default(default)
+        .items(settings.map(|setting| setting.label()))
+        .default(settings.iter().position(|s| *s == current).unwrap_or(0))
         .interact_opt()?;
     let Some(mode_index) = mode_selection else {
         return Ok(());
     };
 
-    match mode_index {
-        0 => {
-            config.lazy_tools.clients.remove(slug);
-        }
-        1 => {
-            config.lazy_tools.clients.insert(
-                slug.to_string(),
-                plug_core::types::LazyToolSetting::Standard,
-            );
-        }
-        2 => {
-            config
-                .lazy_tools
-                .clients
-                .insert(slug.to_string(), plug_core::types::LazyToolSetting::Native);
-        }
-        3 => {
-            config
-                .lazy_tools
-                .clients
-                .insert(slug.to_string(), plug_core::types::LazyToolSetting::Bridge);
-        }
-        _ => unreachable!(),
-    }
-
-    plug_core::operator::persist_config_atomic(&path, &config)?;
+    crate::commands::servers::apply_server_mutation(
+        config_path,
+        plug_core::operator::OperatorMutation::SetLazyTools {
+            client: slug.to_string(),
+            setting: settings[mode_index],
+        },
+    )
+    .await?;
+    let (_, config) = crate::commands::config::load_editable_config(config_path)?;
     let policy =
         plug_core::clients::lazy_tool_policy(config.meta_tool_mode, &config.lazy_tools, slug);
     print_success_line(format!(
@@ -154,7 +137,7 @@ fn prompt_lazy_tool_mode(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
     Ok(())
 }
 
-fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<bool> {
+async fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<bool> {
     let options = [
         "Done",
         "Link clients",
@@ -184,7 +167,7 @@ fn prompt_client_actions(config_path: Option<&std::path::PathBuf>) -> anyhow::Re
             Ok(true)
         }
         Some(3) => {
-            prompt_lazy_tool_mode(config_path)?;
+            prompt_lazy_tool_mode(config_path).await?;
             Ok(true)
         }
         _ => Ok(false),
@@ -482,7 +465,7 @@ pub(crate) async fn cmd_client_list(
             break;
         }
         println!();
-        if !prompt_client_actions(config_path)? {
+        if !prompt_client_actions(config_path).await? {
             break;
         }
         println!();

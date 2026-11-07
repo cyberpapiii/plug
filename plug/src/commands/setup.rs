@@ -6,7 +6,7 @@ use crate::OutputFormat;
 use crate::commands::import::{add_servers, print_discovered, scan};
 use crate::ui::{cli_prompt_theme, print_banner, print_success_line};
 
-pub(crate) fn cmd_setup(
+pub(crate) async fn cmd_setup(
     config_path: Option<&std::path::PathBuf>,
     yes: bool,
     transport: Option<LinkTransport>,
@@ -30,7 +30,7 @@ pub(crate) fn cmd_setup(
                 .default(true)
                 .interact()?
         {
-            add_servers(config_path, &report.new_servers)?;
+            add_servers(config_path, &report.new_servers).await?;
         }
     }
     crate::commands::clients::cmd_link(

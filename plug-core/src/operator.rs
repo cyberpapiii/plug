@@ -26,6 +26,11 @@ pub enum OperatorMutation {
     RemoveServer {
         name: String,
     },
+    /// Add servers found in other clients' settings, all or none, under the
+    /// names [`crate::import::settle_names`] gives them.
+    ImportServers {
+        servers: Vec<crate::import::ImportedServer>,
+    },
     /// Add a configured server again as `<server>-<account>`, for a second
     /// account. See `account_copy`.
     AddAccount {
@@ -39,6 +44,12 @@ pub enum OperatorMutation {
     SetToolEnabled {
         tool: String,
         enabled: bool,
+    },
+    /// How a client is given its tools, by any name `plug link` takes for
+    /// it. `auto` removes the client's own setting.
+    SetLazyTools {
+        client: String,
+        setting: crate::types::LazyToolSetting,
     },
     /// Give a client a name of the owner's choosing. An empty name removes it.
     RenameClient {
@@ -124,6 +135,9 @@ pub struct OperatorMutationResult {
     /// Disabled-tool patterns after the mutation, for `SetToolEnabled`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub disabled_tools: Option<Vec<String>>,
+    /// The servers `ImportServers` added, under the names they went in as.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub imported: Option<Vec<OperatorServerSummary>>,
 }
 
 impl OperatorMutationResult {
@@ -131,6 +145,7 @@ impl OperatorMutationResult {
         Self {
             server: summary,
             disabled_tools: None,
+            imported: None,
         }
     }
 }
@@ -211,6 +226,22 @@ pub fn apply_operator_mutation_knowing(
             }
             OperatorMutationResult::server(None)
         }
+        OperatorMutation::ImportServers { mut servers } => {
+            for imported in &mut servers {
+                imported.server.restore_redacted_secrets(None);
+            }
+            let imported = crate::import::add_to_config(&mut config, servers)
+                .into_iter()
+                .map(|name| {
+                    let server = &config.servers[&name];
+                    OperatorServerSummary::from_config(name, server)
+                })
+                .collect();
+            OperatorMutationResult {
+                imported: Some(imported),
+                ..OperatorMutationResult::server(None)
+            }
+        }
         OperatorMutation::AddAccount { server, account } => {
             let reported = live.reported_name(&server);
             let (name, copy) = account_copy(&config, &server, reported.as_deref(), &account)?;
@@ -229,9 +260,13 @@ pub fn apply_operator_mutation_knowing(
         OperatorMutation::SetToolEnabled { tool, enabled } => {
             set_tool_enabled(&mut config, &tool, enabled)?;
             OperatorMutationResult {
-                server: None,
                 disabled_tools: Some(config.disabled_tools.clone()),
+                ..OperatorMutationResult::server(None)
             }
+        }
+        OperatorMutation::SetLazyTools { client, setting } => {
+            set_lazy_tools(&mut config, &client, setting)?;
+            OperatorMutationResult::server(None)
         }
         OperatorMutation::RenameClient { key, name } => {
             label_client(&mut config, &key, &name, ClientLabel::Name)?;
@@ -369,6 +404,30 @@ fn set_tool_enabled(config: &mut Config, tool: &str, enabled: bool) -> anyhow::R
     {
         config.disabled_tools.push(tool.to_string());
         config.disabled_tools.sort();
+    }
+    Ok(())
+}
+
+/// Store `setting` for `client` under its slug, replacing an entry under
+/// any of its other names, which would otherwise still apply.
+fn set_lazy_tools(
+    config: &mut Config,
+    client: &str,
+    setting: crate::types::LazyToolSetting,
+) -> anyhow::Result<()> {
+    use crate::clients::ClientTarget;
+    let target: ClientTarget = client
+        .parse()
+        .map_err(|error: String| anyhow::anyhow!(error))?;
+    config
+        .lazy_tools
+        .clients
+        .retain(|name, _| name.parse::<ClientTarget>().ok() != Some(target));
+    if setting != crate::types::LazyToolSetting::Auto {
+        config
+            .lazy_tools
+            .clients
+            .insert(target.slug().to_string(), setting);
     }
     Ok(())
 }
@@ -926,6 +985,115 @@ API_KEY = "sk-live-123"
         )
         .unwrap();
         assert!(config.disabled_tools.is_empty());
+    }
+
+    fn imported(name: &str, source_target: &str, command: &str) -> crate::import::ImportedServer {
+        crate::import::ImportedServer {
+            name: name.to_string(),
+            source_target: source_target.to_string(),
+            server: ServerConfig {
+                command: Some(command.to_string()),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Imported servers go in together, a taken name renamed, and the
+    /// result names each as it went in. One the config cannot hold keeps
+    /// them all out.
+    #[test]
+    fn imported_servers_go_in_together_under_free_names() {
+        let path = fixture_path();
+        apply_operator_mutation(
+            &path,
+            OperatorMutation::AddServer {
+                name: "github".into(),
+                server: ServerConfig {
+                    command: Some("gh-mcp".into()),
+                    ..Default::default()
+                },
+            },
+        )
+        .unwrap();
+
+        let (config, result) = apply_operator_mutation(
+            &path,
+            OperatorMutation::ImportServers {
+                servers: vec![
+                    imported("github", "cursor", "npx"),
+                    imported("github", "cursor", "uvx"),
+                    imported("notes", "cursor", "notes-mcp"),
+                ],
+            },
+        )
+        .unwrap();
+        let names: Vec<String> = result
+            .imported
+            .unwrap()
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+        assert_eq!(names, ["github-cursor", "github-cursor-2", "notes"]);
+        assert_eq!(
+            config.servers["github"].command.as_deref(),
+            Some("gh-mcp"),
+            "a taken name is never written over"
+        );
+
+        let refused = apply_operator_mutation(
+            &path,
+            OperatorMutation::ImportServers {
+                servers: vec![
+                    imported("calendar", "cursor", "cal-mcp"),
+                    crate::import::ImportedServer {
+                        server: ServerConfig::default(),
+                        ..imported("broken", "cursor", "")
+                    },
+                ],
+            },
+        );
+        assert!(refused.is_err());
+        let config = load_editable_config(&path).unwrap();
+        assert!(!config.servers.contains_key("calendar"));
+    }
+
+    /// A client's lazy-tool setting is stored under its slug, replacing one
+    /// under an alias, and `auto` removes it.
+    #[test]
+    fn a_lazy_tool_setting_is_stored_once_per_client() {
+        use crate::types::LazyToolSetting;
+        let path = fixture_path();
+        let mut config = Config::default();
+        config
+            .lazy_tools
+            .clients
+            .insert("codex".into(), LazyToolSetting::Native);
+        persist_config_atomic(&path, &config).unwrap();
+        let set = |setting| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::SetLazyTools {
+                    client: "codex-cli".into(),
+                    setting,
+                },
+            )
+            .map(|(config, _)| config.lazy_tools.clients)
+        };
+
+        let clients = set(LazyToolSetting::Bridge).unwrap();
+        assert_eq!(
+            clients.into_iter().collect::<Vec<_>>(),
+            [("codex-cli".to_string(), LazyToolSetting::Bridge)]
+        );
+        assert!(set(LazyToolSetting::Auto).unwrap().is_empty());
+        let unknown = apply_operator_mutation(
+            &path,
+            OperatorMutation::SetLazyTools {
+                client: "nope".into(),
+                setting: LazyToolSetting::Bridge,
+            },
+        );
+        assert!(unknown.is_err());
     }
 
     #[test]

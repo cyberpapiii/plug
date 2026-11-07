@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::clients::{ClientTarget, ServerEntry};
 use crate::config::{Config, ServerConfig, TransportType};
@@ -100,21 +100,52 @@ fn report(existing: &HashMap<String, ServerConfig>, scanned: Vec<ScanResult>) ->
     }
 }
 
-/// Add `servers` to `config`. A name already taken gets the client's slug
-/// after it, and a number after that if it is taken too. Returns the names
-/// they were added under.
-pub fn add_to_config(config: &mut Config, servers: &[DiscoveredServer]) -> Vec<String> {
+/// A discovered server on its way into the config, as
+/// [`crate::operator::OperatorMutation::ImportServers`] carries it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportedServer {
+    pub name: String,
+    /// The slug of the client it came from.
+    pub source_target: String,
+    pub server: ServerConfig,
+}
+
+impl From<&DiscoveredServer> for ImportedServer {
+    fn from(found: &DiscoveredServer) -> Self {
+        Self {
+            name: found.name.clone(),
+            source_target: found.source_target.to_string(),
+            server: found.config.clone(),
+        }
+    }
+}
+
+/// Give each of `servers` the name it goes into `config` under. A name
+/// already taken gets the client's slug after it, and a number after that
+/// if it is taken too. Names already settled stay as they are.
+pub fn settle_names(config: &Config, servers: &mut [ImportedServer]) {
+    let mut taken: HashSet<String> = config.servers.keys().cloned().collect();
+    for server in servers {
+        let renamed = format!("{}-{}", server.name, server.source_target);
+        let name = std::iter::once(server.name.clone())
+            .chain(std::iter::once(renamed.clone()))
+            .chain((2..).map(|n| format!("{renamed}-{n}")))
+            .find(|name| !taken.contains(name))
+            .expect("an unused name");
+        taken.insert(name.clone());
+        server.name = name;
+    }
+}
+
+/// Add `servers` to `config` under the names [`settle_names`] gives them.
+/// Returns those names.
+pub fn add_to_config(config: &mut Config, mut servers: Vec<ImportedServer>) -> Vec<String> {
+    settle_names(config, &mut servers);
     servers
-        .iter()
+        .into_iter()
         .map(|server| {
-            let renamed = format!("{}-{}", server.name, server.source.slug());
-            let name = std::iter::once(server.name.clone())
-                .chain(std::iter::once(renamed.clone()))
-                .chain((2..).map(|n| format!("{renamed}-{n}")))
-                .find(|name| !config.servers.contains_key(name))
-                .expect("an unused name");
-            config.servers.insert(name.clone(), server.config.clone());
-            name
+            config.servers.insert(server.name.clone(), server.server);
+            server.name
         })
         .collect()
 }
@@ -163,6 +194,10 @@ fn server_signature(config: &ServerConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn imported(found: &[DiscoveredServer]) -> Vec<ImportedServer> {
+        found.iter().map(ImportedServer::from).collect()
+    }
 
     fn read(target: ClientTarget, content: &str) -> Vec<DiscoveredServer> {
         target
@@ -293,7 +328,7 @@ mod tests {
         config
             .servers
             .insert("github".to_string(), ServerConfig::default());
-        let mut names = add_to_config(&mut config, &found);
+        let mut names = add_to_config(&mut config, imported(&found));
         names.sort();
         assert_eq!(names, ["github-qwen-code", "my.server"]);
         // The file Plug writes reads back with every server.
@@ -331,7 +366,10 @@ mod tests {
                 .servers
                 .insert(taken.to_string(), ServerConfig::default());
         }
-        assert_eq!(add_to_config(&mut config, &found), ["github-cursor-3"]);
+        assert_eq!(
+            add_to_config(&mut config, imported(&found)),
+            ["github-cursor-3"]
+        );
         assert_eq!(config.servers.len(), 4);
     }
 }
