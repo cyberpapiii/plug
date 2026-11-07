@@ -267,29 +267,11 @@ final class GoldenPayloadTests: XCTestCase {
     /// setting added to the daemon fails this until the app models it.
     func testTheAppModelsEveryServerSetting() throws {
         let server = try decoder.decode(ServerConfig.self, from: golden("server_config_every_field.json"))
-        XCTAssertEqual(server.unmodeled, [:], "the app's ServerConfig has no field for these")
         let sent = try JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(server))
         XCTAssertEqual(
             sent as? NSDictionary,
             try JSONSerialization.jsonObject(with: golden("server_config_every_field.json")) as? NSDictionary
         )
-    }
-
-    /// A setting the app has no field for goes back to the daemon as it
-    /// came, so editing a server in an older app keeps it.
-    func testASettingTheAppDoesNotModelSurvivesASave() throws {
-        var json = try goldens("server_config_default.json")
-        json["future_setting"] = ["max_items": 3, "names": ["a"], "on": true]
-        var server = try decoder.decode(ServerConfig.self, from: JSONSerialization.data(withJSONObject: json))
-        server.args = ["--edited"]
-        let sent = try XCTUnwrap(
-            JSONSerialization.jsonObject(with: PlugIPCClient.makeEncoder().encode(server)) as? [String: Any]
-        )
-        XCTAssertEqual(
-            sent["future_setting"] as? NSDictionary,
-            ["max_items": 3, "names": ["a"], "on": true] as NSDictionary
-        )
-        XCTAssertEqual(sent["args"] as? [String], ["--edited"])
     }
 
     /// A server the app sent, read back once the daemon has filled in what

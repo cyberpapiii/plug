@@ -238,9 +238,8 @@ public struct EventStatus: Codable, Identifiable, Equatable, Sendable {
 
 }
 
-/// Any JSON value: the arguments a watched tool is called with, and the
-/// server settings the app has no field for.
-public enum JSONValue: Codable, Equatable, Sendable {
+/// Any JSON value: the arguments a watched tool is called with.
+public enum JSONValue: Encodable, Equatable, Sendable {
     case null
     case bool(Bool)
     case number(Double)
@@ -271,24 +270,6 @@ public enum JSONValue: Codable, Equatable, Sendable {
             }
             self = .object(values)
         default: return nil
-        }
-    }
-
-    public init(from decoder: Decoder) throws {
-        let container = try decoder.singleValueContainer()
-        if container.decodeNil() {
-            self = .null
-        } else if let value = try? container.decode(Bool.self) {
-            self = .bool(value)
-        } else if let value = try? container.decode(Double.self) {
-            self = .number(value)
-        } else if let value = try? container.decode(String.self) {
-            self = .string(value)
-        } else if let values = try? container.decode([JSONValue].self) {
-            self = .array(values)
-        } else {
-            // A dictionary keeps its keys as written, as on the way out.
-            self = .object(try container.decode([String: JSONValue].self))
         }
     }
 
@@ -542,11 +523,6 @@ public struct ServerConfig: Codable, Equatable, Sendable {
     public var operations: [String] = []
     /// Where an API server sends its token; the app carries it unchanged.
     public var tokenIn: String?
-    /// Settings the daemon sent that this type has no field for, sent back
-    /// as they came. The daemon stores the server it is sent whole, so
-    /// without them a save from an app older than the daemon would erase
-    /// them.
-    public var unmodeled: [String: JSONValue] = [:]
 
     public static func command(_ command: String, args: [String]) -> Self {
         Self(command: command, args: args, transport: "stdio")
@@ -597,10 +573,6 @@ extension ServerConfig {
         spec = try c.decodeIfPresent(String.self, forKey: .spec)
         operations = try c.decodeIfPresent([String].self, forKey: .operations) ?? []
         tokenIn = try c.decodeIfPresent(String.self, forKey: .tokenIn)
-        let all = try decoder.container(keyedBy: AnyKey.self)
-        for key in all.allKeys where CodingKeys(stringValue: key.stringValue) == nil {
-            unmodeled[key.stringValue] = try all.decode(JSONValue.self, forKey: key)
-        }
     }
 
     /// Leaves out what is nil and an empty `operations`.
@@ -628,22 +600,7 @@ extension ServerConfig {
         try c.encodeIfPresent(spec, forKey: .spec)
         if !operations.isEmpty { try c.encode(operations, forKey: .operations) }
         try c.encodeIfPresent(tokenIn, forKey: .tokenIn)
-        // Each key is the one the decoder handed over, which the encoder's
-        // key strategy turns back into the daemon's spelling.
-        var rest = encoder.container(keyedBy: AnyKey.self)
-        for (key, value) in unmodeled {
-            try rest.encode(value, forKey: AnyKey(stringValue: key))
-        }
     }
-}
-
-/// A key known only when it is read.
-private struct AnyKey: CodingKey {
-    let stringValue: String
-    var intValue: Int? { nil }
-
-    init(stringValue: String) { self.stringValue = stringValue }
-    init?(intValue: Int) { nil }
 }
 
 public struct ToolGroupRule: Codable, Equatable, Sendable {

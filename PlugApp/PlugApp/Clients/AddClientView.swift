@@ -170,7 +170,7 @@ struct AddClientView: View {
     @State private var copied: String?
     /// What the owner calls a client Plug has no entry for.
     @State private var name = ""
-    @State private var failure: String?
+    @State private var failure: SheetFailure?
 
     private var apps: [LinkableApp] { model.actions.connectableApps }
     private var address: String? { model.snapshot.clientAddress }
@@ -323,7 +323,10 @@ struct AddClientView: View {
             do {
                 try await model.actions.nameClient(key: customTarget, name: name)
             } catch {
-                failure = "Plug could not keep the name: \(error.localizedDescription)"
+                failure = SheetFailure(
+                    reason: "Plug could not keep the name: \(error.localizedDescription)",
+                    advice: Explain.advice(for: error)
+                )
             }
         }
     }

@@ -273,8 +273,8 @@ extension ProblemNote {
 
     /// A failure inside a sheet, where the sheet's title already says what
     /// was being done: the reason leads, and the next step follows.
-    init(reason: String) {
-        self.init(title: reason, advice: Explain.advice(forReason: reason), failed: true)
+    init(_ failure: SheetFailure) {
+        self.init(title: failure.reason, advice: failure.advice, failed: true)
     }
 }
 

@@ -22,13 +22,26 @@ final class DaemonServiceManagerTests: XCTestCase {
     )
     private lazy var ours = makeTestHandshake(version: "0.7.0", executable: canonical.executableURL)
 
-    /// A started daemon is checked for as long as the CLI waits for one,
-    /// the budget `testdata/paths.json` holds both to.
-    func testAStartIsWaitedForAsLongAsTheCLIWaits() {
-        XCTAssertEqual(
-            DaemonServiceManager.retryInterval * DaemonServiceManager.startupRetries,
-            PlugPaths.startupBudget
-        )
+    /// A started daemon is waited for as long as the CLI waits for one, the
+    /// budget `testdata/paths.json` holds both to: one that answers at the
+    /// end of the budget is kept, and one that answers later is replaced.
+    func testAStartIsWaitedForAsLongAsTheCLIWaits() async throws {
+        let inside = world(.appManagedCurrent(current), enabled: true, started: ours)
+        inside.startsAfter = PlugPaths.startupBudget
+
+        let proven = try await manager(inside).ensureRunning(canonical: canonical, inspected: inspected())
+
+        XCTAssertEqual(proven.daemonVersion, "0.7.0")
+        XCTAssertFalse(inside.events.contains(.unregister))
+        XCTAssertLessThanOrEqual(inside.elapsed, PlugPaths.startupBudget)
+
+        let past = world(.appManagedCurrent(current), enabled: true, started: ours)
+        past.startsAfter = PlugPaths.startupBudget + .milliseconds(1)
+
+        await assertFails(with: .verificationFailed(expectedVersion: "0.7.0", actualVersion: nil)) {
+            _ = try await self.manager(past).ensureRunning(canonical: self.canonical, inspected: self.inspected())
+        }
+        XCTAssertEqual(past.events.filter { $0 == .unregister }.count, 1, "a start past the budget is replaced")
     }
 
     func testStopUnregistersOwnedServiceWithoutStartingOrSuspendingClients() async throws {
@@ -227,7 +240,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let launchd = world(.appManagedCurrent(current), enabled: true, answering: unproven, started: unproven)
 
         await assertFails(with: .verificationFailed(expectedVersion: "0.7.0", actualVersion: "0.7.0")) {
-            _ = try await self.manager(launchd, retryLimit: 1)
+            _ = try await self.manager(launchd)
                 .ensureRunning(canonical: self.canonical, inspected: self.inspected())
         }
     }
@@ -253,7 +266,7 @@ final class DaemonServiceManagerTests: XCTestCase {
         let launchd = world(.appManagedCurrent(current), enabled: true, answering: other, started: other)
 
         await assertFails(with: .verificationFailed(expectedVersion: "0.7.0", actualVersion: "0.7.0")) {
-            _ = try await self.manager(launchd, retryLimit: 1)
+            _ = try await self.manager(launchd)
                 .ensureRunning(canonical: self.canonical, inspected: self.inspected())
         }
         XCTAssertFalse(launchd.recognizedPathSets.isEmpty, "a disagreeing handshake reads launchd again")
@@ -351,7 +364,7 @@ final class DaemonServiceManagerTests: XCTestCase {
 
     func testADaemonStillStartingIsWaitedForAndNotReplaced() async throws {
         let launchd = world(.appManagedCurrent(current), enabled: true, started: ours)
-        launchd.startupWaits = 2
+        launchd.startsAfter = .seconds(1)
 
         let result = try await manager(launchd).ensureRunning(canonical: canonical, inspected: inspected())
 
@@ -378,13 +391,12 @@ final class DaemonServiceManagerTests: XCTestCase {
         )
     }
 
-    private func manager(_ launchd: FakeLaunchd, retryLimit: Int = 3) -> DaemonServiceManager {
+    private func manager(_ launchd: FakeLaunchd) -> DaemonServiceManager {
         DaemonServiceManager(
             appInspector: StaticAppInspector(canonical),
             launchdInspector: FakeLaunchdInspector(launchd: launchd),
             backend: launchd,
-            legacyPaths: [],
-            retryLimit: retryLimit
+            legacyPaths: []
         )
     }
 
@@ -474,12 +486,16 @@ private final class FakeLaunchd: DaemonServiceBackend {
     private(set) var enabled: Bool
     /// The daemon on the socket now; nil when nothing answers.
     private var answering: OperatorHandshake?
-    /// What answers once the agent starts, after `startupWaits` waits.
+    /// What answers once the agent starts, `startsAfter` after a kickstart.
     private let started: OperatorHandshake
-    var startupWaits = 0
+    var startsAfter: Duration = .zero
     /// The agent starts and nothing ever answers.
     var neverStarts = false
-    private var waitsUntilStarted: Int?
+    private var startsAt: Duration?
+    /// The time waited so far. Each wait takes one retry interval and no
+    /// real time.
+    private(set) var elapsed: Duration = .zero
+    private let epoch = ContinuousClock.now
     /// What a handshake fails with while nothing answers.
     var silence: Error = PlugIPCError.systemCall("connect", ECONNREFUSED)
     var registerError: Error?
@@ -557,7 +573,7 @@ private final class FakeLaunchd: DaemonServiceBackend {
         events.append(.kickstart)
         guard enabled else { return }
         answering = nil
-        waitsUntilStarted = startupWaits
+        startsAt = elapsed + startsAfter
     }
 
     func handshake() async throws -> OperatorHandshake {
@@ -565,15 +581,13 @@ private final class FakeLaunchd: DaemonServiceBackend {
         return answering
     }
 
+    var now: ContinuousClock.Instant { epoch + elapsed }
+
     func waitBeforeRetry() async {
-        guard let waits = waitsUntilStarted else { return }
-        if waits == 0 {
-            if neverStarts { return }
-            answering = started
-            waitsUntilStarted = nil
-        } else {
-            waitsUntilStarted = waits - 1
-        }
+        elapsed += DaemonServiceManager.retryInterval
+        guard let startsAt, elapsed >= startsAt, !neverStarts else { return }
+        answering = started
+        self.startsAt = nil
     }
 
     func openLoginItemSettings() {}
