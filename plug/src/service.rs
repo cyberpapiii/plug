@@ -308,21 +308,14 @@ pub fn inspect() -> anyhow::Result<ServiceState> {
     })
 }
 
-fn map_service_ownership(ownership: ServiceOwnership) -> plug_core::ipc::DaemonOwnershipMode {
+#[cfg(target_os = "macos")]
+pub(crate) fn daemon_ownership_mode(
+    ownership: ServiceOwnership,
+) -> plug_core::ipc::DaemonOwnershipMode {
     match ownership {
         ServiceOwnership::AppManaged => plug_core::ipc::DaemonOwnershipMode::AppManaged,
         ServiceOwnership::CliManaged => plug_core::ipc::DaemonOwnershipMode::CliManaged,
         ServiceOwnership::Unmanaged => plug_core::ipc::DaemonOwnershipMode::Unmanaged,
-    }
-}
-
-pub fn ipc_ownership() -> plug_core::ipc::DaemonOwnershipMode {
-    match inspect() {
-        Err(error) => {
-            tracing::warn!(%error, "could not read who runs the daemon");
-            plug_core::ipc::DaemonOwnershipMode::Unknown
-        }
-        Ok(state) => map_service_ownership(state.ownership),
     }
 }
 

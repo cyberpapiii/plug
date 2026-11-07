@@ -168,12 +168,9 @@ pub(crate) async fn cmd_start(
 }
 
 pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
-    require_canonical_daemon_owner()?;
     // launchd's record of who started this process does not change while
-    // it runs, and reading it runs `launchctl`.
-    let ownership = tokio::task::spawn_blocking(crate::service::ipc_ownership)
-        .await
-        .unwrap_or(plug_core::ipc::DaemonOwnershipMode::Unknown);
+    // it runs, so it is read once, and reading it runs `launchctl`.
+    let ownership = tokio::task::spawn_blocking(require_canonical_daemon_owner).await??;
     serve_until(config_path, daemon::termination_signal(), ownership).await
 }
 
@@ -268,11 +265,12 @@ fn daemon_invocation_is_canonical(
 }
 
 #[cfg(target_os = "macos")]
-fn require_canonical_daemon_owner() -> anyhow::Result<()> {
+/// Refuse to run unless Plug.app started this daemon, and say who did.
+fn require_canonical_daemon_owner() -> anyhow::Result<plug_core::ipc::DaemonOwnershipMode> {
     let development = plug_core::paths::is_development();
     let app_installed = crate::install::resolve_verified_app()?.is_some();
-    let app_managed =
-        crate::service::inspect()?.ownership == crate::service::ServiceOwnership::AppManaged;
+    let ownership = crate::service::inspect()?.ownership;
+    let app_managed = ownership == crate::service::ServiceOwnership::AppManaged;
     let parent = std::process::Command::new("/bin/ps")
         .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
         .output()?;
@@ -282,12 +280,12 @@ fn require_canonical_daemon_owner() -> anyhow::Result<()> {
         daemon_invocation_is_canonical(app_installed, app_managed, parent_is_launchd, development,),
         "Plug.app owns daemon startup; open Plug.app to start or repair the service"
     );
-    Ok(())
+    Ok(crate::service::daemon_ownership_mode(ownership))
 }
 
 #[cfg(not(target_os = "macos"))]
-fn require_canonical_daemon_owner() -> anyhow::Result<()> {
-    Ok(())
+fn require_canonical_daemon_owner() -> anyhow::Result<plug_core::ipc::DaemonOwnershipMode> {
+    Ok(plug_core::ipc::DaemonOwnershipMode::Unknown)
 }
 
 pub(crate) async fn cmd_daemon_stop() -> anyhow::Result<()> {
