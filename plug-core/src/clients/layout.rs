@@ -7,7 +7,7 @@
 
 use serde_json::{Map, Value, json};
 
-use crate::config::TransportType;
+use crate::config::{HttpConfig, TransportType};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileFormat {
@@ -90,9 +90,10 @@ fn is_plug(name: &str) -> bool {
 
 /// Whether an entry is Plug itself, which importing would point Plug at:
 /// one named as Plug's entry is, or one under any name that runs
-/// `plug connect` or `plug serve`. The app's paste reader holds to the same
-/// rule; `testdata/server_entries.json` pins both.
-fn is_plug_itself(name: &str, entry: &ServerEntry) -> bool {
+/// `plug connect` or `plug serve`, or names Plug's own address. The app's
+/// paste reader holds to the same rule but for the address, which it does
+/// not know; `testdata/server_entries.json` pins both.
+fn is_plug_itself(name: &str, entry: &ServerEntry, plug: &HttpConfig) -> bool {
     let runs_plug = entry.command.as_deref().is_some_and(|command| {
         std::path::Path::new(command).file_name() == Some("plug".as_ref())
             && entry
@@ -101,7 +102,11 @@ fn is_plug_itself(name: &str, entry: &ServerEntry) -> bool {
                 .flatten()
                 .any(|arg| arg == "connect" || arg == "serve")
     });
-    is_plug(name) || runs_plug
+    let reaches_plug = entry
+        .url
+        .as_deref()
+        .is_some_and(|url| plug.is_own_mcp_url(url));
+    is_plug(name) || runs_plug || reaches_plug
 }
 
 impl Layout {
@@ -231,8 +236,21 @@ impl Layout {
             .and_then(|(_, entry)| read_entry(entry))
     }
 
-    /// Every server in the file but Plug itself.
-    pub fn read_servers(&self, content: &str) -> Result<Vec<(String, ServerEntry)>, String> {
+    /// Every server in the file but Plug itself, which serves at `plug`.
+    pub fn read_servers(
+        &self,
+        content: &str,
+        plug: &HttpConfig,
+    ) -> Result<Vec<(String, ServerEntry)>, String> {
+        Ok(self
+            .entries(content)?
+            .into_iter()
+            .filter(|(name, entry)| !is_plug_itself(name, entry, plug))
+            .collect())
+    }
+
+    /// Every readable entry in the file but those named as Plug's own is.
+    fn entries(&self, content: &str) -> Result<Vec<(String, ServerEntry)>, String> {
         // A file Plug was linked into twice has two `[mcp_servers.plug]`
         // tables, which no TOML parser accepts.
         let content = match self.format {
@@ -243,14 +261,24 @@ impl Layout {
             .servers(&content)?
             .unwrap_or_default()
             .into_iter()
+            .filter(|(name, _)| !is_plug(name))
             .filter_map(|(name, entry)| Some((name, read_entry(&entry)?)))
-            .filter(|(name, entry)| !is_plug_itself(name, entry))
             .collect())
     }
 
-    /// How many entries for Plug the file has. More than one is a mistake to
-    /// clean up.
-    pub fn plug_entry_count(&self, content: &str) -> usize {
+    /// How many entries for Plug, which serves at `plug`, the file has.
+    /// More than one is a mistake to clean up.
+    pub fn plug_entry_count(&self, content: &str, plug: &HttpConfig) -> usize {
+        let renamed = self.entries(content).map_or(0, |entries| {
+            entries
+                .iter()
+                .filter(|(name, entry)| is_plug_itself(name, entry, plug))
+                .count()
+        });
+        renamed + self.named_plug_entry_count(content)
+    }
+
+    fn named_plug_entry_count(&self, content: &str) -> usize {
         match self.format {
             FileFormat::Json => self.servers(content).ok().flatten().map_or(0, |servers| {
                 servers.keys().filter(|name| is_plug(name)).count()
@@ -806,6 +834,14 @@ mod tests {
 
     const URL: &str = "https://plug.example.com/mcp";
 
+    /// Plug serving at [`URL`].
+    fn plug_at_url() -> HttpConfig {
+        HttpConfig {
+            public_base_url: Some("https://plug.example.com".to_string()),
+            ..HttpConfig::default()
+        }
+    }
+
     /// What every client's link is written as reads back as the same link,
     /// and the same entry under another name is what import finds.
     #[test]
@@ -833,22 +869,25 @@ mod tests {
                         assert_ne!(plug.transport, TransportType::Stdio, "{target:?}");
                     }
                 }
-                assert_eq!(layout.plug_entry_count(&written), 1, "{target:?}");
-                assert!(layout.read_servers(&written).unwrap().is_empty());
+                let own = plug_at_url();
+                assert_eq!(layout.plug_entry_count(&written, &own), 1, "{target:?}");
+                assert!(layout.read_servers(&written, &own).unwrap().is_empty());
 
                 let renamed = written
                     .replace("plug:", "github:")
                     .replace("\"plug\"", "\"github\"")
                     .replace(".plug]", ".github]");
-                // Under another name, a link that runs Plug is still Plug.
-                let runs_plug = transport == LinkTransport::Stdio;
-                assert_eq!(
-                    layout.read_servers(&renamed).unwrap().is_empty(),
-                    runs_plug,
+                // Under another name, a link that runs Plug or names its
+                // address is still Plug.
+                assert!(
+                    layout.read_servers(&renamed, &own).unwrap().is_empty(),
                     "{target:?}: {renamed}"
                 );
-                let renamed = renamed.replace("/usr/local/bin/plug", "/usr/local/bin/github-mcp");
-                let imported = layout.read_servers(&renamed).unwrap();
+                assert_eq!(layout.plug_entry_count(&renamed, &own), 1, "{target:?}");
+                let renamed = renamed
+                    .replace("/usr/local/bin/plug", "/usr/local/bin/github-mcp")
+                    .replace(URL, "https://github.example.com/mcp");
+                let imported = layout.read_servers(&renamed, &own).unwrap();
                 assert_eq!(
                     imported.len(),
                     1,
@@ -860,12 +899,16 @@ mod tests {
                         .command
                         .as_ref()
                         .map(|_| "/usr/local/bin/github-mcp".to_string()),
+                    url: plug
+                        .url
+                        .as_ref()
+                        .map(|_| "https://github.example.com/mcp".to_string()),
                     ..plug.clone()
                 };
                 assert_eq!(imported[0].1, expected, "{target:?}");
 
                 let relinked = layout.link(&written, &entry).unwrap();
-                assert_eq!(layout.plug_entry_count(&relinked), 1, "{target:?}");
+                assert_eq!(layout.plug_entry_count(&relinked, &own), 1, "{target:?}");
                 let unlinked = layout.unlink(&relinked).unwrap();
                 assert!(
                     layout.read_plug(&unlinked).is_none(),
@@ -961,7 +1004,7 @@ mod tests {
     fn unlinking_toml_keeps_a_server_whose_name_starts_with_plug() {
         let layout = ClientTarget::CodexCli.layout();
         let content = "[mcp_servers.plug]\ncommand = \"plug\"\n\n[mcp_servers.plug.env]\nA = \"1\"\n\n[mcp_servers.plugin]\ncommand = \"plugin\"\n\n[mcp_servers.\"plug\"]\ncommand = \"again\"\n";
-        assert_eq!(layout.plug_entry_count(content), 2);
+        assert_eq!(layout.plug_entry_count(content, &HttpConfig::default()), 2);
         let unlinked = layout.unlink(content).unwrap();
         assert_eq!(unlinked, "[mcp_servers.plugin]\ncommand = \"plugin\"\n\n");
     }
@@ -1016,7 +1059,11 @@ mod tests {
 
     #[test]
     fn every_plug_entry_is_counted() {
-        let count = |target: ClientTarget, content: &str| target.layout().plug_entry_count(content);
+        let count = |target: ClientTarget, content: &str| {
+            target
+                .layout()
+                .plug_entry_count(content, &HttpConfig::default())
+        };
         assert_eq!(count(ClientTarget::Goose, "extensions:\n  plug:\n"), 1);
         assert_eq!(
             count(
@@ -1074,7 +1121,13 @@ mod tests {
             let plug = layout.read_plug(&updated).unwrap();
             assert_eq!(plug.command.as_deref(), Some("/new/plug"));
             assert_eq!(plug.args.unwrap(), target.connect_args());
-            assert_eq!(layout.read_servers(&updated).unwrap().len(), 1);
+            assert_eq!(
+                layout
+                    .read_servers(&updated, &HttpConfig::default())
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
         let opencode = ClientTarget::OpenCode;
         let linked = opencode

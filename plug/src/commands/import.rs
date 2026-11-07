@@ -54,10 +54,8 @@ pub(crate) fn scan(
     sources: &[ClientTarget],
 ) -> ImportReport {
     // A config that does not load still lets the scan say what is out there.
-    let existing = plug_core::config::load_config(config_path)
-        .map(|config| config.servers)
-        .unwrap_or_default();
-    plug_core::import::import(&existing, sources)
+    let config = plug_core::config::load_config(config_path).unwrap_or_default();
+    plug_core::import::import(&config, sources)
 }
 
 pub(crate) fn print_discovered(servers: &[DiscoveredServer]) {

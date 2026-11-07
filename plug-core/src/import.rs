@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet};
 use serde::{Deserialize, Serialize};
 
 use crate::clients::{ClientTarget, ServerEntry};
-use crate::config::{Config, ServerConfig, TransportType};
+use crate::config::{Config, HttpConfig, ServerConfig, TransportType};
 
 /// A server discovered from a client config file.
 #[derive(Debug, Clone, Serialize)]
@@ -40,7 +40,8 @@ pub struct ImportReport {
     pub duplicates_merged: usize,
 }
 
-pub fn scan_client(source: ClientTarget) -> ScanResult {
+/// The servers `source`'s settings hold, but for Plug, which serves at `plug`.
+pub fn scan_client(source: ClientTarget, plug: &HttpConfig) -> ScanResult {
     let mut servers = Vec::new();
     let mut error = None;
 
@@ -50,7 +51,7 @@ pub fn scan_client(source: ClientTarget) -> ScanResult {
         }
         let found = std::fs::read_to_string(&path)
             .map_err(|e| e.to_string())
-            .and_then(|content| source.layout().read_servers(&content));
+            .and_then(|content| source.layout().read_servers(&content, plug));
         match found {
             Ok(found) => servers.extend(
                 found
@@ -70,9 +71,13 @@ pub fn scan_client(source: ClientTarget) -> ScanResult {
     }
 }
 
-/// Scan, deduplicate, and keep what `existing` does not already have.
-pub fn import(existing: &HashMap<String, ServerConfig>, sources: &[ClientTarget]) -> ImportReport {
-    report(existing, sources.iter().map(|s| scan_client(*s)).collect())
+/// Scan, deduplicate, and keep what `config` does not already have.
+pub fn import(config: &Config, sources: &[ClientTarget]) -> ImportReport {
+    let scanned = sources
+        .iter()
+        .map(|source| scan_client(*source, &config.http))
+        .collect();
+    report(&config.servers, scanned)
 }
 
 fn report(existing: &HashMap<String, ServerConfig>, scanned: Vec<ScanResult>) -> ImportReport {
@@ -202,7 +207,7 @@ mod tests {
     fn read(target: ClientTarget, content: &str) -> Vec<DiscoveredServer> {
         target
             .layout()
-            .read_servers(content)
+            .read_servers(content, &HttpConfig::default())
             .unwrap()
             .into_iter()
             .map(|(name, entry)| discovered(target, name, entry))

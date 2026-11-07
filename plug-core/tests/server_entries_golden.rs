@@ -8,13 +8,18 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use plug_core::clients::ClientTarget;
-use plug_core::config::TransportType;
+use plug_core::config::{HttpConfig, TransportType};
 
 #[derive(serde::Deserialize)]
 struct Case {
     name: String,
     entry: serde_json::Value,
     server: Option<Expected>,
+    /// The entry names Plug's own address at its default settings, so
+    /// `plug import` skips it. The app's paste reader, which does not know
+    /// Plug's address, reads it as `server`.
+    #[serde(default)]
+    plug_address: bool,
 }
 
 #[derive(serde::Deserialize, Debug, PartialEq)]
@@ -36,7 +41,7 @@ fn import_reads_every_shared_server_entry_as_pinned() {
         let file = serde_json::json!({ "mcpServers": { case.name.clone(): case.entry } });
         let read = ClientTarget::ClaudeDesktop
             .layout()
-            .read_servers(&file.to_string())
+            .read_servers(&file.to_string(), &HttpConfig::default())
             .expect("reads");
         let got = read.into_iter().next().map(|(_, entry)| Expected {
             transport: entry.transport,
@@ -46,6 +51,7 @@ fn import_reads_every_shared_server_entry_as_pinned() {
             env: entry.env.into_iter().collect(),
             enabled: entry.enabled,
         });
-        assert_eq!(got, case.server, "{}", case.name);
+        let expected = if case.plug_address { None } else { case.server };
+        assert_eq!(got, expected, "{}", case.name);
     }
 }
