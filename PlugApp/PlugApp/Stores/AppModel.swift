@@ -184,8 +184,6 @@ final class AppModel {
     }
 
     @ObservationIgnored private var snapshotRevision = 0
-    /// The daemon's own count of its uptime at the last read, unrounded.
-    @ObservationIgnored private var lastUptimeSecs: UInt64 = 0
     @ObservationIgnored private var keptSituation: (key: SituationKey, value: PlugSituation)?
 
     private func buildSituation() -> PlugSituation {
@@ -500,9 +498,7 @@ final class AppModel {
         }
         attemptedSkewRecovery = false
         let value = try await daemon.snapshot()
-        let daemonRestarted = lastUptimeSecs > 0 && value.uptimeSecs < lastUptimeSecs
-        lastUptimeSecs = value.uptimeSecs
-        let cursor = activity.cursor(daemonRestarted: daemonRestarted)
+        let cursor = activity.cursor(startedId: value.startedId)
         // A read that says nothing new is not published: every view that
         // shows a server, a client or Plug's status would be drawn again,
         // every poll, for a clock that ticked.
@@ -515,7 +511,7 @@ final class AppModel {
         snapshotDidLoad?(value)
         if let page = try await daemon.activity(after: cursor, limit: ActivityLog.limit + 1) {
             var next = activity
-            next.take(page, after: cursor)
+            next.take(page, after: cursor, startedId: value.startedId)
             if next != activity { activity = next }
         }
         // The tool list is nearly a megabyte, and the snapshot reports when

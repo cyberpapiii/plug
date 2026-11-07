@@ -52,9 +52,6 @@ pub(crate) fn print_live_servers(
         let mut failed = 0usize;
         let mut auth_required = 0usize;
         for server in servers {
-            if server.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
-                continue;
-            }
             match server.health {
                 plug_core::types::ServerHealth::Healthy => healthy += 1,
                 plug_core::types::ServerHealth::Degraded => degraded += 1,
@@ -62,17 +59,7 @@ pub(crate) fn print_live_servers(
                 plug_core::types::ServerHealth::AuthRequired => auth_required += 1,
             }
         }
-        print_banner(
-            "◆",
-            "Servers",
-            &format!(
-                "{} on",
-                servers
-                    .iter()
-                    .filter(|server| server.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
-                    .count()
-            ),
-        );
+        print_banner("◆", "Servers", &format!("{} on", servers.len()));
         print_heading("Summary");
         print_label_value("Running", style(healthy).green().bold());
         print_label_value("Unsteady", style(degraded).yellow().bold());
@@ -81,9 +68,6 @@ pub(crate) fn print_live_servers(
         println!();
         print_heading("Servers");
         for s in servers {
-            if s.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
-                continue;
-            }
             let server_cfg = config
                 .as_ref()
                 .and_then(|cfg| cfg.servers.get(&s.server_id));
@@ -107,19 +91,16 @@ pub(crate) fn print_live_servers(
         }
         let auth_required_servers = servers
             .iter()
-            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
             .filter(|s| matches!(s.health, plug_core::types::ServerHealth::AuthRequired))
             .map(|s| s.server_id.clone())
             .collect::<Vec<_>>();
         let failed_servers = servers
             .iter()
-            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
             .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
             .map(|s| s.server_id.clone())
             .collect::<Vec<_>>();
         let degraded_servers = servers
             .iter()
-            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
             .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Degraded))
             .map(|s| s.server_id.clone())
             .collect::<Vec<_>>();

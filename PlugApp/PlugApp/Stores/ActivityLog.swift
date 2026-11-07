@@ -9,16 +9,21 @@ struct ActivityLog: Equatable, Sendable {
     /// True only after older rows were actually discarded. Holding exactly
     /// `limit` calls is not proof that one more exists.
     private(set) var wasTruncated = false
+    /// The daemon start the calls were numbered under.
+    private var startedId: UInt64?
 
-    /// Where the next read starts. A daemon that restarted numbers its calls
-    /// from the beginning again, so the read starts over too.
-    func cursor(daemonRestarted: Bool) -> UInt64 {
-        daemonRestarted ? 0 : (events.last?.sequence ?? 0)
+    /// Where the next read from the daemon start `startedId` begins. Another
+    /// start numbers its calls from the beginning again, so the read starts
+    /// over too.
+    func cursor(startedId: UInt64) -> UInt64 {
+        startedId == self.startedId ? (events.last?.sequence ?? 0) : 0
     }
 
-    /// Takes the calls read after `cursor`, asked for `limit + 1` at a time so
-    /// a read from the start can tell whether older ones exist.
-    mutating func take(_ page: [ActivityEvent], after cursor: UInt64) {
+    /// Takes the calls read after `cursor` from the daemon start `startedId`,
+    /// asked for `limit + 1` at a time so a read from the start can tell
+    /// whether older ones exist.
+    mutating func take(_ page: [ActivityEvent], after cursor: UInt64, startedId: UInt64) {
+        self.startedId = startedId
         if cursor == 0 {
             wasTruncated = page.count > Self.limit
             events = Array(page.suffix(Self.limit))

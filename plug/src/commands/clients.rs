@@ -292,12 +292,6 @@ pub(crate) async fn cmd_client_only(
     Ok(())
 }
 
-/// Plug's own HTTP settings, which say which entries in a client's file
-/// are Plug: from the config when it loads, else the defaults.
-pub(crate) fn own_http(config: Option<&plug_core::config::Config>) -> HttpConfig {
-    config.map(|config| config.http.clone()).unwrap_or_default()
-}
-
 /// Plug's entry in `target`'s user settings file, if it has one.
 pub(crate) fn linked(target: ClientTarget, plug: &HttpConfig) -> Option<ServerEntry> {
     let path = target.config_path(Scope::User)?;
@@ -469,7 +463,7 @@ fn print_link_changes(
     output: &OutputFormat,
     key: &str,
     changes: &[LinkChange],
-    config: Option<&plug_core::config::Config>,
+    config: &plug_core::config::Config,
 ) -> anyhow::Result<()> {
     match output {
         OutputFormat::Json => println!(
@@ -477,18 +471,11 @@ fn print_link_changes(
             serde_json::to_string_pretty(&serde_json::json!({ key: changes }))?
         ),
         OutputFormat::Text => {
-            let default_config = plug_core::config::Config::default();
             for change in changes {
                 if let Some(target) = ClientTarget::from_slug(change.target)
                     && change.transport.is_some()
                 {
-                    print_info_line(
-                        style(lazy_tool_policy_summary(
-                            config.unwrap_or(&default_config),
-                            target,
-                        ))
-                        .dim(),
-                    );
+                    print_info_line(style(lazy_tool_policy_summary(config, target)).dim());
                 }
             }
         }
@@ -506,8 +493,8 @@ pub(crate) fn cmd_link(
 ) -> anyhow::Result<()> {
     use dialoguer::{Confirm, MultiSelect};
 
-    let config = plug_core::config::load_config(config_path).ok();
-    let plug = own_http(config.as_ref());
+    let config = plug_core::config::load_config(config_path)?;
+    let plug = &config.http;
     // The address an HTTP link points at.
     let http_url = plug.mcp_url();
     // `--yes` takes stdio unless a transport was asked for.
@@ -520,7 +507,7 @@ pub(crate) fn cmd_link(
 
     if !targets.is_empty() || all {
         let targets: Vec<ClientTarget> = if all {
-            let detected = detected_or_linked_clients(&plug);
+            let detected = detected_or_linked_clients(plug);
             if detected.is_empty() {
                 anyhow::bail!(
                     "no detected clients found; pass explicit targets or run `plug link` interactively"
@@ -535,9 +522,9 @@ pub(crate) fn cmd_link(
         };
         let transport = transport_for("How should selected clients connect to plug?")?;
         for target in targets {
-            changes.push(write_link(target, transport, &plug)?);
+            changes.push(write_link(target, transport, plug)?);
         }
-        return print_link_changes(output, "linked", &changes, config.as_ref());
+        return print_link_changes(output, "linked", &changes, &config);
     }
 
     print_banner(
@@ -551,7 +538,7 @@ pub(crate) fn cmd_link(
         (false, true) => format!("{target}  {}", style("[detected]").cyan().dim()),
         (false, false) => target.to_string(),
     };
-    let mut items = detected_or_linked_clients(&plug)
+    let mut items = detected_or_linked_clients(plug)
         .into_iter()
         .map(|(target, linked)| (label(target, linked, true), target, linked))
         .collect::<Vec<_>>();
@@ -580,7 +567,7 @@ pub(crate) fn cmd_link(
     if show_all {
         items = ClientTarget::listed()
             .map(|target| {
-                let linked = linked(target, &plug).is_some();
+                let linked = linked(target, plug).is_some();
                 (label(target, linked, false), target, linked)
             })
             .collect();
@@ -602,12 +589,12 @@ pub(crate) fn cmd_link(
         let selected = selections.contains(&index);
         if selected && !was_linked {
             let transport = transport_for(&format!("How should {target} connect to plug?"))?;
-            changes.push(write_link(*target, transport, &plug)?);
+            changes.push(write_link(*target, transport, plug)?);
         } else if !selected && *was_linked {
-            remove_link(*target, &plug)?;
+            remove_link(*target, plug)?;
         }
     }
-    print_link_changes(output, "linked", &changes, config.as_ref())?;
+    print_link_changes(output, "linked", &changes, &config)?;
 
     if yes {
         return Ok(());
@@ -621,7 +608,7 @@ pub(crate) fn cmd_link(
     {
         link_custom_client(
             transport_for("How should this client connect to plug?")?,
-            &plug,
+            plug,
         )?;
     }
     Ok(())
@@ -747,25 +734,26 @@ pub(crate) fn cmd_unlink(
 ) -> anyhow::Result<()> {
     use dialoguer::{Confirm, MultiSelect};
 
-    let plug = own_http(plug_core::config::load_config(config_path).ok().as_ref());
+    let config = plug_core::config::load_config(config_path)?;
+    let plug = &config.http;
     let mut changes = Vec::new();
     if !targets.is_empty() {
         for name in &targets {
             let target: ClientTarget = name
                 .parse()
                 .map_err(|error: String| anyhow::anyhow!(error))?;
-            changes.extend(remove_link(target, &plug)?);
+            changes.extend(remove_link(target, plug)?);
         }
-        return print_link_changes(output, "unlinked", &changes, None);
+        return print_link_changes(output, "unlinked", &changes, &config);
     }
 
-    let items: Vec<ClientTarget> = linked_clients(&plug)
+    let items: Vec<ClientTarget> = linked_clients(plug)
         .into_iter()
         .map(|(target, _)| target)
         .collect();
     if items.is_empty() {
         if matches!(output, OutputFormat::Json) {
-            return print_link_changes(output, "unlinked", &changes, None);
+            return print_link_changes(output, "unlinked", &changes, &config);
         }
         print_warning_line("No linked clients found.");
         return Ok(());
@@ -773,9 +761,9 @@ pub(crate) fn cmd_unlink(
 
     if all || yes {
         for target in items {
-            changes.extend(remove_link(target, &plug)?);
+            changes.extend(remove_link(target, plug)?);
         }
-        return print_link_changes(output, "unlinked", &changes, None);
+        return print_link_changes(output, "unlinked", &changes, &config);
     }
 
     print_banner(
@@ -797,9 +785,9 @@ pub(crate) fn cmd_unlink(
         .defaults(&vec![true; labels.len()])
         .interact()?;
     for index in selections {
-        changes.extend(remove_link(items[index], &plug)?);
+        changes.extend(remove_link(items[index], plug)?);
     }
-    print_link_changes(output, "unlinked", &changes, None)
+    print_link_changes(output, "unlinked", &changes, &config)
 }
 
 async fn prompt_lazy_tool_mode(config_path: Option<&PathBuf>) -> anyhow::Result<()> {
@@ -1063,14 +1051,22 @@ mod tests {
     }
 
     #[test]
-    fn link_http_url_falls_back_to_the_default_listener() {
-        assert_eq!(own_http(None).mcp_url(), "http://localhost:3282/mcp");
-        let mut config = plug_core::config::Config::default();
-        config.http.public_base_url = Some("https://plug.example.com/base".to_string());
-        assert_eq!(
-            own_http(Some(&config)).mcp_url(),
-            "https://plug.example.com/base/mcp"
-        );
+    fn link_unlink_and_repair_stop_on_a_config_that_does_not_load() {
+        // Plug's own address decides which entry in a client's file is Plug,
+        // so guessing it from the defaults could write a second Plug entry.
+        let path = std::env::temp_dir().join(format!("plug-broken-{}.toml", uuid::Uuid::new_v4()));
+        std::fs::write(&path, "[http]\nport = \"not a port\"\n").unwrap();
+        let config = Some(&path);
+        let codex = || vec!["codex".to_string()];
+        let json = OutputFormat::Json;
+        assert!(cmd_link(config, codex(), false, true, None, &json).is_err());
+        assert!(cmd_unlink(config, codex(), false, true, &json).is_err());
+        assert!(crate::commands::repair::cmd_repair(config, codex(), false, true, &json).is_err());
+        assert!(crate::commands::import::scan(config, &[ClientTarget::CodexCli]).is_err());
+        std::fs::remove_file(&path).unwrap();
+        // With no config file at all, Plug is at its default address.
+        let plug = plug_core::config::load_config(config).unwrap().http;
+        assert_eq!(plug.mcp_url(), "http://localhost:3282/mcp");
     }
 
     #[test]

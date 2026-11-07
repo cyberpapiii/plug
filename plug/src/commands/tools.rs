@@ -318,14 +318,7 @@ pub(crate) async fn cmd_tool_list(
         let (status_availability, runtime_status) = crate::ipc_client::query(
             plug_core::ipc::IpcRequest::Status,
             |response| match response {
-                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(
-                    servers
-                        .into_iter()
-                        .filter(|server| {
-                            server.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID
-                        })
-                        .collect::<Vec<_>>(),
-                ),
+                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(servers),
                 _ => None,
             },
         )

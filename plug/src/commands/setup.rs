@@ -19,7 +19,7 @@ pub(crate) async fn cmd_setup(
         "Discover servers, import config, and link your AI clients",
     );
     let sources: Vec<ClientTarget> = ClientTarget::all().collect();
-    let report = scan(config_path, &sources);
+    let report = scan(config_path, &sources)?;
     if !report.new_servers.is_empty() {
         print_discovered(&report.new_servers);
         print_success_line(format!("Found {} server(s).", report.new_servers.len()));

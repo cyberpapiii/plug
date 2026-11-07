@@ -407,6 +407,7 @@ fn snapshot() -> OperatorSnapshot {
     OperatorSnapshot {
         runtime_version: "0.9.0".to_string(),
         uptime_secs: 4_000,
+        started_id: 9_000_000_000,
         tool_catalog_revision: 7,
         ownership: DaemonOwnershipMode::AppManaged,
         configured_servers: every_health()
@@ -799,6 +800,32 @@ fn chunked_response() -> Vec<plug_core::ipc::DaemonToProxyMessage> {
     plug_core::ipc::response_chunks(&payload, 64).collect()
 }
 
+/// A remote client in each state its sign-in can be in, with whether the
+/// daemon takes it for one whose sign-in never finished. The app reads the
+/// same file, so its own reading of an unfinished client cannot drift.
+fn registered_clients() -> BTreeMap<&'static str, serde_json::Value> {
+    let client = |signed_in: bool, last_used_at: Option<u64>| {
+        let summary = RegisteredClientSummary {
+            client_id: "abc".to_string(),
+            client_name: "ChatGPT".to_string(),
+            redirect_uris: vec!["https://chatgpt.com/callback".to_string()],
+            source: ClientSource::DynamicRegistration,
+            created_at: 1_700_000_000,
+            last_used_at,
+            expires_at: 1_800_000_000,
+            signed_in,
+            client_key: "oauth:abc".to_string(),
+            target: None,
+        };
+        serde_json::json!({ "unfinished": summary.is_unactivated(), "summary": summary })
+    };
+    BTreeMap::from([
+        ("signed_in", client(true, Some(1_700_000_500))),
+        ("signed_out", client(false, Some(1_700_000_500))),
+        ("never_finished", client(false, None)),
+    ])
+}
+
 fn pretty(value: &impl serde::Serialize) -> String {
     format!(
         "{}\n",
@@ -828,6 +855,7 @@ fn the_goldens_are_what_the_daemon_writes() {
     check("requests.json", pretty(&requests()));
     check("responses.json", pretty(&responses()));
     check("chunked_response.json", pretty(&chunked_response()));
+    check("registered_clients.json", pretty(&registered_clients()));
     // What the daemon fills in for a field a server leaves out, which is how
     // the app sends a setting the person did not set.
     check(
@@ -848,6 +876,7 @@ fn the_goldens_are_what_the_daemon_writes() {
         files,
         [
             "chunked_response.json",
+            "registered_clients.json",
             "requests.json",
             "responses.json",
             "server_config_default.json",

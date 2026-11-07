@@ -66,9 +66,7 @@ pub(crate) fn cmd_repair(
     output: &OutputFormat,
 ) -> anyhow::Result<()> {
     let targets = repair_targets(targets, all)?;
-    let plug = crate::commands::clients::own_http(
-        plug_core::config::load_config(config_path).ok().as_ref(),
-    );
+    let plug = plug_core::config::load_config(config_path)?.http;
     // A dry run inspects against this binary, so it needs no Plug.app.
     let canonical_command = if dry_run {
         std::env::current_exe()?

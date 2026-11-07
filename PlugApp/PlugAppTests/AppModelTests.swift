@@ -1064,7 +1064,7 @@ final class AppModelTests: XCTestCase {
             }
             let payload = """
             {
-              "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "toolCatalogRevision": 0, "prefixDelimiter": "__",
+              "runtimeVersion": "\(currentTestAppVersion)", "uptimeSecs": 1, "startedId": 1, "toolCatalogRevision": 0, "prefixDelimiter": "__",
               "ownership": "app_managed", "configuredServers": [], "servers": [], "liveSessions": [],
               "upstreamAuth": [\(auth.joined(separator: ","))], "downstreamClients": []
             }
@@ -1092,7 +1092,7 @@ final class AppModelTests: XCTestCase {
         let payload = """
         {
           "runtimeVersion": "\(currentTestAppVersion)", "prefixDelimiter": "__",
-          "uptimeSecs": 1,
+          "uptimeSecs": 1, "startedId": 1,
           "toolCatalogRevision": 0,
           "ownership": "app_managed",
           "configuredServers": [],

@@ -280,6 +280,7 @@ pub(crate) async fn run_daemon_with_lock(
 
     let cancel = engine.cancel_token().clone();
     let auth_token: Arc<str> = Arc::from(auth_token.as_str());
+    let started_id = uuid::Uuid::new_v4().as_u64_pair().0;
     let client_registry = Arc::new(ClientRegistry::new());
 
     #[cfg(target_os = "macos")]
@@ -303,6 +304,7 @@ pub(crate) async fn run_daemon_with_lock(
                             client_registry: Arc::clone(&client_registry),
                             http: Arc::clone(&http),
                             ownership,
+                            started_id,
                             session_id: None,
                             reverse_request_rx: None,
                         };
@@ -437,6 +439,8 @@ struct ConnectionContext {
     http: Arc<HttpState>,
     /// Who started this daemon, read once when it started.
     ownership: ipc::DaemonOwnershipMode,
+    /// [`ipc::OperatorSnapshot::started_id`].
+    started_id: u64,
     /// Session ID assigned during Register (for auto-deregister on disconnect).
     session_id: Option<String>,
     /// Receiver for reverse requests from the daemon bridge. Created during
@@ -458,6 +462,7 @@ impl ConnectionContext {
             client_registry: Arc::clone(&self.client_registry),
             http: Arc::clone(&self.http),
             ownership: self.ownership,
+            started_id: self.started_id,
             session_id: self.session_id.clone(),
             reverse_request_rx: None,
         }
@@ -1289,6 +1294,7 @@ async fn dispatch_operator(request: &OperatorRequest, ctx: &mut ConnectionContex
                 snapshot: Box::new(plug_core::ipc::OperatorSnapshot {
                     runtime_version: env!("CARGO_PKG_VERSION").to_string(),
                     uptime_secs: ctx.engine.uptime().as_secs(),
+                    started_id: ctx.started_id,
                     tool_catalog_revision: tool_catalog_revision(ctx),
                     ownership: ctx.ownership,
                     configured_servers,
@@ -2282,6 +2288,7 @@ mod tests {
             config_path: config_path.into(),
             client_registry: Arc::new(client_registry),
             ownership: ipc::DaemonOwnershipMode::Unknown,
+            started_id: 1,
             http: Arc::new(HttpState::new(
                 Arc::clone(engine.tool_router()),
                 Arc::new(plug_core::session::SessionStore::new(1800, 100)),
