@@ -541,6 +541,39 @@ struct IssuedRefreshToken {
     family_id: String,
 }
 
+/// What an access or a refresh token grants, read the same way for both.
+struct Grant<'a> {
+    client_id: &'a str,
+    scopes: &'a [String],
+    resource: &'a str,
+    expires_at: u64,
+    family_id: &'a str,
+}
+
+impl<'a> From<&'a IssuedAccessToken> for Grant<'a> {
+    fn from(token: &'a IssuedAccessToken) -> Self {
+        Self {
+            client_id: &token.client_id,
+            scopes: &token.scopes,
+            resource: &token.resource,
+            expires_at: token.expires_at,
+            family_id: &token.family_id,
+        }
+    }
+}
+
+impl<'a> From<&'a IssuedRefreshToken> for Grant<'a> {
+    fn from(token: &'a IssuedRefreshToken) -> Self {
+        Self {
+            client_id: &token.client_id,
+            scopes: &token.scopes,
+            resource: &token.resource,
+            expires_at: token.expires_at,
+            family_id: &token.family_id,
+        }
+    }
+}
+
 /// A refresh token that was already spent, kept only long enough to recognise a
 /// replay. RFC 9700 section 4.14.2: rotation alone lets an attacker who
 /// exfiltrated a refresh token keep a live chain while the legitimate client
@@ -671,6 +704,14 @@ impl DownstreamOauthState {
             .retain(|_, item| item.expires_at > now && !expired.contains(&item.client_id));
         self.evict_expired_owner_records(now);
         expired
+    }
+
+    /// Every access and refresh token issued.
+    fn grants(&self) -> impl Iterator<Item = Grant<'_>> {
+        self.access_tokens
+            .values()
+            .map(Grant::from)
+            .chain(self.refresh_tokens.values().map(Grant::from))
     }
 
     fn remove_client_material(&mut self, client_id: &str) {
@@ -1336,13 +1377,8 @@ impl DownstreamOauthManager {
             .map(|client| {
                 let id = client.client_id.as_str();
                 let holds_a_token = guard
-                    .refresh_tokens
-                    .values()
-                    .any(|token| token.client_id == id && token.expires_at > now)
-                    || guard
-                        .access_tokens
-                        .values()
-                        .any(|token| token.client_id == id && token.expires_at > now);
+                    .grants()
+                    .any(|grant| grant.client_id == id && self.grant_is_live(&guard, &grant, now));
                 RegisteredClientSummary {
                     signed_in: holds_a_token,
                     ..RegisteredClientSummary::from(client)
@@ -1366,41 +1402,36 @@ impl DownstreamOauthManager {
         }
         let guard = self.state.lock().await;
         let now = epoch_secs();
-        if guard.revoked_client_ids.contains(client_id)
-            || !guard
-                .clients
-                .get(client_id)
-                .is_some_and(|client| client.expires_at > now)
-            || !self
-                .principal_lifecycles
-                .get(client_id)
-                .is_some_and(|lease| lease.active.load(Ordering::SeqCst))
-        {
-            return false;
-        }
         let resource = self.resource();
-        let live =
-            |grant_client: &str, expires_at: u64, grant_resource: &str, scopes: &[String]| {
-                grant_client == client_id
-                    && expires_at > now
-                    && grant_resource == resource
-                    && scopes.iter().any(|s| s == scope)
-            };
-        guard.access_tokens.values().any(|grant| {
-            live(
-                &grant.client_id,
-                grant.expires_at,
-                &grant.resource,
-                &grant.scopes,
-            )
-        }) || guard.refresh_tokens.values().any(|grant| {
-            live(
-                &grant.client_id,
-                grant.expires_at,
-                &grant.resource,
-                &grant.scopes,
-            )
+        guard.grants().any(|grant| {
+            grant.client_id == client_id
+                && grant.resource == resource
+                && grant.scopes.iter().any(|s| s == scope)
+                && self.grant_is_live(&guard, &grant, now)
         })
+    }
+
+    /// Whether `grant` still lets its holder in: it has not run out, its
+    /// client is registered and not revoked, and neither the client's
+    /// principal nor the sign-in the grant came from has ended.
+    /// `validate_access_token_for`, `holds_live_grant` and `list_clients` all
+    /// decide by this.
+    fn grant_is_live(&self, state: &DownstreamOauthState, grant: &Grant<'_>, now: u64) -> bool {
+        grant.expires_at > now
+            && !state.revoked_client_ids.contains(grant.client_id)
+            && state
+                .clients
+                .get(grant.client_id)
+                .is_some_and(|client| client.expires_at > now)
+            && self
+                .principal_lifecycles
+                .get(grant.client_id)
+                .is_some_and(|lifecycle| lifecycle.active.load(Ordering::SeqCst))
+            && !(!grant.family_id.is_empty()
+                && self
+                    .family_ended
+                    .get(grant.family_id)
+                    .is_some_and(|sign_in| sign_in.is_over()))
     }
 
     /// Revoke `client_id`'s grant. `Ok(false)` when there is no such client.
@@ -1674,9 +1705,8 @@ impl DownstreamOauthManager {
         }
         let guard = self.state.lock().await;
         let record = guard.access_tokens.get(token)?;
-        if record.expires_at <= epoch_secs()
-            || record.resource != resource
-            || !guard.clients.contains_key(&record.client_id)
+        if record.resource != resource
+            || !self.grant_is_live(&guard, &Grant::from(record), epoch_secs())
         {
             return None;
         }
@@ -4076,6 +4106,49 @@ mod tests {
 
     async fn age_spent_refresh_tokens(manager: &DownstreamOauthManager) {
         manager.age_spent_refresh_tokens_for_tests().await;
+    }
+
+    /// A client whose sign-in has ended is not signed in anywhere Plug asks:
+    /// the app's client list, an event's grant count, and a request.
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_sign_in_that_ended_is_over_for_every_reader() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://localhost:8787/callback").await;
+        let tokens = issue_tokens(&manager, &client).await;
+        let resource = "https://plug.example.com/mcp";
+        let open = manager
+            .validate_access_token_for(&tokens.access_token, resource)
+            .await
+            .expect("a fresh token works");
+        let signed_in = |clients: Vec<RegisteredClientSummary>| {
+            clients
+                .into_iter()
+                .find(|listed| listed.client_id == client.client_id)
+                .expect("listed")
+                .signed_in
+        };
+        assert!(signed_in(manager.list_clients().await));
+        assert!(
+            manager
+                .holds_live_grant(&client.client_id, "tools:read")
+                .await
+        );
+
+        let sign_in = open.principal_lifecycle.family_ended.as_ref().unwrap();
+        sign_in.ended.store(true, Ordering::SeqCst);
+
+        assert!(!signed_in(manager.list_clients().await));
+        assert!(
+            !manager
+                .holds_live_grant(&client.client_id, "tools:read")
+                .await
+        );
+        assert!(
+            manager
+                .validate_access_token_for(&tokens.access_token, resource)
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
