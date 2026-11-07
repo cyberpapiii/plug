@@ -3,6 +3,10 @@ use std::collections::HashMap;
 use rmcp::model::{CallToolRequestParams, InitializeResult, NumberOrString};
 
 use super::*;
+use crate::proxy::tests::{
+    SubscribableUpstreamState, connect_modern_tool_upstream,
+    publish_tool_route_snapshot_with_metadata,
+};
 use crate::proxy::{RouterConfig, RouterSnapshot};
 use crate::server::ServerManager;
 
@@ -576,4 +580,92 @@ fn assert_plug_icons_sequence(icons: &[rmcp::model::Icon]) {
     assert!(svg.src.starts_with("data:image/svg+xml;base64,"));
     assert_eq!(svg.mime_type.as_deref(), Some("image/svg+xml"));
     assert_eq!(svg.sizes.as_deref(), Some(&["any".to_string()][..]));
+}
+
+/// A modern client that declares the tasks extension, calling over IPC.
+struct TaskCapableModernCaller {
+    call: DownstreamCallContext,
+    client: ClientCapabilities,
+}
+
+impl DownstreamContext for TaskCapableModernCaller {
+    fn downstream_call_context(&self) -> DownstreamCallContext {
+        self.call.clone()
+    }
+
+    fn session_bound(&self) -> bool {
+        false
+    }
+
+    fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
+        Ok(crate::downstream_identity::principal_task_owner(
+            self.call.principal().expect("principal"),
+        ))
+    }
+
+    fn modern_task_client(&self) -> Option<&ClientCapabilities> {
+        Some(&self.client)
+    }
+}
+
+/// A task cannot carry a modern upstream's rounds, so a task-capable client
+/// calling such a tool runs a plain call and finishes it in two rounds.
+#[tokio::test]
+async fn a_task_capable_client_calls_a_modern_upstream_as_a_plain_call() {
+    let sm = Arc::new(ServerManager::new());
+    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
+    router.set_modern_downstream_enabled(true);
+    let state = SubscribableUpstreamState::new(&[]);
+    state
+        .tool_requires_input
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
+    sm.replace_server("modern", upstream).await;
+    publish_tool_route_snapshot_with_metadata(&router, "Modern__tool", "modern", "Tool");
+    assert!(router.supports_tasks_for_client(ClientType::Unknown));
+
+    let caller = TaskCapableModernCaller {
+        call: DownstreamCallContext::ipc(
+            "modern-client",
+            RequestId::from(NumberOrString::Number(6)),
+            ClientType::Unknown,
+            None,
+        )
+        .with_local_principal(crate::types::PrincipalId::daemon_ipc(
+            uuid::Uuid::from_u128(104),
+        ))
+        .with_protocol(
+            crate::protocol::ProtocolEra::Modern,
+            crate::protocol::MODERN_PROTOCOL_VERSION,
+        ),
+        client: ClientCapabilities::builder().enable_tasks().build(),
+    };
+    let first = handle(
+        &router,
+        &caller,
+        "tools/call",
+        Some(serde_json::json!({"name": "Modern__tool"})),
+    )
+    .await
+    .expect("the first round runs as a plain call");
+    assert_eq!(first["resultType"], "input_required", "{first}");
+
+    let second = handle(
+        &router,
+        &caller,
+        "tools/call",
+        Some(serde_json::json!({
+            "name": "Modern__tool",
+            "requestState": first["requestState"],
+            "inputResponses": {"answer": {"action": "accept"}},
+        })),
+    )
+    .await
+    .expect("the continuation round runs as a plain call");
+    assert_ne!(second["resultType"], "task", "{second}");
+    assert!(second.get("content").is_some(), "{second}");
+    assert_eq!(
+        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
+        2
+    );
 }

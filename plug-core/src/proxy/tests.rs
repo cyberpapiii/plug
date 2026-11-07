@@ -2343,7 +2343,7 @@ impl SubGate {
 /// Shared state backing a `SubscribableUpstreamHandler`: the resource list
 /// it serves (mutable between refreshes to flip routes) and per-URI
 /// subscribe/unsubscribe call logs plus gates.
-struct SubscribableUpstreamState {
+pub(crate) struct SubscribableUpstreamState {
     resources: std::sync::Mutex<Vec<String>>,
     templates: std::sync::Mutex<Vec<String>>,
     completed_refs: std::sync::Mutex<Vec<String>>,
@@ -2357,15 +2357,15 @@ struct SubscribableUpstreamState {
     subscribe_errors: std::sync::Mutex<HashSet<String>>,
     subscribe_entered: tokio::sync::Notify,
     unsubscribe_entered: tokio::sync::Notify,
-    tool_calls: std::sync::atomic::AtomicUsize,
+    pub(crate) tool_calls: std::sync::atomic::AtomicUsize,
     tool_gate: std::sync::Mutex<Option<Arc<SubGate>>>,
     tool_entered: tokio::sync::Notify,
-    tool_requires_input: std::sync::atomic::AtomicBool,
+    pub(crate) tool_requires_input: std::sync::atomic::AtomicBool,
     tool_growing_input: std::sync::atomic::AtomicBool,
 }
 
 impl SubscribableUpstreamState {
-    fn new(resources: &[&str]) -> Arc<Self> {
+    pub(crate) fn new(resources: &[&str]) -> Arc<Self> {
         Arc::new(Self {
             resources: std::sync::Mutex::new(resources.iter().map(|uri| uri.to_string()).collect()),
             templates: std::sync::Mutex::new(Vec::new()),
@@ -2684,7 +2684,7 @@ async fn connect_subscribable_upstream(
     }
 }
 
-async fn connect_modern_tool_upstream(
+pub(crate) async fn connect_modern_tool_upstream(
     name: &str,
     state: Arc<SubscribableUpstreamState>,
 ) -> UpstreamServer {
@@ -2863,7 +2863,7 @@ fn publish_tool_route_snapshot_with_original(
     });
 }
 
-fn publish_tool_route_snapshot_with_metadata(
+pub(crate) fn publish_tool_route_snapshot_with_metadata(
     router: &ToolRouter,
     tool: &str,
     server_id: &str,
@@ -3191,94 +3191,6 @@ async fn native_modern_upstream_completes_a_real_two_round_tool_call() {
         .await
         .unwrap();
     assert!(matches!(result, CallToolResponse::Complete(_)));
-    assert_eq!(
-        state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
-        2
-    );
-}
-
-/// A modern client that declares the tasks extension, calling over IPC.
-struct TaskCapableModernCaller {
-    call: DownstreamCallContext,
-    client: ClientCapabilities,
-}
-
-impl crate::dispatch::DownstreamContext for TaskCapableModernCaller {
-    fn downstream_call_context(&self) -> DownstreamCallContext {
-        self.call.clone()
-    }
-
-    fn session_bound(&self) -> bool {
-        false
-    }
-
-    fn task_owner(&self) -> Result<crate::tasks::TaskOwner, McpError> {
-        Ok(crate::downstream_identity::principal_task_owner(
-            self.call.principal().expect("principal"),
-        ))
-    }
-
-    fn modern_task_client(&self) -> Option<&ClientCapabilities> {
-        Some(&self.client)
-    }
-}
-
-/// A task cannot carry a modern upstream's rounds, so a task-capable client
-/// calling such a tool runs a plain call and finishes it in two rounds.
-#[tokio::test]
-async fn a_task_capable_client_calls_a_modern_upstream_as_a_plain_call() {
-    let sm = Arc::new(ServerManager::new());
-    let router = Arc::new(ToolRouter::new(Arc::clone(&sm), RouterConfig::default()));
-    router.set_modern_downstream_enabled(true);
-    let state = SubscribableUpstreamState::new(&[]);
-    state
-        .tool_requires_input
-        .store(true, std::sync::atomic::Ordering::SeqCst);
-    let upstream = connect_modern_tool_upstream("modern", Arc::clone(&state)).await;
-    sm.replace_server("modern", upstream).await;
-    publish_tool_route_snapshot_with_metadata(&router, "Modern__tool", "modern", "Tool");
-    assert!(router.supports_tasks_for_client(ClientType::Unknown));
-
-    let caller = TaskCapableModernCaller {
-        call: DownstreamCallContext::ipc(
-            "modern-client",
-            RequestId::from(NumberOrString::Number(6)),
-            ClientType::Unknown,
-            None,
-        )
-        .with_local_principal(crate::types::PrincipalId::daemon_ipc(
-            uuid::Uuid::from_u128(104),
-        ))
-        .with_protocol(
-            crate::protocol::ProtocolEra::Modern,
-            crate::protocol::MODERN_PROTOCOL_VERSION,
-        ),
-        client: ClientCapabilities::builder().enable_tasks().build(),
-    };
-    let first = crate::dispatch::handle(
-        &router,
-        &caller,
-        "tools/call",
-        Some(serde_json::json!({"name": "Modern__tool"})),
-    )
-    .await
-    .expect("the first round runs as a plain call");
-    assert_eq!(first["resultType"], "input_required", "{first}");
-
-    let second = crate::dispatch::handle(
-        &router,
-        &caller,
-        "tools/call",
-        Some(serde_json::json!({
-            "name": "Modern__tool",
-            "requestState": first["requestState"],
-            "inputResponses": {"answer": {"action": "accept"}},
-        })),
-    )
-    .await
-    .expect("the continuation round runs as a plain call");
-    assert_ne!(second["resultType"], "task", "{second}");
-    assert!(second.get("content").is_some(), "{second}");
     assert_eq!(
         state.tool_calls.load(std::sync::atomic::Ordering::SeqCst),
         2

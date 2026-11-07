@@ -4814,4 +4814,4 @@ pub(crate) use catalog::*;
 pub use sessions::{ConnectorAfter, EndedSession};
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
