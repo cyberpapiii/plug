@@ -25,10 +25,6 @@ const POST_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum LegacySseError {
     #[error("reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
-    #[error("sse parse error: {0}")]
-    Sse(#[from] sse_stream::Error),
-    #[error("serialization error: {0}")]
-    Serde(#[from] serde_json::Error),
     #[error("stream closed before endpoint event")]
     MissingEndpoint,
     #[error("invalid endpoint event payload: {0}")]
