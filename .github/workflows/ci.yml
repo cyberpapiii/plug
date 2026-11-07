@@ -67,7 +67,10 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      # Most tests wait on child processes and sockets rather than the CPU,
+      # so the default of one thread per runner core leaves the runner idle.
+      # Sixteen is what the suite already runs at on a 16-core dev Mac.
+      - run: cargo test --workspace -- --test-threads=16
 
   test-macos:
     # macOS is the only shipped platform, and its cfg(target_os = "macos")
@@ -83,7 +86,7 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - run: cargo test --workspace
+      - run: cargo test --workspace -- --test-threads=16
 
   browser-oauth:
     name: Browser OAuth
@@ -113,7 +116,9 @@ jobs:
     name: Test (Plug.app)
     needs: classify
     if: needs.classify.outputs.app == 'true'
-    runs-on: macos-15
+    # The image release.yml builds on. macos-15 has Xcode 16, which compiles
+    # the pre-Liquid Glass fallback that no release ships.
+    runs-on: macos-26
     timeout-minutes: 45
     env: *lane-env
     steps:
@@ -121,7 +126,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: plug-app-ci
+          key: plug-app-macos-26
       - run: brew install xcodegen
       - run: swift test --package-path PlugApp/PlugIPC
       - run: ./scripts/check-app-architecture.sh
