@@ -140,8 +140,6 @@ pub(super) fn router_with_git_commit_tool() -> ToolRouter {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -459,13 +457,16 @@ fn apply_canonical_tool_title_creates_annotation_title_when_missing() {
     );
 }
 
+/// Every client in `TOOL_LIMITS` is served at most its ceiling, with no
+/// other edit, and only while `tool_filter_enabled` is on.
 #[test]
-fn list_tools_for_client_returns_correct_counts() {
-    let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, RouterConfig::default());
-
-    // Manually set up a snapshot with 150 tools
-    let tools: Vec<Tool> = (0..150)
+fn every_client_ceiling_is_enforced_while_filtering_is_on() {
+    let most = crate::clients::TOOL_LIMITS
+        .iter()
+        .map(|entry| entry.limit)
+        .max()
+        .expect("a ceiling");
+    let tools: Vec<Tool> = (0..most + 1)
         .map(|i| {
             Tool::new(
                 Cow::Owned(format!("tool_{i:03}")),
@@ -475,107 +476,39 @@ fn list_tools_for_client_returns_correct_counts() {
         })
         .collect();
 
-    let tools_devin = Arc::new(tools.iter().take(100).cloned().collect::<Vec<_>>());
-    let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect::<Vec<_>>());
-    let tools_all = Arc::new(tools);
-
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all,
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin,
-            tools_copilot,
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-
-    assert_eq!(router.list_tools_for_client(ClientType::Devin).len(), 100);
-    assert_eq!(
-        router
-            .list_tools_for_client(ClientType::VSCodeCopilot)
-            .len(),
-        128
-    );
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+    store_plain_tools_snapshot(&router, tools.clone());
+    for entry in crate::clients::TOOL_LIMITS {
+        assert_eq!(
+            router.list_tools_for_client(entry.client).len(),
+            entry.limit,
+            "{}",
+            entry.client
+        );
+    }
     assert_eq!(
         router.list_tools_for_client(ClientType::ClaudeCode).len(),
-        150
+        most + 1
     );
-    assert_eq!(router.list_tools_for_client(ClientType::Cursor).len(), 150);
-}
 
-#[test]
-fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() {
-    // Pins the invariant the refresh_tools() filtered-view gate depends on:
-    // when `tool_filter_enabled` is false, `refresh_tools()` no longer
-    // populates `tools_devin` / `tools_copilot` (they're left empty).
-    // `list_tools_for_client_session` must still return the FULL catalog for
-    // Devin/Copilot in that case — it has to return `tools_all` early
-    // before ever reading those two fields.
-    let sm = Arc::new(ServerManager::new());
-    let config = RouterConfig {
-        tool_filter_enabled: false,
-        ..RouterConfig::default()
-    };
-    let router = ToolRouter::new(sm, config);
-
-    let tools: Vec<Tool> = (0..150)
-        .map(|i| {
-            Tool::new(
-                Cow::Owned(format!("tool_{i:03}")),
-                Cow::Owned(format!("Tool {i}")),
-                Arc::new(serde_json::Map::new()),
-            )
-        })
-        .collect();
-
-    // Simulate what refresh_tools() now produces when filtering is
-    // disabled: tools_devin/tools_copilot stay empty.
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-
-    assert_eq!(
-        router
-            .list_tools_for_client_session(ClientType::Devin, None, None)
-            .len(),
-        150,
-        "Devin must still see the full catalog, not the empty pre-cached view"
+    let unfiltered = ToolRouter::new(
+        Arc::new(ServerManager::new()),
+        RouterConfig {
+            tool_filter_enabled: false,
+            ..RouterConfig::default()
+        },
     );
-    assert_eq!(
-        router
-            .list_tools_for_client_session(ClientType::VSCodeCopilot, None, None)
-            .len(),
-        150,
-        "Copilot must still see the full catalog, not the empty pre-cached view"
-    );
+    store_plain_tools_snapshot(&unfiltered, tools);
+    for entry in crate::clients::TOOL_LIMITS {
+        assert_eq!(
+            unfiltered
+                .list_tools_for_client_session(entry.client, None, None)
+                .len(),
+            most + 1,
+            "{}",
+            entry.client
+        );
+    }
 }
 
 fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
@@ -595,8 +528,6 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
             tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -701,8 +632,6 @@ fn search_tools_returns_matches() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -841,8 +770,6 @@ fn meta_tool_mode_lists_only_meta_tools() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -887,8 +814,6 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -932,8 +857,6 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -995,8 +918,6 @@ fn bridge_search_keeps_session_working_set_bounded() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1059,8 +980,6 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1122,8 +1041,6 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1306,8 +1223,6 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1422,8 +1337,6 @@ fn case_insensitive_route_lookup() {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1474,8 +1387,6 @@ async fn call_tool_times_out_waiting_for_semaphore() {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1589,8 +1500,6 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
             routes_lower: HashMap::new(),
             tools_by_name: HashMap::new(),
             tools_by_name_lower: HashMap::new(),
-            tools_devin: Arc::new(tools.iter().take(100).cloned().collect()),
-            tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
             resources_all: Arc::new(Vec::new()),
@@ -2944,8 +2853,6 @@ fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
         tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
@@ -2973,8 +2880,6 @@ fn publish_tool_route_snapshot_with_original(
         )]),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
@@ -3005,8 +2910,6 @@ fn publish_tool_route_snapshot_with_metadata(
             Arc::new(serde_json::Map::new()),
         )]),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
@@ -5000,8 +4903,6 @@ fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
         tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(vec![
             Resource::new("git://log", "git__log"),
             Resource::new("slack://inbox", "slack__inbox"),

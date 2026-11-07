@@ -64,7 +64,6 @@ impl Engine {
     ///
     /// Does NOT start any servers — call `start()` to begin.
     pub fn new(config: Config) -> Arc<Self> {
-        crate::secrets::Stores::configure(&config.secrets);
         Arc::new_cyclic(|engine: &Weak<Engine>| {
             let recovery: Weak<dyn Recovery> = engine.clone();
             let cancel = CancellationToken::new();
@@ -79,10 +78,8 @@ impl Engine {
                     recovery.clone(),
                 )
             });
-            tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
-            tool_router.set_client_access(&config.clients);
-            tool_router.set_disabled_tools(&config.disabled_tools);
             let server_manager = Arc::clone(tool_router.server_manager());
+            apply_live_settings(&tool_router, &server_manager, &config);
             let config = Arc::new(ArcSwap::from_pointee(config));
             let supervision = Arc::new(Supervision::default());
             let health = Monitor::new(
@@ -266,13 +263,7 @@ impl Engine {
     }
 
     pub fn store_config(&self, config: Config) {
-        self.tool_router
-            .set_modern_downstream_enabled(config.http.modern_downstream_enabled);
-        self.tool_router.set_client_access(&config.clients);
-        self.tool_router.set_disabled_tools(&config.disabled_tools);
-        self.server_manager
-            .set_modern_upstream_enabled(config.modern_upstream_enabled);
-        crate::secrets::Stores::configure(&config.secrets);
+        apply_live_settings(&self.tool_router, &self.server_manager, &config);
         self.config.store(Arc::new(config));
     }
 
@@ -1084,6 +1075,15 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
             }
         }
     }
+}
+
+/// Hand the settings that apply without a restart to the router, the
+/// servers and the secret stores. The engine's first config and every reload
+/// both come through here.
+fn apply_live_settings(router: &ToolRouter, servers: &ServerManager, config: &Config) {
+    crate::secrets::Stores::configure(&config.secrets);
+    router.apply_config(config);
+    servers.set_modern_upstream_enabled(config.modern_upstream_enabled);
 }
 
 fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {

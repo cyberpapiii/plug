@@ -1372,7 +1372,6 @@ impl ServerManager {
     /// one server that takes a minute to spawn must not delay the health task that
     /// would otherwise be reconnecting an upstream that is already back.
     pub async fn start_all(&self, config: &Config, on_settled: impl Fn(&str)) {
-        self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
             .iter()

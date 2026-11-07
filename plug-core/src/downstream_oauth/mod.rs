@@ -5610,8 +5610,6 @@ mod tests {
             )]),
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),

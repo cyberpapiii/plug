@@ -739,9 +739,10 @@ impl super::ToolRouter {
         if !self.config.tool_filter_enabled {
             return Arc::clone(&snapshot.tools_all);
         }
-        match client_type {
-            ClientType::Devin => Arc::clone(&snapshot.tools_devin),
-            ClientType::VSCodeCopilot => Arc::clone(&snapshot.tools_copilot),
+        match client_type.tool_limit() {
+            Some(limit) if limit < snapshot.tools_all.len() => {
+                Arc::new(snapshot.tools_all[..limit].to_vec())
+            }
             _ => Arc::clone(&snapshot.tools_all),
         }
     }

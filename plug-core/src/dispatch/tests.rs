@@ -304,8 +304,6 @@ fn router_with_unrouted_single_route() -> Arc<ToolRouter> {
         routes,
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
