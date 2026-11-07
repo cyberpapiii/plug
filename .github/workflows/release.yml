@@ -40,12 +40,16 @@ jobs:
           path: target/${{ matrix.target }}/release/plug
           retention-days: 1
 
-  build-app:
-    name: Build Plug.app
-    needs: build-daemon
+  archive-app:
+    # Runs beside build-daemon. The archive is unsigned and its daemon is a
+    # placeholder that build-app replaces before it signs, so the app no
+    # longer waits for the daemon to compile.
+    name: Archive Plug.app
     # Liquid Glass is compiled behind `#if compiler(>=6.2)`. macOS 15 runners
     # use an older Xcode and silently ship the fallback interface instead.
     runs-on: macos-26
+    outputs:
+      version: ${{ steps.version.outputs.version }}
     steps:
       - uses: actions/checkout@v5
 
@@ -56,39 +60,27 @@ jobs:
           xcrun swiftc -version | grep -Eq 'Apple Swift version (6\.[2-9]|[7-9]\.)'
 
       - name: Read workspace release version
+        id: version
         shell: bash
         run: |
           set -euo pipefail
           workspace_version="$(cargo metadata --no-deps --format-version 1 | \
             python3 -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "plug-mcp"))')"
-          echo "WORKSPACE_VERSION=${workspace_version}" >> "$GITHUB_ENV"
+          echo "version=${workspace_version}" >> "$GITHUB_OUTPUT"
 
       - name: Install build tools
         run: brew install xcodegen
 
-      - uses: actions/download-artifact@v7
-        with:
-          pattern: daemon-*
-          path: ${{ runner.temp }}/daemons
-
-      # Artifacts drop the executable bit, and the app's build script embeds
-      # PLUG_RELEASE_BINARY only when it is executable. Otherwise it builds a
-      # host-only daemon, so both are checked here.
-      - name: Assemble universal daemon
-        run: |
-          set -euo pipefail
-          mkdir -p target
-          lipo -create \
-            "$RUNNER_TEMP/daemons/daemon-aarch64-apple-darwin/plug" \
-            "$RUNNER_TEMP/daemons/daemon-x86_64-apple-darwin/plug" \
-            -output target/plug-universal
-          chmod 755 target/plug-universal
-          lipo target/plug-universal -verify_arch arm64 x86_64
-          test -x target/plug-universal
-
+      # The app's build script embeds PLUG_RELEASE_BINARY only when it is
+      # executable, and otherwise builds a host-only daemon, so the placeholder
+      # is executable. It fails if it is ever run.
       - name: Build app archive
+        env:
+          WORKSPACE_VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
+          printf '#!/bin/sh\nexit 1\n' > "$RUNNER_TEMP/plug-placeholder"
+          chmod 755 "$RUNNER_TEMP/plug-placeholder"
           cd PlugApp
           xcodegen generate
           xcodebuild archive \
@@ -101,7 +93,54 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             MARKETING_VERSION="$WORKSPACE_VERSION" \
             CURRENT_PROJECT_VERSION="$GITHUB_RUN_NUMBER" \
-            PLUG_RELEASE_BINARY="$GITHUB_WORKSPACE/target/plug-universal"
+            PLUG_RELEASE_BINARY="$RUNNER_TEMP/plug-placeholder"
+
+      # tar keeps the framework symlinks and executable bits that an artifact
+      # upload would drop.
+      - name: Pack app
+        run: tar -C "$RUNNER_TEMP/Plug.xcarchive/Products/Applications" -czf "$RUNNER_TEMP/Plug-unsigned.tgz" Plug.app
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: plug-app-unsigned
+          path: ${{ runner.temp }}/Plug-unsigned.tgz
+          retention-days: 1
+
+  build-app:
+    name: Build Plug.app
+    needs: [build-daemon, archive-app]
+    runs-on: macos-26
+    env:
+      WORKSPACE_VERSION: ${{ needs.archive-app.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/download-artifact@v7
+        with:
+          pattern: daemon-*
+          path: ${{ runner.temp }}/daemons
+
+      - uses: actions/download-artifact@v7
+        with:
+          name: plug-app-unsigned
+          path: ${{ runner.temp }}
+
+      # Artifacts drop the executable bit, so the daemon is installed 755 and
+      # checked for both architectures where the app will run it.
+      - name: Put the universal daemon in the app
+        run: |
+          set -euo pipefail
+          apps="$RUNNER_TEMP/Plug.xcarchive/Products/Applications"
+          mkdir -p "$apps"
+          tar -C "$apps" -xzf "$RUNNER_TEMP/Plug-unsigned.tgz"
+          embedded="$apps/Plug.app/Contents/Resources/plug"
+          test -f "$embedded"
+          lipo -create \
+            "$RUNNER_TEMP/daemons/daemon-aarch64-apple-darwin/plug" \
+            "$RUNNER_TEMP/daemons/daemon-x86_64-apple-darwin/plug" \
+            -output "$RUNNER_TEMP/plug-universal"
+          install -m 755 "$RUNNER_TEMP/plug-universal" "$embedded"
+          lipo "$embedded" -verify_arch arm64 x86_64
 
       - name: Sign, notarize, and staple app DMG
         env:
