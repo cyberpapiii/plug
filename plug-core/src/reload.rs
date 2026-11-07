@@ -133,11 +133,8 @@ pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
         }
     }
 
-    let restart_required = settings_needing_restart(old, new);
-    let settings_changed = !restart_required.is_empty()
-        || old.disabled_tools != new.disabled_tools
-        || old.http.modern_downstream_enabled != new.http.modern_downstream_enabled
-        || old.modern_upstream_enabled != new.modern_upstream_enabled;
+    let (restart_required, live_settings_changed) = settings_changes(old, new);
+    let settings_changed = !restart_required.is_empty() || live_settings_changed;
 
     ConfigDiff {
         added,
@@ -150,17 +147,18 @@ pub(crate) fn diff_configs(old: &Config, new: &Config) -> ConfigDiff {
     }
 }
 
-/// The settings outside `servers` that changed and are read only when Plug
-/// starts. The destructuring names every field of [`Config`] and
-/// [`HttpConfig`], so a field added to either does not compile until it is
-/// classified here as live or restart-only.
-fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
+/// The settings outside `servers` that changed: by name, those read only
+/// when Plug starts, and whether any that apply live did. The destructuring
+/// names every field of [`Config`] and [`HttpConfig`], so a field added to
+/// either does not compile until it is classified here as live or
+/// restart-only.
+fn settings_changes(old: &Config, new: &Config) -> (Vec<String>, bool) {
     let Config {
         log_level,
         prefix_delimiter,
         enable_prefix,
         // Read by each reload's server starts.
-        startup_concurrency: _,
+        startup_concurrency,
         tool_filter_enabled,
         tool_description_max_chars,
         tool_search_threshold,
@@ -168,13 +166,13 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
         lazy_tools,
         priority_tools,
         // Applied by `Engine::store_config`.
-        disabled_tools: _,
-        clients: _,
-        secrets: _,
-        modern_upstream_enabled: _,
+        disabled_tools,
+        clients,
+        secrets,
+        modern_upstream_enabled,
         // Watches and supervision policy are read from the live config.
-        events: _,
-        supervision: _,
+        events,
+        supervision,
         // Classified per server by `server_change`.
         servers: _,
         http,
@@ -182,7 +180,7 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
     let HttpConfig {
         slack_events,
         // Applied by `Engine::store_config`.
-        modern_downstream_enabled: _,
+        modern_downstream_enabled,
         auth_mode,
         public_base_url,
         oauth_scopes,
@@ -197,7 +195,15 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
     } = http;
 
     let old_http = &old.http;
-    [
+    let live = *startup_concurrency != old.startup_concurrency
+        || *disabled_tools != old.disabled_tools
+        || *clients != old.clients
+        || *secrets != old.secrets
+        || *modern_upstream_enabled != old.modern_upstream_enabled
+        || *events != old.events
+        || *supervision != old.supervision
+        || *modern_downstream_enabled != old_http.modern_downstream_enabled;
+    let restart = [
         ("log_level", *log_level != old.log_level),
         ("http.bind_address", *bind_address != old_http.bind_address),
         ("http.port", *port != old_http.port),
@@ -250,7 +256,8 @@ fn settings_needing_restart(old: &Config, new: &Config) -> Vec<String> {
     .into_iter()
     .filter(|(_, changed)| *changed)
     .map(|(setting, _)| format!("{setting} changed (restart required)"))
-    .collect()
+    .collect();
+    (restart, live)
 }
 
 /// Report of what happened during a reload.
@@ -413,17 +420,33 @@ mod tests {
             assert!(diff.settings_changed, "{setting}");
         }
 
-        let live: [Edit; 4] = [
+        let live: [Edit; 6] = [
             |c| c.startup_concurrency = 1,
             |c| c.disabled_tools = vec!["figma__get_file".into()],
             |c| c.supervision.enabled = !c.supervision.enabled,
             |c| c.http.modern_downstream_enabled = true,
+            |c| {
+                c.clients
+                    .insert("cursor".into(), crate::config::ClientSettings::default());
+            },
+            |c| {
+                c.events.watch.push(crate::config::WatchConfig {
+                    name: "issues".into(),
+                    server: "github".into(),
+                    tool: "list_issues".into(),
+                    arguments: Default::default(),
+                    every_secs: 300,
+                    allow_writes: false,
+                });
+            },
         ];
         for edit in live {
             let old = Config::default();
             let mut new = old.clone();
             edit(&mut new);
-            assert!(diff_configs(&old, &new).restart_required.is_empty());
+            let diff = diff_configs(&old, &new);
+            assert!(diff.restart_required.is_empty());
+            assert!(diff.settings_changed);
         }
     }
 
