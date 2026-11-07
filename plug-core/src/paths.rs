@@ -93,10 +93,15 @@ pub fn default_config_path() -> PathBuf {
 }
 
 /// The daemon's socket. Only a development run may move it, with
-/// `PLUG_SOCKET_PATH`.
+/// `PLUG_SOCKET_PATH`. A test build ignores it, so a shell that exports it
+/// cannot point every test at one socket.
 pub fn socket_path() -> PathBuf {
-    socket_override(is_development(), std::env::var_os(SOCKET_ENV))
-        .unwrap_or_else(|| dir().join(SOCKET_FILE))
+    let value = if cfg!(any(test, feature = "test-helpers")) {
+        None
+    } else {
+        std::env::var_os(SOCKET_ENV)
+    };
+    socket_override(is_development(), value).unwrap_or_else(|| dir().join(SOCKET_FILE))
 }
 
 fn socket_override(development: bool, value: Option<std::ffi::OsString>) -> Option<PathBuf> {
