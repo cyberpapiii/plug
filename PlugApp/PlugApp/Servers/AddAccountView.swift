@@ -74,9 +74,9 @@ struct AddAccountView: View {
         failure = nil
         Task {
             do {
-                try await model.actions.addAccount(server: server, label: label)
+                let added = try await model.actions.addAccount(server: server, label: label)
                 saving = false
-                router.reveal(server: AccountDraft.serverName(server: server, label: label))
+                router.reveal(server: added)
                 dismiss()
             } catch {
                 failure = SheetFailure(error)

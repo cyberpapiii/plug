@@ -97,8 +97,8 @@ enum AddClient {
         return "\(place), add a connector or MCP server and paste this address. Plug then opens a page asking you to approve it.\(reach)"
     }
 
-    /// What the key of a client the owner made up starts with. The daemon
-    /// knows the same word.
+    /// What the key of a client the owner made up starts with.
+    /// `testdata/draft_rules.json` holds it and `customTarget` to the daemon.
     static let customPrefix = "custom:"
 
     /// The target a client the owner named connects as, which is also the

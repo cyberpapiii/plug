@@ -1272,15 +1272,16 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 sessionStorage.append(session)
                 let clientID = object["client_id"] as? String ?? "fixture-client"
                 lock.unlock()
-                reply([
+                var registered: [String: Any] = [
                     "type": "Registered",
-                    "protocol_version": object["protocol_version"] as? Int ?? 3,
                     "client_id": clientID,
                     "session_id": session,
                     "modern_downstream_enabled": false,
                     "cancellation_capability": "fixture-cancellation",
                     "request_ceiling_ms": 660_000,
-                ])
+                ]
+                registered["protocol_version"] = object["protocol_version"]
+                reply(registered)
             case "Capabilities":
                 reply(["type": "Capabilities", "capabilities": [:]])
             case "UpdateSession", "UpdateCapabilities", "RestoreResourceSubscriptions":
@@ -1294,7 +1295,7 @@ private final class FixtureConnectorReplay: @unchecked Sendable {
                 reply(["type": "Pong"])
             case "ModernDownstreamGate":
                 reply(["type": "ModernDownstreamGate", "enabled": false])
-            case "McpRequest", "McpRequestWithContext":
+            case "McpRequest":
                 let method = object["method"] as? String ?? ""
                 switch method {
                 case "tools/list":

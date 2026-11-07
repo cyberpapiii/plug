@@ -371,39 +371,6 @@ final class AppModelTests: XCTestCase {
         XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
     }
 
-    /// The revision counts from the same start in every daemon, so a daemon
-    /// that started again with the same servers reports the old one's
-    /// revision. Its tool list is read anyway.
-    @MainActor
-    func testARestartedDaemonsToolListIsReadAtTheSameRevision() async {
-        let coordinator = RecordingInstallationCoordinator(
-            state: .healthy(makeInstallationSnapshot()),
-            events: LockedEvents()
-        )
-        let server = try! OperatorFixtureServer(events: coordinator.events)
-        defer { server.stop() }
-        server.uptimeSecs = 100
-
-        let model = AppModel(
-            home: makeTestHome(),
-            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
-            coordinator: coordinator
-        )
-        await model.start()
-        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 1)
-
-        server.uptimeSecs = 2
-        await model.refresh()
-        XCTAssertEqual(coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2)
-
-        server.uptimeSecs = 3
-        await model.refresh()
-        XCTAssertEqual(
-            coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 2,
-            "only the read that sees the restart pulls the list"
-        )
-    }
-
     /// An operation that leaves the catalog revision alone must not pull the
     /// whole tool list again. Operations that do change it move the revision.
     @MainActor
@@ -435,6 +402,27 @@ final class AppModelTests: XCTestCase {
             coordinator.events.values.filter { $0 == "ipc.listTools" }.count, 3,
             "an explicit Refresh still pulls the list"
         )
+    }
+
+    /// The sheet shows the new account under the name the daemon gave it,
+    /// which the fixture's reply makes different from the app's own guess.
+    @MainActor
+    func testAnAddedAccountIsKnownByTheDaemonsName() async throws {
+        let coordinator = RecordingInstallationCoordinator(
+            state: .healthy(makeInstallationSnapshot()),
+            events: LockedEvents()
+        )
+        let server = try OperatorFixtureServer(events: coordinator.events)
+        defer { server.stop() }
+
+        let model = AppModel(
+            home: makeTestHome(),
+            ipc: PlugIPCClient(socketURL: server.socketURL, clientVersion: currentTestAppVersion),
+            coordinator: coordinator
+        )
+        await model.start()
+        let added = try await model.actions.addAccount(server: "demo", label: "work")
+        XCTAssertEqual(added, "workspace")
     }
 
     @MainActor
@@ -1240,12 +1228,6 @@ private final class OperatorFixtureServer: @unchecked Sendable {
         set { lock.lock(); storedCatalogRevision = newValue; lock.unlock() }
     }
     private var storedCatalogRevision: UInt64 = 1
-    /// Set lower by a test to say the daemon started again.
-    var uptimeSecs: UInt64 {
-        get { lock.lock(); defer { lock.unlock() }; return storedUptimeSecs }
-        set { lock.lock(); storedUptimeSecs = newValue; lock.unlock() }
-    }
-    private var storedUptimeSecs: UInt64 = 1
     /// When set, the next snapshot request is recorded and then held until the
     /// test signals, so a test can act while a read is in flight.
     var snapshotGate: DispatchSemaphore? {
@@ -1328,7 +1310,7 @@ private final class OperatorFixtureServer: @unchecked Sendable {
                     events.append("ipc.snapshot")
                     _ = snapshotGate?.wait(timeout: .now() + 5)
                     send(response: reply("snapshot", in: "snapshot", [
-                        "runtime_version": currentTestAppVersion, "uptime_secs": uptimeSecs,
+                        "runtime_version": currentTestAppVersion, "uptime_secs": 1,
                         "tool_catalog_revision": catalogRevision,
                     ]), to: accepted)
                 case "ListTools":

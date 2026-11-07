@@ -65,6 +65,7 @@
 		75BCE5314896FF21812B2100 /* ProcessRunner.swift in Sources */ = {isa = PBXBuildFile; fileRef = B7BDED0D0203E8B0A13A1B2E /* ProcessRunner.swift */; };
 		7F4794228FEEBCA056599581 /* ClientRows.swift in Sources */ = {isa = PBXBuildFile; fileRef = C9D579210F78E7D32B77DDF8 /* ClientRows.swift */; };
 		8027D89CBD75B1FB2D466C56 /* EventFacts.swift in Sources */ = {isa = PBXBuildFile; fileRef = F7711E0CB2972E0B9D45D9D9 /* EventFacts.swift */; };
+		87AE38E43C05F4E8567CAAE0 /* DraftRulesTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 58AD57107F93B9807D94F21B /* DraftRulesTests.swift */; };
 		8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */; };
 		8C15CA89C310137DC8DACB7E /* FirstRunGuideTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = EA30E8D16DB931FB22189B76 /* FirstRunGuideTests.swift */; };
 		8D15AF8A80C7EF6C8C1372FD /* AddAccountView.swift in Sources */ = {isa = PBXBuildFile; fileRef = 6904150E3E88BB44913F2231 /* AddAccountView.swift */; };
@@ -159,6 +160,7 @@
 		4F07A06B57DCC09047B6E29D /* legacy_plug_programs.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = legacy_plug_programs.json; sourceTree = "<group>"; };
 		4F9B87F63F82D2FBB678B606 /* PlugIcon.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlugIcon.swift; sourceTree = "<group>"; };
 		588717CF2790EF93C4710EE6 /* EditServerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = EditServerView.swift; sourceTree = "<group>"; };
+		58AD57107F93B9807D94F21B /* DraftRulesTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DraftRulesTests.swift; sourceTree = "<group>"; };
 		59A17BC02D4033FB753EBFFE /* IconViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = IconViews.swift; sourceTree = "<group>"; };
 		59D35A236F003E96A80E9E08 /* ToolSurfaceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ToolSurfaceTests.swift; sourceTree = "<group>"; };
 		64E2869334004AD1B34ADA93 /* InstallationState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = InstallationState.swift; sourceTree = "<group>"; };
@@ -327,6 +329,7 @@
 				9E74E670F2DF448E93AF7AC1 /* ClientRepairServiceTests.swift */,
 				1460E34B79E01604EE96863C /* CLIReportTests.swift */,
 				F3F68EF174B192F68A0B332E /* DaemonServiceManagerTests.swift */,
+				58AD57107F93B9807D94F21B /* DraftRulesTests.swift */,
 				46FB5A60EDCD60A112BF97DA /* EventSurfaceTests.swift */,
 				EA30E8D16DB931FB22189B76 /* FirstRunGuideTests.swift */,
 				39970133BB5F99FEB252D8DE /* ImportSurfaceTests.swift */,
@@ -696,6 +699,7 @@
 				DAE7A2B35F1C6F8C2F0DCE14 /* ClientIdentityTests.swift in Sources */,
 				F00B7C6A8EBB3ECE9AF0A2B7 /* ClientRepairServiceTests.swift in Sources */,
 				8883A2B336402FFF22DEF8F9 /* DaemonServiceManagerTests.swift in Sources */,
+				87AE38E43C05F4E8567CAAE0 /* DraftRulesTests.swift in Sources */,
 				52895501276459EDCBEB65D9 /* EventSurfaceTests.swift in Sources */,
 				8C15CA89C310137DC8DACB7E /* FirstRunGuideTests.swift in Sources */,
 				FD7472A76A6E545F5CAE7D78 /* ImportSurfaceTests.swift in Sources */,

@@ -5,15 +5,11 @@ import PlugIPC
 /// A second account is named before the daemon is asked, so the sheet and the
 /// daemon have to agree on what a name is and on what is sent.
 final class AccountDraftTests: XCTestCase {
-    func testAnAccountNameIsLowercaseLettersAndDigits() {
+    /// What the owner types is trimmed and lowercased before the daemon's
+    /// rule, which `DraftRulesTests` holds to the daemon, is applied.
+    func testWhatIsTypedIsTrimmedAndLowercased() {
         XCTAssertEqual(AccountDraft.label(from: " Personal "), "personal")
-        XCTAssertEqual(AccountDraft.label(from: "team2"), "team2")
-        XCTAssertNil(AccountDraft.label(from: ""))
-        XCTAssertNil(AccountDraft.label(from: "2nd"))
         XCTAssertNil(AccountDraft.label(from: "work team"))
-        XCTAssertNil(AccountDraft.label(from: "work-team"))
-        XCTAssertNil(AccountDraft.label(from: String(repeating: "a", count: AccountDraft.longest + 1)))
-        XCTAssertEqual(AccountDraft.serverName(server: "slack", label: "work"), "slack-work")
     }
 
     func testAddingAnAccountNamesTheServerAndTheAccount() throws {
