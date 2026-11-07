@@ -255,7 +255,7 @@ fn expected_proxy_daemon_identity() -> anyhow::Result<(PathBuf, bool)> {
             // this line at the cost of a codesign walk and two subprocesses
             // per connector. The handshake still has to name this executable.
             let current = std::env::current_exe()?;
-            if crate::install::running_as_bundle_executable(&current) {
+            if crate::install::is_app_executable(&current) {
                 return Ok((current, true));
             }
             let app = crate::install::resolve_verified_app()?.ok_or_else(|| {

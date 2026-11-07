@@ -125,13 +125,7 @@ fn is_recognized_legacy_plug_path(path: &Path) -> bool {
     };
 
     // A client may also run the app's binary or a development build directly.
-    let home = dirs::home_dir();
-    let is_old_app = path == Path::new("/Applications/Plug.app/Contents/Resources/plug")
-        || home
-            .as_ref()
-            .is_some_and(|home| path == home.join("Applications/Plug.app/Contents/Resources/plug"));
-
-    is_old_app
+    crate::install::is_app_executable(path)
         || has_suffix(&["target", "debug", "plug"])
         || has_suffix(&["target", "release", "plug"])
 }

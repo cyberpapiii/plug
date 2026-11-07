@@ -7,8 +7,9 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
+use plug_core::paths::BUNDLED_BINARY;
 #[cfg(target_os = "macos")]
-use plug_core::paths::{APP_BUNDLE_ID, BUNDLED_BINARY, TEAM_ID};
+use plug_core::paths::{APP_BUNDLE_ID, TEAM_ID};
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct VerifiedAppInstallation {
@@ -128,7 +129,7 @@ pub fn maybe_delegate_to_app() -> Result<()> {
         // every single invocation. Bundle integrity is owned by `plug doctor`
         // and by the app's own installation reconciliation, both of which
         // still run the full check.
-        if running_as_bundle_executable(&current) {
+        if is_app_executable(&current) {
             return Ok(());
         }
 
@@ -164,17 +165,17 @@ pub fn maybe_delegate_to_app() -> Result<()> {
     Ok(())
 }
 
-/// Whether the running executable is the embedded executable of some Plug.app.
+/// Whether `path` is the embedded executable of some Plug.app, wherever the
+/// app is.
 ///
 /// Local bundle paths are checked before the LaunchServices query because the
 /// canonical install is one of them, and answering from a path comparison
 /// alone keeps the common case free of any system call beyond `canonicalize`.
-#[cfg(target_os = "macos")]
-pub(crate) fn running_as_bundle_executable(current: &Path) -> bool {
+pub(crate) fn is_app_executable(path: &Path) -> bool {
     fallback_bundle_paths()
         .into_iter()
         .chain(std::iter::once_with(registered_bundle_paths).flatten())
-        .any(|bundle| paths_match(current, &bundle.join(BUNDLED_BINARY)))
+        .any(|bundle| paths_match(path, &bundle.join(BUNDLED_BINARY)))
 }
 
 /// Whether two paths name the same file once symlinks are resolved.
@@ -339,7 +340,12 @@ fn registered_bundle_paths() -> Vec<PathBuf> {
         .collect()
 }
 
-#[cfg(target_os = "macos")]
+/// Only macOS has LaunchServices to ask.
+#[cfg(not(target_os = "macos"))]
+fn registered_bundle_paths() -> Vec<PathBuf> {
+    Vec::new()
+}
+
 fn fallback_bundle_paths() -> Vec<PathBuf> {
     let mut paths = vec![PathBuf::from("/Applications/Plug.app")];
     if let Some(home) = dirs::home_dir() {
@@ -586,11 +592,11 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn bundle_executables_skip_delegation_verification() {
         for bundle in super::fallback_bundle_paths() {
-            assert!(super::running_as_bundle_executable(
+            assert!(super::is_app_executable(
                 &bundle.join(plug_core::paths::BUNDLED_BINARY)
             ));
         }
-        assert!(!super::running_as_bundle_executable(std::path::Path::new(
+        assert!(!super::is_app_executable(std::path::Path::new(
             "/usr/local/bin/plug"
         )));
     }
