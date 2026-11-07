@@ -22,6 +22,15 @@ final class DaemonServiceManagerTests: XCTestCase {
     )
     private lazy var ours = makeTestHandshake(version: "0.7.0", executable: canonical.executableURL)
 
+    /// A started daemon is checked for as long as the CLI waits for one,
+    /// the budget `testdata/paths.json` holds both to.
+    func testAStartIsWaitedForAsLongAsTheCLIWaits() {
+        XCTAssertEqual(
+            DaemonServiceManager.retryInterval * DaemonServiceManager.startupRetries,
+            PlugPaths.startupBudget
+        )
+    }
+
     func testStopUnregistersOwnedServiceWithoutStartingOrSuspendingClients() async throws {
         let launchd = world(.appManagedCurrent(current), enabled: true, answering: ours)
 

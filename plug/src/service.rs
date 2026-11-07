@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use plug_core::paths::{
     APP_BUNDLE_ID, BUNDLED_BINARY, DAEMON_ARGS, DAEMON_LABEL, SERVICE_DISABLED_MARKER,
+    STARTUP_BUDGET,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -450,16 +451,6 @@ fn install_cli_plist(path: &Path, config_path: Option<&Path>) -> anyhow::Result<
     std::fs::rename(temp, path)?;
     Ok(())
 }
-
-/// How long a cold start may take before it is treated as failed.
-///
-/// Starting every configured upstream takes tens of seconds, and each one can
-/// involve a Keychain read or a network round trip. Plug.app allows the same 90
-/// seconds (`DaemonServiceManager.retryLimit`, 180 attempts at 500ms). The CLI
-/// and the app drive one daemon, so two different amounts of patience is not a
-/// tuning difference: the impatient half kills what the patient half is waiting
-/// for.
-const STARTUP_BUDGET: Duration = Duration::from_secs(90);
 
 /// Wait for the daemon's IPC socket, distinguishing a slow start from a dead one.
 ///
