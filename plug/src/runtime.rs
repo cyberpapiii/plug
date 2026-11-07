@@ -169,15 +169,21 @@ pub(crate) async fn cmd_start(
 
 pub(crate) async fn cmd_daemon(config_path: Option<&std::path::PathBuf>) -> anyhow::Result<()> {
     require_canonical_daemon_owner()?;
-    serve_until(config_path, daemon::termination_signal()).await
+    // launchd's record of who started this process does not change while
+    // it runs, and reading it runs `launchctl`.
+    let ownership = tokio::task::spawn_blocking(crate::service::ipc_ownership)
+        .await
+        .unwrap_or(plug_core::ipc::DaemonOwnershipMode::Unknown);
+    serve_until(config_path, daemon::termination_signal(), ownership).await
 }
 
 /// Run the daemon until `stop` resolves or an operator asks it to shut down.
 /// Either way it lets running calls drain, then the socket, the PID file and
 /// the token are removed and HTTP shuts down gracefully before this returns.
-async fn serve_until(
+pub(crate) async fn serve_until(
     config_path: Option<&std::path::PathBuf>,
     stop: impl std::future::Future<Output = ()>,
+    ownership: plug_core::ipc::DaemonOwnershipMode,
 ) -> anyhow::Result<()> {
     // Claim daemon ownership before Engine::start() can read Keychain entries
     // or spawn upstream processes.
@@ -222,11 +228,6 @@ async fn serve_until(
         }
         serve_router(http_router, &http_config, cancel.clone()).await
     };
-    // launchd's record of who started this process does not change while
-    // it runs, and reading it runs `launchctl`.
-    let ownership = tokio::task::spawn_blocking(crate::service::ipc_ownership)
-        .await
-        .unwrap_or(plug_core::ipc::DaemonOwnershipMode::Unknown);
     let ipc = daemon::run_daemon_with_lock(
         engine.clone(),
         config_path,
@@ -268,31 +269,20 @@ fn daemon_invocation_is_canonical(
 
 #[cfg(target_os = "macos")]
 fn require_canonical_daemon_owner() -> anyhow::Result<()> {
-    #[cfg(test)]
-    return Ok(());
-
-    #[cfg(not(test))]
-    {
-        let development = plug_core::paths::is_development();
-        let app_installed = crate::install::resolve_verified_app()?.is_some();
-        let app_managed =
-            crate::service::inspect()?.ownership == crate::service::ServiceOwnership::AppManaged;
-        let parent = std::process::Command::new("/bin/ps")
-            .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
-            .output()?;
-        let parent_is_launchd =
-            parent.status.success() && String::from_utf8_lossy(&parent.stdout).trim() == "1";
-        anyhow::ensure!(
-            daemon_invocation_is_canonical(
-                app_installed,
-                app_managed,
-                parent_is_launchd,
-                development,
-            ),
-            "Plug.app owns daemon startup; open Plug.app to start or repair the service"
-        );
-        Ok(())
-    }
+    let development = plug_core::paths::is_development();
+    let app_installed = crate::install::resolve_verified_app()?.is_some();
+    let app_managed =
+        crate::service::inspect()?.ownership == crate::service::ServiceOwnership::AppManaged;
+    let parent = std::process::Command::new("/bin/ps")
+        .args(["-o", "ppid=", "-p", &std::process::id().to_string()])
+        .output()?;
+    let parent_is_launchd =
+        parent.status.success() && String::from_utf8_lossy(&parent.stdout).trim() == "1";
+    anyhow::ensure!(
+        daemon_invocation_is_canonical(app_installed, app_managed, parent_is_launchd, development,),
+        "Plug.app owns daemon startup; open Plug.app to start or repair the service"
+    );
+    Ok(())
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -744,9 +734,13 @@ mod tests {
 
             let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
             let daemon = tokio::spawn(async move {
-                serve_until(Some(&config_path), async {
-                    let _ = stop_rx.await;
-                })
+                serve_until(
+                    Some(&config_path),
+                    async {
+                        let _ = stop_rx.await;
+                    },
+                    plug_core::ipc::DaemonOwnershipMode::Unknown,
+                )
                 .await
             });
             tokio::time::timeout(Duration::from_secs(5), crate::ipc_client::wait_for_daemon())

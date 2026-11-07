@@ -2698,7 +2698,7 @@ mod tests {
     // Fake-daemon harness: hand-rolled UnixListener speaking plug_core::ipc
     // so reconnect/frame tests control wire responses without Engine hooks.
     // Tests abort the handler heartbeat after construction (avoids racing
-    // DAEMON_PING_INTERVAL) and `isolate` the socket paths.
+    // DAEMON_PING_INTERVAL); each test thread's own root keeps the sockets apart.
 
     /// Request ids a fake daemon has read on each connection and not yet
     /// answered, oldest first. Fakes answer requests in the order they read
@@ -4531,8 +4531,7 @@ mod tests {
     }
 
     /// Start a proxy against a fake daemon that answers one `expected_method`
-    /// request with `payload`, and connect a downstream client to it. Callers
-    /// hold `isolate` and own the temp dir.
+    /// request with `payload`, and connect a downstream client to it.
     async fn proxy_with_one_scripted_reply(
         client_id: &str,
         expected_method: &'static str,

@@ -2586,7 +2586,12 @@ allowed_servers = ["slack"]
         )
         .expect("write config");
 
-        let result = crate::runtime::cmd_daemon(Some(&config_path)).await;
+        let result = crate::runtime::serve_until(
+            Some(&config_path),
+            std::future::pending(),
+            plug_core::ipc::DaemonOwnershipMode::Unknown,
+        )
+        .await;
         let error = result.expect_err("losing daemon should exit immediately");
         assert!(
             error.to_string().contains("PID file locked"),
