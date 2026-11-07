@@ -27,6 +27,8 @@ struct RootView: View {
 
     @AppStorage("firstMoments") private var storedFirsts: String?
     @State private var firstMoment: FirstRunGuide.Step?
+    /// Goes up each time something is added, so the character cheers.
+    @State private var cheers = 0
 
     @State private var columns = NavigationSplitViewVisibility.all
     /// Whether the window is on screen, and whether the model was told so.
@@ -166,6 +168,10 @@ struct RootView: View {
             if guideOpensByItself, router.sheet == nil { router.sheet = .guide }
         }
         .onChange(of: firstsToLookAt, initial: true) { lookForFirsts() }
+        .onChange(of: addedSoFar) { earlier, now in
+            // The first look is not an addition.
+            if let earlier, let now, now.grew(from: earlier) { cheers += 1 }
+        }
         .task { await model.actions.loadConnectableApps() }
         .background(WindowSeenReader(seen: $windowSeen))
         .environment(\.windowSeen, windowSeen)
@@ -242,7 +248,7 @@ struct RootView: View {
         let verdict = model.verdict
         return VStack(alignment: .leading, spacing: Metric.tight) {
             HStack(spacing: Metric.tight) {
-                PlugCharacter(mood: verdict.mood, mark: verdict.markColor)
+                PlugCharacter(mood: verdict.mood, cheers: cheers, mark: verdict.markColor)
                     .foregroundStyle(.tint)
                     .frame(width: 30, height: 30)
                 Text("Plug")
@@ -313,6 +319,11 @@ struct RootView: View {
     /// that an empty list does not mean nothing is there.
     private var firstsToLookAt: FirstRunGuide? {
         model.hasLoadedSnapshot && model.actions.hasLoadedConnectableApps ? model.firstRunGuide : nil
+    }
+
+    /// What has been added, once both halves of the setup have been read.
+    private var addedSoFar: SetupCount? {
+        model.hasLoadedSnapshot && model.actions.hasLoadedConnectableApps ? model.setupCount : nil
     }
 
     private func lookForFirsts() {

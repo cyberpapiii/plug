@@ -9,6 +9,7 @@ struct GuideView: View {
     /// Close the guide, then do something in the window behind it.
     let leave: (PlugIntent?) -> Void
     @State private var copied = false
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     /// The step number or the sparkle at the start of a row.
     private static let markWidth: CGFloat = 24
@@ -79,14 +80,21 @@ struct GuideView: View {
         return HStack(alignment: .top, spacing: Metric.snug) {
             Group {
                 if done {
-                    PlugIcon(.worked, size: 22).foregroundStyle(StatusColor.working)
+                    PlugIcon(.worked, size: 22)
+                        .foregroundStyle(StatusColor.working)
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
                 } else {
-                    Image(systemName: "\(number).circle")
-                        .font(.title3)
+                    Text("\(number)")
+                        .font(.callout.weight(.semibold).monospacedDigit())
                         .foregroundStyle(.secondary)
+                        .frame(width: 22, height: 22)
+                        .overlay(Circle().strokeBorder(.secondary, lineWidth: 1.5))
+                        .transition(.scale(scale: 0.6).combined(with: .opacity))
                 }
             }
             .frame(width: Self.markWidth)
+            // The number turns into the tick; it does not swap.
+            .animation(reduceMotion ? nil : .snappy(duration: 0.3), value: done)
                 .accessibilityLabel(done ? "Done" : "Step \(number)")
             VStack(alignment: .leading, spacing: Metric.hairline) {
                 Text(step.title).font(.body.weight(.medium))
@@ -137,8 +145,7 @@ struct GuideView: View {
     /// The other way to do all three steps: hand the prompt to a client.
     private var setupOffer: some View {
         HStack(alignment: .top, spacing: Metric.snug) {
-            Image(systemName: "sparkles")
-                .font(.title3)
+            PlugIcon(.clients, size: 22)
                 .foregroundStyle(.secondary)
                 .frame(width: Self.markWidth)
                 .accessibilityHidden(true)

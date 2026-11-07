@@ -9,6 +9,12 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Add Server is one sheet whose two steps slide. Each popular server shows its maker's icon. Picking one, or pasting a server Plug can read whole, shows a short card of what Plug understood, with the full form behind More Options. A server that still needs a name or a field opens the form as before. Plug asks each offered server's site for its icon when the sheet opens, and keeps what it finds for a month.
+- Add a Client starts with the clients themselves, each with its icon, the ones that do not use Plug yet first. Picking one slides to how it connects, with Back to choose again. The command or address to paste is shown whole in its own box.
+- Nothing in a sheet is cut off with an ellipsis any more: a web API's operations and document, an imported server's description, a watched tool's summary and the name clients listen for all wrap.
+- Plug's character at the top of the window hops and sparks when a server, a client or an event is added, however it was added.
+- Edit Server and Add Another Account show the server's icon beside the title, and Edit Server's form fades in where the loading dots were. In the first-run guide a step's number turns into its tick, and the numbers are drawn by Plug. A tool's details show its server's icon and its full name on as many lines as it needs.
+- Watch a Tool and Import Servers show Plug's character when there is nothing to pick, and a sheet's error note slides in instead of popping.
 - Remote sign-in no longer offers `subscriptions:listen`, and the consent page no longer says it lets a client receive change notifications. It never controlled anything: subscribing to a resource needs `resources:read`, and events need `events:subscribe`. A token that carries it keeps working, and a client that still asks for it signs in with the rest of what it asked for.
 - `plug auth status --output json` drops `status_scope`, which repeated `status_source`. `plug servers` and `plug` call an OpenAPI server a "Web API", as the app does.
 - `plug`, `plug status` and `plug clients` with `--output json` drop `inventory_partial`, `inventory_unavailable_sources`, `http_sessions_included`, the SSE count in `live_session_transports` (a legacy SSE stream counts as HTTP) and, from `plug`, `live_client_count`, which repeated `live_session_count`. The text output says in one line whether the live list is complete.

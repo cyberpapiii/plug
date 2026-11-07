@@ -59,4 +59,15 @@ final class FirstRunGuideTests: XCTestCase {
         XCTAssertTrue(prompt.contains("plug import --dry-run"))
         XCTAssertTrue(prompt.contains("plug link --yes"))
     }
+
+    func testAddingAnythingCountsAsGrowthAndRemovingDoesNot() {
+        let before = SetupCount(servers: 3, clients: 2, events: 1)
+        XCTAssertTrue(SetupCount(servers: 4, clients: 2, events: 1).grew(from: before))
+        XCTAssertTrue(SetupCount(servers: 3, clients: 3, events: 1).grew(from: before))
+        XCTAssertTrue(SetupCount(servers: 3, clients: 2, events: 2).grew(from: before))
+        XCTAssertFalse(before.grew(from: before))
+        XCTAssertFalse(SetupCount(servers: 2, clients: 2, events: 1).grew(from: before))
+        // One removed and one added in the same look is still an addition.
+        XCTAssertTrue(SetupCount(servers: 2, clients: 3, events: 1).grew(from: before))
+    }
 }

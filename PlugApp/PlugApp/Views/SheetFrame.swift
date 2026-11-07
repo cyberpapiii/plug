@@ -15,6 +15,8 @@ struct SheetFrame<Content: View, Extra: View>: View {
 
     let title: String
     var subtitle: String?
+    /// A picture of what the sheet is about, beside the title.
+    var icon: AnyView?
     /// What went wrong and what to do about it. Stays until the next attempt.
     var failure: SheetFailure?
     /// True while the sheet is saving; it cannot be closed half way.
@@ -28,18 +30,24 @@ struct SheetFrame<Content: View, Extra: View>: View {
     @ViewBuilder var extra: Extra
     @ViewBuilder var content: Content
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: Metric.regular) {
-            VStack(alignment: .leading, spacing: Metric.hairline) {
-                Text(title)
-                    .font(.title2.weight(.semibold))
-                    .accessibilityAddTraits(.isHeader)
-                if let subtitle {
-                    Text(subtitle)
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+            HStack(spacing: Metric.snug) {
+                if let icon {
+                    icon.accessibilityHidden(true)
+                }
+                VStack(alignment: .leading, spacing: Metric.hairline) {
+                    Text(title)
+                        .font(.title2.weight(.semibold))
+                        .accessibilityAddTraits(.isHeader)
+                    if let subtitle {
+                        Text(subtitle)
+                            .font(.callout)
+                            .foregroundStyle(.secondary)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
             }
             .padding(.horizontal, Metric.roomy)
@@ -49,6 +57,7 @@ struct SheetFrame<Content: View, Extra: View>: View {
             if let failure {
                 ProblemNote(failure)
                     .padding(.horizontal, Metric.roomy)
+                    .transition(.opacity.combined(with: .move(edge: .bottom)))
             }
 
             HStack(spacing: Metric.snug) {
@@ -75,6 +84,8 @@ struct SheetFrame<Content: View, Extra: View>: View {
         }
         .padding(.vertical, Metric.roomy)
         .frame(width: Self.width)
+        // What went wrong arrives and leaves; it does not pop.
+        .animation(reduceMotion ? nil : .snappy(duration: 0.25), value: failure)
         .interactiveDismissDisabled(busy)
         .onExitCommand {
             if confirmTitle == nil, !busy { dismiss() }
@@ -86,6 +97,7 @@ extension SheetFrame where Extra == EmptyView {
     init(
         title: String,
         subtitle: String? = nil,
+        icon: AnyView? = nil,
         failure: SheetFailure? = nil,
         busy: Bool = false,
         cancelTitle: String = "Cancel",
@@ -97,6 +109,7 @@ extension SheetFrame where Extra == EmptyView {
         self.init(
             title: title,
             subtitle: subtitle,
+            icon: icon,
             failure: failure,
             busy: busy,
             cancelTitle: cancelTitle,

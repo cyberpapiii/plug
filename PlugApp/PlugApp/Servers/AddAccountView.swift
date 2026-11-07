@@ -29,6 +29,7 @@ struct AddAccountView: View {
         SheetFrame(
             title: "Add Another Account",
             subtitle: "Plug adds \(server) again under its own name.",
+            icon: AnyView(ServerGlyph(name: server, size: 36)),
             failure: failure,
             busy: saving,
             confirmTitle: "Add",
