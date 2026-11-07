@@ -184,9 +184,9 @@ pub struct RegisteredClientSummary {
 }
 
 impl RegisteredClientSummary {
-    /// Whether the client's sign-in never finished, so its registration
-    /// goes by itself [`UNACTIVATED_REGISTRATION_LIFETIME_SECS`] after it
-    /// was made.
+    /// Whether the client's sign-in never finished. A client that
+    /// registered itself then goes by itself
+    /// [`UNACTIVATED_REGISTRATION_LIFETIME_SECS`] after it registered.
     pub fn is_unactivated(&self) -> bool {
         !self.signed_in && self.last_used_at.is_none()
     }
@@ -1811,16 +1811,18 @@ impl DownstreamOauthManager {
             Err(error) => return Err(error),
         };
         validate_metadata_document(client_id, &document)?;
+        self.record_metadata_document_client(client_id, document)
+            .await
+    }
+
+    /// Keep the client `document` describes. A client already known keeps
+    /// when it was first seen and last used: only its document is new.
+    async fn record_metadata_document_client(
+        &self,
+        client_id: &str,
+        document: ClientMetadataDocument,
+    ) -> Result<(), DownstreamOauthError> {
         let now = epoch_secs();
-        let client = RegisteredClient {
-            client_id: client_id.to_string(),
-            client_name: safe_client_name(document.client_name.as_deref()),
-            redirect_uris: document.redirect_uris,
-            source: ClientSource::MetadataDocument,
-            created_at: now,
-            last_used_at: None,
-            expires_at: now + REGISTRATION_LIFETIME_SECS,
-        };
         let mut guard = self.state.lock().await;
         if guard.revoked_client_ids.contains(client_id) {
             return Err(DownstreamOauthError::InvalidClient);
@@ -1830,6 +1832,19 @@ impl DownstreamOauthManager {
         if !next.clients.contains_key(client_id) && next.clients.len() >= MAX_REGISTRATIONS {
             return Err(DownstreamOauthError::RegistrationQuotaExceeded);
         }
+        let known = next
+            .clients
+            .get(client_id)
+            .filter(|client| matches!(client.source, ClientSource::MetadataDocument));
+        let client = RegisteredClient {
+            client_id: client_id.to_string(),
+            client_name: safe_client_name(document.client_name.as_deref()),
+            redirect_uris: document.redirect_uris,
+            source: ClientSource::MetadataDocument,
+            created_at: known.map_or(now, |client| client.created_at),
+            last_used_at: known.and_then(|client| client.last_used_at),
+            expires_at: now + REGISTRATION_LIFETIME_SECS,
+        };
         next.clients.insert(client_id.to_string(), client);
         self.deactivate_principal_lifecycles(&expired);
         self.commit_state(&mut guard, next)?;
@@ -5912,6 +5927,43 @@ mod tests {
                 .iter()
                 .any(|client| client.client_id == expired_id)
         );
+    }
+
+    /// Fetching a known client's document again changes its document, not
+    /// its history: a client that signed in before never reads as unfinished.
+    #[tokio::test]
+    async fn a_refetched_metadata_document_keeps_the_clients_history() {
+        let (manager, _) = test_manager();
+        let client_id = "https://client.example/oauth/client.json";
+        let document = |name: &str| -> ClientMetadataDocument {
+            serde_json::from_value(json!({
+                "client_id": client_id,
+                "client_name": name,
+                "redirect_uris": ["https://client.example/callback"],
+            }))
+            .expect("metadata document")
+        };
+        manager
+            .record_metadata_document_client(client_id, document("First"))
+            .await
+            .unwrap();
+        let (created_at, used_at) = {
+            let mut state = manager.state.lock().await;
+            let client = state.clients.get_mut(client_id).expect("recorded");
+            client.created_at -= 1000;
+            client.last_used_at = Some(client.created_at + 10);
+            (client.created_at, client.last_used_at)
+        };
+
+        manager
+            .record_metadata_document_client(client_id, document("Renamed"))
+            .await
+            .unwrap();
+        let state = manager.state.lock().await;
+        let client = &state.clients[client_id];
+        assert_eq!(client.client_name, "Renamed");
+        assert_eq!(client.created_at, created_at);
+        assert_eq!(client.last_used_at, used_at);
     }
 
     #[tokio::test]
