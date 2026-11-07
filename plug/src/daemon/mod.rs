@@ -2416,7 +2416,7 @@ allowed_servers = ["slack"]
             sessions[0].client_type,
             plug_core::types::ClientType::ClaudeDesktop
         );
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     /// The app and `plug auth clients revoke` revoke over the socket. That
@@ -2551,7 +2551,7 @@ allowed_servers = ["slack"]
         );
 
         drop(claiming);
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -2571,7 +2571,7 @@ allowed_servers = ["slack"]
             "unexpected error: {error}"
         );
 
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
@@ -2602,7 +2602,7 @@ allowed_servers = ["slack"]
         );
 
         drop(first_lock);
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
@@ -2656,7 +2656,7 @@ allowed_servers = ["slack"]
         );
 
         drop(winning_lock);
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     /// `run_daemon` must bind and serve without a started engine, which is what
@@ -2757,7 +2757,7 @@ allowed_servers = ["slack"]
         assert_eq!(token_after, "stable-token");
 
         drop(winning_lock);
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[tokio::test]
@@ -2792,7 +2792,7 @@ allowed_servers = ["slack"]
         let token_after =
             std::fs::read_to_string(&token_file).expect("read token after failed startup");
         assert_eq!(token_after, "stable-token");
-        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
+        let _ = std::fs::remove_dir_all(temp);
     }
 
     #[test]
