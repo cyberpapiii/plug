@@ -194,6 +194,15 @@ pub(crate) async fn request_with_timeout(
         .map_err(|_| IpcClientError::Timeout(timeout))?
 }
 
+/// Every live downstream session, as the daemon reports them; none when it
+/// does not answer.
+pub(crate) async fn live_sessions() -> Vec<plug_core::ipc::IpcLiveSessionInfo> {
+    match request(IpcRequest::ListLiveSessions).await {
+        Ok(IpcResponse::LiveSessions { sessions }) => sessions,
+        _ => Vec::new(),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DaemonQueryAvailability {
     Unreachable,

@@ -3,7 +3,10 @@ use std::collections::HashMap;
 use dialoguer::{Confirm, Input, Password, Select};
 
 use crate::commands::config::load_editable_config;
-use crate::ui::{cli_prompt_theme, print_info_line, print_success_line};
+use crate::ui::{can_prompt_interactively, cli_prompt_theme, print_info_line, print_success_line};
+use crate::views::servers::{
+    configured_servers_json, live_servers_json, print_configured_servers, print_live_servers,
+};
 use crate::{OutputFormat, ServerCommands};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -923,6 +926,141 @@ pub(crate) async fn cmd_server_set_enabled(
         print_success_line(format!("{name} is on."));
     } else {
         print_success_line(format!("{name} is off."));
+    }
+    Ok(())
+}
+
+async fn prompt_server_actions(
+    config_path: Option<&std::path::PathBuf>,
+    output: &OutputFormat,
+) -> anyhow::Result<bool> {
+    let options = [
+        "Done",
+        "Add server",
+        "Edit server",
+        "Remove server",
+        "Enable server",
+        "Disable server",
+    ];
+    let selection = Select::with_theme(&cli_prompt_theme())
+        .with_prompt("Choose action")
+        .items(options)
+        .default(0)
+        .interact_opt()?;
+
+    match selection {
+        Some(1) => {
+            cmd_server_add(
+                config_path,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+                None,
+                Vec::new(),
+                None,
+            )
+            .await?;
+            Ok(true)
+        }
+        Some(2) => {
+            cmd_server_edit(
+                config_path,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                output,
+            )
+            .await?;
+            Ok(true)
+        }
+        Some(3) => {
+            cmd_server_remove(config_path, None, false).await?;
+            Ok(true)
+        }
+        Some(4) => {
+            cmd_server_set_enabled(config_path, None, true).await?;
+            Ok(true)
+        }
+        Some(5) => {
+            cmd_server_set_enabled(config_path, None, false).await?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+pub(crate) async fn cmd_server_list(
+    config_path: Option<&std::path::PathBuf>,
+    output: &OutputFormat,
+) -> anyhow::Result<()> {
+    let interactive = matches!(output, OutputFormat::Text) && can_prompt_interactively();
+
+    loop {
+        let (availability, live_status) = crate::ipc_client::query(
+            plug_core::ipc::IpcRequest::Status,
+            |response| match response {
+                plug_core::ipc::IpcResponse::Status { servers, .. } => Some(servers),
+                _ => None,
+            },
+        )
+        .await;
+        if let Some(servers) = live_status {
+            let config = plug_core::config::load_config(config_path).ok();
+            match output {
+                OutputFormat::Json => {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&live_servers_json(
+                            servers,
+                            config.as_ref(),
+                            availability,
+                        ))?
+                    );
+                    return Ok(());
+                }
+                OutputFormat::Text => print_live_servers(&servers, config.as_ref()),
+            }
+        } else {
+            let config = plug_core::config::load_config(config_path)?;
+            if matches!(output, OutputFormat::Text) {
+                print_configured_servers(
+                    &config,
+                    availability,
+                    !availability.daemon_reachable() && crate::ipc_client::daemon_starting(),
+                );
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&configured_servers_json(&config, availability))?
+                );
+                return Ok(());
+            }
+        }
+
+        if !interactive {
+            break;
+        }
+        println!();
+        if !prompt_server_actions(config_path, output).await? {
+            break;
+        }
+        println!();
     }
     Ok(())
 }

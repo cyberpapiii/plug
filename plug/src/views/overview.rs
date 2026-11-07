@@ -1,23 +1,13 @@
 use dialoguer::console::style;
 use plug_core::clients::LinkTransport;
 
-use crate::OutputFormat;
-use crate::commands::clients::{link_transport, linked_clients, own_http};
-use crate::ipc_client::{self, daemon_running};
+use crate::ipc_client::DaemonQueryAvailability;
 use crate::ui::{
     print_banner, print_heading, print_info_line, print_label_value, print_next_action,
     print_reason, print_warning_line, status_label, status_marker, summarize_server_auth,
     summarize_server_target, summarize_server_transport,
 };
-use crate::views::live::{self, fetch_live_sessions};
-
-/// Each linked client's slug and the transport its link uses.
-fn linked_topology(config: Option<&plug_core::config::Config>) -> Vec<(String, LinkTransport)> {
-    linked_clients(&own_http(config))
-        .into_iter()
-        .map(|(target, entry)| (target.slug().to_string(), link_transport(&entry)))
-        .collect()
-}
+use crate::views::live;
 
 fn linked_client_transport_summary(linked_clients: &[(String, LinkTransport)]) -> String {
     let count = |kind: LinkTransport| {
@@ -31,13 +21,6 @@ fn linked_client_transport_summary(linked_clients: &[(String, LinkTransport)]) -
         count(LinkTransport::Stdio),
         count(LinkTransport::Http)
     )
-}
-
-fn owner_approval_state(
-    config: &plug_core::config::Config,
-) -> Option<plug_core::downstream_oauth::OwnerEnrollmentStatus> {
-    plug_core::downstream_oauth::DownstreamOauthConfig::from_http_config(&config.http)
-        .map(|oauth| plug_core::downstream_oauth::inspect_owner_enrollment(&oauth))
 }
 
 fn owner_approval_summary(
@@ -84,7 +67,7 @@ fn owner_approval_json(
 }
 
 /// What to run next, each with why. Text and JSON both show this list.
-fn overview_next_actions(
+pub(crate) fn overview_next_actions(
     config_exists: bool,
     linked_clients_empty: bool,
     daemon_running: bool,
@@ -134,7 +117,7 @@ fn print_next_actions(actions: &[(&str, &str)]) {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn overview_json(
+pub(crate) fn overview_json(
     config_exists: bool,
     config_path: &std::path::Path,
     daemon_running: bool,
@@ -184,65 +167,29 @@ fn status_json(
     })
 }
 
-pub(crate) async fn cmd_overview(
-    config_path: Option<&std::path::PathBuf>,
-    output: &OutputFormat,
-) -> anyhow::Result<()> {
-    let config_path = config_path
-        .cloned()
-        .unwrap_or_else(plug_core::paths::default_config_path);
-    let config_exists = config_path.exists();
-    let loaded = if config_exists {
-        plug_core::config::load_config(Some(&config_path)).ok()
-    } else {
-        None
-    };
-    let linked = linked_topology(loaded.as_ref());
-    let linked_clients: Vec<String> = linked.iter().map(|(target, _)| target.clone()).collect();
-    let live_clients = fetch_live_sessions().await;
-    let live_client_count = live_clients.len();
-    let inventory = live::inventory(&live_clients);
-
-    if matches!(output, OutputFormat::Json) {
-        let daemon_running = crate::ipc_client::daemon_running().await;
-        let config = loaded;
-        let server_count = config.as_ref().map(|c| c.servers.len()).unwrap_or(0);
-        let owner_approval = config.as_ref().and_then(owner_approval_state);
-        let next_actions = overview_next_actions(
-            config_exists,
-            linked_clients.is_empty(),
-            daemon_running,
-            owner_approval,
-        );
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&overview_json(
-                config_exists,
-                &config_path,
-                daemon_running,
-                server_count,
-                &linked_clients,
-                &inventory,
-                owner_approval,
-                &next_actions,
-            ))?
-        );
-        return Ok(());
-    }
-
+pub(crate) fn print_overview_banner() {
     print_banner("◆", "plug", "MCP gateway");
+}
 
-    if !config_exists {
-        print_heading("Overview");
-        print_label_value("Config", style("not found").yellow().bold());
-        print_label_value("Path", style(config_path.display()).dim());
-        println!();
-        print_next_actions(&overview_next_actions(false, true, false, None));
-        return Ok(());
-    }
+/// `plug` with no command when there is no config yet.
+pub(crate) fn print_overview_without_config(config_path: &std::path::Path) {
+    print_heading("Overview");
+    print_label_value("Config", style("not found").yellow().bold());
+    print_label_value("Path", style(config_path.display()).dim());
+    println!();
+    print_next_actions(&overview_next_actions(false, true, false, None));
+}
 
-    let config = plug_core::config::load_config(Some(&config_path))?;
-    let daemon_running = crate::ipc_client::daemon_running().await;
+/// `plug` with no command, after the banner.
+pub(crate) fn print_overview(
+    config_path: &std::path::Path,
+    config: &plug_core::config::Config,
+    linked: &[(String, LinkTransport)],
+    inventory: &live::LiveInventory,
+    daemon_running: bool,
+    daemon_starting: bool,
+    owner_approval: Option<plug_core::downstream_oauth::OwnerEnrollmentStatus>,
+) {
     let transport_counts =
         config
             .servers
@@ -257,7 +204,6 @@ pub(crate) async fn cmd_overview(
                 acc
             });
     let downstream_auth_mode = config.http.auth_mode.label();
-    let owner_approval = owner_approval_state(&config);
     let downstream_http_endpoint = config.http.mcp_url();
     let downstream_auth_summary = match config.http.auth_mode {
         plug_core::config::DownstreamAuthMode::Auto => {
@@ -282,14 +228,14 @@ pub(crate) async fn cmd_overview(
             transport_counts.0, transport_counts.1, transport_counts.2
         ),
     );
-    print_label_value("Linked Clients", style(linked_clients.len()).bold());
-    print_label_value("Live", style(live_client_count).bold());
+    print_label_value("Linked Clients", style(linked.len()).bold());
+    print_label_value("Live", style(inventory.session_count).bold());
     print_label_value("Live Transports", inventory.session_transports.summary());
     print_label_value(
         "Service",
         if daemon_running {
             style("running").green().bold()
-        } else if crate::ipc_client::daemon_starting() {
+        } else if daemon_starting {
             style("starting").yellow().bold()
         } else {
             style("stopped").yellow().bold()
@@ -331,369 +277,347 @@ pub(crate) async fn cmd_overview(
             .iter()
             .map(|(target, transport)| format!("{target} ({transport})"))
             .collect::<Vec<_>>();
-        print_label_value("Linked Topology", linked_client_transport_summary(&linked));
+        print_label_value("Linked Topology", linked_client_transport_summary(linked));
         print_label_value("Linked Clients", linked_descriptions.join(", "));
     }
 
     println!();
     print_next_actions(&overview_next_actions(
         true,
-        linked_clients.is_empty(),
+        linked.is_empty(),
         daemon_running,
         owner_approval,
     ));
-
-    Ok(())
 }
 
-pub(crate) async fn cmd_status(
-    config_path: Option<&std::path::PathBuf>,
-    output: &OutputFormat,
-    show_token: bool,
-    verbose: bool,
-) -> anyhow::Result<()> {
-    let daemon_running = daemon_running().await;
+/// Whether the HTTP token file exists, and the token when it was asked for.
+pub(crate) type HttpAuthState = (bool, Option<String>);
 
-    let config = plug_core::config::load_config(config_path).ok();
-    let linked_clients = linked_topology(config.as_ref());
-    let downstream_auth_info = config.as_ref().map(|c| {
-        let mode = c.http.auth_mode.label();
-        let summary = match c.http.auth_mode {
-            plug_core::config::DownstreamAuthMode::Auto => {
-                if c.http.requires_bearer() {
-                    "reachable off this Mac => bearer".to_string()
-                } else {
-                    "loopback => no auth".to_string()
-                }
-            }
-            plug_core::config::DownstreamAuthMode::None => "explicit none".to_string(),
-            plug_core::config::DownstreamAuthMode::Bearer => "explicit bearer".to_string(),
-            plug_core::config::DownstreamAuthMode::Oauth => "authorization-code + PKCE".to_string(),
-        };
-        let endpoint = c.http.mcp_url();
-        (
-            mode.to_string(),
-            summary,
-            c.http.public_base_url.clone(),
-            endpoint,
-        )
-    });
-    let http_auth_info = config.as_ref().and_then(|c| {
-        if !c.http.requires_bearer() {
-            return None;
-        }
+/// What `plug status` shows while the daemon answers.
+pub(crate) struct LiveStatus {
+    pub(crate) servers: Vec<plug_core::types::ServerStatus>,
+    pub(crate) daemon_proxy_clients: usize,
+    pub(crate) uptime_secs: u64,
+    pub(crate) runtime_version: String,
+    pub(crate) resource_subscriptions: usize,
+    pub(crate) inventory: live::LiveInventory,
+    pub(crate) daemon_running: bool,
+    pub(crate) config: Option<plug_core::config::Config>,
+    pub(crate) linked_clients: Vec<(String, LinkTransport)>,
+    pub(crate) http_auth: Option<HttpAuthState>,
+}
 
-        let token_path = plug_core::auth::http_auth_token_path(c.http.port);
-        let token = if show_token {
-            std::fs::read_to_string(&token_path)
-                .ok()
-                .map(|t| t.trim().to_string())
-        } else {
-            None
-        };
-        Some((token_path.exists(), token))
-    });
-
-    let (status_availability, live_status) = ipc_client::query(
-        plug_core::ipc::IpcRequest::Status,
-        |response| match response {
-            plug_core::ipc::IpcResponse::Status {
-                servers,
-                clients,
-                uptime_secs,
-                runtime_version,
-                resource_subscriptions,
-            } => Some((
-                servers,
-                clients,
-                uptime_secs,
-                runtime_version,
-                resource_subscriptions,
-            )),
-            _ => None,
-        },
-    )
-    .await;
-
-    if let Some((servers, clients, uptime_secs, runtime_version, resource_subscriptions)) =
-        live_status
-    {
-        let live_sessions = fetch_live_sessions().await;
-        let inventory = live::inventory(&live_sessions);
-        if matches!(output, OutputFormat::Text) {
-            print_banner("◆", "Plug", "Plug is running");
-            print_heading("Plug");
-            print_label_value(
-                "Status",
-                style(format!(
-                    "Running for {}",
-                    crate::ui::format_duration(uptime_secs)
-                ))
-                .green()
-                .bold(),
-            );
-            print_label_value(
-                "Clients",
-                format!(
-                    "{} connected now, {} set up",
-                    inventory.session_count,
-                    linked_clients.len()
-                ),
-            );
-            if let Some((_, _, Some(public_base_url), _)) = &downstream_auth_info {
-                print_label_value("Remote address", public_base_url);
-            }
-            if verbose {
-                println!();
-                print_heading("Detail");
-                print_label_value(
-                    "Live Sessions",
-                    style(inventory.session_count.to_string()).bold(),
-                );
-                print_label_value("Live Transports", inventory.session_transports.summary());
-                // Resource subscriptions are held by the runtime on behalf of
-                // downstream clients and are otherwise invisible from the CLI, so
-                // there is no way to tell a client that subscribed and went quiet
-                // from one that never subscribed at all.
-                print_label_value(
-                    "Subscriptions",
-                    style(resource_subscriptions.to_string()).bold(),
-                );
-                if !linked_clients.is_empty() {
-                    print_label_value("Linked Clients", style(linked_clients.len()).bold());
-                    print_label_value(
-                        "Linked Topology",
-                        linked_client_transport_summary(&linked_clients),
-                    );
-                    let linked_summary = linked_clients
-                        .iter()
-                        .map(|(target, transport)| format!("{target} ({transport})"))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    print_label_value("Linked Detail", linked_summary);
-                }
-                if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
-                    print_label_value(
-                        "Downstream Auth",
-                        if mode == "auto" {
-                            style(format!("{mode} ({summary})")).bold()
-                        } else {
-                            style(format!("{mode} ({summary})")).yellow().bold()
-                        },
-                    );
-                    print_label_value("HTTP Endpoint", endpoint);
-                    if let Some(public_base_url) = public_base_url {
-                        print_label_value("Public URL", public_base_url);
-                    }
-                }
-
-                if let Some((token_exists, token)) = &http_auth_info {
-                    match (*token_exists, token) {
-                        (true, Some(t)) => print_label_value(
-                            "HTTP Auth",
-                            style(format!("enabled | Token: {t}")).green().bold(),
-                        ),
-                        (true, None) => print_label_value(
-                            "HTTP Auth",
-                            style("enabled (use --show-token to reveal)").green().bold(),
-                        ),
-                        (false, _) => {
-                            print_label_value("HTTP Auth", style("NOT CONFIGURED").red().bold())
-                        }
-                    }
-                }
-            }
-
-            println!();
-            if servers.is_empty() {
-                print_heading("Servers");
-                println!("  No servers configured.");
+/// Mode, summary, public URL and endpoint of the downstream listener.
+fn downstream_auth_info(c: &plug_core::config::Config) -> (String, String, Option<String>, String) {
+    let mode = c.http.auth_mode.label();
+    let summary = match c.http.auth_mode {
+        plug_core::config::DownstreamAuthMode::Auto => {
+            if c.http.requires_bearer() {
+                "reachable off this Mac => bearer".to_string()
             } else {
-                let config_by_server = config.as_ref().map(|cfg| &cfg.servers);
-                let auth_required_servers = servers
-                    .iter()
-                    .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
-                    .filter(|s| matches!(s.health, plug_core::types::ServerHealth::AuthRequired))
-                    .map(|s| s.server_id.clone())
-                    .collect::<Vec<_>>();
-                let failed_servers = servers
-                    .iter()
-                    .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
-                    .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
-                    .map(|s| s.server_id.clone())
-                    .collect::<Vec<_>>();
-                print_heading("Servers");
-                for s in &servers {
-                    if s.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
-                        continue;
-                    }
-                    let server_cfg = config_by_server.and_then(|servers| servers.get(&s.server_id));
-                    if verbose {
-                        println!(
-                            "  {} {:<18} {:<14} {:<8} {:<6} {:<28} {:>5}",
-                            status_marker(&s.health),
-                            s.server_id,
-                            status_label(&s.health),
-                            summarize_server_transport(server_cfg),
-                            summarize_server_auth(server_cfg),
-                            summarize_server_target(server_cfg, 28),
-                            s.tool_count
-                        );
-                    } else {
-                        println!(
-                            "  {} {:<18} {:<14} {:<16} {:>4} tools",
-                            status_marker(&s.health),
-                            s.server_id,
-                            status_label(&s.health),
-                            crate::ui::server_place(server_cfg),
-                            s.tool_count
-                        );
-                    }
-                    print_reason(s);
-                }
-
-                if !auth_required_servers.is_empty() || !failed_servers.is_empty() {
-                    println!();
-                    print_heading("Needs you");
-                    for name in &auth_required_servers {
-                        print_info_line(format!(
-                            "{name} needs a sign-in. Run `plug auth login --server {name}`."
-                        ));
-                    }
-                    for name in &failed_servers {
-                        print_info_line(format!(
-                            "{name} is down. The reason is under its name; Plug keeps trying."
-                        ));
-                    }
-                }
-                if !verbose {
-                    println!();
-                    print_info_line("`plug status -v` adds connections and addresses.");
-                }
+                "loopback => no auth".to_string()
             }
-        } else {
-            let mut json_obj = status_json(
-                uptime_secs,
-                clients,
-                &inventory,
-                &servers,
-                true,
-                crate::ipc_client::DaemonQueryAvailability::Available.status_source(),
-                daemon_running,
-                resource_subscriptions,
+        }
+        plug_core::config::DownstreamAuthMode::None => "explicit none".to_string(),
+        plug_core::config::DownstreamAuthMode::Bearer => "explicit bearer".to_string(),
+        plug_core::config::DownstreamAuthMode::Oauth => "authorization-code + PKCE".to_string(),
+    };
+    let endpoint = c.http.mcp_url();
+    (
+        mode.to_string(),
+        summary,
+        c.http.public_base_url.clone(),
+        endpoint,
+    )
+}
+
+pub(crate) fn print_live_status(status: &LiveStatus, verbose: bool) {
+    let LiveStatus {
+        servers,
+        uptime_secs,
+        resource_subscriptions,
+        inventory,
+        config,
+        linked_clients,
+        http_auth,
+        ..
+    } = status;
+    let downstream_auth_info = config.as_ref().map(downstream_auth_info);
+    print_banner("◆", "Plug", "Plug is running");
+    print_heading("Plug");
+    print_label_value(
+        "Status",
+        style(format!(
+            "Running for {}",
+            crate::ui::format_duration(*uptime_secs)
+        ))
+        .green()
+        .bold(),
+    );
+    print_label_value(
+        "Clients",
+        format!(
+            "{} connected now, {} set up",
+            inventory.session_count,
+            linked_clients.len()
+        ),
+    );
+    if let Some((_, _, Some(public_base_url), _)) = &downstream_auth_info {
+        print_label_value("Remote address", public_base_url);
+    }
+    if verbose {
+        println!();
+        print_heading("Detail");
+        print_label_value(
+            "Live Sessions",
+            style(inventory.session_count.to_string()).bold(),
+        );
+        print_label_value("Live Transports", inventory.session_transports.summary());
+        // Resource subscriptions are held by the runtime on behalf of
+        // downstream clients and are otherwise invisible from the CLI, so
+        // there is no way to tell a client that subscribed and went quiet
+        // from one that never subscribed at all.
+        print_label_value(
+            "Subscriptions",
+            style(resource_subscriptions.to_string()).bold(),
+        );
+        if !linked_clients.is_empty() {
+            print_label_value("Linked Clients", style(linked_clients.len()).bold());
+            print_label_value(
+                "Linked Topology",
+                linked_client_transport_summary(linked_clients),
             );
-            json_obj["runtime_version"] = serde_json::json!(runtime_version);
-            if !linked_clients.is_empty() {
-                json_obj["linked_clients"] = serde_json::json!(
-                    linked_clients
-                        .iter()
-                        .map(|(target, transport)| serde_json::json!({
-                            "target": target,
-                            "transport": transport,
-                        }))
-                        .collect::<Vec<_>>()
+            let linked_summary = linked_clients
+                .iter()
+                .map(|(target, transport)| format!("{target} ({transport})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            print_label_value("Linked Detail", linked_summary);
+        }
+        if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
+            print_label_value(
+                "Downstream Auth",
+                if mode == "auto" {
+                    style(format!("{mode} ({summary})")).bold()
+                } else {
+                    style(format!("{mode} ({summary})")).yellow().bold()
+                },
+            );
+            print_label_value("HTTP Endpoint", endpoint);
+            if let Some(public_base_url) = public_base_url {
+                print_label_value("Public URL", public_base_url);
+            }
+        }
+
+        if let Some((token_exists, token)) = http_auth {
+            match (*token_exists, token) {
+                (true, Some(t)) => print_label_value(
+                    "HTTP Auth",
+                    style(format!("enabled | Token: {t}")).green().bold(),
+                ),
+                (true, None) => print_label_value(
+                    "HTTP Auth",
+                    style("enabled (use --show-token to reveal)").green().bold(),
+                ),
+                (false, _) => print_label_value("HTTP Auth", style("NOT CONFIGURED").red().bold()),
+            }
+        }
+    }
+
+    println!();
+    if servers.is_empty() {
+        print_heading("Servers");
+        println!("  No servers configured.");
+    } else {
+        let config_by_server = config.as_ref().map(|cfg| &cfg.servers);
+        let auth_required_servers = servers
+            .iter()
+            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
+            .filter(|s| matches!(s.health, plug_core::types::ServerHealth::AuthRequired))
+            .map(|s| s.server_id.clone())
+            .collect::<Vec<_>>();
+        let failed_servers = servers
+            .iter()
+            .filter(|s| s.server_id != plug_core::tool_naming::INTERNAL_SERVER_ID)
+            .filter(|s| matches!(s.health, plug_core::types::ServerHealth::Failed))
+            .map(|s| s.server_id.clone())
+            .collect::<Vec<_>>();
+        print_heading("Servers");
+        for s in servers {
+            if s.server_id == plug_core::tool_naming::INTERNAL_SERVER_ID {
+                continue;
+            }
+            let server_cfg = config_by_server.and_then(|servers| servers.get(&s.server_id));
+            if verbose {
+                println!(
+                    "  {} {:<18} {:<14} {:<8} {:<6} {:<28} {:>5}",
+                    status_marker(&s.health),
+                    s.server_id,
+                    status_label(&s.health),
+                    summarize_server_transport(server_cfg),
+                    summarize_server_auth(server_cfg),
+                    summarize_server_target(server_cfg, 28),
+                    s.tool_count
+                );
+            } else {
+                println!(
+                    "  {} {:<18} {:<14} {:<16} {:>4} tools",
+                    status_marker(&s.health),
+                    s.server_id,
+                    status_label(&s.health),
+                    crate::ui::server_place(server_cfg),
+                    s.tool_count
                 );
             }
-            if let Some((mode, summary, public_base_url, endpoint)) = &downstream_auth_info {
-                json_obj["downstream_auth"] = serde_json::json!({
-                    "mode": mode,
-                    "summary": summary,
-                    "public_base_url": public_base_url,
-                    "http_endpoint": endpoint,
-                });
-            }
-            if let Some((token_exists, token)) = &http_auth_info {
-                json_obj["http_auth"] = serde_json::json!({
-                    "enabled": *token_exists,
-                    "token": token,
-                });
-            }
-            println!("{}", serde_json::to_string_pretty(&json_obj)?);
+            print_reason(s);
         }
-        return Ok(());
-    }
 
-    let config = plug_core::config::load_config(config_path)?;
-    if matches!(output, OutputFormat::Text) {
-        print_banner("◆", "Plug", "Plug is not running");
-        println!();
-        if status_availability.daemon_reachable() {
-            print_warning_line(
-                "Plug answered but could not say how its servers are doing. Run `plug doctor`.",
-            );
-        } else {
-            print_warning_line(
-                "Open Plug.app or run `plug start`. The servers below come from the settings file.",
-            );
+        if !auth_required_servers.is_empty() || !failed_servers.is_empty() {
+            println!();
+            print_heading("Needs you");
+            for name in &auth_required_servers {
+                print_info_line(format!(
+                    "{name} needs a sign-in. Run `plug auth login --server {name}`."
+                ));
+            }
+            for name in &failed_servers {
+                print_info_line(format!(
+                    "{name} is down. The reason is under its name; Plug keeps trying."
+                ));
+            }
         }
-        println!();
-        print_heading("Servers in the settings file");
-        println!(
-            "  {:<18} {:<8} {:<6} {:<28} {}",
-            style("SERVER").dim(),
-            style("UPSTREAM").dim(),
-            style("AUTH").dim(),
-            style("TARGET").dim(),
-            style("STATE").dim()
-        );
-        println!(
-            "  {}",
-            style(
-                "-------------------------------------------------------------------------------"
-            )
-            .dim()
-        );
-        let mut names: Vec<_> = config.servers.keys().collect();
-        names.sort();
-        for n in names {
-            let server = config.servers.get(n);
-            println!(
-                "  {} {:<18} {:<8} {:<6} {:<28} {}",
-                if server.map(|server| server.enabled).unwrap_or(true) {
-                    style("·").dim()
-                } else {
-                    style("!").yellow().bold()
-                },
-                n,
-                summarize_server_transport(server),
-                summarize_server_auth(server),
-                summarize_server_target(server, 28),
-                if server.map(|server| server.enabled).unwrap_or(true) {
-                    style("on").dim()
-                } else {
-                    style("off").yellow()
-                }
-            );
+        if !verbose {
+            println!();
+            print_info_line("`plug status -v` adds connections and addresses.");
         }
-    } else {
-        let servers = config
-            .servers
-            .iter()
-            .map(|(server_id, server)| {
-                serde_json::json!({
-                    "server_id": server_id,
-                    "health": serde_json::Value::Null,
-                    "tool_count": 0,
-                    "auth_status": serde_json::Value::Null,
-                    "configured": true,
-                    "enabled": server.enabled,
-                    "status_source": super::status_source(status_availability),
-                })
-            })
-            .collect::<Vec<_>>();
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({
-                "uptime": 0,
-                "clients": 0,
-                "runtime_available": false,
-                "status_source": super::status_source(status_availability),
-                "servers": servers,
-                "daemon_running": status_availability.daemon_reachable()
-            }))?
+    }
+}
+
+pub(crate) fn live_status_json(status: &LiveStatus) -> serde_json::Value {
+    let mut json_obj = status_json(
+        status.uptime_secs,
+        status.daemon_proxy_clients,
+        &status.inventory,
+        &status.servers,
+        true,
+        crate::ipc_client::DaemonQueryAvailability::Available.status_source(),
+        status.daemon_running,
+        status.resource_subscriptions,
+    );
+    json_obj["runtime_version"] = serde_json::json!(status.runtime_version);
+    if !status.linked_clients.is_empty() {
+        json_obj["linked_clients"] = serde_json::json!(
+            status
+                .linked_clients
+                .iter()
+                .map(|(target, transport)| serde_json::json!({
+                    "target": target,
+                    "transport": transport,
+                }))
+                .collect::<Vec<_>>()
         );
     }
-    Ok(())
+    if let Some((mode, summary, public_base_url, endpoint)) =
+        status.config.as_ref().map(downstream_auth_info)
+    {
+        json_obj["downstream_auth"] = serde_json::json!({
+            "mode": mode,
+            "summary": summary,
+            "public_base_url": public_base_url,
+            "http_endpoint": endpoint,
+        });
+    }
+    if let Some((token_exists, token)) = &status.http_auth {
+        json_obj["http_auth"] = serde_json::json!({
+            "enabled": *token_exists,
+            "token": token,
+        });
+    }
+    json_obj
+}
+
+/// `plug status` from the config alone, when the daemon could not say.
+pub(crate) fn print_offline_status(
+    config: &plug_core::config::Config,
+    availability: DaemonQueryAvailability,
+) {
+    print_banner("◆", "Plug", "Plug is not running");
+    println!();
+    if availability.daemon_reachable() {
+        print_warning_line(
+            "Plug answered but could not say how its servers are doing. Run `plug doctor`.",
+        );
+    } else {
+        print_warning_line(
+            "Open Plug.app or run `plug start`. The servers below come from the settings file.",
+        );
+    }
+    println!();
+    print_heading("Servers in the settings file");
+    println!(
+        "  {:<18} {:<8} {:<6} {:<28} {}",
+        style("SERVER").dim(),
+        style("UPSTREAM").dim(),
+        style("AUTH").dim(),
+        style("TARGET").dim(),
+        style("STATE").dim()
+    );
+    println!(
+        "  {}",
+        style("-------------------------------------------------------------------------------")
+            .dim()
+    );
+    let mut names: Vec<_> = config.servers.keys().collect();
+    names.sort();
+    for n in names {
+        let server = config.servers.get(n);
+        println!(
+            "  {} {:<18} {:<8} {:<6} {:<28} {}",
+            if server.map(|server| server.enabled).unwrap_or(true) {
+                style("·").dim()
+            } else {
+                style("!").yellow().bold()
+            },
+            n,
+            summarize_server_transport(server),
+            summarize_server_auth(server),
+            summarize_server_target(server, 28),
+            if server.map(|server| server.enabled).unwrap_or(true) {
+                style("on").dim()
+            } else {
+                style("off").yellow()
+            }
+        );
+    }
+}
+
+pub(crate) fn offline_status_json(
+    config: &plug_core::config::Config,
+    availability: DaemonQueryAvailability,
+) -> serde_json::Value {
+    let servers = config
+        .servers
+        .iter()
+        .map(|(server_id, server)| {
+            serde_json::json!({
+                "server_id": server_id,
+                "health": serde_json::Value::Null,
+                "tool_count": 0,
+                "auth_status": serde_json::Value::Null,
+                "configured": true,
+                "enabled": server.enabled,
+                "status_source": super::status_source(availability),
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "uptime": 0,
+        "clients": 0,
+        "runtime_available": false,
+        "status_source": super::status_source(availability),
+        "servers": servers,
+        "daemon_running": availability.daemon_reachable()
+    })
 }
 
 #[cfg(test)]
