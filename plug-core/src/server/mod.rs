@@ -4048,6 +4048,45 @@ mod tests {
         assert!(mgr.server_statuses().is_empty());
     }
 
+    /// Every client with a published ceiling is served no more tools than
+    /// it accepts, and the rest the whole catalog.
+    #[tokio::test]
+    async fn each_capped_client_gets_its_ceiling() {
+        let router = crate::proxy::ToolRouter::linked(RouterConfig {
+            tool_filter_enabled: true,
+            ..RouterConfig::default()
+        });
+        let ceiling = crate::clients::TOOL_LIMITS
+            .iter()
+            .map(|entry| entry.limit)
+            .max()
+            .expect("some client has a ceiling");
+        let tools = (0..ceiling + 10)
+            .map(|i| make_tool(&format!("tool_{i:03}")))
+            .collect();
+        let (upstream, _server) = connect_mutable_tool_upstream("big", tools, no_events()).await;
+        router
+            .server_manager()
+            .replace_server("big", upstream)
+            .await;
+        router.refresh_tools().await;
+
+        for entry in crate::clients::TOOL_LIMITS {
+            assert_eq!(
+                router.list_tools_for_client(entry.client).len(),
+                entry.limit,
+                "{}",
+                entry.client
+            );
+        }
+        assert!(
+            router
+                .list_tools_for_client(crate::types::ClientType::ClaudeCode)
+                .len()
+                > ceiling
+        );
+    }
+
     #[tokio::test]
     async fn upstream_tool_list_changed_refreshes_router_and_notifies_downstream() {
         let router = crate::proxy::ToolRouter::linked(RouterConfig::default());

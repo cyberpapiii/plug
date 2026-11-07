@@ -7,11 +7,13 @@
 
 mod layout;
 mod lazy;
+mod limits;
 
 use std::path::{Path, PathBuf};
 
 pub use layout::{EntryShape, FileFormat, Layout, PlugLink, ServerEntry};
 pub use lazy::lazy_tool_policy;
+pub use limits::{ClientToolLimit, TOOL_LIMITS};
 
 use crate::types::ClientType;
 

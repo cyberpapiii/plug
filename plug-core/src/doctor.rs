@@ -470,15 +470,19 @@ async fn check_server_binaries(config: &Config) -> CheckResult {
     let login_path = crate::server::path::stdio_login_path().await;
     server_binaries_result(
         config,
-        |binary| which(binary, login_path),
+        |command| {
+            let path = crate::server::path::resolve_stdio_command(command, login_path);
+            path.is_file().then_some(path)
+        },
         crate::server::path::resolve_without_login_shell,
     )
 }
 
-/// `resolve` finds a binary the way this shell does. `resolve_fallback` finds
-/// it the way the daemon does when its login-shell PATH probe fails, which
-/// happens after a reboot on a slow login. A binary only the first finds is a
-/// server that will not start after some reboots, so it earns a warning.
+/// `resolve` finds a server's whole `command` the way the daemon does.
+/// `resolve_fallback` finds a bare name the way the daemon does when its
+/// login-shell PATH probe fails, which happens after a reboot on a slow login.
+/// A name only the first finds is a server that will not start after some
+/// reboots, so it earns a warning.
 fn server_binaries_result(
     config: &Config,
     resolve: impl Fn(&str) -> Option<std::path::PathBuf>,
@@ -498,27 +502,23 @@ fn server_binaries_result(
         if !matches!(server.transport, TransportType::Stdio) {
             continue;
         }
-        if let Some(ref cmd) = server.command {
-            // Extract the actual binary name (first word, skip env var refs)
-            let binary = cmd.split_whitespace().next().unwrap_or(cmd);
-            if binary.starts_with('$') {
-                continue; // Skip env var references
+        let Some(command) = server.command.as_deref() else {
+            continue;
+        };
+        // An unset `$NAME` is the env var check's to report.
+        if command.starts_with('$') {
+            continue;
+        }
+        match resolve(command) {
+            None => missing.push(format!("{server_name}: {command}")),
+            Some(found)
+                if check_fallback
+                    && crate::server::path::is_bare_name(command)
+                    && resolve_fallback(command).is_none() =>
+            {
+                login_shell_only.push(format!("{server_name}: {command} ({})", found.display()));
             }
-            // Check if it's an absolute path
-            if binary.starts_with('/') || binary.starts_with('.') {
-                if !Path::new(binary).exists() {
-                    missing.push(format!("{server_name}: {binary}"));
-                }
-            } else {
-                match resolve(binary) {
-                    None => missing.push(format!("{server_name}: {binary}")),
-                    Some(found) if check_fallback && resolve_fallback(binary).is_none() => {
-                        login_shell_only
-                            .push(format!("{server_name}: {binary} ({})", found.display()));
-                    }
-                    Some(_) => {}
-                }
-            }
+            Some(_) => {}
         }
     }
 
@@ -551,60 +551,6 @@ fn server_binaries_result(
     }
 }
 
-fn which(binary: &str, login_path: Option<&std::ffi::OsStr>) -> Option<std::path::PathBuf> {
-    let path = crate::server::path::resolve_stdio_command(binary, login_path);
-    path.is_file().then_some(path)
-}
-
-/// A published ceiling on how many MCP tools one client will accept at once.
-struct ClientToolLimit {
-    /// The ceiling is only raised for a client that is actually pointed at
-    /// plug.
-    target: crate::clients::ClientTarget,
-    limit: usize,
-    /// Date this entry was last checked against `source`, `YYYY-MM-DD`.
-    verified: &'static str,
-    /// The page that was read. Primary vendor documentation where one exists.
-    source: &'static str,
-}
-
-/// Known per-client tool ceilings.
-///
-/// These are other products' limits, not plug's. They move when those products
-/// move, and a number compiled in here goes stale silently — nothing fails, the
-/// check just starts asserting something untrue. That already happened once:
-/// the table shipped on 2026-03-04 with `("Cursor", 40)` and was still claiming
-/// it five months later, long after Cursor had dropped the cap.
-///
-/// So every entry carries the date it was last checked and the page that was
-/// read. Re-verify before trusting one, and move `verified` when you do. A
-/// client that publishes no fixed ceiling does not belong in this table —
-/// omitting it is the accurate answer, and inventing a number to fill the row
-/// is how the Cursor entry got there.
-///
-/// Deliberately absent, each confirmed 2026-08-08:
-/// - **Cursor.** Older versions warned above roughly 40-50 tools. Current
-///   versions use Dynamic Context Discovery and publish no ceiling;
-///   <https://cursor.com/docs/context/mcp> states no limit.
-/// - **Claude Code, Codex CLI, Grok Build.** No published ceiling.
-/// - **Devin.** The `devin` target writes `~/.config/devin/mcp_config.json`,
-///   which the Devin CLI and Devin Desktop's default agent read, and neither
-///   publishes a ceiling;
-///   <https://docs.devin.ai/cli/extensibility/mcp/configuration> (2026-10-03).
-///   Cascade, the desktop app's legacy agent, caps at 100
-///   (<https://docs.devin.ai/desktop/cascade/mcp>), but it reads the old
-///   Windsurf file that plug no longer writes, so a linked `devin` target says
-///   nothing about Cascade. `ClientType::Devin` still carries that 100 for the
-///   session filter, keyed on the `windsurf-client` identity Cascade reports.
-const KNOWN_CLIENT_TOOL_LIMITS: &[ClientToolLimit] = &[ClientToolLimit {
-    target: crate::clients::ClientTarget::VSCodeCopilot,
-    limit: 128,
-    verified: "2026-08-30",
-    // Hard cap enforced per request; `github.copilot.chat.virtualTools.threshold`
-    // itself caps at 128, and extra tools are deferred behind `activate_*` stubs.
-    source: "https://github.com/microsoft/vscode/issues/290356",
-}];
-
 /// Each settings file of `target` that exists, with its contents.
 fn client_files(target: crate::clients::ClientTarget) -> Vec<(std::path::PathBuf, String)> {
     [crate::clients::Scope::User, crate::clients::Scope::Project]
@@ -631,14 +577,17 @@ fn client_is_linked_to_plug(target: crate::clients::ClientTarget) -> bool {
 /// clients are pointed at plug, so that is what it reports. The real total is
 /// `plug status`, which counts tools the servers actually returned.
 fn check_client_limits() -> CheckResult {
-    let linked = KNOWN_CLIENT_TOOL_LIMITS
+    let linked = crate::clients::TOOL_LIMITS
         .iter()
-        .filter(|entry| client_is_linked_to_plug(entry.target))
+        .filter(|entry| entry.linked_by.is_some_and(client_is_linked_to_plug))
         .collect();
     client_limits_result(check::CLIENT_LIMITS.to_string(), linked)
 }
 
-fn client_limits_result(name: String, linked: Vec<&ClientToolLimit>) -> CheckResult {
+fn client_limits_result(
+    name: String,
+    linked: Vec<&crate::clients::ClientToolLimit>,
+) -> CheckResult {
     if linked.is_empty() {
         return CheckResult {
             name,
@@ -656,7 +605,7 @@ fn client_limits_result(name: String, linked: Vec<&ClientToolLimit>) -> CheckRes
             // without going and finding this table first.
             format!(
                 "{} caps at {} tools (verified {}, {})",
-                entry.target, entry.limit, entry.verified, entry.source
+                entry.client, entry.limit, entry.verified, entry.source
             )
         })
         .collect();
@@ -1801,6 +1750,35 @@ auth_token = "keychain:b.token"
         assert!(result.message.contains("plug_nonexistent_binary_xyz"));
     }
 
+    /// The daemon runs the whole `command`, so a path with a space in it is
+    /// found, and a bare name is not cut at its first word.
+    #[tokio::test]
+    async fn server_binaries_check_the_whole_command() {
+        let dir = tempfile::tempdir().unwrap();
+        let spaced = dir.path().join("My Tools").join("server");
+        std::fs::create_dir_all(spaced.parent().unwrap()).unwrap();
+        std::fs::write(&spaced, "").unwrap();
+        let mut config = test_config();
+        config
+            .servers
+            .insert("spaced".to_string(), stdio_server(spaced.to_str().unwrap()));
+        assert_eq!(
+            check_server_binaries(&config).await.status,
+            CheckStatus::Pass
+        );
+
+        config
+            .servers
+            .insert("split".to_string(), stdio_server("echo hello"));
+        let result = check_server_binaries(&config).await;
+        assert_eq!(result.status, CheckStatus::Fail);
+        assert!(
+            result.message.contains("split: echo hello"),
+            "{}",
+            result.message
+        );
+    }
+
     /// `node` from a version manager resolves in a shell but not on the PATH
     /// the daemon falls back to when its login-shell probe fails. Doctor used
     /// to pass that; the server then failed after a slow reboot.
@@ -1847,31 +1825,14 @@ auth_token = "keychain:b.token"
     fn a_linked_capped_client_warns_with_its_source() {
         let result = client_limits_result(
             check::CLIENT_LIMITS.to_string(),
-            KNOWN_CLIENT_TOOL_LIMITS.iter().collect(),
+            crate::clients::TOOL_LIMITS.iter().collect(),
         );
         assert_eq!(result.status, CheckStatus::Warn);
-        assert!(result.message.contains(KNOWN_CLIENT_TOOL_LIMITS[0].source));
-    }
-
-    /// Guards the rule the Cursor entry broke: a client with no published
-    /// ceiling must not be given an invented one.
-    #[tokio::test]
-    async fn no_client_limit_is_asserted_without_a_dated_source() {
-        for entry in KNOWN_CLIENT_TOOL_LIMITS {
-            assert!(
-                entry.source.starts_with("https://"),
-                "{} needs a source URL that can be re-checked",
-                entry.target
-            );
-            let parts: Vec<&str> = entry.verified.split('-').collect();
-            assert!(
-                parts.len() == 3 && parts.iter().all(|p| p.chars().all(|c| c.is_ascii_digit())),
-                "{} needs a YYYY-MM-DD verified date, got {:?}",
-                entry.target,
-                entry.verified
-            );
-            assert!(entry.limit > 0, "{} has a meaningless limit", entry.target);
-        }
+        assert!(
+            result
+                .message
+                .contains(crate::clients::TOOL_LIMITS[0].source)
+        );
     }
 
     // -- check_pid_staleness --

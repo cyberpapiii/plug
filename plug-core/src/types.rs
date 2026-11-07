@@ -971,21 +971,6 @@ pub enum ClientType {
     Unknown,
 }
 
-/// The link target and display name of each come from `crate::clients`.
-impl ClientType {
-    /// Returns the maximum number of tools this client supports, if known.
-    pub fn tool_limit(&self) -> Option<usize> {
-        match self {
-            // Cascade's ceiling. Devin Local publishes none, but it is not
-            // yet known to report a distinct `clientInfo.name`, so the cap
-            // applies to whatever calls itself Devin.
-            ClientType::Devin => Some(100),
-            ClientType::VSCodeCopilot => Some(128),
-            _ => None,
-        }
-    }
-}
-
 /// Operator-facing lazy discovery setting stored in config.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

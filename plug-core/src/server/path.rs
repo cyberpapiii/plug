@@ -10,11 +10,17 @@ use std::path::{Path, PathBuf};
 #[cfg(target_os = "macos")]
 use std::time::Duration;
 
-/// Resolve a bare stdio command through PATH, then through `login_path` (the
-/// user's login-shell PATH from [`stdio_login_path`]).
+/// Whether a stdio `command` is a name looked up in PATH. Anything with more
+/// than one path component runs as written, spaces and all.
+pub(crate) fn is_bare_name(command: &str) -> bool {
+    Path::new(command).components().count() <= 1
+}
+
+/// Resolve a bare stdio command through PATH, then through `login_path`, the
+/// PATH [`stdio_path`] gives stdio servers.
 pub(crate) fn resolve_stdio_command(command: &str, login_path: Option<&OsStr>) -> PathBuf {
     let configured = PathBuf::from(command);
-    if configured.components().count() > 1 {
+    if !is_bare_name(command) {
         return configured;
     }
 
