@@ -1809,19 +1809,19 @@ impl ToolRouter {
         }
     }
 
-    /// Forward an upstream elicitation request to the downstream client that triggered the tool call.
-    pub async fn create_elicitation_from_upstream(
+    /// The bridge to the downstream client whose tool call made `server_id`
+    /// send `upstream_request_id`: where an elicitation or sampling request
+    /// from that server goes.
+    fn bridge_for_upstream_request(
         &self,
         server_id: &str,
-        upstream_request_id: RequestId,
-        request: ElicitRequestParams,
-    ) -> Result<ElicitResult, McpError> {
-        let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
+        upstream_request_id: &RequestId,
+    ) -> Result<Arc<dyn DownstreamBridge>, McpError> {
+        let target = match self.active_call_for_upstream_request(server_id, upstream_request_id) {
             Ok(record) => record.downstream.notification_target(),
             Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
         };
-        let bridge = self
-            .downstream_bridges
+        self.downstream_bridges
             .get(&target)
             .map(|entry| Arc::clone(&*entry))
             .ok_or_else(|| {
@@ -1829,32 +1829,7 @@ impl ToolRouter {
                     format!("no downstream bridge registered for target {target:?}"),
                     None,
                 )
-            })?;
-        bridge.create_elicitation(request).await
-    }
-
-    /// Forward an upstream sampling request to the downstream client that triggered the tool call.
-    pub async fn create_message_from_upstream(
-        &self,
-        server_id: &str,
-        upstream_request_id: RequestId,
-        request: CreateMessageRequestParams,
-    ) -> Result<CreateMessageResult, McpError> {
-        let target = match self.active_call_for_upstream_request(server_id, &upstream_request_id) {
-            Ok(record) => record.downstream.notification_target(),
-            Err(_) => self.resolve_unique_downstream_target_for_upstream(server_id)?,
-        };
-        let bridge = self
-            .downstream_bridges
-            .get(&target)
-            .map(|entry| Arc::clone(&*entry))
-            .ok_or_else(|| {
-                McpError::internal_error(
-                    format!("no downstream bridge registered for target {target:?}"),
-                    None,
-                )
-            })?;
-        bridge.create_message(request).await
+            })
     }
 
     fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
@@ -4444,7 +4419,8 @@ impl crate::server::UpstreamEvents for ToolRouter {
         request_id: RequestId,
         request: ElicitRequestParams,
     ) -> Result<ElicitResult, McpError> {
-        self.create_elicitation_from_upstream(server, request_id, request)
+        self.bridge_for_upstream_request(server, &request_id)?
+            .create_elicitation(request)
             .await
     }
 
@@ -4454,7 +4430,8 @@ impl crate::server::UpstreamEvents for ToolRouter {
         request_id: RequestId,
         request: CreateMessageRequestParams,
     ) -> Result<CreateMessageResult, McpError> {
-        self.create_message_from_upstream(server, request_id, request)
+        self.bridge_for_upstream_request(server, &request_id)?
+            .create_message(request)
             .await
     }
 
