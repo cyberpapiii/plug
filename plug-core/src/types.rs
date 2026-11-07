@@ -957,7 +957,7 @@ pub enum ClientType {
     Devin,
     VSCodeCopilot,
     /// GitHub's terminal agent. It shares a config file with VS Code but
-    /// not VS Code's 128-tool ceiling.
+    /// not VS Code's tool ceiling in `clients::TOOL_LIMITS`.
     CopilotCli,
     GeminiCli,
     CodexCli,
