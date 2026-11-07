@@ -53,6 +53,8 @@ protocol DaemonServiceBackend: AnyObject {
     func registerAgent() throws
     func kickstartAgent() async throws
     func handshake() async throws -> OperatorHandshake
+    /// The time a wait is measured against, so tests can move it.
+    var now: ContinuousClock.Instant { get }
     func waitBeforeRetry() async
     func openLoginItemSettings()
 }
@@ -65,7 +67,7 @@ final class DaemonServiceManager {
     private let launchdInspector: any LaunchdJobInspecting
     private let backend: any DaemonServiceBackend
     private let legacyPaths: Set<URL>
-    private let retryLimit: Int
+    private let startupBudget: Duration
     private var resumedStrandedConnectors = false
 
     init(
@@ -73,20 +75,17 @@ final class DaemonServiceManager {
         launchdInspector: any LaunchdJobInspecting = LaunchdJobInspector(),
         backend: any DaemonServiceBackend = SystemDaemonServiceBackend(),
         legacyPaths: Set<URL> = DaemonServiceManager.defaultLegacyPaths,
-        retryLimit: Int = DaemonServiceManager.startupRetries
+        startupBudget: Duration = PlugPaths.startupBudget
     ) {
         self.appInspector = appInspector
         self.launchdInspector = launchdInspector
         self.backend = backend
         self.legacyPaths = legacyPaths
-        self.retryLimit = max(1, retryLimit)
+        self.startupBudget = startupBudget
     }
 
     /// The wait between two checks of a starting daemon.
     nonisolated static let retryInterval: Duration = .milliseconds(500)
-    /// Checks of a daemon that just started, enough to wait out the startup
-    /// budget the CLI waits too.
-    nonisolated static let startupRetries = Int(PlugPaths.startupBudget / retryInterval)
 
     /// The name the daemon's LaunchAgent is registered under, which is also
     /// its launchd label with `.plist` added.
@@ -396,15 +395,17 @@ final class DaemonServiceManager {
         )
     }
 
-    /// Gives the running daemon a bounded window to prove its version and
-    /// executable. Returns the last version it reported when it never does.
+    /// Gives the running daemon the startup budget the CLI gives it to prove
+    /// its version and executable. Returns the last version it reported when
+    /// it never does.
     private func awaitProof(
         canonical: VerifiedAppInstallation,
         expectedVersion: String,
         inspectionPaths: Set<URL>
     ) async throws -> (OperatorHandshake?, String?) {
         var actualVersion: String?
-        for _ in 0..<retryLimit {
+        let deadline = backend.now + startupBudget
+        repeat {
             await backend.waitBeforeRetry()
             let inspection = try await inspectWithHandshake(
                 canonical: canonical,
@@ -417,7 +418,7 @@ final class DaemonServiceManager {
             {
                 return (handshake, actualVersion)
             }
-        }
+        } while backend.now < deadline
         return (nil, actualVersion)
     }
 
@@ -542,10 +543,12 @@ private final class SystemDaemonServiceBackend: DaemonServiceBackend {
     }
 
     func handshake() async throws -> OperatorHandshake {
-        // Called several times a reconcile and up to `retryLimit` times while
-        // a replacement proves itself, so each probe closes its own socket.
+        // Called several times a reconcile and every retry while a
+        // replacement proves itself, so each probe closes its own socket.
         try await PlugIPCClient(clientVersion: AppModel.defaultClientVersion).handshakeAndDisconnect()
     }
+
+    var now: ContinuousClock.Instant { .now }
 
     func waitBeforeRetry() async {
         try? await Task.sleep(for: DaemonServiceManager.retryInterval)

@@ -302,7 +302,7 @@ final class UnifiedReconciliationFixtureTests: XCTestCase {
             launchdInspector: launchd,
             backend: backend,
             legacyPaths: [fixture.cargoURL],
-            retryLimit: 1
+            startupBudget: .zero
         )
         let coordinator = InstallationCoordinator(
             serviceDisabled: ServiceDisabledMarker(home: makeTestHome()),
@@ -1427,6 +1427,8 @@ private final class FixtureDaemonBackend: DaemonServiceBackend {
             executable: enabled ? currentExecutable : legacyExecutable
         )
     }
+
+    var now: ContinuousClock.Instant { .now }
 
     func waitBeforeRetry() async {}
 
