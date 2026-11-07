@@ -25,6 +25,11 @@ targets:
     preBuildScripts:
       - name: Bundle daemon and LaunchAgent
         basedOnDependencyAnalysis: false
+        # Declared so the app is signed again when the copied daemon changes;
+        # a file Xcode does not know about leaves the old signature in place.
+        outputFiles:
+          - $(TARGET_BUILD_DIR)/$(UNLOCALIZED_RESOURCES_FOLDER_PATH)/plug
+          - $(TARGET_BUILD_DIR)/$(WRAPPER_NAME)/Contents/Library/LaunchAgents/com.plug.daemon.plist
         script: |
           set -euo pipefail
           ROOT="$SRCROOT/.."
