@@ -34,7 +34,7 @@ pub(crate) fn is_blocked_host(host: &str) -> bool {
     let host = host.trim_start_matches('[').trim_end_matches(']');
     // AWS, GCP and Azure all answer on this one address.
     host.parse::<std::net::IpAddr>()
-        .is_ok_and(|ip| ip == std::net::IpAddr::from([169, 254, 169, 254]))
+        .is_ok_and(|ip| ip.to_canonical() == std::net::IpAddr::from([169, 254, 169, 254]))
 }
 
 /// Refuse `url` when its host is a cloud metadata endpoint.
@@ -64,6 +64,7 @@ mod tests {
         for host in [
             "169.254.169.254",
             "[169.254.169.254]",
+            "[::ffff:169.254.169.254]",
             "metadata.google.internal",
         ] {
             assert!(is_blocked_host(host), "{host}");
