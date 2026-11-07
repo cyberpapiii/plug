@@ -62,7 +62,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
-- `plug doctor` no longer reports "launchd inspection failed: command timed out" when your login session has many launchd jobs. Commands Plug runs with a time limit now have their output read while they run, so one that prints more than 64 KB no longer stalls until the limit.
+- `plug doctor` no longer reports "launchd inspection failed" when your login session has many launchd jobs. Commands Plug runs with a time limit now have their output read while they run, so one that prints more than 64 KB no longer stalls until the limit, and the jobs are read eight at a time, so a session with 500 of them is read in well under the three seconds allowed.
 - A server whose secret store you edited in `[secrets.stores]` no longer starts with the value the store gave before the edit when the edited store does not answer. It now stops with the store's error, as a server using a new store does. A store you did not edit still stands in with the value it gave earlier.
 - A task whose server was down when it was asked for, and came back speaking the 2026-07-28 protocol, now fails with "unsupported protocol bridge" before the tool runs. It used to send the call and fail with an internal message beginning "unexpected upstream task response".
 - `plug link`, `plug unlink`, `plug repair`, `plug import` and `plug setup` stop with the config's error when the config file does not load, as `plug doctor` does. They used to carry on with Plug's default address, so with a custom port `plug link` could write `localhost:3282` or add a second Plug entry beside the one already there. With no config file at all they still use the defaults.

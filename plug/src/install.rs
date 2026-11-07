@@ -217,6 +217,9 @@ pub(crate) fn bounded_output(
     let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
     let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
     let started = Instant::now();
+    // Most commands finish in a few milliseconds, so the first checks come
+    // quickly and later ones back off.
+    let mut pause = std::time::Duration::from_millis(1);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -226,7 +229,8 @@ pub(crate) fn bounded_output(
             let _ = child.wait();
             anyhow::bail!("command timed out after {}ms", timeout.as_millis());
         }
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        std::thread::sleep(pause);
+        pause = (pause * 2).min(std::time::Duration::from_millis(20));
     };
     let collected = |reader: std::thread::JoinHandle<Vec<u8>>| {
         reader

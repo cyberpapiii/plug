@@ -254,20 +254,47 @@ pub fn discover_launchd_jobs(
         );
     }
     let labels = parse_launchd_labels(&String::from_utf8_lossy(&output.stdout));
-    let mut jobs = Vec::new();
-    for label in labels {
+    // A login session can hold hundreds of jobs, and each read is its own
+    // `launchctl` process, so they are read a few at a time.
+    const READERS: usize = 8;
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let read_one = |label: &str| -> anyhow::Result<Option<LaunchdJobRecord>> {
         let output = launchctl_output(&["print", &format!("{domain}/{label}")], remaining()?)?;
-        if output.status.success()
-            && let Some(job) = parse_launchd_job(
-                &label,
-                &String::from_utf8_lossy(&output.stdout),
-                verified_app_program,
-            )
-        {
-            jobs.push(job);
-        }
-    }
-    Ok(jobs)
+        Ok(output
+            .status
+            .success()
+            .then(|| {
+                parse_launchd_job(
+                    label,
+                    &String::from_utf8_lossy(&output.stdout),
+                    verified_app_program,
+                )
+            })
+            .flatten())
+    };
+    let found = std::thread::scope(|scope| {
+        let readers: Vec<_> = (0..READERS.min(labels.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut jobs = Vec::new();
+                    loop {
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let Some(label) = labels.get(index) else {
+                            return Ok(jobs);
+                        };
+                        jobs.extend(read_one(label)?.map(|job| (index, job)));
+                    }
+                })
+            })
+            .collect();
+        readers
+            .into_iter()
+            .map(|reader| reader.join().expect("launchd reader panicked"))
+            .collect::<anyhow::Result<Vec<Vec<(usize, LaunchdJobRecord)>>>>()
+    })?;
+    let mut jobs: Vec<_> = found.into_iter().flatten().collect();
+    jobs.sort_by_key(|(index, _)| *index);
+    Ok(jobs.into_iter().map(|(_, job)| job).collect())
 }
 
 /// Whether a launchd job is one plug could own.
