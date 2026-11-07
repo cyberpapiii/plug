@@ -49,8 +49,6 @@
   "daemon_error": null,
   "lazy_tool_live_policy_note": "clients[].lazy_tool_* fields reflect config/default resolution; live sessions keep their daemon-start policy until restart after lazy_tools edits",
   "lazy_tool_policy_scope": "configured",
-  "live_client_support": "supported",
-  "live_inventory_scope": "transport_complete",
   "live_session_count": 2,
   "live_session_transports": {
     "daemon_proxy": 2,

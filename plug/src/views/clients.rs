@@ -8,7 +8,7 @@ use crate::ui::{
     can_prompt_interactively, cli_prompt_theme, print_banner, print_heading, print_info_line,
     print_label_value, print_success_line, print_warning_line,
 };
-use crate::views::live::{self, LiveClientSupport, fetch_live_sessions};
+use crate::views::live::{self, fetch_live_sessions};
 use plug_core::clients::ClientTarget;
 
 fn configured_client_state_text(client: &crate::commands::clients::ClientView) -> String {
@@ -40,8 +40,6 @@ pub(crate) fn client_list_json(
     clients: &[crate::commands::clients::ClientView],
     live_sessions: &[crate::commands::clients::LiveSessionView],
     inventory: &live::LiveInventory,
-    live_client_support: LiveClientSupport,
-    live_inventory_scope: plug_core::ipc::LiveSessionInventoryScope,
     daemon_error: Option<&str>,
     config_error: Option<&str>,
 ) -> serde_json::Value {
@@ -50,8 +48,6 @@ pub(crate) fn client_list_json(
         "live_sessions": live_sessions,
         "live_session_count": inventory.session_count,
         "live_session_transports": inventory.session_transports,
-        "live_client_support": live_client_support,
-        "live_inventory_scope": live_inventory_scope,
         "daemon_error": daemon_error,
         "config_error": config_error,
         "lazy_tool_policy_scope": "configured",
@@ -293,8 +289,8 @@ pub(crate) async fn cmd_client_list(
         } else {
             Some("daemon not running".to_string())
         };
-        let (live, live_inventory_scope, live_client_support) = fetch_live_sessions().await;
-        let inventory = live::inventory(&live, live_inventory_scope);
+        let live = fetch_live_sessions().await;
+        let inventory = live::inventory(&live);
         let config_result = plug_core::config::load_config(config_path);
         let config_error = config_result.as_ref().err().map(|error| error.to_string());
         let config = config_result.ok();
@@ -309,8 +305,6 @@ pub(crate) async fn cmd_client_list(
                     &clients,
                     &live_sessions,
                     &inventory,
-                    live_client_support,
-                    live_inventory_scope,
                     daemon_error.as_deref(),
                     config_error.as_deref(),
                 ))?
@@ -319,15 +313,7 @@ pub(crate) async fn cmd_client_list(
         }
 
         print_banner("◆", "Clients", "The clients that use Plug");
-        if matches!(
-            live_client_support,
-            LiveClientSupport::DaemonRestartRequired
-        ) {
-            print_warning_line(
-                "Plug was updated. Restart it to see which clients are connected now.",
-            );
-            println!();
-        } else if let Some(error) = &daemon_error {
+        if let Some(error) = &daemon_error {
             print_warning_line(format!(
                 "Plug is not answering ({error}), so it cannot say who is connected now."
             ));
@@ -344,25 +330,12 @@ pub(crate) async fn cmd_client_list(
         print_heading("Summary");
         print_label_value("Set up", style(linked_count).green().bold());
         print_label_value("On this Mac", style(detected_count).cyan().bold());
-        match (&daemon_error, &live_client_support) {
-            (Some(_), _) => {
-                print_label_value("Connected now", style("unknown").yellow().bold());
-            }
-            (None, LiveClientSupport::Supported) => {
-                print_label_value("Connected now", style(inventory.session_count).bold());
-            }
-            (None, LiveClientSupport::DaemonRestartRequired) => {
-                print_label_value(
-                    "Connected now",
-                    style("restart Plug to see").yellow().bold(),
-                );
-            }
+        if daemon_error.is_some() {
+            print_label_value("Connected now", style("unknown").yellow().bold());
+        } else {
+            print_label_value("Connected now", style(inventory.session_count).bold());
         }
-        if verbose
-            && daemon_error.is_none()
-            && matches!(live_client_support, LiveClientSupport::Supported)
-        {
-            print_label_value("Live Inventory", live::scope_summary(live_inventory_scope));
+        if verbose && daemon_error.is_none() {
             print_label_value("Live Transports", inventory.session_transports.summary());
             if inventory.session_count > 0 {
                 print_info_line(
@@ -522,22 +495,18 @@ mod tests {
                 daemon_proxy: 0,
                 http: 1,
             },
-            scope: plug_core::ipc::LiveSessionInventoryScope::Unavailable,
         };
 
         let json = client_list_json(
             &clients,
             &live_sessions,
             &inventory,
-            crate::views::live::LiveClientSupport::Supported,
-            plug_core::ipc::LiveSessionInventoryScope::Unavailable,
             Some("daemon unavailable"),
             Some("invalid lazy config"),
         );
 
         assert_eq!(json["live_session_count"], 1);
         assert_eq!(json["live_session_transports"]["http"], 1);
-        assert_eq!(json["live_inventory_scope"], "unavailable");
         assert_eq!(json["daemon_error"], "daemon unavailable");
         assert_eq!(json["config_error"], "invalid lazy config");
         assert_eq!(json["lazy_tool_policy_scope"], "configured");

@@ -1606,7 +1606,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                 ctx.client_registry.list_live_sessions(),
                 &ctx.http.sessions,
             ),
-            scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
         },
         IpcRequest::Capabilities { session_id } => {
             // Capabilities are negotiated once per session and never
@@ -2399,14 +2398,10 @@ allowed_servers = ["slack"]
             .expect("set client type");
 
         let response = dispatch_request(&IpcRequest::ListLiveSessions, &mut ctx).await;
-        let IpcResponse::LiveSessions { sessions, scope } = response else {
+        let IpcResponse::LiveSessions { sessions } = response else {
             panic!("expected live sessions response");
         };
 
-        assert_eq!(
-            scope,
-            plug_core::ipc::LiveSessionInventoryScope::TransportComplete
-        );
         assert_eq!(sessions.len(), 1);
         assert_eq!(
             sessions[0].transport,

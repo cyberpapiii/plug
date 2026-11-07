@@ -25,7 +25,7 @@ use crate::commands::doctor::{
     ClientRepairItem, ClientRepairReport, PlugLinkDisposition, UnifiedInstallSnapshot,
     doctor_json_value,
 };
-use crate::views::live::{LiveClientSupport, LiveInventory, LiveSessionTransportCounts};
+use crate::views::live::{LiveInventory, LiveSessionTransportCounts};
 
 fn dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../testdata/cli")
@@ -100,17 +100,8 @@ fn clients() -> serde_json::Value {
             daemon_proxy: 2,
             http: 0,
         },
-        scope: plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
     };
-    crate::views::clients::client_list_json(
-        &clients,
-        &sessions,
-        &inventory,
-        LiveClientSupport::Supported,
-        plug_core::ipc::LiveSessionInventoryScope::TransportComplete,
-        None,
-        None,
-    )
+    crate::views::clients::client_list_json(&clients, &sessions, &inventory, None, None)
 }
 
 fn discovered(source: ClientTarget, name: &str, config: ServerConfig) -> DiscoveredServer {
