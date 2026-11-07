@@ -37,6 +37,16 @@ pub(crate) fn is_blocked_host(host: &str) -> bool {
         .is_ok_and(|ip| ip == std::net::IpAddr::from([169, 254, 169, 254]))
 }
 
+/// Refuse `url` when its host is a cloud metadata endpoint.
+pub(crate) fn refuse_blocked(url: &reqwest::Url) -> anyhow::Result<()> {
+    match url.host_str() {
+        Some(host) if is_blocked_host(host) => {
+            anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint")
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Whether `a` and `b` share scheme, host and port, counting a default port
 /// written out the same as one left implicit.
 pub(crate) fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
