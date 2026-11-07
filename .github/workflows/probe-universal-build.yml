@@ -1,0 +1,35 @@
+name: Probe universal build
+
+on:
+  pull_request:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [sequential, combined]
+    name: Universal daemon (${{ matrix.mode }})
+    runs-on: macos-26
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+      - run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plug-app-universal
+          save-if: false
+      - name: Build
+        shell: bash
+        run: |
+          set -euo pipefail
+          start=$(date +%s)
+          if [[ "${{ matrix.mode }}" == sequential ]]; then
+            cargo build --release -p plug-mcp --target aarch64-apple-darwin
+            cargo build --release -p plug-mcp --target x86_64-apple-darwin
+          else
+            cargo build --release -p plug-mcp --target aarch64-apple-darwin --target x86_64-apple-darwin
+          fi
+          echo "build_seconds=$(( $(date +%s) - start ))"
+          shasum -a 256 target/aarch64-apple-darwin/release/plug target/x86_64-apple-darwin/release/plug
+          sysctl -n hw.ncpu hw.memsize
