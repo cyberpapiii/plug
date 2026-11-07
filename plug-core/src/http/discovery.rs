@@ -1,5 +1,4 @@
 use super::server::{HttpAuth, HttpState};
-use crate::protocol::SUPPORTED_PROTOCOL_VERSION;
 use axum::Json;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
@@ -24,7 +23,9 @@ pub(super) async fn get_server_card(State(state): State<Arc<HttpState>>) -> impl
     let mut remote = json!({
         "type": "streamable-http",
         "url": "/mcp",
-        "supportedProtocolVersions": [SUPPORTED_PROTOCOL_VERSION],
+        "supportedProtocolVersions": crate::protocol::supported_downstream_protocol_versions(
+            state.router.modern_downstream_enabled()
+        ),
     });
     if !matches!(state.auth, HttpAuth::Open) {
         remote["headers"] = json!([
@@ -141,6 +142,31 @@ mod tests {
         );
         assert!(json.get("tools").is_none());
         assert!(json.get("servers").is_none());
+    }
+
+    /// The card lists the revisions `server/discover` lists.
+    #[tokio::test]
+    async fn server_card_lists_the_modern_revision_once_it_is_served() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        let req = HttpRequest::builder()
+            .method("GET")
+            .uri("/.well-known/mcp.json")
+            .body(Body::empty())
+            .unwrap();
+
+        let resp = build_router(state).oneshot(req).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1024 * 1024)
+            .await
+            .unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            json["remotes"][0]["supportedProtocolVersions"],
+            serde_json::json!([
+                SUPPORTED_PROTOCOL_VERSION,
+                crate::protocol::MODERN_PROTOCOL_VERSION
+            ])
+        );
     }
 
     #[tokio::test]

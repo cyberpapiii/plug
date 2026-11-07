@@ -60,6 +60,11 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- With the 2026-07-28 protocol turned on, a client is offered tasks according to its own lazy-tool mode. Plug used to decide from the mode of a client of unknown type, so a client behind the search bridge could be offered tasks and one that lists tools as they are could be refused them.
+- A large tool result that carries a file is kept whatever the file is called and whatever is in it. A file named `result.json` used to replace the result itself, and a file that could not be decoded or written, or an empty name or `..`, failed the whole call.
+- A client that signs in through a loopback callback on a port of its own, as Claude Code and Codex do, is sent back to its app with the reason when Plug turns the sign-in down, such as a scope it cannot grant. It used to be shown an error page in the browser instead.
+- With the 2026-07-28 protocol turned on, the server card at `/.well-known/mcp.json` lists `2026-07-28` among the versions Plug speaks, as `server/discover` does.
+- With the 2026-07-28 protocol turned on, a client asking to subscribe to events without `events:subscribe` is refused with the permission-denied code. It used to get the code that means "try again".
 - Security: with the 2026-07-28 protocol turned on (`http.modern_downstream_enabled`), two clients signed in the same way, such as two clients on an open loopback listener, could interfere with each other's calls when they used the same request id. The second call was refused, a dropped request could cancel the other client's call, and a reply could carry progress notices about the other client's calls. Each request is now kept apart, and a cancel that names a request id two clients are using cancels neither.
 - Security: a server could tell clients that another server's resource had changed, and the notice reached them. Plug now passes on a resource change only from the server that holds that resource.
 - Security: a remote HTTP session that timed out could be taken over by another signed-in client that knew its id. Opening an event stream on it reopened the session for whoever asked before checking whose it was, and a session Plug had already dropped could be reopened under any grant. Plug now reopens a session only for the grant that opened it.

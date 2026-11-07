@@ -1338,6 +1338,45 @@ mod tests {
         );
     }
 
+    /// Tasks are offered to a modern caller when its own tool surface lists
+    /// tools as they are, whatever the surface of a client of unknown type.
+    #[tokio::test]
+    async fn modern_tasks_follow_the_callers_own_tool_surface() {
+        let mut lazy_tools = crate::config::LazyToolsConfig {
+            mode: crate::types::LazyToolSetting::Bridge,
+            ..Default::default()
+        };
+        lazy_tools.clients.insert(
+            "claude-code".to_string(),
+            crate::types::LazyToolSetting::Standard,
+        );
+        let state = test_state_with_router_config(crate::proxy::RouterConfig {
+            lazy_tools,
+            ..Default::default()
+        });
+        enable_test_task_surface(state.router.as_ref());
+        let caller = |client_type| {
+            let mut call = modern_task_policy_context(true, ["tasks:use".to_string()]);
+            call.client_type = client_type;
+            call
+        };
+        let task_meta = modern_task_meta(true);
+
+        admit_modern_task_operation(
+            state.router.as_ref(),
+            &caller(crate::types::ClientType::ClaudeCode),
+            Some(&task_meta),
+        )
+        .expect("a Standard client is offered tasks");
+        let bridged = admit_modern_task_operation(
+            state.router.as_ref(),
+            &caller(crate::types::ClientType::Unknown),
+            Some(&task_meta),
+        )
+        .expect_err("a client behind the search bridge is not");
+        assert_eq!(bridged.code, ErrorCode::METHOD_NOT_FOUND);
+    }
+
     #[tokio::test]
     async fn the_modern_gate_refuses_every_http_task_method() {
         let state = test_state();
@@ -1484,7 +1523,7 @@ mod tests {
                 .router
                 .synthesized_capabilities_for_client(context.client_type),
             &context,
-            state.router.supports_tasks(),
+            state.router.supports_tasks_for_client(context.client_type),
         );
         assert!(
             context

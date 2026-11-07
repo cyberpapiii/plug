@@ -617,10 +617,6 @@ impl super::ToolRouter {
         self.cache.load().tool_by_name(name).cloned()
     }
 
-    pub fn supports_tasks(&self) -> bool {
-        self.supports_tasks_for_client(ClientType::Unknown)
-    }
-
     pub fn supports_tasks_for_client(&self, client_type: ClientType) -> bool {
         matches!(
             self.config.lazy_surface_for_client(client_type),

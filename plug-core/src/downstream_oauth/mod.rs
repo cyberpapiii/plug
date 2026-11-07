@@ -441,6 +441,16 @@ struct RegisteredClient {
     expires_at: u64,
 }
 
+impl RegisteredClient {
+    /// Whether Plug may send this client's browser to `requested`, with an
+    /// authorization code or with an error.
+    fn allows_redirect(&self, requested: &str) -> bool {
+        self.redirect_uris
+            .iter()
+            .any(|registered| registered_redirect_matches(registered, requested))
+    }
+}
+
 impl From<&RegisteredClient> for RegisteredClientSummary {
     fn from(value: &RegisteredClient) -> Self {
         Self {
@@ -1476,11 +1486,7 @@ impl DownstreamOauthManager {
             .get(request.client_id)
             .cloned()
             .ok_or(DownstreamOauthError::InvalidClient)?;
-        if !client
-            .redirect_uris
-            .iter()
-            .any(|uri| registered_redirect_matches(uri, request.redirect_uri))
-        {
+        if !client.allows_redirect(request.redirect_uri) {
             return Err(DownstreamOauthError::InvalidRedirectUri);
         }
         if request.resource != self.resource() {
@@ -1759,11 +1765,7 @@ impl DownstreamOauthManager {
             .clients
             .get(client_id)
             .is_some_and(|client| {
-                client.expires_at > epoch_secs()
-                    && client
-                        .redirect_uris
-                        .iter()
-                        .any(|registered| registered == redirect_uri)
+                client.expires_at > epoch_secs() && client.allows_redirect(redirect_uri)
             })
     }
 
@@ -5205,6 +5207,28 @@ mod tests {
             "https://example.com/callback",
             "https://example.com:62557/callback"
         ));
+    }
+
+    /// A native client that may be sent a code on any loopback port may be
+    /// sent an error there too.
+    #[tokio::test]
+    async fn an_error_goes_to_any_callback_a_code_may_go_to() {
+        let (manager, _path) = test_manager();
+        let client = register(&manager, "Codex", "http://127.0.0.1:1234/callback").await;
+
+        for (requested, allowed) in [
+            ("http://127.0.0.1:62557/callback", true),
+            ("http://127.0.0.1:62557/other", false),
+            ("https://example.com/callback", false),
+        ] {
+            assert_eq!(
+                manager
+                    .client_redirect_allowed(&client.client_id, requested)
+                    .await,
+                allowed,
+                "{requested}"
+            );
+        }
     }
 
     #[test]
