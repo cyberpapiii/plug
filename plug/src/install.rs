@@ -197,17 +197,29 @@ pub(crate) fn bounded_output(
     mut command: Command,
     timeout: std::time::Duration,
 ) -> Result<std::process::Output> {
+    use std::io::Read;
     use std::process::Stdio;
     use std::time::Instant;
 
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut child = command.spawn().context("could not start bounded command")?;
+    // Read both pipes while the command runs: one that prints more than a
+    // pipe holds blocks on the write and never exits.
+    let drain = |pipe: Option<Box<dyn Read + Send>>| {
+        std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            if let Some(mut pipe) = pipe {
+                let _ = pipe.read_to_end(&mut bytes);
+            }
+            bytes
+        })
+    };
+    let stdout = drain(child.stdout.take().map(|pipe| Box::new(pipe) as _));
+    let stderr = drain(child.stderr.take().map(|pipe| Box::new(pipe) as _));
     let started = Instant::now();
-    loop {
-        if child.try_wait()?.is_some() {
-            return child
-                .wait_with_output()
-                .context("could not collect command output");
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         if started.elapsed() >= timeout {
             let _ = child.kill();
@@ -215,7 +227,17 @@ pub(crate) fn bounded_output(
             anyhow::bail!("command timed out after {}ms", timeout.as_millis());
         }
         std::thread::sleep(std::time::Duration::from_millis(20));
-    }
+    };
+    let collected = |reader: std::thread::JoinHandle<Vec<u8>>| {
+        reader
+            .join()
+            .map_err(|_| anyhow::anyhow!("could not collect command output"))
+    };
+    Ok(std::process::Output {
+        status,
+        stdout: collected(stdout)?,
+        stderr: collected(stderr)?,
+    })
 }
 
 /// Resolve the command a normal interactive login shell will execute.
@@ -458,6 +480,21 @@ fn version_probe_command(executable_path: &Path) -> Command {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_bounded_command_may_print_more_than_a_pipe_holds() {
+        // `launchctl print gui/<uid>` prints over 100 KB; a pipe holds 64 KB.
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "head -c 200000 /dev/zero; head -c 100000 /dev/zero >&2",
+        ]);
+        let output = super::bounded_output(command, std::time::Duration::from_secs(5))
+            .expect("the command finishes");
+        assert!(output.status.success());
+        assert_eq!(output.stdout.len(), 200_000);
+        assert_eq!(output.stderr.len(), 100_000);
+    }
+
     use std::path::{Path, PathBuf};
 
     use super::{
