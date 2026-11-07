@@ -9,8 +9,40 @@ permissions:
   contents: write
 
 jobs:
+  build-daemon:
+    # One runner per architecture. Each build is limited by the runner's three
+    # cores, so two runners finish in the time of the slower build instead of
+    # both back to back.
+    name: Build daemon (${{ matrix.target }})
+    strategy:
+      matrix:
+        target: [aarch64-apple-darwin, x86_64-apple-darwin]
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v5
+
+      - run: rustup target add ${{ matrix.target }}
+
+      # A cache saved on one tag is invisible to the next tag, so a release
+      # build could never hit its own cache. The warm-release-cache job in
+      # ci.yml saves this same key from main after every merge; restore it
+      # here and never save (a tag-scoped save would only be dead weight).
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: plug-app-universal
+          save-if: false
+
+      - run: cargo build --release -p plug-mcp --target ${{ matrix.target }}
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: daemon-${{ matrix.target }}
+          path: target/${{ matrix.target }}/release/plug
+          retention-days: 1
+
   build-app:
     name: Build Plug.app
+    needs: build-daemon
     # Liquid Glass is compiled behind `#if compiler(>=6.2)`. macOS 15 runners
     # use an older Xcode and silently ship the fallback interface instead.
     runs-on: macos-26
@@ -32,29 +64,27 @@ jobs:
           echo "WORKSPACE_VERSION=${workspace_version}" >> "$GITHUB_ENV"
 
       - name: Install build tools
-        run: |
-          brew install xcodegen
-          rustup target add aarch64-apple-darwin x86_64-apple-darwin
+        run: brew install xcodegen
 
-      # A cache saved on one tag is invisible to the next tag, so a release
-      # build could never hit its own cache. The warm-release-cache job in
-      # ci.yml saves this same key from main after every merge; restore it
-      # here and never save (a tag-scoped save would only be dead weight).
-      - uses: Swatinem/rust-cache@v2
+      - uses: actions/download-artifact@v7
         with:
-          shared-key: plug-app-universal
-          save-if: false
+          pattern: daemon-*
+          path: ${{ runner.temp }}/daemons
 
-      - name: Build universal daemon
+      # Artifacts drop the executable bit, and the app's build script embeds
+      # PLUG_RELEASE_BINARY only when it is executable. Otherwise it builds a
+      # host-only daemon, so both are checked here.
+      - name: Assemble universal daemon
         run: |
           set -euo pipefail
-          cargo build --release -p plug-mcp --target aarch64-apple-darwin
-          cargo build --release -p plug-mcp --target x86_64-apple-darwin
+          mkdir -p target
           lipo -create \
-            target/aarch64-apple-darwin/release/plug \
-            target/x86_64-apple-darwin/release/plug \
+            "$RUNNER_TEMP/daemons/daemon-aarch64-apple-darwin/plug" \
+            "$RUNNER_TEMP/daemons/daemon-x86_64-apple-darwin/plug" \
             -output target/plug-universal
-          lipo -archs target/plug-universal
+          chmod 755 target/plug-universal
+          lipo target/plug-universal -verify_arch arm64 x86_64
+          test -x target/plug-universal
 
       - name: Build app archive
         run: |
