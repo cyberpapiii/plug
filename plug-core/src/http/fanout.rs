@@ -26,43 +26,18 @@ impl HttpState {
                             Ok(notification) => {
                                 // One task serves every HTTP session, so a targeted
                                 // notification is routed by the session it names.
-                                use crate::notifications::fanout::{
-                                    NotificationClass, ResolvedDelivery, classify, resolve,
-                                };
-                                let class = classify(&notification);
-                                // Targeted classes carry no broadcast audience; the gate that
-                                // admitted the originating request already authorized the reply.
-                                let kind = match class {
-                                    NotificationClass::ToolListChanged => {
-                                        Some(crate::session::BroadcastKind::ToolList)
-                                    }
-                                    NotificationClass::ResourceListChanged => {
-                                        Some(crate::session::BroadcastKind::ResourceList)
-                                    }
-                                    NotificationClass::PromptListChanged => {
-                                        Some(crate::session::BroadcastKind::PromptList)
-                                    }
-                                    NotificationClass::Logging | NotificationClass::AuthState => {
-                                        Some(crate::session::BroadcastKind::Logging)
-                                    }
-                                    NotificationClass::ToolListChangedFor(_)
-                                    | NotificationClass::Progress(_)
-                                    | NotificationClass::Cancelled(_)
-                                    | NotificationClass::ResourceUpdated(_) => None,
-                                };
-                                match resolve(class) {
-                                    ResolvedDelivery::ToTarget(NotificationTarget::Http {
-                                        session_id,
-                                    }) => {
+                                match notification.target() {
+                                    Some(NotificationTarget::Http { session_id }) => {
                                         if let Some(message) =
                                             notification_to_sse_message(&notification)
                                         {
                                             state.sessions.send_to_live_session(session_id, message);
                                         }
                                     }
-                                    ResolvedDelivery::ToTarget(_) => {}
-                                    ResolvedDelivery::Broadcast => {
-                                        if let Some(kind) = kind
+                                    Some(_) => {}
+                                    None => {
+                                        if let Some(kind) =
+                                            crate::session::BroadcastKind::of(&notification)
                                             && let Some(message) =
                                                 notification_to_sse_message(&notification)
                                         {
@@ -174,14 +149,7 @@ pub(super) fn drain_targeted_notifications(
     loop {
         match receiver.try_recv() {
             Ok(notification) => {
-                let addressed_here = matches!(
-                    crate::notifications::fanout::resolve(
-                        crate::notifications::fanout::classify(&notification)
-                    ),
-                    crate::notifications::fanout::ResolvedDelivery::ToTarget(candidate)
-                        if candidate == target
-                );
-                if addressed_here {
+                if notification.target() == Some(target) {
                     notifications.push(notification);
                 }
             }
