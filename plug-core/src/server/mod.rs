@@ -1791,7 +1791,19 @@ impl ServerManager {
             Arc::new(move || on_upstream_session_replaced(&connection, &events))
         });
 
-        let transport = LegacySseClientTransport::from_config(transport_config)?;
+        let transport = LegacySseClientTransport::connect(transport_config)
+            .await
+            .map_err(|error| {
+                let refused = error
+                    .downcast_ref::<crate::transport::sse_client::LegacySseError>()
+                    .is_some_and(|error| error.refuses_credentials());
+                if refused {
+                    anyhow::Error::new(crate::oauth::AuthRejected(error.to_string()))
+                } else {
+                    error
+                }
+                .context("failed to connect to legacy SSE upstream")
+            })?;
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
         let handler = Arc::new(UpstreamClientHandler::new(
@@ -4726,6 +4738,36 @@ mod tests {
             Some("tools/call")
         );
         assert_eq!(headers.get("Mcp-Name").map(String::as_str), Some("echo"));
+    }
+
+    /// A legacy SSE server that refuses Plug's token when the stream opens
+    /// says so at once, and an OAuth server that does waits for sign-in. The
+    /// start used to redial quietly until it timed out.
+    #[tokio::test]
+    async fn a_legacy_sse_server_refusing_the_token_needs_sign_in() {
+        let (_legacy_server, url) =
+            LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token")).await;
+        let mut config = test_server_config();
+        config.transport = TransportType::Sse;
+        config.command = None;
+        config.url = Some(url);
+        config.timeout_secs = 30;
+        config.auth_token = Some(crate::types::SecretString::from("stale".to_string()));
+        let manager = ServerManager::new();
+
+        let error = manager
+            .start_and_register("legacy-sse", &config)
+            .await
+            .expect_err("the server refuses the token");
+
+        assert!(crate::oauth::is_auth_rejection(&error), "{error:#}");
+        assert!(format!("{error:#}").contains("401"), "{error:#}");
+        config.auth = Some("oauth".to_string());
+        manager.record_start_failure("legacy-sse", &config, &error);
+        assert_eq!(
+            manager.server_statuses()[0].health,
+            ServerHealth::AuthRequired
+        );
     }
 
     #[tokio::test]
