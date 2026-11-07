@@ -678,7 +678,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "set -euo pipefail\nROOT=\"$SRCROOT/..\"\nif [ -n \"${PLUG_RELEASE_BINARY:-}\" ] && [ -x \"$PLUG_RELEASE_BINARY\" ]; then\n  PLUG_BIN=\"$PLUG_RELEASE_BINARY\"\nelif [ \"$CONFIGURATION\" = \"Release\" ]; then\n  cargo build --manifest-path \"$ROOT/Cargo.toml\" --release -p plug-mcp\n  PLUG_BIN=\"$ROOT/target/release/plug\"\nelse\n  cargo build --manifest-path \"$ROOT/Cargo.toml\" -p plug-mcp\n  PLUG_BIN=\"$ROOT/target/debug/plug\"\nfi\nRESOURCES=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nAGENTS=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/Library/LaunchAgents\"\nmkdir -p \"$RESOURCES\" \"$AGENTS\"\ncp \"$PLUG_BIN\" \"$RESOURCES/plug\"\nchmod 755 \"$RESOURCES/plug\"\ncp \"$SRCROOT/PlugApp/Resources/com.plug.daemon.plist\" \"$AGENTS/com.plug.daemon.plist\"\n";
+			shellScript = "set -euo pipefail\nROOT=\"$SRCROOT/..\"\nCARGO_TARGET=\"${CARGO_TARGET_DIR:-$ROOT/target}\"\nif [ -n \"${PLUG_RELEASE_BINARY:-}\" ] && [ -x \"$PLUG_RELEASE_BINARY\" ]; then\n  PLUG_BIN=\"$PLUG_RELEASE_BINARY\"\nelif [ \"$CONFIGURATION\" = \"Release\" ]; then\n  cargo build --manifest-path \"$ROOT/Cargo.toml\" --release -p plug-mcp\n  PLUG_BIN=\"$CARGO_TARGET/release/plug\"\nelse\n  cargo build --manifest-path \"$ROOT/Cargo.toml\" -p plug-mcp\n  PLUG_BIN=\"$CARGO_TARGET/debug/plug\"\nfi\nRESOURCES=\"$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH\"\nAGENTS=\"$TARGET_BUILD_DIR/$WRAPPER_NAME/Contents/Library/LaunchAgents\"\nmkdir -p \"$RESOURCES\" \"$AGENTS\"\ncp \"$PLUG_BIN\" \"$RESOURCES/plug\"\nchmod 755 \"$RESOURCES/plug\"\ncp \"$SRCROOT/PlugApp/Resources/com.plug.daemon.plist\" \"$AGENTS/com.plug.daemon.plist\"\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 

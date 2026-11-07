@@ -2,7 +2,9 @@
 //!
 //! `requests.json` holds every request Plug.app sends and `responses.json`
 //! every reply it reads, by the name the app's own golden tests use;
-//! `chunked_response.json` holds the frames of a reply too large for one.
+//! `chunked_response.json` holds the frames of a reply too large for one;
+//! `cli_requests.json` and `cli_responses.json` what only the command line
+//! sends and reads.
 //! Both sides are checked against the same files: here, that the files are
 //! what the daemon's types write and read; in
 //! `PlugApp/PlugIPC/Tests/PlugIPCTests/GoldenPayloadTests.swift`, that the
@@ -539,6 +541,52 @@ fn reload_report() -> plug_core::reload::ReloadReport {
     }
 }
 
+/// Requests only the command line sends, so the app's golden tests leave
+/// them out.
+fn cli_requests() -> BTreeMap<&'static str, IpcRequest> {
+    BTreeMap::from([
+        (
+            "import_servers",
+            mutate(OperatorMutation::ImportServers {
+                servers: vec![plug_core::import::ImportedServer {
+                    name: "github".to_string(),
+                    source_target: "cursor".to_string(),
+                    server: ServerConfig {
+                        command: Some("npx".to_string()),
+                        args: vec!["-y".to_string(), "github-mcp".to_string()],
+                        ..Default::default()
+                    },
+                }],
+            }),
+        ),
+        (
+            "set_lazy_tools",
+            mutate(OperatorMutation::SetLazyTools {
+                client: "claude-code".to_string(),
+                setting: plug_core::types::LazyToolSetting::Bridge,
+            }),
+        ),
+    ])
+}
+
+/// Replies only the command line reads.
+fn cli_responses() -> BTreeMap<&'static str, IpcResponse> {
+    BTreeMap::from([(
+        "imported",
+        IpcResponse::OperatorMutation {
+            result: OperatorMutationResult {
+                server: None,
+                disabled_tools: None,
+                imported: Some(vec![OperatorServerSummary::from_config(
+                    "github-cursor".to_string(),
+                    &ServerConfig::default(),
+                )]),
+            },
+            reload: reload_report(),
+        },
+    )])
+}
+
 fn responses() -> BTreeMap<&'static str, IpcResponse> {
     BTreeMap::from([
         (
@@ -675,6 +723,7 @@ fn responses() -> BTreeMap<&'static str, IpcResponse> {
                         &stdio_server(),
                     )),
                     disabled_tools: Some(vec!["failed__*".to_string()]),
+                    imported: None,
                 },
                 reload: reload_report(),
             },
@@ -738,6 +787,8 @@ fn check(name: &str, contents: String) {
 fn the_goldens_are_what_the_daemon_writes() {
     check("requests.json", pretty(&requests()));
     check("responses.json", pretty(&responses()));
+    check("cli_requests.json", pretty(&cli_requests()));
+    check("cli_responses.json", pretty(&cli_responses()));
     check("chunked_response.json", pretty(&chunked_response()));
     // What the daemon fills in for a field a server leaves out, which is how
     // the app sends a setting the person did not set.
@@ -755,6 +806,8 @@ fn the_goldens_are_what_the_daemon_writes() {
         files,
         [
             "chunked_response.json",
+            "cli_requests.json",
+            "cli_responses.json",
             "requests.json",
             "responses.json",
             "server_config_default.json"
@@ -763,13 +816,17 @@ fn the_goldens_are_what_the_daemon_writes() {
     );
 }
 
-/// The daemon reads every request the app sends as what it was written from.
+/// The daemon reads every request the app and the command line send as
+/// what it was written from.
 #[test]
 fn the_daemon_reads_every_request_golden() {
-    let golden: BTreeMap<String, serde_json::Value> =
-        serde_json::from_str(&std::fs::read_to_string(dir().join("requests.json")).unwrap())
-            .unwrap();
-    for (name, value) in golden {
+    let golden = |name: &str| -> BTreeMap<String, serde_json::Value> {
+        serde_json::from_str(&std::fs::read_to_string(dir().join(name)).unwrap()).unwrap()
+    };
+    for (name, value) in golden("requests.json")
+        .into_iter()
+        .chain(golden("cli_requests.json"))
+    {
         let request: IpcRequest = serde_json::from_value(value.clone())
             .unwrap_or_else(|e| panic!("request {name} does not parse: {e}"));
         assert_eq!(

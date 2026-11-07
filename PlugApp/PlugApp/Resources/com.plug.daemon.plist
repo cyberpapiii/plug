@@ -11,8 +11,8 @@
        stopped; a panic or a kill self-heals. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
-  <!-- Shutdown lets running tool calls finish for up to eight seconds, and
-       launchd's own default kills an agent about five seconds after SIGTERM. -->
+  <!-- Shutdown first lets running tool calls finish, and launchd's own
+       default kills an agent about five seconds after SIGTERM. -->
   <key>ExitTimeOut</key><integer>20</integer>
   <!-- Every server, client and stream holds a file handle, and the default
        of 256 runs out on a busy day, after which nothing new connects. -->

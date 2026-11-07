@@ -197,16 +197,6 @@ fn unexpected_setup_response(response: IpcResponse) -> anyhow::Error {
     anyhow::anyhow!("unexpected daemon response while waiting for IPC setup: {response:?}")
 }
 
-fn paths_resolve_to_same_file(left: &Path, right: &Path) -> bool {
-    if left == right {
-        return true;
-    }
-    match (std::fs::canonicalize(left), std::fs::canonicalize(right)) {
-        (Ok(left), Ok(right)) => left == right,
-        _ => false,
-    }
-}
-
 fn validate_proxy_daemon_handshake(
     handshake: &ipc::OperatorHandshake,
     expected_executable: &Path,
@@ -218,7 +208,7 @@ fn validate_proxy_daemon_handshake(
                 .daemon_executable
                 .as_deref()
                 .is_some_and(|daemon_executable| {
-                    paths_resolve_to_same_file(&client_executable, daemon_executable)
+                    crate::install::paths_match(&client_executable, daemon_executable)
                 })
         });
         return Err(anyhow::Error::new(DaemonVersionMismatch {
@@ -230,7 +220,7 @@ fn validate_proxy_daemon_handshake(
     let daemon_executable = handshake.daemon_executable.as_deref().ok_or_else(|| {
         anyhow::anyhow!("daemon did not report its executable; refusing an unverified session")
     })?;
-    if !paths_resolve_to_same_file(daemon_executable, expected_executable) {
+    if !crate::install::paths_match(daemon_executable, expected_executable) {
         anyhow::bail!(
             "daemon executable mismatch: expected {}, got {}",
             expected_executable.display(),

@@ -719,7 +719,8 @@ async fn run() -> anyhow::Result<()> {
             dry_run,
             yes,
         }) => {
-            commands::import::cmd_import(cli.config.as_ref(), clients, dry_run, yes, &cli.output)?
+            commands::import::cmd_import(cli.config.as_ref(), clients, dry_run, yes, &cli.output)
+                .await?
         }
         Some(Commands::Doctor) => {
             let exit_code = commands::doctor::cmd_doctor(cli.config.as_ref(), &cli.output).await?;
@@ -737,7 +738,7 @@ async fn run() -> anyhow::Result<()> {
             dry_run,
         }) => commands::repair::cmd_repair(targets, all, dry_run, &cli.output)?,
         Some(Commands::Setup { yes, transport }) => {
-            commands::setup::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into))?
+            commands::setup::cmd_setup(cli.config.as_ref(), yes, transport.map(Into::into)).await?
         }
         Some(Commands::Reload) => commands::reload::cmd_reload(&cli.output).await?,
         Some(Commands::Config { path, command }) => {

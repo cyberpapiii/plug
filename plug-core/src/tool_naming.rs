@@ -326,6 +326,41 @@ pub fn builtin_group_rules(
     is_google_workspace.then(default_workspace_rules)
 }
 
+/// The group rules `server_name` sorts its tools by: those its config
+/// gives, else the built-in ones, if any.
+pub fn group_rules(
+    server_name: &str,
+    server: &crate::config::ServerConfig,
+    reported_name: Option<&str>,
+) -> Option<Vec<crate::config::ToolGroupRule>> {
+    if server.tool_groups.is_empty() {
+        builtin_group_rules(server_name, reported_name)
+    } else {
+        Some(server.tool_groups.clone())
+    }
+}
+
+/// Every prefix a tool of `server_name` can be listed under: each group's,
+/// and the server's own for a tool no group takes. A prefix two servers
+/// share gets the server added (see [`prefixes_for_servers`]); which ones
+/// do depends on the tools both list, so it is not known from the config.
+pub fn server_prefixes(
+    server_name: &str,
+    server: &crate::config::ServerConfig,
+    reported_name: Option<&str>,
+) -> Vec<String> {
+    let mut prefixes: Vec<String> = group_rules(server_name, server, reported_name)
+        .unwrap_or_default()
+        .into_iter()
+        .map(|rule| rule.prefix)
+        .collect();
+    let own = format_server_prefix(server_name);
+    if !prefixes.contains(&own) {
+        prefixes.push(own);
+    }
+    prefixes
+}
+
 /// The prefixes under which two servers have a tool of the same name.
 ///
 /// Each claim is a server, the prefix it puts a tool under, and the tool's

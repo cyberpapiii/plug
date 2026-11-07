@@ -423,8 +423,8 @@ pub fn render_cli_plist(executable: &Path, config_path: Option<&Path>) -> String
        stopped; a panic or a kill self-heals. -->
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>ProcessType</key><string>Interactive</string>
-  <!-- Shutdown lets running tool calls finish for up to eight seconds, and
-       launchd's own default kills an agent about five seconds after SIGTERM. -->
+  <!-- Shutdown first lets running tool calls finish, and launchd's own
+       default kills an agent about five seconds after SIGTERM. -->
   <key>ExitTimeOut</key><integer>20</integer>
   <!-- Every server, client and stream holds a file handle, and the default
        of 256 runs out on a busy day, after which nothing new connects. -->
@@ -966,9 +966,6 @@ arguments = {
     fn cli_and_app_plists_agree_on_crash_only_restart() {
         const CRASH_ONLY: &str =
             "<key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>";
-        // Room for the shutdown drain; without it launchd kills the daemon
-        // while running calls are still finishing.
-        const EXIT_TIMEOUT: &str = "<key>ExitTimeOut</key><integer>20</integer>";
         // launchd's default of 256 file handles runs out with many servers.
         const FILE_LIMIT: &str = "<key>SoftResourceLimits</key><dict><key>NumberOfFiles</key><integer>4096</integer></dict>";
 
@@ -976,10 +973,6 @@ arguments = {
         assert!(
             cli.contains(CRASH_ONLY),
             "CLI plist lost its crash-only restart policy"
-        );
-        assert!(
-            cli.contains(EXIT_TIMEOUT),
-            "CLI plist lost its exit timeout"
         );
         assert!(cli.contains(FILE_LIMIT), "CLI plist lost its file limit");
 
@@ -991,11 +984,25 @@ arguments = {
             app.contains(CRASH_ONLY),
             "app plist lost its crash-only restart policy"
         );
-        assert!(
-            app.contains(EXIT_TIMEOUT),
-            "app plist lost its exit timeout"
-        );
         assert!(app.contains(FILE_LIMIT), "app plist lost its file limit");
+
+        // launchd kills the daemon `ExitTimeOut` seconds after SIGTERM, so
+        // the call drain and the HTTP grace that follows it must fit inside.
+        let exit_timeout = |plist: &str| -> Duration {
+            let value = plist
+                .split("<key>ExitTimeOut</key><integer>")
+                .nth(1)
+                .and_then(|rest| rest.split('<').next())
+                .and_then(|seconds| seconds.parse().ok())
+                .expect("plist sets ExitTimeOut");
+            Duration::from_secs(value)
+        };
+        assert_eq!(exit_timeout(&cli), exit_timeout(&app));
+        let shutdown = crate::daemon::CALL_DRAIN_TIMEOUT + crate::runtime::HTTP_SHUTDOWN_GRACE;
+        assert!(
+            shutdown < exit_timeout(&app),
+            "shutdown takes up to {shutdown:?}, past launchd's ExitTimeOut"
+        );
     }
 
     /// The app registers the job that `app_managed_launchd_evidence` must

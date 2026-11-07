@@ -613,19 +613,22 @@ impl Engine {
         Vec<(String, Option<crate::types::SecretString>)>,
     )> {
         use crate::operator::OperatorMutation;
-        let keep = |name: String, mut server: ServerConfig| async move {
-            let owner = name.clone();
-            tokio::task::spawn_blocking(move || {
-                let kept =
-                    crate::secrets::Stores::current().keep_staged(&store, &owner, &mut server);
-                (server, kept)
-            })
-            .await
-            // Writing the server with its keys still typed into it would put
-            // them in the file in the clear.
-            .map_err(|error| {
-                anyhow::anyhow!("the keys typed into `{name}` could not be stored: {error}")
-            })
+        let keep = |name: String, mut server: ServerConfig| {
+            let store = store.clone();
+            async move {
+                let owner = name.clone();
+                tokio::task::spawn_blocking(move || {
+                    let kept =
+                        crate::secrets::Stores::current().keep_staged(&store, &owner, &mut server);
+                    (server, kept)
+                })
+                .await
+                // Writing the server with its keys still typed into it would put
+                // them in the file in the clear.
+                .map_err(|error| {
+                    anyhow::anyhow!("the keys typed into `{name}` could not be stored: {error}")
+                })
+            }
         };
         let before = |name: &str| {
             self.config
@@ -660,6 +663,24 @@ impl Engine {
                     },
                     (!staged.is_empty()).then_some(name),
                     before,
+                    staged,
+                ))
+            }
+            OperatorMutation::ImportServers { mut servers } => {
+                // Each key is stored under the name its server goes in under.
+                let file = crate::config::load_editable_config(config_path)?;
+                crate::import::settle_names(&file, &mut servers);
+                let mut staged = Vec::new();
+                for imported in &mut servers {
+                    let server = std::mem::take(&mut imported.server);
+                    let (server, kept) = keep(imported.name.clone(), server).await?;
+                    imported.server = server;
+                    staged.extend(kept);
+                }
+                Ok((
+                    OperatorMutation::ImportServers { servers },
+                    None,
+                    None,
                     staged,
                 ))
             }
@@ -1617,6 +1638,61 @@ FROM_ENV = "$HOME"
                 .unwrap()
                 .as_str(),
             "written-in-the-clear"
+        );
+    }
+
+    /// An imported server's key is stored under the name the server goes
+    /// in under, renamed or not.
+    #[tokio::test]
+    async fn an_imported_key_is_kept_under_the_name_the_server_gets() {
+        use crate::secrets::SecretStore;
+        let engine = Engine::new(Config::default());
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        let mut config = Config::default();
+        config.servers.insert(
+            "github".into(),
+            crate::config::ServerConfig {
+                command: Some("gh-mcp".into()),
+                enabled: false,
+                ..Default::default()
+            },
+        );
+        crate::operator::persist_config_atomic(&path, &config).unwrap();
+        let server: crate::config::ServerConfig = serde_json::from_value(serde_json::json!({
+            "command": "npx",
+            "enabled": false,
+            "env": { "GITHUB_TOKEN": "typed-into-cursor" }
+        }))
+        .unwrap();
+
+        let (result, _) = engine
+            .apply_operator_mutation_keeping(
+                &path,
+                crate::operator::OperatorMutation::ImportServers {
+                    servers: vec![crate::import::ImportedServer {
+                        name: "github".into(),
+                        source_target: "cursor".into(),
+                        server,
+                    }],
+                },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.imported.unwrap()[0].name, "github-cursor");
+        let saved = crate::config::load_editable_config(&path).unwrap();
+        assert_eq!(
+            saved.servers["github-cursor"].env["GITHUB_TOKEN"],
+            "keychain:github-cursor.GITHUB_TOKEN"
+        );
+        assert_eq!(
+            crate::secrets::memory::keychain()
+                .get("github-cursor.GITHUB_TOKEN")
+                .unwrap()
+                .unwrap()
+                .as_str(),
+            "typed-into-cursor"
         );
     }
 
