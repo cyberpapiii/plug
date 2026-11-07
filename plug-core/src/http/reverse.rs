@@ -350,13 +350,7 @@ mod tests {
         assert!(state.pending_client_requests.is_empty());
     }
 
-    // Paused time: send_http_client_request and the session store here are
-    // purely in-memory (oneshot channel + DashMap, no socket I/O), so the
-    // 20ms sleep giving the spawned request time to register is a same-
-    // runtime scheduling gap, not a real-I/O wait; auto-advance resolves it
-    // instantly while the spawned task's 1s reverse-request timeout (the
-    // next-nearest timer) stays correctly ordered behind it.
-    #[tokio::test(start_paused = true)]
+    #[tokio::test]
     async fn queued_reverse_request_replays_on_reconnect() {
         let state = test_state();
         let session_id = state.sessions.create_session().unwrap();
@@ -387,7 +381,11 @@ mod tests {
             .await
         });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // A pending request was sent in the same step, so it is queued for
+        // replay behind the full channel before the client reconnects.
+        while state.pending_client_requests.is_empty() {
+            tokio::task::yield_now().await;
+        }
         let (reconnect_tx, mut reconnect_rx) = mpsc::channel(4);
         state
             .sessions

@@ -140,8 +140,6 @@ pub(super) fn router_with_git_commit_tool() -> ToolRouter {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -230,14 +228,14 @@ fn a_watch_takes_the_servers_word_over_the_tools_name() {
 }
 
 #[tokio::test(start_paused = true)]
-async fn schedule_tool_list_changed_refresh_debounces_bursts() {
+async fn schedule_resource_list_changed_refresh_debounces_bursts() {
     let sm = Arc::new(ServerManager::new());
     let router = Arc::new(ToolRouter::new(sm, RouterConfig::default()));
     let mut rx = router.subscribe_notifications();
 
-    router.schedule_tool_list_changed_refresh();
-    router.schedule_tool_list_changed_refresh();
-    router.schedule_tool_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
 
     tokio::task::yield_now().await;
     assert!(
@@ -253,8 +251,8 @@ async fn schedule_tool_list_changed_refresh_debounces_bursts() {
     );
 
     tokio::time::advance(Duration::from_millis(1)).await;
-    let notification = rx.recv().await.expect("tool list changed notification");
-    assert_eq!(notification, ProtocolNotification::ToolListChanged);
+    let notification = rx.recv().await.expect("resource list changed notification");
+    assert_eq!(notification, ProtocolNotification::ResourceListChanged);
     assert!(
         rx.try_recv().is_err(),
         "burst should coalesce into a single notification"
@@ -268,10 +266,10 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
     let mut rx = router.subscribe_notifications();
 
     // First refresh cycle.
-    router.schedule_tool_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let first = rx.recv().await.expect("first notification");
-    assert_eq!(first, ProtocolNotification::ToolListChanged);
+    assert_eq!(first, ProtocolNotification::ResourceListChanged);
 
     // After the cycle completes the in-progress flag must be released —
     // a wedged flag (the regression) would silently drop every future
@@ -286,10 +284,10 @@ async fn refresh_task_releases_in_progress_flag_for_subsequent_refresh() {
 
     // A second schedule must therefore spawn a fresh task and publish
     // again.
-    router.schedule_tool_list_changed_refresh();
+    router.schedule_resource_list_changed_refresh();
     tokio::time::advance(LIST_CHANGED_REFRESH_DEBOUNCE).await;
     let second = rx.recv().await.expect("second notification");
-    assert_eq!(second, ProtocolNotification::ToolListChanged);
+    assert_eq!(second, ProtocolNotification::ResourceListChanged);
 }
 
 #[test]
@@ -459,13 +457,16 @@ fn apply_canonical_tool_title_creates_annotation_title_when_missing() {
     );
 }
 
+/// Every client in `TOOL_LIMITS` is served at most its ceiling, with no
+/// other edit, and only while `tool_filter_enabled` is on.
 #[test]
-fn list_tools_for_client_returns_correct_counts() {
-    let sm = Arc::new(ServerManager::new());
-    let router = ToolRouter::new(sm, RouterConfig::default());
-
-    // Manually set up a snapshot with 150 tools
-    let tools: Vec<Tool> = (0..150)
+fn every_client_ceiling_is_enforced_while_filtering_is_on() {
+    let most = crate::clients::TOOL_LIMITS
+        .iter()
+        .map(|entry| entry.limit)
+        .max()
+        .expect("a ceiling");
+    let tools: Vec<Tool> = (0..most + 1)
         .map(|i| {
             Tool::new(
                 Cow::Owned(format!("tool_{i:03}")),
@@ -475,107 +476,39 @@ fn list_tools_for_client_returns_correct_counts() {
         })
         .collect();
 
-    let tools_devin = Arc::new(tools.iter().take(100).cloned().collect::<Vec<_>>());
-    let tools_copilot = Arc::new(tools.iter().take(128).cloned().collect::<Vec<_>>());
-    let tools_all = Arc::new(tools);
-
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all,
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin,
-            tools_copilot,
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-
-    assert_eq!(router.list_tools_for_client(ClientType::Devin).len(), 100);
-    assert_eq!(
-        router
-            .list_tools_for_client(ClientType::VSCodeCopilot)
-            .len(),
-        128
-    );
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+    store_plain_tools_snapshot(&router, tools.clone());
+    for entry in crate::clients::TOOL_LIMITS {
+        assert_eq!(
+            router.list_tools_for_client(entry.client).len(),
+            entry.limit,
+            "{}",
+            entry.client
+        );
+    }
     assert_eq!(
         router.list_tools_for_client(ClientType::ClaudeCode).len(),
-        150
+        most + 1
     );
-    assert_eq!(router.list_tools_for_client(ClientType::Cursor).len(), 150);
-}
 
-#[test]
-fn list_tools_for_client_ignores_empty_filtered_views_when_filtering_disabled() {
-    // Pins the invariant the refresh_tools() filtered-view gate depends on:
-    // when `tool_filter_enabled` is false, `refresh_tools()` no longer
-    // populates `tools_devin` / `tools_copilot` (they're left empty).
-    // `list_tools_for_client_session` must still return the FULL catalog for
-    // Devin/Copilot in that case — it has to return `tools_all` early
-    // before ever reading those two fields.
-    let sm = Arc::new(ServerManager::new());
-    let config = RouterConfig {
-        tool_filter_enabled: false,
-        ..RouterConfig::default()
-    };
-    let router = ToolRouter::new(sm, config);
-
-    let tools: Vec<Tool> = (0..150)
-        .map(|i| {
-            Tool::new(
-                Cow::Owned(format!("tool_{i:03}")),
-                Cow::Owned(format!("Tool {i}")),
-                Arc::new(serde_json::Map::new()),
-            )
-        })
-        .collect();
-
-    // Simulate what refresh_tools() now produces when filtering is
-    // disabled: tools_devin/tools_copilot stay empty.
-    router.cache.store(Arc::new(
-        RouterSnapshot {
-            routes: HashMap::new(),
-            routes_lower: HashMap::new(),
-            tools_by_name: HashMap::new(),
-            tools_by_name_lower: HashMap::new(),
-            tools_all: Arc::new(tools),
-            meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
-            resources_all: Arc::new(Vec::new()),
-            resource_templates_all: Arc::new(Vec::new()),
-            prompts_all: Arc::new(Vec::new()),
-            resource_routes: HashMap::new(),
-            prompt_routes: HashMap::new(),
-            tool_definition_fingerprints: HashMap::new(),
-            tool_risk_inventory: HashMap::new(),
-        }
-        .with_indexes(),
-    ));
-
-    assert_eq!(
-        router
-            .list_tools_for_client_session(ClientType::Devin, None, None)
-            .len(),
-        150,
-        "Devin must still see the full catalog, not the empty pre-cached view"
+    let unfiltered = ToolRouter::new(
+        Arc::new(ServerManager::new()),
+        RouterConfig {
+            tool_filter_enabled: false,
+            ..RouterConfig::default()
+        },
     );
-    assert_eq!(
-        router
-            .list_tools_for_client_session(ClientType::VSCodeCopilot, None, None)
-            .len(),
-        150,
-        "Copilot must still see the full catalog, not the empty pre-cached view"
-    );
+    store_plain_tools_snapshot(&unfiltered, tools);
+    for entry in crate::clients::TOOL_LIMITS {
+        assert_eq!(
+            unfiltered
+                .list_tools_for_client_session(entry.client, None, None)
+                .len(),
+            most + 1,
+            "{}",
+            entry.client
+        );
+    }
 }
 
 fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
@@ -595,8 +528,6 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
             tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -701,8 +632,6 @@ fn search_tools_returns_matches() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -841,8 +770,6 @@ fn meta_tool_mode_lists_only_meta_tools() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -887,8 +814,6 @@ fn client_lazy_bridge_policy_lists_meta_tools_for_opencode() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -932,8 +857,6 @@ fn bridge_search_tools_adds_real_tools_to_session_visible_set() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -995,8 +918,6 @@ fn bridge_search_keeps_session_working_set_bounded() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1059,8 +980,6 @@ fn bridge_search_publish_tool_list_changed_for_newly_loaded_matches() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1122,8 +1041,6 @@ async fn bridge_session_rejects_unloaded_direct_tool_call() {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1306,8 +1223,6 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
             routes,
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1422,8 +1337,6 @@ fn case_insensitive_route_lookup() {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1474,8 +1387,6 @@ async fn call_tool_times_out_waiting_for_semaphore() {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1589,8 +1500,6 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
             routes_lower: HashMap::new(),
             tools_by_name: HashMap::new(),
             tools_by_name_lower: HashMap::new(),
-            tools_devin: Arc::new(tools.iter().take(100).cloned().collect()),
-            tools_copilot: Arc::new(tools.iter().take(128).cloned().collect()),
             tools_all: Arc::new(tools),
             meta_tools_all: Arc::new(build_meta_tools()),
             resources_all: Arc::new(Vec::new()),
@@ -2944,8 +2853,6 @@ fn publish_route_snapshot(router: &ToolRouter, uri: &str, server_id: &str) {
         tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
@@ -2973,8 +2880,6 @@ fn publish_tool_route_snapshot_with_original(
         )]),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
@@ -3005,8 +2910,6 @@ fn publish_tool_route_snapshot_with_metadata(
             Arc::new(serde_json::Map::new()),
         )]),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(Vec::new()),
         resource_templates_all: Arc::new(Vec::new()),
         prompts_all: Arc::new(Vec::new()),
@@ -4065,7 +3968,7 @@ async fn setup_refresh_parked_pre_publish() -> (
     (sm, router, old_state, new_state, gate_y, refresh)
 }
 
-/// Defect arm 1 (classify owner/route drift): a FIRST subscriber for x
+/// Owner/route drift: a FIRST subscriber for x
 /// lands entirely inside the parked pass's pre-publish window, resolves
 /// the OLD snapshot, and binds to the old owner. The pass classified
 /// before the entry existed, so pure old-vs-new route diffing would
@@ -4144,7 +4047,7 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     }
 }
 
-/// Defect arm 2 (post-subscribe self-check): the first subscriber for x
+/// Post-subscribe self-check: the first subscriber for x
 /// resolves the OLD snapshot pre-publish, but its upstream subscribe call
 /// is still parked on the old server when the refresh publishes the new
 /// snapshot (x -> "new"). When the call lands, the entry's owner is
@@ -4281,7 +4184,7 @@ async fn setup_two_owner_router() -> (
     (sm, router, old_state, new_state)
 }
 
-/// Defect arm (caller cancellation): the heal must not ride the caller's
+/// Caller cancellation: the heal must not ride the caller's
 /// cancellable request future. A subscribe whose upstream confirmation is
 /// still parked when a refresh publish moves the URI — and whose
 /// downstream caller is then aborted — has no self-check left to run. The
@@ -4352,7 +4255,7 @@ async fn caller_cancelled_subscribe_still_heals_via_post_confirm_hook() {
     );
 }
 
-/// Defect arm (retry doesn't heal): a retry/second subscriber against an
+/// A retry or second subscriber against an
 /// already-skewed entry resolves the NEW route, so a self-check comparing
 /// the caller-resolved server against the published route sees nothing
 /// wrong. The self-check must compare the entry's RECORDED owner instead
@@ -4408,11 +4311,11 @@ async fn retry_subscribe_heals_stale_recorded_owner() {
     );
 }
 
-/// Defect arm (silent success on failed migration): the self-check heal
+/// A failed migration is not a silent success: the self-check heal
 /// unsubscribes the stale owner and, when the new owner's subscribe fails,
-/// the transition prunes the entry — the old contract returned Ok with no
-/// live subscription anywhere. The caller must now get an error, and a
-/// fresh subscribe afterwards must succeed cleanly against the new owner.
+/// the transition prunes the entry, leaving no live subscription anywhere.
+/// The caller must get an error, and a fresh subscribe afterwards must
+/// succeed cleanly against the new owner.
 #[tokio::test]
 async fn failed_heal_migration_propagates_error_to_subscriber() {
     let (_sm, router, old_state, new_state) = setup_two_owner_router().await;
@@ -5000,8 +4903,6 @@ fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
         tools_by_name_lower: HashMap::new(),
         tools_all: Arc::new(Vec::new()),
         meta_tools_all: Arc::new(build_meta_tools()),
-        tools_devin: Arc::new(Vec::new()),
-        tools_copilot: Arc::new(Vec::new()),
         resources_all: Arc::new(vec![
             Resource::new("git://log", "git__log"),
             Resource::new("slack://inbox", "slack__inbox"),

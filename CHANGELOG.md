@@ -9,6 +9,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Changed
 
+- Remote sign-in no longer offers `subscriptions:listen`, and the consent page no longer says it lets a client receive change notifications. It never controlled anything: subscribing to a resource needs `resources:read`, and events need `events:subscribe`. A token that carries it keeps working, and a client that still asks for it signs in with the rest of what it asked for.
 - `plug auth status --output json` drops `status_scope`, which repeated `status_source`. `plug servers` and `plug` call an OpenAPI server a "Web API", as the app does.
 - `plug`, `plug status` and `plug clients` with `--output json` drop `inventory_partial`, `inventory_unavailable_sources`, `http_sessions_included`, the SSE count in `live_session_transports` (a legacy SSE stream counts as HTTP) and, from `plug`, `live_client_count`, which repeated `live_session_count`. The text output says in one line whether the live list is complete.
 - `plug clients --output json` no longer has `live_session_transports.sse`. No session ever counted there: a legacy SSE stream belongs to its HTTP session.
@@ -58,6 +59,10 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- A remote client whose sign-in has ended, because it ran out or because Plug ended it after a stolen token was replayed, no longer shows as signed in on the Clients page and no longer counts as a listener for an event. Only its requests used to be refused.
+- Plug reads a server's refusal the same way over HTTP and legacy SSE, as the MCP spec does: a 401, or a 403 asking for more scope, means you need to sign in again; any other 403 is an error that is retried. A 403 asking for more scope over HTTP used to show as an error, and a plain 403 over SSE used to ask for sign-in.
+- A server that signs in with OAuth and refuses its token when Plug reconnects it now asks you to sign in again. It used to show as down and be redialled every minute, forever, with no sign-in prompt.
+- Connected clients are told their tool list changed whenever it does: after a reload adds or removes a server, when a server that went down comes back, and when a server needs you to sign in again. They used to hear only that a crashed server's tools had gone, and kept a stale list until they asked again. A server saying its tools changed when they did not is no longer passed on.
 - A server address written as the IPv6 form of the cloud metadata endpoint, `[::ffff:169.254.169.254]`, is refused like `169.254.169.254`. It used to get past the check.
 - The next step the app suggests under a failure of its own comes with that failure, not from words in its message. A lost or slow connection to Plug no longer suggests checking what was entered or restarting the server. Advice is still read from text the daemon, a server or macOS wrote.
 - A client over the network with no sign-in of its own, such as Cursor on another Mac using Plug's token, is one client in the app under the key its calls carry. Renaming it or saying where it runs no longer renames or moves the same app on this Mac, and its calls in Activity show the name given to its row. Every such client shares one row and one name, because Plug cannot tell their requests apart.

@@ -15,7 +15,6 @@ use tokio_util::task::TaskTracker;
 
 use crate::config::{Config, ServerConfig};
 use crate::health::{Monitor, Reconnect, Recovery};
-use crate::notifications::ProtocolNotification;
 use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::{ReloadReport, ServerChange, server_change};
 use crate::server::{ServerManager, UpstreamEvents, UpstreamServer, retire_upstream_owned};
@@ -65,7 +64,6 @@ impl Engine {
     ///
     /// Does NOT start any servers — call `start()` to begin.
     pub fn new(config: Config) -> Arc<Self> {
-        crate::secrets::Stores::configure(&config.secrets);
         Arc::new_cyclic(|engine: &Weak<Engine>| {
             let recovery: Weak<dyn Recovery> = engine.clone();
             let cancel = CancellationToken::new();
@@ -80,10 +78,8 @@ impl Engine {
                     recovery.clone(),
                 )
             });
-            tool_router.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
-            tool_router.set_client_access(&config.clients);
-            tool_router.set_disabled_tools(&config.disabled_tools);
             let server_manager = Arc::clone(tool_router.server_manager());
+            apply_live_settings(&tool_router, &server_manager, &config);
             let config = Arc::new(ArcSwap::from_pointee(config));
             let supervision = Arc::new(Supervision::default());
             let health = Monitor::new(
@@ -267,13 +263,7 @@ impl Engine {
     }
 
     pub fn store_config(&self, config: Config) {
-        self.tool_router
-            .set_modern_downstream_enabled(config.http.modern_downstream_enabled);
-        self.tool_router.set_client_access(&config.clients);
-        self.tool_router.set_disabled_tools(&config.disabled_tools);
-        self.server_manager
-            .set_modern_upstream_enabled(config.modern_upstream_enabled);
-        crate::secrets::Stores::configure(&config.secrets);
+        apply_live_settings(&self.tool_router, &self.server_manager, &config);
         self.config.store(Arc::new(config));
     }
 
@@ -335,10 +325,19 @@ impl Engine {
         let Some(_starting) = self.supervision.starting.claim(server_id) else {
             return Ok(Reconnect::AlreadyRunning);
         };
-        let upstream = self
+        let upstream = match self
             .server_manager
             .start_server(server_id, server_config)
-            .await?;
+            .await
+        {
+            Ok(upstream) => upstream,
+            Err(error) => {
+                if crate::server::start_needs_sign_in(server_config, &error) {
+                    mark_auth_required(self, server_id).await;
+                }
+                return Err(error);
+            }
+        };
         let outcome = self
             .commit_replacement(server_id, server_config, upstream)
             .await;
@@ -796,8 +795,7 @@ impl Engine {
             }
         }
 
-        let tools_toggled = old_config.disabled_tools != new_config.disabled_tools;
-        let catalog_dirty = tools_toggled
+        let catalog_dirty = old_config.disabled_tools != new_config.disabled_tools
             || !diff.added.is_empty()
             || !diff.changed.is_empty()
             || !diff.removed.is_empty()
@@ -823,10 +821,6 @@ impl Engine {
 
         if catalog_dirty {
             self.tool_router.refresh_tools().await;
-        }
-        if tools_toggled {
-            self.tool_router
-                .publish_protocol_notification(ProtocolNotification::ToolListChanged);
         }
 
         for warning in &diff.restart_required {
@@ -997,10 +991,9 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
         let Some((received_at, expires_in)) = store.cached_expiry() else {
             continue;
         };
-        if !oauth::token_needs_refresh(received_at, expires_in) {
-            next_check = oauth::time_until_refresh_window(received_at, expires_in)
-                .min(REFRESH_POLL)
-                .max(Duration::from_secs(5));
+        let wait = oauth::time_until_refresh_window(received_at, expires_in);
+        if !wait.is_zero() {
+            next_check = wait.min(REFRESH_POLL).max(Duration::from_secs(5));
             continue;
         }
 
@@ -1062,12 +1055,11 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
 
         match engine.reconnect_server(server_name).await {
             Ok(_) => {}
-            Err(e) if crate::oauth::is_auth_rejection(&e) => {
+            Err(e) if crate::server::start_needs_sign_in(&server_config, &e) => {
                 tracing::warn!(
                     server = %server_name,
-                    "reconnect with fresh token failed (auth error), marking AuthRequired"
+                    "reconnect with fresh token failed (auth error), marked AuthRequired"
                 );
-                mark_auth_required(engine, server_name).await;
                 break;
             }
             Err(e) => {
@@ -1082,6 +1074,15 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
             }
         }
     }
+}
+
+/// Hand the settings that apply without a restart to the router, the
+/// servers and the secret stores. The engine's first config and every reload
+/// both come through here.
+fn apply_live_settings(router: &ToolRouter, servers: &ServerManager, config: &Config) {
+    crate::secrets::Stores::configure(&config.secrets);
+    router.apply_config(config);
+    servers.set_modern_upstream_enabled(config.modern_upstream_enabled);
 }
 
 fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {
@@ -1156,6 +1157,26 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(engine.server_manager().get_upstream("on").is_some());
         assert!(engine.server_manager().get_upstream("off").is_none());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn clients_hear_a_reload_add_or_remove_a_servers_tools() {
+        let engine = Engine::new(Config::default());
+        let mut notifications = engine.tool_router().subscribe_notifications();
+        let mut told_tools_changed = || {
+            std::iter::from_fn(|| notifications.try_recv().ok())
+                .any(|n| n == crate::notifications::ProtocolNotification::ToolListChanged)
+        };
+
+        engine.reload_config(mock_stdio_config("foo", "echo")).await;
+        assert!(told_tools_changed(), "server added");
+
+        engine.reload_config(Config::default()).await;
+        assert!(told_tools_changed(), "server removed");
+
+        engine.reload_config(Config::default()).await;
+        assert!(!told_tools_changed(), "nothing changed");
         engine.shutdown().await;
     }
 
@@ -1538,7 +1559,7 @@ mod tests {
         assert!(names.iter().any(|name| name.ends_with("add")), "{names:?}");
         assert!(matches!(
             notifications.try_recv(),
-            Ok(ProtocolNotification::ToolListChanged)
+            Ok(crate::notifications::ProtocolNotification::ToolListChanged)
         ));
 
         engine

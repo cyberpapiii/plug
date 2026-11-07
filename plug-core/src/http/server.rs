@@ -918,7 +918,6 @@ mod tests {
             crate::protocol::MethodFamily::PromptsGet,
             crate::protocol::MethodFamily::Completion,
             crate::protocol::MethodFamily::Tasks,
-            crate::protocol::MethodFamily::Listeners,
         ] {
             assert_eq!(
                 context.policy_decision(family),
@@ -1854,8 +1853,6 @@ mod tests {
                 Arc::new(serde_json::Map::new()),
             )]),
             meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -2209,8 +2206,6 @@ mod tests {
                 std::borrow::Cow::Borrowed("Search tools"),
                 Arc::new(serde_json::Map::new()),
             )]),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),

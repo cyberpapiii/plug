@@ -41,20 +41,21 @@ const LIST_CHANGED_REFRESH_MAX: Duration = Duration::from_secs(600);
 const BRIDGE_WORKING_SET_MAX_TOOLS: usize = 20;
 const BRIDGE_SEARCH_RESULT_MAX: usize = 10;
 
-/// Atomically-swapped tool snapshot with pre-cached filtered views per client type.
-///
-/// Built once at `refresh_tools()` time, so a listing reads it without
-/// rebuilding.
+/// Make a tool result from `server_id` fit to leave Plug. A call's answer
+/// and a task's stored result both come through here.
+fn outward_tool_result(server_id: &str, result: &mut CallToolResult) {
+    admit_tool_result_meta(result);
+    skills::outward_tool_result(server_id, result);
+}
+
+/// Atomically-swapped catalog, built once at `refresh_tools()` time, so a
+/// listing reads it without rebuilding.
 #[derive(Clone)]
 pub(crate) struct RouterSnapshot {
-    /// Full sorted tool list (for clients with no limit).
+    /// Every routed tool, priority-sorted.
     pub tools_all: Arc<Vec<Tool>>,
     /// Meta-tool-only list exposed when meta-tool mode is enabled.
     pub meta_tools_all: Arc<Vec<Tool>>,
-    /// Priority-sorted, truncated to 100 (Devin, for Cascade).
-    pub tools_devin: Arc<Vec<Tool>>,
-    /// Priority-sorted, truncated to 128 (VS Code Copilot).
-    pub tools_copilot: Arc<Vec<Tool>>,
     /// Tool name → (server name, original tool name) routing table.
     pub routes: HashMap<String, (String, String)>,
     /// ASCII-lowercased route keys for O(1) case-insensitive tools/call fallback.
@@ -365,10 +366,6 @@ fn mrtr_pair_supported(
         && upstream_era == crate::protocol::ProtocolEra::Modern)
 }
 
-/// Backs [`ToolRouter::catalog_revision`]. See that method for why it is
-/// process-global instead of a field.
-static CATALOG_REVISION: AtomicU64 = AtomicU64::new(0);
-
 pub struct ToolRouter {
     server_manager: Arc<ServerManager>,
     activity_store: crate::activity::ActivityStore,
@@ -377,6 +374,8 @@ pub struct ToolRouter {
     /// without invalidating parked rounds; route targets and upstream
     /// instances may not.
     published_tool_routes: std::sync::Mutex<HashMap<String, MaterialToolRoute>>,
+    /// Backs [`ToolRouter::catalog_revision`].
+    catalog_revision: AtomicU64,
     /// Search index for the current snapshot, rebuilt lazily when the
     /// snapshot changes. See [`ToolRouter::search_index_for`].
     search_index: std::sync::Mutex<Option<Arc<ToolSearchIndex>>>,
@@ -399,7 +398,6 @@ pub struct ToolRouter {
     upstream_progress_lookup: DashMap<UpstreamProgressKey, u64>,
     notification_refresh_in_progress: AtomicBool,
     notification_refresh_pending: AtomicBool,
-    pending_tool_list_changed: AtomicBool,
     pending_resource_list_changed: AtomicBool,
     pending_prompt_list_changed: AtomicBool,
     /// Reconnects a server whose session failed under a call. Weak: the
@@ -935,15 +933,9 @@ impl ToolRouter {
     }
 
     /// Changes whenever the merged tool catalog could look different to a
-    /// reader: a refreshed upstream catalog, or a reload that rebuilt the
-    /// router around new configuration.
-    ///
-    /// Process-global rather than per-router on purpose. A reload replaces the
-    /// `ToolRouter`, and a per-instance counter would restart at zero, letting
-    /// a client that had already seen revision zero skip the refetch the
-    /// reload just made necessary.
+    /// reader.
     pub fn catalog_revision(&self) -> u64 {
-        CATALOG_REVISION.load(Ordering::Relaxed)
+        self.catalog_revision.load(Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -968,9 +960,6 @@ impl ToolRouter {
         tracker: tokio_util::task::TaskTracker,
         recovery: Weak<dyn Recovery>,
     ) -> Self {
-        // A reload builds a new router around new configuration, which can
-        // change the catalog a reader sees before any upstream refresh runs.
-        CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
         let (protocol_notification_tx, _) = broadcast::channel(128);
         let (logging_tx, _) = broadcast::channel(512);
         let cache = Arc::new(ArcSwap::from_pointee(RouterSnapshot {
@@ -980,8 +969,6 @@ impl ToolRouter {
             tools_by_name_lower: HashMap::new(),
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(build_meta_tools()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1069,6 +1056,7 @@ impl ToolRouter {
             activity_store: crate::activity::ActivityStore::default(),
             cache,
             published_tool_routes: std::sync::Mutex::new(HashMap::new()),
+            catalog_revision: AtomicU64::new(0),
             search_index: std::sync::Mutex::new(None),
             config,
             protocol_notification_tx,
@@ -1083,7 +1071,6 @@ impl ToolRouter {
             upstream_progress_lookup: DashMap::new(),
             notification_refresh_in_progress: AtomicBool::new(false),
             notification_refresh_pending: AtomicBool::new(false),
-            pending_tool_list_changed: AtomicBool::new(false),
             pending_resource_list_changed: AtomicBool::new(false),
             pending_prompt_list_changed: AtomicBool::new(false),
             recovery,
@@ -1127,6 +1114,13 @@ impl ToolRouter {
 
     pub fn publish_protocol_notification(&self, notification: ProtocolNotification) {
         let _ = self.protocol_notification_tx.send(notification);
+    }
+
+    /// Take the settings a reload changes on a running router.
+    pub(crate) fn apply_config(&self, config: &crate::config::Config) {
+        self.set_modern_downstream_enabled(config.http.modern_downstream_enabled);
+        self.set_client_access(&config.clients);
+        self.set_disabled_tools(&config.disabled_tools);
     }
 
     /// Take the owner's per-client blocks. Clients are told their tool list
@@ -1204,7 +1198,7 @@ impl ToolRouter {
 
     /// Take the owner's `disabled_tools`. The catalog they filter changes at
     /// the next `refresh_tools`.
-    pub fn set_disabled_tools(&self, patterns: &[String]) {
+    fn set_disabled_tools(&self, patterns: &[String]) {
         self.disabled_tools.store(Arc::new(
             patterns
                 .iter()
@@ -1552,12 +1546,21 @@ impl ToolRouter {
             .lock()
             .expect("published route mutex poisoned");
         let invalidate = *published != material_routes;
+        let mut tools_changed = false;
         self.continuation_registry
             .publish_with_invalidation(invalidate, || {
                 *published = material_routes;
+                tools_changed = self.cache.load().tools_all != snapshot.tools_all;
                 self.cache.store(snapshot);
-                CATALOG_REVISION.fetch_add(1, Ordering::Relaxed);
+                self.catalog_revision.fetch_add(1, Ordering::Relaxed);
             });
+        drop(published);
+        // The one place clients hear their tool list changed, whatever
+        // changed it: an upstream's own notice, a reload, a server going
+        // down or coming back, or a server needing sign-in.
+        if tools_changed {
+            self.publish_protocol_notification(ProtocolNotification::ToolListChanged);
+        }
     }
 
     /// Reserve one process-wide modern request slot before adapter code can
@@ -1843,9 +1846,6 @@ impl ToolRouter {
 
     fn schedule_list_changed_refresh(self: &Arc<Self>, notification: ProtocolNotification) {
         match notification {
-            ProtocolNotification::ToolListChanged => {
-                self.pending_tool_list_changed.store(true, Ordering::SeqCst);
-            }
             ProtocolNotification::ResourceListChanged => {
                 self.pending_resource_list_changed
                     .store(true, Ordering::SeqCst);
@@ -1912,12 +1912,6 @@ impl ToolRouter {
                     );
                 }
 
-                if router
-                    .pending_tool_list_changed
-                    .swap(false, Ordering::SeqCst)
-                {
-                    router.publish_protocol_notification(ProtocolNotification::ToolListChanged);
-                }
                 if router
                     .pending_resource_list_changed
                     .swap(false, Ordering::SeqCst)
@@ -2292,9 +2286,8 @@ impl ToolRouter {
 
     /// Refresh the merged tool list and routing table from all upstream servers.
     ///
-    /// Builds the full sorted list plus pre-cached filtered views for each
-    /// known client tool limit (Devin: 100, Copilot: 128). All views are
-    /// swapped atomically to prevent torn reads. The three live catalog
+    /// The whole catalog is swapped atomically to prevent torn reads. The
+    /// three live catalog
     /// families (resources, resource templates, prompts) are fetched
     /// concurrently; each is already server-concurrent internally, so a
     /// refresh's upstream latency is the max of the three instead of their
@@ -2718,20 +2711,6 @@ impl ToolRouter {
             "refreshed tool cache"
         );
 
-        // Build pre-cached filtered views — only when tool filtering is
-        // enabled. `list_tools_for_client_session` (catalog.rs) is the only
-        // reader of these two fields, and it always returns `tools_all` early
-        // when filtering is disabled, so these views are provably never read
-        // in that case.
-        let capped = |client: ClientType| {
-            let limit = client.tool_limit().unwrap_or(usize::MAX);
-            Arc::new(tools.iter().take(limit).cloned().collect())
-        };
-        let (tools_devin, tools_copilot) = if self.config.tool_filter_enabled {
-            (capped(ClientType::Devin), capped(ClientType::VSCodeCopilot))
-        } else {
-            (Arc::new(Vec::new()), Arc::new(Vec::new()))
-        };
         let tools_all = Arc::new(tools);
 
         let mut resource_routes = HashMap::new();
@@ -2911,8 +2890,6 @@ impl ToolRouter {
                 tools_by_name_lower: HashMap::new(),
                 tools_all,
                 meta_tools_all: Arc::new(build_meta_tools()),
-                tools_devin,
-                tools_copilot,
                 resources_all,
                 resource_templates_all,
                 prompts_all,
@@ -3832,8 +3809,7 @@ impl ToolRouter {
                 Ok(ServerResult::CallToolResult(mut response)) => {
                     // Sanitize before artifact serialization, cache/buffer
                     // decisions, IPC conversion, or downstream encoding.
-                    admit_tool_result_meta(&mut response);
-                    skills::outward_tool_result(&server_id, &mut response);
+                    outward_tool_result(&server_id, &mut response);
                     finish(Some(true), Some(true));
                     tracing::info!(
                         call_id,

@@ -555,8 +555,7 @@ impl super::ToolRouter {
             // The upstream ran the tool itself, so its result is sanitized
             // here as `call_tool_inner` sanitizes a call's.
             if let Ok(mut result) = serde_json::from_value::<CallToolResult>(payload.clone()) {
-                admit_tool_result_meta(&mut result);
-                skills::outward_tool_result(&server_id, &mut result);
+                super::outward_tool_result(&server_id, &mut result);
                 payload = serde_json::to_value(result)
                     .map_err(|error| McpError::internal_error(error.to_string(), None))?;
             }
@@ -1312,10 +1311,10 @@ mod tests {
         false
     }
 
-    /// Defect-1 regression test: teardown must be abort-first and bounded.
-    /// An upstream whose `tasks/cancel` never responds used to (a) block the
-    /// `handle.abort()` of every later record and (b) hang the caller
-    /// forever (rmcp's `send_request` has no timeout of its own). Paused
+    /// Teardown is abort-first and bounded: an upstream whose `tasks/cancel`
+    /// never responds must neither hold back the `handle.abort()` of later
+    /// records nor hang the caller (rmcp's `send_request` has no timeout of
+    /// its own). Paused
     /// time makes the bound assertion exact: the yield-only phase never
     /// advances the clock, and the final join can only complete via the
     /// per-upstream `call_timeout_secs` timer.
@@ -1436,8 +1435,8 @@ mod tests {
         );
     }
 
-    /// Defect-1 companion for `cancel_task_for_owner`: the forwarding arm
-    /// gets the same per-upstream bound, and on timeout the caller still
+    /// `cancel_task_for_owner`'s forwarding arm gets the same per-upstream
+    /// bound, and on timeout the caller still
     /// gets the locally cancelled task instead of hanging forever.
     #[tokio::test(start_paused = true)]
     async fn cancel_task_for_owner_is_bounded_when_upstream_cancel_hangs() {
@@ -1528,12 +1527,10 @@ mod tests {
         assert_eq!(started.elapsed(), Duration::from_secs(10));
     }
 
-    /// Defect-2 regression test: a teardown that runs while the native
-    /// path's upstream CallToolRequest is still in flight used to see no
-    /// record, and the late `create_passthrough` then inserted a Working
-    /// record for the torn-down owner (unpruned for 24h) whose upstream
-    /// native task was never cancelled. Now the enqueue must error, leave no
-    /// record, and send the upstream a cancel for the task it created.
+    /// A teardown that runs while the native path's upstream
+    /// CallToolRequest is still in flight sees no record yet. The enqueue
+    /// must then error, leave no record for the torn-down owner, and send
+    /// the upstream a cancel for the task it created.
     #[tokio::test]
     async fn native_enqueue_racing_teardown_cancels_upstream_and_returns_error() {
         let state = GatedTaskUpstreamState::new(false, false);
@@ -1554,8 +1551,6 @@ mod tests {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1658,8 +1653,6 @@ mod tests {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1698,8 +1691,6 @@ mod tests {
             routes,
             tools_all: Arc::new(Vec::new()),
             meta_tools_all: Arc::new(Vec::new()),
-            tools_devin: Arc::new(Vec::new()),
-            tools_copilot: Arc::new(Vec::new()),
             resources_all: Arc::new(Vec::new()),
             resource_templates_all: Arc::new(Vec::new()),
             prompts_all: Arc::new(Vec::new()),
@@ -1929,7 +1920,7 @@ mod tests {
             .expect("cleanup must release global capacity");
     }
 
-    /// T1 (Part 1): an owner-liveness probe reporting the owner closed must
+    /// An owner-liveness probe reporting the owner closed must
     /// refuse the create outright — before route lookup, before any
     /// upstream traffic — leave no record, release the lifecycle-ledger
     /// entry (guard at zero), and leave no tombstone behind.
@@ -1967,7 +1958,7 @@ mod tests {
             .expect("fresh create after a probe refusal");
     }
 
-    /// T2 (Part 2): a native create whose upstream never answers must
+    /// A native create whose upstream never answers must
     /// resolve within the per-upstream `call_timeout_secs` bound (paused
     /// time: only that timer can unblock it), surface a timeout error,
     /// send the upstream a request-level cancel for the parked call, and
@@ -2078,7 +2069,7 @@ mod tests {
         );
     }
 
-    /// T3 (Part 2): dropping the enqueue caller mid-round-trip (axum drops
+    /// Dropping the enqueue caller mid-round-trip (axum drops
     /// its POST handler future when the HTTP client disconnects) must not
     /// orphan the native create — the detached round trip completes on its
     /// own and records the created task for the still-live owner, leaving
@@ -2254,7 +2245,7 @@ mod tests {
         }
     }
 
-    /// T4 (Part 3): the record vanishes between `send_cancellable_request`
+    /// The record vanishes between `send_cancellable_request`
     /// and `set_upstream_request` (owner teardown drained the store while
     /// the executor was parked on the store lock). No teardown path can
     /// ever cancel this request — the executor's Missing branch must send
@@ -2334,7 +2325,7 @@ mod tests {
         );
     }
 
-    /// T5 (Part 3): teardown's phase-A `handle.abort()` lands in the
+    /// Teardown's phase-A `handle.abort()` lands in the
     /// send-to-record gap. The dropped executor future can no longer cancel
     /// anything itself — the armed `UpstreamRequestCancelGuard`'s Drop must
     /// fire the request-level cancel for the in-flight upstream call.

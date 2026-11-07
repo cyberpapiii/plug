@@ -1,6 +1,6 @@
 use super::error::HttpError;
 use super::fanout::notification_to_sse_message;
-use super::identity::{AuthStatus, http_credential};
+use super::identity::{AuthStatus, apply_http_auth};
 use super::reverse::{HttpBridge, maybe_request_http_roots};
 use super::server::{HttpState, SESSION_ID_HEADER};
 use crate::notifications::{NotificationTarget, ProtocolNotification};
@@ -9,28 +9,24 @@ use axum::http::HeaderMap;
 use std::sync::Arc;
 
 /// Which broadcast notifications this caller may observe on a legacy
-/// session. `decide_method` stays the single source of policy; this only
-/// records its verdict.
+/// session: what the caller's own requests on it would be allowed to list.
 pub(super) fn broadcast_audience_for(
     state: &HttpState,
+    session_id: &str,
     auth_status: &AuthStatus,
 ) -> BroadcastAudience {
-    use crate::protocol::{CapabilityPolicyInput, MethodFamily, ProtocolEra, decide_method};
+    use crate::protocol::MethodFamily;
     let issuer = state.downstream_oauth().map(|manager| manager.base_url());
-    let principal = http_credential(auth_status, issuer).principal();
-    let (scopes, local_trust) = match auth_status {
-        AuthStatus::Authenticated(Some(claims)) => (claims.scopes.iter().cloned().collect(), false),
-        AuthStatus::Authenticated(None) | AuthStatus::NoAuthRequired => (Default::default(), true),
-    };
-    let input = CapabilityPolicyInput {
-        era: ProtocolEra::Legacy,
-        principal: Some(&principal),
-        scopes: &scopes,
-        local_trust,
-        modern_direction_enabled: false,
-        bridge_implemented: false,
-    };
-    let allows = |family| decide_method(&input, family).is_allowed();
+    let context = apply_http_auth(
+        crate::proxy::DownstreamCallContext::http(
+            session_id,
+            rmcp::model::RequestId::Number(0),
+            crate::types::ClientType::Unknown,
+        ),
+        auth_status,
+        issuer,
+    );
+    let allows = |family| context.policy_decision(family).is_allowed();
     BroadcastAudience {
         tools: allows(MethodFamily::ToolsList),
         resources: allows(MethodFamily::ResourcesList),
@@ -87,7 +83,7 @@ pub(super) fn bind_session_to_caller(
     };
     let binding = SessionBinding {
         grant,
-        broadcast_audience: broadcast_audience_for(state, auth_status),
+        broadcast_audience: broadcast_audience_for(state, session_id, auth_status),
     };
     Ok(state.sessions.bind(session_id, binding)?)
 }
@@ -228,7 +224,7 @@ mod tests {
             .await
             .expect("issued token must validate");
         let state = test_state();
-        let scoped = broadcast_audience_for(&state, &AuthStatus::Authenticated(Some(claims)));
+        let scoped = broadcast_audience_for(&state, "s", &AuthStatus::Authenticated(Some(claims)));
 
         assert!(scoped.tools, "tools:read admits tool list notifications");
         assert!(
@@ -254,7 +250,8 @@ mod tests {
                 .validate_access_token_for(&token, &manager.resource())
                 .await
                 .expect("issued token must validate");
-            let audience = broadcast_audience_for(&state, &AuthStatus::Authenticated(Some(claims)));
+            let audience =
+                broadcast_audience_for(&state, "s", &AuthStatus::Authenticated(Some(claims)));
             assert_eq!(
                 audience.logging,
                 expected,
@@ -265,7 +262,7 @@ mod tests {
 
         // A loopback listener that requires no auth keeps the full audience,
         // so turning auth off does not silence notifications.
-        let loopback = broadcast_audience_for(&state, &AuthStatus::NoAuthRequired);
+        let loopback = broadcast_audience_for(&state, "s", &AuthStatus::NoAuthRequired);
         assert_eq!(
             loopback,
             crate::session::BroadcastAudience::unrestricted(),

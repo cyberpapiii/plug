@@ -102,15 +102,38 @@ fn refused_with(error: &StreamableHttpError<reqwest::Error>) -> Option<u16> {
     }
 }
 
-/// [`refused_with`] for a failed `initialize` over streamable HTTP.
-fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Option<u16> {
+/// The streamable-HTTP error behind a failed `initialize`.
+fn initialize_http_error(
+    error: &rmcp::service::ClientInitializeError,
+) -> Option<&StreamableHttpError<reqwest::Error>> {
     let rmcp::service::ClientInitializeError::TransportError { error, .. } = error else {
         return None;
     };
     error
         .error
         .downcast_ref::<StreamableHttpError<reqwest::Error>>()
-        .and_then(refused_with)
+}
+
+/// [`refused_with`] for a failed `initialize` over streamable HTTP.
+fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Option<u16> {
+    initialize_http_error(error).and_then(refused_with)
+}
+
+/// Whether a streamable-HTTP upstream refused `initialize` in a way that asks
+/// for a new sign-in. See [`crate::transport::refusal_needs_sign_in`].
+fn initialize_needs_sign_in(error: &rmcp::service::ClientInitializeError) -> bool {
+    initialize_http_error(error).is_some_and(|error| {
+        refused_with(error).is_some_and(|status| {
+            crate::transport::refusal_needs_sign_in(status, error.auth_challenge())
+        })
+    })
+}
+
+/// Whether `error`, from starting `config`, means its owner has to sign in
+/// again: the server signs in with OAuth and refused the credentials. Any
+/// other failure is retried.
+pub(crate) fn start_needs_sign_in(config: &ServerConfig, error: &anyhow::Error) -> bool {
+    config.is_oauth() && crate::oauth::is_auth_rejection(error)
 }
 
 /// Whether a legacy-mode HTTP upstream that refused `initialize` is an old
@@ -1107,7 +1130,7 @@ impl ServerManager {
     ) {
         self.configured_auth
             .insert(name.to_string(), Self::configured_auth_for_server(config));
-        if config.is_oauth() && crate::oauth::is_auth_rejection(error) {
+        if start_needs_sign_in(config, error) {
             self.mark_auth_required(name);
         } else {
             self.mark_start_failure(name);
@@ -1349,7 +1372,6 @@ impl ServerManager {
     /// one server that takes a minute to spawn must not delay the health task that
     /// would otherwise be reconnecting an upstream that is already back.
     pub async fn start_all(&self, config: &Config, on_settled: impl Fn(&str)) {
-        self.set_modern_upstream_enabled(config.modern_upstream_enabled);
         let enabled: Vec<(String, ServerConfig)> = config
             .servers
             .iter()
@@ -1648,7 +1670,7 @@ impl ServerManager {
                         Err(e) => {
                             let fall_back =
                                 should_fallback_to_legacy_sse(effective_protocol_mode, &e);
-                            let error = if initialize_refused_with(&e) == Some(401) {
+                            let error = if initialize_needs_sign_in(&e) {
                                 anyhow::Error::new(crate::oauth::AuthRejected(e.to_string()))
                             } else {
                                 anyhow::Error::new(e)
@@ -2552,14 +2574,9 @@ async fn resolve_upstream_auth(
     url: &str,
     config: &ServerConfig,
 ) -> Result<Option<String>, anyhow::Error> {
-    let parsed = url
-        .parse::<http::Uri>()
-        .map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-    if let Some(host) = parsed.host()
-        && crate::upstream_http::is_blocked_host(host)
-    {
-        anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint");
-    }
+    let parsed =
+        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
+    crate::upstream_http::refuse_blocked(&parsed)?;
 
     if !config.is_oauth() {
         return Ok(config.auth_token.as_ref().map(|t| t.as_str().to_string()));
@@ -2923,6 +2940,10 @@ mod tests {
             initialize_refused_with(&refused("HTTP 401 Unauthorized: ")),
             Some(401)
         );
+        assert!(initialize_needs_sign_in(&refused(
+            "HTTP 401 Unauthorized: "
+        )));
+        assert!(!initialize_needs_sign_in(&refused("HTTP 403 Forbidden: ")));
     }
 
     #[tokio::test]
@@ -4780,10 +4801,9 @@ mod tests {
     }
 
     /// A legacy SSE server that refuses Plug's token when the stream opens
-    /// says so at once, and an OAuth server that does waits for sign-in. The
-    /// start used to redial quietly until it timed out.
+    /// says so at once. The start used to redial quietly until it timed out.
     #[tokio::test]
-    async fn a_legacy_sse_server_refusing_the_token_needs_sign_in() {
+    async fn a_legacy_sse_server_refusing_the_token_says_so_at_once() {
         let (_legacy_server, url) =
             LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token")).await;
         let mut config = test_server_config();
@@ -4801,12 +4821,69 @@ mod tests {
 
         assert!(crate::oauth::is_auth_rejection(&error), "{error:#}");
         assert!(format!("{error:#}").contains("401"), "{error:#}");
-        config.auth = Some("oauth".to_string());
-        manager.record_start_failure("legacy-sse", &config, &error);
-        assert_eq!(
-            manager.server_statuses()[0].health,
-            ServerHealth::AuthRequired
-        );
+    }
+
+    /// An OAuth server that refuses its token when recovery reconnects it
+    /// waits for its owner to sign in again. Recovery used to count it as
+    /// down and redial it every minute forever.
+    #[tokio::test]
+    async fn an_oauth_server_refusing_its_token_at_recovery_needs_sign_in() {
+        use rmcp::transport::auth::CredentialStore as _;
+
+        let (_legacy_server, url) =
+            LegacySseTestServer::spawn(vec![make_tool("echo")], Some("sse-token")).await;
+        let name = format!("refused-at-recovery-{}", uuid::Uuid::new_v4());
+        let store = crate::oauth::get_or_create_store(&name);
+        let mut metadata = rmcp::transport::auth::AuthorizationMetadata::default();
+        metadata.token_endpoint = url.replace("/mcp", "/token");
+        store
+            .bind_verified_authority(
+                &crate::oauth::VerifiedOAuthAuthority::verify(&url, &metadata).unwrap(),
+            )
+            .unwrap();
+        let token = |access: &str| {
+            let mut token = oauth2::StandardTokenResponse::new(
+                oauth2::AccessToken::new(access.to_string()),
+                oauth2::basic::BasicTokenType::Bearer,
+                rmcp::transport::auth::VendorExtraTokenFields::default(),
+            );
+            token.set_expires_in(Some(&Duration::from_secs(3600)));
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            rmcp::transport::auth::StoredCredentials::new(
+                "test-client".to_string(),
+                Some(token),
+                vec![],
+                Some(now),
+            )
+        };
+        store.save(token("sse-token")).await.unwrap();
+
+        let mut server = test_server_config();
+        server.transport = TransportType::Sse;
+        server.command = None;
+        server.url = Some(url);
+        server.auth = Some("oauth".to_string());
+        let mut config = crate::config::Config::default();
+        config.servers.insert(name.clone(), server);
+        let engine = crate::engine::Engine::new(config);
+        engine.start().await;
+        assert!(engine.server_manager().get_upstream(&name).is_some());
+
+        store.save(token("revoked")).await.unwrap();
+        engine.recover_server(&name);
+        tokio::time::timeout(Duration::from_secs(15), async {
+            while engine.server_manager().health(&name) != Some(ServerHealth::AuthRequired) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the refused server needs sign-in");
+
+        engine.shutdown().await;
+        store.clear().await.unwrap();
     }
 
     #[tokio::test]

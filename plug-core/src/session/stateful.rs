@@ -1008,10 +1008,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn cleanup_task_keeps_running_across_multiple_expiry_cycles() {
-        // Regression guard for the underflow panic silently killing the
-        // spawned cleanup task: if the first tick's arithmetic panicked, the
-        // JoinHandle is never awaited and idle-session reclamation would stop
-        // forever, so a second expiry cycle would never happen either.
+        // The cleanup task must survive its first tick: a panic there is
+        // never seen, because nothing awaits its JoinHandle, and idle-session
+        // reclamation would stop for good, so a second expiry cycle checks
+        // it is still running.
         //
         // `last_activity` is a `std::time::Instant`, which is NOT affected by
         // tokio's paused virtual clock (only `tokio::time::interval` ticks
@@ -1568,11 +1568,8 @@ mod tests {
 
     #[tokio::test]
     async fn replay_send_failure_preserves_tail() {
-        // Regression guard for the drain-then-break tail loss: the old code
-        // drained `pending_notifications` entirely up front, then on the
-        // first `try_send` failure re-enqueued only that one event and
-        // `break`-ed, silently discarding every already-drained, not-yet-sent
-        // event after it.
+        // A `try_send` failure partway through the drain keeps every event
+        // not yet sent, not only the one that failed.
         let store = SessionStore::new(1800, 100);
         let id = store.create_session().unwrap();
 
@@ -1609,8 +1606,8 @@ mod tests {
         );
     }
 
-    // `replay_requeue_orders_before_concurrent_enqueues` from the plan is
-    // intentionally not implemented: `send_replay_events` is always invoked
+    // There is no test of an enqueue during replay: `send_replay_events` is
+    // always invoked
     // while the caller (`set_sse_sender`) holds the session's `DashMap`
     // `RefMut` for the entire synchronous call (no `.await` inside), and
     // `DashMap::get_mut` takes an exclusive lock on the shard for the guard's
