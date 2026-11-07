@@ -102,7 +102,7 @@ pub(super) async fn stdio_path() -> (Option<&'static OsStr>, StdioPathSource) {
 ///
 /// An interactive login shell runs the user's dotfiles, which can hang, so a
 /// stuck shell delays the first stdio start by at most five seconds.
-#[cfg(all(target_os = "macos", not(test)))]
+#[cfg(all(target_os = "macos", not(any(test, feature = "test-helpers"))))]
 fn login_shell_probe() -> (
     impl Future<Output = Option<OsString>> + Send + 'static,
     Option<PathBuf>,
@@ -117,10 +117,11 @@ fn login_shell_probe() -> (
     )
 }
 
-/// Unit tests answer with the test runner's PATH and save nothing: a real
-/// login shell runs the developer's dotfiles, and its wait can outlive a
-/// paused Tokio clock and use up a test's virtual retry window.
-#[cfg(all(target_os = "macos", test))]
+/// Tests answer with the test runner's PATH and save nothing: a real login
+/// shell runs the developer's dotfiles and would write the live daemon's saved
+/// PATH, and its wait can outlive a paused Tokio clock and use up a test's
+/// virtual retry window.
+#[cfg(all(target_os = "macos", any(test, feature = "test-helpers")))]
 fn login_shell_probe() -> (
     impl Future<Output = Option<OsString>> + Send + 'static,
     Option<PathBuf>,
@@ -272,7 +273,7 @@ async fn cached_login_path(
 
 /// The file in the config directory that holds the last successful probe's
 /// PATH.
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(test, not(feature = "test-helpers"))))]
 const SAVED_LOGIN_PATH_FILE: &str = "login-shell-path";
 
 /// A saved PATH, or `None` when the file is missing, not UTF-8, or names no
@@ -317,7 +318,7 @@ fn fallback_stdio_path(inherited: Option<OsString>) -> OsString {
 #[cfg(target_os = "macos")]
 const LOGIN_SHELL_PROBE_RETRY: Duration = Duration::from_secs(30);
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(test, not(feature = "test-helpers"))))]
 async fn probe_login_shell_path(
     program: &str,
     args: &[&str],
@@ -340,7 +341,7 @@ async fn probe_login_shell_path(
     }
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(all(target_os = "macos", any(test, not(feature = "test-helpers"))))]
 fn login_shell_path(stdout: &[u8]) -> Option<OsString> {
     const MARKER: &str = "__PLUG_STDIO_PATH__";
     String::from_utf8_lossy(stdout)
