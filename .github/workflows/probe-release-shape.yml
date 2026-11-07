@@ -1,0 +1,90 @@
+name: Probe release shape
+
+on:
+  pull_request:
+
+jobs:
+  archive:
+    name: Archive (${{ matrix.mode }})
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [embedded, placeholder]
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - run: brew install xcodegen
+      - name: Archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp /bin/ls "$RUNNER_TEMP/fake-daemon"
+          if [[ "${{ matrix.mode }}" == embedded ]]; then
+            binary="$RUNNER_TEMP/fake-daemon"
+          else
+            printf '#!/bin/sh\nexit 1\n' > "$RUNNER_TEMP/placeholder"
+            chmod 755 "$RUNNER_TEMP/placeholder"
+            binary="$RUNNER_TEMP/placeholder"
+          fi
+          start=$(date +%s)
+          cd PlugApp
+          xcodegen generate
+          xcodebuild archive -project PlugApp.xcodeproj -scheme PlugApp -configuration Release \
+            -archivePath "$RUNNER_TEMP/Plug.xcarchive" ARCHS="arm64 x86_64" ONLY_ACTIVE_ARCH=NO \
+            CODE_SIGNING_ALLOWED=NO MARKETING_VERSION=0.0.0 CURRENT_PROJECT_VERSION=1 \
+            PLUG_RELEASE_BINARY="$binary" -quiet
+          echo "archive_seconds=$(( $(date +%s) - start ))"
+      - name: Hand off and insert
+        if: matrix.mode == 'placeholder'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C "$RUNNER_TEMP/Plug.xcarchive/Products/Applications" -czf "$RUNNER_TEMP/app.tgz" Plug.app
+          rm -rf "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app"
+          tar -C "$RUNNER_TEMP/Plug.xcarchive/Products/Applications" -xzf "$RUNNER_TEMP/app.tgz"
+          install -m 755 "$RUNNER_TEMP/fake-daemon" "$RUNNER_TEMP/Plug.xcarchive/Products/Applications/Plug.app/Contents/Resources/plug"
+      - name: Fingerprint
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/Plug.xcarchive/Products/Applications"
+          find Plug.app -type l -exec sh -c 'printf "%s -> %s\n" "$1" "$(readlink "$1")"' _ {} \; | sort > "$RUNNER_TEMP/links.txt"
+          find Plug.app -type f -exec shasum -a 256 {} \; | sort -k2 > "$RUNNER_TEMP/files.txt"
+          find Plug.app -perm -u+x -type f | sort > "$RUNNER_TEMP/exec.txt"
+          echo "links $(shasum -a 256 < "$RUNNER_TEMP/links.txt")"
+          echo "files $(shasum -a 256 < "$RUNNER_TEMP/files.txt")"
+          echo "exec $(shasum -a 256 < "$RUNNER_TEMP/exec.txt")"
+          cat "$RUNNER_TEMP/files.txt"
+          codesign --force --deep --sign - Plug.app
+          codesign --verify --deep --strict --verbose=2 Plug.app
+
+  profile:
+    name: Daemon profile (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: current, lto: fat, cgu: "1" }
+          - { name: thin-lto, lto: thin, cgu: "1" }
+          - { name: fat-cgu16, lto: fat, cgu: "16" }
+          - { name: thin-cgu16, lto: thin, cgu: "16" }
+    runs-on: macos-26
+    timeout-minutes: 60
+    env:
+      CARGO_PROFILE_RELEASE_LTO: ${{ matrix.lto }}
+      CARGO_PROFILE_RELEASE_CODEGEN_UNITS: ${{ matrix.cgu }}
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build cold, then rebuild only Plug's own crates
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release -p plug-mcp --target aarch64-apple-darwin
+          touch plug-core/src/lib.rs plug/src/main.rs
+          start=$(date +%s)
+          cargo build --release -p plug-mcp --target aarch64-apple-darwin
+          echo "warm_seconds=$(( $(date +%s) - start ))"
+          bin=target/aarch64-apple-darwin/release/plug
+          echo "size_bytes=$(stat -f %z "$bin")"
+          for _ in 1 2 3 4 5; do /usr/bin/time -p "$bin" --version 2>&1 | grep real; done
