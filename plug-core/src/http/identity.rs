@@ -18,7 +18,6 @@ pub(super) struct HttpDownstreamContext {
     pub(super) auth_status: AuthStatus,
     pub(super) oauth_issuer: Option<Arc<str>>,
     pub(super) protocol_era: crate::protocol::ProtocolEra,
-    pub(super) modern_direction_enabled: bool,
     pub(super) client_metadata: Option<crate::protocol::ClientMetadata>,
     /// What a modern request declared in `_meta`. HTTP serves the modern
     /// tasks extension, so a modern request always has one.
@@ -94,7 +93,6 @@ impl HttpDownstreamContext {
             auth_status,
             oauth_issuer,
             protocol_era,
-            modern_direction_enabled: state.router.modern_downstream_enabled(),
             client_metadata,
             modern_task_client,
             events_discoverable,
@@ -174,8 +172,7 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             self.client_type,
         )
         .with_trace_id(Arc::clone(&self.trace_id))
-        .with_protocol(self.protocol_era, self.protocol_era.version_str())
-        .with_modern_direction_enabled(self.modern_direction_enabled);
+        .with_protocol(self.protocol_era, self.protocol_era.version_str());
         if let Some(metadata) = &self.client_metadata {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));

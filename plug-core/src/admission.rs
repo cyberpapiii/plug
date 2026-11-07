@@ -101,7 +101,6 @@ pub struct CapabilityPolicyInput<'a> {
     pub principal: Option<&'a PrincipalId>,
     pub scopes: &'a BTreeSet<String>,
     pub local_trust: bool,
-    pub modern_direction_enabled: bool,
     pub bridge_implemented: bool,
 }
 
@@ -119,9 +118,6 @@ impl PolicyDecision {
 
 /// The single projection/admission policy. Unknown combinations fail closed.
 pub fn decide_method(input: &CapabilityPolicyInput<'_>, family: MethodFamily) -> PolicyDecision {
-    if input.era == ProtocolEra::Modern && !input.modern_direction_enabled {
-        return PolicyDecision::Deny(ProtocolOutcome::UnsupportedBridge);
-    }
     if family.durable() && input.principal.is_none() {
         return PolicyDecision::Deny(ProtocolOutcome::AuthorizationRequired);
     }
@@ -311,7 +307,6 @@ mod tests {
             principal: Some(&principal),
             scopes: &scopes,
             local_trust: false,
-            modern_direction_enabled: false,
             bridge_implemented: false,
         };
         assert_eq!(
@@ -332,7 +327,6 @@ mod tests {
             principal: None,
             scopes: &scopes,
             local_trust: true,
-            modern_direction_enabled: false,
             bridge_implemented: false,
         };
         assert_eq!(

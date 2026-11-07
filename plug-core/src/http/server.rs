@@ -853,7 +853,6 @@ mod tests {
     }
 
     fn modern_task_policy_context(
-        gate_enabled: bool,
         scopes: impl IntoIterator<Item = String>,
     ) -> DownstreamCallContext {
         DownstreamCallContext::http(
@@ -865,7 +864,6 @@ mod tests {
             crate::protocol::ProtocolEra::Modern,
             crate::protocol::MODERN_PROTOCOL_VERSION,
         )
-        .with_modern_direction_enabled(gate_enabled)
         .with_authorization(
             crate::types::PrincipalId::configured_credential("task-test", 1),
             scopes,
@@ -1289,7 +1287,7 @@ mod tests {
     #[tokio::test]
     async fn modern_http_task_admission_matrix_is_consistent() {
         let state = test_state();
-        let allowed = modern_task_policy_context(true, ["tasks:use".to_string()]);
+        let allowed = modern_task_policy_context(["tasks:use".to_string()]);
         let task_meta = modern_task_meta(true);
 
         let unavailable =
@@ -1309,7 +1307,7 @@ mod tests {
             ErrorCode::MISSING_REQUIRED_CLIENT_CAPABILITY
         );
 
-        let denied = modern_task_policy_context(true, ["tools:read".to_string()]);
+        let denied = modern_task_policy_context(["tools:read".to_string()]);
         let permission =
             admit_modern_task_operation(state.router.as_ref(), &denied, Some(&task_meta))
                 .expect_err("task scope is mandatory");
@@ -1318,16 +1316,6 @@ mod tests {
             crate::protocol::ProtocolOutcome::PermissionDenied
                 .encode(crate::protocol::ProtocolEra::Modern)
                 .code
-        );
-
-        let gate_off = modern_task_policy_context(false, ["tasks:use".to_string()]);
-        let disabled =
-            admit_modern_task_operation(state.router.as_ref(), &gate_off, Some(&task_meta))
-                .expect_err("live gate must apply to direct task methods");
-        assert_eq!(
-            disabled,
-            crate::protocol::ProtocolOutcome::UnsupportedBridge
-                .into_error(crate::protocol::ProtocolEra::Modern)
         );
 
         let owner = admit_modern_task_operation(state.router.as_ref(), &allowed, Some(&task_meta))
@@ -1356,7 +1344,7 @@ mod tests {
         });
         enable_test_task_surface(state.router.as_ref());
         let caller = |client_type| {
-            let mut call = modern_task_policy_context(true, ["tasks:use".to_string()]);
+            let mut call = modern_task_policy_context(["tasks:use".to_string()]);
             call.client_type = client_type;
             call
         };
@@ -1406,7 +1394,7 @@ mod tests {
         });
         let call = |scopes: &[&str], tool: &str| {
             let caller = ModernTaskCaller {
-                call: modern_task_policy_context(true, scopes.iter().map(|s| s.to_string())),
+                call: modern_task_policy_context(scopes.iter().map(|s| s.to_string())),
                 client: ClientCapabilities::builder().enable_tasks().build(),
             };
             let router = Arc::clone(&state.router);
@@ -1568,7 +1556,6 @@ mod tests {
                 crate::protocol::ProtocolEra::Modern,
                 crate::protocol::MODERN_PROTOCOL_VERSION,
             )
-            .with_modern_direction_enabled(true)
             .with_authorization(
                 crate::types::PrincipalId::configured_credential("test", 1),
                 scopes.iter().map(ToString::to_string),

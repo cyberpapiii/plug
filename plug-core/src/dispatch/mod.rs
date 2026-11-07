@@ -76,7 +76,6 @@ pub struct IpcContext {
     /// The revision the downstream client negotiated with `plug connect`.
     pub protocol_version: Arc<str>,
     pub client_metadata: Option<crate::protocol::ClientMetadata>,
-    pub modern_enabled: bool,
     pub owner_liveness: Option<OwnerLivenessProbe>,
 }
 
@@ -91,7 +90,6 @@ impl IpcContext {
             client_key: None,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
             client_metadata: None,
-            modern_enabled: false,
             owner_liveness: None,
         }
     }
@@ -107,8 +105,7 @@ impl DownstreamContext for IpcContext {
             self.registry_client_id.as_deref(),
         )
         .with_client_key(self.client_key.clone())
-        .with_protocol(era, Arc::clone(&self.protocol_version))
-        .with_modern_direction_enabled(self.modern_enabled && era == ProtocolEra::Modern);
+        .with_protocol(era, Arc::clone(&self.protocol_version));
         match &self.client_metadata {
             Some(metadata) => context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version)),

@@ -540,9 +540,6 @@ pub struct DownstreamCallContext {
     pub trace_id: Arc<str>,
     pub protocol_era: crate::protocol::ProtocolEra,
     pub protocol_version: Arc<str>,
-    /// Reloadable transport gate captured when this request context is built.
-    /// Modern policy remains fail-closed unless the owning adapter sets it.
-    pub modern_direction_enabled: bool,
     principal: Option<PrincipalId>,
     scopes: Arc<BTreeSet<String>>,
     local_trust: bool,
@@ -579,7 +576,6 @@ impl DownstreamCallContext {
             trace_id: Arc::from(new_trace_id()),
             protocol_era: crate::protocol::ProtocolEra::Legacy,
             protocol_version: Arc::from(crate::protocol::SUPPORTED_PROTOCOL_VERSION),
-            modern_direction_enabled: false,
             principal,
             scopes: Arc::new(BTreeSet::new()),
             local_trust,
@@ -707,11 +703,6 @@ impl DownstreamCallContext {
         self
     }
 
-    pub fn with_modern_direction_enabled(mut self, enabled: bool) -> Self {
-        self.modern_direction_enabled = enabled;
-        self
-    }
-
     pub fn policy_decision(
         &self,
         family: crate::admission::MethodFamily,
@@ -732,7 +723,6 @@ impl DownstreamCallContext {
                 principal: self.principal.as_ref(),
                 scopes: self.scopes.as_ref(),
                 local_trust: self.local_trust,
-                modern_direction_enabled: self.modern_direction_enabled,
                 bridge_implemented,
             },
             family,

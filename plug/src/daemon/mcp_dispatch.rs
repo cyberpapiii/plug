@@ -38,7 +38,6 @@ pub(super) fn ipc_context(
         .client_registry
         .client_key(session_id)
         .map(Arc::<str>::from);
-    context.modern_enabled = ctx.engine.tool_router().modern_downstream_enabled();
     context.owner_liveness = owner_liveness;
     if let Some(request) = request_context {
         context.protocol_version = Arc::from(request.protocol_version.as_str());

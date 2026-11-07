@@ -17,7 +17,6 @@ fn caller(protocol_version: &str) -> IpcContext {
     let mut ctx = IpcContext::new("session-1", RequestId::Number(1));
     ctx.registry_client_id = Some(Arc::from("client-1"));
     ctx.protocol_version = Arc::from(protocol_version);
-    ctx.modern_enabled = true;
     ctx
 }
 
@@ -32,7 +31,6 @@ fn an_ipc_caller_keeps_its_protocol_client_and_principal() {
 
     assert_eq!(call.request_id, RequestId::Number(1));
     assert_eq!(call.protocol_era, ProtocolEra::Modern);
-    assert!(call.modern_direction_enabled);
     assert_eq!(call.protocol_version.as_ref(), "2026-07-28");
     assert_eq!(
         call.principal(),
