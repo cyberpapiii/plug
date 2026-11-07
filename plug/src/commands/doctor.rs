@@ -743,18 +743,17 @@ async fn runtime_doctor_checks(config: &plug_core::config::Config) -> Vec<CheckR
 }
 
 /// Remote apps that sign in through dynamic registration make a new client
-/// each time, and every old one keeps its grants until it expires 90 days
-/// after its last use. Several registrations under one name are usually
-/// leftovers worth revoking. One the owner gave a name of its own is not a
-/// leftover, and one whose sign-in never finished goes by itself in an hour.
+/// each time, and every old one keeps its grants until its registration
+/// runs out. Several registrations under one name are usually leftovers
+/// worth revoking. One the owner gave a name of its own is not a leftover,
+/// and one whose sign-in never finished goes by itself.
 fn duplicate_downstream_client_check(
     clients: &[plug_core::downstream_oauth::RegisteredClientSummary],
     named: &std::collections::BTreeSet<String>,
 ) -> Option<CheckResult> {
     let mut counts = std::collections::BTreeMap::<&str, usize>::new();
     for client in clients {
-        let unfinished = !client.signed_in && client.last_used_at.is_none();
-        if unfinished || named.contains(&client.client_id) {
+        if client.is_unactivated() || named.contains(&client.client_id) {
             continue;
         }
         *counts.entry(client.client_name.as_str()).or_default() += 1;
@@ -771,8 +770,9 @@ fn duplicate_downstream_client_check(
         name: check::DOWNSTREAM_OAUTH_CLIENTS.to_string(),
         status: CheckStatus::Warn,
         message: format!(
-            "Clients signed in more than once: {}. Each old sign-in keeps its access until 90 days after its last use",
-            duplicates.join(", ")
+            "Clients signed in more than once: {}. Each old sign-in keeps its access until {} days after its last use",
+            duplicates.join(", "),
+            plug_core::downstream_oauth::REGISTRATION_LIFETIME_SECS / (24 * 3600)
         ),
         fix_suggestion: Some(
             "Open Clients in Plug and turn off the ones you no longer use, or give each one you keep a name of its own. From a terminal: `plug auth clients list`, then `plug auth clients revoke <client_id>`".to_string(),
