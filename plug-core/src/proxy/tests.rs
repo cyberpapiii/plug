@@ -611,6 +611,44 @@ fn store_plain_tools_snapshot(router: &ToolRouter, tools: Vec<Tool>) {
     ));
 }
 
+/// A start or reload that finds a server needs sign-in tells clients, as
+/// recovery and the token refresh loop do. A start that fails otherwise
+/// does not.
+#[test]
+fn a_start_that_needs_sign_in_tells_clients() {
+    let router = ToolRouter::linked(RouterConfig::default());
+    let mut rx = router.subscribe_notifications();
+    let config = crate::config::ServerConfig {
+        transport: crate::config::TransportType::Http,
+        url: Some("https://example.com/mcp".to_string()),
+        auth: Some("oauth".to_string()),
+        oauth_client_id: Some("test-client".to_string()),
+        ..Default::default()
+    };
+
+    router.server_manager.record_start_failure(
+        "notion",
+        &config,
+        &anyhow::anyhow!("connection refused"),
+    );
+    assert!(rx.try_recv().is_err());
+
+    router.server_manager.record_start_failure(
+        "notion",
+        &config,
+        &anyhow::anyhow!(
+            "AuthRequired(AuthRequiredError {{ www_authenticate_header: \"Bearer\" }})"
+        ),
+    );
+    assert_eq!(
+        rx.try_recv().ok(),
+        Some(ProtocolNotification::AuthStateChanged {
+            server_id: Arc::from("notion"),
+            new_state: crate::types::ServerHealth::AuthRequired,
+        })
+    );
+}
+
 /// The app keeps its tool list while the revision matches the one it read,
 /// so a daemon that publishes as often as the one before it must not land
 /// on that one's number.

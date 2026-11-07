@@ -19,7 +19,7 @@ use crate::proxy::{RouterConfig, ToolRouter};
 use crate::reload::{ReloadReport, ServerChange, server_change};
 use crate::server::{ServerManager, UpstreamEvents, UpstreamServer, retire_upstream_owned};
 use crate::supervision::Supervision;
-use crate::types::{ServerHealth, ServerStatus};
+use crate::types::ServerStatus;
 
 const ARTIFACT_PRUNE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
@@ -1093,16 +1093,10 @@ fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {
     );
 }
 
-/// Mark a server as `AuthRequired` and notify clients of the state change.
+/// Mark a server as `AuthRequired`, which tells clients, and drop its tools.
 async fn mark_auth_required(engine: &Engine, server_name: &str) {
     engine.server_manager().mark_auth_required(server_name);
     engine.tool_router().refresh_tools().await;
-    engine.tool_router().publish_protocol_notification(
-        crate::notifications::ProtocolNotification::AuthStateChanged {
-            server_id: Arc::from(server_name),
-            new_state: ServerHealth::AuthRequired,
-        },
-    );
 }
 
 #[cfg(test)]
@@ -1977,7 +1971,7 @@ HOME_DIR = "$HOME"
             .iter()
             .find(|status| status.server_id == "broken")
             .expect("failed server should remain visible");
-        assert_eq!(broken.health, ServerHealth::Failed);
+        assert_eq!(broken.health, crate::types::ServerHealth::Failed);
         assert_eq!(broken.tool_count, 0);
 
         engine.shutdown().await;

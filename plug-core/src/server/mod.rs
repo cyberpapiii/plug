@@ -477,6 +477,8 @@ pub trait UpstreamEvents: Send + Sync {
     fn cancelled(&self, server: &str, params: CancelledNotificationParam);
     fn resource_updated(&self, server: &str, params: ResourceUpdatedNotificationParam);
     fn logging_message(&self, server: &str, params: LoggingMessageNotificationParam);
+    /// `server` now waits for the owner to sign in.
+    fn auth_required(&self, server: &str);
     /// The level a newly connected server should log at.
     fn log_level(&self) -> LoggingLevel;
 }
@@ -524,6 +526,9 @@ pub(crate) fn no_events() -> Weak<dyn UpstreamEvents> {
             match *self {}
         }
         fn logging_message(&self, _: &str, _: LoggingMessageNotificationParam) {
+            match *self {}
+        }
+        fn auth_required(&self, _: &str) {
             match *self {}
         }
         fn log_level(&self) -> LoggingLevel {
@@ -2259,13 +2264,17 @@ impl ServerManager {
         self.health.insert(name.to_string(), HealthState::failed());
     }
 
-    /// Mark a server as requiring OAuth authentication.
+    /// Mark a server as requiring OAuth authentication, and say so to
+    /// clients. Every path that finds a server needs sign-in comes here.
     /// AuthRequired is sticky — it persists until explicit credential provision + reconnect.
     pub fn mark_auth_required(&self, name: &str) {
         self.configured_auth
             .insert(name.to_string(), ConfiguredAuth::Oauth);
         self.health
             .insert(name.to_string(), HealthState::auth_required());
+        if let Some(events) = self.events.upgrade() {
+            events.auth_required(name);
+        }
     }
 
     /// Start a single server and register it in the manager.

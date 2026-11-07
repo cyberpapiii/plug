@@ -4438,6 +4438,13 @@ impl crate::server::UpstreamEvents for ToolRouter {
         self.route_upstream_cancelled(server, params);
     }
 
+    fn auth_required(&self, server: &str) {
+        self.publish_protocol_notification(ProtocolNotification::AuthStateChanged {
+            server_id: Arc::from(server),
+            new_state: ServerHealth::AuthRequired,
+        });
+    }
+
     fn resource_updated(&self, server: &str, mut params: ResourceUpdatedNotificationParam) {
         self.name_skill_server(server, &mut params.uri);
         self.route_upstream_resource_updated(params);
