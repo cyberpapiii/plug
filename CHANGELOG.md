@@ -58,6 +58,7 @@ and the project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.
 
 ### Fixed
 
+- An OpenAPI server whose `spec` is a web address on a cloud metadata endpoint, such as `169.254.169.254`, is refused before Plug fetches it, as every other address Plug sends a request to already was.
 - When Plug cannot start, stop or check its service, the app says why in a sentence. The reconcile panel used to show a Swift case name such as `verificationFailed(expectedVersion: "0.9.1", actualVersion: nil)`, and a failed restart or switch showed only an error number.
 - The mark beside Plug in the menu bar panel takes the same colour as in the window and Settings. With one server down it was red in the panel and orange everywhere else.
 - A client on another Mac that signs in over the network no longer shows as connected in the row of the same app on this Mac, and the Clients page counts connected clients the way the menu bar panel does.

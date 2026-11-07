@@ -197,10 +197,13 @@ async fn read_document(spec: &str, timeout: Duration) -> anyhow::Result<String> 
             .map_err(|_| anyhow::anyhow!("OpenAPI document '{spec}' is not UTF-8 text"));
     }
 
+    let url = Url::parse(spec)
+        .map_err(|e| anyhow::anyhow!("invalid OpenAPI document address '{spec}': {e}"))?;
+    crate::upstream_http::refuse_blocked(&url)?;
     // The bearer token is never sent here: the document may live on a
     // different host from the API it describes.
     let response = http_client()?
-        .get(spec)
+        .get(url)
         .timeout(timeout)
         .header(
             http::header::ACCEPT,
@@ -493,12 +496,7 @@ fn base_url(root: &Value, spec: &str, url_override: Option<&str>) -> anyhow::Res
         matches!(url.scheme(), "http" | "https") && url.host_str().is_some(),
         "API address '{url}' must be an http or https URL"
     );
-    if url
-        .host_str()
-        .is_some_and(crate::upstream_http::is_blocked_host)
-    {
-        anyhow::bail!("API address '{url}' is blocked: cloud metadata endpoint");
-    }
+    crate::upstream_http::refuse_blocked(&url)?;
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
@@ -1190,6 +1188,18 @@ mod tests {
             Some("http://169.254.169.254/"),
             &[],
         )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("blocked"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_document_on_the_metadata_address_is_not_fetched() {
+        let error = read_document(
+            "http://169.254.169.254/openapi.json",
+            Duration::from_secs(1),
+        )
+        .await
         .unwrap_err()
         .to_string();
         assert!(error.contains("blocked"), "{error}");

@@ -407,7 +407,7 @@ async fn serve_listener(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::{run_daemon, set_test_runtime_paths};
+    use crate::daemon::run_daemon;
     use std::sync::Arc;
 
     use std::time::Duration;
@@ -432,10 +432,6 @@ mod tests {
         assert!(restart_advice_for(true).contains("Plug.app"));
         assert!(!restart_advice_for(true).contains("plug stop"));
         assert!(restart_advice_for(false).contains("`plug stop`, then `plug start`"));
-    }
-
-    fn runtime_path_test_lock() -> &'static tokio::sync::Mutex<()> {
-        plug_core::paths::test::lock()
     }
 
     async fn spawn_https_test_server(
@@ -693,7 +689,6 @@ mod tests {
 
     #[tokio::test]
     async fn ensure_daemon_with_feedback_returns_false_when_daemon_is_already_running() {
-        let _guard = runtime_path_test_lock().lock().await;
         let temp = std::env::temp_dir().join(format!(
             "pr-{}",
             &uuid::Uuid::new_v4().simple().to_string()[..8]
@@ -702,7 +697,7 @@ mod tests {
         let state_root = temp.join("s");
         std::fs::create_dir_all(&runtime_root).expect("create runtime root");
         std::fs::create_dir_all(&state_root).expect("create state root");
-        let _paths = set_test_runtime_paths(runtime_root.clone(), state_root.clone());
+        let _paths = plug_core::paths::test::isolate(&temp).await;
 
         let config_path = runtime_root.join("config.toml");
         std::fs::write(&config_path, "").expect("write config");
@@ -738,8 +733,7 @@ mod tests {
             .expect("daemon join timed out")
             .expect("daemon task join");
         assert!(daemon_result.is_ok(), "daemon should shut down cleanly");
-        std::fs::remove_dir_all(runtime_root).expect("cleanup runtime root");
-        std::fs::remove_dir_all(state_root).expect("cleanup state root");
+        std::fs::remove_dir_all(temp).expect("cleanup temp dir");
     }
 
     /// A stop signal and an operator `Shutdown` end in the same teardown: when
@@ -747,13 +741,12 @@ mod tests {
     /// HTTP port no longer accepts connections.
     #[tokio::test]
     async fn every_way_of_stopping_the_daemon_cleans_up() {
-        let _guard = runtime_path_test_lock().lock().await;
         for via_operator in [false, true] {
             let temp = std::env::temp_dir().join(format!(
                 "pst-{}",
                 &uuid::Uuid::new_v4().simple().to_string()[..8]
             ));
-            let _paths = set_test_runtime_paths(temp.join("r"), temp.join("s"));
+            let _paths = plug_core::paths::test::isolate(&temp).await;
             std::fs::create_dir_all(plug_core::paths::dir()).expect("create runtime dir");
             let mut config = plug_core::config::Config::default();
             let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");

@@ -3,7 +3,12 @@
 //! A row says what the client is called, where its settings files are, where
 //! in them its MCP servers live and in what shape, and how to tell it is
 //! installed. Linking, unlinking, repairing, importing, `plug clients` and
-//! doctor all read the row, so adding a client is one variant and one row.
+//! doctor all read the row.
+//!
+//! A new client is a variant and a row here, its name in the app's
+//! `ClientIdentity.names`, and a regenerated `testdata/clients.json`. One
+//! Plug recognises live also needs a `ClientType` variant, a `default_mode`
+//! arm in `lazy.rs`, and a `TOOL_LIMITS` row if it caps its tool list.
 
 mod layout;
 mod lazy;

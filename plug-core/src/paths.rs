@@ -177,16 +177,13 @@ pub mod test {
         paths().is_some()
     }
 
-    /// Put Plug's folder under `runtime` and its logs under `state` until the
-    /// returned guard drops, which it also does when the test panics.
-    pub fn set(runtime: PathBuf, state: PathBuf) -> Set {
+    fn set(runtime: PathBuf, state: PathBuf) -> Set {
         *slot().lock().unwrap_or_else(PoisonError::into_inner) =
             Some((runtime.join("plug"), state.join("plug/logs")));
         Set(())
     }
 
-    #[must_use = "the paths are cleared when this guard drops"]
-    pub struct Set(());
+    struct Set(());
 
     impl Drop for Set {
         fn drop(&mut self) {
@@ -194,30 +191,28 @@ pub mod test {
         }
     }
 
-    /// Plug's folders under `root`, for one test at a time, until this drops.
-    /// It takes `lock` and sets the paths in the one call, and lets go in
-    /// the right order, so a test cannot get either wrong.
+    /// Plug's folders under `root`, for one test at a time, until this drops,
+    /// which it also does when the test panics. The paths clear before the
+    /// lock lets go.
+    #[must_use = "the paths are cleared when this guard drops"]
     pub struct Isolated {
         _paths: Set,
         _lock: tokio::sync::MutexGuard<'static, ()>,
     }
 
     /// Wait for any other test that set the paths, then put Plug's folder
-    /// under `root`.
+    /// under `root`. The folder names stay short: a Unix socket path has to
+    /// fit in SUN_LEN, and the macOS per-user temp directory nearly fills it.
     pub async fn isolate(root: &std::path::Path) -> Isolated {
-        let lock = lock().lock().await;
+        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+        let lock = LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await;
         Isolated {
-            _paths: set(root.join("runtime"), root.join("state")),
+            _paths: set(root.join("r"), root.join("s")),
             _lock: lock,
         }
-    }
-
-    /// Held by every test that sets the paths, for as long as they are set,
-    /// so tests running in parallel do not see each other's. Take it with
-    /// `.lock().await` in a tokio test and `.blocking_lock()` in a plain one.
-    pub fn lock() -> &'static tokio::sync::Mutex<()> {
-        static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
     }
 }
 
