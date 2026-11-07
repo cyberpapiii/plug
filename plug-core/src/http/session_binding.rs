@@ -115,18 +115,24 @@ pub(super) fn wire_session(state: &Arc<HttpState>, session_id: &str) {
 /// the session timeout, goes on sending the session it was given. Many never
 /// start a new one when told theirs is gone, and fail every call from then
 /// on. The caller has already proved who it is, so its session is opened
-/// again under the same id, as its own. Fails only when there is no room for
-/// it.
+/// again under the same id, as its own. A session that is someone else's,
+/// open or lost, is not found. Fails otherwise only when there is no room
+/// for it.
 pub(super) async fn reopen_lost_session(
     state: &Arc<HttpState>,
     headers: &HeaderMap,
     auth_status: &AuthStatus,
 ) -> Result<(), HttpError> {
+    session_is_the_callers(headers, state.sessions.as_ref(), auth_status)?;
     let Ok(session_id) = extract_session_id(headers) else {
         return Ok(());
     };
+    let grant = match auth_status {
+        AuthStatus::Authenticated(Some(claims)) => Some(claims.client_id.as_str()),
+        AuthStatus::Authenticated(None) | AuthStatus::NoAuthRequired => None,
+    };
     let _turn = state.session_turnover.lock().await;
-    match state.sessions.reopen_session(&session_id) {
+    match state.sessions.reopen_session(&session_id, grant) {
         Ok(true) => {}
         Ok(false) | Err(SessionError::NotFound) => return Ok(()),
         Err(error @ SessionError::TooMany) => return Err(error.into()),
@@ -486,6 +492,53 @@ mod tests {
             .map(|entry| entry.clone())
             .expect("the reopened session keeps its capabilities");
         assert!(capabilities.roots.is_some());
+    }
+
+    /// Each way into a session checks whose it is before anything reopens it,
+    /// so an expired session is not handed to a caller under another grant.
+    #[tokio::test]
+    async fn an_expired_session_is_not_reopened_for_another_grant() {
+        let manager = isolated_oauth_manager(vec!["tools:read".to_string()]);
+        let owner = issue_test_oauth_token(&manager, "tools:read").await;
+        let stranger = issue_test_oauth_token(&manager, "tools:read").await;
+        let state = oauth_test_state_with_manager(manager);
+        let app = build_router(Arc::clone(&state));
+        let session_id = legacy_oauth_session(&app, &owner).await;
+        let open_stream = |token: &str| {
+            HttpRequest::builder()
+                .method("GET")
+                .uri("/mcp")
+                .header(http::header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(http::header::ACCEPT, "text/event-stream")
+                .header(SESSION_ID_HEADER, session_id.as_str())
+                .header(PROTOCOL_VERSION_HEADER, SUPPORTED_PROTOCOL_VERSION)
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        // Expired, still in the store.
+        state.sessions.backdate_for_tests(&session_id);
+        let resp = app.clone().oneshot(open_stream(&stranger)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        // Expired and gone from the store.
+        assert!(state.sessions.validate(&session_id).is_err());
+        let resp = app.clone().oneshot(open_stream(&stranger)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let resp = app
+            .clone()
+            .oneshot(legacy_oauth_session_request(
+                &stranger,
+                &session_id,
+                2,
+                "tools/list",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        assert!(!state.sessions.is_open(&session_id));
+
+        let resp = app.oneshot(open_stream(&owner)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

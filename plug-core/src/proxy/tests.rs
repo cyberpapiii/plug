@@ -353,7 +353,7 @@ async fn hiding_a_meta_tool_tells_clients_their_tool_list_changed() {
     router.refresh_tools().await;
     let listed = || {
         router
-            .list_tools()
+            .list_tools_for_client_session(ClientType::Unknown, None, None)
             .iter()
             .map(|tool| tool.name.to_string())
             .collect::<Vec<_>>()
@@ -1281,7 +1281,7 @@ fn synthesized_capabilities_include_tasks_when_tools_exist() {
         .with_indexes(),
     ));
 
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(crate::protocol::legacy_tasks_capability(&caps));
 }
 
@@ -1525,7 +1525,12 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
     ));
 
     let first = router
-        .list_tools_page_for_client(ClientType::Unknown, Some(Default::default()))
+        .list_tools_page_for_client_session(
+            ClientType::Unknown,
+            None,
+            None,
+            Some(Default::default()),
+        )
         .unwrap();
     assert_eq!(first.tools.len(), 500);
     assert_eq!(first.next_cursor.as_deref(), Some("500"));
@@ -1533,7 +1538,7 @@ fn list_tools_page_for_client_uses_cursor_pagination() {
     let mut second_request = PaginatedRequestParams::default();
     second_request.cursor = first.next_cursor;
     let second = router
-        .list_tools_page_for_client(ClientType::Unknown, Some(second_request))
+        .list_tools_page_for_client_session(ClientType::Unknown, None, None, Some(second_request))
         .unwrap();
     assert_eq!(second.tools.len(), 250);
     assert!(second.next_cursor.is_none());
@@ -1633,7 +1638,7 @@ fn synthesized_capabilities_advertises_subscribe_when_upstream_supports_it() {
     let router = ToolRouter::new(sm, config);
 
     // No upstreams → no resources capability at all
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(caps.resources.is_none());
 }
 
@@ -1651,14 +1656,19 @@ fn resource_subscription_registry_lifecycle() {
     assert_eq!(router.resource_subscriptions.len(), 0);
 
     // Insert directly (bypassing upstream check for unit test)
-    router
-        .resource_subscriptions
-        .insert_active_for_test("file:///test", target.clone());
+    router.resource_subscriptions.insert_active_for_test(
+        "file:///test",
+        Some("files"),
+        target.clone(),
+    );
     assert_eq!(router.resource_subscriptions.len(), 1);
 
     // Route notification should publish to subscriber
     let mut rx = router.subscribe_notifications();
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("file:///test"));
+    router.route_upstream_resource_updated(
+        "files",
+        ResourceUpdatedNotificationParam::new("file:///test"),
+    );
 
     match rx.try_recv() {
         Ok(ProtocolNotification::ResourceUpdated {
@@ -1671,7 +1681,10 @@ fn resource_subscription_registry_lifecycle() {
     }
 
     // Route notification for unsubscribed URI → no notification
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("file:///other"));
+    router.route_upstream_resource_updated(
+        "files",
+        ResourceUpdatedNotificationParam::new("file:///other"),
+    );
     assert!(rx.try_recv().is_err());
 }
 
@@ -1679,7 +1692,7 @@ fn resource_subscription_registry_lifecycle() {
 fn synthesized_capabilities_no_completions_without_upstream() {
     let sm = Arc::new(ServerManager::new());
     let router = ToolRouter::new(sm, RouterConfig::default());
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(caps.completions.is_none());
 }
 
@@ -1819,7 +1832,7 @@ fn synthesized_capabilities_includes_logging_when_upstream_supports_it() {
     let router = ToolRouter::new(sm, RouterConfig::default());
 
     // Without any upstream servers, no logging capability
-    let caps = router.synthesized_capabilities();
+    let caps = router.synthesized_capabilities_for_client(ClientType::Unknown);
     assert!(caps.logging.is_none());
 }
 
@@ -2280,38 +2293,6 @@ fn mrtr_pair_policy_activates_only_native_modern_rounds() {
     assert!(!mrtr_pair_supported(Legacy, Modern, true, false));
     assert!(!mrtr_pair_supported(Legacy, Modern, false, false));
     assert!(!mrtr_pair_supported(Modern, Modern, false, true));
-}
-
-#[test]
-fn admitted_extension_policy_is_identical_for_all_protocol_pair_rows() {
-    let source = MetaObject::from(
-        serde_json::json!({
-            "example.test/typed": {
-                "boolean": true,
-                "number": 7,
-                "array": [null, "value"]
-            },
-            "traceparent": "00-0af7651916cd43dd8448eb211c80319c-00f067aa0ba902b7-01"
-        })
-        .as_object()
-        .unwrap()
-        .clone(),
-    );
-    for downstream in [
-        crate::protocol::ProtocolEra::Legacy,
-        crate::protocol::ProtocolEra::Modern,
-    ] {
-        for upstream in [
-            crate::protocol::ProtocolEra::Legacy,
-            crate::protocol::ProtocolEra::Modern,
-        ] {
-            let admitted = crate::types::ExtensionEnvelope::from_peer_meta(Some(&source))
-                .unwrap()
-                .into_meta()
-                .unwrap();
-            assert_eq!(admitted, source, "pair {downstream:?} -> {upstream:?}");
-        }
-    }
 }
 
 // ─── refresh_tools ↔ subscription race tests ────────────────────────────────
@@ -2790,14 +2771,14 @@ async fn overlapping_refreshes_share_one_trailing_pass_and_publish_fresh_catalog
     assert_eq!(state.list_count(), 3, "initial + active + trailing");
     assert!(
         router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .any(|resource| resource.uri == "memory://new"),
         "trailing pass must publish catalog state newer than active pass"
     );
     assert!(
         !router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .any(|resource| resource.uri == "memory://old")
     );
@@ -2847,7 +2828,7 @@ async fn cancelled_refresh_leader_does_not_wedge_waiting_refresh() {
         .unwrap();
     assert!(
         router
-            .list_resources()
+            .list_resources_for_client(None)
             .iter()
             .any(|resource| resource.uri == "memory://recovered")
     );
@@ -4016,7 +3997,10 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     // Notification-relevant invariant: an upstream resources/updated for x
     // still fans out to the surviving member.
     let mut rx = router.subscribe_notifications();
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("memory://x"));
+    router.route_upstream_resource_updated(
+        "new",
+        ResourceUpdatedNotificationParam::new("memory://x"),
+    );
     match rx.try_recv() {
         Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
             assert_eq!(target, sub_target("a"));
@@ -4516,16 +4500,14 @@ fn a_blocked_client_is_not_listed_what_it_is_kept_from() {
         .unwrap();
     assert_eq!(tool_names(&page.tools), ["slack__post"]);
 
-    assert!(
+    let sees_commit = |client_key| {
         router
-            .get_tool_definition("git__commit", Some("cursor"))
-            .is_none()
-    );
-    assert!(
-        router
-            .get_tool_definition("git__commit", Some("pi"))
-            .is_some()
-    );
+            .list_tools_for_client_session(ClientType::ClaudeCode, None, Some(client_key))
+            .iter()
+            .any(|tool| tool.name == "git__commit")
+    };
+    assert!(!sees_commit("cursor"));
+    assert!(sees_commit("pi"));
 }
 
 #[tokio::test]
@@ -4871,6 +4853,22 @@ fn a_block_on_a_tool_covers_a_watch_of_it_and_survives_a_rename() {
     assert!(!router.client_is_kept_from_a_server(None));
 }
 
+#[test]
+fn applying_settings_says_when_the_catalog_must_be_rebuilt() {
+    let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+    let mut config = crate::config::Config::default();
+    assert!(!router.apply_config(&config));
+
+    config.disabled_tools = vec!["Git__*".to_string()];
+    assert!(router.apply_config(&config));
+    assert!(!router.apply_config(&config), "nothing changed");
+    config.disabled_tools = vec!["git__*".to_string()];
+    assert!(
+        !router.apply_config(&config),
+        "patterns match ignoring case"
+    );
+}
+
 /// Two servers, each with a resource, a resource template, and a prompt.
 /// `cursor` is kept from `git`.
 fn router_with_blocked_resources_and_prompts() -> Arc<ToolRouter> {
@@ -5056,16 +5054,21 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     };
     // Both subscribed before `cursor` was kept from `git`.
     for (target, key) in [(&cursor, "cursor"), (&zed, "zed")] {
-        router
-            .resource_subscriptions
-            .insert_active_for_test("git://log", target.clone());
+        router.resource_subscriptions.insert_active_for_test(
+            "git://log",
+            Some("git"),
+            target.clone(),
+        );
         router
             .subscriber_client_keys
             .insert(target.clone(), key.to_string());
     }
     let mut notifications = router.subscribe_notifications();
     let mut heard = |router: &ToolRouter| {
-        router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("git://log"));
+        router.route_upstream_resource_updated(
+            "git",
+            ResourceUpdatedNotificationParam::new("git://log"),
+        );
         let mut targets = Vec::new();
         while let Ok(notification) = notifications.try_recv() {
             if let ProtocolNotification::ResourceUpdated { target, .. } = notification {
@@ -5082,6 +5085,44 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     let both = heard(&router);
     assert_eq!(both.len(), 2);
     assert!(both.contains(&cursor) && both.contains(&zed));
+}
+
+#[test]
+fn a_server_cannot_say_another_servers_resource_changed() {
+    use crate::server::UpstreamEvents as _;
+    let router = router_with_blocked_resources_and_prompts();
+    let zed = NotificationTarget::Ipc {
+        client_id: Arc::from("zed-session"),
+    };
+    // One entry the subscribe recorded an owner for, one known only by route.
+    router
+        .resource_subscriptions
+        .insert_active_for_test("git://log", Some("git"), zed.clone());
+    router
+        .resource_subscriptions
+        .insert_active_for_test("git://commit/1", None, zed.clone());
+    router
+        .subscriber_client_keys
+        .insert(zed.clone(), "zed".to_string());
+    let mut notifications = router.subscribe_notifications();
+    let mut heard = |server: &str, uri: &str| {
+        router.resource_updated(server, ResourceUpdatedNotificationParam::new(uri));
+        let mut uris = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if let ProtocolNotification::ResourceUpdated { params, .. } = notification {
+                uris.push(params.uri);
+            }
+        }
+        uris
+    };
+
+    assert!(heard("other", "git://log").is_empty());
+    assert!(heard("other", "git://commit/1").is_empty());
+    assert_eq!(heard("git", "git://log"), vec!["git://log".to_string()]);
+    assert_eq!(
+        heard("git", "git://commit/1"),
+        vec!["git://commit/1".to_string()]
+    );
 }
 
 /// An upstream that takes requests and never answers them.

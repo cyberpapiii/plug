@@ -50,7 +50,6 @@ pub struct OwnerBootstrap {
 pub struct OwnerRegistrationCeremony {
     pub id: String,
     pub bootstrap_hash: String,
-    #[serde(default)]
     pub issuer_hash: String,
     pub state: RegistrationState,
     pub expires_at: u64,
@@ -60,13 +59,9 @@ pub struct OwnerRegistrationCeremony {
 pub struct OwnerAuthenticationCeremony {
     pub id: String,
     pub consent_id: String,
-    #[serde(default)]
     pub issuer_hash: String,
-    #[serde(default)]
     pub consent_binding: String,
-    #[serde(default)]
     pub decision: String,
-    #[serde(default)]
     pub credential_ids: Vec<String>,
     pub state: AuthenticationState,
     pub expires_at: u64,

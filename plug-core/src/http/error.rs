@@ -124,9 +124,12 @@ impl IntoResponse for HttpError {
                 metadata_url,
                 scope,
             } => {
+                let code = crate::protocol::ProtocolOutcome::PermissionDenied
+                    .encode(crate::protocol::ProtocolEra::Modern)
+                    .code;
                 let body = serde_json::json!({
                     "jsonrpc": "2.0",
-                    "error": { "code": -32003, "message": "insufficient scope" },
+                    "error": { "code": code, "message": "insufficient scope" },
                     "id": null
                 });
                 let mut response = (StatusCode::FORBIDDEN, axum::Json(body)).into_response();
@@ -247,8 +250,8 @@ mod tests {
         assert!(header.contains("scope=\"tools:read\""));
     }
 
-    #[test]
-    fn insufficient_scope_sets_rfc6750_challenge() {
+    #[tokio::test]
+    async fn insufficient_scope_sets_rfc6750_challenge() {
         let response = HttpError::InsufficientScopeWithMetadata {
             metadata_url: "https://plug.example.com/.well-known/oauth-protected-resource".into(),
             scope: "tools:read".into(),
@@ -264,5 +267,17 @@ mod tests {
         assert!(header.contains("error=\"insufficient_scope\""));
         assert!(header.contains("scope=\"tools:read\""));
         assert!(header.contains("resource_metadata="));
+
+        // A refusal, not a transition worth retrying.
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            body["error"]["code"],
+            crate::protocol::ProtocolOutcome::PermissionDenied
+                .encode(crate::protocol::ProtocolEra::Modern)
+                .code
+        );
     }
 }

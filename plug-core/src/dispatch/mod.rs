@@ -392,7 +392,7 @@ pub(crate) fn admit_modern_task(
     ctx: &dyn DownstreamContext,
     call: &DownstreamCallContext,
 ) -> Result<TaskOwner, McpError> {
-    if !router.supports_tasks() {
+    if !router.supports_tasks_for_client(call.client_type) {
         return Err(McpError::new(
             ErrorCode::METHOD_NOT_FOUND,
             "tasks extension is not available",
@@ -433,7 +433,7 @@ async fn tools_call(
         && ctx
             .modern_task_client()
             .is_some_and(ClientCapabilities::supports_tasks)
-        && router.supports_tasks();
+        && router.supports_tasks_for_client(call.client_type);
     let legacy_task = params
         .meta
         .as_ref()
@@ -577,7 +577,7 @@ pub fn server_capabilities(router: &ToolRouter, ctx: &dyn DownstreamContext) -> 
     project_capabilities(
         router.synthesized_capabilities_for_client(call.client_type),
         &call,
-        ctx.modern_task_client().is_some() && router.supports_tasks(),
+        ctx.modern_task_client().is_some() && router.supports_tasks_for_client(call.client_type),
     )
 }
 

@@ -5,8 +5,8 @@
 use std::time::Duration;
 
 use rmcp::transport::auth::{
-    OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture, OAuthHttpRedirectPolicy,
-    OAuthHttpRequest,
+    AuthError, AuthorizationManager, OAuthHttpClient, OAuthHttpClientError, OAuthHttpClientFuture,
+    OAuthHttpRedirectPolicy, OAuthHttpRequest,
 };
 
 /// How long an upstream HTTP connect may take before it is abandoned.
@@ -69,13 +69,19 @@ fn redirect_policy(redirects: Redirects) -> reqwest::redirect::Policy {
     })
 }
 
-/// The client rmcp's OAuth manager sends discovery, registration and token
-/// requests through. rmcp asks for some of them not to follow redirects.
-pub(crate) fn oauth_client() -> anyhow::Result<std::sync::Arc<dyn OAuthHttpClient>> {
-    Ok(std::sync::Arc::new(OAuthClient {
-        follow: client(Redirects::AnyHost)?,
-        stop: client(Redirects::Never)?,
-    }))
+/// rmcp's OAuth manager for `url`. It sends discovery, registration and
+/// token requests through Plug's upstream clients, so they follow the same
+/// redirect rules; rmcp asks for some of them not to follow redirects.
+pub async fn authorization_manager<U: reqwest::IntoUrl>(
+    url: U,
+) -> Result<AuthorizationManager, AuthError> {
+    let build =
+        |redirects| client(redirects).map_err(|error| AuthError::InternalError(error.to_string()));
+    let oauth_client = OAuthClient {
+        follow: build(Redirects::AnyHost)?,
+        stop: build(Redirects::Never)?,
+    };
+    AuthorizationManager::new_with_oauth_http_client(url, std::sync::Arc::new(oauth_client)).await
 }
 
 /// The most of an OAuth response body read, as rmcp's own client reads.

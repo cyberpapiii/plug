@@ -191,14 +191,25 @@ fn html_response(status: StatusCode, html: String) -> Response {
     response
 }
 
+/// What the consent page says a scope lets a client do.
 fn scope_description(scope: &str) -> &'static str {
+    // Scopes a client may ask for besides the ones Plug grants by default.
+    const ASKED_FOR: [(&str, &str); 2] = [
+        (
+            crate::events::EVENT_SCOPE,
+            "Hear about the events Plug watches for",
+        ),
+        (
+            "offline_access",
+            "Stay connected after this browser window closes",
+        ),
+    ];
     crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPE_GRANTS
         .iter()
+        .chain(&ASKED_FOR)
         .find(|(granted, _)| *granted == scope)
-        .map(|(_, description)| *description)
-        .unwrap_or(match scope {
-            "offline_access" => "Stay connected after this browser window closes",
-            _ => "Use the requested Plug capability",
+        .map_or("Use the requested Plug capability", |(_, description)| {
+            description
         })
 }
 
@@ -235,6 +246,20 @@ mod tests {
             resource: "https://plug.example.com/mcp".to_string(),
             csrf_token: "csrf".to_string(),
             expires_at: 0,
+        }
+    }
+
+    #[test]
+    fn every_scope_plug_asks_for_is_described() {
+        for scope in crate::protocol::DEFAULT_DOWNSTREAM_OAUTH_SCOPES
+            .into_iter()
+            .chain([crate::events::EVENT_SCOPE, "offline_access"])
+        {
+            assert_ne!(
+                super::scope_description(scope),
+                super::scope_description("unknown:scope"),
+                "{scope}"
+            );
         }
     }
 

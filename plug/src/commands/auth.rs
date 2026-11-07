@@ -725,7 +725,7 @@ impl SignIn {
     /// Discover the server's authorization metadata, verify its authority
     /// and bind the server's stored credentials to it.
     async fn start(server_name: &str, url: &str) -> anyhow::Result<Self> {
-        let mut manager = plug_core::tls::authorization_manager(url)
+        let mut manager = plug_core::upstream_http::authorization_manager(url)
             .await
             .map_err(|e| anyhow::anyhow!("failed to initialize OAuth for '{server_name}': {e}"))?;
 

@@ -154,7 +154,10 @@ impl ArtifactStore {
         let materialized_path = tokio::task::spawn_blocking(move || {
             std::fs::create_dir_all(&write_dir)?;
             std::fs::write(&write_payload_path, &serialized)?;
-            maybe_materialize_attachment(&write_dir, attachment_source.as_deref())
+            std::io::Result::Ok(maybe_materialize_attachment(
+                &write_dir,
+                attachment_source.as_deref(),
+            ))
         })
         .await
         .map_err(|e| McpError::internal_error(e.to_string(), None))?
@@ -617,47 +620,56 @@ fn read_chunk_text(record: &ArtifactRecord, index: usize) -> anyhow::Result<Stri
 /// `attachment_source` is the first text content of the tool result,
 /// extracted by the caller so the blocking write task does not need to own
 /// the whole `CallToolResult`.
+/// Write the file a result carries, when it carries one, next to the
+/// payload. The file is extra: a result whose file cannot be written is kept
+/// without it.
 fn maybe_materialize_attachment(
     artifact_dir: &Path,
     attachment_source: Option<&str>,
-) -> anyhow::Result<Option<PathBuf>> {
-    let Some(text) = attachment_source else {
-        return Ok(None);
+) -> Option<PathBuf> {
+    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(attachment_source?) else {
+        return None;
     };
-
-    let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(text) else {
-        return Ok(None);
-    };
-
-    let Some(filename) = obj.get("filename").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let Some(content) = obj.get("content").and_then(Value::as_str) else {
-        return Ok(None);
-    };
-    let encoding = obj
+    let filename = obj.get("filename").and_then(Value::as_str)?;
+    let content = obj.get("content").and_then(Value::as_str)?;
+    let bytes = match obj
         .get("encoding")
         .and_then(Value::as_str)
-        .unwrap_or("none");
-
-    let bytes = match encoding {
-        "base64" => base64::engine::general_purpose::STANDARD.decode(content)?,
+        .unwrap_or("none")
+    {
+        "base64" => match base64::engine::general_purpose::STANDARD.decode(content) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                tracing::debug!(%error, "result's attachment is not base64; kept without it");
+                return None;
+            }
+        },
         "none" => content.as_bytes().to_vec(),
-        _ => return Ok(None),
+        _ => return None,
     };
 
-    let attachment_path = artifact_dir.join(sanitize_filename(filename));
-    std::fs::write(&attachment_path, bytes)?;
-    Ok(Some(attachment_path))
+    let attachment_path = artifact_dir.join(attachment_filename(filename));
+    if let Err(error) = std::fs::write(&attachment_path, bytes) {
+        tracing::warn!(%error, "could not write a result's attachment; kept without it");
+        return None;
+    }
+    Some(attachment_path)
 }
 
-fn sanitize_filename(name: &str) -> String {
-    name.chars()
+/// A name for an attachment that stays inside its artifact's folder and
+/// leaves the artifact's own files alone.
+fn attachment_filename(name: &str) -> String {
+    let name: String = name
+        .chars()
         .map(|ch| match ch {
             '/' | '\\' | ':' | '\0' => '_',
             _ => ch,
         })
-        .collect()
+        .collect();
+    match name.as_str() {
+        "" | "." | ".." | PAYLOAD_FILE | METADATA_FILE => format!("attachment-{name}"),
+        _ => name,
+    }
 }
 
 fn write_metadata(artifact_dir: &Path, record: &ArtifactRecord) -> anyhow::Result<()> {
@@ -691,56 +703,20 @@ fn write_metadata(artifact_dir: &Path, record: &ArtifactRecord) -> anyhow::Resul
 }
 
 fn load_record_from_dir(dir: &Path) -> Option<ArtifactRecord> {
-    let metadata_path = dir.join(METADATA_FILE);
-    if metadata_path.exists() {
-        let bytes = std::fs::read(&metadata_path).ok()?;
-        let metadata: ArtifactMetadata = serde_json::from_slice(&bytes).ok()?;
-        let payload_path = dir.join(metadata.payload_file);
-        let materialized_path = metadata.materialized_file.map(|file| dir.join(file));
-        return Some(ArtifactRecord {
-            id: metadata.id,
-            source_tool: metadata.source_tool,
-            source_server: metadata.source_server,
-            source_own_tool: metadata.source_own_tool,
-            original_size_bytes: metadata.original_size_bytes,
-            created_at: from_unix_secs(metadata.created_at_secs),
-            expires_at: from_unix_secs(metadata.expires_at_secs),
-            payload_path,
-            materialized_path,
-            chunk_count: metadata.chunk_count,
-            preview: metadata.preview,
-        });
-    }
-
-    let payload_path = dir.join(PAYLOAD_FILE);
-    if !payload_path.exists() {
-        return None;
-    }
-    let payload = std::fs::read(&payload_path).ok()?;
-    let result: CallToolResult = serde_json::from_slice(&payload).ok()?;
-    let materialized_path = std::fs::read_dir(dir)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .find(|path| path.is_file() && path.file_name().is_some_and(|name| name != PAYLOAD_FILE));
-
-    let modified = std::fs::metadata(&payload_path)
-        .ok()
-        .and_then(|meta| meta.modified().ok())
-        .unwrap_or_else(SystemTime::now);
-    let id = dir.file_name()?.to_string_lossy().into_owned();
+    let bytes = std::fs::read(dir.join(METADATA_FILE)).ok()?;
+    let metadata: ArtifactMetadata = serde_json::from_slice(&bytes).ok()?;
     Some(ArtifactRecord {
-        id,
-        source_tool: "unknown".to_string(),
-        source_server: None,
-        source_own_tool: None,
-        original_size_bytes: payload.len(),
-        created_at: modified,
-        expires_at: modified + ARTIFACT_RETENTION,
-        payload_path,
-        materialized_path,
-        chunk_count: payload.len().div_ceil(ARTIFACT_CHUNK_BYTES),
-        preview: build_preview(&result),
+        id: metadata.id,
+        source_tool: metadata.source_tool,
+        source_server: metadata.source_server,
+        source_own_tool: metadata.source_own_tool,
+        original_size_bytes: metadata.original_size_bytes,
+        created_at: from_unix_secs(metadata.created_at_secs),
+        expires_at: from_unix_secs(metadata.expires_at_secs),
+        payload_path: dir.join(metadata.payload_file),
+        materialized_path: metadata.materialized_file.map(|file| dir.join(file)),
+        chunk_count: metadata.chunk_count,
+        preview: metadata.preview,
     })
 }
 
@@ -1126,6 +1102,64 @@ mod tests {
             record.payload_path.exists(),
             "payload file must be written to disk"
         );
+
+        let _ = std::fs::remove_dir_all(base_dir);
+    }
+
+    /// The attachment is an extra. A name that would land on the artifact's
+    /// own files, or content that cannot be decoded, never costs the result.
+    #[tokio::test]
+    async fn an_attachment_never_costs_the_result_it_came_with() {
+        let base_dir = temp_dir("attachment-names");
+        let store = test_store(base_dir.clone());
+        let body = "A".repeat(ARTIFACT_RESULT_MIN_BYTES + 1);
+        for (filename, encoding, kept_as) in [
+            (PAYLOAD_FILE, "none", Some("attachment-result.json")),
+            (METADATA_FILE, "none", Some("attachment-metadata.json")),
+            ("..", "none", Some("attachment-..")),
+            ("", "none", Some("attachment-")),
+            ("data.bin", "base64", None),
+        ] {
+            let text = serde_json::json!({
+                "filename": filename,
+                "encoding": encoding,
+                "content": format!("-_{body}"),
+            })
+            .to_string();
+            let spilled = store
+                .maybe_spill_result_of(
+                    None,
+                    "Mock__attachment_get_data",
+                    CallToolResult::success(vec![ContentBlock::text(text.clone())]),
+                )
+                .await
+                .expect("the result is kept");
+            let uri = spilled
+                .content
+                .iter()
+                .find_map(ContentBlock::as_resource_link)
+                .expect("artifact resource_link")
+                .uri
+                .clone();
+            let id = parse_artifact_uri(&uri).expect("artifact uri").id;
+            let record = store.records.get(&id).expect("record").clone();
+            assert_eq!(
+                record
+                    .materialized_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str()),
+                kept_as,
+                "{filename}"
+            );
+            let payload: CallToolResult =
+                serde_json::from_slice(&std::fs::read(&record.payload_path).unwrap()).unwrap();
+            assert_eq!(
+                payload.content[0].as_text().map(|text| text.text.as_str()),
+                Some(text.as_str()),
+                "the payload is the result, not the attachment"
+            );
+        }
 
         let _ = std::fs::remove_dir_all(base_dir);
     }

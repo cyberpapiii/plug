@@ -20,9 +20,13 @@ pub struct SessionStore {
     /// Sessions their own client closed, newest last. These stay closed; any
     /// other session Plug no longer has may be reopened.
     closed: std::sync::Mutex<VecDeque<String>>,
+    /// The grant behind each session that left for any other reason, newest
+    /// last. Only that grant may open it again.
+    left_grants: std::sync::Mutex<VecDeque<(String, String)>>,
 }
 
-/// How many closed sessions are remembered.
+/// How many closed sessions, and how many grants of sessions that left, are
+/// remembered.
 const CLOSED_SESSIONS_KEPT: usize = 512;
 
 /// Why a session left the store. What each one implies is decided in
@@ -63,6 +67,15 @@ enum Liveness {
     Expired,
     /// The sign-in it was opened under no longer holds.
     AccessEnded,
+}
+
+/// Keep `item`, dropping the oldest once [`CLOSED_SESSIONS_KEPT`] are kept.
+fn remember<T>(kept: &std::sync::Mutex<VecDeque<T>>, item: T) {
+    let mut kept = kept.lock().expect("remembered sessions mutex poisoned");
+    if kept.len() == CLOSED_SESSIONS_KEPT {
+        kept.pop_front();
+    }
+    kept.push_back(item);
 }
 
 impl SessionState {
@@ -112,6 +125,7 @@ impl SessionStore {
             timeout: Duration::from_secs(timeout_secs),
             lapsed_tx: OnceLock::new(),
             closed: std::sync::Mutex::new(VecDeque::new()),
+            left_grants: std::sync::Mutex::new(VecDeque::new()),
         }
     }
 
@@ -147,30 +161,28 @@ impl SessionStore {
     /// End `session_id` for `why`. A caller that ends a session releases
     /// what the daemon holds for it itself; only a lapse is reported.
     pub(crate) fn end(&self, session_id: &str, why: SessionEnd) -> bool {
-        let removed = self.sessions.remove(session_id).is_some();
-        if removed {
-            self.forget(session_id, why);
+        let removed = self.sessions.remove(session_id);
+        let ended = removed.is_some();
+        if let Some((_, state)) = removed {
+            self.forget(session_id, why, state.grant);
         }
-        removed
+        ended
     }
 
     /// What a session's leaving implies, once it has left.
-    fn forget(&self, session_id: &str, why: SessionEnd) {
+    fn forget(&self, session_id: &str, why: SessionEnd, grant: Option<String>) {
         tracing::debug!(session_id = %session_id, ?why, "session ended");
-        match why {
-            SessionEnd::ClosedByClient => {
-                let mut closed = self.closed.lock().expect("closed sessions mutex poisoned");
-                if closed.len() == CLOSED_SESSIONS_KEPT {
-                    closed.pop_front();
-                }
-                closed.push_back(session_id.to_owned());
-            }
-            SessionEnd::Revoked => {}
-            SessionEnd::Lapsed => {
-                if let Some(tx) = self.lapsed_tx.get() {
-                    let _ = tx.send(session_id.to_owned());
-                }
-            }
+        if why == SessionEnd::ClosedByClient {
+            remember(&self.closed, session_id.to_owned());
+            return;
+        }
+        if let Some(grant) = grant {
+            remember(&self.left_grants, (session_id.to_owned(), grant));
+        }
+        if why == SessionEnd::Lapsed
+            && let Some(tx) = self.lapsed_tx.get()
+        {
+            let _ = tx.send(session_id.to_owned());
         }
     }
 
@@ -190,16 +202,14 @@ impl SessionStore {
     /// still using it.
     fn remove_if_expired(&self, session_id: &str) -> bool {
         let timeout = self.timeout;
-        let removed = self
-            .sessions
-            .remove_if(session_id, |_, state| {
-                state.last_activity.elapsed() > timeout
-            })
-            .is_some();
-        if removed {
-            self.forget(session_id, SessionEnd::Lapsed);
+        let removed = self.sessions.remove_if(session_id, |_, state| {
+            state.last_activity.elapsed() > timeout
+        });
+        let ended = removed.is_some();
+        if let Some((_, state)) = removed {
+            self.forget(session_id, SessionEnd::Lapsed, state.grant);
         }
-        removed
+        ended
     }
 
     /// Remove every session that is no longer live, rechecking expiry at
@@ -243,13 +253,12 @@ impl SessionStore {
         let Some((session_id, seen)) = quietest else {
             return false;
         };
-        let removed = self
+        if let Some((_, state)) = self
             .sessions
             .remove_if(&session_id, |_, state| state.last_activity == seen)
-            .is_some();
-        if removed {
+        {
             tracing::info!(session = %session_id, "dropped the quietest session to make room");
-            self.forget(&session_id, SessionEnd::Lapsed);
+            self.forget(&session_id, SessionEnd::Lapsed, state.grant);
         }
         self.sessions.len() < self.max_sessions
     }
@@ -512,8 +521,13 @@ impl SessionStore {
     /// Open a session again under the id its client still holds, after Plug
     /// restarted or the session timed out. `Ok(true)` when this call opened
     /// it, `Ok(false)` when it was open already. A session its client closed
-    /// is not reopened.
-    pub fn reopen_session(&self, session_id: &str) -> Result<bool, SessionError> {
+    /// is not reopened, and one opened under a grant is reopened only for
+    /// that grant.
+    pub fn reopen_session(
+        &self,
+        session_id: &str,
+        grant: Option<&str>,
+    ) -> Result<bool, SessionError> {
         // Plug only ever hands out UUIDs, so nothing else can be one it lost.
         if uuid::Uuid::parse_str(session_id).is_err() {
             return Err(SessionError::NotFound);
@@ -534,6 +548,15 @@ impl SessionStore {
             .any(|closed| closed == session_id)
         {
             return Err(SessionError::NotFound);
+        }
+        {
+            let mut left = self.left_grants.lock().expect("left grants mutex poisoned");
+            if let Some(index) = left.iter().position(|(id, _)| id == session_id) {
+                if grant != Some(left[index].1.as_str()) {
+                    return Err(SessionError::NotFound);
+                }
+                left.remove(index);
+            }
         }
         if !self.make_room() {
             return Err(SessionError::TooMany);
@@ -571,12 +594,16 @@ impl SessionStore {
         self.with_live_session_mut(session_id, |entry| entry.sse_sender.is_some())
     }
 
+    /// Give `session_id` the stream `sender` feeds, and send it what the
+    /// client has not seen. Returns the id of the last event the client is
+    /// taken to have, which the stream opens with: a client that comes back
+    /// with it is sent only what followed.
     pub fn set_sse_sender(
         &self,
         session_id: &str,
         sender: mpsc::Sender<SseEvent>,
         last_event_id: Option<u64>,
-    ) -> Result<(), SessionError> {
+    ) -> Result<u64, SessionError> {
         let mut entry = self
             .sessions
             .get_mut(session_id)
@@ -592,8 +619,17 @@ impl SessionStore {
         } else {
             last_event_id.filter(|id| *id < entry.next_event_id)
         };
+        // Without an id the client is sent what was queued for it; it has
+        // everything before that.
+        let seen_through = last_event_id.unwrap_or_else(|| {
+            entry
+                .pending_notifications
+                .front()
+                .map_or(entry.next_event_id, |event| event.id)
+                - 1
+        });
         Self::send_replay_events(&mut entry, &active_sender, last_event_id);
-        Ok(())
+        Ok(seen_through)
     }
 
     pub fn set_client_type(
@@ -829,10 +865,10 @@ mod tests {
         let store = SessionStore::new(1800, 10);
         let lost = uuid::Uuid::new_v4().to_string();
 
-        assert!(store.reopen_session(&lost).unwrap());
+        assert!(store.reopen_session(&lost, None).unwrap());
         assert!(store.validate(&lost).is_ok());
         // Already open: nothing to do, and nothing is replaced.
-        assert!(!store.reopen_session(&lost).unwrap());
+        assert!(!store.reopen_session(&lost, None).unwrap());
         assert_eq!(store.session_count(), 1);
     }
 
@@ -840,7 +876,7 @@ mod tests {
     fn a_reopened_session_ignores_event_ids_it_never_issued() {
         let store = SessionStore::new(1800, 10);
         let lost = uuid::Uuid::new_v4().to_string();
-        assert!(store.reopen_session(&lost).unwrap());
+        assert!(store.reopen_session(&lost, None).unwrap());
         let message = || SseMessage::from_json_value(serde_json::json!({"n": 1})).unwrap();
         store.send_to_live_session(&lost, message());
         store.send_to_live_session(&lost, message());
@@ -872,14 +908,61 @@ mod tests {
         assert_eq!(rx.try_recv().unwrap().id, 1);
     }
 
+    /// A stream opens with the id of the last event its client has, so a
+    /// client whose stream drops before anything new comes back for nothing
+    /// it already had.
+    #[test]
+    fn a_stream_opens_with_the_last_event_its_client_has() {
+        let store = SessionStore::new(1800, 10);
+        let id = store.create_session().unwrap();
+        let message = || SseMessage::from_json_value(serde_json::json!({"n": 1})).unwrap();
+        let (tx, _rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, None).unwrap(), 0);
+        store.send_to_live_session(&id, message());
+        store.send_to_live_session(&id, message());
+
+        // It had both on the stream that dropped.
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, None).unwrap(), 2);
+        assert!(rx.try_recv().is_err());
+        // It says it had the first: the second is sent again.
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, Some(1)).unwrap(), 1);
+        assert_eq!(rx.try_recv().unwrap().id, 2);
+
+        // Queued while no stream was open: it has what came before.
+        drop(rx);
+        store.send_to_live_session(&id, message());
+        let (tx, mut rx) = mpsc::channel(8);
+        assert_eq!(store.set_sse_sender(&id, tx, None).unwrap(), 2);
+        assert_eq!(rx.try_recv().unwrap().id, 3);
+    }
+
     #[test]
     fn a_session_that_timed_out_reopens() {
         let store = SessionStore::new(60, 10);
         let id = store.create_session().unwrap();
         store.backdate_for_tests(&id);
 
-        assert!(store.reopen_session(&id).unwrap());
+        assert!(store.reopen_session(&id, None).unwrap());
         assert!(store.validate(&id).is_ok());
+    }
+
+    #[test]
+    fn a_session_that_left_reopens_only_for_its_own_grant() {
+        let store = SessionStore::new(60, 10);
+        let id = store.create_session().unwrap();
+        bind(&store, &id, Some(("client-abc", always())));
+        // Expired but still in the store: the reopen is what finds it.
+        store.backdate_for_tests(&id);
+
+        for stranger in [None, Some("client-xyz")] {
+            assert!(matches!(
+                store.reopen_session(&id, stranger),
+                Err(SessionError::NotFound)
+            ));
+        }
+        assert!(store.reopen_session(&id, Some("client-abc")).unwrap());
     }
 
     #[test]
@@ -889,7 +972,7 @@ mod tests {
         assert!(store.end(&id, SessionEnd::ClosedByClient));
 
         assert!(matches!(
-            store.reopen_session(&id),
+            store.reopen_session(&id, None),
             Err(SessionError::NotFound)
         ));
     }
@@ -898,7 +981,7 @@ mod tests {
     fn only_an_id_plug_could_have_issued_reopens() {
         let store = SessionStore::new(1800, 10);
         assert!(matches!(
-            store.reopen_session("not-a-session"),
+            store.reopen_session("not-a-session", None),
             Err(SessionError::NotFound)
         ));
     }
@@ -908,7 +991,7 @@ mod tests {
         let store = SessionStore::new(1800, 1);
         store.create_session().unwrap();
         assert!(matches!(
-            store.reopen_session(&uuid::Uuid::new_v4().to_string()),
+            store.reopen_session(&uuid::Uuid::new_v4().to_string(), None),
             Err(SessionError::TooMany)
         ));
     }
@@ -937,7 +1020,7 @@ mod tests {
 
         // The dropped client calls again and gets its session back.
         quiet_since(&newcomer, 90);
-        assert!(store.reopen_session(&quiet).unwrap());
+        assert!(store.reopen_session(&quiet, None).unwrap());
         assert!(store.validate(&newcomer).is_err());
     }
 
@@ -1190,7 +1273,7 @@ mod tests {
         // The caller that revoked it releases it, so the listener hears
         // nothing, and the id is not remembered as closed by its client.
         assert!(rx.try_recv().is_err());
-        assert!(store.reopen_session(&theirs).unwrap());
+        assert!(store.reopen_session(&theirs, Some("client-abc")).unwrap());
     }
 
     #[test]

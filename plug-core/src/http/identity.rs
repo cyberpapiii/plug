@@ -24,7 +24,13 @@ pub(super) struct HttpDownstreamContext {
     /// tasks extension, so a modern request always has one.
     pub(super) modern_task_client: Option<ClientCapabilities>,
     pub(super) events_discoverable: bool,
+    /// See [`DownstreamCallContext::exchange`]. Set for a modern request
+    /// that carries a call; a modern cancel arrives in an exchange of its
+    /// own and names the call by request id.
+    exchange: Option<u64>,
 }
+
+static NEXT_EXCHANGE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl HttpDownstreamContext {
     /// `session` is the legacy session the request belongs to; a modern
@@ -92,7 +98,16 @@ impl HttpDownstreamContext {
             client_metadata,
             modern_task_client,
             events_discoverable,
+            exchange: None,
         }
+    }
+
+    /// Mark a stateless request as the only one its exchange carries.
+    pub(super) fn in_own_exchange(mut self) -> Self {
+        if self.protocol_era == crate::protocol::ProtocolEra::Modern {
+            self.exchange = Some(NEXT_EXCHANGE.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        }
+        self
     }
 }
 
@@ -165,6 +180,9 @@ impl crate::dispatch::DownstreamContext for HttpDownstreamContext {
             context = context
                 .with_client_metadata(Arc::clone(&metadata.name), Arc::clone(&metadata.version));
         }
+        if let Some(exchange) = self.exchange {
+            context = context.in_exchange(exchange);
+        }
         apply_http_auth(context, &self.auth_status, self.oauth_issuer.as_deref())
     }
 
@@ -227,4 +245,35 @@ pub(super) enum AuthStatus {
     Authenticated(Option<AccessTokenClaims>),
     /// The listener asks for no credential.
     NoAuthRequired,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dispatch::DownstreamContext as _;
+    use crate::http::test_support::test_state;
+
+    #[tokio::test]
+    async fn each_stateless_request_is_its_own_exchange() {
+        let state = test_state();
+        let context = |session: Option<&str>| {
+            HttpDownstreamContext::new(
+                &state,
+                AuthStatus::NoAuthRequired,
+                session,
+                RequestId::Number(1),
+                Arc::from("trace"),
+                None,
+            )
+            .in_own_exchange()
+            .downstream_call_context()
+        };
+        let (first, second) = (context(None), context(None));
+        assert_eq!(first.client_id, second.client_id);
+        assert_ne!(first.exchange, second.exchange);
+        assert_ne!(first.notification_target(), second.notification_target());
+
+        // A legacy request is told apart by its session already.
+        assert_eq!(context(Some("legacy-session")).exchange, None);
+    }
 }
