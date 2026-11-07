@@ -218,16 +218,22 @@ impl Worker for LegacySseWorker {
             ))?;
 
         let initialize = context.recv_from_handler().await?;
-        post_message(
+        if let Err(error) = post_message(
             &self.client,
             endpoint.clone(),
             &self.config,
             initialize.message,
         )
         .await
-        .map_err(WorkerQuitReason::fatal_context(
-            "send initialize over legacy SSE",
-        ))?;
+        {
+            // rmcp reports a dropped responder as a closed channel, so the
+            // refusal, and its status, reach the caller only through it.
+            let _ = initialize.responder.send(Err(error));
+            return Err(WorkerQuitReason::fatal(
+                LegacySseError::TransportChannelClosed,
+                "send initialize over legacy SSE",
+            ));
+        }
         let _ = initialize.responder.send(Ok(()));
 
         // Legacy SSE servers can send notifications before the initialize
@@ -629,6 +635,7 @@ pub(crate) mod mock {
         server: LegacySse,
         bearer: Option<String>,
         on_message: OnMessage,
+        refuse_messages: Option<StatusCode>,
     }
 
     impl App {
@@ -649,13 +656,30 @@ pub(crate) mod mock {
             bearer: Option<&str>,
             on_message: impl Fn(&LegacySse, &HeaderMap, ClientJsonRpcMessage) + Send + Sync + 'static,
         ) -> (Self, String) {
+            Self::serve(bearer, Arc::new(on_message), None).await
+        }
+
+        /// Serve a stream that opens, and answer every message with `status`.
+        /// Returns the `/mcp` URL.
+        pub(crate) async fn refusing_messages(status: StatusCode) -> String {
+            Self::serve(None, Arc::new(|_, _, _| {}), Some(status))
+                .await
+                .1
+        }
+
+        async fn serve(
+            bearer: Option<&str>,
+            on_message: OnMessage,
+            refuse_messages: Option<StatusCode>,
+        ) -> (Self, String) {
             let server = Self {
                 tx: tokio::sync::broadcast::channel(64).0,
             };
             let app = App {
                 server: server.clone(),
                 bearer: bearer.map(str::to_string),
-                on_message: Arc::new(on_message),
+                on_message,
+                refuse_messages,
             };
             let router = Router::new()
                 .route("/mcp", get(stream).post(refuse_streamable_http))
@@ -718,6 +742,9 @@ pub(crate) mod mock {
     ) -> StatusCode {
         if !app.authorized(&headers) {
             return StatusCode::UNAUTHORIZED;
+        }
+        if let Some(status) = app.refuse_messages {
+            return status;
         }
         (app.on_message)(&app.server, &headers, message);
         StatusCode::ACCEPTED
