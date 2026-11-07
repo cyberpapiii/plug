@@ -2605,37 +2605,42 @@ allowed_servers = ["slack"]
         drop(winning_lock);
     }
 
-    /// `run_daemon` must bind and serve without a started engine, which is what
-    /// lets `cmd_daemon` run `Engine::start` alongside it. `Engine::start` waits
-    /// on third-party server processes, so a socket bound after it makes a
-    /// healthy cold start look like an absent daemon for as long as the slowest
-    /// upstream takes.
+    /// `serve_until` binds the IPC socket while upstreams are still starting.
+    /// `Engine::start` waits on third-party server processes, so a socket bound
+    /// after it makes a healthy cold start look like an absent daemon for as
+    /// long as the slowest upstream takes.
     #[tokio::test]
     async fn ipc_socket_is_bound_while_upstream_startup_is_still_running() {
-        let temp = plug_core::paths::test::scratch("plug-d");
-
         // `/bin/sleep` never completes an MCP handshake, so this start stays in
-        // flight until the upstream timeout expires.
+        // flight for the five seconds it sleeps, far longer than the checks
+        // below take, and the child is gone soon after the test.
         let mut server = mock_server("noop");
         server.command = Some("/bin/sleep".to_string());
-        server.args = vec!["30".to_string()];
+        server.args = vec!["5".to_string()];
         server.timeout_secs = 20;
         let mut config = plug_core::config::Config::default();
         config.servers.insert("slow".to_string(), server);
+        let probe = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("reserve HTTP port");
+        let port = probe.local_addr().expect("HTTP address").port();
+        drop(probe);
+        config.http.port = port;
 
-        let config_path = temp.join("config.toml");
-        std::fs::write(&config_path, "").expect("write config");
-        let engine = Engine::new(config);
+        std::fs::create_dir_all(plug_core::paths::dir()).expect("create runtime dir");
+        let config_path = plug_core::paths::dir().join("config.toml");
+        std::fs::write(
+            &config_path,
+            toml::to_string(&config).expect("serialize config"),
+        )
+        .expect("write config");
 
-        let startup = {
-            let engine = engine.clone();
-            tokio::spawn(async move { engine.start().await })
-        };
-        let daemon = {
-            let engine = engine.clone();
-            let config_path = config_path.clone();
-            tokio::spawn(async move { run_daemon(engine, config_path).await })
-        };
+        let daemon = tokio::spawn(async move {
+            crate::runtime::serve_until(
+                Some(&config_path),
+                std::future::pending(),
+                plug_core::ipc::DaemonOwnershipMode::Unknown,
+            )
+            .await
+        });
 
         let sock_path = socket_path();
         let mut connected = false;
@@ -2651,13 +2656,15 @@ allowed_servers = ["slack"]
             panic!("daemon exited early: {:?}", daemon.await);
         }
         assert!(connected, "socket never accepted a connection");
+        // HTTP binds only once every upstream has started, so a closed port
+        // shows the slow start is still in flight.
         assert!(
-            !startup.is_finished(),
-            "upstream startup finished first, so this run proves nothing"
+            tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_err(),
+            "HTTP came up, so upstream startup finished first and this run proves nothing"
         );
 
-        engine.cancel_token().cancel();
-        startup.abort();
         daemon.abort();
     }
 

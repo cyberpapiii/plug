@@ -3,7 +3,9 @@ import Foundation
 /// Who started the daemon, as launchd records it.
 public enum DaemonOwnership: String, Codable, Sendable {
     case unmanaged
-    /// The daemon could not read its own launchd registration.
+    /// Who started the daemon is not known. A macOS daemon that cannot read
+    /// its launchd registration refuses to start, so only a daemon that
+    /// skipped that check could send this.
     case unknown
     case cliManaged = "cli_managed"
     case appManaged = "app_managed"

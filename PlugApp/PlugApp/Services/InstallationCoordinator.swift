@@ -580,8 +580,9 @@ final class InstallationCoordinator {
         canonical: VerifiedAppInstallation,
         shellLink: ShellLinkState
     ) throws -> OwnDaemonProof {
-        // `unknown` is an absence of evidence, not a disagreement: the daemon
-        // could not read its own launchd registration. Repairable drift retries
+        // `unknown` is an absence of evidence, not a disagreement. A daemon
+        // that cannot read its launchd registration refuses to start, so this
+        // stays only to fail closed if one ever answers. Repairable drift retries
         // the whole adoption path on every trigger, so folding absence into
         // drift would keep replacing a daemon nobody has proved is ours. Fail
         // closed and wait to be asked.
