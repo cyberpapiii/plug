@@ -1,0 +1,54 @@
+{
+  "command": "uvx",
+  "args": [
+    "workspace-mcp"
+  ],
+  "env": {
+    "TOKEN": "$TOKEN"
+  },
+  "enabled": false,
+  "transport": "http",
+  "protocol": "auto",
+  "url": "https://example.com/mcp",
+  "auth_token": "••••••••",
+  "auth": "oauth",
+  "oauth_client_id": "plug",
+  "oauth_scopes": [
+    "read"
+  ],
+  "timeout_secs": 45,
+  "call_timeout_secs": 600,
+  "max_concurrent": 2,
+  "health_check_interval_secs": 120,
+  "circuit_breaker_enabled": false,
+  "tool_renames": {
+    "search": "find"
+  },
+  "tool_groups": [
+    {
+      "prefix": "Gmail",
+      "contains": [
+        "gmail"
+      ],
+      "strip": [
+        "gmail"
+      ]
+    }
+  ],
+  "sandbox": {
+    "enabled": true,
+    "allow_network": true,
+    "allow_read": [
+      "/Users/me/notes"
+    ],
+    "allow_write": [
+      "/tmp"
+    ],
+    "profile_path": "/Users/me/plug.sb"
+  },
+  "spec": "https://example.com/openapi.json",
+  "operations": [
+    "listPets"
+  ],
+  "token_in": "header:X-Api-Key"
+}
