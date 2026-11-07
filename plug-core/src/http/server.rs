@@ -1377,6 +1377,62 @@ mod tests {
         assert_eq!(bridged.code, ErrorCode::METHOD_NOT_FOUND);
     }
 
+    /// Every modern tools/call from a task-capable client becomes a task, but
+    /// one that cannot be a task runs as a plain call instead of failing.
+    #[tokio::test]
+    async fn a_modern_call_that_cannot_be_a_task_runs_as_a_plain_call() {
+        let state = test_state();
+        state.router.set_modern_downstream_enabled(true);
+        state.router.replace_snapshot(crate::proxy::RouterSnapshot {
+            routes: std::collections::HashMap::from([
+                (
+                    "Mock__echo".to_string(),
+                    ("mock".to_string(), "echo".to_string()),
+                ),
+                (
+                    "plug__search_tools".to_string(),
+                    (
+                        crate::tool_naming::INTERNAL_SERVER_ID.to_string(),
+                        "plug__search_tools".to_string(),
+                    ),
+                ),
+            ]),
+            tools_all: Arc::new(vec![rmcp::model::Tool::new(
+                "Mock__echo",
+                "Echo",
+                Arc::new(serde_json::Map::new()),
+            )]),
+            ..Default::default()
+        });
+        let call = |scopes: &[&str], tool: &str| {
+            let caller = ModernTaskCaller {
+                call: modern_task_policy_context(true, scopes.iter().map(|s| s.to_string())),
+                client: ClientCapabilities::builder().enable_tasks().build(),
+            };
+            let router = Arc::clone(&state.router);
+            let params = json!({"name": tool, "arguments": {"query": "echo"}});
+            async move { crate::dispatch::handle(&router, &caller, "tools/call", Some(params)).await }
+        };
+
+        let task = call(&["tools:read", "tasks:use"], "Mock__echo")
+            .await
+            .expect("a task-capable caller gets a task");
+        assert_eq!(task["resultType"], "task", "{task}");
+
+        // With no upstream behind `mock`, a plain call fails as unavailable;
+        // a task would have been created instead.
+        let plain = call(&["tools:read"], "Mock__echo")
+            .await
+            .expect_err("a plain call reaches the missing upstream");
+        assert!(plain.message.contains("unavailable"), "{plain:?}");
+
+        let meta = call(&["tools:read", "tasks:use"], "plug__search_tools")
+            .await
+            .expect("a meta-tool runs as a plain call");
+        assert_ne!(meta["resultType"], "task", "{meta}");
+        assert!(meta.get("content").is_some(), "{meta}");
+    }
+
     #[tokio::test]
     async fn the_modern_gate_refuses_every_http_task_method() {
         let state = test_state();

@@ -25,6 +25,8 @@ const POST_TIMEOUT: Duration = Duration::from_secs(30);
 pub enum LegacySseError {
     #[error("reqwest error: {0}")]
     Reqwest(#[from] reqwest::Error),
+    #[error(transparent)]
+    Blocked(#[from] crate::upstream_http::Blocked),
     #[error("stream closed before endpoint event")]
     MissingEndpoint,
     #[error("invalid endpoint event payload: {0}")]
@@ -166,7 +168,7 @@ impl Transport<RoleClient> for LegacySseClientTransport {
 }
 
 struct LegacySseWorker {
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     config: LegacySseTransportConfig,
     stream: BoxedSseStream,
 }
@@ -218,16 +220,22 @@ impl Worker for LegacySseWorker {
             ))?;
 
         let initialize = context.recv_from_handler().await?;
-        post_message(
+        if let Err(error) = post_message(
             &self.client,
             endpoint.clone(),
             &self.config,
             initialize.message,
         )
         .await
-        .map_err(WorkerQuitReason::fatal_context(
-            "send initialize over legacy SSE",
-        ))?;
+        {
+            // rmcp reports a dropped responder as a closed channel, so the
+            // refusal, and its status, reach the caller only through it.
+            let _ = initialize.responder.send(Err(error));
+            return Err(WorkerQuitReason::fatal(
+                LegacySseError::TransportChannelClosed,
+                "send initialize over legacy SSE",
+            ));
+        }
         let _ = initialize.responder.send(Ok(()));
 
         // Legacy SSE servers can send notifications before the initialize
@@ -356,7 +364,7 @@ fn publish_endpoint(
 }
 
 async fn run_sse_loop(
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     config: LegacySseTransportConfig,
     first_stream: BoxedSseStream,
     endpoint_tx: tokio::sync::watch::Sender<Option<Arc<str>>>,
@@ -492,13 +500,13 @@ async fn wait_for_endpoint(
 }
 
 async fn open_sse_stream(
-    client: reqwest::Client,
+    client: crate::upstream_http::Client,
     uri: Arc<str>,
     auth_token: Option<Arc<str>>,
     last_event_id: Option<String>,
 ) -> Result<BoxedSseStream, LegacySseError> {
     let mut request = client
-        .get(uri.as_ref())
+        .request(reqwest::Method::GET, &uri)?
         .header(header::ACCEPT, "text/event-stream");
     if let Some(token) = auth_token {
         request = request.bearer_auth(token.as_ref());
@@ -529,13 +537,13 @@ async fn open_sse_stream(
 }
 
 async fn post_message(
-    client: &reqwest::Client,
+    client: &crate::upstream_http::Client,
     endpoint: Arc<str>,
     config: &LegacySseTransportConfig,
     message: ClientJsonRpcMessage,
 ) -> Result<(), LegacySseError> {
     let mut request = client
-        .post(endpoint.as_ref())
+        .request(reqwest::Method::POST, &endpoint)?
         .timeout(config.post_timeout)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCEPT, "application/json, text/event-stream");
@@ -629,6 +637,7 @@ pub(crate) mod mock {
         server: LegacySse,
         bearer: Option<String>,
         on_message: OnMessage,
+        refuse_messages: Option<StatusCode>,
     }
 
     impl App {
@@ -649,13 +658,30 @@ pub(crate) mod mock {
             bearer: Option<&str>,
             on_message: impl Fn(&LegacySse, &HeaderMap, ClientJsonRpcMessage) + Send + Sync + 'static,
         ) -> (Self, String) {
+            Self::serve(bearer, Arc::new(on_message), None).await
+        }
+
+        /// Serve a stream that opens, and answer every message with `status`.
+        /// Returns the `/mcp` URL.
+        pub(crate) async fn refusing_messages(status: StatusCode) -> String {
+            Self::serve(None, Arc::new(|_, _, _| {}), Some(status))
+                .await
+                .1
+        }
+
+        async fn serve(
+            bearer: Option<&str>,
+            on_message: OnMessage,
+            refuse_messages: Option<StatusCode>,
+        ) -> (Self, String) {
             let server = Self {
                 tx: tokio::sync::broadcast::channel(64).0,
             };
             let app = App {
                 server: server.clone(),
                 bearer: bearer.map(str::to_string),
-                on_message: Arc::new(on_message),
+                on_message,
+                refuse_messages,
             };
             let router = Router::new()
                 .route("/mcp", get(stream).post(refuse_streamable_http))
@@ -718,6 +744,9 @@ pub(crate) mod mock {
     ) -> StatusCode {
         if !app.authorized(&headers) {
             return StatusCode::UNAUTHORIZED;
+        }
+        if let Some(status) = app.refuse_messages {
+            return status;
         }
         (app.on_message)(&app.server, &headers, message);
         StatusCode::ACCEPTED

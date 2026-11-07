@@ -120,14 +120,6 @@ fn initialize_refused_with(error: &rmcp::service::ClientInitializeError) -> Opti
     initialize_http_error(error).and_then(refused_with)
 }
 
-/// Whether a streamable-HTTP upstream refused `initialize` in a way that asks
-/// for a new sign-in. See [`crate::transport::refusal_needs_sign_in`].
-fn initialize_needs_sign_in(error: &rmcp::service::ClientInitializeError) -> bool {
-    initialize_http_error(error)
-        .and_then(http_refusal_needs_sign_in)
-        .unwrap_or(false)
-}
-
 /// [`crate::transport::refusal_needs_sign_in`] on a streamable-HTTP refusal;
 /// `None` when `error` is not one.
 fn http_refusal_needs_sign_in(error: &StreamableHttpError<reqwest::Error>) -> Option<bool> {
@@ -225,7 +217,7 @@ async fn restore_legacy_task_capability(
 
 #[derive(Clone)]
 struct InitializedNotificationCompatHttpClient {
-    inner: reqwest::Client,
+    inner: crate::upstream_http::Client,
     server_name: Arc<str>,
     /// Shared with the `UpstreamServer` this client backs.
     connection: ConnectionGeneration,
@@ -301,6 +293,13 @@ impl InitializedNotificationCompatHttpClient {
             None => *last = Some(Arc::clone(session_id)),
         }
     }
+}
+
+fn blocked(error: crate::upstream_http::Blocked) -> StreamableHttpError<reqwest::Error> {
+    StreamableHttpError::Io(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        error,
+    ))
 }
 
 fn is_initialized_notification_message(message: &rmcp::model::ClientJsonRpcMessage) -> bool {
@@ -429,7 +428,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
             &message,
         ));
         let result = <reqwest::Client as StreamableHttpClient>::post_message(
-            &self.inner,
+            self.inner.sending_to(&uri).map_err(blocked)?,
             uri,
             message,
             session_id.clone(),
@@ -462,7 +461,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         custom_headers: HashMap<http::HeaderName, http::HeaderValue>,
     ) -> Result<(), StreamableHttpError<Self::Error>> {
         <reqwest::Client as StreamableHttpClient>::delete_session(
-            &self.inner,
+            self.inner.sending_to(&uri).map_err(blocked)?,
             uri,
             session_id,
             auth_header,
@@ -484,7 +483,7 @@ impl StreamableHttpClient for InitializedNotificationCompatHttpClient {
         // the wire before any request does.
         self.observe_session(session_id.as_ref());
         <reqwest::Client as StreamableHttpClient>::get_stream(
-            &self.inner,
+            self.inner.sending_to(&uri).map_err(blocked)?,
             uri,
             session_id,
             last_event_id,
@@ -1723,12 +1722,8 @@ impl ServerManager {
                         Err(e) => {
                             let fall_back =
                                 should_fallback_to_legacy_sse(effective_protocol_mode, &e);
-                            let error = if initialize_needs_sign_in(&e) {
-                                anyhow::Error::new(crate::oauth::AuthRejected(e.to_string()))
-                            } else {
-                                anyhow::Error::new(e)
-                            }
-                            .context("failed to connect to HTTP upstream");
+                            let error = anyhow::Error::new(e)
+                                .context("failed to connect to HTTP upstream");
                             if fall_back {
                                 tracing::info!(
                                     server = %name,
@@ -1868,17 +1863,7 @@ impl ServerManager {
 
         let transport = LegacySseClientTransport::connect(transport_config)
             .await
-            .map_err(|error| {
-                let refused = error
-                    .downcast_ref::<crate::transport::sse_client::LegacySseError>()
-                    .is_some_and(|error| error.refuses_credentials());
-                if refused {
-                    anyhow::Error::new(crate::oauth::AuthRejected(error.to_string()))
-                } else {
-                    error
-                }
-                .context("failed to connect to legacy SSE upstream")
-            })?;
+            .context("failed to connect to legacy SSE upstream")?;
 
         let tools = Arc::new(ArcSwap::from_pointee(Vec::<Tool>::new()));
         let handler = Arc::new(UpstreamClientHandler::new(
@@ -2622,17 +2607,15 @@ impl Default for ServerManager {
     }
 }
 
-/// Check a remote upstream URL against the SSRF block list and resolve the
-/// bearer token to send: the verified OAuth token for `auth = "oauth"`, the
-/// static `auth_token` otherwise. Shared by the HTTP and legacy SSE paths.
+/// Resolve the bearer token to send to a remote upstream: the verified OAuth
+/// token for `auth = "oauth"`, the static `auth_token` otherwise. Shared by
+/// the HTTP and legacy SSE paths.
 async fn resolve_upstream_auth(
     name: &str,
     url: &str,
     config: &ServerConfig,
 ) -> Result<Option<String>, anyhow::Error> {
-    let parsed =
-        reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
-    crate::upstream_http::refuse_blocked(&parsed)?;
+    reqwest::Url::parse(url).map_err(|e| anyhow::anyhow!("invalid URL '{url}': {e}"))?;
 
     if !config.is_oauth() {
         return Ok(config.auth_token.as_ref().map(|t| t.as_str().to_string()));
@@ -2973,6 +2956,17 @@ mod tests {
         }
     }
 
+    /// Whether an OAuth server whose `initialize` failed with `error` asks
+    /// its owner to sign in again.
+    fn initialize_needs_sign_in(error: rmcp::service::ClientInitializeError) -> bool {
+        let mut oauth = test_server_config();
+        oauth.auth = Some("oauth".to_string());
+        start_needs_sign_in(
+            &oauth,
+            &anyhow::Error::new(error).context("failed to connect to HTTP upstream"),
+        )
+    }
+
     #[test]
     fn a_403_asking_for_more_scope_needs_sign_in_and_others_do_not() {
         let forbidden = |challenge: &str| {
@@ -2983,10 +2977,10 @@ mod tests {
                 ),
             ))
         };
-        assert!(initialize_needs_sign_in(&forbidden(
+        assert!(initialize_needs_sign_in(forbidden(
             r#"Bearer error="insufficient_scope", scope="files:write""#
         )));
-        assert!(!initialize_needs_sign_in(&forbidden(
+        assert!(!initialize_needs_sign_in(forbidden(
             r#"Bearer realm="files""#
         )));
     }
@@ -3016,20 +3010,6 @@ mod tests {
             challenge: None,
             body: "Unauthorized".into(),
         };
-        let sse_initialize =
-            anyhow::Error::new(rmcp::service::ClientInitializeError::TransportError {
-                error: rmcp::transport::DynamicTransportError::from_parts(
-                    "legacy-sse",
-                    std::any::TypeId::of::<()>(),
-                    Box::new(forbidden()),
-                ),
-                context: "send initialize request".into(),
-            })
-            .context("failed to connect to legacy SSE upstream");
-        assert!(
-            !start_needs_sign_in(&oauth, &sse_initialize),
-            "{sse_initialize:#}"
-        );
         let list_tools = |error: Box<dyn std::error::Error + Send + Sync>| {
             anyhow::Error::new(rmcp::service::ServiceError::TransportSend(
                 rmcp::transport::DynamicTransportError::from_parts(
@@ -3089,10 +3069,8 @@ mod tests {
             initialize_refused_with(&refused("HTTP 401 Unauthorized: ")),
             Some(401)
         );
-        assert!(initialize_needs_sign_in(&refused(
-            "HTTP 401 Unauthorized: "
-        )));
-        assert!(!initialize_needs_sign_in(&refused("HTTP 403 Forbidden: ")));
+        assert!(initialize_needs_sign_in(refused("HTTP 401 Unauthorized: ")));
+        assert!(!initialize_needs_sign_in(refused("HTTP 403 Forbidden: ")));
     }
 
     #[tokio::test]
@@ -4969,8 +4947,44 @@ mod tests {
             .await
             .expect_err("the server refuses the token");
 
-        assert!(crate::oauth::is_auth_rejection(&error), "{error:#}");
+        let mut oauth = config.clone();
+        oauth.auth = Some("oauth".to_string());
+        assert!(start_needs_sign_in(&oauth, &error), "{error:#}");
         assert!(format!("{error:#}").contains("401"), "{error:#}");
+    }
+
+    /// The refusal reaches the sign-in judgment with its status when the
+    /// stream opens but the `initialize` message is refused.
+    #[tokio::test]
+    async fn a_legacy_sse_server_refusing_initialize_is_judged_by_its_status() {
+        let mut oauth = test_server_config();
+        oauth.auth = Some("oauth".to_string());
+        for (status, needs_sign_in) in [
+            (axum::http::StatusCode::UNAUTHORIZED, true),
+            (axum::http::StatusCode::FORBIDDEN, false),
+        ] {
+            let url =
+                crate::transport::sse_client::mock::LegacySse::refusing_messages(status).await;
+            let mut config = test_server_config();
+            config.transport = TransportType::Sse;
+            config.command = None;
+            config.url = Some(url);
+
+            let error = ServerManager::new()
+                .start_and_register("legacy-sse", &config)
+                .await
+                .expect_err("the server refuses initialize");
+
+            assert_eq!(
+                start_needs_sign_in(&oauth, &error),
+                needs_sign_in,
+                "{status}: {error:#}"
+            );
+            assert!(
+                format!("{error:#}").contains(status.as_str()),
+                "{status}: {error:#}"
+            );
+        }
     }
 
     /// An OAuth server that refuses its token when recovery reconnects it

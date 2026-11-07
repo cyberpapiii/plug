@@ -79,7 +79,8 @@ impl Engine {
                 )
             });
             let server_manager = Arc::clone(tool_router.server_manager());
-            apply_live_settings(&tool_router, &server_manager, &config);
+            apply_start_settings(&server_manager, &config);
+            tool_router.apply_config(&config);
             let config = Arc::new(ArcSwap::from_pointee(config));
             let supervision = Arc::new(Supervision::default());
             let health = Monitor::new(
@@ -260,14 +261,6 @@ impl Engine {
         } else {
             self.supervision.refresh_tasks.clear(server_name);
         }
-    }
-
-    /// Take `config` as the running one. Returns whether the tool catalog
-    /// must be rebuilt for its settings to show.
-    pub fn store_config(&self, config: Config) -> bool {
-        let catalog_stale = apply_live_settings(&self.tool_router, &self.server_manager, &config);
-        self.config.store(Arc::new(config));
-        catalog_stale
     }
 
     /// Install a freshly connected upstream, unless the server was removed or
@@ -748,10 +741,9 @@ impl Engine {
             errors: Vec::new(),
         };
 
-        // The live gate goes first, so replacements negotiate under it.
-        // Running connections stay until their own restart below.
-        self.server_manager
-            .set_modern_upstream_enabled(new_config.modern_upstream_enabled);
+        // Replacements start under the new gate and secret stores. Running
+        // connections stay until their own restart below.
+        apply_start_settings(&self.server_manager, &new_config);
 
         for name in &diff.removed {
             tracing::info!(server = %name, "stopping removed server");
@@ -808,7 +800,8 @@ impl Engine {
 
         // Swapped before the background tasks start, so they see the new
         // server set.
-        let catalog_dirty = self.store_config(new_config) || servers_changed;
+        let catalog_dirty = self.tool_router.apply_config(&new_config) || servers_changed;
+        self.config.store(Arc::new(new_config));
 
         // A server that could not start gets its health task too, so it is
         // retried.
@@ -1081,14 +1074,10 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
     }
 }
 
-/// Hand the settings that apply without a restart to the router, the
-/// servers and the secret stores. The engine's first config and every reload
-/// both come through here. Returns whether the tool catalog must be rebuilt
-/// for them to show.
-fn apply_live_settings(router: &ToolRouter, servers: &ServerManager, config: &Config) -> bool {
+/// The settings a server start reads that apply without a restart.
+fn apply_start_settings(servers: &ServerManager, config: &Config) {
     crate::secrets::Stores::configure(&config.secrets);
     servers.set_modern_upstream_enabled(config.modern_upstream_enabled);
-    router.apply_config(config)
 }
 
 fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {
@@ -1157,6 +1146,36 @@ mod tests {
         assert!(report.errors.is_empty(), "{:?}", report.errors);
         assert!(engine.server_manager().get_upstream("on").is_some());
         assert!(engine.server_manager().get_upstream("off").is_none());
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_reload_starts_a_server_with_the_secret_store_it_adds() {
+        let engine = Engine::new(Config::default());
+        let dir = tempfile::tempdir().unwrap();
+        let read = dir.path().join("read");
+        let mut config = Config::default();
+        config.secrets.stores.insert(
+            "vault".into(),
+            crate::config::CommandStoreConfig {
+                command: vec![
+                    "sh".into(),
+                    "-c".into(),
+                    format!("touch '{}'; printf value", read.display()),
+                ],
+                timeout_secs: 5,
+            },
+        );
+        let mut server = mock_stdio_server_config("echo", 1);
+        server.env.insert("TOKEN".into(), "vault:token".into());
+        config.servers.insert("vaulted".into(), server);
+
+        let report = engine.reload_config(config).await;
+        assert!(report.errors.is_empty(), "{:?}", report.errors);
+        assert!(
+            read.exists(),
+            "the start followed the reference through the new store"
+        );
         engine.shutdown().await;
     }
 

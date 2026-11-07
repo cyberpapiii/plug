@@ -111,32 +111,15 @@ pub(crate) fn inspect_owner_enrollment_in_dir(
     config: &DownstreamOauthConfig,
     state_dir: &std::path::Path,
 ) -> OwnerEnrollmentStatus {
-    use std::io::Read as _;
-
     let path = owner_enrollment_state_path_in_dir(config, state_dir);
-    let mut file = match std::fs::File::open(path) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return OwnerEnrollmentStatus::NotEnrolled;
-        }
-        Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
-    };
-    match state_file_is_private(&file) {
-        Ok(true) => {}
-        Ok(false) => return OwnerEnrollmentStatus::UnsafePermissions,
-        Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
-    }
-    let mut bytes = Vec::new();
-    if file.read_to_end(&mut bytes).is_err() {
-        return OwnerEnrollmentStatus::StateUnavailable;
-    }
-    let state = match serde_json::from_slice::<DownstreamOauthState>(&bytes) {
-        Ok(state) if state.version == STATE_VERSION => state,
-        Ok(_) | Err(_) => return OwnerEnrollmentStatus::StateUnavailable,
-    };
-    match state.owner_credentials.len() {
-        0 => OwnerEnrollmentStatus::NotEnrolled,
-        credential_count => OwnerEnrollmentStatus::Enrolled { credential_count },
+    match read_state_file(&path) {
+        Ok(None) => OwnerEnrollmentStatus::NotEnrolled,
+        Ok(Some(state)) => match state.owner_credentials.len() {
+            0 => OwnerEnrollmentStatus::NotEnrolled,
+            credential_count => OwnerEnrollmentStatus::Enrolled { credential_count },
+        },
+        Err(StateFileError::Shared) => OwnerEnrollmentStatus::UnsafePermissions,
+        Err(StateFileError::Unreadable(_)) => OwnerEnrollmentStatus::StateUnavailable,
     }
 }
 
@@ -2367,34 +2350,53 @@ fn state_file_is_private(file: &std::fs::File) -> std::io::Result<bool> {
     Ok(file.metadata()?.permissions().mode() & 0o077 == 0)
 }
 
-fn load_persisted_state(
-    path: &std::path::Path,
-) -> Result<DownstreamOauthState, DownstreamOauthError> {
+enum StateFileError {
+    /// Other local users can read the file.
+    Shared,
+    Unreadable(String),
+}
+
+/// Read the issuer state file. `Ok(None)` when there is none yet.
+fn read_state_file(path: &std::path::Path) -> Result<Option<DownstreamOauthState>, StateFileError> {
     use std::io::Read as _;
 
-    let persistence = |error: std::io::Error| DownstreamOauthError::Persistence(error.to_string());
+    let unreadable = |error: std::io::Error| StateFileError::Unreadable(error.to_string());
     let mut file = match std::fs::File::open(path) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(DownstreamOauthState::default());
-        }
-        Err(error) => return Err(persistence(error)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(unreadable(error)),
     };
-    if !state_file_is_private(&file).map_err(persistence)? {
-        return Err(DownstreamOauthError::Persistence(format!(
-            "{} is visible to other local users; run chmod 600 on it",
-            path.display()
-        )));
+    if !state_file_is_private(&file).map_err(unreadable)? {
+        return Err(StateFileError::Shared);
     }
     let mut data = String::new();
-    file.read_to_string(&mut data).map_err(persistence)?;
-    let mut state: DownstreamOauthState = serde_json::from_str(&data)
-        .map_err(|error| DownstreamOauthError::Persistence(error.to_string()))?;
+    file.read_to_string(&mut data).map_err(unreadable)?;
+    let state: DownstreamOauthState = serde_json::from_str(&data)
+        .map_err(|error| StateFileError::Unreadable(error.to_string()))?;
     if state.version != STATE_VERSION {
-        return Err(DownstreamOauthError::Persistence(
+        return Err(StateFileError::Unreadable(
             "unsupported downstream OAuth state version".to_string(),
         ));
     }
+    Ok(Some(state))
+}
+
+fn load_persisted_state(
+    path: &std::path::Path,
+) -> Result<DownstreamOauthState, DownstreamOauthError> {
+    let mut state = match read_state_file(path) {
+        Ok(Some(state)) => state,
+        Ok(None) => return Ok(DownstreamOauthState::default()),
+        Err(StateFileError::Shared) => {
+            return Err(DownstreamOauthError::Persistence(format!(
+                "{} is visible to other local users; run chmod 600 on it",
+                path.display()
+            )));
+        }
+        Err(StateFileError::Unreadable(detail)) => {
+            return Err(DownstreamOauthError::Persistence(detail));
+        }
+    };
     let _ = state.evict_expired(epoch_secs());
     state
         .access_tokens

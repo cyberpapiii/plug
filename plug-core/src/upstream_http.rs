@@ -31,12 +31,46 @@ pub(crate) enum Redirects {
 const MAX_REDIRECTS: usize = 10;
 
 /// A client for upstream traffic, following redirects by `redirects`.
-pub(crate) fn client(redirects: Redirects) -> anyhow::Result<reqwest::Client> {
+pub(crate) fn client(redirects: Redirects) -> anyhow::Result<Client> {
     crate::tls::http_client_builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .redirect(redirect_policy(redirects))
         .build()
+        .map(Client)
         .map_err(|error| anyhow::anyhow!("could not build the HTTP client: {error}"))
+}
+
+/// An HTTP client that sends nothing to a blocked host: neither a request
+/// nor a redirect it follows.
+#[derive(Clone, Debug)]
+pub(crate) struct Client(reqwest::Client);
+
+/// A request refused because its host is a cloud metadata endpoint.
+#[derive(Debug, thiserror::Error)]
+#[error("URL host '{0}' is blocked: cloud metadata endpoint")]
+pub struct Blocked(String);
+
+impl Client {
+    /// A request to `url`.
+    pub(crate) fn request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+    ) -> Result<reqwest::RequestBuilder, Blocked> {
+        Ok(self.sending_to(url)?.request(method, url))
+    }
+
+    /// The client to send a request to `url` with. An address that does not
+    /// parse is left to reqwest to refuse.
+    pub(crate) fn sending_to(&self, url: &str) -> Result<&reqwest::Client, Blocked> {
+        match reqwest::Url::parse(url) {
+            Ok(url) => match url.host_str() {
+                Some(host) if is_blocked_host(host) => Err(Blocked(host.to_string())),
+                _ => Ok(&self.0),
+            },
+            Err(_) => Ok(&self.0),
+        }
+    }
 }
 
 fn redirect_policy(redirects: Redirects) -> reqwest::redirect::Policy {
@@ -88,8 +122,8 @@ pub async fn authorization_manager<U: reqwest::IntoUrl>(
 const MAX_OAUTH_BODY_BYTES: usize = 1024 * 1024;
 
 struct OAuthClient {
-    follow: reqwest::Client,
-    stop: reqwest::Client,
+    follow: Client,
+    stop: Client,
 }
 
 impl OAuthHttpClient for OAuthClient {
@@ -117,12 +151,14 @@ impl OAuthClient {
             _ => &self.follow,
         };
         let mut request = reqwest::Request::try_from(request)?;
+        *request.timeout_mut() = timeout;
         // rmcp 3.1.0 checks only the authorization server's metadata address.
         // The registration, token and other endpoints that metadata names
         // arrive here unchecked.
-        refuse_blocked(request.url())?;
-        *request.timeout_mut() = timeout;
-        let response = client.execute(request).await?;
+        let response = client
+            .sending_to(request.url().as_str())?
+            .execute(request)
+            .await?;
         let mut builder = http::Response::builder()
             .status(response.status())
             .version(response.version());
@@ -149,7 +185,7 @@ impl OAuthClient {
 /// Loopback and private addresses are allowed: every server is one the owner
 /// configured, and local servers are common. A hostname that resolves to a
 /// metadata address is not caught; that would need resolving at connect time.
-pub(crate) fn is_blocked_host(host: &str) -> bool {
+fn is_blocked_host(host: &str) -> bool {
     if host == "metadata.google.internal" {
         return true;
     }
@@ -157,16 +193,6 @@ pub(crate) fn is_blocked_host(host: &str) -> bool {
     // AWS, GCP and Azure all answer on this one address.
     host.parse::<std::net::IpAddr>()
         .is_ok_and(|ip| ip.to_canonical() == std::net::IpAddr::from([169, 254, 169, 254]))
-}
-
-/// Refuse `url` when its host is a cloud metadata endpoint.
-pub(crate) fn refuse_blocked(url: &reqwest::Url) -> anyhow::Result<()> {
-    match url.host_str() {
-        Some(host) if is_blocked_host(host) => {
-            anyhow::bail!("URL host '{host}' is blocked: cloud metadata endpoint")
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Whether `a` and `b` share scheme, host and port, counting a default port
@@ -205,6 +231,29 @@ mod tests {
         }
     }
 
+    #[test]
+    fn no_request_is_made_to_a_cloud_metadata_endpoint() {
+        for redirects in [Redirects::Never, Redirects::SameOrigin, Redirects::AnyHost] {
+            let client = client(redirects).unwrap();
+            let error = client
+                .request(
+                    reqwest::Method::GET,
+                    "http://169.254.169.254/latest/meta-data/",
+                )
+                .expect_err("the request is refused");
+            assert!(
+                error.to_string().contains("cloud metadata endpoint"),
+                "{error}"
+            );
+            assert!(
+                client
+                    .sending_to("http://metadata.google.internal/")
+                    .is_err()
+            );
+            assert!(client.sending_to("http://127.0.0.1:8080/mcp").is_ok());
+        }
+    }
+
     /// Serve one route that redirects to `location`. Returns its URL.
     async fn redirecting_to(location: &'static str) -> String {
         let router = axum::Router::new().route(
@@ -232,7 +281,8 @@ mod tests {
             for redirects in [Redirects::AnyHost, Redirects::SameOrigin] {
                 let error = client(redirects)
                     .unwrap()
-                    .get(&url)
+                    .request(reqwest::Method::GET, &url)
+                    .unwrap()
                     .timeout(Duration::from_secs(5))
                     .send()
                     .await
@@ -277,7 +327,8 @@ mod tests {
         let url = redirecting_to("http://example.invalid/").await;
         let response = client(Redirects::SameOrigin)
             .unwrap()
-            .get(&url)
+            .request(reqwest::Method::GET, &url)
+            .unwrap()
             .send()
             .await
             .unwrap();
