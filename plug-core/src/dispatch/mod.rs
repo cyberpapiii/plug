@@ -426,7 +426,7 @@ fn can_be_task(
         && router.supports_tasks_for_client(call.client_type)
         && call.policy_decision(MethodFamily::Tasks) == crate::admission::PolicyDecision::Allow
         && crate::proxy::PlugTool::named(tool).is_none()
-        && router.tool_upstream_era(tool) != Some(ProtocolEra::Modern)
+        && router.task_can_carry_tool(tool)
 }
 
 async fn tools_call(

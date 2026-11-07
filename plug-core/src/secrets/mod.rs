@@ -34,24 +34,6 @@ pub const WRITABLE: [&str; 2] = [KEYCHAIN, FILE];
 /// asks a person for approval can wait forever; a server start cannot.
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// The last value each reference gave, so a store that locks after the
-/// service started does not take down a server that restarts. Memory only.
-static LAST: Mutex<Option<HashMap<String, SecretString>>> = Mutex::new(None);
-
-fn last(reference: &str) -> Option<SecretString> {
-    LAST.lock().ok()?.as_ref()?.get(reference).cloned()
-}
-
-fn remember(reference: &str, value: Option<&SecretString>) {
-    if let Ok(mut last) = LAST.lock() {
-        let last = last.get_or_insert_with(HashMap::new);
-        match value {
-            Some(value) => last.insert(reference.to_string(), value.clone()),
-            None => last.remove(reference),
-        };
-    }
-}
-
 /// What to do about a missing secret, for the stores Plug can write.
 fn set_hint(store: &str, name: &str) -> String {
     match store {
@@ -285,10 +267,46 @@ impl SecretStore for Keychain {
     }
 }
 
+/// What a store was made from. A store made again from the same thing, as a
+/// reload does, keeps the values the old one gave.
+#[derive(Clone, PartialEq)]
+enum MadeFrom {
+    Builtin,
+    Config(CommandStoreConfig),
+    /// Handed in by [`Stores::with`]; never the same as another.
+    Given,
+}
+
+#[derive(Clone)]
+struct Entry {
+    id: String,
+    store: Arc<dyn SecretStore>,
+    made_from: MadeFrom,
+    /// The last value each name gave, so a store that locks after the
+    /// service started does not take down a server that restarts. Memory
+    /// only.
+    last: Arc<Mutex<HashMap<String, SecretString>>>,
+}
+
+impl Entry {
+    fn last(&self, name: &str) -> Option<SecretString> {
+        self.last.lock().ok()?.get(name).cloned()
+    }
+
+    fn remember(&self, name: &str, value: Option<&SecretString>) {
+        if let Ok(mut last) = self.last.lock() {
+            match value {
+                Some(value) => last.insert(name.to_string(), value.clone()),
+                None => last.remove(name),
+            };
+        }
+    }
+}
+
 /// The stores a reference may name.
 #[derive(Clone, Default)]
 pub struct Stores {
-    stores: Vec<(String, Arc<dyn SecretStore>)>,
+    stores: Vec<Entry>,
 }
 
 impl Stores {
@@ -317,9 +335,13 @@ impl Stores {
 
     fn with_keychain_and_file(keychain: Arc<dyn SecretStore>, file: file::File) -> Self {
         Self::default()
-            .with(KEYCHAIN, keychain)
-            .with(FILE, Arc::new(file))
-            .with(OP, Arc::new(command::Command::one_password()))
+            .with_made_from(KEYCHAIN, keychain, MadeFrom::Builtin)
+            .with_made_from(FILE, Arc::new(file), MadeFrom::Builtin)
+            .with_made_from(
+                OP,
+                Arc::new(command::Command::one_password()),
+                MadeFrom::Builtin,
+            )
     }
 
     /// The built-in stores and the ones `config` adds.
@@ -328,15 +350,35 @@ impl Stores {
             .stores
             .iter()
             .fold(Self::builtin(), |stores, (id, store)| {
-                stores.with(
+                stores.with_made_from(
                     id,
                     Arc::new(command::Command::new(
                         id,
                         store.command.clone(),
                         Duration::from_secs(store.timeout_secs),
                     )),
+                    MadeFrom::Config(store.clone()),
                 )
             })
+    }
+
+    /// These stores, keeping the values each store in `previous` that was
+    /// made from the same thing gave. A store whose config changed starts
+    /// with none, so it never stands in with the old store's value.
+    pub(crate) fn keeping_values_of(mut self, previous: &Stores) -> Self {
+        for entry in &mut self.stores {
+            if entry.made_from == MadeFrom::Given {
+                continue;
+            }
+            if let Some(old) = previous
+                .stores
+                .iter()
+                .find(|old| old.id == entry.id && old.made_from == entry.made_from)
+            {
+                entry.last = Arc::clone(&old.last);
+            }
+        }
+        self
     }
 
     /// Whether `server` refers to any store, so the caller can prepare what
@@ -345,17 +387,32 @@ impl Stores {
         reference_values(server).any(|value| self.parse(value).is_some())
     }
 
-    pub fn with(mut self, id: &str, store: Arc<dyn SecretStore>) -> Self {
-        self.stores.retain(|(existing, _)| existing != id);
-        self.stores.push((id.to_string(), store));
+    pub fn with(self, id: &str, store: Arc<dyn SecretStore>) -> Self {
+        self.with_made_from(id, store, MadeFrom::Given)
+    }
+
+    fn with_made_from(
+        mut self,
+        id: &str,
+        store: Arc<dyn SecretStore>,
+        made_from: MadeFrom,
+    ) -> Self {
+        self.stores.retain(|entry| entry.id != id);
+        self.stores.push(Entry {
+            id: id.to_string(),
+            store,
+            made_from,
+            last: Arc::default(),
+        });
         self
     }
 
+    fn entry(&self, id: &str) -> Option<&Entry> {
+        self.stores.iter().find(|entry| entry.id == id)
+    }
+
     pub fn get(&self, id: &str) -> Option<&Arc<dyn SecretStore>> {
-        self.stores
-            .iter()
-            .find(|(existing, _)| existing == id)
-            .map(|(_, store)| store)
+        self.entry(id).map(|entry| &entry.store)
     }
 
     /// Split `value` into a store and a name, when the whole value is a
@@ -535,7 +592,8 @@ impl Stores {
         let Some((id, name)) = self.parse(value) else {
             return Ok(None);
         };
-        let store = Arc::clone(self.get(id).expect("parse checked the store"));
+        let entry = self.entry(id).expect("parse checked the store");
+        let store = Arc::clone(&entry.store);
         // The store stops itself at its own limit; this is the backstop.
         let limit = store.timeout() + Duration::from_secs(2);
         let owned = name.to_string();
@@ -557,16 +615,16 @@ impl Stores {
         };
         match outcome {
             Ok(secret) => {
-                remember(value, Some(&secret));
+                entry.remember(name, Some(&secret));
                 Ok(Some(secret))
             }
             // The store answered: the secret is gone, and so is the copy.
             Err(error @ (SecretError::Missing { .. } | SecretError::InvalidName(_))) => {
-                remember(value, None);
+                entry.remember(name, None);
                 Err(error)
             }
             // The store did not answer. A value it gave earlier still works.
-            Err(error) => match last(value) {
+            Err(error) => match entry.last(name) {
                 Some(secret) => {
                     tracing::warn!(store = %id, %error, "using the value read earlier");
                     Ok(Some(secret))
@@ -766,6 +824,45 @@ LEVEL = "debug:verbose"
             let resolved = stores.resolve_server(&config, None).await.unwrap();
             assert_eq!(resolved.auth_token.as_ref().unwrap().as_str(), "first-read");
         }
+    }
+
+    #[tokio::test]
+    async fn only_a_store_made_as_before_gives_the_value_it_gave() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = dir.path().join("held");
+        std::fs::write(&held, "old-value\n").unwrap();
+        let reading = |path: &std::path::Path| -> SecretsConfig {
+            toml::from_str(&format!(
+                "[stores.vault]\ncommand = [\"cat\", {:?}]\n",
+                path.display().to_string()
+            ))
+            .unwrap()
+        };
+        let config = server("command = \"server\"\nauth_token = \"vault:token\"\n");
+        let servers = crate::server::ServerManager::new();
+        let token = |stores: Arc<Stores>| {
+            let config = config.clone();
+            async move {
+                stores
+                    .resolve_server(&config, None)
+                    .await
+                    .map(|resolved| resolved.auth_token.clone().unwrap().as_str().to_string())
+            }
+        };
+
+        servers.set_secret_stores(Stores::from_config(&reading(&held)));
+        assert_eq!(token(servers.secret_stores()).await.unwrap(), "old-value");
+        std::fs::remove_file(&held).unwrap();
+
+        servers.set_secret_stores(Stores::from_config(&reading(&held)));
+        assert_eq!(token(servers.secret_stores()).await.unwrap(), "old-value");
+
+        servers.set_secret_stores(Stores::from_config(&reading(&dir.path().join("moved"))));
+        let error = token(servers.secret_stores()).await.unwrap_err();
+        assert!(
+            matches!(error, SecretError::Unavailable { ref store, .. } if store == "vault"),
+            "{error:?}"
+        );
     }
 
     #[test]

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 
-use crate::protocol::{ProtocolEra, ProtocolOutcome};
+use crate::protocol::ProtocolOutcome;
 use crate::types::PrincipalId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -97,7 +97,6 @@ impl MethodFamily {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CapabilityPolicyInput<'a> {
-    pub era: ProtocolEra,
     pub principal: Option<&'a PrincipalId>,
     pub scopes: &'a BTreeSet<String>,
     pub local_trust: bool,
@@ -303,7 +302,6 @@ mod tests {
         let principal = PrincipalId::downstream_oauth("https://issuer", "client", "plug");
         let scopes = BTreeSet::from(["tools:read".to_string()]);
         let input = CapabilityPolicyInput {
-            era: ProtocolEra::Legacy,
             principal: Some(&principal),
             scopes: &scopes,
             local_trust: false,
@@ -323,7 +321,6 @@ mod tests {
     fn anonymous_callers_cannot_own_durable_state() {
         let scopes = BTreeSet::new();
         let input = CapabilityPolicyInput {
-            era: ProtocolEra::Legacy,
             principal: None,
             scopes: &scopes,
             local_trust: true,

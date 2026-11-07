@@ -821,7 +821,8 @@ fn registered_clients() -> BTreeMap<&'static str, serde_json::Value> {
     };
     BTreeMap::from([
         ("signed_in", client(true, Some(1_700_000_500))),
-        // A client registered again keeps its old grants but not its last use.
+        // Signed in with no recorded last use, as a client stored before
+        // Plug kept `last_used_at` is.
         ("signed_in_registered_again", client(true, None)),
         ("signed_out", client(false, Some(1_700_000_500))),
         ("never_finished", client(false, None)),

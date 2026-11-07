@@ -1225,7 +1225,10 @@ impl ServerManager {
         }
     }
 
+    /// Use `stores` from now on. A store made as before keeps the values
+    /// it gave.
     pub fn set_secret_stores(&self, stores: crate::secrets::Stores) {
+        let stores = stores.keeping_values_of(&self.secret_stores.load());
         self.secret_stores.store(Arc::new(stores));
     }
 
