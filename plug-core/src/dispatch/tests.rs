@@ -457,32 +457,82 @@ async fn dispatch_tools_call_task_param_requires_task_scope_before_creating_reco
     assert!(activity[0].remote, "an HTTP call comes over the network");
 }
 
-/// A local caller whose client cancelled the request.
-struct CancelledCaller(IpcContext);
+/// An upstream whose call runs until the client cancels it. rmcp cancels a
+/// handler's `context.ct` when `notifications/cancelled` names its request.
+struct HangingUpstream {
+    entered: Arc<tokio::sync::Notify>,
+}
 
-impl DownstreamContext for CancelledCaller {
-    fn downstream_call_context(&self) -> DownstreamCallContext {
-        let call = self.0.downstream_call_context();
-        call.cancellation.cancel();
-        call
+impl rmcp::handler::server::ServerHandler for HangingUpstream {
+    fn get_info(&self) -> rmcp::model::ServerInfo {
+        rmcp::model::ServerInfo::new(rmcp::model::ServerCapabilities::default())
     }
 
-    fn session_bound(&self) -> bool {
-        self.0.session_bound()
-    }
-
-    fn task_owner(&self) -> Result<TaskOwner, McpError> {
-        self.0.task_owner()
+    fn call_tool(
+        &self,
+        _request: CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::service::RoleServer>,
+    ) -> impl std::future::Future<Output = Result<rmcp::model::CallToolResponse, McpError>> + Send + '_
+    {
+        let entered = Arc::clone(&self.entered);
+        async move {
+            entered.notify_one();
+            context.ct.cancelled().await;
+            Err(McpError::internal_error("call cancelled by client", None))
+        }
     }
 }
 
 #[tokio::test]
-async fn a_cancelled_call_is_recorded_as_cancelled() {
+async fn a_call_the_client_cancels_while_it_runs_is_recorded_as_cancelled() {
+    use rmcp::ServiceExt as _;
+
     let router = router_with_unrouted_single_route();
-    let ctx = CancelledCaller(local_caller());
-    dispatch_call(&router, &ctx, CallToolRequestParams::new("Mock__tool"))
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let (server_transport, client_transport) = tokio::io::duplex(4096);
+    let upstream = HangingUpstream {
+        entered: Arc::clone(&entered),
+    };
+    tokio::spawn(async move {
+        let server = upstream
+            .serve(server_transport)
+            .await
+            .expect("start hanging upstream");
+        let _ = server.waiting().await;
+    });
+    let tools = Arc::new(arc_swap::ArcSwap::from_pointee(Vec::new()));
+    let client = Arc::new(crate::server::UpstreamClientHandler::new_for_tests(
+        Arc::from("mock-server"),
+        Arc::clone(&tools),
+        crate::server::no_events(),
+    ))
+    .serve(client_transport)
+    .await
+    .expect("connect hanging upstream");
+    router
+        .server_manager()
+        .replace_server(
+            "mock-server",
+            crate::server::UpstreamServer::for_tests("mock-server".to_string(), client, tools),
+        )
+        .await;
+
+    let ctx = local_caller();
+    let call = {
+        let router = Arc::clone(&router);
+        let ctx = local_caller();
+        tokio::spawn(async move {
+            dispatch_call(&router, &ctx, CallToolRequestParams::new("Mock__tool")).await
+        })
+    };
+    entered.notified().await;
+    router.cancel_downstream_request(&ctx.downstream_call_context(), Some("stop".to_string()));
+
+    tokio::time::timeout(std::time::Duration::from_secs(10), call)
         .await
-        .expect_err("the call has no upstream and was cancelled");
+        .expect("the cancelled call ends")
+        .expect("call task")
+        .expect_err("a cancelled call has no result");
     let activity = router.activity_snapshot(&crate::activity::ActivityFilter::default());
     assert_eq!(activity.len(), 1);
     assert_eq!(
