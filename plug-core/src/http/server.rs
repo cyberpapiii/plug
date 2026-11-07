@@ -548,7 +548,6 @@ pub(super) async fn get_mcp(
     let session_id = extract_session_id(&headers)?;
     reopen_lost_session(&state, &headers, &auth_status).await?;
     state.sessions.validate(&session_id)?;
-    session_is_the_callers(&headers, state.sessions.as_ref(), &auth_status)?;
 
     let accept = headers
         .get(header::ACCEPT)
@@ -693,7 +692,8 @@ pub(super) async fn handle_request(
         request_id.clone(),
         trace_id,
         request_meta.as_ref(),
-    );
+    )
+    .in_own_exchange();
 
     if matches!(req.request, ClientRequest::CallToolRequest(_)) {
         // A call through a tunnel dies if nothing is sent for too long. A

@@ -1651,14 +1651,19 @@ fn resource_subscription_registry_lifecycle() {
     assert_eq!(router.resource_subscriptions.len(), 0);
 
     // Insert directly (bypassing upstream check for unit test)
-    router
-        .resource_subscriptions
-        .insert_active_for_test("file:///test", target.clone());
+    router.resource_subscriptions.insert_active_for_test(
+        "file:///test",
+        Some("files"),
+        target.clone(),
+    );
     assert_eq!(router.resource_subscriptions.len(), 1);
 
     // Route notification should publish to subscriber
     let mut rx = router.subscribe_notifications();
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("file:///test"));
+    router.route_upstream_resource_updated(
+        "files",
+        ResourceUpdatedNotificationParam::new("file:///test"),
+    );
 
     match rx.try_recv() {
         Ok(ProtocolNotification::ResourceUpdated {
@@ -1671,7 +1676,10 @@ fn resource_subscription_registry_lifecycle() {
     }
 
     // Route notification for unsubscribed URI → no notification
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("file:///other"));
+    router.route_upstream_resource_updated(
+        "files",
+        ResourceUpdatedNotificationParam::new("file:///other"),
+    );
     assert!(rx.try_recv().is_err());
 }
 
@@ -4016,7 +4024,10 @@ async fn first_subscribe_during_refresh_window_heals_in_same_refresh() {
     // Notification-relevant invariant: an upstream resources/updated for x
     // still fans out to the surviving member.
     let mut rx = router.subscribe_notifications();
-    router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("memory://x"));
+    router.route_upstream_resource_updated(
+        "new",
+        ResourceUpdatedNotificationParam::new("memory://x"),
+    );
     match rx.try_recv() {
         Ok(ProtocolNotification::ResourceUpdated { target, params }) => {
             assert_eq!(target, sub_target("a"));
@@ -5056,16 +5067,21 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     };
     // Both subscribed before `cursor` was kept from `git`.
     for (target, key) in [(&cursor, "cursor"), (&zed, "zed")] {
-        router
-            .resource_subscriptions
-            .insert_active_for_test("git://log", target.clone());
+        router.resource_subscriptions.insert_active_for_test(
+            "git://log",
+            Some("git"),
+            target.clone(),
+        );
         router
             .subscriber_client_keys
             .insert(target.clone(), key.to_string());
     }
     let mut notifications = router.subscribe_notifications();
     let mut heard = |router: &ToolRouter| {
-        router.route_upstream_resource_updated(ResourceUpdatedNotificationParam::new("git://log"));
+        router.route_upstream_resource_updated(
+            "git",
+            ResourceUpdatedNotificationParam::new("git://log"),
+        );
         let mut targets = Vec::new();
         while let Ok(notification) = notifications.try_recv() {
             if let ProtocolNotification::ResourceUpdated { target, .. } = notification {
@@ -5082,6 +5098,44 @@ fn a_client_kept_from_a_server_stops_hearing_its_resource_updates() {
     let both = heard(&router);
     assert_eq!(both.len(), 2);
     assert!(both.contains(&cursor) && both.contains(&zed));
+}
+
+#[test]
+fn a_server_cannot_say_another_servers_resource_changed() {
+    use crate::server::UpstreamEvents as _;
+    let router = router_with_blocked_resources_and_prompts();
+    let zed = NotificationTarget::Ipc {
+        client_id: Arc::from("zed-session"),
+    };
+    // One entry the subscribe recorded an owner for, one known only by route.
+    router
+        .resource_subscriptions
+        .insert_active_for_test("git://log", Some("git"), zed.clone());
+    router
+        .resource_subscriptions
+        .insert_active_for_test("git://commit/1", None, zed.clone());
+    router
+        .subscriber_client_keys
+        .insert(zed.clone(), "zed".to_string());
+    let mut notifications = router.subscribe_notifications();
+    let mut heard = |server: &str, uri: &str| {
+        router.resource_updated(server, ResourceUpdatedNotificationParam::new(uri));
+        let mut uris = Vec::new();
+        while let Ok(notification) = notifications.try_recv() {
+            if let ProtocolNotification::ResourceUpdated { params, .. } = notification {
+                uris.push(params.uri);
+            }
+        }
+        uris
+    };
+
+    assert!(heard("other", "git://log").is_empty());
+    assert!(heard("other", "git://commit/1").is_empty());
+    assert_eq!(heard("git", "git://log"), vec!["git://log".to_string()]);
+    assert_eq!(
+        heard("git", "git://commit/1"),
+        vec!["git://commit/1".to_string()]
+    );
 }
 
 /// An upstream that takes requests and never answers them.

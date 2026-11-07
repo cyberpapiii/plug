@@ -555,6 +555,10 @@ pub struct DownstreamCallContext {
     /// Cancelled when the client cancels this request, so a call that then
     /// fails is recorded as cancelled rather than as an error.
     pub(crate) cancellation: tokio_util::sync::CancellationToken,
+    /// The one HTTP exchange a stateless request arrived in. Its client id
+    /// names a whole principal, which several callers may share, so this is
+    /// what keeps their calls, and the notices about them, apart.
+    pub(crate) exchange: Option<u64>,
 }
 
 impl DownstreamCallContext {
@@ -583,6 +587,7 @@ impl DownstreamCallContext {
             principal_lifecycle: None,
             extension_envelope: None,
             cancellation: tokio_util::sync::CancellationToken::new(),
+            exchange: None,
         }
     }
 
@@ -697,6 +702,11 @@ impl DownstreamCallContext {
         self
     }
 
+    pub(crate) fn in_exchange(mut self, exchange: u64) -> Self {
+        self.exchange = Some(exchange);
+        self
+    }
+
     pub fn with_modern_direction_enabled(mut self, enabled: bool) -> Self {
         self.modern_direction_enabled = enabled;
         self
@@ -760,7 +770,12 @@ impl DownstreamCallContext {
     }
 
     pub fn notification_target(&self) -> NotificationTarget {
-        self.transport.notification_target(&self.client_id)
+        match self.exchange {
+            Some(exchange) => self
+                .transport
+                .notification_target(&Arc::from(format!("{}#{exchange}", self.client_id))),
+            None => self.transport.notification_target(&self.client_id),
+        }
     }
 }
 
@@ -784,6 +799,7 @@ struct DownstreamCallKey {
     transport: DownstreamTransport,
     client_id: Arc<str>,
     request_id: RequestId,
+    exchange: Option<u64>,
 }
 
 impl From<&DownstreamCallContext> for DownstreamCallKey {
@@ -792,6 +808,7 @@ impl From<&DownstreamCallContext> for DownstreamCallKey {
             transport: value.transport,
             client_id: Arc::clone(&value.client_id),
             request_id: value.request_id.clone(),
+            exchange: value.exchange,
         }
     }
 }
@@ -2111,11 +2128,7 @@ impl ToolRouter {
         context: &DownstreamCallContext,
         reason: Option<String>,
     ) {
-        let Some(call_id) = self
-            .active_call_lookup
-            .get(&DownstreamCallKey::from(context))
-            .map(|entry| *entry)
-        else {
+        let Some(call_id) = self.active_call_for(context) else {
             tracing::debug!(
                 transport = ?context.transport,
                 request_id = ?context.request_id,
@@ -2156,6 +2169,35 @@ impl ToolRouter {
                 tracing::warn!(error = %error, "failed to forward downstream cancellation upstream");
             }
         });
+    }
+
+    /// The active call `context` names. A cancel sent in an exchange of its
+    /// own names a stateless call by its request id alone, which finds it
+    /// only when no other caller under the same principal used that id.
+    fn active_call_for(&self, context: &DownstreamCallContext) -> Option<u64> {
+        let key = DownstreamCallKey::from(context);
+        if let Some(call_id) = self.active_call_lookup.get(&key) {
+            return Some(*call_id);
+        }
+        if key.exchange.is_some() {
+            return None;
+        }
+        let mut matching = self.active_call_lookup.iter().filter(|entry| {
+            let candidate = entry.key();
+            candidate.exchange.is_some()
+                && candidate.transport == key.transport
+                && candidate.client_id == key.client_id
+                && candidate.request_id == key.request_id
+        });
+        let call_id = *matching.next()?.value();
+        if matching.next().is_some() {
+            tracing::debug!(
+                request_id = ?context.request_id,
+                "a cancel names a request id two callers are using; cancelling neither"
+            );
+            return None;
+        }
+        Some(call_id)
     }
 
     /// Cancel an active request owned by the supplied downstream context.
@@ -4447,7 +4489,7 @@ impl crate::server::UpstreamEvents for ToolRouter {
 
     fn resource_updated(&self, server: &str, mut params: ResourceUpdatedNotificationParam) {
         self.name_skill_server(server, &mut params.uri);
-        self.route_upstream_resource_updated(params);
+        self.route_upstream_resource_updated(server, params);
     }
 
     fn logging_message(&self, server: &str, params: LoggingMessageNotificationParam) {
@@ -4688,6 +4730,64 @@ mod lifecycle_regression_tests {
         router.remove_active_call(winner);
         assert!(!router.active_call_lookup.contains_key(&key));
         assert!(router.active_calls.is_empty());
+    }
+
+    /// Two stateless callers under one principal, such as two clients on an
+    /// open loopback listener, often send the same request id.
+    #[test]
+    fn stateless_callers_sharing_a_principal_keep_their_calls_apart() {
+        let router = ToolRouter::new(Arc::new(ServerManager::new()), RouterConfig::default());
+        let call = |exchange: Option<u64>| {
+            let context = DownstreamCallContext::http(
+                "loopback-principal",
+                RequestId::from(NumberOrString::Number(1)),
+                crate::types::ClientType::Unknown,
+            )
+            .with_protocol(
+                crate::protocol::ProtocolEra::Modern,
+                crate::protocol::MODERN_PROTOCOL_VERSION,
+            );
+            match exchange {
+                Some(exchange) => context.in_exchange(exchange),
+                None => context,
+            }
+        };
+        let record = |downstream: DownstreamCallContext| ActiveCallRecord {
+            downstream,
+            upstream_server_id: "upstream".to_string(),
+            upstream_request_id: None,
+            downstream_progress_token: None,
+            upstream_progress_token: None,
+            pending_cancel_reason: None,
+        };
+        let (first, second) = (call(Some(1)), call(Some(2)));
+        router
+            .register_active_call(1, record(first.clone()))
+            .unwrap();
+        router
+            .register_active_call(2, record(second.clone()))
+            .expect("the same id from another exchange is another call");
+        assert_ne!(first.notification_target(), second.notification_target());
+        let cancelled = |call_id: u64| {
+            router
+                .active_calls
+                .get(&call_id)
+                .unwrap()
+                .downstream
+                .cancellation
+                .is_cancelled()
+        };
+
+        // A cancel by request id alone cannot tell the two apart.
+        router.cancel_downstream_request(&call(None), None);
+        assert!(!cancelled(1) && !cancelled(2));
+        // An exchange that ends cancels only the call it carried.
+        router.cancel_downstream_request(&second, None);
+        assert!(!cancelled(1) && cancelled(2));
+        router.remove_active_call(2);
+        // With one call left under that id, the cancel finds it.
+        router.cancel_downstream_request(&call(None), None);
+        assert!(cancelled(1));
     }
 }
 

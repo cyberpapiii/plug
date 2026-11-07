@@ -1316,7 +1316,12 @@ impl SubscriptionRegistry {
     /// Test-only: lets `proxy::tests` exercise notification fan-out
     /// (`route_upstream_resource_updated`) without a real upstream call.
     #[cfg(test)]
-    pub(super) fn insert_active_for_test(&self, uri: &str, target: NotificationTarget) {
+    pub(super) fn insert_active_for_test(
+        &self,
+        uri: &str,
+        owner: Option<&str>,
+        target: NotificationTarget,
+    ) {
         if let Some(mut entry) = self.entries.get_mut(uri) {
             entry.members.insert(target);
             return;
@@ -1330,7 +1335,7 @@ impl SubscriptionRegistry {
                 generation,
                 members,
                 state: EntryState::Active,
-                owner_server_id: None,
+                owner_server_id: owner.map(str::to_string),
                 owner_connection_generation: None,
             },
         );
@@ -1519,25 +1524,38 @@ impl super::ToolRouter {
         }
     }
 
-    /// Route an upstream resource-updated notification to subscribed downstream clients.
-    pub(crate) fn route_upstream_resource_updated(&self, params: ResourceUpdatedNotificationParam) {
+    /// Route `server`'s resource-updated notification to the clients
+    /// subscribed to that resource. Only the server that holds the resource
+    /// may say it changed; a notice about anyone else's is dropped.
+    pub(crate) fn route_upstream_resource_updated(
+        &self,
+        server: &str,
+        params: ResourceUpdatedNotificationParam,
+    ) {
         let Some(subscribers) = self.resource_subscriptions.members_snapshot(&params.uri) else {
             return;
         };
-
-        // A client kept from this server after it subscribed hears nothing
-        // more from it. The subscription itself stays, so lifting the block
-        // brings the updates back without the client subscribing again.
-        let server_id = self
+        let owner = self
             .resource_subscriptions
             .owner_snapshot(&params.uri)
             .flatten()
             .or_else(|| resolve_resource_route(&self.cache.load().resource_routes, &params.uri));
+        if owner.as_deref() != Some(server) {
+            tracing::debug!(
+                server,
+                uri = %params.uri,
+                owner = ?owner,
+                "dropped resources/updated for a resource another server holds"
+            );
+            return;
+        }
 
+        // A client kept from this server after it subscribed hears nothing
+        // more from it. The subscription itself stays, so lifting the block
+        // brings the updates back without the client subscribing again.
         for target in subscribers {
-            if let Some(server_id) = &server_id
-                && let Some(client_key) = self.subscriber_client_keys.get(&target)
-                && !self.client_may_use_all_of_server(Some(client_key.as_str()), server_id)
+            if let Some(client_key) = self.subscriber_client_keys.get(&target)
+                && !self.client_may_use_all_of_server(Some(client_key.as_str()), server)
             {
                 continue;
             }
@@ -2913,7 +2931,7 @@ mod tests {
     fn classify_unconfirmed_owner_with_unchanged_route_produces_nothing() {
         let registry = SubscriptionRegistry::new(TaskTracker::new());
         // Seed helper records no owner (owner_server_id: None).
-        registry.insert_active_for_test("file:///x", client("a"));
+        registry.insert_active_for_test("file:///x", None, client("a"));
 
         let routes = HashMap::from([("file:///x".to_string(), "server-b".to_string())]);
         let items = registry.classify_route_changes(&routes, &routes);
