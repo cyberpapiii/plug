@@ -864,9 +864,8 @@ async fn handle_ipc_loop(
         };
 
         // The receiver belongs to the session it was taken out with. A
-        // Register made a new one, already in `ctx`; a Deregister ended the
-        // session and its bridge, so the old one is dropped.
-        if ctx.reverse_request_rx.is_none() && ctx.session_id == dispatch_session_id {
+        // Register made a new one, already in `ctx`, so the old one is dropped.
+        if ctx.reverse_request_rx.is_none() {
             ctx.reverse_request_rx = reverse_rx;
         }
 
@@ -1534,12 +1533,6 @@ async fn dispatch_request(request: &IpcRequest, ctx: &mut ConnectionContext) -> 
                     .try_into()
                     .unwrap_or(u64::MAX),
             }
-        }
-
-        IpcRequest::Deregister { session_id } => {
-            end_ipc_session(ctx, session_id).await;
-            ctx.session_id = None;
-            IpcResponse::Ok
         }
 
         IpcRequest::UpdateSession {
@@ -3441,138 +3434,6 @@ allowed_servers = ["slack"]
         .await
         .expect("registered connection is pushed the change");
         assert!(matches!(push, Push::ModernGate));
-    }
-
-    /// A Deregister that FAILS validation (here: SESSION_MISMATCH) must not
-    /// kill the connection's live reverse-request channel. The Deregister
-    /// handler only clears `ctx.reverse_request_rx` and drops the bridge's
-    /// sender on its SUCCESS path — the validation early-returns leave the
-    /// channel untouched. If the dispatch loop's restore-skip predicate keyed
-    /// on the request TYPE alone (rather than request type AND `Ok` response),
-    /// the still-live receiver taken out for the dispatch would be dropped at
-    /// end of iteration, closing the bridge sender and permanently breaking
-    /// elicitation/sampling for a session that is still active.
-    #[tokio::test]
-    async fn failed_deregister_does_not_kill_reverse_channel() {
-        let config = plug_core::config::Config::default();
-        let engine = Engine::new(config);
-        engine.start().await;
-
-        let socket_path = std::path::PathBuf::from(format!(
-            "/tmp/plug-ipc-failed-dereg-{}.sock",
-            &uuid::Uuid::new_v4().simple().to_string()[..12]
-        ));
-        let _ = std::fs::remove_file(&socket_path);
-        let listener = UnixListener::bind(&socket_path).expect("bind temp socket");
-        let cancel = CancellationToken::new();
-
-        let client_registry = ClientRegistry::new();
-        let session_id = "failed-dereg-session".to_string();
-
-        // Same hand-built harness as
-        // `idle_registered_connection_services_reverse_request_without_new_client_frame`:
-        // pre-seed `session_id` and a hand-built reverse-request channel.
-        let (reverse_tx, reverse_rx) = tokio::sync::mpsc::channel(8);
-        let mut ctx = test_connection_context(
-            &engine,
-            cancel.clone(),
-            client_registry,
-            "/tmp/plug-ipc-failed-dereg-config.toml",
-        );
-        ctx.session_id = Some(session_id.clone());
-        ctx.reverse_request_rx = Some(reverse_rx);
-
-        let server_task = tokio::spawn(async move {
-            if let Ok((stream, _addr)) = listener.accept().await {
-                let _ = handle_ipc_connection(stream, ctx).await;
-            }
-        });
-
-        let mut stream = tokio::net::UnixStream::connect(&socket_path)
-            .await
-            .expect("client connect");
-
-        // Enter the registered-idle loop (subscribes log/ctrl channels).
-        write_ipc(&mut stream, &IpcRequest::Status).await;
-        let status = read_ipc_response(&mut stream).await;
-        assert!(
-            matches!(status, IpcResponse::Status { .. }),
-            "expected Status, got {status:?}"
-        );
-
-        // Deregister with the WRONG session id — the handler must reject it
-        // with SESSION_MISMATCH and leave the connection fully registered.
-        write_ipc(
-            &mut stream,
-            &IpcRequest::Deregister {
-                session_id: "not-the-session".to_string(),
-            },
-        )
-        .await;
-        let deregister_resp = read_ipc_response(&mut stream).await;
-        match &deregister_resp {
-            IpcResponse::Error { code, .. } => {
-                assert_eq!(code, "SESSION_MISMATCH", "unexpected error code");
-            }
-            other => panic!("expected SESSION_MISMATCH error, got {other:?}"),
-        }
-
-        // The reverse channel must still be alive and serviced: inject a
-        // reverse request with no further client frame and expect it pushed.
-        let (resp_tx, _resp_rx) = tokio::sync::oneshot::channel();
-        let request = plug_core::ipc::IpcClientRequest::CreateElicitation {
-            params: serde_json::from_value(serde_json::json!({
-                "message": "post-failed-deregister test",
-                "requestedSchema": { "type": "object", "properties": {} }
-            }))
-            .unwrap(),
-        };
-        reverse_tx
-            .send((request, resp_tx))
-            .await
-            .expect("reverse channel receiver was dropped — failed Deregister killed it");
-
-        let frame = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            plug_core::ipc::read_frame(&mut stream),
-        )
-        .await
-        .expect("timed out waiting for the reverse request after failed Deregister")
-        .expect("read frame")
-        .expect("unexpected EOF waiting for reverse request");
-
-        let msg: plug_core::ipc::DaemonToProxyMessage =
-            serde_json::from_slice(&frame).expect("decode DaemonToProxyMessage");
-        let reverse_id = match msg {
-            plug_core::ipc::DaemonToProxyMessage::ReverseRequest { id, request } => {
-                assert!(
-                    matches!(
-                        *request,
-                        plug_core::ipc::IpcClientRequest::CreateElicitation { .. }
-                    ),
-                    "expected CreateElicitation, got {request:?}"
-                );
-                id
-            }
-            other => panic!("expected ReverseRequest envelope, got {other:?}"),
-        };
-
-        // Answer the reverse request so everything winds down cleanly.
-        let reply = IpcClientResponse::Error {
-            message: "test reply".to_string(),
-        };
-        plug_core::ipc::write_frame(
-            &mut stream,
-            &plug_core::ipc::encode_reverse_response(reverse_id, &reply).unwrap(),
-        )
-        .await
-        .expect("write reverse-request reply");
-
-        cancel.cancel();
-        drop(stream);
-        let _ = server_task.await;
-        engine.shutdown().await;
-        let _ = std::fs::remove_file(&socket_path);
     }
 
     /// Regression test for the frame-reader cancellation-safety fix.

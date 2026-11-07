@@ -843,7 +843,6 @@ const NOT_SENT_BY_THE_APP: &[&str] = &[
     "AuthStatus",
     "CancelMcpRequest",
     "Capabilities",
-    "Deregister",
     "ListLiveSessions",
     "McpRequest",
     "ModernDownstreamGate",
