@@ -1,23 +1,7 @@
-#![deny(unsafe_code)]
+#![forbid(unsafe_code)]
 // RMCP 3.1 deprecates some APIs toward future SEP-2577. Plug intentionally
 // retains them while MCP 2025-11-25 remains the default negotiated revision.
 #![allow(deprecated)]
-
-/// Load `.env` file vars into the process environment, so config expansion
-/// and every upstream process Plug starts see them.
-#[allow(unsafe_code)]
-fn apply_dotenv() {
-    for (key, value) in
-        plug_core::config::env::dotenv_to_apply(&plug_core::paths::default_config_path())
-    {
-        // SAFETY: `main` calls this before it builds the tokio runtime, while
-        // the process has only its main thread, so nothing reads or writes the
-        // environment concurrently.
-        unsafe {
-            std::env::set_var(&key, &value);
-        }
-    }
-}
 
 #[cfg(test)]
 mod cli_goldens;
@@ -536,7 +520,6 @@ pub(crate) enum OwnerCommands {
 
 fn main() -> anyhow::Result<()> {
     install::maybe_delegate_to_app()?;
-    apply_dotenv();
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?

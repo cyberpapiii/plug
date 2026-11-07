@@ -16,8 +16,8 @@ pub fn env_source(config_path: &Path) -> HashMap<String, String> {
     vars
 }
 
-/// The `.env` variables the process environment does not have yet, for the
-/// caller to set before anything reads the environment.
+/// The `.env` variables the process environment does not have, which a
+/// server Plug starts is given on top of Plug's own environment.
 pub fn dotenv_to_apply(config_path: &Path) -> HashMap<String, String> {
     let mut vars = read_dotenv(&env_file_path(config_path));
     vars.retain(|key, _| std::env::var_os(key).is_none());

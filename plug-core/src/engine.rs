@@ -707,6 +707,7 @@ impl Engine {
         if !replacing {
             crate::operator::NameTaken::check(&config, name)?;
         }
+        config.http.refuse_plug_itself(name, server)?;
         config.servers.insert(name.to_string(), server.clone());
         let errors = crate::config::validate_config(&config);
         if !errors.is_empty() {
@@ -1078,6 +1079,7 @@ async fn run_refresh_loop(engine: &Arc<Engine>, server_name: &str, generation: u
 fn apply_start_settings(servers: &ServerManager, config: &Config) {
     servers.set_secret_stores(crate::secrets::Stores::from_config(&config.secrets));
     servers.set_modern_upstream_enabled(config.modern_upstream_enabled);
+    servers.set_own_http(config.http.clone());
 }
 
 fn publish_token_refresh_exchanged(engine: &Engine, server_name: &str) {

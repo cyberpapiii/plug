@@ -351,7 +351,12 @@ fn build_stdio_command(
     }
 }
 
+/// What a stdio server is given on top of Plug's own environment: the `.env`
+/// variables that environment lacks, then the PATH a terminal would have.
 fn apply_stdio_environment(command: &mut tokio::process::Command, login_path: Option<&OsStr>) {
+    command.envs(crate::config::env::dotenv_to_apply(
+        &crate::paths::default_config_path(),
+    ));
     if let Some(path) = login_path {
         command.env("PATH", path);
     }
@@ -1139,6 +1144,9 @@ pub struct ServerManager {
     /// The stores a server start follows secret references with. Set from
     /// the config when it loads; the built-in ones until then.
     secret_stores: ArcSwap<crate::secrets::Stores>,
+    /// Plug's own HTTP settings, which say which servers are Plug itself.
+    /// A start refuses one. Set from the config when it loads.
+    own_http: ArcSwap<crate::config::HttpConfig>,
     /// Wakes every health task and every waiting recovery at once. Signalled
     /// when a server's process stops and when the Mac wakes or its network
     /// changes, the moments a wait until the next tick is wasted time.
@@ -1222,7 +1230,12 @@ impl ServerManager {
             check_now: Arc::new(tokio::sync::Notify::new()),
             modern_upstream_gate: AtomicU64::new(ProtocolGate::default().0),
             secret_stores: ArcSwap::from_pointee(crate::secrets::Stores::builtin()),
+            own_http: ArcSwap::from_pointee(crate::config::HttpConfig::default()),
         }
+    }
+
+    pub fn set_own_http(&self, http: crate::config::HttpConfig) {
+        self.own_http.store(Arc::new(http));
     }
 
     /// Use `stores` from now on. A store made as before keeps the values
@@ -1473,10 +1486,18 @@ impl ServerManager {
             let reporting = self.reporting();
             let protocol_gate = self.protocol_gate();
             let stores = self.secret_stores();
+            let own_http = self.own_http.load_full();
             join_set.spawn(async move {
                 let _permit = permits.acquire_owned().await;
-                let result =
-                    Self::connect(&name_clone, &sc, &stores, reporting, protocol_gate).await;
+                let result = Self::connect(
+                    &name_clone,
+                    &sc,
+                    &stores,
+                    &own_http,
+                    reporting,
+                    protocol_gate,
+                )
+                .await;
                 (name_clone, result)
             });
         }
@@ -1522,6 +1543,7 @@ impl ServerManager {
             name,
             config,
             &self.secret_stores(),
+            &self.own_http.load(),
             self.reporting(),
             self.protocol_gate(),
         )
@@ -1549,9 +1571,11 @@ impl ServerManager {
         name: &str,
         config: &ServerConfig,
         stores: &crate::secrets::Stores,
+        own_http: &crate::config::HttpConfig,
         reporting: Reporting,
         protocol_gate: ProtocolGate,
     ) -> Result<UpstreamServer, anyhow::Error> {
+        own_http.refuse_plug_itself(name, config)?;
         // A store that is a command finds its tool on the PATH a terminal
         // would have.
         let path = if stores.refers(config) {
@@ -3095,6 +3119,47 @@ mod tests {
         );
         assert!(initialize_needs_sign_in(refused("HTTP 401 Unauthorized: ")));
         assert!(!initialize_needs_sign_in(refused("HTTP 403 Forbidden: ")));
+    }
+
+    #[test]
+    fn a_stdio_server_gets_the_dotenv_variables_plug_lacks() {
+        let env_file = crate::config::env::env_file_path(&crate::paths::default_config_path());
+        std::fs::create_dir_all(env_file.parent().unwrap()).unwrap();
+        std::fs::write(
+            &env_file,
+            "PLUG_TEST_ONLY_IN_DOTENV=from-dotenv\nHOME=/not/home\nPATH=/from/dotenv\n",
+        )
+        .unwrap();
+        let cmd = build_stdio_command(
+            "/bin/echo",
+            &[],
+            &test_server_config(),
+            Some(OsStr::new("/login/path")),
+        )
+        .unwrap();
+        let envs: HashMap<_, _> = cmd.as_std().get_envs().collect();
+        assert_eq!(
+            envs[OsStr::new("PLUG_TEST_ONLY_IN_DOTENV")],
+            Some(OsStr::new("from-dotenv"))
+        );
+        assert_eq!(envs[OsStr::new("PATH")], Some(OsStr::new("/login/path")));
+        assert!(!envs.contains_key(OsStr::new("HOME")));
+    }
+
+    #[tokio::test]
+    async fn a_server_that_is_plug_itself_does_not_start() {
+        let manager = ServerManager::new();
+        let config = ServerConfig {
+            transport: TransportType::Http,
+            url: Some("http://localhost:3282/mcp".to_string()),
+            ..test_server_config()
+        };
+        let error = manager
+            .start_server("loop", &config)
+            .await
+            .err()
+            .expect("Plug must not connect to itself");
+        assert!(error.to_string().contains("Plug itself"), "{error}");
     }
 
     #[tokio::test]

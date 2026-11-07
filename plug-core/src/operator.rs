@@ -221,6 +221,7 @@ pub fn apply_operator_mutation_knowing(
     let result = match mutation {
         OperatorMutation::AddServer { name, mut server } => {
             NameTaken::check(&config, &name)?;
+            config.http.refuse_plug_itself(&name, &server)?;
             // A new server has nothing stored behind a placeholder, so this only
             // drops one that came back from a redacted read of another server.
             server.restore_redacted_secrets(None);
@@ -235,6 +236,7 @@ pub fn apply_operator_mutation_knowing(
             // Clients read this server redacted, so untouched secrets arrive as
             // placeholders. Put the stored values back before they are written.
             server.restore_redacted_secrets(Some(stored));
+            config.http.refuse_plug_itself(&name, &server)?;
             let summary = OperatorServerSummary::from_config(name.clone(), &server);
             config.servers.insert(name, server);
             OperatorMutationResult::server(Some(summary))
@@ -256,6 +258,9 @@ pub fn apply_operator_mutation_knowing(
         OperatorMutation::ImportServers { mut servers } => {
             for imported in &mut servers {
                 imported.server.restore_redacted_secrets(None);
+                config
+                    .http
+                    .refuse_plug_itself(&imported.name, &imported.server)?;
             }
             let imported = crate::import::add_to_config(&mut config, servers)
                 .into_iter()
@@ -859,6 +864,45 @@ API_KEY = "sk-live-123"
         assert_eq!(NameTaken::code_or(&error, "OTHER"), NameTaken::CODE);
         let other = anyhow::anyhow!("server `workspace` already exists");
         assert_eq!(NameTaken::code_or(&other, "OTHER"), "OTHER");
+    }
+
+    #[test]
+    fn plug_itself_is_refused_as_a_new_or_edited_server_but_others_still_save() {
+        let path = fixture_path();
+        let plug_itself = || ServerConfig {
+            transport: crate::config::TransportType::Http,
+            url: Some("http://localhost:3282/mcp".into()),
+            ..Default::default()
+        };
+        let add = |name: &str, server| {
+            apply_operator_mutation(
+                &path,
+                OperatorMutation::AddServer {
+                    name: name.into(),
+                    server,
+                },
+            )
+        };
+        assert!(add("loop", plug_itself()).is_err());
+        assert!(!path.exists(), "a refused add must not write the config");
+
+        add("workspace", server_with_secrets()).unwrap();
+        let edit = apply_operator_mutation(
+            &path,
+            OperatorMutation::UpdateServer {
+                name: "workspace".into(),
+                server: plug_itself(),
+            },
+        );
+        assert!(edit.is_err());
+
+        std::fs::write(
+            &path,
+            "[servers.loop]\ntransport = \"http\"\nurl = \"http://localhost:3282/mcp\"\n",
+        )
+        .unwrap();
+        let (config, _) = add("workspace", server_with_secrets()).unwrap();
+        assert!(config.servers.contains_key("loop"));
     }
 
     #[test]

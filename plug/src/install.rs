@@ -110,7 +110,7 @@ fn delegation_decision(
 }
 
 /// Re-exec a standalone macOS command through a freshly verified Plug.app.
-/// This must run before dotenv loading and Clap parsing.
+/// This must run before Clap parsing.
 pub fn maybe_delegate_to_app() -> Result<()> {
     #[cfg(target_os = "macos")]
     {
