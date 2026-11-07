@@ -231,29 +231,35 @@ impl Layout {
 
     /// [`Self::read_plug`], with the entry's name.
     fn find_plug(&self, content: &str, plug: &HttpConfig) -> Option<(String, ServerEntry)> {
-        let servers = self.servers(content).ok()??;
-        let named = servers
-            .iter()
-            .find(|(name, _)| is_plug(name))
-            .and_then(|(name, entry)| Some((name.clone(), read_entry(entry)?)));
-        named.or_else(|| {
+        self.plug_entries(content, plug)
+            .into_iter()
+            .find_map(|(name, entry)| Some((name, entry?)))
+    }
+
+    /// Every entry in the file that is Plug: those named as Plug's entry is,
+    /// in file order, then those [`is_plug_itself`] under another name. A
+    /// named entry Plug cannot read is listed with no entry. Reading,
+    /// counting, linking, unlinking and repairing all go by this list.
+    fn plug_entries(&self, content: &str, plug: &HttpConfig) -> Vec<(String, Option<ServerEntry>)> {
+        let mut found = self.named_plug_entries(content);
+        found.extend(
             self.entries(content)
-                .ok()?
+                .unwrap_or_default()
                 .into_iter()
-                .find(|(name, entry)| is_plug_itself(name, entry, plug))
-        })
+                .filter(|(name, entry)| is_plug_itself(name, entry, plug))
+                .map(|(name, entry)| (name, Some(entry))),
+        );
+        found
     }
 
     /// Whether a server name in `content` is one of Plug's entries.
     fn plug_names(&self, content: &str, plug: &HttpConfig) -> impl Fn(&str) -> bool + use<> {
-        let renamed: Vec<String> = self
-            .entries(content)
-            .unwrap_or_default()
+        let names: Vec<String> = self
+            .plug_entries(content, plug)
             .into_iter()
-            .filter(|(name, entry)| is_plug_itself(name, entry, plug))
             .map(|(name, _)| name)
             .collect();
-        move |name: &str| is_plug(name) || renamed.iter().any(|plug| plug == name)
+        move |name: &str| is_plug(name) || names.iter().any(|plug| plug == name)
     }
 
     /// Every server in the file but Plug itself, which serves at `plug`.
@@ -289,32 +295,72 @@ impl Layout {
     /// How many entries for Plug, which serves at `plug`, the file has.
     /// More than one is a mistake to clean up.
     pub fn plug_entry_count(&self, content: &str, plug: &HttpConfig) -> usize {
-        let renamed = self.entries(content).map_or(0, |entries| {
-            entries
-                .iter()
-                .filter(|(name, entry)| is_plug_itself(name, entry, plug))
-                .count()
-        });
-        renamed + self.named_plug_entry_count(content)
+        self.plug_entries(content, plug).len()
     }
 
-    fn named_plug_entry_count(&self, content: &str) -> usize {
-        match self.format {
-            FileFormat::Json => self.servers(content).ok().flatten().map_or(0, |servers| {
-                servers.keys().filter(|name| is_plug(name)).count()
-            }),
-            FileFormat::Toml => content
-                .lines()
-                .filter(|line| {
-                    self.toml_server_header(line.trim())
-                        .is_some_and(|(name, header)| header == TomlHeader::Entry && is_plug(&name))
-                })
-                .count(),
-            FileFormat::Yaml => {
-                let lines: Vec<String> = content.lines().map(str::to_string).collect();
-                yaml_entry_lines(&lines, self.yaml_key(), &is_plug).len()
+    /// The entries named as Plug's entry is, each read on its own: a file
+    /// Plug was linked into twice has two `[mcp_servers.plug]` tables or two
+    /// `plug:` keys, which no parser accepts together.
+    fn named_plug_entries(&self, content: &str) -> Vec<(String, Option<ServerEntry>)> {
+        let blocks: Vec<(String, String)> = match self.format {
+            FileFormat::Json => {
+                return self
+                    .servers(content)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default()
+                    .into_iter()
+                    .filter(|(name, _)| is_plug(name))
+                    .map(|(name, entry)| (name, read_entry(&entry)))
+                    .collect();
             }
-        }
+            FileFormat::Toml => {
+                let mut blocks: Vec<(String, String)> = Vec::new();
+                let mut inside = false;
+                for line in content.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with('[') {
+                        match self.toml_server_header(trimmed) {
+                            Some((name, TomlHeader::Entry)) if is_plug(&name) => {
+                                blocks.push((name, String::new()));
+                                inside = true;
+                            }
+                            Some((name, TomlHeader::Inside)) if inside && is_plug(&name) => {}
+                            _ => inside = false,
+                        }
+                    }
+                    if inside && let Some((_, block)) = blocks.last_mut() {
+                        block.push_str(line);
+                        block.push('\n');
+                    }
+                }
+                blocks
+            }
+            FileFormat::Yaml => {
+                let key = self.yaml_key();
+                let lines = text_lines(content);
+                yaml_entry_lines(&lines, key, &is_plug)
+                    .into_iter()
+                    .map(|start| {
+                        let name = yaml_entry_name(&lines[start]).unwrap_or_default();
+                        let end = yaml_block_end(&lines, start);
+                        let block = format!("{key}:\n{}\n", lines[start..end].join("\n"));
+                        (name.to_string(), block)
+                    })
+                    .collect()
+            }
+        };
+        blocks
+            .into_iter()
+            .map(|(name, block)| {
+                let entry = self
+                    .servers(&block)
+                    .ok()
+                    .flatten()
+                    .and_then(|servers| read_entry(servers.get(&name)?));
+                (name, entry)
+            })
+            .collect()
     }
 
     /// Whether the file parses at all.
@@ -534,17 +580,20 @@ impl Layout {
                 "the client's config file {detail}, so Plug left it alone; fix or move the file and try again"
             )
         };
-        if !existing.trim().is_empty()
-            && !serde_norway::from_str::<serde_norway::Value>(existing)
+        let key = self.yaml_key();
+        // Checked without Plug's entries, so a file linked twice, whose two
+        // `plug:` keys no parser accepts, is linked once again.
+        let others = unlink_yaml(existing, key, is_plug);
+        if !others.trim().is_empty()
+            && !serde_norway::from_str::<serde_norway::Value>(&others)
                 .is_ok_and(|value| value.is_mapping())
         {
             return Err(refused("is not valid YAML"));
         }
-        let key = self.yaml_key();
         let heading = format!("{key}:");
         let snippet = self.snippet(entry);
         let entry_lines = snippet.lines().skip(1).map(str::to_string);
-        let mut lines = text_lines(&unlink_yaml(existing, key, is_plug));
+        let mut lines = text_lines(&others);
         match lines.iter().position(|line| line.trim_end() == heading) {
             Some(parent) => {
                 // Match the indentation the file's other servers already use.
@@ -728,13 +777,24 @@ fn yaml_entry_lines(lines: &[String], key: &str, is_plug: &dyn Fn(&str) -> bool)
     (parent + 1..section_end)
         .filter(|&index| {
             indentation(&lines[index]) == child_indent
-                && lines[index]
-                    .trim()
-                    .strip_suffix(':')
-                    .map(|name| name.trim_matches(|c| c == '"' || c == '\''))
-                    .is_some_and(is_plug)
+                && yaml_entry_name(&lines[index]).is_some_and(is_plug)
         })
         .collect()
+}
+
+/// The name a `<name>:` line starts an entry under.
+fn yaml_entry_name(line: &str) -> Option<&str> {
+    line.trim()
+        .strip_suffix(':')
+        .map(|name| name.trim_matches(|c| c == '"' || c == '\''))
+}
+
+/// One past the last line of the entry whose `<name>:` line is `start`.
+fn yaml_block_end(lines: &[String], start: usize) -> usize {
+    let indent = indentation(&lines[start]);
+    (start + 1..lines.len())
+        .find(|&index| !lines[index].trim().is_empty() && indentation(&lines[index]) <= indent)
+        .unwrap_or(lines.len())
 }
 
 /// The lines of the first entry under `key` that `is_plug` names: its
@@ -745,11 +805,7 @@ fn yaml_entry_block(
     is_plug: &dyn Fn(&str) -> bool,
 ) -> Option<(usize, usize)> {
     let plug = *yaml_entry_lines(lines, key, is_plug).first()?;
-    let plug_indent = indentation(&lines[plug]);
-    let end = (plug + 1..lines.len())
-        .find(|&index| !lines[index].trim().is_empty() && indentation(&lines[index]) <= plug_indent)
-        .unwrap_or(lines.len());
-    Some((plug, end))
+    Some((plug, yaml_block_end(lines, plug)))
 }
 
 /// Remove the entries under `key` that `is_plug` names, and nothing else.
@@ -1208,6 +1264,42 @@ mod tests {
                 layout.read_plug(&repaired, &plug).unwrap().command.as_deref(),
                 Some("/new/plug"),
                 "{target:?}: {repaired}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_linked_twice_reads_as_linked_wherever_it_is_counted() {
+        let plug = HttpConfig::default();
+        for (target, content) in [
+            (
+                ClientTarget::CodexCli,
+                "[mcp_servers.plug]\ncommand = \"/old/plug\"\nargs = [\"connect\"]\n\n[mcp_servers.plug.env]\nA = \"1\"\n\n[mcp_servers.other]\ncommand = \"x\"\n\n[mcp_servers.plug]\ncommand = \"/older/plug\"\n",
+            ),
+            (
+                ClientTarget::Hermes,
+                "mcp_servers:\n  plug:\n    command: /old/plug\n    args: [connect]\n  other:\n    command: x\n  plug:\n    command: /older/plug\n",
+            ),
+        ] {
+            let layout = target.layout();
+            assert_eq!(layout.plug_entry_count(content, &plug), 2, "{target:?}");
+            let entry = layout.read_plug(content, &plug).unwrap();
+            assert_eq!(entry.command.as_deref(), Some("/old/plug"), "{target:?}");
+            let repaired = layout
+                .set_plug_command(content, &plug, "/new/plug", &target.connect_args())
+                .unwrap();
+            assert!(repaired.contains("/new/plug"), "{target:?}: {repaired}");
+            let linked = layout
+                .link(
+                    content,
+                    &target.plug_entry(LinkTransport::Stdio, "/new/plug", URL),
+                    &plug,
+                )
+                .unwrap();
+            assert_eq!(
+                layout.plug_entry_count(&linked, &plug),
+                1,
+                "{target:?}: {linked}"
             );
         }
     }

@@ -551,12 +551,17 @@ fn server_binaries_result(
     }
 }
 
-/// Each settings file of `target` that exists, with its contents.
-fn client_files(target: crate::clients::ClientTarget) -> Vec<(std::path::PathBuf, String)> {
+/// Each settings file of `target` that exists, with its scope and contents.
+fn client_files(
+    target: crate::clients::ClientTarget,
+) -> Vec<(crate::clients::Scope, std::path::PathBuf, String)> {
     [crate::clients::Scope::User, crate::clients::Scope::Project]
         .into_iter()
-        .filter_map(|scope| target.config_path(scope))
-        .filter_map(|path| Some((path.clone(), std::fs::read_to_string(&path).ok()?)))
+        .filter_map(|scope| Some((scope, target.config_path(scope)?)))
+        .filter_map(|(scope, path)| {
+            let content = std::fs::read_to_string(&path).ok()?;
+            Some((scope, path, content))
+        })
         .collect()
 }
 
@@ -567,7 +572,7 @@ fn client_is_linked_to_plug(
 ) -> bool {
     client_files(target)
         .iter()
-        .any(|(_, content)| target.layout().plug_entry_count(content, plug) > 0)
+        .any(|(_, _, content)| target.layout().plug_entry_count(content, plug) > 0)
 }
 
 /// Published tool ceilings of the clients actually using plug.
@@ -822,20 +827,8 @@ async fn check_client_configs(plug: &crate::config::HttpConfig) -> CheckResult {
     let mut issues = Vec::new();
 
     for target in crate::clients::ClientTarget::all() {
-        let layout = target.layout();
-        for (path, content) in client_files(target) {
-            if layout.plug_entry_count(&content, plug) > 1 {
-                issues.push(format!(
-                    "{} (duplicate entries in {})",
-                    target.slug(),
-                    path.display()
-                ));
-            }
-            // A file plug cannot parse is worth reporting on its own: a
-            // duplicate hiding inside it would go uncounted above.
-            if let Err(error) = layout.check_syntax(&content) {
-                issues.push(format!("{} ({error} in {})", target.slug(), path.display()));
-            }
+        for (scope, path, content) in client_files(target) {
+            issues.extend(client_file_issues(target, scope, &path, &content, plug));
         }
     }
 
@@ -857,6 +850,33 @@ async fn check_client_configs(plug: &crate::config::HttpConfig) -> CheckResult {
             ),
         }
     }
+}
+
+/// What is wrong with one of `target`'s settings files: more than one Plug
+/// entry in the user file, the only one `plug link` rewrites, or a file that
+/// does not parse.
+fn client_file_issues(
+    target: crate::clients::ClientTarget,
+    scope: crate::clients::Scope,
+    path: &std::path::Path,
+    content: &str,
+    plug: &crate::config::HttpConfig,
+) -> Vec<String> {
+    let layout = target.layout();
+    let mut issues = Vec::new();
+    if scope == crate::clients::Scope::User && layout.plug_entry_count(content, plug) > 1 {
+        issues.push(format!(
+            "{} (duplicate entries in {})",
+            target.slug(),
+            path.display()
+        ));
+    }
+    // A file plug cannot parse is worth reporting on its own: a duplicate
+    // hiding inside it would go uncounted above.
+    if let Err(error) = layout.check_syntax(content) {
+        issues.push(format!("{} ({error} in {})", target.slug(), path.display()));
+    }
+    issues
 }
 
 /// Downstream HTTP auth configuration and token state.
@@ -1197,6 +1217,27 @@ fn self_is_adhoc_or_unsigned() -> Option<bool> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_duplicate_plug_link_can_clear_is_reported() {
+        use crate::clients::{ClientTarget, Scope};
+        let plug = crate::config::HttpConfig::default();
+        let twice = r#"{"servers":{"plug":{"command":"plug"},"Plug":{"command":"plug"}}}"#;
+        let issues = |scope| {
+            super::client_file_issues(
+                ClientTarget::VSCodeCopilot,
+                scope,
+                std::path::Path::new("mcp.json"),
+                twice,
+                &plug,
+            )
+        };
+        assert_eq!(
+            issues(Scope::User),
+            ["vscode (duplicate entries in mcp.json)"]
+        );
+        assert!(issues(Scope::Project).is_empty());
+    }
+
     use std::collections::HashMap;
 
     use super::*;
